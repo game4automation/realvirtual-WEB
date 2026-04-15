@@ -1,0 +1,41 @@
+{
+  "_comment": "Copy this file to settings.json to configure the WebViewer deployment.",
+
+  "lockSettings": false,
+  "lockedTabs": [],
+  "hideWelcomeModal": false,
+  "defaultModel": "models/demo.glb",
+
+  "visual": {
+    "shadows": true,
+    "shadowStrength": 0.5,
+    "lightIntensity": 1.0
+  },
+
+  "physics": {
+    "enabled": false,
+    "gravity": 9.81,
+    "friction": 1.5
+  },
+
+  "interface": {
+    "activeType": "none",
+    "autoConnect": false,
+    "wsAddress": "localhost",
+    "wsPort": 7000
+  },
+
+  "search": {
+    "highlightEnabled": true,
+    "nodesEnabled": true
+  },
+
+  "groups": {
+    "excludedFromOverlay": [],
+    "defaultHiddenGroups": []
+  },
+
+  "analytics": {
+    "googleAnalyticsId": ""
+  }
+}

@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>realvirtual WEB — Tab Configuration</title>
+  <script src="https://res.cdn.office.net/teams-js/2.31.1/js/MicrosoftTeams.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: #f5f5f5;
+      color: #333;
+      padding: 24px;
+    }
+    h2 { font-size: 18px; font-weight: 600; margin-bottom: 16px; color: #1a1a1a; }
+    label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; color: #555; }
+    input[type="text"] {
+      width: 100%;
+      padding: 10px 12px;
+      font-size: 14px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type="text"]:focus { border-color: #6264a7; }
+    .hint { font-size: 12px; color: #888; margin-top: 6px; }
+    .section { margin-bottom: 20px; }
+  </style>
+</head>
+<body>
+  <h2>realvirtual WEB — Configure Digital Twin Tab</h2>
+
+  <div class="section">
+    <label for="model-url">Model URL (GLB file)</label>
+    <input type="text" id="model-url" placeholder="https://your-cdn.com/models/demo.glb" />
+    <div class="hint">Enter the full URL to a .glb model file, or leave empty to use the default model.</div>
+  </div>
+
+  <div class="section">
+    <label for="tab-name">Tab Name</label>
+    <input type="text" id="tab-name" placeholder="Digital Twin" value="Digital Twin" />
+    <div class="hint">Name shown on the Teams tab header.</div>
+  </div>
+
+  <div class="section">
+    <label for="relay-url">Relay Server URL (Multiuser)</label>
+    <input type="text" id="relay-url" placeholder="wss://download.realvirtual.io/relay" value="wss://download.realvirtual.io/relay" />
+    <div class="hint">WebSocket relay server for multiuser collaboration. Leave empty to disable auto-join.</div>
+  </div>
+
+  <div class="section">
+    <label for="join-code">Join Code</label>
+    <input type="text" id="join-code" placeholder="e.g. MY-TEAM-ROOM" style="text-transform: uppercase; font-family: monospace;" />
+    <div class="hint">Shared room code — all users with this tab auto-join the same session.</div>
+  </div>
+
+  <script>
+    (async function () {
+      await microsoftTeams.app.initialize();
+
+      const modelInput = document.getElementById('model-url');
+      const nameInput = document.getElementById('tab-name');
+      const relayInput = document.getElementById('relay-url');
+      const joinCodeInput = document.getElementById('join-code');
+
+      // Enable save button when inputs are valid
+      function validate() {
+        const name = nameInput.value.trim();
+        const relay = relayInput.value.trim();
+        const code = joinCodeInput.value.trim();
+        // Invalid if: no tab name, or join code without relay URL
+        if (!name || (code && !relay)) {
+          microsoftTeams.pages.config.setValidityState(false);
+        } else {
+          microsoftTeams.pages.config.setValidityState(true);
+        }
+      }
+
+      modelInput.addEventListener('input', validate);
+      nameInput.addEventListener('input', validate);
+      relayInput.addEventListener('input', validate);
+      joinCodeInput.addEventListener('input', validate);
+      validate();
+
+      // Handle save
+      microsoftTeams.pages.config.registerOnSaveHandler(function (saveEvent) {
+        const modelUrl = modelInput.value.trim();
+        const baseUrl = window.location.origin;
+
+        const relayUrlVal = relayInput.value.trim();
+        const joinCodeVal = joinCodeInput.value.trim().toUpperCase();
+
+        // Build content URL with optional model parameter
+        let contentUrl = baseUrl + '/?teams=1';
+        if (modelUrl) {
+          contentUrl += '&model=' + encodeURIComponent(modelUrl);
+        }
+        contentUrl += '&lockSettings=true';
+
+        // Append multiuser params for auto-join
+        if (relayUrlVal) {
+          contentUrl += '&server=' + encodeURIComponent(relayUrlVal);
+        }
+        if (joinCodeVal) {
+          contentUrl += '&joinCode=' + encodeURIComponent(joinCodeVal);
+        }
+
+        microsoftTeams.pages.config.setConfig({
+          suggestedDisplayName: nameInput.value.trim(),
+          entityId: 'realvirtual-viewer-' + Date.now(),
+          contentUrl: contentUrl,
+          websiteUrl: baseUrl,
+        });
+
+        saveEvent.notifySuccess();
+      });
+    })();
+  </script>
+</body>
+</html>

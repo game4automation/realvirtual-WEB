@@ -1,0 +1,10 @@
+{
+  "http://smart.festo.com/aas/99920200623113326000013225": {
+    "file": "23_Festo.aasx",
+    "idShort": "Festo_EPCC-BS-32-100-3P-A_99920200623113326000013225"
+  },
+  "http://smart.festo.com/aas/99920200617190044000012858": {
+    "file": "24_Festo.aasx",
+    "idShort": "Festo_EMME-AS-40-M-LV-AS_99920200617190044000012858"
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "72d38d46-1fb3-42d9-b666-004d9af5e71e",
+  "developer": {
+    "name": "realvirtual GmbH",
+    "websiteUrl": "https://realvirtual.io",
+    "privacyUrl": "https://realvirtual.io/datenschutzerklaerung",
+    "termsOfUseUrl": "https://realvirtual.io/unternehmen/lizenz"
+  },
+  "name": {
+    "short": "realvirtual WEB",
+    "full": "realvirtual WEB — 3D Digital Twin Viewer"
+  },
+  "description": {
+    "short": "Browser-based 3D Digital Twin Viewer for industrial automation",
+    "full": "realvirtual WEB brings industrial digital twins directly into Microsoft Teams. View and interact with 3D models of production lines, machines, and automation systems. Supports live PLC connections, signal monitoring, and drive visualization — all within a lightweight browser-based viewer."
+  },
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "accentColor": "#e94078",
+  "staticTabs": [
+    {
+      "entityId": "realvirtual-viewer",
+      "name": "Digital Twin",
+      "contentUrl": "https://web.realvirtual.io/demo/?teams=1&lockSettings=true",
+      "websiteUrl": "https://web.realvirtual.io/demo/",
+      "scopes": ["personal", "groupChat", "team"]
+    }
+  ],
+  "configurableTabs": [
+    {
+      "configurationUrl": "https://web.realvirtual.io/demo/teams-config.html",
+      "canUpdateConfiguration": true,
+      "scopes": ["team", "groupChat"]
+    }
+  ],
+  "validDomains": [
+    "web.realvirtual.io"
+  ],
+  "permissions": ["identity"]
+}

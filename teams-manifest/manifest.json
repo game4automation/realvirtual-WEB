@@ -1,0 +1,36 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "{{MICROSOFT_APP_ID}}",
+  "developer": {
+    "name": "realvirtual GmbH",
+    "websiteUrl": "https://realvirtual.io",
+    "privacyUrl": "https://realvirtual.io/privacy",
+    "termsOfUseUrl": "https://realvirtual.io/terms"
+  },
+  "name": {
+    "short": "realvirtual 3D",
+    "full": "realvirtual 3D Digital Twin Viewer"
+  },
+  "description": {
+    "short": "3D digital twin viewer for industrial automation",
+    "full": "View and interact with industrial digital twins directly in Microsoft Teams. Supports multiuser collaboration with real-time avatar presence."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#2196F3",
+  "staticTabs": [
+    {
+      "entityId": "realvirtual-viewer",
+      "name": "3D Viewer",
+      "contentUrl": "https://{{YOUR_DOMAIN}}/webviewer?context=teams",
+      "websiteUrl": "https://{{YOUR_DOMAIN}}/webviewer",
+      "scopes": ["personal"]
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": ["{{YOUR_DOMAIN}}"]
+}

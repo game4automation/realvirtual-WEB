@@ -1,0 +1,50 @@
+{
+  "name": "realvirtual-web",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "e2e": "npx playwright test",
+    "e2e:headed": "npx playwright test --headed",
+    "perf": "npx playwright test e2e/perf-smoke.spec.ts --headed",
+    "build:aasx-index": "node scripts/build-aasx-index.mjs"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.19.3",
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@microsoft/teams-js": "^2.51.0",
+    "@mui/icons-material": "^7.3.9",
+    "@mui/material": "^7.3.9",
+    "@tanstack/react-virtual": "^3.13.22",
+    "echarts": "^6.0.0",
+    "jszip": "^3.10.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-pdf": "^10.4.1",
+    "stats-gl": "^4.1.0",
+    "three": "^0.171.0",
+    "three-mesh-bvh": "^0.9.9"
+  },
+  "devDependencies": {
+    "@rollup/rollup-win32-x64-msvc": "^4.59.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/three": "^0.171.0",
+    "@types/webxr": "^0.5.24",
+    "@vitejs/plugin-react": "^5.1.4",
+    "@vitest/browser": "^4.0.18",
+    "@vitest/browser-playwright": "^4.0.18",
+    "playwright": "^1.58.2",
+    "typescript": "^5.7.0",
+    "vite": "^6.1.0",
+    "vite-plugin-pwa": "^1.2.0",
+    "vitest": "^4.0.18"
+  }
+}
