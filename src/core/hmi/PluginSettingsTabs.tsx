@@ -4,33 +4,31 @@
 /**
  * SlotRenderer helpers for plugin-registered settings-tab entries.
  *
- * `PluginSettingsTabs` renders <Tab> elements (intended to live inside MUI <Tabs>)
- * for every plugin entry. Tab `value` starts at `offset` (typically 100) so it
- * does not collide with hardcoded settings tabs (0..8).
+ * `usePluginSettingsTabs` is a hook that returns the reactive list of all
+ * registered settings-tab entries. Consumers must render <Tab> elements
+ * INLINE as direct children of MUI <Tabs> — wrapping Tabs inside a custom
+ * component or Fragment prevents MUI from enumerating them (MUI Tabs uses
+ * React.Children.map on direct children only).
  *
  * `PluginSettingsTabContent` renders the active plugin tab's component when
  * `value >= offset`. Returns null otherwise.
  *
- * Both components subscribe reactively to UIPluginRegistry changes via
- * useSyncExternalStore so plugin (un)registration updates the UI immediately.
+ * Both subscribe reactively to UIPluginRegistry via useSyncExternalStore so
+ * plugin (un)registration updates the UI immediately.
  */
 
-import { Tab } from '@mui/material';
 import { useSyncExternalStore } from 'react';
 import type { RVViewer } from '../rv-viewer';
+import type { UISlotEntry } from '../rv-ui-plugin';
 
-export function PluginSettingsTabs({ viewer, offset }: { viewer: RVViewer; offset: number }) {
+/**
+ * Hook: returns reactive list of registered settings-tab entries.
+ * Callers should render <Tab> elements inline as direct children of <Tabs>.
+ */
+export function usePluginSettingsTabs(viewer: RVViewer): UISlotEntry[] {
   const registry = viewer.uiRegistry;
-  // Subscribe for reactive updates when plugins register/unregister.
   useSyncExternalStore(registry.subscribe, registry.getSnapshot, registry.getSnapshot);
-  const tabs = registry.getSettingsTabs();
-  return (
-    <>
-      {tabs.map((entry, i) => (
-        <Tab key={entry.pluginId ?? i} label={entry.label ?? 'Tab'} value={offset + i} />
-      ))}
-    </>
-  );
+  return registry.getSettingsTabs();
 }
 
 export function PluginSettingsTabContent({

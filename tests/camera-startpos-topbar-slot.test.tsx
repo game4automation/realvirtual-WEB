@@ -2,8 +2,8 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
-import { PluginSettingsTabs, PluginSettingsTabContent } from '../src/core/hmi/PluginSettingsTabs';
+import { render, renderHook, screen, cleanup } from '@testing-library/react';
+import { usePluginSettingsTabs, PluginSettingsTabContent } from '../src/core/hmi/PluginSettingsTabs';
 import { UIPluginRegistry } from '../src/core/rv-ui-registry';
 
 function FakeTabComponent() { return <div>Plugin Tab Content Rendered</div>; }
@@ -17,14 +17,22 @@ function mockViewerWithRegistry(): any {
   return { uiRegistry: registry };
 }
 
-describe('PluginSettingsTabs + PluginSettingsTabContent (EDIT 3)', () => {
+describe('usePluginSettingsTabs + PluginSettingsTabContent (EDIT 3)', () => {
   afterEach(() => cleanup());
 
-  it('renders plugin-registered Tab label', () => {
+  it('hook returns registered settings-tab entries', () => {
     const viewer = mockViewerWithRegistry();
-    // MUI Tab requires a Tabs ancestor; emulate with a tablist role wrapper for unit test.
-    render(<div role="tablist"><PluginSettingsTabs viewer={viewer} offset={100} /></div>);
-    expect(screen.getByText('Test Tab')).toBeTruthy();
+    const { result } = renderHook(() => usePluginSettingsTabs(viewer));
+    expect(result.current.length).toBe(1);
+    expect(result.current[0].label).toBe('Test Tab');
+    expect(result.current[0].pluginId).toBe('test-plugin');
+  });
+
+  it('hook returns empty list when no tabs registered', () => {
+    const registry = new UIPluginRegistry();
+    const viewer: any = { uiRegistry: registry };
+    const { result } = renderHook(() => usePluginSettingsTabs(viewer));
+    expect(result.current.length).toBe(0);
   });
 
   it('PluginSettingsTabContent renders active plugin Tab component at correct offset', () => {

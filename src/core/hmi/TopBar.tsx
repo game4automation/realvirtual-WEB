@@ -22,13 +22,14 @@ import type { MultiuserPluginAPI, WebXRPluginAPI } from '../types/plugin-types';
 
 // Settings tab components (extracted for maintainability)
 import { ModelTab, VisualTab, PhysicsTab, InterfacesTab, MultiuserTab, McpTab, DevToolsTab, TestsTab, GroupsTab } from './settings';
-import { PluginSettingsTabs, PluginSettingsTabContent } from './PluginSettingsTabs';
+import { usePluginSettingsTabs, PluginSettingsTabContent } from './PluginSettingsTabs';
 
 export function TopBar() {
   const viewer = useViewer();
   const [settingsTab, setSettingsTab] = useState(0);
   const [vrOpen, setVrOpen] = useState(false);
   const [muOpen, setMuOpen] = useState(false);
+  const pluginSettingsTabs = usePluginSettingsTabs(viewer);
 
   // Hierarchy panel state from plugin
   const { plugin, state: pluginState } = useEditorPlugin();
@@ -232,8 +233,12 @@ export function TopBar() {
             {!isTabLocked('devtools') && <Tab label="Dev Tools" value={6} />}
             {!isTabLocked('tests') && <Tab label="Tests" value={7} />}
             {!isTabLocked('groups') && <Tab label="Groups" value={8} />}
-            {/* Plugin-registered settings-tab slots (value = 100..N) */}
-            <PluginSettingsTabs viewer={viewer} offset={100} />
+            {/* Plugin-registered settings-tab slots (value = 100..N).
+                Rendered inline (not wrapped in a component) so MUI Tabs
+                enumerates them via React.Children.map. */}
+            {pluginSettingsTabs.map((entry, i) => (
+              <Tab key={entry.pluginId ?? i} label={entry.label ?? 'Tab'} value={100 + i} />
+            ))}
           </Tabs>
 
           {/* Tab content - minHeight: 0 for correct flexbox scrolling */}
