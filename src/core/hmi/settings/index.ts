@@ -2,6 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 export { ModelTab } from './ModelTab';
+export { MouseTab } from './MouseTab';
 export { VisualTab } from './VisualTab';
 export { PhysicsTab } from './PhysicsTab';
 export { InterfacesTab } from './InterfacesTab';

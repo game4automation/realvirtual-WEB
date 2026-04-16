@@ -317,9 +317,9 @@ async function init() {
     document.title = `${firebaseDemoName} - realvirtual WEB`;
     loadModel(firebaseGlbUrl);
   } else {
-    // Model priority: URL param > settings.json defaultModel > last opened (localStorage) > first model
-    // When settings.json specifies a defaultModel, it overrides localStorage because the deployer
-    // explicitly configured this model for this deployment (e.g. private project publish).
+    // Model priority: URL param > last opened (localStorage, if still available) > settings.json defaultModel > first model.
+    // The user's last choice wins over the deployer's default — `defaultModel` only kicks in on first visit
+    // (empty localStorage) or when the saved model no longer exists in the manifest (e.g. after a deploy removed it).
     const urlModel = params.get('model');
     const configModel = appConfig.defaultModel;
     const savedModel = localStorage.getItem(LS_KEY_MODEL);
@@ -345,8 +345,8 @@ async function init() {
       : null;
 
     const modelToLoad = urlModel
-      ?? resolvedConfigModel
       ?? savedEntry?.url
+      ?? resolvedConfigModel
       ?? null;
 
     if (modelToLoad) {

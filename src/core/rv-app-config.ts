@@ -24,7 +24,7 @@ export interface UIContextConfig {
 }
 
 /** Settings tab identifiers used for selective locking. */
-export type SettingsTabId = 'model' | 'visual' | 'physics' | 'interfaces' | 'devtools' | 'tests' | 'mcp' | 'multiuser' | 'groups';
+export type SettingsTabId = 'model' | 'mouse' | 'visual' | 'physics' | 'interfaces' | 'devtools' | 'tests' | 'mcp' | 'multiuser' | 'groups';
 
 /** Top-level app configuration loaded from `public/settings.json`. */
 export interface RVAppConfig {
@@ -32,8 +32,10 @@ export interface RVAppConfig {
   lockSettings?: boolean;
   /** Selectively lock individual tabs (settings gear still visible). */
   lockedTabs?: SettingsTabId[];
-/** Default model URL or filename (priority: URL param > last opened > defaultModel > first model). */
+  /** Default model URL or filename (priority: URL param > settings.json defaultModel > last opened > first model). */
   defaultModel?: string;
+  /** Base path for project-specific assets (docs, AASX, logos). Relative to BASE_URL. Ends with '/'. */
+  projectAssetsPath?: string;
 
   /** Global plugin IDs — lowest priority, overridden by modelname.json and GLB extras. */
   plugins?: string[];

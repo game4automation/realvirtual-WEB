@@ -21,7 +21,7 @@ import { loadMultiuserSettings } from './multiuser-settings-store';
 import type { MultiuserPluginAPI, WebXRPluginAPI } from '../types/plugin-types';
 
 // Settings tab components (extracted for maintainability)
-import { ModelTab, VisualTab, PhysicsTab, InterfacesTab, MultiuserTab, McpTab, DevToolsTab, TestsTab, GroupsTab } from './settings';
+import { ModelTab, MouseTab, VisualTab, PhysicsTab, InterfacesTab, MultiuserTab, McpTab, DevToolsTab, TestsTab, GroupsTab } from './settings';
 import { usePluginSettingsTabs, PluginSettingsTabContent } from './PluginSettingsTabs';
 
 export function TopBar() {
@@ -225,6 +225,14 @@ export function TopBar() {
             }}
           >
             {!isTabLocked('model') && <Tab label="Model" value={0} />}
+            {/* Plugin-registered settings-tab slots (value = 100..N), rendered right
+                after Model so project-level tabs (e.g. "Start View") appear prominently.
+                Rendered inline (not wrapped in a component) so MUI Tabs
+                enumerates them via React.Children.map. */}
+            {pluginSettingsTabs.map((entry, i) => (
+              <Tab key={entry.pluginId ?? i} label={entry.label ?? 'Tab'} value={100 + i} />
+            ))}
+            {!isTabLocked('mouse') && <Tab label="Mouse & Touch" value={9} />}
             {!isTabLocked('visual') && <Tab label="Visual" value={1} />}
             {!isTabLocked('physics') && <Tab label="Physics" value={2} />}
             {!isTabLocked('interfaces') && <Tab label="Interfaces" value={3} />}
@@ -233,17 +241,12 @@ export function TopBar() {
             {!isTabLocked('devtools') && <Tab label="Dev Tools" value={6} />}
             {!isTabLocked('tests') && <Tab label="Tests" value={7} />}
             {!isTabLocked('groups') && <Tab label="Groups" value={8} />}
-            {/* Plugin-registered settings-tab slots (value = 100..N).
-                Rendered inline (not wrapped in a component) so MUI Tabs
-                enumerates them via React.Children.map. */}
-            {pluginSettingsTabs.map((entry, i) => (
-              <Tab key={entry.pluginId ?? i} label={entry.label ?? 'Tab'} value={100 + i} />
-            ))}
           </Tabs>
 
           {/* Tab content - minHeight: 0 for correct flexbox scrolling */}
           <Box sx={{ flex: 1, overflow: 'auto', minHeight: 0, px: { xs: 1.5, sm: 2 }, py: 1.5 }}>
             {settingsTab === 0 && !isTabLocked('model') && <ModelTab />}
+            {settingsTab === 9 && !isTabLocked('mouse') && <MouseTab />}
             {settingsTab === 1 && !isTabLocked('visual') && <VisualTab />}
             {settingsTab === 2 && !isTabLocked('physics') && <PhysicsTab />}
             {settingsTab === 3 && !isTabLocked('interfaces') && <InterfacesTab />}
