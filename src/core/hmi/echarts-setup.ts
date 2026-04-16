@@ -17,6 +17,11 @@ import {
   TitleComponent,
   MarkLineComponent,
   MarkAreaComponent,
+  VisualMapComponent,
+  DataZoomComponent,
+  DataZoomInsideComponent,
+  DataZoomSliderComponent,
+  AxisPointerComponent,
 } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
 
@@ -30,6 +35,13 @@ echarts.use([
   TitleComponent,
   MarkLineComponent,
   MarkAreaComponent,
+  // Sensor history panel (plan-156) — visualMap for ISA-101 state colors,
+  // synchronized zoom + cursor for logic-analyzer multi-grid.
+  VisualMapComponent,
+  DataZoomComponent,
+  DataZoomInsideComponent,
+  DataZoomSliderComponent,
+  AxisPointerComponent,
   CanvasRenderer,
 ]);
 

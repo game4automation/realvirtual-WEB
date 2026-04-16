@@ -30,7 +30,17 @@ export const ALL_RV_STORAGE_KEYS = [
   'rv-layout-autosave',
   'rv-layout-grid-enabled',
   'rv-layout-grid-size',
-  'rv-sensor-view-state',
+] as const;
+
+/**
+ * sessionStorage keys used by the WebViewer.
+ * These are automatically cleared by the browser when the tab closes, so they
+ * are NOT included in ALL_RV_STORAGE_KEYS / clearAllRVStorage(). Listed here
+ * for documentation + grep-ability.
+ */
+export const ALL_RV_SESSION_STORAGE_KEYS = [
+  'rv-sensor-history',   // Floating SensorHistoryPanel layout (plan-156)
+  'rv-order-cart',       // Order Manager cart state
 ] as const;
 
 /**

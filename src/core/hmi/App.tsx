@@ -29,6 +29,7 @@ import './tooltip/TankTooltipContent';
 import './tooltip/PumpTooltipContent';
 import './tooltip/ProcessingUnitTooltipContent';
 import './tooltip/MetadataTooltipContent';
+import './tooltip/WebSensorTooltipContent';
 import './tooltip/PdfTooltipSection';
 // Generic PDF viewer bridge (self-registers as controller)
 import './pdf-viewer-store';
@@ -44,6 +45,9 @@ import './rv-metadata-field-renderer';
 import { ContextMenuLayer } from './ContextMenuLayer';
 import { SetPositionDialog } from './SetPositionDialog';
 
+// Generic Instruction Overlay (unified positional text/callout/banner primitive)
+import { InstructionLayer } from './InstructionLayer';
+
 // Annotation & Shared View overlays
 import { AnnotationPanel } from './AnnotationPanel';
 import { SharedViewBanner } from './SharedViewBanner';
@@ -52,8 +56,9 @@ import { AnnotationEditModal } from './AnnotationEditModal';
 // Order Manager panel
 import { OrderPanel } from '../../plugins/order-manager-plugin';
 
-// Web Sensor tool panel
-import { SensorToolPanel } from './SensorToolPanel';
+// Sensor History Panel (opens from pinned WebSensor tooltip "Show" button)
+import { SensorHistoryPanel } from './SensorHistoryPanel';
+
 
 
 /** Apply persisted visual settings to the viewer on startup (batch — single recompile). */
@@ -99,7 +104,9 @@ export function App() {
     <ThemeProvider theme={theme}>
       <HMIShell>
         <TooltipLayer />
+        <SensorHistoryPanel />
         <ContextMenuLayer />
+        <InstructionLayer />
         <SetPositionDialog />
         {hmiVisible && showKpiBar && <KpiBar />}
         {hmiVisible && showTopBar && <TopBar />}
@@ -111,7 +118,6 @@ export function App() {
         <SharedViewBanner />
         {hmiVisible && <AnnotationPanel />}
         {hmiVisible && <OrderPanel />}
-        {hmiVisible && <SensorToolPanel />}
         <AnnotationEditModal />
       </HMIShell>
       {tooltipRegistry.getControllers().map((ctrl, i) => {
