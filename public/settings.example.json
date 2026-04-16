@@ -7,9 +7,11 @@
   "defaultModel": "models/demo.glb",
 
   "visual": {
-    "shadows": true,
-    "shadowStrength": 0.5,
-    "lightIntensity": 1.0
+    "lightingMode": "default",
+    "orbitRotateSpeed": 1.0,
+    "orbitPanSpeed": 1.0,
+    "orbitZoomSpeed": 1.0,
+    "orbitDampingFactor": 0.08
   },
 
   "physics": {

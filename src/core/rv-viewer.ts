@@ -52,7 +52,8 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
-import type { ToneMappingType, ShadowQuality, ProjectionType } from './hmi/visual-settings-store';
+import type { ToneMappingType, ShadowQuality, ProjectionType, VisualSettings } from './hmi/visual-settings-store';
+import { loadVisualSettings } from './hmi/visual-settings-store';
 import { CameraManager, type ViewportOffset } from './rv-camera-manager';
 import { VisualSettingsManager } from './rv-visual-settings-manager';
 import Stats from 'stats-gl';
@@ -84,6 +85,7 @@ import { TankFillManager } from './engine/rv-tank-fill';
 import { PipeFlowManager } from './engine/rv-pipe-flow';
 import { PipelineSimulation } from './engine/rv-pipeline-sim';
 import type { GroupRegistry } from './engine/rv-group-registry';
+import { AutoFilterRegistry } from './engine/rv-auto-filter-registry';
 import { ISOLATE_FOCUS_LAYER } from './engine/rv-group-registry';
 import { registerFilterSubscriber, loadSearchSettings, isTypeEnabled } from './hmi/search-settings-store';
 import { getTypesWithCapability, getRegisteredCapabilities } from './engine/rv-component-registry';
@@ -194,6 +196,28 @@ export interface ViewerEvents {
   'layout-transform-update': { path: string; position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number } };
 }
 
+// ─── Navigation Helper ──────────────────────────────────────────────────
+
+/**
+ * Apply navigation-sensitivity settings (rotate/pan/zoom speed + damping) to an
+ * OrbitControls-compatible object. Extracted as a free function so it can be
+ * unit-tested against a plain mock object without WebGL/Three.js setup.
+ */
+export function applyNavigationSettingsToControls(
+  controls: {
+    rotateSpeed: number;
+    panSpeed: number;
+    zoomSpeed: number;
+    dampingFactor: number;
+  },
+  s: Pick<VisualSettings, 'orbitRotateSpeed' | 'orbitPanSpeed' | 'orbitZoomSpeed' | 'orbitDampingFactor'>,
+): void {
+  controls.rotateSpeed = s.orbitRotateSpeed;
+  controls.panSpeed = s.orbitPanSpeed;
+  controls.zoomSpeed = s.orbitZoomSpeed;
+  controls.dampingFactor = s.orbitDampingFactor;
+}
+
 // ─── RVViewer ───────────────────────────────────────────────────────────
 
 export class RVViewer extends EventEmitter<ViewerEvents> {
@@ -263,6 +287,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   pipelineSimulation: PipelineSimulation | null = null;
   playback: RVDrivesPlayback | null = null;
   groups: GroupRegistry | null = null;
+  autoFilters: AutoFilterRegistry | null = null;
 
   /**
    * @deprecated Use `viewer.raycastManager` instead. This getter returns
@@ -900,7 +925,6 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // --- Controls ---
     this.controls = new OrbitControls(this._activeCamera, renderer.domElement);
     this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.08;
     this.controls.target.set(0, 0.5, 0);
     this.controls.mouseButtons = {
       LEFT: -1 as MOUSE,
@@ -911,6 +935,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       ONE: TOUCH.ROTATE,
       TWO: TOUCH.DOLLY_PAN,
     };
+    // Apply navigation-sensitivity settings (rotate/pan/zoom/damping) from store.
+    const navSettings = loadVisualSettings();
+    applyNavigationSettingsToControls(this.controls, navSettings);
     this.controls.update();
 
     // Track orbit/pan/pinch gesture state to suppress selection & hover highlighting
@@ -922,8 +949,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.controls.addEventListener('end', () => {
       this._isOrbiting = false;
       if (this.raycastManager) this.raycastManager.setEnabled(true);
-      // Keep rendering for 60 frames (1s) after last user input for damping decay
-      this._dampingFramesRemaining = 60;
+      // Keep rendering long enough for damping decay to fall below 1% velocity.
+      // Budget adapts to current dampingFactor; capped at 300 frames (~5 s @ 60 fps).
+      this._dampingFramesRemaining = Math.min(
+        Math.ceil(Math.log(0.01) / Math.log(1 - this.controls.dampingFactor)),
+        300,
+      );
     });
     // Mark render dirty on any controls change (orbit, pan, zoom). Shadow
     // dirty is more nuanced: in the legacy tight-fit mode the shadow camera
@@ -1279,6 +1310,16 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.logicEngine = result.logicEngine;
     this.registry = result.registry;
     this.groups = result.groups;
+    if (this.groups && this.raycastManager) {
+      this.groups.raycastManager = this.raycastManager;
+    }
+
+    // Build auto-filter groups from component capabilities
+    this.autoFilters = new AutoFilterRegistry();
+    this.autoFilters.build(result.registry);
+    if (this.raycastManager) {
+      this.autoFilters.raycastManager = this.raycastManager;
+    }
 
     // Selection manager — init after registry is available
     this.selectionManager.init(this);
@@ -1564,6 +1605,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this.groups.clear();
       this.groups = null;
     }
+    if (this.autoFilters) {
+      this.autoFilters.clear();
+      this.autoFilters = null;
+    }
     // Reset dirty flags for next model load
     this._shadowsDirty = true;
     this._renderDirty = true;
@@ -1578,6 +1623,25 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   /** Override the stored model URL (e.g. to replace blob: URL with original for display). */
   set currentModelUrl(url: string | null) {
     this._currentModelUrl = url;
+  }
+
+  /** Explicit override for projectAssetsPath (set by ModelPluginManager in dev mode). */
+  private _projectAssetsPath: string | null = null;
+
+  /** Base URL for project-specific assets (docs, AASX, logos, branding). Ends with '/'.
+   *  Priority: explicit override > settings.json `projectAssetsPath` > BASE_URL. */
+  get projectAssetsPath(): string {
+    if (this._projectAssetsPath) return this._projectAssetsPath;
+    const cfg = getAppConfig().projectAssetsPath;
+    if (!cfg) return import.meta.env.BASE_URL;
+    // Relative paths resolve against BASE_URL
+    if (!cfg.startsWith('http') && !cfg.startsWith('/'))
+      return `${import.meta.env.BASE_URL}${cfg}`;
+    return cfg;
+  }
+
+  set projectAssetsPath(path: string | null) {
+    this._projectAssetsPath = path;
   }
 
   /**
@@ -1930,6 +1994,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // 10. Ground / Floor
     this.groundEnabled = settings.groundEnabled ?? true;
     this.groundBrightness = settings.groundBrightness ?? 1.0;
+
+    // 11. Navigation sensitivity (OrbitControls)
+    if (this.controls) {
+      applyNavigationSettingsToControls(this.controls, settings);
+    }
   }
 
   // ─── Individual Rendering Settings ──────────────────────────────────
@@ -2275,6 +2344,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // regenerated (shadowMap.render only runs inside renderer.render).
     if (this._shadowsDirty) this._renderDirty = true;
 
+    // XR sessions MUST render every frame — the compositor needs a submitted
+    // frame each animation tick or the passthrough/scene will freeze.
+    const glXR = (this.renderer as unknown as WebGLRenderer).xr;
+    if (glXR?.isPresenting) this._renderDirty = true;
+
     // Render-on-demand: skip expensive GPU render when scene is static
     if (this._renderDirty) {
       // Shadow dirty flag handling lives INSIDE the render block so a
@@ -2297,7 +2371,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       const glForClearState = this.renderer as unknown as WebGLRenderer;
       const prevAutoClear = glForClearState.autoClear;
       try {
-        if (this.groups?.isIsolateActive) {
+        if (this.groups?.isIsolateActive || this.autoFilters?.isIsolateActive) {
           this._renderIsolateMode();
         } else if (this._useComposer) {
           // Update camera references (may have switched persp/ortho)

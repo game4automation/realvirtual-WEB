@@ -10,6 +10,7 @@ import {
   loadModelSettingsConfig,
 } from '../src/core/hmi/rv-settings-bundle';
 import type { RVSettingsBundle } from '../src/core/hmi/rv-settings-bundle';
+import { loadVisualSettings, saveVisualSettings } from '../src/core/hmi/visual-settings-store';
 
 function createTestBundle(settings: RVSettingsBundle['settings']): RVSettingsBundle {
   return {
@@ -97,6 +98,40 @@ describe('applySettingsBundle', () => {
     applySettingsBundle(bundle);
     const raw = JSON.parse(localStorage.getItem('rv-physics-settings') ?? '{}');
     expect(raw.enabled).toBe(true);
+  });
+
+  // ── Navigation Sensitivity (Plan 148) ─────────────────────────────────
+  test('includes navigation settings in export bundle', () => {
+    const s = loadVisualSettings();
+    s.orbitRotateSpeed = 2.0;
+    s.orbitPanSpeed = 0.5;
+    s.orbitZoomSpeed = 1.7;
+    s.orbitDampingFactor = 0.15;
+    saveVisualSettings(s);
+
+    const bundle = collectSettingsBundle('models/demo.glb');
+    const v = bundle.settings.visual as Record<string, unknown>;
+    expect(v.orbitRotateSpeed).toBe(2.0);
+    expect(v.orbitPanSpeed).toBe(0.5);
+    expect(v.orbitZoomSpeed).toBe(1.7);
+    expect(v.orbitDampingFactor).toBe(0.15);
+  });
+
+  test('applies navigation settings from imported bundle to localStorage', () => {
+    const bundle = createTestBundle({
+      visual: {
+        orbitRotateSpeed: 2.5,
+        orbitPanSpeed: 0.5,
+        orbitZoomSpeed: 1.8,
+        orbitDampingFactor: 0.20,
+      },
+    });
+    applySettingsBundle(bundle);
+    const loaded = loadVisualSettings();
+    expect(loaded.orbitRotateSpeed).toBe(2.5);
+    expect(loaded.orbitPanSpeed).toBe(0.5);
+    expect(loaded.orbitZoomSpeed).toBe(1.8);
+    expect(loaded.orbitDampingFactor).toBe(0.20);
   });
 });
 

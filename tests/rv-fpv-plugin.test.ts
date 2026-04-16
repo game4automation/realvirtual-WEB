@@ -52,6 +52,10 @@ vi.mock('../src/core/hmi/visual-settings-store', () => ({
     shadowMapSize: 1024,
     shadowRadius: 2,
     maxDpr: 1.5,
+    orbitRotateSpeed: 1.0,
+    orbitPanSpeed: 1.0,
+    orbitZoomSpeed: 1.0,
+    orbitDampingFactor: 0.08,
   }),
 }));
 

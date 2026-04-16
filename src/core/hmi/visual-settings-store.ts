@@ -3,6 +3,7 @@
 
 /** Persists visual settings and camera bookmarks to localStorage. */
 
+import { useSyncExternalStore } from 'react';
 import { getAppConfig, isSettingsLocked } from '../rv-app-config';
 
 const STORAGE_KEY = 'rv-visual-settings';
@@ -77,6 +78,30 @@ export interface VisualSettings {
   groundEnabled: boolean;
   /** Floor brightness multiplier (0 = black, 1 = default, 2 = double). */
   groundBrightness: number;
+  /** Zoom factor for the React HMI overlay (0.5–2.0, default 1.0). */
+  uiZoom: number;
+  /** OrbitControls rotate speed multiplier (0.1–3.0, default 1.0). */
+  orbitRotateSpeed: number;
+  /** OrbitControls pan speed multiplier (0.1–3.0, default 1.0). */
+  orbitPanSpeed: number;
+  /** OrbitControls zoom speed for mouse wheel, trackpad, and touch pinch (0.1–3.0, default 1.0). */
+  orbitZoomSpeed: number;
+  /** OrbitControls damping factor — inertia feel (0.01–0.5, default 0.08). */
+  orbitDampingFactor: number;
+}
+
+/** Single source of truth for OrbitControls navigation-sensitivity ranges (UI sliders + clamping). */
+export const NAVIGATION_RANGES = {
+  rotateSpeed:   { min: 0.1,  max: 3.0, step: 0.05 },
+  panSpeed:      { min: 0.1,  max: 3.0, step: 0.05 },
+  zoomSpeed:     { min: 0.1,  max: 3.0, step: 0.1  },
+  dampingFactor: { min: 0.01, max: 0.5, step: 0.01 },
+} as const;
+
+function clampNavNumber(raw: unknown, range: { min: number; max: number }, fallback: number): number {
+  if (typeof raw !== 'number' || Number.isNaN(raw)) return fallback;
+  if (raw < range.min || raw > range.max) return fallback;
+  return raw;
 }
 
 const MODE_DEFAULTS: Record<LightingMode, LightingModeSettings> = {
@@ -120,6 +145,11 @@ const DEFAULTS: VisualSettings = {
   bloomRadius: 0.4,
   groundEnabled: true,
   groundBrightness: 1.0,
+  uiZoom: 1.0,
+  orbitRotateSpeed: 1.0,
+  orbitPanSpeed: 1.0,
+  orbitZoomSpeed: 1.0,
+  orbitDampingFactor: 0.08,
 };
 
 function migrateToneMapping(raw: unknown, mode: LightingMode): ToneMappingType {
@@ -183,6 +213,27 @@ export function loadVisualSettings(): VisualSettings {
     bloomRadius: fromStorage.bloomRadius,
     groundEnabled: fromStorage.groundEnabled,
     groundBrightness: fromStorage.groundBrightness,
+    uiZoom: fromStorage.uiZoom,
+    orbitRotateSpeed: clampNavNumber(
+      override.orbitRotateSpeed,
+      NAVIGATION_RANGES.rotateSpeed,
+      fromStorage.orbitRotateSpeed,
+    ),
+    orbitPanSpeed: clampNavNumber(
+      override.orbitPanSpeed,
+      NAVIGATION_RANGES.panSpeed,
+      fromStorage.orbitPanSpeed,
+    ),
+    orbitZoomSpeed: clampNavNumber(
+      override.orbitZoomSpeed,
+      NAVIGATION_RANGES.zoomSpeed,
+      fromStorage.orbitZoomSpeed,
+    ),
+    orbitDampingFactor: clampNavNumber(
+      override.orbitDampingFactor,
+      NAVIGATION_RANGES.dampingFactor,
+      fromStorage.orbitDampingFactor,
+    ),
   };
 }
 
@@ -244,6 +295,29 @@ function loadFromLocalStorage(): VisualSettings {
     const groundBrightnessRaw = (parsed as Record<string, unknown>).groundBrightness;
     const groundBrightness = (typeof groundBrightnessRaw === 'number' && groundBrightnessRaw >= 0 && groundBrightnessRaw <= 2)
       ? groundBrightnessRaw : DEFAULTS.groundBrightness;
+    const uiZoomRaw = (parsed as Record<string, unknown>).uiZoom;
+    const uiZoom = (typeof uiZoomRaw === 'number' && uiZoomRaw >= 0.5 && uiZoomRaw <= 2)
+      ? uiZoomRaw : DEFAULTS.uiZoom;
+    const orbitRotateSpeed = clampNavNumber(
+      (parsed as Record<string, unknown>).orbitRotateSpeed,
+      NAVIGATION_RANGES.rotateSpeed,
+      DEFAULTS.orbitRotateSpeed,
+    );
+    const orbitPanSpeed = clampNavNumber(
+      (parsed as Record<string, unknown>).orbitPanSpeed,
+      NAVIGATION_RANGES.panSpeed,
+      DEFAULTS.orbitPanSpeed,
+    );
+    const orbitZoomSpeed = clampNavNumber(
+      (parsed as Record<string, unknown>).orbitZoomSpeed,
+      NAVIGATION_RANGES.zoomSpeed,
+      DEFAULTS.orbitZoomSpeed,
+    );
+    const orbitDampingFactor = clampNavNumber(
+      (parsed as Record<string, unknown>).orbitDampingFactor,
+      NAVIGATION_RANGES.dampingFactor,
+      DEFAULTS.orbitDampingFactor,
+    );
     return {
       lightingMode: mode,
       modeSettings,
@@ -267,6 +341,11 @@ function loadFromLocalStorage(): VisualSettings {
       bloomRadius,
       groundEnabled,
       groundBrightness,
+      uiZoom,
+      orbitRotateSpeed,
+      orbitPanSpeed,
+      orbitZoomSpeed,
+      orbitDampingFactor,
     };
   } catch {
     return { ...DEFAULTS, modeSettings: { simple: { ...MODE_DEFAULTS.simple }, default: { ...MODE_DEFAULTS.default } }, cameras: [...DEFAULTS.cameras] };
@@ -278,4 +357,35 @@ export function saveVisualSettings(settings: VisualSettings): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
   } catch { /* quota exceeded — silently ignore */ }
+}
+
+// ─── Reactive UI Zoom Store ────────────────────────────────────────────
+// Tiny reactive store so HMIShell can subscribe to zoom changes in real time.
+
+let _uiZoom: number = loadVisualSettings().uiZoom;
+const _zoomListeners = new Set<() => void>();
+
+function notifyZoom(): void { for (const l of _zoomListeners) l(); }
+
+/** Update the live UI zoom factor (also persists to visual settings). */
+export function setUIZoom(zoom: number): void {
+  _uiZoom = zoom;
+  notifyZoom();
+}
+
+/** Read the current UI zoom value (non-reactive). */
+export function getUIZoom(): number { return _uiZoom; }
+
+/** Subscribe to zoom changes. Returns unsubscribe function. */
+export function subscribeUIZoom(cb: () => void): () => void {
+  _zoomListeners.add(cb);
+  return () => { _zoomListeners.delete(cb); };
+}
+
+/** React hook: returns the current UI zoom factor (reactive). */
+export function useUIZoom(): number {
+  return useSyncExternalStore(
+    (cb) => { _zoomListeners.add(cb); return () => { _zoomListeners.delete(cb); }; },
+    () => _uiZoom,
+  );
 }

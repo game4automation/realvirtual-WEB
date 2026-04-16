@@ -175,4 +175,28 @@ describe('rv-app-config', () => {
     expect(result.modeSettings.default.shadowEnabled).toBe(false);
     expect(result.modeSettings.default.lightIntensity).toBe(1.5);
   });
+
+  // ── Navigation Sensitivity Overrides (Plan 148) ─────────────────────
+  it('overrides navigation settings from settings.json (visual.orbit*)', async () => {
+    const { loadVisualSettings } = await import('../src/core/hmi/visual-settings-store');
+    setAppConfig({ visual: { orbitRotateSpeed: 2.0, orbitDampingFactor: 0.15 } });
+    const s = loadVisualSettings();
+    expect(s.orbitRotateSpeed).toBe(2.0);
+    expect(s.orbitDampingFactor).toBe(0.15);
+  });
+
+  it('ignores string values in settings.json for nav fields (typeof guard)', async () => {
+    const { loadVisualSettings } = await import('../src/core/hmi/visual-settings-store');
+    // Cast forces a broken JSON-like payload that TS would normally reject.
+    setAppConfig({ visual: { orbitRotateSpeed: '2.0' as unknown as number } });
+    const s = loadVisualSettings();
+    expect(s.orbitRotateSpeed).toBe(1.0); // falls back to DEFAULT
+  });
+
+  it('ignores out-of-range values in settings.json for nav fields', async () => {
+    const { loadVisualSettings } = await import('../src/core/hmi/visual-settings-store');
+    setAppConfig({ visual: { orbitPanSpeed: 99 } });
+    const s = loadVisualSettings();
+    expect(s.orbitPanSpeed).toBe(1.0); // clamped to DEFAULT
+  });
 });
