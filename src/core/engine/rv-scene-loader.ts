@@ -17,7 +17,10 @@ import './rv-sink';
 import './rv-grip';
 import './rv-grip-target';
 import './rv-connect-signal';
+import './rv-safety-door';
+import './rv-web-sensor';
 import { applySchema, resolveComponentRefs, getRegisteredFactories, registerCapabilities, type RVComponent, type ComponentContext, type ComponentSchema } from './rv-component-registry';
+import type { GizmoOverlayManager } from './rv-gizmo-manager';
 import { RVTransportManager } from './rv-transport-manager';
 import { SignalStore } from './rv-signal-store';
 import { RVDrivesPlayback, parseCompactRecording, parseScriptableObjectRecording, type CompactRecording } from './rv-drives-playback';
@@ -89,7 +92,13 @@ registerCapabilities('Metadata', {
 // Note: AASLink capabilities are registered by aas-link-plugin.tsx (plugin side-effect).
 // Model plugins load BEFORE loadGLB() so capabilities are available for BVH construction.
 registerCapabilities('RuntimeMetadata', {
+  hoverable: true,
+  tooltipType: 'metadata',
   badgeColor: '#ffb74d',
+  filterLabel: 'Metadata',
+  hoverEnabledByDefault: true,
+  hoverPriority: 8,
+  pinPriority: 3,
 });
 
 // Recorder types (visible in inspector but not hoverable)
@@ -194,6 +203,8 @@ const SIGNAL_TYPES = ['PLCOutputBool', 'PLCInputBool', 'PLCOutputFloat', 'PLCInp
 export interface LoadGLBOptions {
   /** When true, apply WebGPU-specific geometry fixes (e.g., Uint16 index conversion). Default: false */
   isWebGPU?: boolean;
+  /** Optional gizmo manager — passed into ComponentContext so components (e.g. WebSensor) can create overlays. */
+  gizmoManager?: GizmoOverlayManager;
 }
 
 /** Pending component awaiting resolveComponentRefs + init() in Step 2 */
@@ -429,11 +440,11 @@ export function traverseAndRegister(
         const status = sigData['Status'] as { Value?: boolean | number } | undefined;
         const signalName = (sigData['Name'] as string) || renamedNodes.get(node) || node.name;
         if (sigType.includes('Bool')) {
-          signalStore.register(signalName, path, status?.Value as boolean ?? false);
+          signalStore.register(signalName, path, status?.Value as boolean ?? false, sigType);
         } else if (sigType.includes('Float')) {
-          signalStore.register(signalName, path, status?.Value as number ?? 0);
+          signalStore.register(signalName, path, status?.Value as number ?? 0, sigType);
         } else if (sigType.includes('Int')) {
-          signalStore.register(signalName, path, status?.Value as number ?? 0);
+          signalStore.register(signalName, path, status?.Value as number ?? 0, sigType);
         }
         registry.register(sigType, path, { address: path, signalName });
       }
@@ -720,8 +731,9 @@ export function initializeComponents(
   scene: Scene,
   transportManager: RVTransportManager,
   root: Object3D,
+  gizmoManager?: GizmoOverlayManager,
 ): void {
-  const context: ComponentContext = { registry, signalStore, scene, transportManager, root };
+  const context: ComponentContext = { registry, signalStore, scene, transportManager, root, gizmoManager };
   for (const { component } of pending) {
     resolveComponentRefs(component as unknown as Record<string, unknown>, registry);
     component.init(context);
@@ -1037,7 +1049,7 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
   registerNodeAliases(renamedNodes, registry, signalStore);
 
   // Phase 7: Initialize components (Step 2 "Start")
-  initializeComponents(traverseResult.pending, registry, signalStore, scene, manager, root);
+  initializeComponents(traverseResult.pending, registry, signalStore, scene, manager, root, options?.gizmoManager);
 
   // Phase 8: Build groups
   const groups = buildGroups(traverseResult.groupNodes, registry);
@@ -1222,9 +1234,9 @@ export function processExtras(
         const status = sigData['Status'] as { Value?: boolean | number } | undefined;
         const signalName = (sigData['Name'] as string) || node.name;
         if (sigType.includes('Bool')) {
-          signalStore.register(signalName, path, status?.Value as boolean ?? false);
+          signalStore.register(signalName, path, status?.Value as boolean ?? false, sigType);
         } else if (sigType.includes('Float') || sigType.includes('Int')) {
-          signalStore.register(signalName, path, status?.Value as number ?? 0);
+          signalStore.register(signalName, path, status?.Value as number ?? 0, sigType);
         }
         registry.register(sigType, path, { address: path, signalName });
         signalsRegistered++;
@@ -1286,6 +1298,10 @@ export function processExtras(
     resolveComponentRefs(component as unknown as Record<string, unknown>, registry);
     component.init(context);
   }
+  // NOTE: gizmoManager omitted here — this second loader pass
+  // (dynamic add path) currently does not thread the gizmoManager
+  // through. Components needing overlays should use the main
+  // loadGLB() path which passes it via initializeComponents().
 
   // Rebuild signal index for O(1) lookup of newly added signals
   signalStore.buildIndex();

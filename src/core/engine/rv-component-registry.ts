@@ -19,6 +19,9 @@ import type { NodeRegistry, ComponentRef } from './rv-node-registry';
 import type { SignalStore } from './rv-signal-store';
 import type { RVTransportManager } from './rv-transport-manager';
 import type { AABB } from './rv-aabb';
+import type { GizmoOverlayManager } from './rv-gizmo-manager';
+import type { ComponentEventDispatcher } from './rv-component-event-dispatcher';
+import type { ObjectHoverData } from './rv-raycast-manager';
 
 // ─── Schema Types ────────────────────────────────────────────────
 
@@ -45,6 +48,12 @@ export interface ComponentContext {
   transportManager: RVTransportManager;
   /** Root of the loaded GLB scene (needed by Source for spawnParent) */
   root: Object3D;
+  /** Optional — available when RVViewer instantiates one. Components that need
+   *  overlays (e.g. WebSensor) must null-check before use. */
+  gizmoManager?: GizmoOverlayManager;
+  /** Optional — available when RVViewer instantiates one. Components don't
+   *  need to touch this directly; they just implement onHover/onClick/onSelect. */
+  componentEventDispatcher?: ComponentEventDispatcher;
 }
 
 /** Interface all auto-mapped components implement */
@@ -58,6 +67,15 @@ export interface RVComponent {
   /** Called when ownership changes (e.g. multiuser connect/disconnect).
    *  Components self-manage their multiuser behavior in this callback. */
   onOwnershipChanged?(isOwner: boolean): void;
+
+  // ── Optional component-level event callbacks (dispatched by
+  //    ComponentEventDispatcher). Components opt in by implementing any of these.
+  /** Called when this component's node is hovered (true) or un-hovered (false). */
+  onHover?(hovered: boolean, event?: ObjectHoverData): void;
+  /** Called when this component's node is clicked. Payload from 'object-clicked'. */
+  onClick?(event: { path: string; node: Object3D }): void;
+  /** Called when this component's node enters (true) or leaves (false) the selection. */
+  onSelect?(selected: boolean): void;
 }
 
 // ─── Schema Application ─────────────────────────────────────────
@@ -350,7 +368,20 @@ const registeredFactories = new Map<string, ComponentFactory>();
  * Also registers the schema for CONSUMED field derivation (backward compat).
  */
 export function registerComponent(factory: ComponentFactory): void {
-  registeredFactories.set(factory.type, factory);
+  // Wrap afterCreate so _rvComponentInstance is always set — enables
+  // ComponentEventDispatcher parent-walk lookup regardless of whether the
+  // factory defined its own afterCreate hook.
+  const originalAfterCreate = factory.afterCreate;
+  const wrappedFactory: ComponentFactory = {
+    ...factory,
+    afterCreate(instance: RVComponent, node: Object3D): void {
+      if (originalAfterCreate) originalAfterCreate(instance, node);
+      if (!node.userData._rvComponentInstance) {
+        node.userData._rvComponentInstance = instance;
+      }
+    },
+  };
+  registeredFactories.set(factory.type, wrappedFactory);
   registeredSchemas.set(factory.type, factory.schema);
   if (factory.capabilities) {
     registerCapabilities(factory.type, factory.capabilities);

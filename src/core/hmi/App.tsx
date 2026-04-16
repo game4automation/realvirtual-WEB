@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { ThemeProvider } from '@mui/material/styles';
 import { useViewer } from '../../hooks/use-viewer';
 
 // Core HMI components
-import { rvDarkTheme } from './theme';
+import { rvDarkTheme, createBrandedTheme } from './theme';
+import { useCustomBranding } from './branding-store';
 import { HMIShell, SlotRenderer } from './HMIShell';
 import { TopBar } from './TopBar';
 import { KpiBar } from './KpiBar';
@@ -31,6 +32,8 @@ import './tooltip/MetadataTooltipContent';
 import './tooltip/PdfTooltipSection';
 // Generic PDF viewer bridge (self-registers as controller)
 import './pdf-viewer-store';
+// Generic info overlay bridge (self-registers as controller)
+import './info-overlay-store';
 // Generic controller replaces DriveTooltipController, PipelineTooltipController, MetadataTooltipController
 import './tooltip/GenericTooltipController';
 import { tooltipStore } from './tooltip/tooltip-store';
@@ -48,6 +51,9 @@ import { AnnotationEditModal } from './AnnotationEditModal';
 
 // Order Manager panel
 import { OrderPanel } from '../../plugins/order-manager-plugin';
+
+// Web Sensor tool panel
+import { SensorToolPanel } from './SensorToolPanel';
 
 
 /** Apply persisted visual settings to the viewer on startup (batch — single recompile). */
@@ -71,6 +77,15 @@ export function App() {
   useApplyPersistedSettings();
   useTooltipStoreConnection();
   const hmiVisible = useHmiVisible();
+  const branding = useCustomBranding();
+
+  // Build theme: apply custom branding colors if set
+  const theme = useMemo(
+    () => branding?.primaryColor || branding?.secondaryColor
+      ? createBrandedTheme(branding.primaryColor, branding.secondaryColor)
+      : rvDarkTheme,
+    [branding?.primaryColor, branding?.secondaryColor],
+  );
 
   // Context-aware visibility: each area declares its default hiddenIn rule.
   // These defaults can be overridden by settings.json `ui.visibilityOverrides`.
@@ -81,7 +96,7 @@ export function App() {
   const showViewsSlot = useUIVisible('views-slot', { hiddenIn: ['fpv', 'planner', 'xr'] });
 
   return (
-    <ThemeProvider theme={rvDarkTheme}>
+    <ThemeProvider theme={theme}>
       <HMIShell>
         <TooltipLayer />
         <ContextMenuLayer />
@@ -96,6 +111,7 @@ export function App() {
         <SharedViewBanner />
         {hmiVisible && <AnnotationPanel />}
         {hmiVisible && <OrderPanel />}
+        {hmiVisible && <SensorToolPanel />}
         <AnnotationEditModal />
       </HMIShell>
       {tooltipRegistry.getControllers().map((ctrl, i) => {

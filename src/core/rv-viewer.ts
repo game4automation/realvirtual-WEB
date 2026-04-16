@@ -84,9 +84,11 @@ import type { NodeRegistry, NodeSearchResult } from './engine/rv-node-registry';
 import { TankFillManager } from './engine/rv-tank-fill';
 import { PipeFlowManager } from './engine/rv-pipe-flow';
 import { PipelineSimulation } from './engine/rv-pipeline-sim';
+import { GizmoOverlayManager } from './engine/rv-gizmo-manager';
+import { ComponentEventDispatcher } from './engine/rv-component-event-dispatcher';
 import type { GroupRegistry } from './engine/rv-group-registry';
 import { AutoFilterRegistry } from './engine/rv-auto-filter-registry';
-import { ISOLATE_FOCUS_LAYER } from './engine/rv-group-registry';
+import { ISOLATE_FOCUS_LAYER, HIGHLIGHT_OVERLAY_LAYER } from './engine/rv-group-registry';
 import { registerFilterSubscriber, loadSearchSettings, isTypeEnabled } from './hmi/search-settings-store';
 import { getTypesWithCapability, getRegisteredCapabilities } from './engine/rv-component-registry';
 import type { RVViewerPlugin } from './rv-plugin';
@@ -100,6 +102,10 @@ import type { SelectionSnapshot } from './engine/rv-selection-manager';
 import { isMobileDevice } from '../hooks/use-mobile-layout';
 import { resetDynamicContexts } from './hmi/ui-context-store';
 import { getAppConfig } from './rv-app-config';
+
+// Base scene-background grayscale (0x9a9a9a / 255 ≈ 0.604). Multiplied by
+// backgroundBrightness so brightness=1 reproduces the original default color.
+const BG_BASE_SCALAR = 0x9a / 255;
 
 // ─── Plugin Error Isolation ──────────────────────────────────────────────
 
@@ -194,6 +200,20 @@ export interface ViewerEvents {
 
   // ── Layout events ──
   'layout-transform-update': { path: string; position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number } };
+
+  // ── Simulation pause events ──
+  /** Fired when the overall simulation pause state transitions (idle ↔ paused).
+   *  Plugins can subscribe to stop/resume external PLC I/O, freeze animations,
+   *  disable cursor interactions, etc. Not fired when reasons are added/removed
+   *  while already paused — only on the idle/paused transition. */
+  'simulation-pause-changed': {
+    /** New overall pause state. */
+    paused: boolean;
+    /** All currently active pause reasons (snapshot). */
+    reasons: readonly string[];
+    /** The specific reason that triggered this transition. */
+    reason: string;
+  };
 }
 
 // ─── Navigation Helper ──────────────────────────────────────────────────
@@ -248,6 +268,14 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
   // --- Highlight system (always available) ---
   readonly highlighter: RVHighlightManager;
+
+  // --- Generic gizmo overlay system (always available) ---
+  /** Central 3D-overlay/gizmo system. Used by WebSensor and other components. */
+  readonly gizmoManager: GizmoOverlayManager;
+
+  // --- Component event dispatcher (routes viewer events → per-component callbacks) ---
+  /** Dispatches object-hover/clicked/selection-changed to RVComponent.onHover/onClick/onSelect. */
+  componentEventDispatcher: ComponentEventDispatcher | null = null;
 
   // --- Connection State ---
   /** Global connection state — controls which subsystems run based on their ActiveOnly mode. */
@@ -677,6 +705,44 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._renderDirty = true;
   }
 
+  /**
+   * Scene background brightness multiplier (0 = black, 1 = default gray, 2 = white).
+   * Scales the base 0x9a9a9a gray uniformly so brightness=1 reproduces the original look.
+   */
+  get backgroundBrightness(): number {
+    return this._backgroundBrightness;
+  }
+  set backgroundBrightness(v: number) {
+    const clamped = Math.max(0, Math.min(2, v));
+    if (this._backgroundBrightness === clamped) return;
+    this._backgroundBrightness = clamped;
+    const bg = this.scene.background;
+    if (bg && (bg as Color).isColor) {
+      (bg as Color).setScalar(Math.min(1, BG_BASE_SCALAR * clamped));
+      this._renderDirty = true;
+    }
+  }
+
+  /**
+   * Floor checker pattern contrast multiplier (0 = flat midgray, 1 = default, 2 = doubled spread).
+   * Regenerates the checker CanvasTexture in place.
+   */
+  get checkerContrast(): number {
+    return this._checkerContrast;
+  }
+  set checkerContrast(v: number) {
+    const clamped = Math.max(0, Math.min(2, v));
+    if (this._checkerContrast === clamped) return;
+    this._checkerContrast = clamped;
+    if (!this._groundMesh || !this._checkerCanvas) return;
+    this.drawCheckerPattern(this._checkerCanvas, clamped);
+    const mat = this._groundMesh.material as MeshStandardMaterial;
+    if (mat.map) {
+      (mat.map as CanvasTexture).needsUpdate = true;
+      this._renderDirty = true;
+    }
+  }
+
 
   /**
    * Cancel any in-progress camera animation immediately.
@@ -719,6 +785,45 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._renderDirty = true;
     return true;
   }
+
+  // ─── Simulation Pause ────────────────────────────────────────────
+
+  /**
+   * Pause or resume the fixed-timestep simulation with a named reason.
+   *
+   * Multiple reasons can hold a pause simultaneously (AR placement, layout edit,
+   * shared-view session, user-initiated pause button, layout-planner drag, etc.).
+   * The simulation resumes only after every reason has released its hold.
+   *
+   * Rendering is unaffected — onRender still fires each frame, so the 3D view,
+   * highlights, gizmos, and camera passthrough stay live. Only `onFixedUpdate`
+   * is skipped, which freezes drives, transport surfaces, sensors, logic steps,
+   * physics, sources, and sinks.
+   *
+   * Plugins can subscribe to `'simulation-pause-changed'` to react to transitions
+   * (e.g. disconnect WebSocket commands, stop signal polling, dim the scene).
+   *
+   * @param reason  Short, stable identifier per caller — e.g. `'ar-placement'`,
+   *                `'layout-edit'`, `'user'`, `'shared-view'`. Same reason can be
+   *                set/cleared multiple times; only the set state matters.
+   * @param paused  `true` to request pause, `false` to release this reason.
+   */
+  setSimulationPaused(reason: string, paused: boolean): void {
+    const changed = this.loop.setPaused(reason, paused);
+    if (changed) {
+      this.emit('simulation-pause-changed', {
+        paused: this.loop.isPaused,
+        reasons: this.loop.pauseReasons,
+        reason,
+      });
+    }
+  }
+
+  /** True if any reason is currently holding the simulation paused. */
+  get isSimulationPaused(): boolean { return this.loop.isPaused; }
+
+  /** Snapshot of active pause reasons (for diagnostics / UI badges). */
+  get simulationPauseReasons(): readonly string[] { return this.loop.pauseReasons; }
 
   // ─── Unified Node Filter ──────────────────────────────────────────
 
@@ -851,8 +956,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
     // --- Scene ---
     this.scene = new Scene();
-    this.scene.background = new Color(0x9a9a9a);
+    // Default background = 0x9a9a9a gray (scalar 0.604) scaled by backgroundBrightness.
+    this.scene.background = new Color().setScalar(BG_BASE_SCALAR * this._backgroundBrightness);
     this.highlighter = new RVHighlightManager(this.scene);
+    this.gizmoManager = new GizmoOverlayManager(this.scene);
 
     // --- Camera ---
     const w = container.clientWidth || window.innerWidth;
@@ -861,6 +968,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.perspCamera = new PerspectiveCamera(45, aspect, 0.01, 1000);
     this.perspCamera.position.set(3, 2.5, 4);
     this.perspCamera.lookAt(0, 0.5, 0);
+    // Enable highlight-overlay layer so hover/select wireframes render in
+    // normal mode. The 3-pass isolate renderer manages this layer per-pass.
+    this.perspCamera.layers.enable(HIGHLIGHT_OVERLAY_LAYER);
 
     const frustumHalf = 5;
     this.orthoCamera = new OrthographicCamera(
@@ -868,6 +978,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     );
     this.orthoCamera.position.set(3, 2.5, 4);
     this.orthoCamera.lookAt(0, 0.5, 0);
+    this.orthoCamera.layers.enable(HIGHLIGHT_OVERLAY_LAYER);
 
     this._activeCamera = this.perspCamera;
 
@@ -1040,9 +1151,18 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
   // ─── Post-Processing Pipeline (WebGL only) ─────────────────────────
 
-  /** Whether any post-processing effect is active (determines composer vs direct render). */
+  /** Whether any post-processing effect is active (determines composer vs direct render).
+   *
+   * Always false while a WebXR session is presenting — the EffectComposer renders to its
+   * own offscreen render targets, but WebXR requires the scene be rendered directly into
+   * the XR session's framebuffer each frame. Routing through composer in XR shows only
+   * the camera passthrough (no 3D content). In XR we always go through the direct path.
+   */
   private get _useComposer(): boolean {
-    return !this.isWebGPU && !!this._composer && (this._ssaoEnabled || this._bloomEnabled);
+    if (this.isWebGPU) return false;
+    const xr = (this.renderer as unknown as WebGLRenderer).xr;
+    if (xr?.isPresenting) return false;
+    return !!this._composer && (this._ssaoEnabled || this._bloomEnabled);
   }
 
   /** Internal buffers for GTAO and Bloom run at half resolution for performance. */
@@ -1117,7 +1237,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     const mat = new MeshBasicMaterial({
       color: 0xffffff, // refreshed from scene background each frame in _renderIsolateMode
       transparent: true,
-      opacity: 0.8,
+      opacity: 0.9,
       depthTest: false,
       depthWrite: false,
       side: DoubleSide,
@@ -1142,6 +1262,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    */
   private _renderIsolateMode(): void {
     this._ensureIsolateOverlay();
+    // Re-tag isolated subtrees so dynamically added descendants (spawned MUs,
+    // gripper pickups, async-loaded geometry, etc.) inherit ISOLATE_FOCUS_LAYER
+    // and render in pass 3 instead of being washed by the dim overlay.
+    this.groups?.refreshIsolateLayer();
+    this.autoFilters?.refreshIsolateLayer();
     const camera = this.camera;
     // Cast to WebGLRenderer for autoClear / clearDepth typings. The running
     // instance is actually three/webgpu Renderer in forceWebGL mode — see
@@ -1151,9 +1276,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // ── Pass 1: Dim backdrop ──
     // enableAll + disable focus = "everything but focus", mutation-safe for
     // dynamically spawned nodes (MUs, tank fills, pipe-flow rings) which
-    // default to layer 0 only.
+    // default to layer 0 only. Also exclude the highlight layer so hover/
+    // select wireframes don't render dim here — they're rendered crisply in
+    // pass 4.
     camera.layers.enableAll();
     camera.layers.disable(ISOLATE_FOCUS_LAYER);
+    camera.layers.disable(HIGHLIGHT_OVERLAY_LAYER);
     if (this._useComposer) {
       if (this._gtaoPass) this._gtaoPass.camera = camera;
       const renderPass = this._composer!.passes[0] as RenderPass;
@@ -1191,6 +1319,14 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       // ── Pass 3: Focus group on top ──
       gl.clearDepth();
       camera.layers.set(ISOLATE_FOCUS_LAYER);
+      gl.render(this.scene, camera);
+
+      // ── Pass 4: Hover/select wireframes on top of everything ──
+      // Overlay materials already have depthTest:false, depthWrite:false; the
+      // depth clear keeps them visible regardless of pass-3 z-state. Only the
+      // overlay layer is enabled, so the pass renders just the highlight pairs.
+      gl.clearDepth();
+      camera.layers.set(HIGHLIGHT_OVERLAY_LAYER);
       gl.render(this.scene, camera);
     } finally {
       this.scene.background = savedBackground;
@@ -1277,22 +1413,28 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
     // --- Pre-load phase: load model plugins BEFORE GLB so they can register capabilities ---
     // Capabilities must be registered before buildRaycastGeometries() in loadGLB().
-    const modelBaseName = url.replace(/^.*\//, '').replace(/\.glb$/i, '');
-    const tryPreloadPlugin = async (pluginUrl: string): Promise<void> => {
-      try {
-        const resp = await fetch(pluginUrl, { method: 'HEAD' });
-        if (!resp.ok) return;
-        const mod = await import(/* @vite-ignore */ pluginUrl);
-        if (typeof mod.default === 'function') mod.default(this);
-      } catch { /* skip silently */ }
-    };
-    await tryPreloadPlugin('./project-plugin.js');
-    await tryPreloadPlugin(`./models/${modelBaseName}/model-plugin.js`);
+    // External plugin bundles (./project-plugin.js, ./models/<name>/model-plugin.js) are
+    // an opt-in feature for deploys that ship standalone plugin bundles alongside the viewer.
+    // Gated on appConfig.externalPlugins to avoid two 404s per model load on every other deploy
+    // where no such bundle exists. The Vite-bundled ModelPluginManager below is the default path.
+    if (getAppConfig().externalPlugins) {
+      const modelBaseName = url.replace(/^.*\//, '').replace(/\.glb$/i, '');
+      const tryPreloadPlugin = async (pluginUrl: string): Promise<void> => {
+        try {
+          const resp = await fetch(pluginUrl, { method: 'HEAD' });
+          if (!resp.ok) return;
+          const mod = await import(/* @vite-ignore */ pluginUrl);
+          if (typeof mod.default === 'function') mod.default(this);
+        } catch { /* skip silently */ }
+      };
+      await tryPreloadPlugin('./project-plugin.js');
+      await tryPreloadPlugin(`./models/${modelBaseName}/model-plugin.js`);
+    }
     if (this.modelPluginManager) {
       await this.modelPluginManager.onModelLoading(url, this);
     }
 
-    const result = await loadGLB(url, this.scene, { isWebGPU: this.isWebGPU });
+    const result = await loadGLB(url, this.scene, { isWebGPU: this.isWebGPU, gizmoManager: this.gizmoManager });
 
     // Pre-compile shaders to avoid first-frame stutter (available on WebGPURenderer)
     if ('compileAsync' in this.renderer) {
@@ -1310,16 +1452,18 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.logicEngine = result.logicEngine;
     this.registry = result.registry;
     this.groups = result.groups;
-    if (this.groups && this.raycastManager) {
-      this.groups.raycastManager = this.raycastManager;
+
+    // Component event dispatcher — routes viewer events (object-hover, object-clicked,
+    // selection-changed) to per-component onHover/onClick/onSelect callbacks.
+    // Must be created after registry is available.
+    if (this.componentEventDispatcher) {
+      this.componentEventDispatcher.dispose();
     }
+    this.componentEventDispatcher = new ComponentEventDispatcher(this, result.registry);
 
     // Build auto-filter groups from component capabilities
     this.autoFilters = new AutoFilterRegistry();
     this.autoFilters.build(result.registry);
-    if (this.raycastManager) {
-      this.autoFilters.raycastManager = this.raycastManager;
-    }
 
     // Selection manager — init after registry is available
     this.selectionManager.init(this);
@@ -1350,6 +1494,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this.renderer, this.camera, this.scene,
       result.registry, this.highlighter, this,
     );
+
+    // Install central isolation gate — single invariant across all isolate
+    // providers (GroupRegistry, AutoFilterRegistry, external/plugin isolates).
+    // Stacks atop any plugin-specific allow filter.
+    this.raycastManager.setIsolationGate((node) => {
+      if (this.groups?.isIsolateActive && !this.groups.isInIsolatedSubtree(node)) return false;
+      if (this.autoFilters?.isIsolateActive && !this.autoFilters.isInIsolatedSubtree(node)) return false;
+      return true;
+    });
 
     // Provide grouped raycast geometry (built during scene loading)
     if (result.raycastGeometrySet) {
@@ -1404,10 +1557,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     result.boundingBox.getSize(size);
 
     if (this._groundMesh) {
-      // Ground is a 200×200 fade plane; scale to 2× model bounds (with 10% margin)
-      const groundSizeX = size.x * 1.1 * 2;
-      const groundSizeZ = size.z * 1.1 * 2;
-      this._groundMesh.scale.set(groundSizeX / 200, groundSizeZ / 200, 1);
+      // Ground is a 200×200 fade plane; always square, sized to cover the
+      // longer of the model's X/Z extents so elongated models still fit.
+      const groundSize = Math.max(size.x, size.z) * 1.1 * 2;
+      this._groundMesh.scale.set(groundSize / 200, groundSize / 200, 1);
       this._groundMesh.position.set(center.x, 0, center.z);
 
       // Update checker texture repeat so each square is always 0.5m
@@ -1416,7 +1569,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       const metersPerRepeat = TILES_PER_REPEAT * SQUARE_SIZE; // 4m
       const checkerMap = ((this._groundMesh as Mesh).material as MeshStandardMaterial).map;
       if (checkerMap) {
-        checkerMap.repeat.set(groundSizeX / metersPerRepeat, groundSizeZ / metersPerRepeat);
+        checkerMap.repeat.set(groundSize / metersPerRepeat, groundSize / metersPerRepeat);
       }
     }
 
@@ -1599,6 +1752,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this.pipeFlowManager = null;
     }
     this.pipelineSimulation = null;
+    // Dispose gizmo entries & dispatcher before registry is cleared
+    this.gizmoManager.dispose();
+    if (this.componentEventDispatcher) {
+      this.componentEventDispatcher.dispose();
+      this.componentEventDispatcher = null;
+    }
     this.signalStore = null;
     this.registry = null;
     if (this.groups) {
@@ -1994,6 +2153,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // 10. Ground / Floor
     this.groundEnabled = settings.groundEnabled ?? true;
     this.groundBrightness = settings.groundBrightness ?? 1.0;
+    this.backgroundBrightness = settings.backgroundBrightness ?? 1.0;
+    this.checkerContrast = settings.checkerContrast ?? 1.0;
 
     // 11. Navigation sensitivity (OrbitControls)
     if (this.controls) {
@@ -2094,6 +2255,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     materialsUnique: number;
     /** Meshes baked onto the RVUberMaterial singleton (0 if uber pass was a no-op) */
     uberBakedMeshCount: number;
+    /** Meshes that shared an already-baked BufferGeometry instead of cloning (plan-153) */
+    uberSharedGeometryReuses: number;
+    /** Meshes that had to clone their geometry because of a material conflict (plan-153) */
+    uberClonedGeometryCount: number;
+    /** Orphaned source BufferGeometries that Pass 3 disposed (plan-153) */
+    uberDisposedSourceGeometries: number;
     /** Number of uber-baked static meshes that fed into the uber static merge */
     uberMergeOriginal: number;
     /** Number of merged meshes created by the uber static batching pass (0 or 1) */
@@ -2128,6 +2295,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       materialsOriginal: dedup?.originalCount ?? 0,
       materialsUnique: dedup?.uniqueCount ?? 0,
       uberBakedMeshCount: uber?.bakedMeshCount ?? 0,
+      uberSharedGeometryReuses: uber?.sharedGeometryReuses ?? 0,
+      uberClonedGeometryCount: uber?.clonedGeometryCount ?? 0,
+      uberDisposedSourceGeometries: uber?.disposedSourceGeometries ?? 0,
       uberMergeOriginal: uberMerge?.originalCount ?? 0,
       uberMergeCreated: uberMerge?.mergedCount ?? 0,
       kinGroupsMerged: kinMerge?.groupsMerged ?? 0,
@@ -2214,6 +2384,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   private _prevMuCount = 0;
   /** Reference to the ground plane mesh (if created). */
   private _groundMesh: Mesh | null = null;
+  /** Canvas backing the checker CanvasTexture — re-drawn when checkerContrast changes. */
+  private _checkerCanvas: HTMLCanvasElement | null = null;
+  /** Floor checker pattern contrast (0 = flat midgray, 1 = default, 2 = doubled). */
+  private _checkerContrast = 1.0;
+  /** Scene background brightness multiplier (0 = black, 1 = default, 2 = white). */
+  private _backgroundBrightness = 1.0;
 
   /** Lazy overlay scene used for the semi-transparent wash during group isolate. */
   private _isolateOverlayScene: Scene | null = null;
@@ -2298,6 +2474,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this._renderDirty = true;
     }
 
+    // ── Gizmo overlay blink loop (early-returns when no entries) ──
+    this.gizmoManager.tick(dt * 1000);
+
     // ── Pipe flow visualization (animated rings) ──
     if (this.pipeFlowManager && this.pipeFlowManager.update(dt)) {
       this._renderDirty = true;
@@ -2371,7 +2550,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       const glForClearState = this.renderer as unknown as WebGLRenderer;
       const prevAutoClear = glForClearState.autoClear;
       try {
-        if (this.groups?.isIsolateActive || this.autoFilters?.isIsolateActive) {
+        // XR sessions must always go through the direct renderer path —
+        // EffectComposer renders to its own offscreen render targets, and
+        // the multi-pass isolate mode clears/overlays in ways that break
+        // the XR compositor. Passthrough camera would still show, but no
+        // 3D content lands in the XR framebuffer → invisible scene.
+        const xrPresenting = (this.renderer as unknown as WebGLRenderer).xr?.isPresenting;
+        if (xrPresenting) {
+          this.renderer.render(this.scene, this.camera);
+        } else if (this.groups?.isIsolateActive || this.autoFilters?.isIsolateActive) {
           this._renderIsolateMode();
         } else if (this._useComposer) {
           // Update camera references (may have switched persp/ortho)
@@ -2799,25 +2986,44 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   }
 
   /**
-   * Create ground plane with checker pattern that fades to transparent at edges.
-   * Inner 50% is opaque, outer 50% fades to transparent via alphaMap.
+   * Draw the 8×8 checker pattern into `canvas`. The darker tile always equals
+   * the scene-background base color, so at contrast=0 (and when floor/bg
+   * brightness are equal) the floor and background render to the same color.
+   * The lighter tile brightens above the base by CHECKER_HIGHLIGHT_DELTA × contrast,
+   * so contrast=1 reproduces the original `#b0b0b0` / `#9a9a9a` pair.
    */
-  private createGroundFade(): Mesh {
-    const checkerSize = 512;
+  private drawCheckerPattern(canvas: HTMLCanvasElement, contrast: number): void {
     const tileCount = 8;
-    const canvas = document.createElement('canvas');
-    canvas.width = checkerSize;
-    canvas.height = checkerSize;
     const ctx = canvas.getContext('2d')!;
-    const tilePixels = checkerSize / tileCount;
-    const colorA = '#b0b0b0';
-    const colorB = '#9a9a9a';
+    const tilePixels = canvas.width / tileCount;
+    const CHECKER_HIGHLIGHT_DELTA = 0x16 / 255; // 0x9a → 0xb0 spread ≈ 0.086
+    const a = Math.max(0, Math.min(1, BG_BASE_SCALAR + CHECKER_HIGHLIGHT_DELTA * contrast));
+    const b = BG_BASE_SCALAR;
+    const toCss = (x: number) => {
+      const v = Math.round(x * 255);
+      return `rgb(${v},${v},${v})`;
+    };
+    const colorA = toCss(a);
+    const colorB = toCss(b);
     for (let y = 0; y < tileCount; y++) {
       for (let x = 0; x < tileCount; x++) {
         ctx.fillStyle = (x + y) % 2 === 0 ? colorA : colorB;
         ctx.fillRect(x * tilePixels, y * tilePixels, tilePixels, tilePixels);
       }
     }
+  }
+
+  /**
+   * Create ground plane with checker pattern that fades to transparent at edges.
+   * Inner 50% is opaque, outer 50% fades to transparent via alphaMap.
+   */
+  private createGroundFade(): Mesh {
+    const checkerSize = 512;
+    const canvas = document.createElement('canvas');
+    canvas.width = checkerSize;
+    canvas.height = checkerSize;
+    this.drawCheckerPattern(canvas, this._checkerContrast);
+    this._checkerCanvas = canvas;
     const checkerTex = new CanvasTexture(canvas);
     checkerTex.wrapS = RepeatWrapping;
     checkerTex.wrapT = RepeatWrapping;

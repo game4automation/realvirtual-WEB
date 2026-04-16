@@ -37,6 +37,7 @@ import { TransportStatsPlugin } from './plugins/transport-stats-plugin';
 import { CameraEventsPlugin } from './plugins/camera-events-plugin';
 import { DriveOrderPlugin } from './plugins/drive-order-plugin';
 import { CameraStartPosPlugin } from './plugins/camera-startpos-plugin';
+import { WebSensorPlugin } from './plugins/web-sensor-plugin';
 import { RapierPhysicsPlugin } from './core/engine/rapier-physics-plugin';
 import { loadPhysicsSettings } from './core/hmi/physics-settings-store';
 
@@ -198,6 +199,7 @@ async function init() {
     .use(new TransportStatsPlugin())
     .use(new CameraEventsPlugin())
     .use(new CameraStartPosPlugin())
+    .use(new WebSensorPlugin())
     .use(new RvExtrasEditorPlugin());
 
   // --- Per-model plugin manager (loads model-specific plugins on model switch) ---
@@ -230,15 +232,19 @@ async function init() {
     }
   } catch { /* private models endpoint not available (production build) — ignore */ }
 
-  // Runtime model manifest (generated during private project staging, replaces build-time glob)
+  // Runtime model manifest (generated during private project staging, replaces build-time glob).
+  // If present, the manifest is AUTHORITATIVE — the build-time glob bundles
+  // /public/models/*.glb from the dev environment (e.g. DemoRealvirtualWeb.glb) into every
+  // build, but private deploys swap out the models folder on the server. Keeping the
+  // build-time entries around would leave stale filenames matchable by localStorage, causing
+  // 404s when a returning user had previously opened a model that only exists in another deploy.
   try {
     const resp = await fetch(`${import.meta.env.BASE_URL}models.json`, { cache: 'no-store' });
     if (resp.ok) {
       const runtimeModels: string[] = await resp.json();
+      entries.length = 0;
       for (const filename of runtimeModels) {
-        if (!entries.some(e => e.filename === filename)) {
-          entries.push({ filename, url: `${import.meta.env.BASE_URL}models/${filename}` });
-        }
+        entries.push({ filename, url: `${import.meta.env.BASE_URL}models/${filename}` });
       }
     }
   } catch { /* no manifest — use build-time discovery only */ }
@@ -339,10 +345,17 @@ async function init() {
       }
     }
 
-    // Match saved model by URL or by filename (handles base path changes)
+    // Match saved model by URL or by filename (handles base path changes).
+    // Only matches if the saved model is ACTUALLY available in this deploy — a user that
+    // previously visited another deploy (or an older version of this one) gets fresh defaults
+    // from settings.json instead of a 404 on a stale localStorage value.
     const savedEntry = savedModel
       ? entries.find((e) => e.url === savedModel || e.filename === savedModel.split('/').pop())
       : null;
+    if (savedModel && !savedEntry) {
+      debug('config', `Saved model "${savedModel}" not available in this deploy — falling back to settings.json defaultModel`);
+      localStorage.removeItem(LS_KEY_MODEL);
+    }
 
     const modelToLoad = urlModel
       ?? savedEntry?.url

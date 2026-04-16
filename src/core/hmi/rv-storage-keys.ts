@@ -30,6 +30,7 @@ export const ALL_RV_STORAGE_KEYS = [
   'rv-layout-autosave',
   'rv-layout-grid-enabled',
   'rv-layout-grid-size',
+  'rv-sensor-view-state',
 ] as const;
 
 /**
