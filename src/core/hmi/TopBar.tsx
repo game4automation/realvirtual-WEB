@@ -22,6 +22,7 @@ import type { MultiuserPluginAPI, WebXRPluginAPI } from '../types/plugin-types';
 
 // Settings tab components (extracted for maintainability)
 import { ModelTab, VisualTab, PhysicsTab, InterfacesTab, MultiuserTab, McpTab, DevToolsTab, TestsTab, GroupsTab } from './settings';
+import { PluginSettingsTabs, PluginSettingsTabContent } from './PluginSettingsTabs';
 
 export function TopBar() {
   const viewer = useViewer();
@@ -207,17 +208,19 @@ export function TopBar() {
           width={SETTINGS_PANEL_WIDTH}
           headerSx={{ px: 1.5, py: 0.75 }}
         >
-          {/* Tabs - scrollable for 360px width */}
+          {/* Tabs - scrollable with visible scroll buttons on mobile (MUI hides them by default). */}
           <Tabs
             value={settingsTab}
             onChange={(_, v: number) => setSettingsTab(v)}
             variant="scrollable"
-            scrollButtons="auto"
+            scrollButtons
+            allowScrollButtonsMobile
             sx={{
               borderBottom: '1px solid rgba(255,255,255,0.08)',
               minHeight: 40,
               flexShrink: 0,
-              '& .MuiTab-root': { minHeight: 40, py: 1, textTransform: 'none', fontSize: 13, minWidth: 0, px: { xs: 1.5, sm: 2 } },
+              '& .MuiTab-root': { minHeight: 40, py: 1, textTransform: 'none', fontSize: 13, minWidth: 0, px: { xs: 1, sm: 2 } },
+              '& .MuiTabs-scrollButtons.Mui-disabled': { opacity: 0.3 },
             }}
           >
             {!isTabLocked('model') && <Tab label="Model" value={0} />}
@@ -229,6 +232,8 @@ export function TopBar() {
             {!isTabLocked('devtools') && <Tab label="Dev Tools" value={6} />}
             {!isTabLocked('tests') && <Tab label="Tests" value={7} />}
             {!isTabLocked('groups') && <Tab label="Groups" value={8} />}
+            {/* Plugin-registered settings-tab slots (value = 100..N) */}
+            <PluginSettingsTabs viewer={viewer} offset={100} />
           </Tabs>
 
           {/* Tab content - minHeight: 0 for correct flexbox scrolling */}
@@ -242,6 +247,9 @@ export function TopBar() {
             {settingsTab === 6 && !isTabLocked('devtools') && <DevToolsTab />}
             {settingsTab === 7 && !isTabLocked('tests') && <TestsTab />}
             {settingsTab === 8 && !isTabLocked('groups') && <GroupsTab />}
+            {settingsTab >= 100 && (
+              <PluginSettingsTabContent viewer={viewer} value={settingsTab} offset={100} />
+            )}
           </Box>
         </LeftPanel>
       )}

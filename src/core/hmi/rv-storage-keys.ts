@@ -42,6 +42,7 @@ export const RV_DYNAMIC_PREFIXES = [
   'rv-annotations-',
   'rv-panel-',
   'rv-order-',
+  'rv-camera-start:',
 ] as const;
 
 /**

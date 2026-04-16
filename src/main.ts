@@ -24,8 +24,9 @@ import { activateContext, registerUIElement } from './core/hmi/ui-context-store'
 import { initHMI } from '@rv-private/custom/hmi-entry';
 import { registerPrivatePlugins } from '@rv-private/private-plugins';
 
-// Hide AGPL watermark for commercial builds (RV_COMMERCIAL=1)
-if (__RV_COMMERCIAL__) {
+// Hide AGPL watermark for commercial/private builds
+// (private projects show "powered by realvirtual" in the logo badge instead)
+if (__RV_COMMERCIAL__ || __RV_HAS_PRIVATE__) {
   const wm = document.getElementById('rv-watermark');
   if (wm) wm.style.display = 'none';
 }
@@ -35,6 +36,7 @@ import { SensorMonitorPlugin } from './plugins/sensor-monitor-plugin';
 import { TransportStatsPlugin } from './plugins/transport-stats-plugin';
 import { CameraEventsPlugin } from './plugins/camera-events-plugin';
 import { DriveOrderPlugin } from './plugins/drive-order-plugin';
+import { CameraStartPosPlugin } from './plugins/camera-startpos-plugin';
 import { RapierPhysicsPlugin } from './core/engine/rapier-physics-plugin';
 import { loadPhysicsSettings } from './core/hmi/physics-settings-store';
 
@@ -195,6 +197,7 @@ async function init() {
     .use(new SensorMonitorPlugin())
     .use(new TransportStatsPlugin())
     .use(new CameraEventsPlugin())
+    .use(new CameraStartPosPlugin())
     .use(new RvExtrasEditorPlugin());
 
   // --- Per-model plugin manager (loads model-specific plugins on model switch) ---
@@ -226,6 +229,19 @@ async function init() {
       }
     }
   } catch { /* private models endpoint not available (production build) — ignore */ }
+
+  // Runtime model manifest (generated during private project staging, replaces build-time glob)
+  try {
+    const resp = await fetch(`${import.meta.env.BASE_URL}models.json`, { cache: 'no-store' });
+    if (resp.ok) {
+      const runtimeModels: string[] = await resp.json();
+      for (const filename of runtimeModels) {
+        if (!entries.some(e => e.filename === filename)) {
+          entries.push({ filename, url: `${import.meta.env.BASE_URL}models/${filename}` });
+        }
+      }
+    }
+  } catch { /* no manifest — use build-time discovery only */ }
 
   // Expose discovered models to the HMI model selector
   viewer.availableModels = entries.map((e) => ({ url: e.url, label: e.filename.replace(/\.glb$/i, '') }));
@@ -301,15 +317,27 @@ async function init() {
     document.title = `${firebaseDemoName} - realvirtual WEB`;
     loadModel(firebaseGlbUrl);
   } else {
-    // Local dev mode: URL param > last opened (localStorage) > settings.json defaultModel > first model
+    // Model priority: URL param > settings.json defaultModel > last opened (localStorage) > first model
+    // When settings.json specifies a defaultModel, it overrides localStorage because the deployer
+    // explicitly configured this model for this deployment (e.g. private project publish).
     const urlModel = params.get('model');
     const configModel = appConfig.defaultModel;
     const savedModel = localStorage.getItem(LS_KEY_MODEL);
 
-    // Resolve configModel: could be a full URL or just a filename like "customer-line.glb"
-    const resolvedConfigModel = configModel
-      ? entries.find((e) => e.url === configModel || e.filename === configModel)?.url ?? configModel
-      : null;
+    // Resolve configModel: match against discovered entries, or build a URL from filename/path
+    let resolvedConfigModel: string | null = null;
+    if (configModel) {
+      const match = entries.find((e) => e.url === configModel || e.filename === configModel);
+      if (match) {
+        resolvedConfigModel = match.url;
+      } else {
+        // Not in build-time manifest — resolve relative to BASE_URL (e.g. private deploy with swapped models)
+        const isAbsoluteOrUrl = configModel.startsWith('http') || configModel.startsWith('/');
+        resolvedConfigModel = isAbsoluteOrUrl
+          ? configModel
+          : `${import.meta.env.BASE_URL}${configModel.startsWith('models/') ? '' : 'models/'}${configModel}`;
+      }
+    }
 
     // Match saved model by URL or by filename (handles base path changes)
     const savedEntry = savedModel
@@ -317,8 +345,8 @@ async function init() {
       : null;
 
     const modelToLoad = urlModel
-      ?? savedEntry?.url
       ?? resolvedConfigModel
+      ?? savedEntry?.url
       ?? null;
 
     if (modelToLoad) {

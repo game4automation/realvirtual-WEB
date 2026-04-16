@@ -34,6 +34,8 @@
   },
   "devDependencies": {
     "@rollup/rollup-win32-x64-msvc": "^4.59.0",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.2",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@types/three": "^0.171.0",

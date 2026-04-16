@@ -6,8 +6,8 @@ import react from '@vitejs/plugin-react';
 // PWA disabled – always serve fresh content, no service worker caching
 // import { VitePWA } from 'vite-plugin-pwa';
 import { playwright } from '@vitest/browser-playwright';
-import { readdirSync, existsSync, mkdirSync, writeFileSync, createReadStream, statSync } from 'node:fs';
-import { join, resolve, dirname } from 'node:path';
+import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, createReadStream, statSync } from 'node:fs';
+import { join, resolve, dirname, extname } from 'node:path';
 
 // ─── Private content detection ──────────────────────────────────────────
 const PRIVATE_DIR = resolve(__dirname, '../realvirtual-WebViewer-Private~/src');
@@ -28,7 +28,7 @@ function testRunnerPlugin() {
           let files: string[] = [];
           if (existsSync(testsDir)) {
             files = readdirSync(testsDir)
-              .filter((f: string) => f.endsWith('.test.ts'))
+              .filter((f: string) => f.endsWith('.test.ts') || f.endsWith('.test.tsx'))
               .map((f: string) => `tests/${f}`);
           }
           res.setHeader('Content-Type', 'application/json');
@@ -263,12 +263,30 @@ function thumbnailSavePlugin() {
 // ─── Private project directory (contains project subfolders with models/) ────
 const PRIVATE_PROJECTS_DIR = resolve(__dirname, '../realvirtual-WebViewer-Private~/projects');
 
+/** MIME types for static assets served from private projects. */
+const PRIVATE_ASSET_MIME: Record<string, string> = {
+  '.glb': 'model/gltf-binary',
+  '.aasx': 'application/asset-administration-shell-package',
+  '.pdf': 'application/pdf',
+  '.json': 'application/json',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+};
+
 /**
- * Vite plugin: Discover and serve GLB models from private project folders.
+ * Vite plugin: Discover and serve GLB models + AASX/PDF assets from private project folders.
  *
- * Scans `realvirtual-WebViewer-Private~/projects/<name>/models/` for .glb files,
- * serves them under `/private-models/<project>/<file>.glb`, and exposes a
- * `/__api/private-models` JSON manifest for runtime discovery.
+ * Scans `realvirtual-WebViewer-Private~/projects/<name>/` for:
+ *   - `models/*.glb`  → served under `/private-models/<project>/`
+ *   - `aasx/*.aasx`   → served under `/private-assets/<project>/aasx/`
+ *   - `pdf/*.pdf`     → served under `/private-assets/<project>/pdf/`
+ *
+ * Also exposes:
+ *   - `GET /__api/private-models` — JSON manifest of all GLB models
+ *   - `GET /private-assets/<project>/aasx/index.json` — auto-generated AASX index
  */
 function privateModelsPlugin() {
   if (!HAS_PRIVATE || !existsSync(PRIVATE_PROJECTS_DIR)) return null;
@@ -294,6 +312,29 @@ function privateModelsPlugin() {
     return entries;
   }
 
+  /** List files in a private project subfolder. */
+  function listProjectFiles(project: string, subfolder: string, ext: string): string[] {
+    const dir = join(PRIVATE_PROJECTS_DIR, project, subfolder);
+    if (!existsSync(dir)) return [];
+    try {
+      return readdirSync(dir).filter(f => f.toLowerCase().endsWith(ext));
+    } catch { return []; }
+  }
+
+  /** Serve a static file from a private project subfolder with correct MIME type. */
+  function serveProjectFile(res: any, project: string, subfolder: string, filename: string): boolean {
+    const filePath = join(PRIVATE_PROJECTS_DIR, project, subfolder, filename);
+    if (!existsSync(filePath)) return false;
+    const ext = extname(filename).toLowerCase();
+    const mime = PRIVATE_ASSET_MIME[ext] ?? 'application/octet-stream';
+    const stat = statSync(filePath);
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Cache-Control', 'no-store');
+    createReadStream(filePath).pipe(res);
+    return true;
+  }
+
   return {
     name: 'rv-private-models',
     apply: 'serve' as const,
@@ -314,14 +355,52 @@ function privateModelsPlugin() {
           const parts = url.replace('/private-models/', '').split('/');
           if (parts.length === 2) {
             const [project, file] = parts;
-            const filePath = join(PRIVATE_PROJECTS_DIR, project, 'models', file);
-            if (existsSync(filePath)) {
-              const stat = statSync(filePath);
-              res.setHeader('Content-Type', 'model/gltf-binary');
-              res.setHeader('Content-Length', stat.size);
+            if (serveProjectFile(res, project, 'models', file)) return;
+          }
+          res.writeHead(404);
+          res.end('Not found');
+          return;
+        }
+
+        // Serve private assets: /private-assets/<project>/<path...>
+        // Supports arbitrary depth paths (e.g., docs/subfolder/subfolder/file.pdf)
+        // as well as flat paths (e.g., docs-index.json, aasx/index.json)
+        if (url.startsWith('/private-assets/')) {
+          const decoded = decodeURIComponent(url);
+          const stripped = decoded.replace('/private-assets/', '');
+          const slashIdx = stripped.indexOf('/');
+          if (slashIdx > 0) {
+            const project = stripped.substring(0, slashIdx);
+            const assetPath = stripped.substring(slashIdx + 1);
+
+            // Auto-generate AASX index.json on the fly
+            if (assetPath === 'aasx/index.json') {
+              const aasxFiles = listProjectFiles(project, 'aasx', '.aasx');
+              const index: Record<string, { file: string; idShort: string }> = {};
+              for (const f of aasxFiles) {
+                index[f.replace('.aasx', '')] = { file: f, idShort: f.replace('.aasx', '') };
+              }
+              res.setHeader('Content-Type', 'application/json');
               res.setHeader('Cache-Control', 'no-store');
-              createReadStream(filePath).pipe(res);
+              res.end(JSON.stringify(index, null, 2));
               return;
+            }
+
+            // Serve any file from the project directory
+            const filePath = join(PRIVATE_PROJECTS_DIR, project, assetPath);
+            if (existsSync(filePath)) {
+              try {
+                const fstat = statSync(filePath);
+                if (fstat.isFile()) {
+                  const ext = extname(filePath).toLowerCase();
+                  const mime = PRIVATE_ASSET_MIME[ext] ?? 'application/octet-stream';
+                  res.setHeader('Content-Type', mime);
+                  res.setHeader('Content-Length', fstat.size);
+                  res.setHeader('Cache-Control', 'no-store');
+                  createReadStream(filePath).pipe(res);
+                  return;
+                }
+              } catch { /* fall through to 404 */ }
             }
           }
           res.writeHead(404);
@@ -428,7 +507,7 @@ export default defineConfig({
     },
   },
   test: {
-    include: ['tests/**/*.test.ts'],
+    include: ['tests/**/*.test.{ts,tsx}'],
     browser: {
       enabled: true,
       provider: playwright(),
