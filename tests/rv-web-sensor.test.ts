@@ -36,7 +36,8 @@ describe('RVWebSensor', () => {
     __resetWarnedSignals();
   });
 
-  it('unbound when neither signal is set', () => {
+  it('unbound (when randomDemoStates=false) if no signal is set', () => {
+    initWebSensor({ randomDemoStates: false });
     const scene = new Scene();
     const mgr = new GizmoOverlayManager(scene);
     const store = new SignalStore();
@@ -45,6 +46,19 @@ describe('RVWebSensor', () => {
     const inst = new RVWebSensor(node);
     inst.init({ scene, signalStore: store, gizmoManager: mgr } as any);
     expect(inst.getCurrentState()).toBe('unbound');
+    resetWebSensorConfig();
+  });
+
+  it('random demo state (default) when no signal is set', () => {
+    const scene = new Scene();
+    const mgr = new GizmoOverlayManager(scene);
+    const store = new SignalStore();
+    const node = new Mesh(new BoxGeometry());
+    scene.add(node);
+    const inst = new RVWebSensor(node);
+    inst.init({ scene, signalStore: store, gizmoManager: mgr } as any);
+    // Default config: randomDemoStates=true → state is one of low/high/warning/error
+    expect(['low', 'high', 'warning', 'error']).toContain(inst.getCurrentState());
   });
 
   it('bool mode: false → low, true → high', () => {
@@ -112,25 +126,6 @@ describe('RVWebSensor', () => {
     expect(() => inst.init({ scene, signalStore: store } as any)).not.toThrow();
     expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
-  });
-
-  it('creates text-gizmo when Label is non-empty', () => {
-    const { inst } = setup('bool', '', 'Position 1');
-    expect((inst as any)._textGizmo).toBeDefined();
-  });
-
-  it('no text-gizmo when Label is empty', () => {
-    const { inst } = setup('bool', '', '');
-    expect((inst as any)._textGizmo).toBeUndefined();
-  });
-
-  it('text-gizmo color syncs with state', () => {
-    const { inst, store } = setup('bool', '', 'Exit');
-    const textHandle = (inst as any)._textGizmo;
-    const updateSpy = vi.spyOn(textHandle, 'update');
-    store.set('Sig', true); // → high
-    expect(updateSpy).toHaveBeenCalledWith(expect.objectContaining({ color: 0x3080ff }));
-    updateSpy.mockRestore();
   });
 
   it('onHover increases size by 1.15x then restores', () => {

@@ -35,6 +35,17 @@ export type SearchResolver = (
   node: Object3D,
 ) => string[];
 
+/**
+ * Search display resolver function for a component type.
+ * Called when a search result matched via this component — returns a human-readable
+ * display label to show in the dropdown instead of the raw node name.
+ * For example, AASLink returns the English product name, RuntimeMetadata returns the header.
+ * Return null to fall back to the default node name.
+ */
+export type SearchDisplayResolver = (
+  node: Object3D,
+) => string | null;
+
 /** Props passed to tooltip content provider components. */
 export interface TooltipContentProps<T extends TooltipData = TooltipData> {
   /** The typed data from TooltipEntry.data. */
@@ -82,6 +93,7 @@ export class TooltipContentRegistry {
   private controllers: TooltipControllerEntry[] = [];
   private dataResolvers = new Map<string, TooltipDataResolver>();
   private searchResolvers = new Map<string, SearchResolver>();
+  private searchDisplayResolvers = new Map<string, SearchDisplayResolver>();
 
   /** Register a content provider for a content type. */
   register(entry: TooltipProviderEntry): void {
@@ -125,6 +137,17 @@ export class TooltipContentRegistry {
   /** Register a search resolver for a component type (rv_extras key). */
   registerSearchResolver(componentType: string, resolver: SearchResolver): void {
     this.searchResolvers.set(componentType, resolver);
+  }
+
+  /** Register a display resolver for search results matched by this component type. */
+  registerSearchDisplayResolver(componentType: string, resolver: SearchDisplayResolver): void {
+    this.searchDisplayResolvers.set(componentType, resolver);
+  }
+
+  /** Get the display label for a search result matched by a specific component type. Returns null to use default. */
+  getSearchDisplayText(node: Object3D, matchedBy: string): string | null {
+    const resolver = this.searchDisplayResolvers.get(matchedBy);
+    return resolver ? resolver(node) : null;
   }
 
   /**

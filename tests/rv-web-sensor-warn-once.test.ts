@@ -4,13 +4,22 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Scene, Mesh, BoxGeometry } from 'three';
 import { GizmoOverlayManager } from '../src/core/engine/rv-gizmo-manager';
-import { RVWebSensor, __resetWarnedSignals } from '../src/core/engine/rv-web-sensor';
+import {
+  RVWebSensor,
+  __resetWarnedSignals,
+  initWebSensor,
+  resetWebSensorConfig,
+} from '../src/core/engine/rv-web-sensor';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 
 describe('RVWebSensor warn-once', () => {
-  beforeEach(() => __resetWarnedSignals());
+  beforeEach(() => {
+    __resetWarnedSignals();
+    resetWebSensorConfig();
+  });
 
-  it('warns once for missing signal across multiple sensors with same default label', () => {
+  it('warns once for missing signal across multiple sensors when randomDemoStates is off', () => {
+    initWebSensor({ randomDemoStates: false });
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const scene = new Scene();
     const mgr = new GizmoOverlayManager(scene);

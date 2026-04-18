@@ -22,6 +22,7 @@ import type { AABB } from './rv-aabb';
 import type { GizmoOverlayManager } from './rv-gizmo-manager';
 import type { ComponentEventDispatcher } from './rv-component-event-dispatcher';
 import type { ObjectHoverData } from './rv-raycast-manager';
+import type { EventEmitter } from '../rv-events';
 
 // ─── Schema Types ────────────────────────────────────────────────
 
@@ -54,6 +55,10 @@ export interface ComponentContext {
   /** Optional — available when RVViewer instantiates one. Components don't
    *  need to touch this directly; they just implement onHover/onClick/onSelect. */
   componentEventDispatcher?: ComponentEventDispatcher;
+  /** Optional — viewer event bus for cross-component / UI↔engine signaling.
+   *  Untyped at the registry layer to avoid pulling ViewerEvents (rv-viewer)
+   *  into the engine; consumers that need typed events cast on usage. */
+  events?: EventEmitter;
 }
 
 /** Interface all auto-mapped components implement */
@@ -63,6 +68,11 @@ export interface RVComponent {
    *  Set to false by MultiuserPlugin when server is authority. Default: true. */
   isOwner: boolean;
   init(context: ComponentContext): void;
+  /** Optional second-pass init, called by the scene loader AFTER the Kinematic
+   *  re-parenting pass (Phase 8b). Use this when the component needs the final
+   *  child hierarchy — e.g. to compute an AABB that includes meshes which are
+   *  re-parented under this node by Kinematic groups. */
+  onSceneReady?(context: ComponentContext): void;
   dispose?(): void;
   /** Called when ownership changes (e.g. multiuser connect/disconnect).
    *  Components self-manage their multiuser behavior in this callback. */
@@ -344,6 +354,9 @@ export function getRegisteredCapabilities(): ReadonlyMap<string, Readonly<Requir
 export interface ComponentFactory {
   /** GLB extras key that triggers this component (e.g. 'Source', 'Sensor') */
   readonly type: string;
+  /** Optional short label for hierarchy badges / inspector — falls back to `type` when omitted.
+   *  Use this when the GLB key (e.g. 'WebSafetyDoor') differs from the user-facing name (e.g. 'SafetyDoor'). */
+  readonly displayName?: string;
   /** Component schema for auto-mapping GLB extras → instance properties */
   readonly schema: ComponentSchema;
   /** Whether this component needs an AABB from BoxCollider extras */
@@ -362,6 +375,26 @@ export interface ComponentFactory {
 const registeredFactories = new Map<string, ComponentFactory>();
 
 /**
+ * Attach an RVComponent instance to a Three.js node's userData as
+ * `_rvComponentInstance`. The property is NON-ENUMERABLE so Three.js's
+ * `Object3D.clone()` (which does `JSON.parse(JSON.stringify(userData))` on
+ * userData) doesn't try to serialize the circular instance↔node reference.
+ * Direct access `node.userData._rvComponentInstance` still works.
+ *
+ * Re-assignable (writable/configurable) so re-running the scene loader for
+ * the same node (e.g. hot-reload) doesn't throw on re-definition.
+ */
+export function setComponentInstance(node: Object3D, instance: object): void {
+  if (node.userData._rvComponentInstance) return; // first-writer wins
+  Object.defineProperty(node.userData, '_rvComponentInstance', {
+    value: instance,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+}
+
+/**
  * Register a component factory for auto-discovery.
  * Components call this at module-load time. The scene loader iterates all
  * registered factories instead of using hardcoded if-blocks.
@@ -377,7 +410,18 @@ export function registerComponent(factory: ComponentFactory): void {
     afterCreate(instance: RVComponent, node: Object3D): void {
       if (originalAfterCreate) originalAfterCreate(instance, node);
       if (!node.userData._rvComponentInstance) {
-        node.userData._rvComponentInstance = instance;
+        // Non-enumerable so JSON.stringify() skips this circular reference
+        // (component → node → userData → component). Three.js Object3D.clone()
+        // klont userData per JSON round-trip and would otherwise crash here
+        // with "Converting circular structure to JSON" — seen since
+        // conditional geometry clone (plan-153) reshapes spawn paths such that
+        // some sources fall back to Object3D.clone() instead of instancing.
+        Object.defineProperty(node.userData, '_rvComponentInstance', {
+          value: instance,
+          writable: true,
+          configurable: true,
+          enumerable: false,
+        });
       }
     },
   };
@@ -391,6 +435,12 @@ export function registerComponent(factory: ComponentFactory): void {
 /** Get all registered component factories (used by scene loader) */
 export function getRegisteredFactories(): ReadonlyMap<string, ComponentFactory> {
   return registeredFactories;
+}
+
+/** Resolve a component type to its user-facing display label.
+ *  Returns the factory's `displayName` if defined, otherwise the raw type. */
+export function getDisplayName(type: string): string {
+  return registeredFactories.get(type)?.displayName ?? type;
 }
 
 // ─── Schema-Derived CONSUMED Fields ─────────────────────────────

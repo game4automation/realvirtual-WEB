@@ -29,11 +29,12 @@ export { BOTTOM_BAR_HEIGHT } from './layout-constants';
 import { RV_SCROLL_CLASS } from './shared-sx';
 
 const DEBOUNCE_MS = 250;
-const MAX_VISIBLE_RESULTS = 8;
 
 export function BottomBar() {
   const viewer = useViewer();
   const { filter, filteredNodes, tooMany, setFilter } = useNodeFilter();
+  const MAX_DROPDOWN = 20;
+  const displayedNodes = tooMany ? filteredNodes.slice(0, MAX_DROPDOWN) : filteredNodes;
   const [inputValue, setInputValue] = useState('');
   const [settings, setSettings] = useState<SearchSettings>(loadSearchSettings);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -84,10 +85,11 @@ export function BottomBar() {
     setSettingsAnchor(null);
   }, [setFilter]);
 
-  // Enter → focus camera on highlighted nodes
+  // Enter → focus camera on highlighted nodes (use first MAX_DROPDOWN when many)
   const handleFocus = useCallback(() => {
-    if (filteredNodes.length > 0 && !tooMany) {
-      const nodes = filteredNodes.map(r => r.node);
+    if (filteredNodes.length > 0) {
+      const subset = tooMany ? filteredNodes.slice(0, MAX_DROPDOWN) : filteredNodes;
+      const nodes = subset.map(r => r.node);
       viewer.fitToNodes(nodes);
     }
   }, [viewer, filteredNodes, tooMany]);
@@ -151,7 +153,7 @@ export function BottomBar() {
     [viewer],
   );
 
-  const visibleCount = filteredNodes.length;
+  const visibleCount = displayedNodes.length;
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -176,8 +178,8 @@ export function BottomBar() {
           return next;
         });
       } else if (e.key === 'Enter') {
-        if (selectedIdx >= 0 && selectedIdx < filteredNodes.length) {
-          handleResultClick(filteredNodes[selectedIdx]);
+        if (selectedIdx >= 0 && selectedIdx < displayedNodes.length) {
+          handleResultClick(displayedNodes[selectedIdx]);
         } else {
           handleFocus();
           setDropdownVisible(false);
@@ -185,7 +187,7 @@ export function BottomBar() {
         }
       }
     },
-    [handleClear, handleFocus, handleResultClick, filteredNodes, selectedIdx, visibleCount],
+    [handleClear, handleFocus, handleResultClick, displayedNodes, selectedIdx, visibleCount],
   );
 
   // Cleanup debounce on unmount
@@ -223,15 +225,11 @@ export function BottomBar() {
   }, []);
 
   const subscribers = getFilterSubscribers();
-  const showResults = filter && !tooMany && filteredNodes.length > 0 && dropdownVisible;
+  const showResults = filter && filteredNodes.length > 0 && dropdownVisible;
   const resultCount = filteredNodes.length;
 
   // Count badge text
-  const badgeText = !filter
-    ? null
-    : tooMany
-      ? `${resultCount} — type more`
-      : `${resultCount} found`;
+  const badgeText = filter ? `${resultCount} found` : null;
 
   return (
     <>
@@ -278,18 +276,17 @@ export function BottomBar() {
             onScroll={() => { if (programmaticScroll.current) programmaticScroll.current = false; else if (selectedIdx >= 0) setSelectedIdx(-1); }}
             sx={{
               width: { xs: 'calc(100vw - 24px)', sm: 388 },
-              maxHeight: 320,
               mb: 0.5,
               borderRadius: 2,
               pointerEvents: 'auto',
-              overflow: 'auto',
             }}
           >
             <List dense disablePadding ref={listRef}>
-              {filteredNodes.map((r, i) => {
-                const name = r.path.split('/').pop() ?? r.path;
+              {displayedNodes.map((r, i) => {
+                const nodeName = r.path.split('/').pop() ?? r.path;
+                const label = r.displayText ?? nodeName;
                 // Show where the match was found: matchedBy component, or primary type for name matches
-                const badgeType = r.matchedBy ?? (r.types.length > 0 ? r.types[0] : null);
+                const badgeType = r.matchedBy ?? (r.types.length > 0 ? r.types[0] : 'Node');
                 const isSelected = i === selectedIdx;
                 return (
                   <Tooltip title={r.path} placement="right" enterDelay={800} slotProps={{ tooltip: { sx: { fontSize: 10 } } }}>
@@ -302,7 +299,7 @@ export function BottomBar() {
                     onMouseLeave={() => handleResultHover(null)}
                     sx={{ py: 0.25, px: 1.5, minHeight: 0 }}
                   >
-                    <Typography variant="body2" noWrap sx={{ flex: 1 }}>{name}</Typography>
+                    <Typography variant="body2" noWrap sx={{ flex: 1 }}>{label}</Typography>
                     {badgeType && (
                       <Typography variant="caption" noWrap sx={{
                         ml: 0.5, fontSize: '0.6rem', fontWeight: 600,
@@ -315,6 +312,11 @@ export function BottomBar() {
                   </Tooltip>
                 );
               })}
+              {resultCount > MAX_DROPDOWN && (
+                <Typography variant="caption" sx={{ display: 'block', textAlign: 'center', py: 0.5, color: 'text.disabled' }}>
+                  and {resultCount - MAX_DROPDOWN} more — type to narrow
+                </Typography>
+              )}
             </List>
           </Paper>
         )}
@@ -352,12 +354,12 @@ export function BottomBar() {
                 endAdornment: (
                   <InputAdornment position="end">
                     {badgeText && (
-                      <Typography variant="caption" sx={{ color: tooMany ? 'text.disabled' : 'primary.main', mr: 0.5, whiteSpace: 'nowrap' }}>
+                      <Typography variant="caption" sx={{ color: 'primary.main', mr: 0.5, whiteSpace: 'nowrap' }}>
                         {badgeText}
                       </Typography>
                     )}
                     {/* Focus button (touch alternative to Enter) */}
-                    {filter && !tooMany && filteredNodes.length > 0 && (
+                    {filter && filteredNodes.length > 0 && (
                       <IconButton size="small" onClick={handleFocus} sx={{ p: 0.25 }} title="Focus camera (Enter)">
                         <CenterFocusStrong sx={{ fontSize: 16, color: 'primary.main' }} />
                       </IconButton>

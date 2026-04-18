@@ -112,8 +112,8 @@ function useAnimatedKpi(seed: number[], baseValue: string, active: boolean) {
   return { sparkData: data, displayValue };
 }
 
-export function KpiCard({ label, value, unit, secondary, color = '#4fc3f7', animate = true, onClick }: KpiCardProps) {
-  const seed = SPARKLINES[label] || [];
+export function KpiCard({ label, value, unit, secondary, color = '#4fc3f7', sparkline, animate = true, onClick }: KpiCardProps) {
+  const seed = sparkline ?? SPARKLINES[label] ?? [];
   const { sparkData, displayValue } = useAnimatedKpi(seed, value, animate && seed.length >= 2);
 
   return (

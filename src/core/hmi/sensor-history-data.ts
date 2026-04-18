@@ -56,7 +56,27 @@ export const WINDOW_SEC: Record<SensorHistoryWindow, number> = {
   '1h': 3600,
 };
 
-/** Average dwell time per state (min, max seconds). Tunable per state. */
+/**
+ * Sensor personality — determined by the first PRNG value per sensor.
+ * Gives visual variety: some fast toggling, some slow, some mostly stuck.
+ */
+interface SensorPersonality {
+  /** Dwell time multiplier (< 1 = fast, > 1 = slow). */
+  dwellScale: number;
+  /** Probability of actually transitioning (< 1 = tends to stay in current state). */
+  transitionProb: number;
+}
+
+const PERSONALITIES: SensorPersonality[] = [
+  { dwellScale: 1.0, transitionProb: 1.0 },   // normal
+  { dwellScale: 0.3, transitionProb: 1.0 },   // fast toggler
+  { dwellScale: 3.0, transitionProb: 1.0 },   // slow, long dwells
+  { dwellScale: 1.0, transitionProb: 0.15 },  // mostly stuck (always-high or always-low)
+  { dwellScale: 0.6, transitionProb: 0.8 },   // medium-fast, occasional skip
+  { dwellScale: 5.0, transitionProb: 0.5 },   // very slow, half-transitions skipped
+];
+
+/** Base dwell time per state (min, max seconds). Scaled by personality. */
 const DWELL_SEC: Record<WebSensorState, [number, number]> = {
   low:     [3, 12],
   high:    [1, 4],
@@ -146,14 +166,18 @@ export function generateHistory(
   const seed = hashPath(sensorPath);
   const rng = mulberry32(seed);
 
+  // Pick a deterministic personality based on the first PRNG value.
+  const personalityIdx = Math.floor(rng() * PERSONALITIES.length);
+  const personality = PERSONALITIES[personalityIdx];
+
   const ts: number[] = [];
   const state: WebSensorState[] = [];
   const numeric: number[] = [];
 
   const startMs = nowMs - windowSec * 1000;
 
-  // Initial state anchored at window start.
-  let cur: WebSensorState = 'low';
+  // Initial state: "stuck" personalities start high or low based on seed.
+  let cur: WebSensorState = rng() > 0.5 ? 'high' : 'low';
   let tMs = startMs;
 
   // Emit initial entry at the exact window start so charts have an anchor.
@@ -166,11 +190,18 @@ export function generateHistory(
   let steps = 0;
 
   while (tMs < nowMs && steps < HARD_CAP) {
-    const dwell = sampleDwell(rng, cur);
+    const dwell = sampleDwell(rng, cur) * personality.dwellScale;
     tMs += dwell * 1000;
     if (tMs > nowMs) tMs = nowMs;
 
-    const next = pickNext(rng, TRANSITIONS[cur], isInt);
+    // Personality may suppress transitions (sensor stays in current state).
+    let next: WebSensorState;
+    if (rng() < personality.transitionProb) {
+      next = pickNext(rng, TRANSITIONS[cur], isInt);
+    } else {
+      next = cur;  // stay in current state
+      rng();       // consume PRNG value to keep determinism
+    }
     cur = next;
 
     ts.push(tMs);

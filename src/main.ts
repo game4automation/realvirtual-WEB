@@ -37,6 +37,7 @@ import { TransportStatsPlugin } from './plugins/transport-stats-plugin';
 import { CameraEventsPlugin } from './plugins/camera-events-plugin';
 import { DriveOrderPlugin } from './plugins/drive-order-plugin';
 import { CameraStartPosPlugin } from './plugins/camera-startpos-plugin';
+import { KioskPlugin } from './plugins/kiosk-plugin';
 import { WebSensorPlugin } from './plugins/web-sensor-plugin';
 import { RapierPhysicsPlugin } from './core/engine/rapier-physics-plugin';
 import { loadPhysicsSettings } from './core/hmi/physics-settings-store';
@@ -199,6 +200,7 @@ async function init() {
     .use(new TransportStatsPlugin())
     .use(new CameraEventsPlugin())
     .use(new CameraStartPosPlugin())
+    .use(new KioskPlugin())
     .use(new WebSensorPlugin())
     .use(new RvExtrasEditorPlugin());
 
@@ -386,6 +388,15 @@ async function init() {
     initTestRunner();
     const { DebugEndpointPlugin } = await import('./plugins/debug-endpoint-plugin');
     viewer.use(new DebugEndpointPlugin());
+
+    // --- Dev-only: expose window.__rvInstruction for Playwright E2E + manual QA ---
+    const instrStore = await import('./core/hmi/instruction-store');
+    (window as unknown as { __rvInstruction?: unknown }).__rvInstruction = {
+      show: instrStore.showInstruction,
+      hide: instrStore.hideInstruction,
+      clearBySource: instrStore.clearBySource,
+      list: instrStore.getInstructions,
+    };
   }
 
   // --- MCP bridge: DEV mode or ?mcp=1 URL param ---

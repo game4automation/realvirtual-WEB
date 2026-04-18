@@ -99,7 +99,7 @@ npm test             # Run all tests (headless Chromium via Playwright)
 | Charts | Apache ECharts 5 |
 | Build Tool | Vite 6 |
 | Language | TypeScript 5.7 |
-| Testing | Vitest + Playwright (1300+ tests) |
+| Testing | Vitest (browser-mode) + Playwright |
 
 ## Industrial Connectivity
 
@@ -130,7 +130,7 @@ src/
   plugins/           # Built-in plugins (multiuser, annotations, FPV, XR)
     demo/            # Demo charts and HMI (OEE, cycle time, energy, drive/sensor overlays)
     models/          # Per-model plugins (auto-loaded when a model is selected)
-tests/               # 1300+ Vitest browser tests
+tests/               # Vitest browser-mode tests
 e2e/                 # Playwright E2E tests
 public/models/       # GLB model files
 ```
@@ -193,7 +193,7 @@ For the full plugin API — UI slots, event bus, hooks, context menus, and toolt
 | [Plugin Development](doc-extending-webviewer.md) | Plugin system, custom components, UI slots, hooks |
 | [Multiuser System](doc-multiuser-system.md) | Sessions, shared views, avatars *(Beta)* |
 | [Debugging Guide](doc-web-debugging.md) | Debugging tools and workflow |
-| [API Reference](doc-webviewer-interface.md) | RVViewer public API |
+| [Industrial Interfaces](doc-webviewer-interface.md) | WebSocket Realtime, ctrlX, MQTT, signal flow, implementing new interfaces |
 
 ## AI-Enabled Development (MCP)
 

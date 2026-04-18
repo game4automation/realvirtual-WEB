@@ -78,26 +78,26 @@ function generateOeeDummyData(): OeeTimeBucket[] {
     let base: Record<string, number>;
 
     if ((hour === 6 && !isHalf) || (hour === 14 && !isHalf) || (hour === 22 && !isHalf)) {
-      // Shift handover
-      base = { production: 25, waiting: 40, blocked: 0, loading: 30, toolchange: 5, downtime: 0 };
+      // Shift handover — brief dip, still ~80% productive
+      base = { production: 72, waiting: 8, blocked: 2, loading: 3, toolchange: 8, downtime: 7 };
     } else if (hour === 12 && !isHalf) {
-      // Lunch break
-      base = { production: 10, waiting: 60, blocked: 0, loading: 20, toolchange: 10, downtime: 0 };
+      // Lunch break — lowest point, ~75% productive
+      base = { production: 65, waiting: 12, blocked: 3, loading: 5, toolchange: 10, downtime: 5 };
     } else if (hour >= 22 || hour < 6) {
-      // Night shift
-      base = { production: 70, waiting: 10, blocked: 5, loading: 5, toolchange: 2, downtime: 8 };
+      // Night shift — ~90% productive
+      base = { production: 84, waiting: 3, blocked: 2, loading: 2, toolchange: 6, downtime: 3 };
     } else if (hour >= 6 && hour < 14) {
-      // Day shift
-      base = { production: 80, waiting: 5, blocked: 5, loading: 3, toolchange: 2, downtime: 5 };
+      // Day shift — ~94% productive (above target)
+      base = { production: 87, waiting: 2, blocked: 1, loading: 1, toolchange: 7, downtime: 2 };
     } else {
-      // Afternoon shift
-      base = { production: 75, waiting: 8, blocked: 6, loading: 3, toolchange: 2, downtime: 6 };
+      // Afternoon shift — ~92% productive (at target)
+      base = { production: 85, waiting: 3, blocked: 2, loading: 1, toolchange: 7, downtime: 2 };
     }
 
-    // Add ±5% jitter
+    // Add jitter proportional to the base value (±10% of each category)
     const jittered: Record<string, number> = {};
     for (const [key, val] of Object.entries(base)) {
-      jittered[key] = Math.max(0, val + (rand() - 0.5) * 10);
+      jittered[key] = Math.max(0, val + (rand() - 0.5) * val * 0.2);
     }
 
     const normalized = normalizeTo100(jittered);
@@ -121,10 +121,10 @@ function generateOeeDummyData(): OeeTimeBucket[] {
 function generatePartsDummyData(): PartsHourBucket[] {
   const rand = seededRandom(123);
   const baseParts = [
-    24, 23, 22, 23, 23, 21,   // 00-05: night
-    10, 17, 27, 30, 31, 30,   // 06-11: handover + day ramp
-    11, 29, 31, 32, 32, 30,   // 12-17: lunch + afternoon
-    10, 26, 29, 28, 25, 24,   // 18-23: break + night
+    31, 30, 29, 30, 31, 30,   // 00-05: night shift (steady)
+    28, 32, 34, 33, 34, 33,   // 06-11: handover + day ramp
+    27, 33, 35, 34, 33, 32,   // 12-17: lunch dip + afternoon
+    28, 31, 33, 32, 31, 30,   // 18-23: evening shift
   ];
 
   return baseParts.map((base, i) => ({

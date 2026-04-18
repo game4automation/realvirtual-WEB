@@ -99,6 +99,12 @@ export interface UberResult {
   bakedMeshCount: number;
   /** Shared uber-material reference, or null if nothing was eligible */
   sharedMaterial: RVUberMaterial | null;
+  /** Meshes that shared an already-baked BufferGeometry instead of cloning (plan-153) */
+  sharedGeometryReuses: number;
+  /** Meshes that had to clone their geometry because of a material conflict (plan-153) */
+  clonedGeometryCount: number;
+  /** Orphaned source BufferGeometries that Pass 3 disposed (plan-153) */
+  disposedSourceGeometries: number;
 }
 
 /**
@@ -249,11 +255,20 @@ export function applyUberMaterial(
 ): UberResult {
   const eligible = classifyUberEligible(dedupedMaterials);
   if (eligible.size === 0) {
-    return { eligibleMaterialCount: 0, bakedMeshCount: 0, sharedMaterial: null };
+    return {
+      eligibleMaterialCount: 0,
+      bakedMeshCount: 0,
+      sharedMaterial: null,
+      sharedGeometryReuses: 0,
+      clonedGeometryCount: 0,
+      disposedSourceGeometries: 0,
+    };
   }
 
   const sharedUber = new RVUberMaterial();
   let bakedMeshCount = 0;
+  let sharedGeometryReuses = 0;
+  let clonedGeometryCount = 0;
   // Track every source geometry we replace so we can dispose the ones that
   // nothing references anymore after the pass. GLTFLoader often shares a
   // single BufferGeometry across several meshes (e.g. 100 identical bolts,
@@ -293,6 +308,13 @@ export function applyUberMaterial(
     // use the deduped (but not uber-collapsed) materials.
     if (Array.isArray(mesh.material)) return;
 
+    // Skip pipe and tank meshes — ProcessIndustryPlugin swaps their materials
+    // at runtime to show the fluid color. Uber baking freezes the color into
+    // a shared vertex attribute, which would make `mesh.material = newMat` a
+    // visual no-op.
+    if (mesh.userData?._rvType === 'Pipe' || mesh.parent?.userData?._rvType === 'Pipe') return;
+    if (mesh.userData?._rvType === 'Tank' || mesh.parent?.userData?._rvType === 'Tank') return;
+
     const mat = mesh.material;
     if (!mat || !eligible.has(mat)) return;
 
@@ -307,6 +329,7 @@ export function applyUberMaterial(
       mesh.material = sharedUber;
       mesh.userData._rvUberBaked = true;
       bakedMeshCount++;
+      sharedGeometryReuses++;
       return;
     }
 
@@ -317,12 +340,21 @@ export function applyUberMaterial(
       shareGeometry: canShare,
     });
     bakedMeshCount++;
+    if (canShare) sharedGeometryReuses++;
+    else clonedGeometryCount++;
   });
 
   if (bakedMeshCount === 0) {
     // Predicate matched materials but no live mesh used them — bail out
     // without adding the shared material to the unique set.
-    return { eligibleMaterialCount: eligible.size, bakedMeshCount: 0, sharedMaterial: null };
+    return {
+      eligibleMaterialCount: eligible.size,
+      bakedMeshCount: 0,
+      sharedMaterial: null,
+      sharedGeometryReuses: 0,
+      clonedGeometryCount: 0,
+      disposedSourceGeometries: 0,
+    };
   }
 
   // Pass 2: dispose source geometries that no surviving mesh still uses.
@@ -352,12 +384,16 @@ export function applyUberMaterial(
 
   debug('loader',
     `[UberMaterial] ${eligible.size} untextured materials → 1 shared ` +
-    `(${bakedMeshCount} meshes baked, ${disposedSources} orphaned source geometries disposed)`
+    `(${bakedMeshCount} meshes baked: ${sharedGeometryReuses} shared / ${clonedGeometryCount} cloned, ` +
+    `${disposedSources} orphaned source geometries disposed)`
   );
 
   return {
     eligibleMaterialCount: eligible.size,
     bakedMeshCount,
     sharedMaterial: sharedUber,
+    sharedGeometryReuses,
+    clonedGeometryCount,
+    disposedSourceGeometries: disposedSources,
   };
 }

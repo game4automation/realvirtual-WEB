@@ -9,6 +9,7 @@ import { RVErraticDriver } from './rv-erratic';
 import { RVDriveSimple } from './rv-drive-simple';
 import { RVDriveCylinder } from './rv-drive-cylinder';
 import { AABB } from './rv-aabb';
+import type { EventEmitter } from '../rv-events';
 // Side-effect imports: trigger registerComponent() at module load
 import './rv-transport-surface';
 import './rv-sensor';
@@ -19,6 +20,10 @@ import './rv-grip-target';
 import './rv-connect-signal';
 import './rv-safety-door';
 import './rv-web-sensor';
+// Pipeline components — class constructors also register capabilities + tooltip resolvers
+import { RVPipe } from './rv-pipe';
+import { RVTank } from './rv-tank';
+import { RVPump } from './rv-pump';
 import { applySchema, resolveComponentRefs, getRegisteredFactories, registerCapabilities, type RVComponent, type ComponentContext, type ComponentSchema } from './rv-component-registry';
 import type { GizmoOverlayManager } from './rv-gizmo-manager';
 import { RVTransportManager } from './rv-transport-manager';
@@ -47,31 +52,9 @@ gltfLoader.setDRACOLoader(dracoLoader);
 
 // ─── Register capabilities for types without factories ────────────
 
-// Pipeline types (no factory, just userData._rvType)
-registerCapabilities('Pipe', {
-  hoverable: true,
-  tooltipType: 'pipe',
-  badgeColor: '#26c6da',
-  hoverEnabledByDefault: true,
-  hoverPriority: 10,
-  pinPriority: 5,
-});
-registerCapabilities('Tank', {
-  hoverable: true,
-  tooltipType: 'tank',
-  badgeColor: '#42a5f5',
-  hoverEnabledByDefault: true,
-  hoverPriority: 10,
-  pinPriority: 5,
-});
-registerCapabilities('Pump', {
-  hoverable: true,
-  tooltipType: 'pump',
-  badgeColor: '#7e57c2',
-  hoverEnabledByDefault: true,
-  hoverPriority: 10,
-  pinPriority: 5,
-});
+// Pipeline Pipe/Tank/Pump capabilities are registered by the RVPipe/RVTank/RVPump
+// class modules themselves (see rv-pipe.ts / rv-tank.ts / rv-pump.ts) via
+// registerTooltipComponent(). ProcessingUnit stays here until it's promoted too.
 registerCapabilities('ProcessingUnit', {
   hoverable: true,
   tooltipType: 'processing-unit',
@@ -205,6 +188,9 @@ export interface LoadGLBOptions {
   isWebGPU?: boolean;
   /** Optional gizmo manager — passed into ComponentContext so components (e.g. WebSensor) can create overlays. */
   gizmoManager?: GizmoOverlayManager;
+  /** Optional viewer event bus — passed into ComponentContext for components
+   *  that need to react to UI↔engine signals (e.g. RVSafetyDoor visibility toggle). */
+  events?: EventEmitter;
 }
 
 /** Pending component awaiting resolveComponentRefs + init() in Step 2 */
@@ -543,46 +529,23 @@ export function traverseAndRegister(
     }
 
     // DrivesRecording / DrivesRecorder / ReplayRecording (special cases)
-    // Collect Pipeline nodes (Pipe, ResourceTank, Pump, ProcessingUnit)
+    // Pipeline components (Pipe, ResourceTank, Pump) — construct as RVComponent classes.
+    // Each class validates extras, applies schema, attaches itself to
+    // node.userData._rvComponentInstance, and syncs the legacy _rvPipe/_rvTank/_rvPump
+    // userData view so downstream consumers (rv-pipe-flow, rv-tank-fill)
+    // continue to work unchanged.
     if (rv['Pipe']) {
-      validateExtras('Pipe', rv['Pipe'] as Record<string, unknown>);
-      node.userData._rvType = 'Pipe';
-      const pd = rv['Pipe'] as Record<string, unknown>;
-      const sourceRef = pd['source'] as { path?: string } | undefined;
-      const destRef = pd['destination'] as { path?: string } | undefined;
-      node.userData._rvPipe = {
-        resourceName: pd['resourceName'] as string ?? '',
-        flowRate: pd['flowRate'] as number ?? 0,
-        sourcePath: sourceRef?.path ?? null,
-        destinationPath: destRef?.path ?? null,
-        uvDirection: pd['uvDirection'] as number ?? 1,
-      };
+      new RVPipe(node, rv['Pipe'] as Record<string, unknown>);
       pipeNodes.push(node);
       registry.register('Pipe', path, node);
     }
     if (rv['ResourceTank']) {
-      validateExtras('ResourceTank', rv['ResourceTank'] as Record<string, unknown>);
-      const td = rv['ResourceTank'] as Record<string, unknown>;
-      node.userData._rvType = 'Tank';
-      node.userData._rvTank = {
-        resourceName: td['resourceName'] as string ?? '',
-        capacity: td['capacity'] as number ?? 0,
-        amount: td['amount'] as number ?? 0,
-        pressure: td['pressure'] as number ?? 0,
-        temperature: td['temperature'] as number ?? 0,
-      };
+      new RVTank(node, rv['ResourceTank'] as Record<string, unknown>);
       tankNodes.push(node);
       registry.register('Tank', path, node);
     }
     if (rv['Pump']) {
-      validateExtras('Pump', rv['Pump'] as Record<string, unknown>);
-      node.userData._rvType = 'Pump';
-      const pumpData = rv['Pump'] as Record<string, unknown>;
-      const pipeRef = pumpData['pipe'] as { path?: string } | undefined;
-      node.userData._rvPump = {
-        flowRate: pumpData['flowRate'] as number ?? 0,
-        pipePath: pipeRef?.path ?? null,
-      };
+      new RVPump(node, rv['Pump'] as Record<string, unknown>);
       pumpNodes.push(node);
       registry.register('Pump', path, node);
     }
@@ -732,11 +695,36 @@ export function initializeComponents(
   transportManager: RVTransportManager,
   root: Object3D,
   gizmoManager?: GizmoOverlayManager,
+  events?: EventEmitter,
 ): void {
-  const context: ComponentContext = { registry, signalStore, scene, transportManager, root, gizmoManager };
+  const context: ComponentContext = { registry, signalStore, scene, transportManager, root, gizmoManager, events };
   for (const { component } of pending) {
     resolveComponentRefs(component as unknown as Record<string, unknown>, registry);
     component.init(context);
+  }
+}
+
+/**
+ * Late-init pass: invokes `onSceneReady()` on every pending component that
+ * implements it. Called by the scene loader AFTER kinematic re-parenting
+ * (Phase 8b), so components that need the final child hierarchy (e.g. for
+ * AABB-driven gizmos like RVSafetyDoor) see the reparented meshes.
+ */
+export function runOnSceneReady(
+  pending: PendingComponent[],
+  registry: NodeRegistry,
+  signalStore: SignalStore,
+  scene: Scene,
+  transportManager: RVTransportManager,
+  root: Object3D,
+  gizmoManager?: GizmoOverlayManager,
+  events?: EventEmitter,
+): void {
+  const context: ComponentContext = { registry, signalStore, scene, transportManager, root, gizmoManager, events };
+  for (const { component } of pending) {
+    if (typeof component.onSceneReady === 'function') {
+      component.onSceneReady(context);
+    }
   }
 }
 
@@ -1049,7 +1037,7 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
   registerNodeAliases(renamedNodes, registry, signalStore);
 
   // Phase 7: Initialize components (Step 2 "Start")
-  initializeComponents(traverseResult.pending, registry, signalStore, scene, manager, root, options?.gizmoManager);
+  initializeComponents(traverseResult.pending, registry, signalStore, scene, manager, root, options?.gizmoManager, options?.events);
 
   // Phase 8: Build groups
   const groups = buildGroups(traverseResult.groupNodes, registry);
@@ -1074,6 +1062,11 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
     }
     debug('loader', `[Kinematic] Recomputed ${count} registry paths, ${remap.size} signal paths after re-parenting`);
   }
+
+  // Phase 8d: Late-init pass — components opting into onSceneReady() now see
+  // the final hierarchy (kinematic re-parenting complete). Used by gizmos that
+  // need an accurate subtree AABB (e.g. RVSafetyDoor floor halo + label).
+  runOnSceneReady(traverseResult.pending, registry, signalStore, scene, manager, root, options?.gizmoManager, options?.events);
 
   // Phase 9: WebGPU compatibility fixes
   applyWebGPUFixes(root, options?.isWebGPU ?? false);

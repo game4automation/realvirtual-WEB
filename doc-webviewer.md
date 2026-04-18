@@ -28,8 +28,8 @@ Drop `.glb` files into `public/models/` — they appear automatically in the mod
 ```bash
 npm run build        # Production build → dist/
 npm run preview      # Preview production build
-npm test             # Run all 226 tests (headless Chromium)
-npm run test:watch   # Watch mode (328 tests)
+npm test             # Run all tests (headless Chromium via Playwright)
+npm run test:watch   # Watch mode
 ```
 
 ## Architecture
@@ -40,56 +40,80 @@ src/
 ├── rv-test-runner.ts                    # Dev-only in-browser test runner
 ├── core/
 │   ├── rv-viewer.ts                     # RVViewer facade (scene, sim loop, plugins, events)
-│   ├── rv-camera-manager.ts             # CameraManager (projection, animation, viewport offset)
-│   ├── rv-visual-settings-manager.ts    # VisualSettingsManager (lighting, shadows, tone mapping)
+│   ├── rv-camera-manager.ts             # Camera (projection, animation, viewport offset)
+│   ├── rv-visual-settings-manager.ts    # Lighting, shadows, tone mapping
+│   ├── rv-app-config.ts                 # App config singleton (settings.json, lock mode)
 │   ├── rv-plugin.ts                     # RVViewerPlugin interface (lifecycle + optional UI slots)
-│   ├── rv-model-plugin-manager.ts       # Per-model dynamic plugin loading/unloading
+│   ├── rv-behavior.ts                   # RVBehavior abstract base class (MonoBehaviour-like)
 │   ├── rv-events.ts                     # Typed EventEmitter<TEvents>
-│   ├── rv-behavior.ts                    # RVBehavior abstract base class (MonoBehaviour-like)
-│   ├── rv-ui-plugin.ts                  # UISlot types, UISlotEntry (with pluginId tracking)
-│   ├── rv-ui-registry.ts               # UIPluginRegistry (slot component lookup, register/unregister)
-│   ├── types/
-│   │   └── plugin-types.ts             # Shared plugin API type definitions (decouples core↔plugins)
+│   ├── rv-model-plugin-manager.ts       # Per-model dynamic plugin loading/unloading
+│   ├── rv-ui-plugin.ts                  # UISlot types, UISlotEntry
+│   ├── rv-ui-registry.ts                # UIPluginRegistry (slot component lookup)
+│   ├── maintenance-parser.ts            # MaintenancePanel content parser
+│   ├── types/plugin-types.ts            # Shared plugin API types (decouples core↔plugins)
 │   ├── engine/                          # Simulation engine subsystems
-│   │   ├── rv-scene-loader.ts           # GLB loading, component construction, NodeRegistry population
-│   │   ├── rv-node-registry.ts          # Centralized object discovery (path, type, hierarchy)
-│   │   ├── rv-component-registry.ts     # Schema-based auto-mapping (Unity C# → TypeScript)
-│   │   ├── rv-model-config.ts           # Model-specific plugin config (modelname.json + GLB extras)
-│   │   ├── rv-plugin-loader.ts          # Dynamic ESM plugin loading (external .js plugins)
-│   │   ├── rv-drive.ts                  # RVDrive (ported from Drive.cs)
-│   │   ├── rv-drive-simple.ts           # RVDriveSimple (companion drive)
-│   │   ├── rv-drive-cylinder.ts         # RVDriveCylinder (companion drive)
-│   │   ├── rv-drives-playback.ts        # Frame-based recording playback
-│   │   ├── rv-transport-manager.ts      # Sources → Transport → Sensors → Sinks
-│   │   ├── rv-transport-surface.ts      # AABB-based conveyor surface
-│   │   ├── rv-mu.ts                     # RVMovingUnit
-│   │   ├── rv-source.ts                 # MU spawner (interval/distance modes)
+│   │   ├── rv-scene-loader.ts           # GLB loading, two-phase component construction
+│   │   ├── rv-node-registry.ts          # Object discovery (path, type, hierarchy)
+│   │   ├── rv-component-registry.ts     # Schema-based auto-mapping (C# → TS) + capability registry
+│   │   ├── rv-model-config.ts           # Per-model plugin config (modelname.json + GLB extras)
+│   │   ├── rv-plugin-loader.ts          # Dynamic ESM plugin loading
+│   │   ├── rv-simulation-loop.ts        # Fixed 60 Hz accumulator (XR-compatible)
+│   │   ├── rv-debug.ts                  # Structured category-based debug logging + ring buffer
+│   │   ├── rv-constants.ts              # Shared numeric constants (MM_TO_METERS, etc.)
+│   │   ├── rv-coordinate-utils.ts       # Unity ↔ glTF coord conversions
+│   │   ├── rv-active-only.ts            # Active-only sub-tree marker
+│   │   │
+│   │   │── # Components (ports of Unity C#) ───────────────────────────────
+│   │   ├── rv-drive.ts                  # RVDrive (Drive.cs)
+│   │   ├── rv-drive-simple.ts           # Drive_Simple
+│   │   ├── rv-drive-cylinder.ts         # Drive_Cylinder
+│   │   ├── rv-drives-playback.ts        # DrivesRecorder playback
+│   │   ├── rv-drive-recorder.ts         # Drive data recording
+│   │   ├── rv-replay-recording.ts       # ReplayRecording component
+│   │   ├── rv-erratic.ts                # Drive_ErraticPosition
+│   │   ├── rv-mu.ts                     # MovingUnit (incl. instanced MU pool)
+│   │   ├── rv-source.ts                 # MU spawner
 │   │   ├── rv-sink.ts                   # MU consumer
-│   │   ├── rv-sensor.ts                 # AABB overlap detection
-│   │   ├── rv-aabb.ts                   # Axis-aligned bounding box
-│   │   ├── rv-signal-store.ts           # PLC signal pub/sub store
+│   │   ├── rv-sensor.ts                 # AABB sensor
+│   │   ├── rv-sensor-recorder.ts        # Sensor history sampler
+│   │   ├── rv-transport-surface.ts      # Conveyor surface
+│   │   ├── rv-transport-manager.ts      # Sources → surfaces → sensors → sinks
+│   │   ├── rv-grip.ts / rv-grip-target.ts  # Gripping
+│   │   ├── rv-signal-store.ts           # PLC signal pub/sub
 │   │   ├── rv-signal-wiring.ts          # Signal routing (ConnectSignal)
 │   │   ├── rv-connect-signal.ts         # Signal connection component
-│   │   ├── rv-logic-step.ts             # LogicStep base + all step types
-│   │   ├── rv-logic-engine.ts           # LogicStep tree builder from GLB extras
-│   │   ├── rv-erratic.ts               # RVErraticDriver (random targets)
-│   │   ├── rv-ring-buffer.ts            # Generic RingBuffer for history/stats
-│   │   ├── rv-drive-recorder.ts         # Drive data recording
-│   │   ├── rv-raycast-manager.ts        # Unified raycast system (hover, click, XR)
-│   │   ├── rv-raycast-layers.ts        # Three.js layer constants for selective raycasting
-│   │   ├── rv-drive-hover.ts            # Drive hover/click detection
-│   │   ├── rv-highlight-manager.ts      # Object highlight overlays + edge glow
-│   │   ├── rv-replay-recording.ts       # DrivesRecorder replay
-│   │   ├── rv-simulation-loop.ts        # Fixed 60Hz accumulator loop (XR-compatible)
-│   │   ├── rv-xr-manager.ts            # WebXR session management (VR/AR)
-│   │   ├── rv-xr-hit-test.ts           # AR hit-test reticle
-│   │   ├── rv-grip.ts                   # Gripping system
-│   │   ├── rv-grip-target.ts            # Grip target positions
+│   │   ├── rv-logic-step.ts             # LogicStep base + step types
+│   │   ├── rv-logic-engine.ts           # LogicStep tree builder
+│   │   ├── rv-pipe-flow.ts              # Process pipe flow propagation
+│   │   ├── rv-pipeline-sim.ts           # Pipeline simulation
+│   │   ├── rv-tank-fill.ts              # Tank fill visualization
+│   │   ├── rv-safety-door.ts            # Safety door / hazard zone halo
+│   │   │
+│   │   │── # Rendering, raycast, optimization ────────────────────────────
+│   │   ├── rv-raycast-manager.ts        # Unified hover/click/XR raycaster
+│   │   ├── rv-raycast-geometry.ts       # BVH groups + face-range hit resolution
+│   │   ├── rv-highlight-manager.ts      # Highlight overlays + edge glow
+│   │   ├── rv-selection-manager.ts      # Selection state + events
+│   │   ├── rv-gizmo-manager.ts          # Generic 3D gizmo overlays (sensors, etc.)
+│   │   ├── rv-mesh-bake.ts              # Static mesh baking
+│   │   ├── rv-static-merge.ts           # Static merge candidates
+│   │   ├── rv-static-merge-uber.ts      # Uber-material static merge
+│   │   ├── rv-kinematic-merge-uber.ts   # Uber-material kinematic merge
+│   │   ├── rv-uber-material.ts          # Uber-material (PBR atlas-shared)
+│   │   ├── rv-material-dedup.ts         # Material deduplication
+│   │   │
+│   │   │── # Plumbing ────────────────────────────────────────────────────
+│   │   ├── rv-aabb.ts                   # AABB primitive
+│   │   ├── rv-ring-buffer.ts            # Generic RingBuffer
 │   │   ├── rv-group-registry.ts         # Group definitions and visibility
-│   │   ├── rv-physics-world.ts          # Rapier.js physics world wrapper
+│   │   ├── rv-physics-world.ts          # Rapier.js wrapper
 │   │   ├── rapier-physics-plugin.ts     # Physics-based transport (replaces kinematic)
-│   │   ├── rv-constants.ts              # Shared numeric constants (MM_TO_METERS, DRAG_THRESHOLD_PX, etc.)
-│   │   ├── rv-debug.ts                  # Structured category-based debug logging
+│   │   ├── rv-xr-manager.ts             # WebXR session management
+│   │   ├── rv-xr-hit-test.ts            # AR hit-test reticle
+│   │   ├── rv-avatar-manager.ts         # Multiuser 3D avatar rendering
+│   │   ├── rv-mcp-tools.ts              # @McpTool / @McpParam decorators
+│   │   ├── rv-component-event-dispatcher.ts # Per-component onHover/onClick/onSelect routing
+│   │   ├── rv-auto-filter-registry.ts   # Type-based auto filter registration
 │   │   └── rv-extras-validator.ts       # Dev-mode GLB extras parity checker
 │   └── hmi/                             # React HMI layout components (MUI-based)
 │       ├── rv-app-config.ts             # App config singleton (settings.json, lock mode, plugins)
@@ -126,14 +150,20 @@ src/
 │       ├── chart-theme.ts              # Shared ECharts theme constants
 │       ├── chart-constants.ts           # Chart color/size constants
 │       ├── group-visibility-store.ts    # Group visibility state
-│       └── tooltip/                     # Generic tooltip system
-│           ├── tooltip-store.ts         # TooltipStore (useSyncExternalStore, priority resolution)
-│           ├── tooltip-registry.ts      # TooltipContentRegistry (content type → React component)
-│           ├── tooltip-utils.ts         # 3D→screen projection, viewport clamping
-│           ├── TooltipLayer.tsx         # Tooltip renderer (glassmorphism, cursor/world/fixed)
-│           ├── DriveTooltipController.tsx # Headless bridge: drive hover → tooltip store
-│           ├── DriveTooltipContent.tsx   # Drive tooltip content (name, speed, position)
-│           └── index.ts                 # Barrel export
+│       └── tooltip/                       # Generic tooltip system
+│           ├── tooltip-store.ts           # TooltipStore (useSyncExternalStore, priority resolution)
+│           ├── tooltip-registry.ts        # TooltipContentRegistry (content-type → React, data resolvers, search resolvers)
+│           ├── tooltip-utils.ts           # 3D→screen projection, viewport clamping
+│           ├── TooltipLayer.tsx           # Tooltip renderer (glassmorphism, cursor/world/fixed)
+│           ├── GenericTooltipController.tsx # Single headless controller — reads rv_extras + _rvPdfLinks, calls resolvers
+│           ├── DriveTooltipContent.tsx    # Drive content provider + data resolver
+│           ├── MetadataTooltipContent.tsx # RuntimeMetadata content provider
+│           ├── PipeTooltipContent.tsx     # Pipe/flow content provider
+│           ├── PumpTooltipContent.tsx     # Pump content provider
+│           ├── TankTooltipContent.tsx     # Tank content provider
+│           ├── ProcessingUnitTooltipContent.tsx
+│           ├── PdfTooltipSection.tsx      # Generic PDF links section (auto-stacked)
+│           └── index.ts                   # Barrel export
 ├── private-stubs/                       # No-op fallbacks when private folder absent
 │   ├── private-plugins.ts              # export function registerPrivatePlugins() {} // no-op
 │   └── custom/
@@ -145,81 +175,45 @@ src/
 │   ├── websocket-realtime-interface.ts  # WebSocket Realtime protocol
 │   └── ctrlx-interface.ts              # Bosch Rexroth ctrlX protocol
 ├── plugins/                             # Plugin implementations
-│   ├── sensor-monitor-plugin.ts         # Event-based sensor monitoring (core)
-│   ├── transport-stats-plugin.ts        # Transport statistics (10Hz RingBuffer, core)
-│   ├── camera-events-plugin.ts          # Camera animation done events (core)
-│   ├── drive-order-plugin.ts            # Topological drive sorting for CAM/Gear (core)
-│   ├── multiuser-plugin.ts             # Multi-user presence + avatars
-│   ├── webxr-plugin.ts                 # WebXR VR/AR support
-│   ├── fpv-plugin.tsx                  # First-person view navigation
-│   ├── annotation-plugin.ts            # 3D markers, labels, drawing
-│   ├── mcp-bridge-plugin.ts            # Claude MCP WebSocket bridge (dev)
-│   ├── debug-endpoint-plugin.ts        # Debug HTTP endpoint (dev)
-│   ├── demo/                            # Demo model plugins (loaded per-model)
-│   │   ├── index.ts                    # Barrel exports (no global registration)
-│   │   ├── kpi-demo-plugin.ts          # OEE/Parts/CycleTime demo data
-│   │   ├── demo-hmi-plugin.tsx         # Demo KPI cards, buttons, messages
-│   │   ├── DriveChartOverlay.tsx       # Real-time drive position/speed chart
-│   │   ├── SensorChartOverlay.tsx      # Real-time sensor timeline chart
-│   │   ├── OeeChart.tsx               # OEE breakdown chart
-│   │   ├── PartsChart.tsx             # Parts per hour chart
-│   │   ├── CycleTimeChart.tsx         # Cycle time scatter chart
-│   │   ├── EnergyChart.tsx            # Power consumption chart
-│   │   ├── test-axes-plugin.tsx        # Manual axis control slider
-│   │   ├── machine-control-plugin.ts   # Machine start/stop panel
-│   │   ├── maintenance-plugin.ts       # Maintenance checklists
-│   │   └── perf-test-plugin.ts         # Performance benchmarking (?perf)
+│   │  # Core (always loaded) ──────────────────────────────────────────
+│   ├── sensor-monitor-plugin.ts         # Event-based sensor monitoring
+│   ├── transport-stats-plugin.ts        # 10 Hz RingBuffer transport stats
+│   ├── camera-events-plugin.ts          # Camera animation done events
+│   ├── drive-order-plugin.ts            # Topological CAM/Gear drive sort
+│   ├── debug-endpoint-plugin.ts         # /__api/debug HTTP endpoint (dev)
+│   ├── mcp-bridge-plugin.ts             # Claude MCP WebSocket bridge (dev)
+│   │  # Optional / model-specific ─────────────────────────────────────
+│   ├── multiuser-plugin.ts              # Multi-user presence + avatars + relay
+│   ├── webxr-plugin.ts                  # WebXR VR/AR support
+│   ├── fpv-plugin.tsx                   # First-person WASD navigation
+│   ├── annotation-plugin.ts             # 3D markers, labels, drawing
+│   ├── rv-annotation-renderer.ts        # Annotation render helpers
+│   ├── aas-link-plugin.tsx              # AAS / AASX linking + tooltip
+│   ├── aas-link-parser.ts               # AASX ZIP/index parser
+│   ├── docs-browser-plugin.tsx          # PDF / docs browser panel
+│   ├── camera-startpos-plugin.tsx       # Per-model camera start position
+│   ├── blueprint-plugin.ts              # Blueprint / 2D plan view
+│   ├── drive-recorder-plugin.ts         # Drive recording (runtime)
+│   ├── sensor-recorder-plugin.ts        # Sensor history recording
+│   ├── order-manager-plugin.tsx         # Production order manager
+│   │  # Demo model plugins (loaded per-model) ─────────────────────────
+│   ├── demo/
+│   │   ├── index.ts                     # Barrel exports
+│   │   ├── kpi-demo-plugin.ts           # OEE/Parts/CycleTime demo data
+│   │   ├── demo-hmi-plugin.tsx          # Demo KPI cards, buttons, messages
+│   │   ├── machine-control-plugin.ts    # Machine start/stop panel
+│   │   ├── maintenance-plugin.ts        # Maintenance checklists
+│   │   ├── test-axes-plugin.tsx         # Manual axis control slider
+│   │   ├── perf-test-plugin.ts          # Performance benchmark (?perf)
+│   │   ├── DriveChartOverlay.tsx, SensorChartOverlay.tsx
+│   │   └── OeeChart.tsx, PartsChart.tsx, CycleTimeChart.tsx, EnergyChart.tsx
 │   └── models/                          # Per-model plugin entry points
-│       └── DemoRealvirtualWeb/
-│           └── index.ts                # Registers all demo model plugins
-├── hooks/                               # React hooks
-│   ├── use-viewer.ts                    # RVViewer context access
-│   ├── use-plugin.ts                    # usePlugin<T>(id) for type-safe plugin access
-│   ├── use-simulation-event.ts          # Event subscription with auto-cleanup
-│   ├── use-slot.ts                      # useSlot(slot) for UI rendering
-│   ├── use-sensor-state.ts              # Event-based sensor state
-│   ├── use-transport-stats.ts           # Transport counters
-│   ├── use-drives.ts                    # Drive list and hover state
-│   ├── use-drive-chart.ts              # Drive chart toggle
-│   ├── use-drive-filter.ts             # Drive search/filter
-│   ├── use-signal.ts                    # Signal store subscriptions
-│   ├── use-tooltip.ts                   # useTooltipState() hook
-│   ├── use-mobile-layout.ts            # Mobile detection
-│   ├── use-multiuser.ts                # Multiuser state
-│   ├── use-machine-control.ts          # Machine control state
-│   ├── use-maintenance-mode.ts         # Maintenance mode state
-│   ├── use-groups-overlay.ts           # Group visibility
-│   └── use-interface-status.ts          # Interface connection status
-└── tests/
-    ├── glb-extras.test.ts               # GLB structure (21 tests)
-    ├── rv-node-registry.test.ts         # NodeRegistry (34 tests)
-    ├── rv-transport.test.ts             # Transport simulation (17 tests)
-    ├── rv-logic-steps.test.ts           # LogicStep sequencing (33 tests)
-    ├── rv-signal-store.test.ts          # Signal pub/sub (23 tests)
-    ├── rv-drives-playback.test.ts       # Recording playback (10 tests)
-    ├── rv-aabb.test.ts                  # AABB collision (7 tests)
-    ├── rv-events-typed.test.ts          # Typed EventEmitter (7 tests)
-    ├── rv-plugin-lifecycle.test.ts      # Plugin lifecycle (8 tests)
-    ├── rv-sensor-monitor-plugin.test.ts # SensorMonitor (6 tests)
-    ├── rv-ui-registry.test.ts           # UI registry (5 tests)
-    ├── rv-simulation-loop-xr.test.ts    # SimLoop XR compat (5 tests)
-    ├── rv-xr-manager.test.ts            # XR platform detection (8 tests)
-    ├── rv-xr-hit-test.test.ts           # AR hit-test (5 tests)
-    ├── kpi-utils.test.ts                # KPI utilities (40 tests)
-    ├── rv-step-serializer.test.ts       # LogicStep serializer (5 tests)
-    ├── rv-app-config.test.ts            # App config, lock mode, store overrides (15 tests)
-    ├── rv-model-config.test.ts          # Model config, plugin activation modes (25 tests)
-    ├── rv-component-registry.test.ts    # Component auto-mapping (tests)
-    ├── rv-group-registry.test.ts        # Group parsing/registry (tests)
-    ├── rv-layout-store.test.ts          # Layout planner store (16 tests)
-    ├── rv-layout-persistence.test.ts    # Layout JSON serialization (5 tests)
-    ├── rv-layout-grid.test.ts           # Grid snap math (7 tests)
-    ├── rv-layout-model-cache.test.ts    # GLB model cache (6 tests)
-    ├── rv-layout-bounds.test.ts         # Floor alignment (4 tests)
-    ├── rv-layout-lifecycle.test.ts      # Layout plugin lifecycle (6 tests)
-    ├── rv-layout-localstorage.test.ts   # Layout localStorage persistence (8 tests)
-    └── ...                              # Additional test suites (67 files total, 900+ tests)
+│       └── DemoRealvirtualWeb/index.ts  # Registers demo model plugins
+├── hooks/                               # React hooks (see hook table in extending guide)
+└── ...
 ```
+
+**Tests** live in [tests/](tests/) (Vitest browser-mode) and [e2e/](e2e/) (Playwright). For the current inventory run `ls tests/*.test.*`; for a particular suite, run `npx vitest run -t '<name>'`.
 
 > **Note:** The `~` suffix in `realvirtual-WebViewer~` prevents Unity from importing `node_modules/`.
 
@@ -329,15 +323,15 @@ In selective mode, core plugins (physics, drive sorting, sensor monitoring) alwa
 
 See **[Model-Specific Plugin Configuration](#model-specific-plugin-configuration)** for how to declare `rv_plugins`.
 
-Plugins with `slots` automatically register React components into HMI layout positions (kpi-bar, button-group, messages, views, search-bar, settings-tab).
+Plugins with `slots` automatically register React components into HMI layout positions: `kpi-bar`, `button-group`, `messages`, `views`, `search-bar`, `settings-tab`, `toolbar-button`, `overlay`. See **[doc-extending-webviewer.md § 5](doc-extending-webviewer.md)** for the full slot reference.
 
 ### Plugin Tiers
 
 | Tier | Loaded when | Can be removed | Examples |
 |------|------------|----------------|----------|
-| **Core** (`core: true`) | Always — survive model switches | No (`removePlugin()` blocked) | drive-order, sensor-monitor, transport-stats, camera-events, rapier-physics, extras-editor |
-| **Global Private** | Always when private folder present | Yes | layout-planner, des-plugin, des-hmi |
-| **Model-Specific** | Only when matching GLB is loaded | Yes (auto-removed on model switch) | kpi-demo, demo-hmi, webxr, multiuser, fpv, annotations |
+| **Core** (`core: true`) | Always — survive model switches | No (`removePlugin()` blocked); use `disablePlugin()` | `drive-order`, `sensor-monitor`, `transport-stats`, `camera-events`, `rapier-physics`, `rv-extras-editor`, `debug-endpoint`, `mcp-bridge` |
+| **Global Private** | Always when private folder present | Yes | `layout-planner`, `des-plugin`, `des-hmi` |
+| **Model-Specific** | Only when matching GLB is loaded | Yes (auto-removed on model switch) | `kpi-demo`, `demo-hmi`, `webxr`, `multiuser`, `fpv`, `annotations`, `aas-link`, `docs-browser`, `camera-startpos`, `blueprint`, `drive-recorder`, `sensor-recorder`, `order-manager`, `machine-control`, `maintenance` |
 
 Model-specific plugins are defined in `plugins/index.ts` files per model folder. The `ModelPluginManager` auto-discovers them via `import.meta.glob` and loads/unloads them when models are switched. See **[doc-extending-webviewer.md](doc-extending-webviewer.md) § Per-Model Plugin System** for how to create model-specific plugins.
 
@@ -361,29 +355,52 @@ Change-only notification. Batch semantics for `setMany()`.
 ### Drive Physics
 Ported from Drive.cs — acceleration/deceleration, position limits, rotation and linear movement. CAM/Gear master-slave dependencies resolved via topological sort.
 
+### WebSensor (3D-HMI status indicator)
+Pure UI marker authored in Unity (`Packages/io.realvirtual.professional/Runtime/WebViewerHMI/WebSensor.cs`) and rendered exclusively by the WebViewer (`rv-web-sensor.ts`). Four visual states — **Low / High / Warning / Error** plus an **Unbound** fallback — driven by either:
+
+- a **PLCOutputBool** (`SignalBool`) → `false=Low`, `true=High`, OR
+- a **PLCOutputInt** (`SignalInt`) → mapped via flexible `IntStateMap` string (default `0=Low, 1=High, 2=Warning, 3=Error`)
+
+ISA-101-aligned colors (grey / blue / amber / red), with amber blinking at 1 Hz and red at 2 Hz. The visualization is delegated to the generic `GizmoOverlayManager` and supports six shapes (box / transparent-shell / mesh-overlay / sphere / sprite / text). When `Label` is set, an additional camera-facing text gizmo renders the label above the node. See `Sensor Tool Panel` below for end-user controls. For developer-side customization (corporate-design overrides, custom int-mapping defaults), see [doc-extending-webviewer.md § 19](./doc-extending-webviewer.md#19-websensor--initwebsensor-configuration-api).
+
+### Sensor Tool Panel (left toolbar)
+A dedicated left-side panel (`SensorToolPanel.tsx`, button registered via `WebSensorPlugin`) gives end-users runtime control over all `WebSensor` components in the scene:
+
+- **Show sensor gizmos** toggle — globally hide/show all sensor overlays
+- **Gizmo shape selector** — override the default shape for all sensors (box / transparent-shell / mesh-overlay / sphere / sprite / text)
+- **Isolate sensors** toggle — hide all non-sensor root meshes so only sensors remain visible
+- **Live sensor list** — every `WebSensor` in the scene with label + current state badge; click an entry to focus the camera on that sensor
+
+State persists in `localStorage` under key `rv-sensor-view-state`.
+
+### Generic Gizmo Overlay System
+The `GizmoOverlayManager` (`viewer.gizmoManager`) is a reusable infrastructure for any component that needs to render a visual overlay over its node. WebSensor is the first consumer; future Drive direction arrows, Grip volumes, Station zones, etc. can all use the same API. Material sharing keyed by `(color, opacity, depthTest, blinkHz)` keeps memory low; one central `tick()` loop modulates all blinking gizmos in sync. See [doc-extending-webviewer.md § 17](./doc-extending-webviewer.md#17-gizmo-overlay-system-viewergizmomanager).
+
+### Component Event Dispatcher
+Per-component event callbacks for `onHover` / `onClick` / `onSelect` are routed centrally via `viewer.componentEventDispatcher` — components implement optional methods on the `RVComponent` interface and the dispatcher resolves which component matches each viewer-level event (via `node.userData._rvComponentInstance` + parent-chain walk). Exception-isolated and listener-leak-safe. See [doc-extending-webviewer.md § 18](./doc-extending-webviewer.md#18-component-event-dispatcher-viewercomponenteventdispatcher).
+
 ### Raycast System
 
-Unified raycast pipeline (`rv-raycast-manager.ts`) consolidates drive hover, scene click, and XR controller raycasting into a single Three.js `Raycaster` with **layer-based filtering**.
+Unified raycast pipeline (`rv-raycast-manager.ts`) consolidates hover, scene click, and XR controller raycasting into a single Three.js `Raycaster`. Hover is throttled at 50 ms.
 
-**Layer Architecture** (`rv-raycast-layers.ts`):
-| Layer | Bit | Purpose |
-|-------|-----|---------|
-| DEFAULT | 0 | Standard Three.js rendering layer |
-| DRIVE | 1 | Drive meshes |
-| SENSOR | 2 | Sensor meshes |
-| MU | 3 | Moving Unit meshes |
-| METADATA | 4 | Metadata nodes |
-| SCENE_CLICK | 5 | General scene click targets |
+**BVH-grouped geometry** (`rv-raycast-geometry.ts`):
+Instead of iterating all scene meshes per ray, the loader builds **merged BVH groups**:
 
-Layers are hardware-level bit-mask filters (zero-cost, no array iteration). Each node type gets its own layer. Plugins register targets via `registerTargets()`, and the raycaster only tests meshes on enabled layers.
+- **One merged BVH for all static meshes** — never animates, baked once.
+- **One merged BVH per kinematic Drive group** — re-used as the drive moves; only the group transform updates.
+- **`InstancedMesh` targets for MU pools** — single instanced draw, single BVH.
+
+Each ray is tested against this small set of grouped geometries. Hit-to-node resolution uses **face-range binary search** (O(log n)) — the loader records, for every face range in a group, which `realvirtual` ancestor owns it. No ancestor walk-up at runtime.
+
+**Hoverability is capability-driven**: `getCapabilities(type).hoverable` (from [rv-component-registry.ts](src/core/engine/rv-component-registry.ts)) decides whether a component type takes part in hover/click. There is no separate Three.js layer per type; the raycaster runs `layers.enableAll()`.
 
 **Key features:**
-- **Pointer hover**: Throttled at 50ms, walks up from hit mesh to find nearest ancestor with `realvirtual` userData
-- **XR controller ray**: `updateFromXRController(origin, direction)` for VR/AR controller raycasting
-- **AR tap selection**: 9-point sampling (`arTapRaycast()`) for touch tolerance on mobile AR
-- **Click detection**: `raycastForRVNode(e)` for scene click without altering hover state
-- **Exclude filters**: Skip highlight overlays, sensor viz meshes, and custom exclusions
-- **Highlight integration**: Automatic orange overlay + edge glow via `RVHighlightManager`
+- **Pointer hover**: Throttled at 50 ms, resolves the hit face to its registered `realvirtual` ancestor via face-range lookup.
+- **XR controller ray**: `updateFromXRController(origin, direction)` for VR/AR controller raycasting.
+- **AR tap selection**: 9-point sampling (`arTapRaycast()`) for touch tolerance on mobile AR.
+- **Click detection**: `raycastForRVNode(e)` for scene click without altering hover state.
+- **Exclude filters**: Skip highlight overlays, sensor viz meshes, and custom exclusions.
+- **Highlight integration**: Automatic orange overlay + edge glow via `RVHighlightManager`.
 
 **Highlight Manager** (`rv-highlight-manager.ts`):
 - Semi-transparent orange fill overlay + glowing edge outlines
@@ -392,22 +409,29 @@ Layers are hardware-level bit-mask filters (zero-cost, no array iteration). Each
 - Single highlight slot — calling `highlight()` replaces the previous one
 
 **Events emitted:**
-- `object-hover` — `{ node, nodeType, nodePath, pointer, mesh }`
+- `object-hover` — `{ node, nodeType, nodePath, pointer, hitPoint, mesh }`
 - `object-unhover` — `{ node, nodeType }`
+- `object-click` — `{ node, nodeType, nodePath, pointer }`
 
 ### Tooltip System
 
-Generic, extensible tooltip system (`core/hmi/tooltip/`) with content-type registry pattern. Decoupled from specific component types — new tooltip providers (sensor, MU, etc.) can be added without modifying the core.
+Generic, extensible tooltip system (`core/hmi/tooltip/`) with **a single headless controller**, a content-type registry, and per-component **data resolvers**. New tooltip types are added by registering a content provider + a data resolver — no per-type controllers.
 
 **Architecture:**
 
 ```
-Controller (headless)  →  TooltipStore (singleton)  →  TooltipLayer (renderer)
-                                                            ↓
-                                                    TooltipContentRegistry
-                                                            ↓
-                                                    Content Provider (React)
+GenericTooltipController (single, headless)
+    ├─ reads node.userData.realvirtual (rv_extras keys)
+    ├─ for each key → getCapabilities(key).tooltipType
+    ├─ tooltipRegistry.getDataResolver(tooltipType) → data
+    └─ tooltipStore.show({ id, data, mode, cursorPos, priority })
+                ↓
+         TooltipLayer (renderer)
+                ↓
+         tooltipRegistry.getProvider(contentType)  →  Content Provider (React)
 ```
+
+The same controller also auto-attaches a **PDF links section** (`PdfTooltipSection`) at the bottom whenever `node.userData._rvPdfLinks` is non-empty.
 
 **Three positioning modes:**
 - **cursor** — Follows mouse pointer (ref-based updates, no React re-render on move)
@@ -415,47 +439,48 @@ Controller (headless)  →  TooltipStore (singleton)  →  TooltipLayer (rendere
 - **fixed** — Uses a fixed screen position
 
 **Key design decisions:**
+- **One controller for all types**: `GenericTooltipController` replaced the previous per-type controllers (Drive/Pipeline/Metadata/AAS).
+- **Capability-driven dispatch**: which `rv_extras` keys produce a tooltip is decided by `getCapabilities(type).tooltipType` in [rv-component-registry.ts](src/core/engine/rv-component-registry.ts). No controller code per type.
 - **Data-only store**: Holds typed data objects, not ReactNodes (avoids re-render storms)
 - **Shallow-compare guard**: `show()` only notifies React when data fields actually change
-- **Cursor position is ref-based**: Updated via `getCursorPos()`, polled at 100ms — not in React state
-- **Priority resolution**: When multiple tooltips are active, highest priority wins
+- **Cursor position is ref-based**: Updated via `getCursorPos()`, polled at 100 ms — not in React state
+- **Priority resolution**: When multiple tooltips are active, highest priority wins (lower `priority` number = higher)
 - **useSyncExternalStore**: React 18+ pattern for efficient subscription without cascading renders
 
-**Built-in: Drive Tooltip**
-
-`DriveTooltipController` (headless) bridges drive hover/focus state to `tooltipStore.show()/hide()`. `DriveTooltipContent` renders drive name, direction, position, speed (exponential moving average), target, and limits.
+**Built-ins**: Drive, RuntimeMetadata, Pipe, Pump, Tank, ProcessingUnit, AASLink. Each ships a content provider + a data resolver.
 
 **Adding a new tooltip type** (e.g., Sensor):
 
 ```typescript
-// 1. Create content provider — self-registers at module import
-import { tooltipRegistry } from './core/hmi/tooltip';
+// 1. Declare the capability — in rv-component-registry registration:
+registerComponent({
+  type: 'Sensor',
+  // ... other fields ...
+  capabilities: { hoverable: true, tooltipType: 'sensor' /* matches step 2 */ },
+});
 
-function SensorTooltipContent({ data, viewer }: TooltipContentProps) {
+// 2. Register a content provider AND a data resolver — self-registers at module import
+import { tooltipRegistry, type TooltipContentProps } from './core/hmi/tooltip/tooltip-registry';
+
+function SensorTooltipContent({ data }: TooltipContentProps) {
   return <Typography>{data.sensorName}: {data.occupied ? 'Occupied' : 'Free'}</Typography>;
 }
+
 tooltipRegistry.register({ contentType: 'sensor', component: SensorTooltipContent });
 
-// 2. Create controller (headless React component)
-function SensorTooltipController() {
-  useEffect(() => {
-    // On sensor hover:
-    tooltipStore.show({
-      id: 'sensor',
-      data: { type: 'sensor', sensorName: 'MySensor', occupied: true },
-      mode: 'cursor',
-      cursorPos: { x: clientX, y: clientY },
-      priority: 10,
-    });
-    // On unhover:
-    tooltipStore.hide('sensor');
-  }, [/* deps */]);
-  return null;
-}
+tooltipRegistry.registerDataResolver('sensor', (node, viewer) => {
+  // node has rv_extras.Sensor — derive what to display
+  const path = viewer.registry.pathFor(node) ?? node.name;
+  const sensor = viewer.sensors.find(s => s.path === path);
+  if (!sensor) return null;
+  return { type: 'sensor', sensorName: node.name, occupied: sensor.occupied };
+});
 
-// 3. Import content module in App.tsx (triggers self-registration)
+// 3. Side-effect-import the content module so registration runs (in App.tsx)
 import './core/hmi/tooltip/SensorTooltipContent';
 ```
+
+That's it — the single `GenericTooltipController` will now show the sensor tooltip on hover and on selection (pinned). No controller code to write.
 
 **React hook:**
 ```typescript
@@ -749,7 +774,7 @@ Enums as strings, component references as `{ type: "ComponentReference", path: "
 
 ## Testing
 
-**328 tests** running in real Chromium via Vitest v4 + Playwright:
+Tests run in real Chromium via Vitest + Playwright:
 
 ```bash
 npm test              # All tests, headless
@@ -759,25 +784,7 @@ npx tsc --noEmit     # Type check only
 
 Test GLB: Export from Unity demo scene → `public/models/tests.glb`.
 
-| Suite | Tests | Validates |
-|-------|-------|-----------|
-| GLB structure | 21 | File loads, extras, component properties |
-| NodeRegistry | 34 | Path computation, type queries, hierarchy traversal |
-| Transport | 17 | Linear/radial movement, MU lifecycle, surface transfer |
-| LogicSteps | 33 | All step types, containers, looping, integration |
-| SignalStore | 23 | Pub/sub, name/path access, change notification, bulk updates |
-| DrivesPlayback | 10 | Frame advancement, looping, seeking |
-| KPI utils | 40 | Formatting, calculations, edge cases |
-| AABB | 7 | Overlap, position update, X-flip |
-| EventEmitter | 7 | Typed events, unsubscribe, custom events |
-| Plugin Lifecycle | 8 | Order, retroactive load, exception isolation |
-| SensorMonitor | 6 | onChanged callback, RingBuffer |
-| UI Registry | 5 | Slot registration, order sorting |
-| SimLoop XR | 5 | setAnimationLoop, frame clamping |
-| XR Manager | 8 | Platform detection, WebGPU guard |
-| XR Hit-Test | 5 | Reticle, placement, dispose |
-| Step Serializer | 5 | RVLogicStep to RVStepNode conversion |
-| App Config | 15 | Fetch fallbacks, lock guards, config override merge, store integration |
+Test files live in [tests/](tests/) (Vitest, browser-mode) and [e2e/](e2e/) (Playwright). Run `ls tests/*.test.*` for the current inventory — counts move every release, so no totals are kept here.
 
 ## Debug Logging
 
@@ -842,12 +849,7 @@ realvirtual WEB supports real-time multiuser sessions where multiple users see e
 
 ### Web-only Mode (No Unity)
 
-Use the standalone relay server for sessions without a running Unity instance:
-
-```bash
-cd relay
-npm start -- --port 7000 --model ./model.glb
-```
+For sessions without a running Unity instance, point the WebViewer at a standalone relay server. The relay source lives in a separate repository; the WebViewer ships with a default hosted relay (`wss://download.realvirtual.io/relay`) configured in [multiuser-settings-store.ts](src/core/hmi/multiuser-settings-store.ts). Switch a session into relay mode via the Multiuser settings tab or by passing `?server=wss://...&joinCode=...` on the URL.
 
 ### Microsoft Teams Integration
 

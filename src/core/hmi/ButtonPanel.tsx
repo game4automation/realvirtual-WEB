@@ -11,9 +11,53 @@ import { useEditorPlugin } from '../../hooks/use-editor-plugin';
 import { SETTINGS_PANEL_WIDTH, INSPECTOR_PANEL_WIDTH } from './layout-constants';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
 import { WelcomeModal } from './WelcomeModal';
+import { useCustomBranding } from './branding-store';
+import { useKioskHasTour, startKioskFromWelcome } from '../../plugins/kiosk-plugin';
 
 /* Logo URL: use BASE_URL so it resolves correctly under sub-folder deploys (e.g. Bunny CDN /demo/) */
 const logoUrl = `${import.meta.env.BASE_URL}logo.png`;
+
+/**
+ * BrandingContent — renders either the default realvirtual branding or
+ * a custom logo followed by "powered by realvirtual" when custom branding is set.
+ */
+function BrandingContent({ isMobile }: { isMobile: boolean }) {
+  const custom = useCustomBranding();
+
+  if (!custom) {
+    // Default: realvirtual logo + name
+    return (
+      <>
+        <img src={logoUrl} alt="realvirtual" style={{ height: 18, width: 18 }} />
+        {!isMobile && (
+          <Typography sx={{ fontSize: 12, fontWeight: 500, letterSpacing: 0.5, color: 'text.primary' }}>
+            realvirtual
+          </Typography>
+        )}
+      </>
+    );
+  }
+
+  // Custom branding: [Custom Logo] | [powered by rv-logo realvirtual]
+  const logoHeight = custom.logoHeight ?? 20;
+  return (
+    <>
+      <img src={custom.logoUrl} alt={custom.name ?? 'Logo'} style={{ height: logoHeight, width: 'auto', maxWidth: 180, objectFit: 'contain' }} />
+      {!isMobile && (
+        <Box sx={{
+          display: 'flex', alignItems: 'center', gap: 0.4,
+          ml: 0.75, pl: 0.75,
+          borderLeft: '1px solid rgba(255,255,255,0.15)',
+        }}>
+          <Typography sx={{ fontSize: 8, color: 'rgba(255,255,255,0.4)', whiteSpace: 'nowrap', lineHeight: 1 }}>
+            powered by
+          </Typography>
+          <img src={logoUrl} alt="realvirtual" style={{ height: 11, width: 11, opacity: 0.5 }} />
+        </Box>
+      )}
+    </>
+  );
+}
 
 // ── Logo Badge (always visible, independent of ButtonPanel) ─────────────
 
@@ -24,35 +68,41 @@ export function LogoBadge() {
   const [aboutOpen, setAboutOpen] = useState(() => !localStorage.getItem(WELCOME_DISMISSED_KEY));
   const isMobile = useMobileLayout();
   const mcp = useMcpBridge();
+  const customBranding = useCustomBranding();
+  const badgeBg = customBranding?.badgeBackground;
+  const fullWidth = customBranding?.badgeFullWidth;
+
+  // Hide the logo badge entirely on mobile — it collides with the top-right button panel
+  // on narrow viewports and wastes scarce screen real estate.
+  if (isMobile) return null;
 
   return (
     <>
-      <Paper
-        elevation={4}
+      <Box
         data-ui-panel
         sx={{
           position: 'fixed',
           left: 8,
           top: 8,
-          zIndex: 1200,
+          zIndex: 1210,
           display: 'flex',
           alignItems: 'center',
+          justifyContent: fullWidth ? 'center' : undefined,
           gap: 1,
           px: 1.25,
           py: 0.5,
           borderRadius: 2,
           pointerEvents: 'auto',
           cursor: 'pointer',
-          '&:hover': { bgcolor: 'rgba(255,255,255,0.06)' },
+          backgroundColor: badgeBg ?? 'rgba(18, 18, 18, 0.65)',
+          backdropFilter: 'blur(16px)',
+          boxShadow: 4,
+          ...(fullWidth && { width: 280, boxSizing: 'border-box' }),
+          '&:hover': { backgroundColor: badgeBg ?? 'rgba(255,255,255,0.06)' },
         }}
         onClick={() => setAboutOpen(true)}
       >
-        <img src={logoUrl} alt="realvirtual" style={{ height: 18, width: 18 }} />
-        {!isMobile && (
-          <Typography sx={{ fontSize: 12, fontWeight: 500, letterSpacing: 0.5, color: 'text.primary' }}>
-            realvirtual
-          </Typography>
-        )}
+        <BrandingContent isMobile={isMobile} />
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
           <Circle sx={{ fontSize: 6, color: '#66bb6a' }} />
           {!isMobile && (
@@ -71,10 +121,25 @@ export function LogoBadge() {
             )}
           </Box>
         )}
-      </Paper>
+      </Box>
 
-      <WelcomeModal open={aboutOpen} onClose={() => { setAboutOpen(false); localStorage.setItem(WELCOME_DISMISSED_KEY, '1'); }} />
+      <WelcomeModalHost
+        open={aboutOpen}
+        onClose={() => { setAboutOpen(false); localStorage.setItem(WELCOME_DISMISSED_KEY, '1'); }}
+      />
     </>
+  );
+}
+
+/** Thread kiosk-plugin's useKioskHasTour() hook + onStartDemo callback into WelcomeModal. */
+function WelcomeModalHost({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const hasKioskTour = useKioskHasTour();
+  return (
+    <WelcomeModal
+      open={open}
+      onClose={onClose}
+      onStartDemo={hasKioskTour ? startKioskFromWelcome : undefined}
+    />
   );
 }
 
@@ -101,7 +166,7 @@ export function ButtonPanel() {
   // Also account for panels managed by leftPanelManager (e.g. machine-control)
   const lpmWidth = (panelSnapshot.activePanel && panelSnapshot.activePanel !== 'settings' && panelSnapshot.activePanel !== 'hierarchy')
     ? 8 + panelSnapshot.activePanelWidth + 8 : 0;
-  const buttonLeftOffset = Math.max(settingsWidth, hierarchyWidth, lpmWidth) || 8;
+  const buttonLeftOffset = Math.max(settingsWidth, hierarchyWidth, lpmWidth) || 12;
 
   if (entries.length === 0) return null;
 

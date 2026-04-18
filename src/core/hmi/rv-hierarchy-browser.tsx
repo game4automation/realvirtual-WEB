@@ -42,6 +42,7 @@ import { HIERARCHY_MIN_WIDTH, HIERARCHY_MAX_WIDTH, type EditableNodeInfo } from 
 import { LeftPanel } from './LeftPanel';
 import type { RVExtrasOverlay } from '../engine/rv-extras-overlay-store';
 import type { SignalStore } from '../engine/rv-signal-store';
+import { getDisplayName } from '../engine/rv-component-registry';
 import type { RVLogicEngine, StepStateInfo } from '../engine/rv-logic-engine';
 import { StepState } from '../engine/rv-logic-step';
 import { STEP_STATE_COLORS, STEP_STATE_LABELS } from './rv-logic-step-colors';
@@ -86,7 +87,7 @@ const TYPE_FILTERS: { key: TypeFilter; label: string }[] = [
 function matchesTypeFilter(types: string[], filter: TypeFilter): boolean {
   if (filter === 'all') return true;
   if (filter === 'drives') return types.some(t => t === 'Drive' || t.startsWith('Drive_'));
-  if (filter === 'sensors') return types.some(t => t === 'Sensor');
+  if (filter === 'sensors') return types.some(t => t === 'Sensor' || t === 'WebSensor');
   if (filter === 'signals') return types.some(t => t.startsWith('PLCInput') || t.startsWith('PLCOutput'));
   if (filter === 'logic') return types.some(t => t.startsWith('LogicStep_'));
   return true;
@@ -363,7 +364,8 @@ function badgeLabel(type: string, stepState?: StepState): string {
   if (type.startsWith('PLCOutput')) return 'Out:' + type.replace('PLCOutput', '');
   if (type.startsWith('PLCInput')) return 'In:' + type.replace('PLCInput', '');
   if (type.startsWith('Drive_')) return type.replace('Drive_', 'D:');
-  return type;
+  // Components can declare a custom display name via registerComponent({ displayName })
+  return getDisplayName(type);
 }
 
 // ─── Badge Chip ─────────────────────────────────────────────────────────

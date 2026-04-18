@@ -54,6 +54,7 @@ export const RV_DYNAMIC_PREFIXES = [
   'rv-panel-',
   'rv-order-',
   'rv-camera-start:',
+  'rv-login-',    // login gate keys
 ] as const;
 
 /**

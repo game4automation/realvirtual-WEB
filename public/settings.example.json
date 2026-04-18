@@ -39,5 +39,22 @@
 
   "analytics": {
     "googleAnalyticsId": ""
+  },
+
+  "pluginConfig": {
+    "_comment": "Per-plugin configuration. Missing keys fall back to built-in defaults.",
+    "kiosk": {
+      "_comment": "Kiosk Mode — opt-in auto-demo after idle timeout. Default is DISABLED (backwards-compatible for existing deployments). Trade-show / showroom installations set enabled: true.",
+      "enabled": false,
+      "idleTimeoutSeconds": 60,
+      "hintIntervalSeconds": 15,
+      "exitOnAnyInput": true,
+      "pauseOnHidden": true,
+      "respectReducedMotion": true,
+      "cycleLimit": 0,
+      "cameraAnimationTimeoutMs": 5000,
+      "maxDwellMs": 60000,
+      "maxConcurrentMessages": 5
+    }
   }
 }

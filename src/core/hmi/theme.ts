@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { createTheme } from '@mui/material/styles';
+import { createTheme, type Theme } from '@mui/material/styles';
+
+/** Create a branded theme with custom primary/secondary colors. */
+export function createBrandedTheme(primary?: string, secondary?: string): Theme {
+  return createTheme({
+    ...rvDarkTheme,
+    palette: {
+      ...rvDarkTheme.palette,
+      ...(primary && { primary: { main: primary } }),
+      ...(secondary && { secondary: { main: secondary } }),
+    },
+  });
+}
 
 export const rvDarkTheme = createTheme({
   palette: {

@@ -20,6 +20,10 @@ export interface GroupVisibilitySettings {
   excludedFromOverlay?: string[];
   /** Groups hidden by default when a model loads. */
   defaultHiddenGroups?: string[];
+  /** Component type keys of hidden auto-filter groups (e.g. 'Drive', 'Sensor'). */
+  hiddenAutoFilters?: string[];
+  /** Component type key of the isolated auto-filter, or null. */
+  isolatedAutoFilter?: string | null;
 }
 
 const DEFAULTS: GroupVisibilitySettings = {
@@ -27,6 +31,8 @@ const DEFAULTS: GroupVisibilitySettings = {
   isolatedGroup: null,
   excludedFromOverlay: [],
   defaultHiddenGroups: [],
+  hiddenAutoFilters: [],
+  isolatedAutoFilter: null,
 };
 
 /**
@@ -43,6 +49,8 @@ export function loadGroupVisibilitySettings(): GroupVisibilitySettings {
       isolatedGroup: typeof parsed.isolatedGroup === 'string' ? parsed.isolatedGroup : null,
       excludedFromOverlay: Array.isArray(parsed.excludedFromOverlay) ? parsed.excludedFromOverlay : [],
       defaultHiddenGroups: Array.isArray(parsed.defaultHiddenGroups) ? parsed.defaultHiddenGroups : [],
+      hiddenAutoFilters: Array.isArray(parsed.hiddenAutoFilters) ? parsed.hiddenAutoFilters : [],
+      isolatedAutoFilter: typeof parsed.isolatedAutoFilter === 'string' ? parsed.isolatedAutoFilter : null,
     };
   } catch {
     return { ...DEFAULTS };

@@ -32,7 +32,7 @@ import {
 describe('layout-constants', () => {
   it('exports all panel dimension constants with correct values', () => {
     expect(BOTTOM_BAR_HEIGHT).toBe(52);
-    expect(LEFT_PANEL_TOP).toBe(44);
+    expect(LEFT_PANEL_TOP).toBe(56);
     expect(LEFT_PANEL_LEFT).toBe(8);
     expect(LEFT_PANEL_BOTTOM).toBe(8);
     expect(LEFT_PANEL_ZINDEX).toBe(1200);
@@ -128,13 +128,25 @@ describe('buildPanelSx', () => {
     expect(sx.right).toBe('auto');
   });
 
-  it('returns full-screen mobile positioning', () => {
+  it('returns full-screen mobile positioning covering entire viewport', () => {
     const sx = buildPanelSx({ width: 320, isMobile: true, mobile: 'full-screen' });
-    expect(sx.left).toBe(0);
-    expect(sx.right).toBe(0);
-    expect(sx.bottom).toBe(0);
+    expect(sx.inset).toBe(0);
     expect(sx.width).toBe('100%');
+    expect(sx.height).toBe('100%');
     expect(sx.borderRadius).toBe(0);
+  });
+
+  it('mobile panel zIndex overlays TopBar/ButtonPanel/BottomBar/LogoBadge', () => {
+    // TopBar buttons=9001, ButtonPanel=1210, BottomBar=1201, LogoBadge=1210.
+    // Mobile panel must overlay every UI element including the TopBar.
+    const sx = buildPanelSx({ width: 320, isMobile: true, mobile: 'full-screen' });
+    expect(sx.zIndex).toBeGreaterThan(9001);
+  });
+
+  it('mobile hidden panel uses the same elevated zIndex', () => {
+    const shown = buildPanelSx({ width: 320, isMobile: true, mobile: 'full-screen' });
+    const hidden = buildPanelSx({ width: 320, isMobile: true, mobile: 'hidden' });
+    expect(hidden.zIndex).toBe(shown.zIndex);
   });
 
   it('returns display:none for mobile=hidden', () => {
@@ -149,8 +161,9 @@ describe('buildPanelSx', () => {
 
   it('defaults mobile to full-screen', () => {
     const sx = buildPanelSx({ width: 320, isMobile: true });
-    expect(sx.left).toBe(0);
-    expect(sx.right).toBe(0);
+    expect(sx.inset).toBe(0);
+    expect(sx.width).toBe('100%');
+    expect(sx.height).toBe('100%');
   });
 });
 

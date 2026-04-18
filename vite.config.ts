@@ -424,7 +424,10 @@ function privateModelsPlugin() {
  * from the main project's node_modules instead.
  */
 function privateResolverPlugin() {
-  if (!HAS_PRIVATE) return null;
+  // Always activate when the private folder exists, even in public builds.
+  // import.meta.glob discovers private project files on disk regardless of
+  // VITE_PUBLIC_BUILD, so Rollup still needs to resolve their bare imports.
+  if (!existsSync(PRIVATE_DIR)) return null;
   // A virtual importer inside the main project so Vite/Rollup resolves
   // bare npm imports using the main project's node_modules with proper ESM handling.
   const mainImporter = resolve(__dirname, 'src/main.ts');
@@ -460,6 +463,7 @@ export default defineConfig({
   ].filter(Boolean),
   resolve: {
     alias: {
+      '@rv': resolve(__dirname, 'src'),
       '@rv-private': HAS_PRIVATE
         ? PRIVATE_DIR
         : resolve(__dirname, 'src/private-stubs'),
@@ -482,6 +486,9 @@ export default defineConfig({
   server: {
     open: true,
     https: !!process.env.HTTPS,
+    // Allow Tailscale MagicDNS hostnames (*.ts.net) when testing via `tailscale serve`.
+    // Without this, Vite returns 403 due to DNS-rebinding protection on non-localhost Host headers.
+    allowedHosts: ['.ts.net'],
     headers: {
       'Cache-Control': 'no-store',
     },

@@ -47,7 +47,7 @@ Three extension points:
     <BottomBar />                      //   Bottom — search/filter bar (slot: search-bar)
     <SlotRenderer slot="views" />      //   Bottom-right — charts, tables (slot: views)
   </HMIShell>
-  <DriveTooltipController />           // Headless — outside HMIShell for pointer events
+  <GenericTooltipController />         // Single headless controller for all tooltip types
   <DriveChartOverlay />                // Floating chart — outside HMIShell for drag/resize
   <WelcomeModal />                     // First-visit overlay
 </ThemeProvider>
@@ -754,13 +754,33 @@ The `order` property controls execution order within each phase (Pre, Post, Rend
 
 ### Built-in Event Types
 
+The full `ViewerEvents` interface lives at [src/core/rv-viewer.ts](src/core/rv-viewer.ts) (search for `export interface ViewerEvents`). Snapshot of the categories:
+
 ```typescript
 interface ViewerEvents {
-  // Core
+  // Lifecycle
   'model-loaded':       { result: LoadResult };
   'model-cleared':      void;
+  'connection-state-changed': { state: 'Connected' | 'Disconnected'; previous: 'Connected' | 'Disconnected' };
+  'simulation-pause-changed': { paused: boolean; reasons: readonly string[]; reason: string };
+
+  // Hover / focus / selection
   'drive-hover':        { drive: RVDrive | null; clientX: number; clientY: number };
   'drive-focus':        { drive: RVDrive | null; node: Object3D | null };
+  'object-hover':       ObjectHoverData | null;       // { node, nodeType, nodePath, pointer, hitPoint, mesh }
+  'object-unhover':     ObjectUnhoverData;            // { node, nodeType }
+  'object-click':       ObjectClickData;              // { node, nodeType, nodePath, pointer }
+  'object-clicked':     { path: string; node: Object3D };
+  'object-focus':       { path: string; node: Object3D };
+  'selection-changed':  SelectionSnapshot;
+  'exclusive-hover-mode': { mode: HoverableType | null };
+
+  // Filters / charts (UI plumbing)
+  'drive-chart-toggle':    { open: boolean };
+  'drive-filter':          { filter: string; filteredDrives: RVDrive[] };
+  'node-filter':           { filter: string; filteredNodes: NodeSearchResult[]; tooMany: boolean };
+  'sensor-chart-toggle':   { open: boolean };
+  'groups-overlay-toggle': { open: boolean };
 
   // Simulation (emitted by plugins)
   'sensor-changed':     { sensorPath: string; occupied: boolean };
@@ -768,20 +788,30 @@ interface ViewerEvents {
   'mu-consumed':        { totalConsumed: number };
   'drive-at-target':    { drivePath: string; position: number };
 
-  // Interface
+  // Industrial interfaces
   'interface-connected':    { interfaceId: string; type: string };
   'interface-disconnected': { interfaceId: string; reason?: string };
   'interface-error':        { interfaceId: string; error: string };
+  'interface-data':         { interfaceId: string; signals: Record<string, unknown> };
 
-  // Raycast / Hover
-  'object-hover':           { node: Object3D; nodeType: string; nodePath: string; pointer: { x: number; y: number }; mesh: Object3D };
-  'object-unhover':         { node: Object3D; nodeType: string };
-
-  // UI
+  // Camera / panels / context menu
   'camera-animation-done':  { targetPath?: string };
-  'object-clicked':         { path: string; node: Object3D };
   'panel-opened':           { panelId: string };
   'panel-closed':           { panelId: string };
+  'context-menu-request':   { pos: { x: number; y: number }; path: string; node: Object3D };
+
+  // XR
+  'xr-session-start':       void;
+  'xr-session-end':         void;
+  'xr-hit-test':            { position: Float32Array; matrix: Float32Array };
+  'xr-controller-select':   { hand: 'left' | 'right'; position: { x: number; y: number; z: number } };
+
+  // FPV
+  'fpv-enter':              void;
+  'fpv-exit':               void;
+
+  // Layout planner
+  'layout-transform-update': { path: string; position: {x,y,z}; rotation: {x,y,z} };
 }
 ```
 
@@ -844,19 +874,32 @@ Plugins can provide UI by declaring a `slots` array on `RVViewerPlugin`. Slot en
 | `messages` | Right sidebar | Notifications, status tiles |
 | `views` | Bottom right | Expandable panels, charts |
 | `settings-tab` | Settings dialog | Additional tabs |
+| `toolbar-button` | TopBar (right) | Extra toolbar buttons next to hierarchy/settings |
+| `overlay` | Full-screen | Left panels, modals, custom overlays |
 
 ### UISlotEntry Type
 
 ```typescript
 // src/core/rv-ui-plugin.ts
 
-type UISlot = 'kpi-bar' | 'button-group' | 'search-bar' | 'messages' | 'views' | 'settings-tab';
+type UISlot =
+  | 'kpi-bar'        // Top center: KPI cards horizontal
+  | 'button-group'   // Left sidebar: nav buttons vertical
+  | 'search-bar'     // Bottom center: search field
+  | 'messages'       // Right sidebar: notifications / status tiles
+  | 'views'          // Bottom right: expandable panels (charts, tables)
+  | 'settings-tab'   // Settings dialog: tab registration
+  | 'toolbar-button' // TopBar: extra toolbar buttons
+  | 'overlay';       // Full-screen overlays (left panels, modals, etc.)
 
 interface UISlotEntry {
+  pluginId?: string;      // Auto-stamped by UIPluginRegistry.register()
   slot: UISlot;
   component: ComponentType<{ viewer: RVViewer }>;
-  order?: number;    // Sort order within slot (lower = first)
-  label?: string;    // For settings-tab: tab label
+  order?: number;         // Sort order within slot (lower = earlier). Default: 100
+  label?: string;         // For settings-tab: tab label
+  visibilityId?: string;  // Optional context-store element id for hiding
+  visibilityRule?: UIVisibilityRule; // Inline visibility rule (hiddenIn / shownOnlyIn)
 }
 ```
 
@@ -980,73 +1023,64 @@ export function useAlarm() {
 
 ## 6b. Generic Tooltip System
 
-The tooltip system (`core/hmi/tooltip/`) uses a content-type registry pattern. To add a tooltip for a new object type:
+The tooltip system (`core/hmi/tooltip/`) uses **a single headless controller** (`GenericTooltipController`) plus a registry of **content providers** and **data resolvers**. To add a tooltip for a new component type:
 
-### Register a Content Provider
+### Step 1: Declare `tooltipType` on the component capability
+
+When registering the component (in [rv-component-registry.ts](src/core/engine/rv-component-registry.ts) via `registerComponent({ type: 'Sensor', ... })`), set `capabilities.tooltipType` to a stable string key:
+
+```typescript
+registerComponent({
+  type: 'Sensor',
+  schema: RVSensor.schema,
+  capabilities: { hoverable: true, tooltipType: 'sensor' },
+  create: (node) => new RVSensor(node),
+});
+```
+
+For types that have no factory (e.g. AAS links), use `registerCapabilities('AASLink', { tooltipType: 'aas', ... })` instead.
+
+### Step 2: Register a Content Provider AND a Data Resolver
 
 ```typescript
 // src/core/hmi/tooltip/SensorTooltipContent.tsx
 import { tooltipRegistry, type TooltipContentProps } from './tooltip-registry';
+import { Typography } from '@mui/material';
 
-function SensorTooltipContent({ data, viewer }: TooltipContentProps) {
+function SensorTooltipContent({ data }: TooltipContentProps) {
   return (
     <>
-      <Typography variant="subtitle2" sx={{ color: '#4fc3f7' }}>
-        {data.sensorName}
-      </Typography>
-      <Typography variant="caption">
-        {data.occupied ? 'Occupied' : 'Free'}
-      </Typography>
+      <Typography variant="subtitle2" sx={{ color: '#4fc3f7' }}>{data.sensorName}</Typography>
+      <Typography variant="caption">{data.occupied ? 'Occupied' : 'Free'}</Typography>
     </>
   );
 }
 
-// Self-register at module load (imported in App.tsx)
+// Self-register at module load (side-effect imported by App.tsx)
 tooltipRegistry.register({ contentType: 'sensor', component: SensorTooltipContent });
+
+tooltipRegistry.registerDataResolver('sensor', (node, viewer) => {
+  const path = viewer.registry.pathFor(node) ?? node.name;
+  const sensor = viewer.sensors.find(s => s.path === path);
+  if (!sensor) return null;
+  return { type: 'sensor', sensorName: node.name, occupied: sensor.occupied };
+});
 ```
 
-### Create a Headless Controller
+### Step 3: Side-effect-import the module
 
 ```typescript
-// src/core/hmi/tooltip/SensorTooltipController.tsx
-import { useEffect } from 'react';
-import { tooltipStore } from './tooltip-store';
-
-export function SensorTooltipController() {
-  // Subscribe to hover events (from RaycastManager or custom logic)
-  useEffect(() => {
-    const onHover = (data) => {
-      if (data.nodeType === 'Sensor') {
-        tooltipStore.show({
-          id: 'sensor',
-          data: { type: 'sensor', sensorName: data.nodePath, occupied: false },
-          mode: 'cursor',
-          cursorPos: { x: data.pointer.x, y: data.pointer.y },
-          priority: 10,
-        });
-      }
-    };
-    const onUnhover = (data) => {
-      if (data.nodeType === 'Sensor') tooltipStore.hide('sensor');
-    };
-    viewer.on('object-hover', onHover);
-    viewer.on('object-unhover', onUnhover);
-    return () => { viewer.off('object-hover', onHover); viewer.off('object-unhover', onUnhover); };
-  }, [viewer]);
-  return null;  // Headless — no UI
-}
+// In src/core/hmi/App.tsx — already imports GenericTooltipController, just add yours:
+import './core/hmi/tooltip/SensorTooltipContent';
 ```
 
-### Wire Into App.tsx
+That's it. No controller code, no event subscriptions — `GenericTooltipController` (already mounted in `App.tsx`) reads `node.userData.realvirtual` keys on hover and selection, looks up `getCapabilities(key).tooltipType`, and calls your data resolver.
 
-```typescript
-import './core/hmi/tooltip/SensorTooltipContent';  // Triggers self-registration
-// Add <SensorTooltipController /> alongside <DriveTooltipController />
-```
+**Bonus — generic PDF links**: any node with `node.userData._rvPdfLinks` automatically gets a PDF section appended at the bottom of its tooltip via `PdfTooltipSection`. No registration needed.
 
 **Positioning modes:** `cursor` (follows mouse), `world` (3D→screen projection), `fixed` (screen position).
 
-**Priority:** When multiple tooltips are active simultaneously, the highest `priority` value wins.
+**Priority:** When multiple tooltip sections show at once, the **lower** `priority` number wins (default `5` for hover via `caps.hoverPriority`).
 
 ---
 
@@ -1462,41 +1496,43 @@ class MockHost {
 
 ### Core Plugins (`core: true` — always loaded, survive model switches)
 
-| Plugin | ID | Callbacks | Purpose |
-|--------|----|-----------|---------|
-| `RapierPhysicsPlugin` | `rapier-physics` | onModelLoaded, onFixedUpdatePre/Post, onModelCleared | Rapier.js physics-based transport (replaces kinematic) |
-| `DriveOrderPlugin` | `drive-order` | onModelLoaded | Topological sort of drives for CAM/Gear master-slave |
-| `SensorMonitorPlugin` | `sensor-monitor` | onModelLoaded, onFixedUpdatePost, onModelCleared | Event-based sensor change tracking via onChanged |
-| `TransportStatsPlugin` | `transport-stats` | onModelLoaded, onFixedUpdatePost, onModelCleared | 10Hz spawn/consume counters in RingBuffers |
-| `CameraEventsPlugin` | `camera-events` | onModelLoaded, onRender | Emits camera-animation-done |
-| `RvExtrasEditorPlugin` | `rv-extras-editor` | (slots only) | Hierarchy browser + property inspector |
+| Plugin | ID | File | Purpose |
+|--------|----|------|---------|
+| `RapierPhysicsPlugin` | `rapier-physics` | [src/core/engine/rapier-physics-plugin.ts](src/core/engine/rapier-physics-plugin.ts) | Rapier.js physics-based transport (replaces kinematic) |
+| `DriveOrderPlugin` | `drive-order` | [src/plugins/drive-order-plugin.ts](src/plugins/drive-order-plugin.ts) | Topological sort for CAM/Gear master-slave |
+| `SensorMonitorPlugin` | `sensor-monitor` | [src/plugins/sensor-monitor-plugin.ts](src/plugins/sensor-monitor-plugin.ts) | Event-based sensor change tracking |
+| `TransportStatsPlugin` | `transport-stats` | [src/plugins/transport-stats-plugin.ts](src/plugins/transport-stats-plugin.ts) | 10 Hz spawn/consume RingBuffers |
+| `CameraEventsPlugin` | `camera-events` | [src/plugins/camera-events-plugin.ts](src/plugins/camera-events-plugin.ts) | Emits `camera-animation-done` |
+| `RvExtrasEditorPlugin` | `rv-extras-editor` | [src/core/hmi/rv-extras-editor.tsx](src/core/hmi/rv-extras-editor.tsx) | Hierarchy browser + property inspector |
+| `DebugEndpointPlugin` | `debug-endpoint` | [src/plugins/debug-endpoint-plugin.ts](src/plugins/debug-endpoint-plugin.ts) | `/__api/debug` HTTP bridge (dev) |
+| `McpBridgePlugin` | `mcp-bridge` | [src/plugins/mcp-bridge-plugin.ts](src/plugins/mcp-bridge-plugin.ts) | Claude MCP WebSocket bridge (dev) |
 
-### Model-Specific Plugins (loaded/unloaded per model)
+### Optional Plugins (registered eagerly, opt-in via model config)
 
-| Plugin | ID | Purpose |
-|--------|----|---------|
-| `KpiDemoPlugin` | `kpi-demo` | Static OEE/Parts/CycleTime demo data with seeded PRNG |
-| `DemoHMIPlugin` | `demo-hmi` | Demo KPI cards, nav buttons, message tiles |
-| `TestAxesPlugin` | `test-axes` | Manual axis tester with slider UI |
-| `MachineControlPlugin` | `machine-control` | Machine start/stop control panel |
-| `MaintenancePlugin` | `maintenance` | Maintenance checklist and progress tracking |
-| `WebXRPlugin` | `webxr` | Immersive VR/AR on Quest 3 and other headsets |
-| `MultiuserPlugin` | `multiuser` | Presence + avatar synchronization |
-| `FpvPlugin` | `fpv` | First-person WASD + mouse look walkthrough |
-| `AnnotationPlugin` | `annotations` | 3D markers, labels, drawing on surfaces |
+| Plugin | ID | File | Purpose |
+|--------|----|------|---------|
+| `WebXRPlugin` | `webxr` | [src/plugins/webxr-plugin.ts](src/plugins/webxr-plugin.ts) | Immersive VR/AR (Quest, Vision Pro, Android AR) |
+| `MultiuserPlugin` | `multiuser` | [src/plugins/multiuser-plugin.ts](src/plugins/multiuser-plugin.ts) | Presence, avatars, signal/drive sync, relay support |
+| `FpvPlugin` | `fpv` | [src/plugins/fpv-plugin.tsx](src/plugins/fpv-plugin.tsx) | First-person WASD + mouse look walkthrough |
+| `AnnotationPlugin` | `annotations` | [src/plugins/annotation-plugin.ts](src/plugins/annotation-plugin.ts) | 3D markers, labels, drawing |
+| `AasLinkPlugin` | `aas-link` | [src/plugins/aas-link-plugin.tsx](src/plugins/aas-link-plugin.tsx) | AAS / AASX linking + tooltip |
+| `DocsBrowserPlugin` | `docs-browser` | [src/plugins/docs-browser-plugin.tsx](src/plugins/docs-browser-plugin.tsx) | PDF / docs browser overlay |
+| `CameraStartposPlugin` | `camera-startpos` | [src/plugins/camera-startpos-plugin.tsx](src/plugins/camera-startpos-plugin.tsx) | Per-model start position presets |
+| `BlueprintPlugin` | `blueprint` | [src/plugins/blueprint-plugin.ts](src/plugins/blueprint-plugin.ts) | Blueprint / 2D plan view |
+| `DriveRecorderPlugin` | `drive-recorder` | [src/plugins/drive-recorder-plugin.ts](src/plugins/drive-recorder-plugin.ts) | Drive recording at runtime |
+| `SensorRecorderPlugin` | `sensor-recorder` | [src/plugins/sensor-recorder-plugin.ts](src/plugins/sensor-recorder-plugin.ts) | Sensor history recording |
+| `OrderManagerPlugin` | `order-manager` | [src/plugins/order-manager-plugin.tsx](src/plugins/order-manager-plugin.tsx) | Production order manager |
 
-### Plugin Locations
+### Demo Model Plugins (loaded for `DemoRealvirtualWeb.glb`)
 
-| Plugin | File |
-|--------|------|
-| `RapierPhysicsPlugin` | `src/core/engine/rapier-physics-plugin.ts` |
-| `DriveOrderPlugin` | `src/plugins/drive-order-plugin.ts` |
-| `SensorMonitorPlugin` | `src/plugins/sensor-monitor-plugin.ts` |
-| `TransportStatsPlugin` | `src/plugins/transport-stats-plugin.ts` |
-| `CameraEventsPlugin` | `src/plugins/camera-events-plugin.ts` |
-| `KpiDemoPlugin` | `src/plugins/demo/kpi-demo-plugin.ts` |
-| `DemoHMIPlugin` | `src/plugins/demo/demo-hmi-plugin.tsx` |
-| `TestAxesPlugin` | `src/plugins/demo/test-axes-plugin.tsx` |
+| Plugin | ID | File | Purpose |
+|--------|----|------|---------|
+| `KpiDemoPlugin` | `kpi-demo` | [src/plugins/demo/kpi-demo-plugin.ts](src/plugins/demo/kpi-demo-plugin.ts) | Seeded OEE/Parts/CycleTime demo data |
+| `DemoHMIPlugin` | `demo-hmi` | [src/plugins/demo/demo-hmi-plugin.tsx](src/plugins/demo/demo-hmi-plugin.tsx) | Demo KPI cards, nav buttons, message tiles |
+| `MachineControlPlugin` | `machine-control` | [src/plugins/demo/machine-control-plugin.ts](src/plugins/demo/machine-control-plugin.ts) | Start/stop control panel |
+| `MaintenancePlugin` | `maintenance` | [src/plugins/demo/maintenance-plugin.ts](src/plugins/demo/maintenance-plugin.ts) | Maintenance checklist + progress |
+| `TestAxesPlugin` | `test-axes` | [src/plugins/demo/test-axes-plugin.tsx](src/plugins/demo/test-axes-plugin.tsx) | Manual axis slider |
+| `PerfTestPlugin` | `perf-test` | [src/plugins/demo/perf-test-plugin.ts](src/plugins/demo/perf-test-plugin.ts) | Performance benchmark (`?perf`) |
 
 ### Data Access Patterns
 
@@ -1699,7 +1735,7 @@ function MyComponent() {
 
 ---
 
-## 14. Context-Aware UI Visibility
+## 14b. Context-Aware UI Visibility
 
 The `ui-context-store` provides data-driven visibility for HMI elements based on active "contexts" — special modes like FPV navigation, layout planner, maintenance, or XR sessions that should hide irrelevant UI.
 
@@ -1836,3 +1872,227 @@ Mirrors Unity's MonoBehaviour pattern. Every plugin repeated the same boilerplat
 
 **Why two signal lookup tables (name + path)?**
 Signals need to be addressed by **name** for communication (plugin API, HMI, interfaces) and by **path** for GLB object references (ComponentRef). The name is the signal's identity (Signal.Name if set, otherwise node name); the path is its location in the scene hierarchy. Both resolve to the same underlying value.
+
+---
+
+## 17. Gizmo Overlay System (`viewer.gizmoManager`)
+
+The `GizmoOverlayManager` is the central tool for rendering visual overlays on top of any 3D node. It is **generic** — sensors, drives, grips, stations, or any custom component can request a gizmo without knowing implementation details.
+
+### Public API
+
+```typescript
+import type { GizmoOverlayManager, GizmoShape, GizmoOptions, GizmoHandle } from '@/core';
+
+// Available on every viewer:
+viewer.gizmoManager.create(node, opts): GizmoHandle;
+viewer.gizmoManager.clearNode(node): void;
+viewer.gizmoManager.setGlobalVisibility(visible): void;
+viewer.gizmoManager.setGlobalShapeOverride(shape | null): void;
+viewer.gizmoManager.setTagFilter(tag | null): void;
+```
+
+### Gizmo Shapes
+
+| Shape | Renders | Notes |
+|-------|---------|-------|
+| `'box'` | AABB wireframe of the subtree | Cheap, unobtrusive |
+| `'transparent-shell'` | Filled transparent box on subtree-AABB | **Default for WebSensor** — volumetric |
+| `'mesh-overlay'` | Overlay mesh per `isMesh` descendant | Best when the node has multiple visible parts (lamp = housing + lens + base); non-Mesh children (Group, Light, Camera) are filtered out |
+| `'sphere'` | Sphere centered on subtree | Point sensors |
+| `'sprite'` | Camera-facing billboard (icon) | Always visible |
+| `'text'` | Camera-facing label, `depthTest: false`, `renderOrder: 11` | NOT a tooltip — always visible, controlled by the component (not by hover state); each text gizmo gets its own `CanvasTexture` (not material-cached) |
+
+### `GizmoOptions`
+
+```typescript
+interface GizmoOptions {
+  shape: GizmoShape;
+  color: number;            // 0xRRGGBB
+  opacity: number;          // 0..1
+  blinkHz?: number;         // 0 = no blink, > 0 = square-wave opacity modulation
+  size?: number;            // default 1.0
+  visible?: boolean;
+  renderOrder?: number;     // default 10 (text default 11)
+  depthTest?: boolean;      // default true (text default false)
+  text?: string;            // required for shape: 'text'
+  textOffsetY?: number;     // world-units above subtree-top
+}
+```
+
+### Material sharing & blink
+
+Materials are cached by `${color}_${opacity}_${depthTest}_${blinkHz}` — sensors that share **all four** properties share one material instance. Blink is modulated **once per material per frame** in the central `tick()` loop (called from `RVViewer.fixedUpdate()`). This guarantees no opacity conflicts even when many gizmos use the same color but different blink rates: they end up on different materials.
+
+### Subtree behavior
+
+All shapes are subtree-aware:
+- Bounding shapes (`box`, `transparent-shell`, `sphere`) compute the AABB over **all mesh descendants** of the node
+- `mesh-overlay` creates one overlay-mesh **per descendant Mesh** (skipping `Group`/`Light`/`Camera`/etc.)
+- Subtree-AABB is computed **once at `create()`** (assumes static scene); for moving objects, dispose and re-create the gizmo
+
+### Example: a custom component using gizmos
+
+```typescript
+class MyComponent implements RVComponent {
+  private _gizmo?: GizmoHandle;
+  init(ctx: ComponentContext): void {
+    if (!ctx.gizmoManager) return;     // gizmoManager is OPTIONAL on ComponentContext
+    this._gizmo = ctx.gizmoManager.create(this.node, {
+      shape: 'transparent-shell',
+      color: 0x00ff00,
+      opacity: 0.4,
+    });
+  }
+  dispose(): void { this._gizmo?.dispose(); }
+}
+```
+
+---
+
+## 18. Component Event Dispatcher (`viewer.componentEventDispatcher`)
+
+Most components need to react when their node is hovered, clicked, or selected. Rather than every component subscribing to `viewer.on('object-hover'/'object-clicked'/'selection-changed')` and filtering, the `ComponentEventDispatcher` does the routing centrally.
+
+### How it works
+
+`registerComponent({ ... })` automatically tags `node.userData._rvComponentInstance = inst` in `afterCreate`. The dispatcher listens to the viewer's raycast/selection events, walks up the parent chain to find a tagged node, and invokes the matching component's optional callbacks:
+
+```typescript
+interface RVComponent {
+  // Required (existing):
+  readonly node: Object3D;
+  init(ctx: ComponentContext): void;
+
+  // Optional event callbacks (NEW — additive, no existing implementer breaks):
+  onHover?(hovered: boolean, event?: ObjectHoverData): void;
+  onClick?(event: { path: string; node: Object3D }): void;
+  onSelect?(selected: boolean): void;
+  dispose?(): void;
+}
+```
+
+### Important details
+
+- Subscribes to the **real** event channels: `object-hover`, `object-unhover`, `object-clicked` (NOT the declared-but-unemitted `object-click`), `selection-changed`
+- Selection is resolved via `SelectionSnapshot.selectedPaths` + `registry.getNode(path)` (NOT a non-existent `nodes` field)
+- `onSelect(false)` fires for nodes that **leave** the selection (tracked via internal `Set<Object3D>`)
+- All callback invocations are wrapped in `try/catch` — a faulty component never breaks the dispatcher
+- Listener cleanup on `dispose()`: viewer subscriptions are stored as unsubscribe fns and called on disposal (no listener leaks on scene reload)
+
+### Example
+
+```typescript
+class MyHoverableComponent implements RVComponent {
+  init(ctx: ComponentContext): void { /* ... */ }
+  onHover(hovered: boolean): void {
+    this._gizmo?.update({ size: hovered ? 1.15 : 1.0 });
+  }
+  onClick(event): void { console.log('Clicked at', event.path); }
+  onSelect(selected: boolean): void {
+    this._gizmo?.update({ color: selected ? 0xffff00 : 0x808080 });
+  }
+}
+```
+
+---
+
+## 19. WebSensor & `initWebSensor()` Configuration API
+
+`WebSensor` (Unity component) → `RVWebSensor` (TypeScript) is the canonical reference implementation that uses both `gizmoManager` and the event dispatcher. See [doc-webviewer.md](./doc-webviewer.md) for end-user documentation. The developer-facing aspect:
+
+### Customizing default visuals via `initWebSensor()`
+
+All WebSensor visual parameters (state colors, opacities, blink rates, default shape, default size, default int→state map) are **hardcoded constants** but **overridable** at runtime via a config API. Call this from a model's `index.ts` (per-project styling) or from the app bootstrap (global corporate design):
+
+```typescript
+import { initWebSensor, resetWebSensorConfig } from '@/core';
+
+// Brand-color override + slower warning blink + custom int mapping
+initWebSensor({
+  stateStyles: {
+    high:    { color: 0x00a030, opacity: 0.60 },   // brand green (other fields kept)
+    warning: { blinkHz: 0.5 },                      // slower pulse
+  },
+  defaultIntStateMap: { 0: 'low', 10: 'high', 20: 'warning', 30: 'error' },
+  defaultShape: 'mesh-overlay',
+  defaultSize: 1.5,
+});
+
+// To restore baked-in ISA-101 defaults:
+resetWebSensorConfig();
+```
+
+`stateStyles` uses **deep partial merge** — only the fields you specify override; unspecified fields keep their current value. `initWebSensor()` is additive across multiple calls.
+
+### Default state styling (ISA-101 aligned)
+
+| State | Color | Opacity | Blink | Meaning |
+|-------|-------|---------|-------|---------|
+| `low` | `#808080` (grey) | 0.35 | — | Normal / inactive |
+| `high` | `#3080ff` (blue) | 0.55 | — | Active / OK |
+| `warning` | `#ffaa00` (amber) | 0.70 | 1 Hz | Attention |
+| `error` | `#ff2020` (red) | 0.85 | 2 Hz | Alarm |
+| `unbound` | `#404040` (dark grey) | 0.20 | — | Signal not resolved |
+
+### Public API exports
+
+The barrel `src/core/index.ts` exposes:
+
+- `WebSensor`-related: `initWebSensor`, `resetWebSensorConfig`, `WebSensorConfig`, `WebSensorInitOptions`, `WebSensorState`, `StateStyle`
+- `Gizmo`-related: `GizmoOverlayManager`, `GizmoShape`, `GizmoOptions`, `GizmoHandle`
+- `Events`: `ComponentEventDispatcher`
+
+---
+
+## 20. Other Feature Plugins (one-paragraph orientation)
+
+These plugins are documented inline (in their source) rather than in dedicated long-form pages. Use this section as a map; the linked file is the canonical spec.
+
+### Process simulation: Pipe / Tank / Pipeline / SafetyDoor
+
+- **Pipe flow propagation** — [src/core/engine/rv-pipe-flow.ts](src/core/engine/rv-pipe-flow.ts). Propagates flow values through connected `Pipe` components based on graph traversal; works hand-in-hand with `Pump` and `Tank`.
+- **Pipeline simulation** — [src/core/engine/rv-pipeline-sim.ts](src/core/engine/rv-pipeline-sim.ts). Higher-level pipeline orchestration: pump speed, tank levels, processing-unit throughput.
+- **Tank fill** — [src/core/engine/rv-tank-fill.ts](src/core/engine/rv-tank-fill.ts). Renders a fill-level visualization inside a tank mesh, driven by a signal or a `Tank` component value.
+- **Safety door** — [src/core/engine/rv-safety-door.ts](src/core/engine/rv-safety-door.ts). Renders an amber hazard halo around a safety-door component when its zone is breached.
+
+Each ships its own tooltip content provider (Pipe, Pump, Tank, ProcessingUnit). Author scenes in Unity with the matching components and they appear automatically — no plugin registration needed for the rendering side.
+
+### Recorders
+
+- **Drive recorder** — [src/plugins/drive-recorder-plugin.ts](src/plugins/drive-recorder-plugin.ts). Records drive position/speed/target during a session for later replay or analysis.
+- **Sensor recorder** — [src/plugins/sensor-recorder-plugin.ts](src/plugins/sensor-recorder-plugin.ts). Records sensor occupied/free transitions with timestamps.
+
+Both expose RingBuffers via the plugin instance — read them through `usePlugin<TheRecorder>('id')`.
+
+### Camera start-position presets
+
+[src/plugins/camera-startpos-plugin.tsx](src/plugins/camera-startpos-plugin.tsx) + [src/core/hmi/camera-startpos-store.ts](src/core/hmi/camera-startpos-store.ts) + [src/core/hmi/settings/CameraStartTab.tsx](src/core/hmi/settings/CameraStartTab.tsx). Per-model named camera positions, persisted in localStorage and embeddable in `rv_extras`. Activated automatically on model load if a `defaultStartPos` is set.
+
+### Annotations + shared view
+
+[src/plugins/annotation-plugin.ts](src/plugins/annotation-plugin.ts) + [src/core/hmi/AnnotationPanel.tsx](src/core/hmi/AnnotationPanel.tsx) + [src/core/hmi/SharedViewBanner.tsx](src/core/hmi/SharedViewBanner.tsx). 3D markers / labels / drawings on surfaces, with `?view=...` URL param for shareable curated views. Sync of annotations across multiuser sessions is handled by the `multiuser-plugin` integration.
+
+### AAS / AASX linking
+
+[src/plugins/aas-link-plugin.tsx](src/plugins/aas-link-plugin.tsx) + [src/plugins/aas-link-parser.ts](src/plugins/aas-link-parser.ts). Loads AASX packages from `public/aasx/` (or `assetsBasePath`), extracts embedded PDFs, and attaches them as `_rvPdfLinks` on matching nodes. Tooltip rendering is handled by the generic tooltip system (`tooltipType: 'aas'`). See also [doc-document-linking.md](doc-document-linking.md).
+
+### Docs browser
+
+[src/plugins/docs-browser-plugin.tsx](src/plugins/docs-browser-plugin.tsx) + [src/core/hmi/DocViewerOverlay.tsx](src/core/hmi/DocViewerOverlay.tsx) + [src/core/hmi/pdf-viewer-store.tsx](src/core/hmi/pdf-viewer-store.tsx). Built-in PDF viewer (page nav, zoom, open in new tab) for `_rvPdfLinks` entries. Auto-mounts when any node has PDF links.
+
+### Order manager
+
+[src/plugins/order-manager-plugin.tsx](src/plugins/order-manager-plugin.tsx). Production order list / status panel — useful for OEE-style demos and operator HMIs. Reads orders from the plugin's own state; pair with a custom feeder plugin for live data.
+
+### Blueprint / 2D plan view
+
+[src/plugins/blueprint-plugin.ts](src/plugins/blueprint-plugin.ts). Top-down 2D plan view overlay; useful as a mini-map or layout preview.
+
+### MCP bridge & MCP tool authoring
+
+[src/plugins/mcp-bridge-plugin.ts](src/plugins/mcp-bridge-plugin.ts) opens a WebSocket to the Python MCP server. Tools are declared on `RVBehavior` subclasses with the `@McpTool` and `@McpParam` decorators in [src/core/engine/rv-mcp-tools.ts](src/core/engine/rv-mcp-tools.ts) — the bridge auto-discovers them on connect and registers JSON tool schemas. To add a new tool: subclass `RVBehavior`, decorate an async method, and register the plugin. The user-facing tool catalog is [webviewer.mcp.md](webviewer.mcp.md).
+
+### Where the public RVViewer API is documented
+
+There is no separate API reference yet. The authoritative surface is [src/core/rv-viewer.ts](src/core/rv-viewer.ts) (search for `class RVViewer` and `interface ViewerEvents`). Most plugin-relevant calls are described in §3 (RVViewerPlugin / RVBehavior), §4 (Events), §5 (UI Slots), §9 (Left Panels), §13 (Per-Model Plugins) above.

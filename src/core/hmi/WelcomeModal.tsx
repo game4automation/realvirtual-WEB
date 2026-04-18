@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+import { useEffect } from 'react';
 import { Box, Paper, Typography, Button } from '@mui/material';
+import SlideshowOutlinedIcon from '@mui/icons-material/SlideshowOutlined';
+import { setWelcomeModalOpen } from './welcome-modal-store';
 
 interface WelcomeModalProps {
   open: boolean;
   onClose: () => void;
+  /** Optional: when supplied, a "Start Demo" button is rendered beside "Got it". */
+  onStartDemo?: () => void;
 }
 
-export function WelcomeModal({ open, onClose }: WelcomeModalProps) {
+export function WelcomeModal({ open, onClose, onStartDemo }: WelcomeModalProps) {
+  // Track visibility in the welcome-modal-store so KioskPlugin can pause idle
+  // detection while the modal blocks interaction. Cleanup on unmount sets false.
+  useEffect(() => {
+    setWelcomeModalOpen(open);
+    return () => { setWelcomeModalOpen(false); };
+  }, [open]);
+
   if (!open) return null;
 
   return (
@@ -92,7 +104,20 @@ export function WelcomeModal({ open, onClose }: WelcomeModalProps) {
           &copy; 2025 realvirtual GmbH
         </Typography>
 
-        <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 1 }}>
+        <Box sx={{ display: 'flex', justifyContent: onStartDemo ? 'space-between' : 'flex-end', mt: 1, gap: 1 }}>
+          {onStartDemo && (
+            <Button
+              variant="contained"
+              color="primary"
+              size="small"
+              startIcon={<SlideshowOutlinedIcon />}
+              onClick={() => { onClose(); onStartDemo(); }}
+              data-testid="welcome-start-demo"
+              sx={{ textTransform: 'none', fontWeight: 600 }}
+            >
+              Start Demo
+            </Button>
+          )}
           <Button variant="contained" size="small" onClick={onClose} sx={{ textTransform: 'none', fontWeight: 600 }}>
             Got it
           </Button>

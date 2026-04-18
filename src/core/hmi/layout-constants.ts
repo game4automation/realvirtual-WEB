@@ -7,7 +7,7 @@
 export const BOTTOM_BAR_HEIGHT = 52;
 
 /** Top position of left-side panels (below TopBar). */
-export const LEFT_PANEL_TOP = 44;
+export const LEFT_PANEL_TOP = 56;
 
 /** Left margin of left-side panels on desktop. */
 export const LEFT_PANEL_LEFT = 8;
@@ -15,8 +15,16 @@ export const LEFT_PANEL_LEFT = 8;
 /** Bottom margin of left-side panels on desktop. */
 export const LEFT_PANEL_BOTTOM = 8;
 
-/** Z-index for left-side panels. */
+/** Z-index for left-side panels (desktop). */
 export const LEFT_PANEL_ZINDEX = 1200;
+
+/**
+ * Z-index for left-side panels on mobile.
+ * Higher than TopBar buttons (9001), BottomBar (1201), ButtonPanel/LogoBadge (1210),
+ * so mobile panels fully overlay the entire viewport. The panel header's own close
+ * button keeps it dismissable.
+ */
+export const LEFT_PANEL_MOBILE_ZINDEX = 10000;
 
 /** Width of the Settings panel. */
 export const SETTINGS_PANEL_WIDTH = 540;

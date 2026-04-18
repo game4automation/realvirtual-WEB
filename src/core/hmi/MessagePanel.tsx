@@ -2,23 +2,31 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { useState } from 'react';
-import { Box } from '@mui/material';
+import { Box, IconButton, Tooltip } from '@mui/material';
+import { ChevronRight, ChevronLeft } from '@mui/icons-material';
 import { useViewer } from '../../hooks/use-viewer';
 import { useSlot } from '../../hooks/use-slot';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
 import { useMaintenanceMode } from '../../hooks/use-maintenance-mode';
-import { useMessagePanelOpen } from './message-panel-store';
+import {
+  useMessagePanelOpen,
+  useMessagePanelMinimized,
+  toggleMessagePanelMinimized,
+} from './message-panel-store';
 import { MaintenancePanel } from './MaintenancePanel';
 
 /** Core layout container for messages (right side). Renders 'messages' slot entries.
- *  When maintenance mode is active, swaps to the MaintenancePanel stepper. */
+ *  When maintenance mode is active, swaps to the MaintenancePanel stepper.
+ *  Desktop supports a minimized peek mode that expands individual cards on hover. */
 export function MessagePanel() {
   const viewer = useViewer();
   const entries = useSlot('messages');
   const isMobile = useMobileLayout();
   const [expandedIdx, setExpandedIdx] = useState(-1);
+  const [hoveredIdx, setHoveredIdx] = useState(-1);
   const maintenanceState = useMaintenanceMode();
   const messagePanelOpen = useMessagePanelOpen();
+  const minimized = useMessagePanelMinimized();
 
   const isMaintenanceActive = maintenanceState.mode !== 'idle';
 
@@ -51,6 +59,60 @@ export function MessagePanel() {
 
   // ── Desktop: vertical centered column on the right ──
   if (!isMobile) {
+    // Minimized desktop mode: peek tabs, expand individual card on hover.
+    if (minimized) {
+      return (
+        <Box
+          data-ar-show
+          sx={{
+            position: 'fixed',
+            right: 0,
+            top: 0,
+            bottom: 0,
+            zIndex: 1200,
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'center',
+            gap: 0.5,
+            pointerEvents: 'none',
+          }}
+        >
+          <Box sx={{ alignSelf: 'flex-end', pointerEvents: 'auto', mb: 0.5 }}>
+            <Tooltip title="Expand messages" placement="left">
+              <IconButton
+                size="small"
+                onClick={toggleMessagePanelMinimized}
+                sx={{ bgcolor: 'rgba(0,0,0,0.4)', '&:hover': { bgcolor: 'rgba(0,0,0,0.6)' } }}
+              >
+                <ChevronLeft fontSize="small" />
+              </IconButton>
+            </Tooltip>
+          </Box>
+          {entries.map((entry, i) => {
+            const Comp = entry.component;
+            const isHovered = hoveredIdx === i;
+            return (
+              <Box
+                key={`msg-${i}`}
+                data-ui-panel
+                onMouseEnter={() => setHoveredIdx(i)}
+                onMouseLeave={() => setHoveredIdx(-1)}
+                sx={{
+                  pointerEvents: 'auto',
+                  width: 300,
+                  transform: isHovered ? 'translateX(0)' : 'translateX(calc(100% - 36px))',
+                  transition: 'transform 0.25s ease',
+                }}
+              >
+                <Comp viewer={viewer} />
+              </Box>
+            );
+          })}
+        </Box>
+      );
+    }
+
+    // Full desktop column with a minimize button at the top.
     return (
       <Box
         data-ar-show
@@ -69,6 +131,17 @@ export function MessagePanel() {
           overflow: 'auto',
         }}
       >
+        <Box sx={{ alignSelf: 'flex-end', pointerEvents: 'auto' }}>
+          <Tooltip title="Minimize messages" placement="left">
+            <IconButton
+              size="small"
+              onClick={toggleMessagePanelMinimized}
+              sx={{ bgcolor: 'rgba(0,0,0,0.4)', '&:hover': { bgcolor: 'rgba(0,0,0,0.6)' } }}
+            >
+              <ChevronRight fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        </Box>
         {entries.map((entry, i) => {
           const Comp = entry.component;
           return <Box key={`msg-${i}`} data-ui-panel><Comp viewer={viewer} /></Box>;

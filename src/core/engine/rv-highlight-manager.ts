@@ -30,9 +30,12 @@ import {
   Matrix4,
   Box3,
   Box3Helper,
+  BufferGeometry,
+  Float32BufferAttribute,
 } from 'three';
-import type { Scene, BufferGeometry } from 'three';
+import type { Scene } from 'three';
 import type { InstancedMovingUnit } from './rv-mu';
+import { HIGHLIGHT_OVERLAY_LAYER } from './rv-group-registry';
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -48,8 +51,8 @@ const SELECTION_EDGE_OPACITY = 0.8;
 
 const EDGE_THRESHOLD_DEG = 30;
 
-/** Max meshes for hover highlight — above this, show bounding-box wireframe instead. */
-const MAX_HOVER_MESHES = 50;
+/** Default max meshes for hover highlight — above this, show bounding-box wireframe instead. */
+const DEFAULT_MAX_HOVER_MESHES = 200;
 
 // ─── Shared Materials ─────────────────────────────────────────────────
 
@@ -116,6 +119,9 @@ export class RVHighlightManager {
   /** When true, update() re-syncs selection overlay matrices. */
   private selectionTracked = false;
 
+  /** Max meshes before falling back to bounding-box wireframe. */
+  maxHoverMeshes = DEFAULT_MAX_HOVER_MESHES;
+
   constructor(private readonly scene: Scene) {}
 
   // ─── Private helpers ─────────────────────────────────────────────────
@@ -144,6 +150,7 @@ export class RVHighlightManager {
     overlay.matrixWorldAutoUpdate = false;
     overlay.matrix.copy(matrix);
     overlay.matrixWorld.copy(matrix);
+    overlay.layers.set(HIGHLIGHT_OVERLAY_LAYER);
     this.scene.add(overlay);
 
     let edgeGeo = edgeGeometryCache.get(geometry);
@@ -160,6 +167,7 @@ export class RVHighlightManager {
     edgeLines.matrixWorldAutoUpdate = false;
     edgeLines.matrix.copy(matrix);
     edgeLines.matrixWorld.copy(matrix);
+    edgeLines.layers.set(HIGHLIGHT_OVERLAY_LAYER);
     this.scene.add(edgeLines);
 
     return { source: sourceMesh, fill: overlay, edge: edgeLines };
@@ -198,7 +206,7 @@ export class RVHighlightManager {
     const includeChildDrives = options?.includeChildDrives ?? false;
     const meshes = this.collectMeshes(root, includeSensorViz, includeChildDrives);
 
-    if (meshes.length > MAX_HOVER_MESHES) {
+    if (meshes.length > this.maxHoverMeshes) {
       this._highlightBoundingBox(root);
       return;
     }
@@ -256,7 +264,7 @@ export class RVHighlightManager {
       totalMeshes += meshes.length;
     }
 
-    if (totalMeshes > MAX_HOVER_MESHES) {
+    if (totalMeshes > this.maxHoverMeshes) {
       for (const { root } of allMeshes) this._highlightBoundingBox(root);
       return;
     }
@@ -311,6 +319,72 @@ export class RVHighlightManager {
     }
   }
 
+  /**
+   * Batched selection highlight — merges all meshes from all roots into a single
+   * overlay + single edge mesh. Much faster than highlightSelection() for many nodes
+   * (1 EdgesGeometry computation instead of N, 2 draw calls instead of 2N).
+   * Not tracked (static snapshot) — use for browse modes, not moving objects.
+   */
+  highlightSelectionBatched(roots: Object3D[]): void {
+    this.clearSelection();
+    if (roots.length === 0) return;
+
+    // Collect all mesh geometries with their world transforms
+    const positions: number[] = [];
+    for (const root of roots) {
+      const meshes = this.collectMeshes(root, false, false);
+      for (const mesh of meshes) {
+        mesh.updateWorldMatrix(true, false);
+        const geo = mesh.geometry;
+        const posAttr = geo.getAttribute('position');
+        if (!posAttr) continue;
+        const idx = geo.index;
+        const mat = mesh.matrixWorld;
+        if (idx) {
+          for (let i = 0; i < idx.count; i++) {
+            const vi = idx.getX(i);
+            const x = posAttr.getX(vi), y = posAttr.getY(vi), z = posAttr.getZ(vi);
+            // Transform by world matrix
+            const w = 1 / (mat.elements[3] * x + mat.elements[7] * y + mat.elements[11] * z + mat.elements[15]);
+            positions.push(
+              (mat.elements[0] * x + mat.elements[4] * y + mat.elements[8] * z + mat.elements[12]) * w,
+              (mat.elements[1] * x + mat.elements[5] * y + mat.elements[9] * z + mat.elements[13]) * w,
+              (mat.elements[2] * x + mat.elements[6] * y + mat.elements[10] * z + mat.elements[14]) * w,
+            );
+          }
+        } else {
+          for (let i = 0; i < posAttr.count; i++) {
+            const x = posAttr.getX(i), y = posAttr.getY(i), z = posAttr.getZ(i);
+            const w = 1 / (mat.elements[3] * x + mat.elements[7] * y + mat.elements[11] * z + mat.elements[15]);
+            positions.push(
+              (mat.elements[0] * x + mat.elements[4] * y + mat.elements[8] * z + mat.elements[12]) * w,
+              (mat.elements[1] * x + mat.elements[5] * y + mat.elements[9] * z + mat.elements[13]) * w,
+              (mat.elements[2] * x + mat.elements[6] * y + mat.elements[10] * z + mat.elements[14]) * w,
+            );
+          }
+        }
+      }
+    }
+
+    if (positions.length === 0) return;
+
+    const mergedGeo = new BufferGeometry();
+    mergedGeo.setAttribute('position', new Float32BufferAttribute(positions, 3));
+
+    // Single fill overlay — no edge computation (fast)
+    const fill = new Mesh(mergedGeo, selectionOverlayMat);
+    fill.name = '_batchedSelFill';
+    fill.userData._highlightOverlay = true;
+    fill.renderOrder = 900;
+    fill.raycast = () => {};
+    fill.frustumCulled = false;
+    fill.layers.set(HIGHLIGHT_OVERLAY_LAYER);
+    this.scene.add(fill);
+
+    // Use fill as dummy edge too — batched highlights skip edge computation for speed
+    this.selectionPairs.push({ source: fill, fill, edge: fill as unknown as LineSegments });
+  }
+
   /** Remove selection highlight overlays only. Hover persists. */
   clearSelection(): void {
     this._removePairs(this.selectionPairs);
@@ -355,6 +429,7 @@ export class RVHighlightManager {
     helper.userData._highlightOverlay = true;
     helper.renderOrder = 1000;
     helper.raycast = () => {};
+    helper.layers.set(HIGHLIGHT_OVERLAY_LAYER);
     this.scene.add(helper);
     this.hoverPairs.push({ source: root as unknown as Mesh, fill: helper as unknown as Mesh, edge: helper as unknown as LineSegments });
   }

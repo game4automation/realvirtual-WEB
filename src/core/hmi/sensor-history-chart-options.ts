@@ -33,8 +33,6 @@ export const DEFAULT_CHART_THEME: SensorHistoryChartTheme = {
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
-const STATE_ORDER: WebSensorState[] = ['low', 'high', 'warning', 'error'];
-
 function colorForState(s: WebSensorState): string {
   const c = WebSensorConfig.stateStyles[s].color;
   return '#' + c.toString(16).padStart(6, '0');
@@ -61,11 +59,6 @@ function timeFormatter(window: SensorHistoryWindow): (val: number) => string {
   };
 }
 
-/** Y-axis label formatter for single-mode: map numeric → state short label. */
-function stateLabelFormatter(val: number): string {
-  const idx = Math.round(val);
-  return STATE_LABEL[STATE_ORDER[idx] ?? 'low'] ?? '';
-}
 
 // ─── Single-mode option ────────────────────────────────────────────────
 
@@ -79,9 +72,10 @@ export function buildSingleOption(
   window: SensorHistoryWindow,
   theme: SensorHistoryChartTheme = DEFAULT_CHART_THEME,
 ): Record<string, unknown> {
+  // Collapse to 0/1 (LOW/HIGH) — same view as all-mode tracks.
   const data: Array<[number, number]> = new Array(series.ts.length);
   for (let i = 0; i < series.ts.length; i++) {
-    data[i] = [series.ts[i], series.numeric[i]];
+    data[i] = [series.ts[i], series.numeric[i] >= 1 ? 1 : 0];
   }
 
   return {
@@ -97,13 +91,17 @@ export function buildSingleOption(
     yAxis: {
       type: 'value',
       min: -0.2,
-      max: 3.2,
+      max: 1.2,
       interval: 1,
       axisLabel: {
         color: theme.textSecondary,
-        formatter: stateLabelFormatter,
+        formatter: (val: number) => {
+          const idx = Math.round(val);
+          if (idx === 0) return 'LOW';
+          if (idx === 1) return 'HIGH';
+          return '';
+        },
       },
-      splitNumber: 4,
       splitLine: { lineStyle: { color: 'rgba(255,255,255,0.05)' } },
     },
     visualMap: {
@@ -114,8 +112,6 @@ export function buildSingleOption(
       pieces: [
         { value: 0, color: colorForState('low') },
         { value: 1, color: colorForState('high') },
-        { value: 2, color: colorForState('warning') },
-        { value: 3, color: colorForState('error') },
       ],
     },
     series: [{
@@ -124,11 +120,27 @@ export function buildSingleOption(
       symbol: 'none',
       data,
       lineStyle: { width: 2 },
+      areaStyle: { opacity: 0.2 },
       progressive: 1000,
       large: true,
     }],
+    axisPointer: {
+      label: {
+        show: true,
+        backgroundColor: theme.accent,
+        formatter: (params: { value: number }) => {
+          const d = new Date(params.value);
+          const hh = d.getHours().toString().padStart(2, '0');
+          const mm = d.getMinutes().toString().padStart(2, '0');
+          const ss = d.getSeconds().toString().padStart(2, '0');
+          return `${hh}:${mm}:${ss}`;
+        },
+      },
+      lineStyle: { color: 'rgba(255,255,255,0.35)' },
+    },
     tooltip: {
       trigger: 'axis',
+      axisPointer: { type: 'line' },
       backgroundColor: 'rgba(18,18,18,0.95)',
       borderColor: 'rgba(255,255,255,0.1)',
       textStyle: { color: '#fff' },
@@ -136,14 +148,10 @@ export function buildSingleOption(
         const arr = Array.isArray(params) ? params : [params];
         const p = arr[0] as { value: [number, number] } | undefined;
         if (!p?.value) return '';
-        const [t, n] = p.value;
-        const stateIdx = Math.round(n);
-        const state = STATE_ORDER[stateIdx] ?? 'low';
-        const d = new Date(t);
-        const hh = d.getHours().toString().padStart(2, '0');
-        const mm = d.getMinutes().toString().padStart(2, '0');
-        const ss = d.getSeconds().toString().padStart(2, '0');
-        return `${hh}:${mm}:${ss} — ${STATE_LABEL[state]}`;
+        const v = p.value[1];
+        const state: WebSensorState = v >= 1 ? 'high' : 'low';
+        const stateColor = colorForState(state);
+        return `<span style="color:${stateColor};font-weight:600">${STATE_LABEL[state]}</span>`;
       },
     },
     dataZoom: [
@@ -166,6 +174,19 @@ const ROW_GAP = 6;      // px between tracks
 const TOP_PAD = 12;     // top padding inside chart area
 const BOTTOM_PAD = 56;  // room for time axis + slider
 
+/** Calculate the minimum canvas height needed for N sensor tracks. */
+export function allModeCanvasHeight(trackCount: number): number {
+  if (trackCount <= 0) return 200;
+  return TOP_PAD + trackCount * (ROW_H + ROW_GAP) - ROW_GAP + BOTTOM_PAD;
+}
+
+/** Palette for per-sensor line colors in all-mode. Cycles for >N sensors. */
+const TRACK_PALETTE = [
+  '#4fc3f7', '#81c784', '#ffb74d', '#e57373', '#ba68c8',
+  '#4dd0e1', '#aed581', '#ffd54f', '#f06292', '#7986cb',
+  '#4db6ac', '#dce775', '#ff8a65', '#9575cd', '#64b5f6',
+];
+
 /**
  * Build ECharts options for the logic-analyzer multi-grid view
  * (one grid per sensor, shared zoom + cursor).
@@ -182,7 +203,7 @@ export function buildAllOption(
   const N = Math.max(0, allSeries.length);
 
   const grid = allSeries.map((_, i) => ({
-    left: 96,
+    left: 110,
     right: 24,
     top: TOP_PAD + i * (ROW_H + ROW_GAP),
     height: ROW_H,
@@ -212,12 +233,15 @@ export function buildAllOption(
     axisLine: { show: false },
     splitLine: { show: false },
     name: sensor.label,
-    nameLocation: 'middle',
-    nameGap: 64,
+    nameLocation: 'middle' as const,
+    nameGap: 72,
+    nameRotate: 0,   // horizontal label (not vertical)
     nameTextStyle: {
       color: sensor.path === activePath ? theme.accent : theme.textSecondary,
-      fontWeight: sensor.path === activePath ? 'bold' : 'normal',
-      fontSize: 11,
+      fontWeight: sensor.path === activePath ? 'bold' : ('normal' as const),
+      fontSize: 10,
+      fontFamily: 'monospace',
+      align: 'right' as const,
     },
   }));
 
@@ -228,6 +252,7 @@ export function buildAllOption(
       data[j] = [s.ts[j], s.numeric[j] >= 1 ? 1 : 0];
     }
     const isActive = sensor.path === activePath;
+    const trackColor = TRACK_PALETTE[i % TRACK_PALETTE.length];
     return {
       type: 'line',
       step: 'start',
@@ -237,11 +262,11 @@ export function buildAllOption(
       data,
       lineStyle: {
         width: isActive ? 2.5 : 1.5,
-        color: isActive ? theme.accent : theme.line,
+        color: isActive ? theme.accent : trackColor,
       },
       areaStyle: {
-        opacity: isActive ? 0.25 : 0.15,
-        color: isActive ? theme.accent : theme.line,
+        opacity: isActive ? 0.25 : 0.12,
+        color: isActive ? theme.accent : trackColor,
       },
       progressive: 1000,
       large: true,
@@ -257,7 +282,17 @@ export function buildAllOption(
     series,
     axisPointer: {
       link: [{ xAxisIndex: 'all' }],
-      label: { backgroundColor: theme.accent },
+      label: {
+        show: true,
+        backgroundColor: theme.accent,
+        formatter: (params: { value: number }) => {
+          const d = new Date(params.value);
+          const hh = d.getHours().toString().padStart(2, '0');
+          const mm = d.getMinutes().toString().padStart(2, '0');
+          const ss = d.getSeconds().toString().padStart(2, '0');
+          return `${hh}:${mm}:${ss}`;
+        },
+      },
       lineStyle: { color: 'rgba(255,255,255,0.35)' },
     },
     tooltip: {
@@ -265,7 +300,37 @@ export function buildAllOption(
       axisPointer: { type: 'line' },
       backgroundColor: 'rgba(18,18,18,0.95)',
       borderColor: 'rgba(255,255,255,0.1)',
-      textStyle: { color: '#fff' },
+      textStyle: { color: '#fff', fontSize: 11 },
+      formatter: (params: unknown) => {
+        const arr = Array.isArray(params) ? params : [params];
+        if (arr.length === 0) return '';
+        // Time header from first entry
+        const first = arr[0] as { value?: [number, number] } | undefined;
+        if (!first?.value) return '';
+        const d = new Date(first.value[0]);
+        const hh = d.getHours().toString().padStart(2, '0');
+        const mm = d.getMinutes().toString().padStart(2, '0');
+        const ss = d.getSeconds().toString().padStart(2, '0');
+        const time = `<div style="margin-bottom:4px;color:#aaa;font-size:10px">${hh}:${mm}:${ss}</div>`;
+        // One row per sensor
+        const rows = (arr as Array<{ seriesIndex?: number; value?: [number, number]; color?: string }>)
+          .map(p => {
+            if (!p.value) return '';
+            const idx = p.seriesIndex ?? 0;
+            const sensorRef = allSeries[idx]?.sensor;
+            const label = sensorRef?.label ?? `#${idx}`;
+            const v = p.value[1];
+            const state = v >= 1 ? 'HIGH' : 'LOW';
+            const stateColor = v >= 1 ? colorForState('high') : colorForState('low');
+            return `<div style="display:flex;align-items:center;gap:6px;font-size:11px">`
+              + `<span style="width:8px;height:8px;border-radius:50%;background:${stateColor};flex-shrink:0"></span>`
+              + `<span style="color:#ccc">${label}</span>`
+              + `<span style="margin-left:auto;font-weight:600;color:${stateColor}">${state}</span></div>`;
+          })
+          .filter(Boolean)
+          .join('');
+        return time + rows;
+      },
     },
     dataZoom: [
       { type: 'inside', xAxisIndex: xAxisIndexAll },

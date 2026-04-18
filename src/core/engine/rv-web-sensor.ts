@@ -15,7 +15,7 @@
 
 import type { Object3D } from 'three';
 import type { ComponentContext, ComponentSchema, RVComponent } from './rv-component-registry';
-import { registerComponent } from './rv-component-registry';
+import { registerComponent, setComponentInstance } from './rv-component-registry';
 import type { GizmoHandle, GizmoShape } from './rv-gizmo-manager';
 
 // ─── Types ─────────────────────────────────────────────────────────────
@@ -31,11 +31,22 @@ export interface StateStyle {
 // ─── Baked-in defaults (ISA-101 aligned) ────────────────────────────────
 
 const BAKED_STATE_STYLES: Record<WebSensorState, StateStyle> = {
-  low:     { color: 0x808080, opacity: 0.35, blinkHz: 0 },
-  high:    { color: 0x3080ff, opacity: 0.55, blinkHz: 0 },
-  warning: { color: 0xffaa00, opacity: 0.70, blinkHz: 1 },
-  error:   { color: 0xff2020, opacity: 0.85, blinkHz: 2 },
-  unbound: { color: 0x404040, opacity: 0.20, blinkHz: 0 },
+  // Hull material is always 'transparent: true' (forced in _buildMeshGlowHull),
+  // so the blink loop can modulate opacity for active states.
+  low:     { color: 0x808080, opacity: 0.85, blinkHz: 0 },
+  high:    { color: 0x22cc44, opacity: 0.95, blinkHz: 0 },   // green
+  warning: { color: 0xffaa00, opacity: 0.95, blinkHz: 1 },   // 1 Hz blink
+  error:   { color: 0xff2020, opacity: 0.95, blinkHz: 2 },   // 2 Hz blink
+  unbound: { color: 0x404040, opacity: 0.60, blinkHz: 0 },
+};
+
+/** Emissive intensity per state — non-zero values trigger UnrealBloomPass glow. */
+const STATE_EMISSIVE: Record<WebSensorState, number> = {
+  low:     0,    // flat MeshBasic, no glow
+  high:    1.5,  // moderate glow
+  warning: 2.5,  // strong glow
+  error:   3.5,  // very strong glow
+  unbound: 0,
 };
 
 const BAKED_INT_STATE_MAP: ReadonlyMap<number, WebSensorState> = new Map<number, WebSensorState>([
@@ -45,8 +56,15 @@ const BAKED_INT_STATE_MAP: ReadonlyMap<number, WebSensorState> = new Map<number,
   [3, 'error'],
 ]);
 
-const BAKED_SHAPE: GizmoShape = 'transparent-shell';
+// Use an inverted-hull outline of the actual sensor mesh: solid colored "shell"
+// slightly larger than the real geometry, so the sensor body is highlighted in
+// its state color from any angle. No abstract sphere — the user sees the real
+// CAD geometry with a colored outline.
+const BAKED_SHAPE: GizmoShape = 'mesh-glow-hull';
 const BAKED_SIZE = 1.0;
+// Sensors without a bound signal automatically pick a random state so the scene
+// is visually meaningful out of the box. Override via initWebSensor({ randomDemoStates: false }).
+const BAKED_RANDOM_DEMO = true;
 
 // ─── Mutable module state (override via initWebSensor) ──────────────────
 
@@ -55,6 +73,9 @@ export const WebSensorConfig = {
   defaultIntStateMap: new Map(BAKED_INT_STATE_MAP) as Map<number, WebSensorState>,
   defaultShape: BAKED_SHAPE as GizmoShape,
   defaultSize: BAKED_SIZE,
+  /** Demo: when true, sensors without a bound signal pick a random state at init
+   *  (one of low/high/warning/error). Default false → unbound (neutral grey). */
+  randomDemoStates: BAKED_RANDOM_DEMO,
 };
 
 // ─── Module-local warn-once set (F22 — no external warnOnce util) ──────
@@ -77,6 +98,7 @@ export interface WebSensorInitOptions {
   stateStyles?: Partial<Record<WebSensorState, Partial<StateStyle>>>;
   defaultShape?: GizmoShape;
   defaultSize?: number;
+  randomDemoStates?: boolean;
 }
 
 export function initWebSensor(opts: WebSensorInitOptions): void {
@@ -96,6 +118,7 @@ export function initWebSensor(opts: WebSensorInitOptions): void {
   }
   if (opts.defaultShape) WebSensorConfig.defaultShape = opts.defaultShape;
   if (opts.defaultSize !== undefined) WebSensorConfig.defaultSize = opts.defaultSize;
+  if (opts.randomDemoStates !== undefined) WebSensorConfig.randomDemoStates = opts.randomDemoStates;
 }
 
 export function resetWebSensorConfig(): void {
@@ -103,6 +126,7 @@ export function resetWebSensorConfig(): void {
   WebSensorConfig.defaultIntStateMap = new Map(BAKED_INT_STATE_MAP);
   WebSensorConfig.defaultShape       = BAKED_SHAPE;
   WebSensorConfig.defaultSize        = BAKED_SIZE;
+  WebSensorConfig.randomDemoStates   = BAKED_RANDOM_DEMO;
 }
 
 // ─── IntStateMap parser ────────────────────────────────────────────────
@@ -151,7 +175,7 @@ export class RVWebSensor implements RVComponent {
   Label = '';
 
   private _gizmo?: GizmoHandle;
-  private _textGizmo?: GizmoHandle;
+  private _labelGizmo?: GizmoHandle;
   private _unsubscribe?: () => void;
   private _state: WebSensorState = 'low';
   private _intMap?: Map<number, WebSensorState>;
@@ -170,8 +194,14 @@ export class RVWebSensor implements RVComponent {
     // Tag the node so the Panel and event dispatcher can find it
     this.node.userData._rvType = 'WebSensor';
     this.node.userData._rvTag = 'sensor';
-    this.node.userData._rvWebSensor = this;
-    this.node.userData._rvComponentInstance = this;
+    // Non-enumerable for the back-references (component → node → userData → component
+    // would crash Three.js Object3D.clone() which JSON round-trips userData).
+    Object.defineProperty(this.node.userData, '_rvWebSensor', {
+      value: this, writable: true, configurable: true, enumerable: false,
+    });
+    Object.defineProperty(this.node.userData, '_rvComponentInstance', {
+      value: this, writable: true, configurable: true, enumerable: false,
+    });
 
     const initialStyle = WebSensorConfig.stateStyles.low;
     this._gizmo = ctx.gizmoManager.create(this.node, {
@@ -180,15 +210,24 @@ export class RVWebSensor implements RVComponent {
       opacity: initialStyle.opacity,
       blinkHz: initialStyle.blinkHz,
       size:    WebSensorConfig.defaultSize,
+      // Wider outline so small sensor bodies (~4 cm) are visible from far.
+      outlineScale: 2.0,
     });
+    // Note: GizmoOverlayManager auto-registers the sphere as an auxiliary
+    // raycast target (resolving to this.node) when constructed with a
+    // raycastManager — see GizmoOverlayManager constructor JSDoc.
 
+    // Small text gizmo with the sensor ID — HIDDEN by default in the normal busy
+    // scene; toggled on via setLabelVisible(true) only when sensor isolate-mode
+    // is active (then labels help identify which sensor is which).
     if (this.Label) {
-      this._textGizmo = ctx.gizmoManager.create(this.node, {
+      this._labelGizmo = ctx.gizmoManager.create(this.node, {
         shape: 'text',
         text: this.Label,
-        color: initialStyle.color,
+        color: 0xffffff,
         opacity: 1.0,
-        blinkHz: 0,
+        size: 0.15,   // small enough to not dominate the scene
+        visible: false,
       });
     }
 
@@ -212,6 +251,11 @@ export class RVWebSensor implements RVComponent {
       );
       const current = ctx.signalStore.getByPath(this.SignalBool);
       if (current !== undefined) this._onBoolChange(!!current);
+    } else if (WebSensorConfig.randomDemoStates) {
+      // Demo mode: assign a random state instead of 'unbound'.
+      // State is stable per-sensor for the session (does not change).
+      const states: WebSensorState[] = ['low', 'high', 'warning', 'error'];
+      this._applyState(states[Math.floor(Math.random() * states.length)]);
     } else {
       this._applyState('unbound');
       warnOnceForSignal(this.Label || '(WebSensor)', 'no signal bound');
@@ -239,13 +283,24 @@ export class RVWebSensor implements RVComponent {
     if (s === this._state) return;
     this._state = s;
     const st = WebSensorConfig.stateStyles[s];
-    this._gizmo?.update({ color: st.color, opacity: st.opacity, blinkHz: st.blinkHz });
-    // Text label color follows state, but no blink
-    this._textGizmo?.update({ color: st.color });
+    // Glow via emissive intensity → picked up by UnrealBloomPass for bright states.
+    // STATE_EMISSIVE: low/unbound = 0 (flat MeshBasic), active states 1.5-3.5 (bloom).
+    this._gizmo?.update({
+      color: st.color,
+      opacity: st.opacity,
+      blinkHz: st.blinkHz,
+      emissiveIntensity: STATE_EMISSIVE[s],
+    });
   }
 
   getCurrentState(): WebSensorState {
     return this._state;
+  }
+
+  /** Show/hide the small ID text gizmo above the sensor.
+   *  Used by WebSensorPlugin to clear labels when sensors are isolated. */
+  setLabelVisible(visible: boolean): void {
+    this._labelGizmo?.setVisible(visible);
   }
 
   // ── Component event callbacks (F32/F33) ────────────────────────────────
@@ -269,10 +324,11 @@ export class RVWebSensor implements RVComponent {
   dispose(): void {
     this._unsubscribe?.();
     this._unsubscribe = undefined;
+    // Aux raycast targets are auto-unregistered by GizmoOverlayManager.dispose().
     this._gizmo?.dispose();
     this._gizmo = undefined;
-    this._textGizmo?.dispose();
-    this._textGizmo = undefined;
+    this._labelGizmo?.dispose();
+    this._labelGizmo = undefined;
   }
 }
 
@@ -280,17 +336,27 @@ export class RVWebSensor implements RVComponent {
 
 registerComponent({
   type: 'WebSensor',
+  // Display as a regular Sensor in the hierarchy badge.
+  displayName: 'Sensor',
   schema: RVWebSensor.schema,
   capabilities: {
     hoverable: true,
+    hoverEnabledByDefault: true,   // ← enable hover/click out of the box
     selectable: true,
+    // The "Web Sensors" filterLabel is kept for the dedicated SensorToolPanel + future filters.
     filterLabel: 'Web Sensors',
-    badgeColor: '#3080ff',
+    badgeColor: '#66bb6a',   // matches BADGE_COLORS.Sensor (green)
+    tooltipType: 'web-sensor',
   },
   create: (node) => new RVWebSensor(node),
   afterCreate: (inst, node) => {
     node.userData._rvType = 'WebSensor';
     node.userData._rvTag = 'sensor';
+    // Non-enumerable — JSON.stringify-safe (see rv-component-registry.ts)
+    Object.defineProperty(node.userData, '_rvComponentInstance', {
+      value: inst, writable: true, configurable: true, enumerable: false,
+    });
     node.userData._rvComponentInstance = inst;
+    setComponentInstance(node, inst);
   },
 });

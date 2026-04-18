@@ -41,6 +41,7 @@ import {
 import {
   buildSingleOption,
   buildAllOption,
+  allModeCanvasHeight,
   DEFAULT_CHART_THEME,
 } from './sensor-history-chart-options';
 import { useDrag } from './ChartPanel';
@@ -203,24 +204,36 @@ export function SensorHistoryPanel() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pos.x, pos.y]);
 
-  // Resize via ResizeObserver → commits to store.
   const paperRef = useRef<HTMLDivElement | null>(null);
+
+  // Track user-driven CSS resize (the `resize: both` handle). Only commits
+  // on pointer-up to avoid re-render loops during drag. We detect the resize
+  // via ResizeObserver but ONLY apply if the user is actively dragging the
+  // resize handle (pointerdown on the element).
+  const isUserResizing = useRef(false);
   useEffect(() => {
     if (!activeSensor) return;
     const el = paperRef.current;
     if (!el) return;
-    const ro = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        const cr = entry.contentRect;
-        // Apply min constraints.
-        const w = Math.max(MIN_W, Math.round(cr.width));
-        const h = Math.max(MIN_H, Math.round(cr.height));
-        setSize({ w, h });
-        sensorHistoryStore.setLayout({ w, h });
-      }
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
+
+    const onDown = () => { isUserResizing.current = true; };
+    const onUp = () => {
+      if (!isUserResizing.current) return;
+      isUserResizing.current = false;
+      // Read the actual element size after CSS resize and commit.
+      const rect = el.getBoundingClientRect();
+      const w = Math.max(MIN_W, Math.round(rect.width));
+      const h = Math.max(MIN_H, Math.round(rect.height));
+      setSize({ w, h });
+      sensorHistoryStore.setLayout({ w, h });
+    };
+
+    el.addEventListener('pointerdown', onDown);
+    window.addEventListener('pointerup', onUp);
+    return () => {
+      el.removeEventListener('pointerdown', onDown);
+      window.removeEventListener('pointerup', onUp);
+    };
   }, [activeSensor]);
 
   // Close on ESC.
@@ -278,9 +291,38 @@ export function SensorHistoryPanel() {
     return buildAllOption(allSeries, activeSensor.path, win, DEFAULT_CHART_THEME);
   }, [mode, allSeries, activeSensor, win]);
 
+  // Keep a ref to the latest option so the onInit callback can apply it
+  // as soon as ECharts finishes its init (50ms delay). Without this, the
+  // initial setOption fires before chartInstance is created → empty panel.
+  const optionRef = useRef(option);
+  optionRef.current = option;
+
+  // Keep a stable ref to allSensors for the click handler.
+  const allSensorsRef = useRef(allSensors);
+  allSensorsRef.current = allSensors;
+
   const { containerRef, chartInstance } = useEChart({
     open: !!activeSensor,
     enableWindowResize: true,
+    onInit: (chart) => {
+      if (optionRef.current) chart.setOption(optionRef.current, true);
+
+      // Click on a sensor track → focus camera on that sensor in 3D.
+      chart.on('click', (params: { seriesIndex?: number }) => {
+        const idx = params.seriesIndex ?? 0;
+        const ref = allSensorsRef.current[idx];
+        if (!ref) return;
+        const reg = viewer.registry;
+        if (!reg) return;
+        const node = reg.getNode(ref.path);
+        if (node) {
+          viewer.fitToNodes([node]);
+          viewer.emit('object-focus', { path: ref.path, node });
+        }
+        // Switch active sensor in store so single-mode follows the click.
+        sensorHistoryStore.open(ref);
+      });
+    },
   });
 
   // Apply option with notMerge=true so mode-switches single↔all fully reset
@@ -343,6 +385,15 @@ export function SensorHistoryPanel() {
           fontSize: 12,
         }}>
           No WebSensors in the current scene
+        </Box>
+      ) : mode === 'all' && allSensors.length > 6 ? (
+        /* Scrollable wrapper for all-mode: ECharts canvas has a fixed height
+           based on track count; outer Box scrolls when panel is smaller. */
+        <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+          <Box
+            ref={containerRef}
+            sx={{ width: '100%', height: allModeCanvasHeight(allSensors.length) }}
+          />
         </Box>
       ) : (
         <Box ref={containerRef} sx={{ flex: 1, minHeight: 0 }} />

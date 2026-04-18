@@ -134,8 +134,21 @@ export class RaycastManager {
   private _enabledTypes = new Set<HoverableType>();
   /** Ancestor override callbacks — first non-null result wins. */
   private _ancestorOverrides: AncestorOverrideFn[] = [];
+  /** Optional allow filter — when set, only nodes passing this filter are hoverable/clickable. */
+  private _allowFilter: ((node: Object3D) => boolean) | null = null;
+  /**
+   * Isolation gate — installed by RVViewer once both registries exist.
+   * Returns false for nodes outside any active isolation, regardless of
+   * which provider (group/auto-filter/external) requested the isolate.
+   * Stacked with `_allowFilter` (gate AND filter must pass).
+   */
+  private _isolationGate: ((node: Object3D) => boolean) | null = null;
   /** Cached raycast target list (rebuilt when geometry or instanced meshes change). */
   private _targets: Object3D[] = [];
+  /** Auxiliary raycast targets registered by plugins/components (e.g. gizmo spheres).
+   *  When a ray hits one of these, it is resolved to the owner via _auxOwners. */
+  private _auxTargets: Object3D[] = [];
+  private _auxOwners = new WeakMap<Object3D, Object3D>();
   /** Map from raycast BVH mesh → RaycastGroup (for face-range lookup). */
   private _meshToGroup = new Map<Object3D, RaycastGroup>();
 
@@ -240,6 +253,53 @@ export class RaycastManager {
   /** Add an exclude filter for mesh intersection results. */
   addExcludeFilter(filter: ExcludeFilter): void {
     this._excludeFilters.push(filter);
+  }
+
+  /**
+   * Register an auxiliary mesh as raycast target whose hit resolves to a
+   * different "owner" node. Used by gizmo systems (sphere overlays, glow
+   * meshes, etc.) so hover/click on the visual gizmo behaves as if the
+   * underlying realvirtual node was hit. Owner must be a registered node
+   * (NodeRegistry) so the standard resolution pipeline works.
+   *
+   * Idempotent: calling twice with the same mesh just refreshes the owner.
+   */
+  addAuxRaycastTarget(mesh: Object3D, owner: Object3D): void {
+    if (!this._auxOwners.has(mesh)) {
+      this._auxTargets.push(mesh);
+      this._targets.push(mesh);
+    }
+    this._auxOwners.set(mesh, owner);
+  }
+
+  /** Remove an auxiliary raycast target. Safe to call with an unregistered mesh. */
+  removeAuxRaycastTarget(mesh: Object3D): void {
+    const i = this._auxTargets.indexOf(mesh);
+    if (i >= 0) this._auxTargets.splice(i, 1);
+    const j = this._targets.indexOf(mesh);
+    if (j >= 0) this._targets.splice(j, 1);
+    this._auxOwners.delete(mesh);
+  }
+
+  /**
+   * Set an allow filter — when set, only resolved nodes passing this filter
+   * are hoverable/clickable. Pass null to remove the filter.
+   *
+   * This is a plugin-specific extra filter (e.g. docs-browser restricts to
+   * doc-bearing nodes). Stacked atop the isolation gate — both must pass.
+   */
+  setAllowFilter(filter: ((node: Object3D) => boolean) | null): void {
+    this._allowFilter = filter;
+  }
+
+  /**
+   * Set the isolation gate — when set, only nodes passing this gate are
+   * hoverable/clickable. Wired by RVViewer from GroupRegistry +
+   * AutoFilterRegistry so isolation enforcement is a single invariant rather
+   * than a per-provider concern.
+   */
+  setIsolationGate(gate: ((node: Object3D) => boolean) | null): void {
+    this._isolationGate = gate;
   }
 
   /**
@@ -396,6 +456,11 @@ export class RaycastManager {
     for (const im of this._instancedMeshes) {
       this._targets.push(im);
     }
+
+    // Aux targets (gizmo spheres etc.) are appended last so they don't take
+    // precedence over real geometry at the same depth — but raycaster sorts
+    // by distance anyway, so closest hit always wins.
+    for (const m of this._auxTargets) this._targets.push(m);
   }
 
   private _handlePointerMove(e: PointerEvent): void {
@@ -445,6 +510,21 @@ export class RaycastManager {
       return null;
     }
 
+    // Auxiliary target hit: resolve to registered owner node (gizmo overlays etc.)
+    const auxOwner = this._auxOwners.get(hit.object);
+    if (auxOwner) {
+      const ownerPath = this.registry.getPathForNode(auxOwner);
+      if (!ownerPath) return null;
+      // Apply isolation gate + allow filter
+      if (this._isolationGate && !this._isolationGate(auxOwner)) return null;
+      if (this._allowFilter && !this._allowFilter(auxOwner)) return null;
+      return {
+        node: auxOwner,
+        nodeType: this._resolveNodeType(auxOwner),
+        nodePath: ownerPath,
+      };
+    }
+
     // Look up the BVH group for this mesh
     const group = this._meshToGroup.get(hit.object);
     if (!group || hit.faceIndex == null) return null;
@@ -463,11 +543,18 @@ export class RaycastManager {
       if (overrideNode) {
         const overridePath = this.registry.getPathForNode(overrideNode);
         if (overridePath) {
+          // Apply isolation gate + allow filter before returning override result
+          if (this._isolationGate && !this._isolationGate(overrideNode)) return null;
+          if (this._allowFilter && !this._allowFilter(overrideNode)) return null;
           const nodeType = this._resolveNodeType(overrideNode);
           return { node: overrideNode, nodeType, nodePath: overridePath };
         }
       }
     }
+
+    // Apply isolation gate (group/auto-filter/external) and any plugin-specific filter
+    if (this._isolationGate && !this._isolationGate(node)) return null;
+    if (this._allowFilter && !this._allowFilter(node)) return null;
 
     const nodeType = this._resolveNodeType(node);
     return { node, nodeType, nodePath: objectPath };
@@ -574,6 +661,16 @@ export class RaycastManager {
     // to that ancestor for selection, so hover should highlight the same node.
     const highlightNode = (hitType ? this._findComponentOwner(hitNode, hitType) : null) ?? hitNode;
     const highlightPath = this.registry.getPathForNode(highlightNode) ?? hitPath;
+
+    // Apply isolation gate + allow filter on the final highlight node (after component owner resolution)
+    if (this._isolationGate && !this._isolationGate(highlightNode)) {
+      this._clearHover();
+      return;
+    }
+    if (this._allowFilter && !this._allowFilter(highlightNode)) {
+      this._clearHover();
+      return;
+    }
 
     if (highlightNode === this._hoveredNode && !hitInstancedMU) return;
     // For instanced MUs, check if same MU is still highlighted

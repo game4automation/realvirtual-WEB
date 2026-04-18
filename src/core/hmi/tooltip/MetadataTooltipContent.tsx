@@ -17,10 +17,14 @@
  *   <signal>signalName</signal>     — labeled value row bound to live signal value
  */
 
-import { useMemo } from 'react';
+import type { Object3D } from 'three';
+import { useMemo, useCallback } from 'react';
 import { Box, Typography, Button } from '@mui/material';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
+import ShoppingCartIcon from '@mui/icons-material/ShoppingCart';
 import { SignalRow, useSignalValues } from '../rv-signal-badge';
+import { useCustomBranding } from '../branding-store';
+import { useMetadataTooltipConfig, getMetadataTooltipConfig, normalizeLabel } from '../metadata-tooltip-config-store';
 import type { TooltipContentProps } from './tooltip-registry';
 import { tooltipRegistry } from './tooltip-registry';
 import type { TooltipData } from './tooltip-store';
@@ -144,8 +148,41 @@ function LinkButton({ url, text }: { url: string; text: string }) {
 
 // ── Content provider ──
 
-export function MetadataTooltipContent({ data, viewer }: TooltipContentProps<MetadataTooltipData>) {
+export function MetadataTooltipContent({ data, viewer, isPinned }: TooltipContentProps<MetadataTooltipData>) {
+  const branding = useCustomBranding();
+  const accentColor = branding?.primaryColor ?? '#4fc3f7';
+  const tooltipConfig = useMetadataTooltipConfig();
   const tags = useMemo(() => parseTags(data.content), [data.content]);
+
+  // Resolve customer-specific header: find first matching headerLabel in the
+  // metadata values and promote it to the orange title. Falls back to <name>.
+  const headerOverride = useMemo(() => {
+    const labels = tooltipConfig?.headerLabels;
+    if (!labels || labels.length === 0) return null;
+    const normalized = labels.map(normalizeLabel);
+    for (const wanted of normalized) {
+      for (const t of tags) {
+        if (t.tag !== 'value') continue;
+        const lbl = normalizeLabel(extractAttr(t.attributes, 'label') ?? '');
+        if (lbl === wanted && t.text) {
+          return { text: t.text, sourceLabel: lbl };
+        }
+      }
+    }
+    return null;
+  }, [tooltipConfig, tags]);
+
+  // Set of labels that should not be rendered as body rows.
+  const hiddenLabelSet = useMemo(() => {
+    const set = new Set<string>();
+    for (const l of tooltipConfig?.hiddenLabels ?? []) set.add(normalizeLabel(l));
+    if (headerOverride && tooltipConfig?.hidePromotedRow !== false) {
+      set.add(headerOverride.sourceLabel);
+    }
+    return set;
+  }, [tooltipConfig, headerOverride]);
+
+  const hideOriginalName = headerOverride !== null && tooltipConfig?.hideOriginalName !== false;
 
   // Collect signal names for live binding — both top-level <signal> tags
   // and nested <signal> inside <value> tags
@@ -168,13 +205,74 @@ export function MetadataTooltipContent({ data, viewer }: TooltipContentProps<Met
   }, [tags]);
   const signalValues = useSignalValues(viewer, signalNames);
 
+  // Check if this metadata has an article number (orderable via OrderManagerPlugin)
+  const articleInfo = useMemo(() => {
+    for (const t of tags) {
+      if (t.tag !== 'value') continue;
+      const label = (extractAttr(t.attributes, 'label') ?? '').toLowerCase().replace(/[\s_-]/g, '');
+      if (['article', 'articlenumber', 'ordercode', 'partnumber'].some(c => label.includes(c))) {
+        return t.text;
+      }
+    }
+    return null;
+  }, [tags]);
+
+  const handleAddToCart = useCallback(() => {
+    const plugin = viewer.getPlugin('order-manager') as
+      | import('../../types/plugin-types').OrderManagerPluginAPI
+      | undefined;
+    if (!plugin) return;
+
+    // Extract order data from parsed tags
+    const normalize = (s: string) => s.replace(/[\s_-]/g, '').toLowerCase();
+    const getByLabels = (candidates: string[]) => {
+      for (const c of candidates) {
+        const nc = normalize(c);
+        for (const t of tags) {
+          if (t.tag !== 'value') continue;
+          const lbl = normalize(extractAttr(t.attributes, 'label') ?? '');
+          if (lbl.includes(nc)) return t.text;
+        }
+      }
+      return '';
+    };
+
+    const nodeName = data.nodePath.split('/').pop() || 'Component';
+    const nameTag = tags.find(t => t.tag === 'name');
+    const article = getByLabels(['Article', 'ArticleNumber', 'OrderCode', 'PartNumber']);
+    const description = getByLabels(['English', 'Description', 'Designation']) || nameTag?.text || nodeName;
+    const manufacturer = getByLabels(['Manufacturer', 'ManufacturerName']);
+
+    if (article) {
+      plugin.addItem(article, description, manufacturer, article, data.nodePath);
+    }
+  }, [viewer, tags, data.nodePath]);
+
   if (tags.length === 0) return null;
+
+  // When a header override is configured, render it once at the top and skip
+  // all <name> tags below. Without an override, the default <name> tag renders
+  // as the orange title (existing behavior).
+  const hasNameTag = tags.some(t => t.tag === 'name');
+  const injectHeader = headerOverride !== null && (hideOriginalName || !hasNameTag);
 
   return (
     <>
+      {injectHeader && (
+        <Typography
+          key="__header_override"
+          variant="subtitle2"
+          sx={{ color: '#ffa040', fontWeight: 700, fontSize: 13, lineHeight: 1.3, mb: 0.25 }}
+        >
+          {headerOverride!.text}
+        </Typography>
+      )}
       {tags.map((t, i) => {
         switch (t.tag) {
-          case 'name':
+          case 'name': {
+            // Hide the original <name> tag whenever a header override replaced it
+            // (either injected above, or we're told to hide the name entirely).
+            if (headerOverride && hideOriginalName) return null;
             return (
               <Typography
                 key={i}
@@ -184,6 +282,7 @@ export function MetadataTooltipContent({ data, viewer }: TooltipContentProps<Met
                 {t.text}
               </Typography>
             );
+          }
 
           case 'bold':
             return (
@@ -221,6 +320,9 @@ export function MetadataTooltipContent({ data, viewer }: TooltipContentProps<Met
 
           case 'value': {
             const label = extractAttr(t.attributes, 'label') ?? '';
+            // Skip rows whose label is hidden by project config (incl. the promoted
+            // header label, to avoid duplicating it in the body).
+            if (hiddenLabelSet.has(normalizeLabel(label))) return null;
             // Check for nested <signal> inside the value text
             const nestedSignalMatch = /<signal>([^<]*)<\/signal>/.exec(t.text);
             if (nestedSignalMatch) {
@@ -249,6 +351,30 @@ export function MetadataTooltipContent({ data, viewer }: TooltipContentProps<Met
             return null;
         }
       })}
+
+      {/* Add to Cart button — only in pinned mode (same style as AAS tooltips) */}
+      {isPinned && articleInfo && viewer.getPlugin('order-manager') && (
+        <Button
+          variant="outlined"
+          size="small"
+          startIcon={<ShoppingCartIcon sx={{ fontSize: 14 }} />}
+          onClick={handleAddToCart}
+          sx={{
+            mt: 1,
+            width: '100%',
+            color: accentColor,
+            borderColor: `${accentColor}80`,
+            fontSize: 11,
+            fontWeight: 600,
+            textTransform: 'none',
+            py: 0.5,
+            pointerEvents: 'auto',
+            '&:hover': { borderColor: accentColor, bgcolor: `${accentColor}1a` },
+          }}
+        >
+          Add to Cart
+        </Button>
+      )}
     </>
   );
 }
@@ -267,12 +393,50 @@ tooltipRegistry.registerDataResolver('metadata', (node, viewer) => {
   return { type: 'metadata', nodePath: path, content: meta.content };
 });
 
-// ── Search resolver: extract text content from metadata tags (values only) ──
-tooltipRegistry.registerSearchResolver('RuntimeMetadata', (node) => {
+// ── Shared search resolvers for both 'Metadata' and 'RuntimeMetadata' rv_extras keys ──
+// Both store their content in node.userData._rvMetadata.
+
+/** Extract searchable text from metadata tags (values only). */
+function metadataSearchResolver(node: Object3D): string[] {
   const meta = node.userData?._rvMetadata as { content: string } | undefined;
   if (!meta?.content) return [];
-  // Extract text from parsed tags — labels and values, not XML markup
   return parseTags(meta.content)
     .filter(t => t.text)
     .map(t => t.text);
-});
+}
+
+/**
+ * Display resolver: show a meaningful label in search results.
+ * Respects MetadataTooltipConfig.headerLabels (e.g. 'English' → product name)
+ * and falls back to the <name> tag.
+ */
+function metadataDisplayResolver(node: Object3D): string | null {
+  const meta = node.userData?._rvMetadata as { content: string } | undefined;
+  if (!meta?.content) return null;
+  const tags = parseTags(meta.content);
+
+  // If a customer config defines headerLabels, use the first matching value tag
+  const config = getMetadataTooltipConfig();
+  if (config?.headerLabels) {
+    const labelRe = /(\w+)=["']([^"']*)["']/;
+    for (const wanted of config.headerLabels) {
+      const norm = normalizeLabel(wanted);
+      const match = tags.find(t => {
+        if (t.tag !== 'value') return false;
+        const m = labelRe.exec(t.attributes);
+        return m != null && normalizeLabel(m[2]) === norm;
+      });
+      if (match?.text) return match.text;
+    }
+  }
+
+  // Fallback: <name> tag
+  const nameTag = tags.find(t => t.tag === 'name');
+  return nameTag?.text || null;
+}
+
+// Register for both rv_extras keys
+tooltipRegistry.registerSearchResolver('RuntimeMetadata', metadataSearchResolver);
+tooltipRegistry.registerSearchResolver('Metadata', metadataSearchResolver);
+tooltipRegistry.registerSearchDisplayResolver('RuntimeMetadata', metadataDisplayResolver);
+tooltipRegistry.registerSearchDisplayResolver('Metadata', metadataDisplayResolver);

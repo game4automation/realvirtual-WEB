@@ -24,16 +24,17 @@ import {
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
-/** Ring color (bright cyan). */
-const RING_COLOR = 0x44ccff;
+/** Default ring color (bright cyan) used when no per-pipe override is set. */
+export const RING_COLOR = 0x44ccff;
 /** Base opacity of the ring bands. */
 const RING_OPACITY = 0.6;
 /** Rings per meter of pipe length. */
 const RING_DENSITY = 3.0;
 /** Ring width as fraction of spacing (0–1, lower = thinner). */
 const RING_WIDTH = 0.25;
-/** Flow speed multiplier (meters per second at flowRate=1). */
-const FLOW_SPEED_SCALE = 0.5;
+/** UV scroll speed in meters/second. Uniform regardless of flow magnitude —
+ *  only the SIGN of flowRate (and uvDirection) decides the direction. */
+const FLOW_SCROLL_SPEED = 1.0;
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -104,18 +105,31 @@ export class PipeFlowManager {
       const uvDirection = (rv as any).uvDirection ?? 1;
       const active = Math.abs(flowRate) > 0.001;
 
-      // Visual flow speed accounts for UV direction on the mesh
+      // Uniform UV scroll speed — only the sign of flowRate (combined with
+      // uvDirection) decides the direction. Magnitude is ignored so all
+      // flowing pipes scroll at FLOW_SCROLL_SPEED m/s. When flow is zero the
+      // overlay stays visible (static rings) so the viewer can still see the
+      // pipe decoration; we just set scroll speed to zero.
+      //
+      // Sign convention: Unity PipelineController treats positive flowRate as
+      // "fill source, drain destination" — so the visible fluid must appear
+      // to move FROM destination TOWARD source. Our fragment shader uses
+      // `fract(vPipeUv.x * density - uTime * uFlowSpeed)`, where positive
+      // uFlowSpeed makes rings drift toward lower uv.x. To match the Unity
+      // convention for rings flowing from destination→source, we negate the
+      // direction before assigning.
       if (entry.shader) {
         entry.shader.uniforms.uTime.value = this._time;
-        entry.shader.uniforms.uFlowSpeed.value = flowRate * uvDirection * FLOW_SPEED_SCALE;
+        const direction = Math.sign(flowRate) * uvDirection;
+        entry.shader.uniforms.uFlowSpeed.value = active ? -direction * FLOW_SCROLL_SPEED : 0;
       }
 
-      entry.overlay.visible = active;
+      entry.overlay.visible = true; // always visible — zero flow shows static rings
       if (active) hasActive = true;
       entry.lastFlowRate = flowRate;
     }
 
-    return hasActive; // always dirty when pipes are flowing (animation)
+    return hasActive; // animation still dirties frames only when something actually flows
   }
 
   dispose(): void {
@@ -124,6 +138,27 @@ export class PipeFlowManager {
       (entry.overlay.material as Material).dispose();
     }
     this.entries.length = 0;
+  }
+
+  /**
+   * Override the scrolling-ring color for a single pipe. Callers (e.g.
+   * ProcessIndustryPlugin's fluid-coloring toggle) use this so the animated
+   * rings match the fluid the pipe currently carries. Pass RING_COLOR to
+   * restore the default cyan.
+   */
+  setRingColor(pipeNode: Object3D, color: number): void {
+    const entry = this.entries.find((e) => e.node === pipeNode);
+    if (!entry) return;
+    const mat = entry.overlay.material as MeshBasicMaterial;
+    mat.color.setHex(color);
+  }
+
+  /** Restore every overlay to the default cyan ring color. */
+  resetAllRingColors(): void {
+    for (const entry of this.entries) {
+      const mat = entry.overlay.material as MeshBasicMaterial;
+      mat.color.setHex(RING_COLOR);
+    }
   }
 
   private _createFlow(pipeNode: Object3D): void {

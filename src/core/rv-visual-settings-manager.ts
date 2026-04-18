@@ -197,9 +197,13 @@ export class VisualSettingsManager {
   // ─── Internal ─────────────────────────────────────────────────────
 
   private applyLightingMode(mode: LightingMode): void {
-    if (!this.state.ambientLight.parent) this.state.scene.add(this.state.ambientLight);
-
     if (mode === 'default') {
+      // Default mode relies solely on the HDRI environment for ambient lighting —
+      // remove the AmbientLight so it does not stack on top of the environment.
+      if (this.state.ambientLight.parent) {
+        this.state.scene.remove(this.state.ambientLight);
+        this.state.sceneFixtures.delete(this.state.ambientLight);
+      }
       this.state.renderer.toneMapping = TONE_MAP_LOOKUP[this._toneMapping];
       this.loadEnvMap().then(() => {
         if (this._lightingMode === 'default') {
@@ -207,6 +211,10 @@ export class VisualSettingsManager {
         }
       });
     } else {
+      if (!this.state.ambientLight.parent) {
+        this.state.scene.add(this.state.ambientLight);
+        this.state.sceneFixtures.add(this.state.ambientLight);
+      }
       this.state.scene.environment = null;
       this.state.renderer.toneMapping = NoToneMapping;
       this.dirLightEnabled = false;

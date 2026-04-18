@@ -23,6 +23,8 @@ export class SignalStore {
   private byName = new Map<string, boolean | number>();
   /** Path → name mapping for path-based access. */
   private pathToName = new Map<string, string>();
+  /** PLC type per signal name (e.g. 'PLCOutputBool', 'PLCInputFloat'). */
+  private typeByName = new Map<string, string>();
   /** Per-name listener sets. */
   private listeners = new Map<string, Set<(value: boolean | number) => void>>();
   /** Cache for resolved path lookups (avoids repeated suffix scans at runtime). */
@@ -38,6 +40,11 @@ export class SignalStore {
   /** Get raw value by name (undefined if not registered). */
   get(name: string): boolean | number | undefined {
     return this.byName.get(name);
+  }
+
+  /** Get PLC type by signal name (e.g. 'PLCOutputBool'). Returns undefined if unknown. */
+  getType(name: string): string | undefined {
+    return this.typeByName.get(name);
   }
 
   /** Get as boolean by name (false if not set). */
@@ -219,11 +226,12 @@ export class SignalStore {
    * @param path Full hierarchy path
    * @param initialValue Default value
    */
-  register(name: string, path: string, initialValue: boolean | number): void {
+  register(name: string, path: string, initialValue: boolean | number, plcType?: string): void {
     if (!this.byName.has(name)) {
       this.byName.set(name, initialValue);
     }
     this.pathToName.set(path, name);
+    if (plcType) this.typeByName.set(name, plcType);
     debug('signal', `register "${name}" path="${path}" initial=${initialValue}`);
   }
 
@@ -299,6 +307,7 @@ export class SignalStore {
   clear(): void {
     this.byName.clear();
     this.pathToName.clear();
+    this.typeByName.clear();
     this.listeners.clear();
     this.resolveCache.clear();
   }

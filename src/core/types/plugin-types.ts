@@ -239,4 +239,20 @@ export interface OrderManagerConfig {
   orderMethod?: 'GET' | 'POST';
   /** Default recipient email for mailto export. */
   orderEmail?: string;
+  /**
+   * Metadata value labels to match as article number (first match wins).
+   * Compared case-insensitively against `<value label="...">` in RuntimeMetadata content.
+   * Default: ['Article', 'ArticleNumber', 'OrderCode', 'PartNumber']
+   */
+  metadataArticleLabels?: string[];
+  /**
+   * Metadata value labels to match as description (first match wins).
+   * Default: ['English', 'Description', 'Designation']
+   */
+  metadataDescriptionLabels?: string[];
+  /**
+   * Metadata value labels to match as manufacturer (first match wins).
+   * Default: ['Manufacturer', 'ManufacturerName']
+   */
+  metadataManufacturerLabels?: string[];
 }

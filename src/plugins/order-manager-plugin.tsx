@@ -48,6 +48,7 @@ import type {
   OrderManagerConfig,
 } from '../core/types/plugin-types';
 import { loadAasxById, type AasParsedData } from './aas-link-parser';
+import { parseTags, extractAttr } from '../core/hmi/tooltip/MetadataTooltipContent';
 import { NavButton } from '../core/hmi/NavButton';
 import { LeftPanel } from '../core/hmi/LeftPanel';
 import { ORDER_PANEL_WIDTH } from '../core/hmi/layout-constants';
@@ -159,6 +160,80 @@ export function extractOrderData(parsed: AasParsedData): Partial<OrderItem> {
   };
 }
 
+// ── Metadata Order Data Extraction ──────────────────────────────────
+
+const DEFAULT_ARTICLE_LABELS = ['Article', 'ArticleNumber', 'OrderCode', 'PartNumber'];
+const DEFAULT_DESCRIPTION_LABELS = ['English', 'Description', 'Designation'];
+const DEFAULT_MANUFACTURER_LABELS = ['Manufacturer', 'ManufacturerName'];
+
+/**
+ * Extract order-relevant fields from RuntimeMetadata content string.
+ * Parses `<value label="...">text</value>` tags and matches against
+ * configurable label lists (case-insensitive).
+ *
+ * Returns null if no article number is found (component is not orderable).
+ */
+export function extractMetadataOrderData(
+  content: string,
+  nodeName: string,
+  articleLabels: string[] = DEFAULT_ARTICLE_LABELS,
+  descriptionLabels: string[] = DEFAULT_DESCRIPTION_LABELS,
+  manufacturerLabels: string[] = DEFAULT_MANUFACTURER_LABELS,
+): Partial<OrderItem> | null {
+  const tags = parseTags(content);
+  const normalize = (s: string): string => s.replace(/[\s_-]/g, '').toLowerCase();
+
+  const getByLabels = (candidates: string[]): string => {
+    for (const candidate of candidates) {
+      const nc = normalize(candidate);
+      for (const t of tags) {
+        if (t.tag !== 'value') continue;
+        const label = extractAttr(t.attributes, 'label') ?? '';
+        if (normalize(label).includes(nc)) return t.text;
+      }
+    }
+    return '';
+  };
+
+  const articleNumber = getByLabels(articleLabels);
+  if (!articleNumber) return null; // No article = not orderable
+
+  // Use <name> tag as fallback display name
+  const nameTag = tags.find(t => t.tag === 'name');
+  const displayName = getByLabels(descriptionLabels) || nameTag?.text || nodeName;
+  const manufacturer = getByLabels(manufacturerLabels);
+
+  return {
+    aasId: articleNumber, // Use article number as unique ID
+    displayName,
+    manufacturer,
+    articleNumber,
+  };
+}
+
+/**
+ * Check if a node's RuntimeMetadata content has an article number
+ * (i.e. is orderable).
+ */
+export function hasMetadataArticle(
+  node: import('three').Object3D,
+  articleLabels: string[] = DEFAULT_ARTICLE_LABELS,
+): boolean {
+  const meta = node.userData?._rvMetadata as { content: string } | undefined;
+  if (!meta?.content) return false;
+  const tags = parseTags(meta.content);
+  const normalize = (s: string): string => s.replace(/[\s_-]/g, '').toLowerCase();
+  for (const candidate of articleLabels) {
+    const nc = normalize(candidate);
+    for (const t of tags) {
+      if (t.tag !== 'value') continue;
+      const label = extractAttr(t.attributes, 'label') ?? '';
+      if (normalize(label).includes(nc)) return !!t.text;
+    }
+  }
+  return false;
+}
+
 // ── Store mutation functions ──────────────────────────────────────────
 
 function _addItem(
@@ -262,7 +337,7 @@ export class OrderManagerPlugin implements RVViewerPlugin, OrderManagerPluginAPI
   readonly order = 60;
 
   readonly slots: UISlotEntry[] = [
-    { slot: 'button-group', component: OrderManagerButton, order: 46 },
+    { slot: 'button-group', component: OrderManagerButton, order: 50 },
   ];
 
   private _config: OrderManagerConfig;
@@ -331,6 +406,10 @@ export class OrderManagerPlugin implements RVViewerPlugin, OrderManagerPluginAPI
     }
 
     // Register context menu
+    const artLabels = this._config.metadataArticleLabels ?? DEFAULT_ARTICLE_LABELS;
+    const descLabels = this._config.metadataDescriptionLabels ?? DEFAULT_DESCRIPTION_LABELS;
+    const mfgLabels = this._config.metadataManufacturerLabels ?? DEFAULT_MANUFACTURER_LABELS;
+
     viewer.contextMenu.register({
       pluginId: 'order-manager',
       items: [
@@ -340,28 +419,45 @@ export class OrderManagerPlugin implements RVViewerPlugin, OrderManagerPluginAPI
           order: 55,
           dividerBefore: true,
           condition: (target) => {
-            // Only show if node has AAS data with an aasId
+            // Show if node has AAS data OR RuntimeMetadata with article number
             const aas = target.node.userData?._rvAasLink as { aasId?: string } | undefined;
-            return !!aas?.aasId;
+            if (aas?.aasId) return true;
+            return hasMetadataArticle(target.node, artLabels);
           },
           action: (target) => {
+            // Try AAS first
             const aas = target.node.userData?._rvAasLink as { aasId: string; description?: string } | undefined;
-            if (!aas?.aasId) return;
-            // Load full AAS data to get manufacturer + article number
-            loadAasxById(aas.aasId).then(parsed => {
-              const orderData = extractOrderData(parsed);
-              this.addItem(
-                orderData.aasId ?? aas.aasId,
-                aas.description || orderData.displayName || target.path.split('/').pop() || 'Component',
-                orderData.manufacturer ?? '',
-                orderData.articleNumber ?? '',
-                target.path,
-              );
-            }).catch(() => {
-              // Fallback: add with minimal data if AASX loading fails
-              const displayName = aas.description || target.path.split('/').pop() || 'Component';
-              this.addItem(aas.aasId, displayName, '', '', target.path);
-            });
+            if (aas?.aasId) {
+              loadAasxById(aas.aasId).then(parsed => {
+                const orderData = extractOrderData(parsed);
+                this.addItem(
+                  orderData.aasId ?? aas.aasId,
+                  aas.description || orderData.displayName || target.path.split('/').pop() || 'Component',
+                  orderData.manufacturer ?? '',
+                  orderData.articleNumber ?? '',
+                  target.path,
+                );
+              }).catch(() => {
+                const displayName = aas.description || target.path.split('/').pop() || 'Component';
+                this.addItem(aas.aasId, displayName, '', '', target.path);
+              });
+              return;
+            }
+            // Fallback: extract from RuntimeMetadata
+            const meta = target.node.userData?._rvMetadata as { content: string } | undefined;
+            if (meta?.content) {
+              const nodeName = target.path.split('/').pop() || 'Component';
+              const orderData = extractMetadataOrderData(meta.content, nodeName, artLabels, descLabels, mfgLabels);
+              if (orderData) {
+                this.addItem(
+                  orderData.aasId ?? nodeName,
+                  orderData.displayName ?? nodeName,
+                  orderData.manufacturer ?? '',
+                  orderData.articleNumber ?? '',
+                  target.path,
+                );
+              }
+            }
           },
         },
       ],
@@ -426,6 +522,8 @@ function OrderManagerButton({ viewer }: UISlotProps) {
 
 export function OrderPanel() {
   const viewer = useViewer();
+  const branding = useCustomBranding();
+  const accentColor = branding?.primaryColor ?? undefined;
   const snap = useSyncExternalStore(subscribeOrderStore, getOrderSnapshot);
   const lpm = viewer.leftPanelManager;
   const isOpen = useSyncExternalStore(lpm.subscribe, lpm.getSnapshot).activePanel === 'order-manager';
@@ -569,7 +667,9 @@ export function OrderPanel() {
         size="small"
         startIcon={<ShoppingCart />}
         onClick={handleOrderOnline}
-        sx={{ fontSize: 11, textTransform: 'none' }}
+        sx={{ fontSize: 11, textTransform: 'none',
+          ...(accentColor ? { bgcolor: accentColor, '&:hover': { bgcolor: accentColor, filter: 'brightness(1.15)' } } : {}),
+        }}
       >
         Order Online
       </Button>
@@ -579,7 +679,9 @@ export function OrderPanel() {
           size="small"
           startIcon={<FileDownload />}
           onClick={handleCsvExport}
-          sx={{ fontSize: 10, textTransform: 'none', flex: 1 }}
+          sx={{ fontSize: 10, textTransform: 'none', flex: 1,
+            ...(accentColor ? { color: accentColor, borderColor: `${accentColor}80` } : {}),
+          }}
         >
           CSV
         </Button>
@@ -588,7 +690,9 @@ export function OrderPanel() {
           size="small"
           startIcon={<Email />}
           onClick={handleEmailExport}
-          sx={{ fontSize: 10, textTransform: 'none', flex: 1 }}
+          sx={{ fontSize: 10, textTransform: 'none', flex: 1,
+            ...(accentColor ? { color: accentColor, borderColor: `${accentColor}80` } : {}),
+          }}
         >
           Email
         </Button>
@@ -610,7 +714,7 @@ export function OrderPanel() {
       <LeftPanel
         title={
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-            <ShoppingCart sx={{ fontSize: 14, color: 'primary.main' }} />
+            <ShoppingCart sx={{ fontSize: 14, color: accentColor ?? 'primary.main' }} />
             <Typography sx={{ fontSize: 11, fontWeight: 600, color: 'text.primary' }}>
               Order Cart
             </Typography>
@@ -725,6 +829,7 @@ export function OrderPanel() {
 // We need this import here (after OrderPanel definition) to avoid circular issues
 // The useViewer hook is used inside OrderPanel, so import at top-level of the module.
 import { useViewer } from '../hooks/use-viewer';
+import { useCustomBranding } from '../core/hmi/branding-store';
 
 // ── OrderItemCard Component ──────────────────────────────────────────
 

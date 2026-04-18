@@ -1,4 +1,4 @@
-so# realvirtual WEB Multiuser System
+# realvirtual WEB Multiuser System
 
 Technical documentation for the real-time multiuser collaboration system in realvirtual WEB.
 
@@ -313,13 +313,15 @@ Enforcement is on the Unity server side. The relay forwards all messages regardl
 
 ## Relay Server
 
-The relay server (`relay/`) is a Node.js WebSocket multiplexer that enables multiuser without direct LAN access.
+A relay server is a Node.js WebSocket multiplexer that enables multiuser sessions when clients cannot reach Unity directly (firewalls, NAT, Teams meetings, public web sessions).
+
+> **The relay server source code lives in a separate repository.** It is no longer bundled with the WebViewer. The settings store ships with a default hosted relay URL (`wss://download.realvirtual.io/relay`) and the WebViewer plugin handles both `local` and `relay` connection modes (see `connectionMode` in [multiuser-settings-store.ts](src/core/hmi/multiuser-settings-store.ts)).
 
 ### Architecture
-- Express.js HTTP + ws WebSocket on a single port (default 7000)
-- Room-based session management with 6-character alphanumeric join codes
-- Heartbeat pings every 30 seconds to detect stale connections
-- Automatic room cleanup 30 seconds after last client leaves
+- Express.js HTTP + `ws` WebSocket on a single port (default 7000)
+- Room-based session management with alphanumeric join codes
+- Heartbeat pings to detect stale connections
+- Automatic room cleanup after the last client leaves
 
 ### Endpoints
 
@@ -347,10 +349,11 @@ Sliding-window counter per WebSocket connection.
 | Drive positions | No | Continuous stream at 60 Hz |
 | MU positions | No | Continuous stream at 50 Hz |
 
-### Deployment
+### Self-hosting
+
+If you need to run your own relay (private network, on-prem deployments), check out the relay repo and follow its README. A typical run:
 
 ```bash
-cd relay
 npm install
 npm run build
 npm start -- --port 7000
@@ -360,7 +363,7 @@ docker build -t relay-server .
 docker run -p 7000:7000 relay-server
 ```
 
-Docker healthcheck polls `/health` every 30 seconds.
+Then set `relayUrl` in `multiuser-settings-store.ts` defaults (or via `settings.json`) to your relay endpoint.
 
 ---
 
@@ -626,13 +629,7 @@ Unity (Host)        Relay Server        Browser A        Browser B
 | `src/core/types/plugin-types.ts` | MultiuserPluginAPI interface |
 
 ### Relay Server
-| File | Purpose |
-|------|---------|
-| `relay/src/server.ts` | HTTP + WebSocket server, health endpoint |
-| `relay/src/protocol-handler.ts` | Message routing, validation, broadcasting |
-| `relay/src/room-manager.ts` | Room lifecycle, state snapshot assembly |
-| `relay/src/join-code.ts` | Join code generation |
-| `relay/Dockerfile` | Container deployment |
+The relay server lives in its own repository (not in this WebViewer repo). The hosted endpoint defaults to `wss://download.realvirtual.io/relay`.
 
 ### Teams Integration
 | File | Purpose |
@@ -647,4 +644,3 @@ Unity (Host)        Relay Server        Browser A        Browser B
 | `tests/rv-multiuser.test.ts` | Avatar manager, message handling |
 | `tests/rv-multiuser-perf.test.ts` | 15-avatar performance, cache behavior |
 | `tests/rv-multiuser-relay.test.ts` | Settings persistence, relay config |
-| `relay/tests/relay-perf.test.ts` | Relay server performance |

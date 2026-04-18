@@ -78,6 +78,10 @@ export interface VisualSettings {
   groundEnabled: boolean;
   /** Floor brightness multiplier (0 = black, 1 = default, 2 = double). */
   groundBrightness: number;
+  /** Scene background brightness multiplier (0 = black, 1 = default gray, 2 = white). */
+  backgroundBrightness: number;
+  /** Floor checker pattern contrast multiplier (0 = flat midgray, 1 = default, 2 = doubled). */
+  checkerContrast: number;
   /** Zoom factor for the React HMI overlay (0.5–2.0, default 1.0). */
   uiZoom: number;
   /** OrbitControls rotate speed multiplier (0.1–3.0, default 1.0). */
@@ -145,6 +149,8 @@ const DEFAULTS: VisualSettings = {
   bloomRadius: 0.4,
   groundEnabled: true,
   groundBrightness: 1.0,
+  backgroundBrightness: 1.0,
+  checkerContrast: 1.0,
   uiZoom: 1.0,
   orbitRotateSpeed: 1.0,
   orbitPanSpeed: 1.0,
@@ -213,6 +219,8 @@ export function loadVisualSettings(): VisualSettings {
     bloomRadius: fromStorage.bloomRadius,
     groundEnabled: fromStorage.groundEnabled,
     groundBrightness: fromStorage.groundBrightness,
+    backgroundBrightness: fromStorage.backgroundBrightness,
+    checkerContrast: fromStorage.checkerContrast,
     uiZoom: fromStorage.uiZoom,
     orbitRotateSpeed: clampNavNumber(
       override.orbitRotateSpeed,
@@ -295,6 +303,12 @@ function loadFromLocalStorage(): VisualSettings {
     const groundBrightnessRaw = (parsed as Record<string, unknown>).groundBrightness;
     const groundBrightness = (typeof groundBrightnessRaw === 'number' && groundBrightnessRaw >= 0 && groundBrightnessRaw <= 2)
       ? groundBrightnessRaw : DEFAULTS.groundBrightness;
+    const backgroundBrightnessRaw = (parsed as Record<string, unknown>).backgroundBrightness;
+    const backgroundBrightness = (typeof backgroundBrightnessRaw === 'number' && backgroundBrightnessRaw >= 0 && backgroundBrightnessRaw <= 2)
+      ? backgroundBrightnessRaw : DEFAULTS.backgroundBrightness;
+    const checkerContrastRaw = (parsed as Record<string, unknown>).checkerContrast;
+    const checkerContrast = (typeof checkerContrastRaw === 'number' && checkerContrastRaw >= 0 && checkerContrastRaw <= 2)
+      ? checkerContrastRaw : DEFAULTS.checkerContrast;
     const uiZoomRaw = (parsed as Record<string, unknown>).uiZoom;
     const uiZoom = (typeof uiZoomRaw === 'number' && uiZoomRaw >= 0.5 && uiZoomRaw <= 2)
       ? uiZoomRaw : DEFAULTS.uiZoom;
@@ -341,6 +355,8 @@ function loadFromLocalStorage(): VisualSettings {
       bloomRadius,
       groundEnabled,
       groundBrightness,
+      backgroundBrightness,
+      checkerContrast,
       uiZoom,
       orbitRotateSpeed,
       orbitPanSpeed,

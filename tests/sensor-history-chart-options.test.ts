@@ -26,26 +26,26 @@ describe('buildSingleOption', () => {
     const vm = opt.visualMap as any;
     expect(vm.type).toBe('piecewise');
     expect(vm.dimension).toBe(1);
-    expect(vm.pieces).toHaveLength(4);
-    // Piece values cover 0..3 (low, high, warning, error).
-    expect(vm.pieces.map((p: any) => p.value)).toEqual([0, 1, 2, 3]);
+    expect(vm.pieces).toHaveLength(2);
+    // Piece values cover 0..1 (low, high) — single mode collapses to binary.
+    expect(vm.pieces.map((p: any) => p.value)).toEqual([0, 1]);
   });
 
-  it('y-axis covers all 4 states', () => {
+  it('y-axis covers LOW/HIGH range', () => {
     const series = generateHistory(sensor.path, 60, true, 1_000_000);
     const opt = buildSingleOption(series, sensor, '5m', theme);
     const y = opt.yAxis as any;
     expect(y.min).toBeLessThanOrEqual(0);
-    expect(y.max).toBeGreaterThanOrEqual(3);
+    expect(y.max).toBeGreaterThanOrEqual(1);
   });
 
-  it('data tuples are [timestamp, numeric]', () => {
+  it('data tuples are [timestamp, 0|1]', () => {
     const series = generateHistory(sensor.path, 60, true, 1_000_000);
     const opt = buildSingleOption(series, sensor, '5m', theme);
     const data = (opt.series as any[])[0].data as Array<[number, number]>;
     expect(data.length).toBe(series.ts.length);
     expect(data[0][0]).toBe(series.ts[0]);
-    expect(data[0][1]).toBe(series.numeric[0]);
+    expect(data.every(([, v]) => v === 0 || v === 1)).toBe(true);
   });
 
   it('dataZoom has inside + slider', () => {

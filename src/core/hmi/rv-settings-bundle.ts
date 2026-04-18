@@ -25,6 +25,10 @@ import {
   saveGroupVisibilitySettings,
 } from './group-visibility-store';
 import type { GroupVisibilitySettings } from './group-visibility-store';
+import type { ModelCameraStart } from './camera-startpos-types';
+import { isValidPreset } from './camera-startpos-store';
+
+const CAMERA_START_LS_PREFIX = 'rv-camera-start:';
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -40,6 +44,8 @@ export interface RVSettingsBundle {
     multiuser?: Partial<MultiuserSettings>;
     groupVisibility?: Partial<GroupVisibilitySettings>;
     panelLayouts?: Record<string, { x: number; y: number; w: number; h: number }>;
+    /** Per-model camera start positions, keyed by model basename (without .glb). */
+    cameraStart?: Record<string, ModelCameraStart>;
   };
 }
 
@@ -70,13 +76,23 @@ export function getModelBasename(url: string | null): string {
 export function collectSettingsBundle(modelUrl: string | null): RVSettingsBundle {
   // Collect panel layout positions from localStorage
   const panelLayouts: Record<string, { x: number; y: number; w: number; h: number }> = {};
+  // Collect per-model camera start presets from localStorage (rv-camera-start:<modelKey>)
+  const cameraStart: Record<string, ModelCameraStart> = {};
   for (let i = 0; i < localStorage.length; i++) {
     const key = localStorage.key(i);
-    if (key && key.startsWith('rv-panel-')) {
+    if (!key) continue;
+    if (key.startsWith('rv-panel-')) {
       try {
         const val = JSON.parse(localStorage.getItem(key)!);
         if (val && typeof val === 'object' && typeof val.x === 'number') {
           panelLayouts[key.substring('rv-panel-'.length)] = val;
+        }
+      } catch { /* skip invalid */ }
+    } else if (key.startsWith(CAMERA_START_LS_PREFIX)) {
+      try {
+        const val = JSON.parse(localStorage.getItem(key)!);
+        if (isValidPreset(val)) {
+          cameraStart[key.substring(CAMERA_START_LS_PREFIX.length)] = val;
         }
       } catch { /* skip invalid */ }
     }
@@ -94,6 +110,7 @@ export function collectSettingsBundle(modelUrl: string | null): RVSettingsBundle
       multiuser: loadMultiuserSettings(),
       groupVisibility: loadGroupVisibilitySettings(),
       panelLayouts: Object.keys(panelLayouts).length > 0 ? panelLayouts : undefined,
+      cameraStart: Object.keys(cameraStart).length > 0 ? cameraStart : undefined,
     },
   };
 
@@ -188,6 +205,15 @@ export function applySettingsBundle(bundle: RVSettingsBundle): void {
     for (const [key, val] of Object.entries(s.panelLayouts)) {
       try {
         localStorage.setItem(`rv-panel-${key}`, JSON.stringify(val));
+      } catch { /* quota exceeded — skip */ }
+    }
+  }
+
+  if (s.cameraStart) {
+    for (const [modelKey, preset] of Object.entries(s.cameraStart)) {
+      if (!isValidPreset(preset)) continue;
+      try {
+        localStorage.setItem(`${CAMERA_START_LS_PREFIX}${modelKey}`, JSON.stringify(preset));
       } catch { /* quota exceeded — skip */ }
     }
   }

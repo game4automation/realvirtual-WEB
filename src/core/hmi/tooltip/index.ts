@@ -31,6 +31,8 @@ export {
   type TooltipContentProps,
   type TooltipProviderEntry,
   type TooltipDataResolver,
+  type SearchResolver,
+  type SearchDisplayResolver,
 } from './tooltip-registry';
 
 // Utilities

@@ -63,6 +63,13 @@ export function mergeStaticGeometries(
     // Walk up one level: mesh may be a child of a tank node
     if (mesh.parent?.userData?._rvType === 'Tank') return;
 
+    // Skip pipe meshes — same reason: PipeFlowManager overlays need the
+    // original mesh rendered (not merged) and ProcessIndustryPlugin needs to
+    // swap per-pipe materials at runtime for fluid-based coloring.
+    if (mesh.userData?._pipeFlowViz) return;
+    if (mesh.userData?._rvType === 'Pipe') return;
+    if (mesh.parent?.userData?._rvType === 'Pipe') return;
+
     // Must have geometry with position attribute
     if (!mesh.geometry?.attributes?.position) return;
 

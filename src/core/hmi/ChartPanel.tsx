@@ -243,6 +243,47 @@ export function ChartPanel({
   useDrag(dragRef, pos, setPosAndSave, open);
   useResize(resizeRef, size, setSizeAndSave, minW, MIN_H, open);
 
+  /** Clamp (x, y) so the panel is fully inside the viewport. Leaves room
+   *  for the left-sidebar ButtonPanel so the panel never covers its own
+   *  trigger button. */
+  const clampToViewport = useCallback((x: number, y: number, w: number, h: number) => {
+    const minX = isMobile ? 4 : 72; // 64px button column + 8 gutter
+    const minY = 8;
+    const maxX = Math.max(minX, window.innerWidth - w - 8);
+    const maxY = Math.max(minY, window.innerHeight - h - BOTTOM_MARGIN);
+    return {
+      x: Math.max(minX, Math.min(x, maxX)),
+      y: Math.max(minY, Math.min(y, maxY)),
+    };
+  }, [isMobile]);
+
+  // When the panel opens, guarantee it lands inside the current viewport.
+  // Covers three scenarios: (a) default position was computed off-screen at
+  // mount time, (b) saved layout is stale from a bigger browser window,
+  // (c) the browser was resized while the panel was closed.
+  useEffect(() => {
+    if (!open) return;
+    const clamped = clampToViewport(pos.x, pos.y, size.w, size.h);
+    if (clamped.x !== pos.x || clamped.y !== pos.y) {
+      setPosAndSave(clamped);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // Keep the panel in frame while the user resizes the browser.
+  useEffect(() => {
+    if (!open) return;
+    const onResize = () => {
+      const clamped = clampToViewport(posRef.current.x, posRef.current.y, sizeRef.current.w, sizeRef.current.h);
+      if (clamped.x !== posRef.current.x || clamped.y !== posRef.current.y) {
+        setPosAndSave(clamped);
+      }
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
   // Snap to bottom-full-width when expanding; restore saved layout on collapse
   useEffect(() => {
     if (expanded) {
@@ -281,14 +322,18 @@ export function ChartPanel({
 
   if (!open) return null;
 
+  // Clamp position so the panel title bar stays within the viewport
+  const clampedX = Math.max(0, Math.min(pos.x, window.innerWidth - 120));
+  const clampedY = Math.max(0, Math.min(pos.y, window.innerHeight - 40));
+
   return (
     <Paper
       elevation={8}
       data-ui-panel
       sx={{
         position: 'fixed',
-        left: pos.x,
-        top: pos.y,
+        left: clampedX,
+        top: clampedY,
         width: size.w,
         height: size.h,
         zIndex,

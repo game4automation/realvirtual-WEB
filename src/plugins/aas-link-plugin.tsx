@@ -28,6 +28,7 @@ import { ChartPanel } from '../core/hmi/ChartPanel';
 import { RV_SCROLL_CLASS } from '../core/hmi/shared-sx';
 import { loadIndex, loadAasxById, type AasParsedData } from './aas-link-parser';
 import type { OrderManagerPluginAPI } from '../core/types/plugin-types';
+import { useCustomBranding } from '../core/hmi/branding-store';
 import { extractOrderData } from './order-manager-plugin';
 import { NavButton } from '../core/hmi/NavButton';
 import type { UISlotEntry, UISlotProps } from '../core/rv-ui-plugin';
@@ -120,10 +121,16 @@ export class AasLinkPlugin implements RVViewerPlugin {
   onModelLoaded(result: LoadResult, viewer: RVViewer): void {
     this.viewer = viewer;
 
+    // Read optional assetsBasePath from model config for project-specific AASX/PDF.
+    // Falls back to viewer.projectAssetsPath (set via settings.json in private deploys).
+    const aasConfig = result.modelConfig?.pluginConfig?.['aas-link'] as
+      { assetsBasePath?: string; pdfLinks?: Record<string, string> } | undefined;
+    const assetsBasePath = aasConfig?.assetsBasePath ?? viewer.projectAssetsPath;
+
     // Pre-fetch AASX index and pre-parse all AASX files for nodes with AASLink.
     // Stores searchable text (nameplate + technical data values) on each node's
     // _rvAasLink.searchText so the search resolver can find them synchronously.
-    loadIndex().then(index => {
+    loadIndex(assetsBasePath).then(index => {
       if (Object.keys(index).length === 0) return;
 
       // Collect unique AAS IDs from the scene
@@ -138,7 +145,7 @@ export class AasLinkPlugin implements RVViewerPlugin {
 
       // Pre-parse each unique AASX and store searchable text + PDF links on nodes
       for (const [aasId, nodes] of aasNodes) {
-        loadAasxById(aasId).then(parsed => {
+        loadAasxById(aasId, assetsBasePath).then(parsed => {
           // Combine all property values into one searchable string
           const values = [
             ...parsed.nameplate.map(p => p.value),
@@ -158,7 +165,7 @@ export class AasLinkPlugin implements RVViewerPlugin {
               for (const doc of parsed.documents) {
                 existing.push({
                   title: doc.title,
-                  source: { type: 'blob', aasId, zipPath: doc.zipPath },
+                  source: { type: 'blob', aasId, zipPath: doc.zipPath, basePath: assetsBasePath },
                 });
               }
             }
@@ -169,8 +176,7 @@ export class AasLinkPlugin implements RVViewerPlugin {
 
     // --- Standalone PDF matching ---
     // Read pdfLinks from model config: { "Robot/Arm": "pdf/robot-arm-manual.pdf" }
-    const aasConfig = result.modelConfig?.pluginConfig?.['aas-link'] as
-      { pdfLinks?: Record<string, string> } | undefined;
+    // When assetsBasePath is set, PDF URLs are resolved relative to it.
     const configPdfLinks = aasConfig?.pdfLinks;
     if (configPdfLinks) {
       const entries = Object.entries(configPdfLinks);
@@ -180,9 +186,13 @@ export class AasLinkPlugin implements RVViewerPlugin {
           for (const [pathPattern, pdfUrl] of entries) {
             if (nodePath.endsWith(pathPattern) || nodePath.endsWith('/' + pathPattern)) {
               if (!node.userData._rvPdfLinks) node.userData._rvPdfLinks = [];
+              // Resolve PDF URL: if assetsBasePath is set and URL is relative, prepend it
+              const resolvedUrl = assetsBasePath && !pdfUrl.startsWith('http') && !pdfUrl.startsWith('/')
+                ? `${assetsBasePath}${pdfUrl}`
+                : pdfUrl;
               (node.userData._rvPdfLinks as PdfLink[]).push({
                 title: pdfUrl.split('/').pop()?.replace(/\.pdf$/i, '') ?? pdfUrl,
-                source: { type: 'url', url: pdfUrl },
+                source: { type: 'url', url: resolvedUrl },
               });
             }
           }
@@ -243,6 +253,8 @@ const HOVER_MAX_ROWS = 5;
 
 /** AAS tooltip content provider. Self-registers in tooltipRegistry at module load. */
 export function AasTooltipContent({ data, isPinned, viewer }: TooltipContentProps<AasTooltipData>) {
+  const branding = useCustomBranding();
+  const accentColor = branding?.primaryColor ?? '#26a69a';
   const [state, setState] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [parsed, setParsed] = useState<AasParsedData | null>(null);
   const [error, setError] = useState('');
@@ -384,13 +396,13 @@ export function AasTooltipContent({ data, isPinned, viewer }: TooltipContentProp
             sx={{
               mt: 1,
               width: '100%',
-              color: '#26a69a',
-              borderColor: 'rgba(38,166,154,0.5)',
+              color: accentColor,
+              borderColor: `${accentColor}80`,
               fontSize: 11,
               fontWeight: 600,
               textTransform: 'none',
               py: 0.5,
-              '&:hover': { borderColor: '#26a69a', bgcolor: 'rgba(38,166,154,0.1)' },
+              '&:hover': { borderColor: accentColor, bgcolor: `${accentColor}1a` },
             }}
           >
             Add to Cart
@@ -424,6 +436,12 @@ tooltipRegistry.registerSearchResolver('AASLink', (node) => {
   // searchText is populated async by onModelLoaded after AASX pre-parse
   if (aas.searchText) texts.push(aas.searchText);
   return texts;
+});
+
+// ── Search display resolver: show AAS description (product name) in search results ──
+tooltipRegistry.registerSearchDisplayResolver('AASLink', (node) => {
+  const aas = node.userData?._rvAasLink as { description?: string } | undefined;
+  return aas?.description || null;
 });
 
 // ─── Floating AAS Detail Panel ─────────────────────────────────────────

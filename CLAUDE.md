@@ -11,7 +11,7 @@ This file provides guidance to Claude Code when working with the realvirtual WEB
 - **HMI:** React 19 + MUI 7
 - **Build:** Vite 6
 - **Physics:** Rapier.js (WASM)
-- **Tests:** Vitest + Playwright (browser-mode, 1300+ tests)
+- **Tests:** Vitest (browser-mode via Playwright provider) + Playwright E2E
 
 ## Quick Start
 
@@ -87,9 +87,13 @@ src/
       settings/                  # Settings panel tabs
       tooltip/                   # Tooltip system
   hooks/                         # React hooks
-  interfaces/                    # Industrial protocol adapters
-  plugins/                       # Built-in plugins
-  plugins/demo/                  # Demo charts and HMI plugin (OeeChart, DriveChartOverlay, etc.)
+  interfaces/                    # Industrial protocol adapters (WebSocket Realtime, ctrlX)
+  plugins/                       # Built-in + optional plugins (multiuser, webxr, fpv, annotations,
+                                 #   aas-link, docs-browser, camera-startpos, blueprint, recorders,
+                                 #   order-manager, debug-endpoint, mcp-bridge, ...)
+  plugins/demo/                  # Demo model plugins + charts (OEE, parts, cycle time, energy)
+  plugins/models/                # Per-model plugin entry points (auto-loaded by ModelPluginManager)
+  private-stubs/                 # No-op fallbacks when ../realvirtual-WebViewer-Private~ is absent
 tests/                           # Vitest browser tests
 e2e/                             # Playwright E2E tests
 public/models/                   # GLB model files
@@ -168,7 +172,7 @@ The recommended MCP server is [realvirtual-MCP](https://github.com/game4automati
 | `doc-extending-webviewer.md` | Plugin system, custom components, UI slots, hooks |
 | `doc-multiuser-system.md` | Multiuser sessions, relay server, shared views |
 | `doc-web-debugging.md` | Debugging tools and workflow |
-| `doc-webviewer-interface.md` | RVViewer public API reference |
+| `doc-webviewer-interface.md` | Industrial interfaces (WebSocket Realtime, ctrlX, MQTT) — protocol, signal flow, new-interface guide |
 | `webviewer.mcp.md` | MCP tools reference (imported at runtime) |
 
 ## Git Repository

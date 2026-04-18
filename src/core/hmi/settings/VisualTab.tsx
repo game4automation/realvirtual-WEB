@@ -42,8 +42,6 @@ export function VisualTab() {
   const [bloomInt, setBloomInt] = useState<number>(settingsRef.current.bloomIntensity);
   const [bloomThresh, setBloomThresh] = useState<number>(settingsRef.current.bloomThreshold);
   const [bloomRad, setBloomRad] = useState<number>(settingsRef.current.bloomRadius);
-  const [groundOn, setGroundOn] = useState<boolean>(settingsRef.current.groundEnabled);
-  const [groundBright, setGroundBright] = useState<number>(settingsRef.current.groundBrightness);
   const [uiZoom, setUiZoom] = useState<number>(settingsRef.current.uiZoom);
   const settingsLocked = isSettingsLocked();
 
@@ -177,15 +175,6 @@ export function VisualTab() {
     const val = v as number; viewer.bloomRadius = val; setBloomRad(val);
     persist({ bloomRadius: val });
   };
-  const updateGroundOn = (_: unknown, v: boolean) => {
-    viewer.groundEnabled = v; setGroundOn(v);
-    persist({ groundEnabled: v });
-  };
-  const updateGroundBright = (_: unknown, v: number | number[]) => {
-    const val = v as number; viewer.groundBrightness = val; setGroundBright(val);
-    persist({ groundBrightness: val });
-  };
-
   const updateUiZoom = (val: number) => {
     setUiZoom(val); setUIZoom(val); persist({ uiZoom: val });
   };
@@ -279,27 +268,6 @@ export function VisualTab() {
           )}
         </Box>
       )}
-
-      {/* Floor / Ground Plane */}
-      <Box>
-        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <Typography variant="body2" sx={{ color: 'text.primary' }}>Floor</Typography>
-          <Switch size="small" checked={groundOn} onChange={updateGroundOn} />
-        </Box>
-        {groundOn && (
-          <Box sx={{ mt: 1 }}>
-            <Typography variant="caption" sx={{ color: 'text.secondary', textTransform: 'uppercase', letterSpacing: 1 }}>
-              Floor Brightness
-            </Typography>
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mt: 0.5 }}>
-              <Slider size="small" min={0} max={2} step={0.05} value={groundBright} onChange={updateGroundBright} sx={{ flex: 1 }} />
-              <Typography variant="caption" sx={{ color: 'text.secondary', fontFamily: 'monospace', minWidth: 32, textAlign: 'right' }}>
-                {groundBright.toFixed(2)}
-              </Typography>
-            </Box>
-          </Box>
-        )}
-      </Box>
 
       {/* Bloom */}
       {!viewer.isWebGPU && (
@@ -403,24 +371,26 @@ export function VisualTab() {
         </Select>
       </Box>
 
-      {/* Ambient Light */}
-      <Box>
-        <Typography variant="caption" sx={{ color: 'text.secondary', textTransform: 'uppercase', letterSpacing: 1 }}>
-          Ambient Light
-        </Typography>
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mt: 0.5 }}>
-          <Slider size="small" min={0} max={2} step={0.05} value={ambInt} onChange={updateAmbInt} sx={{ flex: 1 }} />
-          <Typography variant="caption" sx={{ color: 'text.secondary', fontFamily: 'monospace', minWidth: 32, textAlign: 'right' }}>
-            {ambInt.toFixed(2)}
+      {/* Ambient Light — simple mode only; default mode relies on the HDRI environment */}
+      {mode !== 'default' && (
+        <Box>
+          <Typography variant="caption" sx={{ color: 'text.secondary', textTransform: 'uppercase', letterSpacing: 1 }}>
+            Ambient Light
           </Typography>
-          <input
-            type="color"
-            value={ambColor}
-            onChange={(e) => updateAmbColor(e.target.value)}
-            style={{ width: 28, height: 28, border: 'none', borderRadius: 4, padding: 0, cursor: 'pointer', background: 'none' }}
-          />
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mt: 0.5 }}>
+            <Slider size="small" min={0} max={2} step={0.05} value={ambInt} onChange={updateAmbInt} sx={{ flex: 1 }} />
+            <Typography variant="caption" sx={{ color: 'text.secondary', fontFamily: 'monospace', minWidth: 32, textAlign: 'right' }}>
+              {ambInt.toFixed(2)}
+            </Typography>
+            <input
+              type="color"
+              value={ambColor}
+              onChange={(e) => updateAmbColor(e.target.value)}
+              style={{ width: 28, height: 28, border: 'none', borderRadius: 4, padding: 0, cursor: 'pointer', background: 'none' }}
+            />
+          </Box>
         </Box>
-      </Box>
+      )}
 
       {/* Global Lighting */}
       <Box>

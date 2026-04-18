@@ -27,6 +27,10 @@ import { AnnotationPlugin } from '../../annotation-plugin';
 import { AasLinkPlugin } from '../../aas-link-plugin';
 import { OrderManagerPlugin } from '../../order-manager-plugin';
 
+// Kiosk Mode — code-first async tour (Plan 150)
+import type { KioskPlugin } from '../../kiosk-plugin';
+import { demoKioskTour } from './demo-kiosk-tour';
+
 // Side-effect import: triggers tooltipRegistry self-registration for 'aas' content type
 import '../../aas-link-plugin';
 
@@ -56,6 +60,15 @@ export function registerModelPlugins(viewer: RVViewer): void {
     viewer.use(p);
     registeredIds.push(p.id);
   }
+
+  // Register kiosk tours for this model (if KioskPlugin is loaded).
+  // Optional chaining handles the case where KioskPlugin was excluded from the build.
+  const kiosk = viewer.getPlugin<KioskPlugin>('kiosk');
+  if (kiosk) {
+    for (const modelName of models) {
+      kiosk.registerTour(modelName, demoKioskTour);
+    }
+  }
 }
 
 export function unregisterModelPlugins(viewer: RVViewer): void {
@@ -63,6 +76,14 @@ export function unregisterModelPlugins(viewer: RVViewer): void {
     viewer.removePlugin(id);
   }
   registeredIds.length = 0;
+
+  // Unregister kiosk tours (does not remove the KioskPlugin itself — it is core)
+  const kiosk = viewer.getPlugin<KioskPlugin>('kiosk');
+  if (kiosk) {
+    for (const modelName of models) {
+      kiosk.unregisterTour(modelName);
+    }
+  }
 }
 
 export default { models, registerModelPlugins, unregisterModelPlugins } satisfies ModelPluginModule;

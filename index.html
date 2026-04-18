@@ -192,7 +192,6 @@
     </div>
     <div class="loader-brand">realvirtual WEB</div>
     <div class="loader-slogan">Open. Light. Industrial. Anywhere.</div>
-    <a class="loader-github" href="https://github.com/game4automation/realvirtual-WEB" target="_blank" rel="noopener noreferrer">github.com/game4automation/realvirtual-WEB</a>
     <div class="loader-status" id="loading-status">Loading <span class="model-name" id="loading-model-name"></span></div>
     <div class="loader-progress-wrap">
       <div class="loader-progress-track"><div class="loader-progress-bar indeterminate" id="loading-progress-bar"></div></div>
@@ -231,6 +230,16 @@
       font-weight: 600;
     }
   </style>
+
+  <!-- On-screen DevTools console (opt-in via ?debug=1 URL param) -->
+  <script>
+    if (new URLSearchParams(location.search).has('debug')) {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/eruda';
+      s.onload = () => { (window).eruda?.init(); };
+      document.head.appendChild(s);
+    }
+  </script>
 
   <script type="module" src="/src/main.ts"></script>
 </body>

@@ -17,6 +17,8 @@ export interface NodeSearchResult {
   types: string[];
   /** Which source matched the search: 'name' (node name), or component type key (e.g. 'AASLink', 'RuntimeMetadata'). */
   matchedBy?: string;
+  /** Optional display label provided by the matched component's SearchDisplayResolver. */
+  displayText?: string;
 }
 
 /**
@@ -390,7 +392,11 @@ export class NodeRegistry {
       const types = compMap ? [...compMap.keys()] : [];
       const rvType = node.userData?._rvType as string | undefined;
       if (rvType && !types.includes(rvType)) types.push(rvType);
-      results.push({ path, node, types, matchedBy });
+      // Ask the matched component for a display label (e.g. product name from AAS)
+      const displayText = matchedBy
+        ? tooltipRegistry.getSearchDisplayText(node, matchedBy)
+        : null;
+      results.push({ path, node, types, matchedBy, ...(displayText ? { displayText } : {}) });
     }
     return results;
   }

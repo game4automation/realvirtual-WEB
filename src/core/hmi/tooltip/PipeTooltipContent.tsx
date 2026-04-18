@@ -87,14 +87,10 @@ export function PipeTooltipContent({ data, viewer }: TooltipContentProps<PipeToo
   );
 }
 
-// ── Self-registration ──
+// ── Self-registration (content provider only) ──
+// The data resolver for 'pipe' is registered by the RVPipe class module via
+// registerTooltipComponent() — single source of truth.
 tooltipRegistry.register({
   contentType: 'pipe',
   component: PipeTooltipContent as any,
-});
-
-// ── Data resolver for GenericTooltipController ──
-tooltipRegistry.registerDataResolver('pipe', (node, viewer) => {
-  const path = viewer.registry?.getPathForNode(node) ?? '';
-  return path ? { type: 'pipe', nodePath: path } : null;
 });

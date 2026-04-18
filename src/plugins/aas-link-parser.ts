@@ -47,21 +47,38 @@ export interface AasIndexEntry {
 
 // ─── Index ──────────────────────────────────────────────────────────────
 
-let indexPromise: Promise<Record<string, AasIndexEntry>> | null = null;
+/** Per-basePath index cache. Empty string key = default (public/aasx). */
+const indexCache = new Map<string, Promise<Record<string, AasIndexEntry>>>();
 
-/** Fetch and cache the aasx/index.json. Returns empty object on failure. */
-export function loadIndex(): Promise<Record<string, AasIndexEntry>> {
-  if (!indexPromise) {
-    indexPromise = fetch(`${import.meta.env.BASE_URL}aasx/index.json`, { signal: AbortSignal.timeout(10_000) })
-      .then(r => r.ok ? r.json() as Promise<Record<string, AasIndexEntry>> : {})
-      .catch(() => ({}));
-  }
-  return indexPromise;
+/**
+ * Maps AAS IDs to their basePath so that tooltip components can load
+ * project-specific AASX without knowing the basePath themselves.
+ * Populated when loadAasxById() is called with a basePath.
+ */
+const aasIdBasePathMap = new Map<string, string>();
+
+/**
+ * Fetch and cache the aasx/index.json. Returns empty object on failure.
+ * @param basePath Optional base path for project-specific AASX (e.g. '/private-assets/myproject/').
+ *                 Must end with '/'. When omitted, loads from the default public/aasx/ folder.
+ */
+export function loadIndex(basePath?: string): Promise<Record<string, AasIndexEntry>> {
+  const key = basePath ?? '';
+  const existing = indexCache.get(key);
+  if (existing) return existing;
+
+  const base = basePath ?? `${import.meta.env.BASE_URL}`;
+  const url = `${base}aasx/index.json`;
+  const promise = fetch(url, { signal: AbortSignal.timeout(10_000) })
+    .then(r => r.ok ? r.json() as Promise<Record<string, AasIndexEntry>> : {})
+    .catch(() => ({}));
+  indexCache.set(key, promise);
+  return promise;
 }
 
 /** Reset the index cache (for testing). */
 export function resetIndex(): void {
-  indexPromise = null;
+  indexCache.clear();
 }
 
 // ─── AASX Cache ─────────────────────────────────────────────────────────
@@ -80,28 +97,31 @@ export function resetCache(): void {
 /**
  * Load and parse an AASX by AAS ID.
  * Resolves the ID to a filename via the index, then loads the AASX.
+ * @param basePath Optional base path for project-specific AASX (e.g. '/private-assets/myproject/').
  */
-export async function loadAasxById(aasId: string): Promise<AasParsedData> {
-  const index = await loadIndex();
+export async function loadAasxById(aasId: string, basePath?: string): Promise<AasParsedData> {
+  const index = await loadIndex(basePath);
   const entry = index[aasId];
   if (!entry) throw new Error(`AAS ID not found in index: ${aasId}`);
-  return loadAasx(entry.file);
+  return loadAasx(entry.file, basePath);
 }
 
 /**
  * Load and parse an AASX by filename.
  * Caches the promise; on rejection the cache entry is removed to allow retry.
+ * @param basePath Optional base path for project-specific AASX.
  */
-export function loadAasx(filename: string): Promise<AasParsedData> {
-  const existing = cache.get(filename);
+export function loadAasx(filename: string, basePath?: string): Promise<AasParsedData> {
+  const cacheKey = basePath ? `${basePath}::${filename}` : filename;
+  const existing = cache.get(cacheKey);
   if (existing) return existing;
 
-  const promise = doLoad(filename);
-  cache.set(filename, promise);
+  const promise = doLoad(filename, basePath);
+  cache.set(cacheKey, promise);
 
   // Delete cache entry on rejection so next call can retry
   promise.catch(() => {
-    cache.delete(filename);
+    cache.delete(cacheKey);
   });
 
   return promise;
@@ -109,12 +129,14 @@ export function loadAasx(filename: string): Promise<AasParsedData> {
 
 // ─── Internal: Load + Parse ─────────────────────────────────────────────
 
-async function doLoad(filename: string): Promise<AasParsedData> {
-  const response = await fetch(`${import.meta.env.BASE_URL}aasx/${filename}`, { signal: AbortSignal.timeout(10_000) });
+async function doLoad(filename: string, basePath?: string): Promise<AasParsedData> {
+  const base = basePath ?? `${import.meta.env.BASE_URL}`;
+  const response = await fetch(`${base}aasx/${filename}`, { signal: AbortSignal.timeout(10_000) });
   if (!response.ok) throw new Error(`Failed to load ${filename}: ${response.status}`);
 
+  const cacheKey = basePath ? `${basePath}::${filename}` : filename;
   const zipPromise = JSZip.loadAsync(await response.arrayBuffer());
-  zipCache.set(filename, zipPromise);
+  zipCache.set(cacheKey, zipPromise);
   const zip = await zipPromise;
 
   // Find the .aas.xml file (may be in a subfolder)
@@ -279,20 +301,22 @@ export function parseDocuments(doc: Document): AasDocument[] {
  * (and cached), then extracts the specified file from the ZIP.
  * Normalizes the zipPath: tries as-is, then with 'aasx/' prefix.
  *
+ * @param basePath Optional base path for project-specific AASX.
  * @returns blob URL string — caller is responsible for revoking it.
  */
-export async function extractFileBlob(aasId: string, zipPath: string): Promise<string> {
-  const index = await loadIndex();
+export async function extractFileBlob(aasId: string, zipPath: string, basePath?: string): Promise<string> {
+  const index = await loadIndex(basePath);
   const entry = index[aasId];
   if (!entry) throw new Error(`AAS ID not found in index: ${aasId}`);
 
   const filename = entry.file;
 
   // Ensure AASX is loaded (triggers doLoad if not cached)
-  await loadAasx(filename);
+  await loadAasx(filename, basePath);
 
   // Get the cached ZIP instance
-  const zip = await zipCache.get(filename);
+  const cacheKey = basePath ? `${basePath}::${filename}` : filename;
+  const zip = await zipCache.get(cacheKey);
   if (!zip) throw new Error(`ZIP not available for ${filename}`);
 
   // Normalize path: strip leading '/', replace '\' with '/'

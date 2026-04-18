@@ -43,10 +43,13 @@ function makeStubViewer() {
   const camera = {
     position: new Vector3(3, 2.5, 4),
   };
-  return { renderer, scene, camera, _xrListeners: listeners } as unknown as {
+  // Minimal RVViewer surface used by WebXRPlugin — just the methods it actually calls.
+  const setSimulationPaused = vi.fn();
+  return { renderer, scene, camera, setSimulationPaused, _xrListeners: listeners } as unknown as {
     renderer: import('three').WebGLRenderer;
     scene: import('three').Scene;
     camera: import('three').PerspectiveCamera;
+    setSimulationPaused: ReturnType<typeof vi.fn>;
     _xrListeners: Record<string, Function[]>;
   };
 }

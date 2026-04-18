@@ -4,6 +4,7 @@
 export { ModelTab } from './ModelTab';
 export { MouseTab } from './MouseTab';
 export { VisualTab } from './VisualTab';
+export { EnvironmentTab } from './EnvironmentTab';
 export { PhysicsTab } from './PhysicsTab';
 export { InterfacesTab } from './InterfacesTab';
 export { DevToolsTab } from './DevToolsTab';

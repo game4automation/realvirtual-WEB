@@ -42,8 +42,16 @@ export function signalBadgeLabel(plcType: string): string {
   return plcType;
 }
 
-/** Resolve signal direction and full PLC type from registry. */
+/** Resolve signal direction and full PLC type from registry or signal store. */
 export function resolveSignalInfo(viewer: RVViewer, signalName: string): { direction: SignalDirection; plcType: string } {
+  // Primary: check SignalStore (always knows the PLC type, even when Signal.Name differs from node name)
+  const storeType = viewer.signalStore?.getType(signalName);
+  if (storeType) {
+    const direction: SignalDirection = storeType.startsWith('PLCOutput') ? 'output'
+      : storeType.startsWith('PLCInput') ? 'input' : 'unknown';
+    return { direction, plcType: storeType };
+  }
+  // Fallback: search registry by node name
   const reg = viewer.registry;
   if (!reg) return { direction: 'unknown', plcType: '' };
   const results = reg.search(signalName);

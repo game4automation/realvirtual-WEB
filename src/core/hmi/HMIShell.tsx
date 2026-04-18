@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useSyncExternalStore } from 'react';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { Box } from '@mui/material';
 import { useViewer } from '../../hooks/use-viewer';
 import type { UISlot } from '../rv-ui-plugin';
 import { useActiveContexts, isUIElementVisible, registerUIElement } from './ui-context-store';
+import { subscribeUIZoom, getUIZoom } from './visual-settings-store';
 
 interface HMIShellProps {
   children: React.ReactNode;
@@ -49,8 +50,23 @@ export function SlotRenderer({ slot }: { slot: UISlot }) {
 }
 
 export function HMIShell({ children }: HMIShellProps) {
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  // Apply zoom directly to DOM — avoids re-rendering the entire child tree on every slider tick.
+  useEffect(() => {
+    function applyZoom() {
+      const el = boxRef.current;
+      if (!el) return;
+      const z = getUIZoom();
+      el.style.zoom = z !== 1 ? String(z) : '';
+    }
+    applyZoom();
+    return subscribeUIZoom(applyZoom);
+  }, []);
+
   return (
     <Box
+      ref={boxRef}
       sx={{
         position: 'fixed',
         inset: 0,

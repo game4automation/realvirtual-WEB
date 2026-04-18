@@ -33,6 +33,8 @@ import {
   Mesh,
   MeshBasicMaterial,
   MeshStandardMaterial,
+  ShaderMaterial,
+  WebGLRenderTarget,
   DoubleSide,
   NoToneMapping,
   CanvasTexture,
@@ -83,7 +85,6 @@ import type { RVLogicEngine } from './engine/rv-logic-engine';
 import type { NodeRegistry, NodeSearchResult } from './engine/rv-node-registry';
 import { TankFillManager } from './engine/rv-tank-fill';
 import { PipeFlowManager } from './engine/rv-pipe-flow';
-import { PipelineSimulation } from './engine/rv-pipeline-sim';
 import { GizmoOverlayManager } from './engine/rv-gizmo-manager';
 import { ComponentEventDispatcher } from './engine/rv-component-event-dispatcher';
 import type { GroupRegistry } from './engine/rv-group-registry';
@@ -184,6 +185,11 @@ export interface ViewerEvents {
   'object-focus': { path: string; node: Object3D };
   'panel-opened': { panelId: string };
   'panel-closed': { panelId: string };
+
+  // ── Safety door events (engine listens, UI emits) ──
+  /** Show or hide all safety-door gizmos at once.
+   *  UI plugins emit this to toggle visibility from a warning tile etc. */
+  'safety-door:show-all': { show: boolean };
 
   // ── XR events ──
   'xr-session-start': void;
@@ -312,7 +318,6 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   logicEngine: RVLogicEngine | null = null;
   tankFillManager: TankFillManager | null = null;
   pipeFlowManager: PipeFlowManager | null = null;
-  pipelineSimulation: PipelineSimulation | null = null;
   playback: RVDrivesPlayback | null = null;
   groups: GroupRegistry | null = null;
   autoFilters: AutoFilterRegistry | null = null;
@@ -597,16 +602,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
         this.emit('sensor-chart-toggle', { open: false });
       }
       this.setExclusiveHoverMode('Drive');
-      // Highlight filtered drives (or all if no filter)
-      const drivesToHighlight = this._driveFilter ? this._filteredDrives : this.drives;
-      const nodes = drivesToHighlight.map((d) => d.node);
-      if (nodes.length > 0) {
-        this.highlighter.highlightMultiple(nodes);
-        this.fitToNodes(nodes);
-      }
+      // Isolate drives — dims non-drive geometry
+      this.autoFilters?.isolate('Drive', { dimOpacity: 0.55, dimDesaturate: true });
+      this.markShadowsDirty();
     } else {
       this.setExclusiveHoverMode(null);
-      this.highlighter.clear();
+      this.autoFilters?.showAll();
+      this.markShadowsDirty();
     }
     this.emit('drive-chart-toggle', { open: this._driveChartOpen });
   }
@@ -913,6 +915,14 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   /** Load model with progress overlay (set by main.ts bootstrap). */
   loadModelWithProgress: ((url: string) => Promise<void>) | null = null;
 
+  /**
+   * Optional gate promise that must resolve before model loading begins.
+   * Set by plugins like LoginGatePlugin to defer heavy loading until the
+   * user has authenticated — avoids main-thread contention that causes
+   * laggy login UI.
+   */
+  loadGate: Promise<void> | null = null;
+
   // --- XR state ---
   private _savedBackground: Color | null = null;
   private _savedShadowState = true;
@@ -959,7 +969,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Default background = 0x9a9a9a gray (scalar 0.604) scaled by backgroundBrightness.
     this.scene.background = new Color().setScalar(BG_BASE_SCALAR * this._backgroundBrightness);
     this.highlighter = new RVHighlightManager(this.scene);
-    this.gizmoManager = new GizmoOverlayManager(this.scene);
+    // Lazy getter for raycastManager: it's created later (loadGLB time), so a closure
+    // is needed instead of passing the value directly. Once available, every gizmo
+    // automatically participates in raycasting (hover/click resolves to owner node).
+    this.gizmoManager = new GizmoOverlayManager(this.scene, () => this.raycastManager);
 
     // --- Camera ---
     const w = container.clientWidth || window.innerWidth;
@@ -1251,6 +1264,46 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._isolateOverlayMat = mat;
   }
 
+  /** Lazily build the fullscreen desaturation resources. */
+  private _ensureDesatPass(): void {
+    if (this._desatScene) return;
+    const w = this.renderer.domElement.width || 1;
+    const h = this.renderer.domElement.height || 1;
+    this._desatRT = new WebGLRenderTarget(w, h, { samples: this._antialiasActive ? 4 : 0 });
+    const cam = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const mat = new ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: this._desatRT.texture },
+        saturation: { value: 0.0 },
+      },
+      vertexShader: /* glsl */ `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = vec4(position, 1.0); }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform sampler2D tDiffuse;
+        uniform float saturation;
+        varying vec2 vUv;
+        void main() {
+          vec4 c = texture2D(tDiffuse, vUv);
+          float lum = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+          gl_FragColor = vec4(mix(vec3(lum), c.rgb, saturation), c.a);
+        }
+      `,
+      depthTest: false,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    const mesh = new Mesh(new PlaneGeometry(2, 2), mat);
+    mesh.frustumCulled = false;
+    const scene = new Scene();
+    scene.background = null;
+    scene.add(mesh);
+    this._desatScene = scene;
+    this._desatCam = cam;
+    this._desatMat = mat;
+  }
+
   /**
    * Three-pass render used when GroupRegistry.isIsolateActive is true:
    *   1. Dim backdrop — everything except the focus layer, through composer if enabled.
@@ -1273,6 +1326,16 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Background.js in the three/webgpu source for the clear gate.
     const gl = this.renderer as unknown as WebGLRenderer;
 
+    // Check if desaturation is requested by any active isolate caller.
+    const desaturate =
+      this.autoFilters?.dimDesaturate ||
+      !!(this.groups as { dimDesaturate?: boolean } | null)?.dimDesaturate;
+
+    // Restrict shadow map to focus-layer objects only so dimmed objects
+    // don't cast shadows onto the ground plane.
+    const savedShadowLayers = this.dirLight.shadow.camera.layers.mask;
+    this.dirLight.shadow.camera.layers.set(ISOLATE_FOCUS_LAYER);
+
     // ── Pass 1: Dim backdrop ──
     // enableAll + disable focus = "everything but focus", mutation-safe for
     // dynamically spawned nodes (MUs, tank fills, pipe-flow rings) which
@@ -1282,7 +1345,38 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     camera.layers.enableAll();
     camera.layers.disable(ISOLATE_FOCUS_LAYER);
     camera.layers.disable(HIGHLIGHT_OVERLAY_LAYER);
-    if (this._useComposer) {
+
+    if (desaturate) {
+      // Render backdrop to offscreen RT, then blit desaturated to screen.
+      this._ensureDesatPass();
+      const rt = this._desatRT!;
+      const w = gl.domElement.width;
+      const h = gl.domElement.height;
+      if (rt.width !== w || rt.height !== h) rt.setSize(w, h);
+
+      // Remove environment map during backdrop render so metallic surfaces
+      // don't show specular reflections (they'd appear as bright white spots
+      // even after desaturation). Restored before Pass 3 (focus group).
+      const savedEnv = this.scene.environment;
+      this.scene.environment = null;
+
+      // Render the full-color backdrop (everything except focus layer) into the RT.
+      gl.setRenderTarget(rt);
+      gl.clear(true, true, false);
+      gl.render(this.scene, camera);
+      gl.setRenderTarget(null);
+
+      // Restore environment map for the focus group render (Pass 3).
+      this.scene.environment = savedEnv;
+
+      // Blit the RT to the default framebuffer through a desaturation shader.
+      // saturation=0 → full grayscale; the focus group (Pass 3) renders in
+      // full color on top afterwards.
+      this._desatMat!.uniforms.tDiffuse.value = rt.texture;
+      this._desatMat!.uniforms.saturation.value = 0.0;
+      gl.clear(true, true, false);
+      gl.render(this._desatScene!, this._desatCam!);
+    } else if (this._useComposer) {
       if (this._gtaoPass) this._gtaoPass.camera = camera;
       const renderPass = this._composer!.passes[0] as RenderPass;
       if (renderPass) renderPass.camera = camera;
@@ -1308,6 +1402,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       } else {
         gl.getClearColor(this._isolateOverlayMat.color);
       }
+      // Allow the active isolate caller to override the dim-opacity.
+      // autoFilters takes precedence over groups; both fall back to the default 0.9.
+      const override =
+        this.autoFilters?.dimOpacity ??
+        (this.groups as { dimOpacity?: number | null } | null)?.dimOpacity ??
+        null;
+      this._isolateOverlayMat.opacity = override ?? 0.9;
     }
     try {
       // ── Pass 2: Semi-transparent fullscreen overlay ──
@@ -1330,6 +1431,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       gl.render(this.scene, camera);
     } finally {
       this.scene.background = savedBackground;
+      this.dirLight.shadow.camera.layers.mask = savedShadowLayers;
     }
   }
 
@@ -1434,7 +1536,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       await this.modelPluginManager.onModelLoading(url, this);
     }
 
-    const result = await loadGLB(url, this.scene, { isWebGPU: this.isWebGPU, gizmoManager: this.gizmoManager });
+    // Wait for any load gate (e.g. login) before heavy GLB parsing
+    if (this.loadGate) await this.loadGate;
+
+    const result = await loadGLB(url, this.scene, { isWebGPU: this.isWebGPU, gizmoManager: this.gizmoManager, events: this });
 
     // Pre-compile shaders to avoid first-frame stutter (available on WebGPURenderer)
     if ('compileAsync' in this.renderer) {
@@ -1510,6 +1615,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this.raycastManager.setRaycastGeometry(result.raycastGeometrySet, muMeshes);
     }
 
+    // Gizmos created during loadGLB (e.g. WebSensor outlines) were instantiated
+    // before raycastManager existed. Register them AFTER setRaycastGeometry so
+    // they survive the rebuild that setRaycastGeometry triggers.
+    this.gizmoManager.refreshAuxRaycastTargets();
+
     // Enable hover types based on capabilities registry (hoverEnabledByDefault)
     const hoverDefaults = getTypesWithCapability('hoverEnabledByDefault');
     for (const type of hoverDefaults) {
@@ -1528,13 +1638,6 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Pipe flow visualization (animated rings)
     if (pl.pipes.length > 0) {
       this.pipeFlowManager = new PipeFlowManager(pl.pipes);
-    }
-
-    // Pipeline simulation (fluid transfer between tanks via pipes)
-    if (pl.pipes.length > 0 && pl.tanks.length > 0) {
-      this.pipelineSimulation = new PipelineSimulation(
-        pl.pipes, pl.tanks, pl.pumps, pl.processingUnits, result.registry,
-      );
     }
 
     // LogicEngine
@@ -1751,7 +1854,6 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this.pipeFlowManager.dispose();
       this.pipeFlowManager = null;
     }
-    this.pipelineSimulation = null;
     // Dispose gizmo entries & dispatcher before registry is cleared
     this.gizmoManager.dispose();
     if (this.componentEventDispatcher) {
@@ -2398,6 +2500,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   /** Overlay material — color is refreshed to match scene background each frame. */
   private _isolateOverlayMat: MeshBasicMaterial | null = null;
 
+  // --- Isolate desaturation pass (framebuffer-level grayscale) ---
+  private _desatRT: WebGLRenderTarget | null = null;
+  private _desatScene: Scene | null = null;
+  private _desatCam: OrthographicCamera | null = null;
+  private _desatMat: ShaderMaterial | null = null;
+
   private fixedUpdate(dt: number): void {
     this.simTickCount++;
     const isConnected = this._connectionState === 'Connected';
@@ -2462,11 +2570,6 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
           break;
         }
       }
-    }
-
-    // ── Pipeline simulation (fluid transfer) ──
-    if (this.pipelineSimulation) {
-      this.pipelineSimulation.fixedUpdate(dt);
     }
 
     // ── Tank fill visualization (clip plane updates) ──

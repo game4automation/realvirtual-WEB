@@ -61,15 +61,15 @@ function FillBar({ fraction }: { fraction: number }) {
         <Box sx={{
           position: 'absolute',
           left: 0,
-          bottom: 0,
-          width: '100%',
-          height: `${clamped * 100}%`,
+          top: 0,
+          width: `${clamped * 100}%`,
+          height: '100%',
           bgcolor: color,
-          transition: 'height 0.3s, background-color 0.3s',
+          transition: 'width 0.3s, background-color 0.3s',
         }} />
       </Box>
       <Typography variant="caption" sx={{ color, fontSize: 11, fontFamily: 'monospace', fontWeight: 700 }}>
-        {(clamped * 100).toFixed(1)}%
+        {(clamped * 100).toFixed(2)}%
       </Typography>
     </Box>
   );
@@ -134,14 +134,10 @@ export function TankTooltipContent({ data, viewer }: TooltipContentProps<TankToo
   );
 }
 
-// ── Self-registration ──
+// ── Self-registration (content provider only) ──
+// The data resolver for 'tank' is registered by the RVTank class module via
+// registerTooltipComponent() — single source of truth.
 tooltipRegistry.register({
   contentType: 'tank',
   component: TankTooltipContent as any,
-});
-
-// ── Data resolver for GenericTooltipController ──
-tooltipRegistry.registerDataResolver('tank', (node, viewer) => {
-  const path = viewer.registry?.getPathForNode(node) ?? '';
-  return path ? { type: 'tank', nodePath: path } : null;
 });

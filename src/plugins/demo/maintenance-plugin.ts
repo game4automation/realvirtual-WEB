@@ -33,6 +33,7 @@ import {
   clearMaintenanceProgress,
 } from '../../core/hmi/maintenance-progress-store';
 import { activateContext, deactivateContext } from '../../core/hmi/ui-context-store';
+import { waitForCameraAndDwell } from '../tour-utils';
 
 // Re-export shared types from core (canonical source of truth)
 export type { MaintenanceMode, StepResult, MaintenanceState } from '../../core/types/plugin-types';
@@ -54,11 +55,14 @@ export class MaintenancePlugin implements RVViewerPlugin {
     isCameraAnimating: false,
   };
 
-  /** Flag to cancel flythrough async loop. */
-  private _flythroughCancelled = false;
+  /** AbortController for cancelling the flythrough async loop (standard Web API). */
+  private _flythroughAbort: AbortController | null = null;
 
   /** Dwell time in ms for each step during flythrough mode. */
   private _flythroughDwellMs = 2500;
+
+  /** Timeout (ms) to wait for 'camera-animation-done' before forcing continue. */
+  private _flythroughCameraTimeoutMs = 5000;
 
   /** Unsubscribe functions for event listeners. */
   private _unsubs: (() => void)[] = [];
@@ -158,7 +162,9 @@ export class MaintenancePlugin implements RVViewerPlugin {
       stepResults,
       isCameraAnimating: false,
     };
-    this._flythroughCancelled = false;
+    // Fresh AbortController per flythrough invocation (abort is one-way).
+    this._flythroughAbort?.abort();
+    this._flythroughAbort = new AbortController();
 
     this._emitModeChanged();
     this._goToStep(startStep);
@@ -211,7 +217,7 @@ export class MaintenancePlugin implements RVViewerPlugin {
 
   /** Exit maintenance mode — clean up everything. */
   exitMaintenance(): void {
-    this._flythroughCancelled = true;
+    this._flythroughAbort?.abort();
     if (this.viewer) {
       this.viewer.clearHighlight();
     }
@@ -284,45 +290,32 @@ export class MaintenancePlugin implements RVViewerPlugin {
   private async _runFlythrough(): Promise<void> {
     if (!this._state.procedure || !this.viewer) return;
     const steps = this._state.procedure.steps;
+    const signal = this._flythroughAbort?.signal;
+    if (!signal) return;
 
     for (let i = 0; i < steps.length; i++) {
-      if (this._flythroughCancelled) break;
+      if (signal.aborted) break;
 
       this._state.currentStep = i;
       this._goToStep(i);
       this._emitModeChanged();
 
-      // Wait for camera animation + dwell time
-      await this._waitForCameraAndDwell();
+      // Wait for camera animation + dwell time (shared tour-utils helper)
+      await waitForCameraAndDwell(
+        this.viewer,
+        this._flythroughDwellMs,
+        this._flythroughCameraTimeoutMs,
+        signal,
+      );
 
-      if (this._flythroughCancelled) break;
+      if (signal.aborted) break;
     }
 
-    if (!this._flythroughCancelled) {
+    if (!signal.aborted) {
       // Flythrough complete — transition to completed
       this._state.mode = 'completed';
       this._emitModeChanged();
     }
-  }
-
-  /** Wait for camera animation to finish, then wait the dwell time. */
-  private _waitForCameraAndDwell(): Promise<void> {
-    return new Promise((resolve) => {
-      const checkAndDwell = () => {
-        if (this._flythroughCancelled) { resolve(); return; }
-        // Wait for the dwell time
-        setTimeout(() => resolve(), this._flythroughDwellMs);
-      };
-
-      // If camera is animating, wait for it
-      if (this.viewer?.isCameraAnimating) {
-        this.viewer.once('camera-animation-done', () => {
-          checkAndDwell();
-        });
-      } else {
-        checkAndDwell();
-      }
-    });
   }
 
   /** Persist current progress to localStorage (stepbystep mode only). */

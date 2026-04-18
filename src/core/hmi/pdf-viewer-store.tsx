@@ -25,7 +25,7 @@ import { DocViewerOverlay } from './DocViewerOverlay';
 /** Source descriptor for a PDF document. */
 export type PdfSource =
   | { type: 'url'; url: string }
-  | { type: 'blob'; aasId: string; zipPath: string };
+  | { type: 'blob'; aasId: string; zipPath: string; basePath?: string };
 
 /** A single PDF link attached to a node. */
 export interface PdfLink {
@@ -77,7 +77,7 @@ export function openPdfViewer(
     _pdfState = { open: true, url: '', title, loading: true, error: '' };
     notifyPdf();
 
-    extractFileBlob(source.aasId, source.zipPath)
+    extractFileBlob(source.aasId, source.zipPath, source.basePath)
       .then((blobUrl) => {
         _activeBlobUrls.add(blobUrl);
         _pdfState = { ..._pdfState, url: blobUrl, loading: false, error: '' };

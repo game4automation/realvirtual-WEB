@@ -96,14 +96,10 @@ export function PumpTooltipContent({ data, viewer }: TooltipContentProps<PumpToo
   );
 }
 
-// ── Self-registration ──
+// ── Self-registration (content provider only) ──
+// The data resolver for 'pump' is registered by the RVPump class module via
+// registerTooltipComponent() — single source of truth.
 tooltipRegistry.register({
   contentType: 'pump',
   component: PumpTooltipContent as any,
-});
-
-// ── Data resolver for GenericTooltipController ──
-tooltipRegistry.registerDataResolver('pump', (node, viewer) => {
-  const path = viewer.registry?.getPathForNode(node) ?? '';
-  return path ? { type: 'pump', nodePath: path } : null;
 });

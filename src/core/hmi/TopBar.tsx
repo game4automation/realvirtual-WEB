@@ -21,7 +21,7 @@ import { loadMultiuserSettings } from './multiuser-settings-store';
 import type { MultiuserPluginAPI, WebXRPluginAPI } from '../types/plugin-types';
 
 // Settings tab components (extracted for maintainability)
-import { ModelTab, MouseTab, VisualTab, PhysicsTab, InterfacesTab, MultiuserTab, McpTab, DevToolsTab, TestsTab, GroupsTab } from './settings';
+import { ModelTab, MouseTab, VisualTab, EnvironmentTab, PhysicsTab, InterfacesTab, MultiuserTab, McpTab, DevToolsTab, TestsTab, GroupsTab } from './settings';
 import { usePluginSettingsTabs, PluginSettingsTabContent } from './PluginSettingsTabs';
 
 export function TopBar() {
@@ -234,6 +234,7 @@ export function TopBar() {
             ))}
             {!isTabLocked('mouse') && <Tab label="Mouse & Touch" value={9} />}
             {!isTabLocked('visual') && <Tab label="Visual" value={1} />}
+            {!isTabLocked('environment') && <Tab label="Environment" value={10} />}
             {!isTabLocked('physics') && <Tab label="Physics" value={2} />}
             {!isTabLocked('interfaces') && <Tab label="Interfaces" value={3} />}
             {!isTabLocked('multiuser') && muPlugin && <Tab label="Multiuser" value={4} />}
@@ -248,6 +249,7 @@ export function TopBar() {
             {settingsTab === 0 && !isTabLocked('model') && <ModelTab />}
             {settingsTab === 9 && !isTabLocked('mouse') && <MouseTab />}
             {settingsTab === 1 && !isTabLocked('visual') && <VisualTab />}
+            {settingsTab === 10 && !isTabLocked('environment') && <EnvironmentTab />}
             {settingsTab === 2 && !isTabLocked('physics') && <PhysicsTab />}
             {settingsTab === 3 && !isTabLocked('interfaces') && <InterfacesTab />}
             {settingsTab === 4 && !isTabLocked('multiuser') && muPlugin && <MultiuserTab muEnabled={muEnabled} onMuEnabledChange={setMuEnabled} />}

@@ -39,7 +39,7 @@ describe('RVWebSensor dispose', () => {
     inst.init({ scene, signalStore: store, gizmoManager: mgr } as any);
 
     const before = (mgr as any)._entries.size;
-    expect(before).toBeGreaterThanOrEqual(2); // state + text
+    expect(before).toBeGreaterThanOrEqual(1); // only state gizmo (text-gizmo removed; label is in tooltip)
     inst.dispose();
     const after = (mgr as any)._entries.size;
     expect(after).toBeLessThan(before);

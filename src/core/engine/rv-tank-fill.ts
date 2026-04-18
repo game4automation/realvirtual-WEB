@@ -147,6 +147,29 @@ export class TankFillManager {
     this.entries.length = 0;
   }
 
+  /**
+   * Override a tank's fill + surface-line colors (e.g. to match a custom
+   * fluid palette owned by ProcessIndustryPlugin). No-op when the tank has
+   * no fill overlay yet.
+   */
+  setFillColor(tankNode: Object3D, fillColor: number, lineColor: number): void {
+    const entry = this.entries.find((e) => e.node === tankNode);
+    if (!entry) return;
+    (entry.overlay.material as MeshBasicMaterial).color.setHex(fillColor);
+    (entry.line.material as MeshBasicMaterial).color.setHex(lineColor);
+  }
+
+  /** Restore every fill + surface-line overlay to the built-in preset color
+   *  derived from the tank's current resourceName (or the default preset). */
+  resetAllFillColors(): void {
+    for (const entry of this.entries) {
+      const rv = entry.node.userData._rvTank as { resourceName?: string } | undefined;
+      const preset = getLiquidPreset(rv?.resourceName ?? '');
+      (entry.overlay.material as MeshBasicMaterial).color.setHex(preset.fill);
+      (entry.line.material as MeshBasicMaterial).color.setHex(preset.line);
+    }
+  }
+
   private _createFill(tankNode: Object3D): void {
     const vesselMesh = findVesselMesh(tankNode);
     if (!vesselMesh) return;

@@ -27,6 +27,9 @@ interface DevStats {
   loadTime: string;
   // Optimization pipeline
   uberBakedMeshCount: number;
+  uberSharedGeometryReuses: number;
+  uberClonedGeometryCount: number;
+  uberDisposedSourceGeometries: number;
   staticMergeIn: number;
   staticMergeOut: number;
   kinMergeGroups: number;
@@ -109,6 +112,9 @@ export function DevToolsTab() {
         glbSize: viewer.lastLoadInfo?.glbSize ?? '--',
         loadTime: viewer.lastLoadInfo?.loadTime ?? '--',
         uberBakedMeshCount: info.uberBakedMeshCount,
+        uberSharedGeometryReuses: info.uberSharedGeometryReuses,
+        uberClonedGeometryCount: info.uberClonedGeometryCount,
+        uberDisposedSourceGeometries: info.uberDisposedSourceGeometries,
         staticMergeIn: info.uberMergeOriginal,
         staticMergeOut: info.uberMergeCreated,
         kinMergeGroups: info.kinGroupsMerged,
@@ -163,6 +169,19 @@ export function DevToolsTab() {
           <StatRow
             label="Uber Baked"
             value={s ? `${s.uberBakedMeshCount.toLocaleString()} meshes` : '--'}
+          />
+          <PipelineRow
+            label="Geometry Dedup"
+            before={
+              s
+                ? `${(s.uberSharedGeometryReuses + s.uberClonedGeometryCount).toLocaleString()} candidates`
+                : '--'
+            }
+            after={
+              s
+                ? `${s.uberSharedGeometryReuses.toLocaleString()} shared / ${s.uberClonedGeometryCount.toLocaleString()} cloned`
+                : '--'
+            }
           />
           <PipelineRow
             label="Static Merge"

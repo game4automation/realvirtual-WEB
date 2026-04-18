@@ -24,7 +24,7 @@ export interface UIContextConfig {
 }
 
 /** Settings tab identifiers used for selective locking. */
-export type SettingsTabId = 'model' | 'mouse' | 'visual' | 'physics' | 'interfaces' | 'devtools' | 'tests' | 'mcp' | 'multiuser' | 'groups';
+export type SettingsTabId = 'model' | 'mouse' | 'visual' | 'environment' | 'physics' | 'interfaces' | 'devtools' | 'tests' | 'mcp' | 'multiuser' | 'groups';
 
 /** Top-level app configuration loaded from `public/settings.json`. */
 export interface RVAppConfig {
@@ -41,6 +41,16 @@ export interface RVAppConfig {
   plugins?: string[];
   /** Global per-plugin config — lowest priority, deep-merged with model-specific config. */
   pluginConfig?: Record<string, Record<string, unknown>>;
+
+  /**
+   * Opt-in: load external plugin bundles at runtime via HEAD-then-import.
+   * - `./project-plugin.js` (always checked if enabled)
+   * - `./models/{modelName}/model-plugin.js` (per-model)
+   * Default `false` — leaving it off keeps the network tab clean and skips two
+   * HEAD requests per model load. Enable only when deploying external plugin
+   * bundles (not bundled by Vite) alongside the viewer.
+   */
+  externalPlugins?: boolean;
 
   /** Partial overrides merged on top of localStorage values. */
   visual?: Partial<VisualSettings>;

@@ -21,6 +21,7 @@ import {
   LEFT_PANEL_LEFT,
   LEFT_PANEL_BOTTOM,
   LEFT_PANEL_ZINDEX,
+  LEFT_PANEL_MOBILE_ZINDEX,
 } from './layout-constants';
 import type { SxProps } from '@mui/material/styles';
 
@@ -45,12 +46,10 @@ export function buildPanelSx(opts: {
     return {
       display: 'none',
       position: 'fixed',
-      left: 0,
-      top: LEFT_PANEL_TOP,
-      bottom: 0,
-      right: 0,
+      inset: 0,
       width: '100%',
-      zIndex: LEFT_PANEL_ZINDEX,
+      height: '100%',
+      zIndex: LEFT_PANEL_MOBILE_ZINDEX,
       flexDirection: 'column',
       overflow: 'hidden',
       pointerEvents: 'auto',
@@ -59,14 +58,14 @@ export function buildPanelSx(opts: {
   }
 
   if (isMobile) {
+    // Mobile: true fullscreen modal covering the entire viewport (TopBar + ButtonPanel + BottomBar).
+    // TopBar close button stays on top (zIndex 9001) so panel can still be dismissed.
     return {
       position: 'fixed',
-      left: 0,
-      top: LEFT_PANEL_TOP,
-      bottom: 0,
-      right: 0,
+      inset: 0,
       width: '100%',
-      zIndex: LEFT_PANEL_ZINDEX,
+      height: '100%',
+      zIndex: LEFT_PANEL_MOBILE_ZINDEX,
       display: 'flex',
       flexDirection: 'column',
       overflow: 'hidden',

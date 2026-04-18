@@ -14,7 +14,7 @@ describe('initWebSensor', () => {
   it('partial-merges single state-style field', () => {
     initWebSensor({ stateStyles: { high: { color: 0x00a030 } } });
     expect(WebSensorConfig.stateStyles.high.color).toBe(0x00a030);
-    expect(WebSensorConfig.stateStyles.high.opacity).toBe(0.55);
+    expect(WebSensorConfig.stateStyles.high.opacity).toBe(0.95);
     expect(WebSensorConfig.stateStyles.high.blinkHz).toBe(0);
     expect(WebSensorConfig.stateStyles.error.color).toBe(0xff2020);
   });
@@ -56,7 +56,7 @@ describe('initWebSensor', () => {
   it('resetWebSensorConfig restores baked-in defaults', () => {
     initWebSensor({ stateStyles: { high: { color: 0x00a030 } }, defaultSize: 99 });
     resetWebSensorConfig();
-    expect(WebSensorConfig.stateStyles.high.color).toBe(0x3080ff);
+    expect(WebSensorConfig.stateStyles.high.color).toBe(0x22cc44);
     expect(WebSensorConfig.defaultSize).toBe(1.0);
   });
 });
