@@ -59,21 +59,30 @@ function selfFor(opts: { root: Object3D; drives?: FakeDrive[]; transportManager?
 // ─── findTransport / findSensor / findRotaryDrive ───────────────────────────
 
 describe('self toolkit — convention finders', () => {
-  it('findTransport resolves a Transport-* child', () => {
+  it("find('transport'/'sensor') resolves the matching children", () => {
     const root = new Object3D(); root.name = 'Conv';
     const belt = new Object3D(); belt.name = 'Transport-Z'; root.add(belt);
     const sensor = new Object3D(); sensor.name = 'Sensor-1'; root.add(sensor);
     const { self } = selfFor({ root });
-    expect(self.findTransport()).toBe(belt);
-    expect(self.findSensor()).toBe(sensor);
-    expect(self.findRotaryDrive()).toBeNull();
+    expect(self.find('transport')).toBe(belt);
+    expect(self.find('sensor')).toBe(sensor);
+    expect(self.find('rotary')).toBeNull();
   });
 
-  it('findRotaryDrive resolves a Drive-Rot-* child', () => {
+  it("find('rotary') resolves a Drive-Rot-* child", () => {
     const root = new Object3D(); root.name = 'TT';
     const rot = new Object3D(); rot.name = 'Drive-Rot-Y'; root.add(rot);
     const { self } = selfFor({ root });
-    expect(self.findRotaryDrive()).toBe(rot);
+    expect(self.find('rotary')).toBe(rot);
+  });
+
+  it("findAll('transport') resolves every matching child (multi-axis)", () => {
+    const root = new Object3D(); root.name = 'Transfer';
+    const x = new Object3D(); x.name = 'Transport-X'; root.add(x);
+    const z = new Object3D(); z.name = 'Transport-Z'; root.add(z);
+    const { self } = selfFor({ root });
+    expect(self.findAll('transport')).toEqual([x, z]);
+    expect(self.findAll('rotary')).toEqual([]);
   });
 });
 

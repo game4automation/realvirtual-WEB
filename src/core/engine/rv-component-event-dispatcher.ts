@@ -42,6 +42,7 @@ export class ComponentEventDispatcher {
     data: ObjectHoverData | null,
     _unhoverData?: ObjectUnhoverData,
   ): void {
+    if (this.viewer.logicRunState && this.viewer.logicRunState !== 'active') return;
     // If new hover target equals last → no-op (avoids double-fires from
     // object-hover:null + object-unhover).
     if (node === this._lastHoveredNode) return;
@@ -58,11 +59,13 @@ export class ComponentEventDispatcher {
   }
 
   private _dispatchClick(node: Object3D, data: { path: string; node: Object3D }): void {
+    if (this.viewer.logicRunState && this.viewer.logicRunState !== 'active') return;
     const comp = this._findComponent(node);
     this._safeCall(() => comp?.onClick?.(data));
   }
 
   private _dispatchSelect(snap: SelectionSnapshot): void {
+    if (this.viewer.logicRunState && this.viewer.logicRunState !== 'active') return;
     const newSelected = new Set<Object3D>();
     const paths = snap?.selectedPaths ?? [];
     for (const path of paths) {

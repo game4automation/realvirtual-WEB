@@ -8,6 +8,7 @@ import { loadInterfaceSettings, saveInterfaceSettings, type InterfaceSettings, t
 import { InterfaceManager } from '../../../interfaces/interface-manager';
 import { StatRow, tfSx, SettingsSection, FieldRow } from './settings-helpers';
 import { connectionStateColor } from '../isa-colors';
+import { useSignalDisplaySettings, setChipVariant, setTooltipField, type SignalChipVariant } from '../signal-display-store';
 
 const INTERFACE_OPTIONS: { value: InterfaceType; label: string; available: boolean }[] = [
   { value: 'none', label: 'None', available: true },
@@ -29,6 +30,7 @@ export function InterfacesTab() {
     manager?.getActive()?.discoveredSignals.length ?? 0,
   );
   const [connecting, setConnecting] = useState(false);
+  const display = useSignalDisplaySettings();
 
   // Poll connection state
   useEffect(() => {
@@ -250,6 +252,52 @@ export function InterfacesTab() {
           </Box>
         </SettingsSection>
       )}
+
+      {/* Signal Display — how signal chips + tooltips render (persisted in the browser) */}
+      <SettingsSection id="interfaces-signal-display" title="Signal Display">
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+          <FieldRow label="Signal chips" hint="Global default for how signal chips render (per-usage overrides win).">
+            <Select
+              size="small"
+              value={display.chipVariant}
+              onChange={(e) => setChipVariant(e.target.value as SignalChipVariant)}
+              renderValue={(v) => v === 'full' ? 'Full' : v === 'standard' ? 'Standard' : 'Minimal'}
+              sx={tfSx}
+            >
+              <MenuItem value="full">
+                Full
+                <Typography component="span" sx={{ ml: 1, fontSize: 10, color: 'text.disabled' }}>
+                  Conveyor.Start OutBool ●
+                </Typography>
+              </MenuItem>
+              <MenuItem value="standard">
+                Standard
+                <Typography component="span" sx={{ ml: 1, fontSize: 10, color: 'text.disabled' }}>
+                  Conveyor.Start ●
+                </Typography>
+              </MenuItem>
+              <MenuItem value="minimal">
+                Minimal
+                <Typography component="span" sx={{ ml: 1, fontSize: 10, color: 'text.disabled' }}>
+                  O ●
+                </Typography>
+              </MenuItem>
+            </Select>
+          </FieldRow>
+          <FieldRow label="Tooltip: value">
+            <Switch size="small" checked={display.tooltip.value} onChange={(e) => setTooltipField('value', e.target.checked)} />
+          </FieldRow>
+          <FieldRow label="Tooltip: address / source">
+            <Switch size="small" checked={display.tooltip.address} onChange={(e) => setTooltipField('address', e.target.checked)} />
+          </FieldRow>
+          <FieldRow label="Tooltip: comment">
+            <Switch size="small" checked={display.tooltip.comment} onChange={(e) => setTooltipField('comment', e.target.checked)} />
+          </FieldRow>
+          <FieldRow label="Tooltip: binding">
+            <Switch size="small" checked={display.tooltip.binding} onChange={(e) => setTooltipField('binding', e.target.checked)} />
+          </FieldRow>
+        </Box>
+      </SettingsSection>
 
       {!manager && (
         <Typography variant="caption" sx={{ color: '#ef5350' }}>

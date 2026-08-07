@@ -45,6 +45,7 @@ import {
 import type { Object3D, PerspectiveCamera, OrthographicCamera, WebGLRenderer } from 'three';
 import { pointerToNDC } from '../../core/engine/rv-pointer-utils';
 import { HIGHLIGHT_OVERLAY_LAYER } from '../../core/engine/rv-group-registry';
+import { disposeSubtree } from './three-utils';
 import type { CustomSnapFn, SnapAxisLock } from './bbox-snap';
 
 // ─── Constants & shared temps ─────────────────────────────────────────
@@ -527,11 +528,7 @@ export class FloorGizmo {
     (this._ring.material as MeshBasicMaterial).dispose();
     // Axis handles are Groups with child Meshes — traverse to dispose
     for (const axis of [this._axisX, this._axisXPicker, this._axisY, this._axisYPicker, this._axisZ, this._axisZPicker]) {
-      axis.traverse((n) => {
-        const m = n as Mesh;
-        if (m.geometry) m.geometry.dispose();
-        if (m.material && (m.material as MeshBasicMaterial).dispose) (m.material as MeshBasicMaterial).dispose();
-      });
+      disposeSubtree(axis);
     }
     this._axisXMat.dispose();
     this._axisYMat.dispose();

@@ -219,6 +219,49 @@ describe('applyKinematicParenting', () => {
     expect(kinNode.parent).toBe(parentNode);
   });
 
+  it('pre-reparent paths stay resolvable via alias after recompute (GLB refs)', () => {
+    // References serialized in the GLB (e.g. instruction targetObjects) use the
+    // authoring hierarchy. After kinematic re-parenting + path recompute, the
+    // loader registers the old paths as aliases so those references still resolve.
+    const root = new Object3D(); root.name = 'Root';
+    const oldParent = new Object3D(); oldParent.name = 'OldParent';
+    const kinNode = new Object3D(); kinNode.name = 'Kin';
+    const part = new Object3D(); part.name = 'Part';
+    oldParent.add(part);
+    root.add(oldParent);
+    root.add(kinNode);
+
+    const groups = new GroupRegistry();
+    groups.register('G', part);
+
+    const registry = buildRegistry(root);
+    expect(registry.getNode('OldParent/Part')).toBe(part);
+
+    const kinEntries: KinematicNodeEntry[] = [{
+      node: kinNode,
+      data: { IntegrateGroupEnable: true, GroupName: 'G' },
+    }];
+
+    const result = applyKinematicParenting(kinEntries, groups, registry, root);
+    const { remap } = registry.recomputePathsForSubtrees(result.affectedSubtrees);
+
+    // Canonical path moved; the stale multi-segment path no longer resolves
+    // (suffix fallback requires the full old parent chain to match).
+    expect(remap.get('OldParent/Part')).toBe('Kin/Part');
+    expect(registry.getNode('Kin/Part')).toBe(part);
+    expect(registry.getNode('OldParent/Part')).toBeNull();
+
+    // Loader Phase 8c: register the pre-reparent paths as aliases.
+    for (const [oldPath, newPath] of remap) {
+      const node = registry.getNode(newPath);
+      if (node) registry.registerAlias(oldPath, node);
+    }
+
+    // Stale GLB reference resolves again; canonical path stays the new one.
+    expect(registry.getNode('OldParent/Part')).toBe(part);
+    expect(registry.getPathForNode(part)).toBe('Kin/Part');
+  });
+
   it('processes IntegrateGroup before KinematicParent', () => {
     const root = new Object3D(); root.name = 'Root';
     const kinNode = new Object3D(); kinNode.name = 'Kin';

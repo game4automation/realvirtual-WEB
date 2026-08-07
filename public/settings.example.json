@@ -35,6 +35,12 @@
     "googleAnalyticsId": ""
   },
 
+  "diagnostics": {
+    "_comment": "AI error diagnosis + operator comment backend (CONNECT). Leave both URLs empty to keep the offline demo/fake path.",
+    "diagnoseUrl": "",
+    "notesUrl": ""
+  },
+
   "pluginConfig": {
     "_comment": "Per-plugin configuration. Missing keys fall back to built-in defaults.",
     "orientationGizmo": {

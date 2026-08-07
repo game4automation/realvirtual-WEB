@@ -31,8 +31,27 @@ export class ToolRegistry {
     return this._tools.has(name);
   }
 
+  /** Per-call timeout hint announced by the browser for this tool (ms), if any. */
+  timeoutMs(name: string): number | undefined {
+    return this._tools.get(name)?.timeoutMs;
+  }
+
+  /**
+   * Side-effect classification announced for this tool. Missing annotation or an explicit
+   * `false` both mean "treat as a write" — the same secure-by-default rule CONNECT applies, so
+   * a client sees one behaviour regardless of which bridge it talks to.
+   */
+  isReadOnly(name: string): boolean {
+    return this._tools.get(name)?.annotations?.readOnlyHint === true;
+  }
+
+  /**
+   * Tool list for the MCP client. Only the bridge-internal `timeoutMs` hint is stripped —
+   * `annotations` is part of the MCP tool shape and must reach the client, otherwise the two
+   * transports advertise the same tools differently.
+   */
   list(): ToolSchema[] {
-    return [...this._tools.values()];
+    return [...this._tools.values()].map(({ timeoutMs: _timeoutMs, ...rest }) => rest);
   }
 
   get size(): number {

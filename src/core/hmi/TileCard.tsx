@@ -3,27 +3,23 @@
 
 import { useCallback } from 'react';
 import { Paper, Box, Typography, IconButton } from '@mui/material';
-import { Warning, Build, Speed, Sensors, OpenInNew } from '@mui/icons-material';
+import { Warning, Build, Speed, Sensors, OpenInNew, Info, CheckCircle } from '@mui/icons-material';
 import { useViewer } from '../../hooks/use-viewer';
+import { SEVERITY_COLORS, pulseSeverityOutline, type MessageSeverity } from './severity-pulse';
 
 const iconMap: Record<string, React.ReactElement> = {
   warning: <Warning />,
   build: <Build />,
   speed: <Speed />,
   sensors: <Sensors />,
-};
-
-const severityColors: Record<string, string> = {
-  error: '#ef5350',
-  warning: '#ffa726',
-  info: '#4fc3f7',
-  success: '#66bb6a',
+  info: <Info />,
+  success: <CheckCircle />,
 };
 
 export interface TileCardProps {
   title: string;
   subtitle: React.ReactNode;
-  severity: 'error' | 'warning' | 'info' | 'success';
+  severity: MessageSeverity;
   icon: string;
   timestamp: string;
   /** Hierarchy path of the related scene component (enables hover highlight + click focus) */
@@ -39,7 +35,7 @@ export interface TileCardProps {
 }
 
 export function TileCard({ title, subtitle, severity, icon, timestamp, componentPath, onAction, actions }: TileCardProps) {
-  const color = severityColors[severity];
+  const color = SEVERITY_COLORS[severity];
   const viewer = useViewer();
 
   const handleMouseEnter = useCallback(() => {
@@ -56,12 +52,13 @@ export function TileCard({ title, subtitle, severity, icon, timestamp, component
       return;
     }
     if (componentPath) {
-      viewer.focusByPath(componentPath);
-      viewer.highlightByPath(componentPath, true);
+      // Frame the related component and pulse its outline in the severity
+      // color (shared alarm effect — see severity-pulse.ts).
+      pulseSeverityOutline(viewer, componentPath, severity);
       const driveName = componentPath.split('/').pop() ?? componentPath;
       viewer.filterDrives(driveName);
     }
-  }, [viewer, componentPath, onAction]);
+  }, [viewer, componentPath, onAction, severity]);
 
   return (
     <Paper
@@ -95,7 +92,7 @@ export function TileCard({ title, subtitle, severity, icon, timestamp, component
             {timestamp}
           </Typography>
           <Box sx={{ display: 'flex', gap: 0.25 }}>
-            <IconButton size="small" sx={{ p: 0.25 }} onClick={(e) => { e.stopPropagation(); if (componentPath) { viewer.focusByPath(componentPath); viewer.highlightByPath(componentPath, true); } }}>
+            <IconButton size="small" sx={{ p: 0.25 }} onClick={(e) => { e.stopPropagation(); if (componentPath) pulseSeverityOutline(viewer, componentPath, severity); }}>
               <OpenInNew sx={{ fontSize: 14 }} />
             </IconButton>
           </Box>

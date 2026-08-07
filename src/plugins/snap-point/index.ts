@@ -17,6 +17,7 @@ import type { RVViewer } from '../../core/rv-viewer';
 import type { RVViewerPlugin } from '../../core/rv-plugin';
 import type { LoadResult } from '../../core/engine/rv-scene-loader';
 import type { UISlotEntry, UISlotProps } from '../../core/rv-ui-plugin';
+import type { ModeId } from '../../core/rv-mode-manager';
 import type { LayoutPlannerPlugin } from '../layout-planner';
 import { SnapPointRegistry } from '../../core/engine/rv-snap-point-registry';
 import { SnapPointController } from './snap-point-controller';
@@ -45,6 +46,17 @@ const SNAP_APPROACH_RADIUS_M = 5;
 
 export class SnapPointPlugin implements RVViewerPlugin {
   readonly id = 'snap-point';
+
+  /**
+   * Snap points are an AUTHORING affordance (placement, magnets, chain preview)
+   * — excluded from the Viewer workspace (plan-387 F4). Declaring `modes` is
+   * safe here precisely because this plugin's ONLY slot is the overlay below:
+   * it owns no ruleless `button-group` entry, so it cannot trigger the
+   * ButtonPanel regression that `modes` causes for such plugins (see
+   * doc-ui-visibility.md and plan-387 §2.2a/B2). This also takes the runtime
+   * out in the Viewer, which is wanted — nothing there places components.
+   */
+  readonly modes: ModeId[] = ['hmi', 'des', 'planner', 'editor'];
 
   // The popup renders as a full-screen overlay portal
   readonly slots: UISlotEntry[] = [

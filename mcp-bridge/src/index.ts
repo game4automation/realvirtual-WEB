@@ -40,6 +40,7 @@ function getArg(name: string): string | undefined {
   return idx >= 0 ? process.argv[idx + 1] : undefined;
 }
 const port = Number(getArg('--web-port') ?? process.env.RV_WEB_PORT ?? DEFAULT_WEB_PORT);
+const strictPort = process.argv.includes('--strict-web-port');
 
 // ── instructions: read webviewer.mcp.md from disk (NOT a Vite ?raw import) ────
 function loadInstructions(): string {
@@ -56,6 +57,7 @@ function loadInstructions(): string {
 // ── wire up ──────────────────────────────────────────────────────────────────
 const { server, bridge } = createBridgeServer({
   port,
+  strictPort,
   instructions: loadInstructions(),
   logger,
   onShutdownRequested: () => { void shutdown(0); },

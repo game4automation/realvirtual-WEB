@@ -5,6 +5,7 @@ import { describe, it, expect } from 'vitest';
 import { Object3D } from 'three';
 import {
   createBindContext,
+  iterateFixedUpdate,
   type BindContextHost,
   type KinematicsSpec,
 } from '../src/core/behavior-runtime';
@@ -218,18 +219,40 @@ describe('createSelf — state machine + prop', () => {
 });
 
 describe('createSelf — statistics sink (Plan 201)', () => {
-  it('setState books state time into the StateStatistics sink', () => {
+  it('statState books canonical category time into the StateStatistics sink', () => {
     let t = 0;
     const stats = new StateStatistics(() => t, { initialState: 'idle' });
     const root = new Object3D();
     const { host } = makeHost({ root });
     const self = createSelf(ctxFor(host, root), DEF, { statistics: stats });
-    self.setState('Working'); t = 10;
-    self.setState('Empty'); t = 20;
+    self.statState('Working'); t = 10;
+    self.statState('Empty'); t = 20;
     const snap = stats.getSnapshot();
     expect(snap.states['Working'].duration).toBeCloseTo(10);
     expect(snap.states['Empty'].duration).toBeCloseTo(10);
-    expect(self.state).toBe('Empty');
+  });
+
+  it('setState is FSM-only and does NOT pollute the statistics sink', () => {
+    let t = 0;
+    const stats = new StateStatistics(() => t, { initialState: 'idle' });
+    const root = new Object3D();
+    const { host } = makeHost({ root });
+    const self = createSelf(ctxFor(host, root), DEF, { statistics: stats });
+    self.setState('receiving'); t = 10; // FSM phase — must NOT book a stat bucket
+    const snap = stats.getSnapshot();
+    expect(snap.states['receiving']).toBeUndefined();
+    expect(self.state).toBe('receiving'); // FSM state still reflects it
+  });
+
+  it('statState forwards the canonical category to onStatState (DES bridge)', () => {
+    const seen: string[] = [];
+    const root = new Object3D();
+    const { host } = makeHost({ root });
+    const self = createSelf(ctxFor(host, root), DEF, { onStatState: (n) => seen.push(n) });
+    self.statState('Working');
+    self.statState('Working'); // de-duped — no second forward
+    self.statState('Setup');
+    expect(seen).toEqual(['Working', 'Setup']);
   });
 
   it('statOutput / statCycle delegate to the sink', () => {
@@ -252,6 +275,7 @@ describe('createSelf — statistics sink (Plan 201)', () => {
     const self = createSelf(ctxFor(host, root), DEF);
     expect(() => {
       self.setState('Working');
+      self.statState('Working');
       self.statOutput(2);
       self.statCycleStart();
       self.statCycleEnd();
@@ -260,15 +284,73 @@ describe('createSelf — statistics sink (Plan 201)', () => {
   });
 });
 
-describe('createSelf — scheduling is DES-only', () => {
-  it('in/at/cancel dev-throw in continuous mode', () => {
+describe('createSelf — kernel-agnostic scheduling (plan-210 §6b)', () => {
+  it('continuous mode: in/at schedule on the event heap, the fixed tick drains due hooks via onHook', () => {
     const root = new Object3D();
     const { host } = makeHost({ root });
-    const self = createSelf(ctxFor(host, root), DEF, { mode: 'continuous' });
-    expect(() => self.in(1, 'Arrival')).toThrow(/DES-only/);
-    expect(() => self.at(1, 'Arrival')).toThrow(/DES-only/);
-    expect(() => self.cancel(0)).toThrow(/DES-only/);
+    const accum: KinematicsSpec = {};
+    const { ctx, handle } = createBindContext(root, host, accum);
+    const hooks: Array<[string, MU | null, unknown]> = [];
+    const self = createSelf(ctx, DEF, {
+      mode: 'continuous',
+      onHook: (h, mu, data) => hooks.push([h, mu, data]),
+    });
+    const mu: MU = { id: 1 };
+    const id = self.in(0.5, 'Arrival', mu, { x: 1 });
+    self.at(1.0, 'Later');
+    expect(id).toBeGreaterThan(0);
     expect(self.now).toBe(0);
+
+    // 0.4 s: nothing due yet.
+    for (let i = 0; i < 4; i++) iterateFixedUpdate(handle, 0.1);
+    expect(hooks).toEqual([]);
+    expect(self.now).toBeCloseTo(0.4, 9);
+
+    // Cross 0.5 s → 'Arrival' fires with mu + data.
+    iterateFixedUpdate(handle, 0.1);
+    expect(hooks).toEqual([['Arrival', mu, { x: 1 }]]);
+
+    // Cross 1.0 s → the absolute-time event fires too.
+    for (let i = 0; i < 6; i++) iterateFixedUpdate(handle, 0.1);
+    expect(hooks).toHaveLength(2);
+    expect(hooks[1][0]).toBe('Later');
+  });
+
+  it('continuous mode: cancel prevents the hook; now advances with the tick', () => {
+    const root = new Object3D();
+    const { host } = makeHost({ root });
+    const accum: KinematicsSpec = {};
+    const { ctx, handle } = createBindContext(root, host, accum);
+    const hooks: string[] = [];
+    const self = createSelf(ctx, DEF, {
+      mode: 'continuous',
+      onHook: (h) => hooks.push(h),
+    });
+    const id = self.in(0.2, 'Never');
+    self.cancel(id);
+    for (let i = 0; i < 10; i++) iterateFixedUpdate(handle, 0.1);
+    expect(hooks).toEqual([]);
+    expect(self.now).toBeCloseTo(1.0, 9);
+  });
+
+  it('continuous mode without onHook: a due event warns once instead of throwing', () => {
+    const root = new Object3D();
+    const { host } = makeHost({ root });
+    const accum: KinematicsSpec = {};
+    const { ctx, handle } = createBindContext(root, host, accum);
+    const self = createSelf(ctx, DEF, { mode: 'continuous' });
+    const warnings: unknown[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args[0]); };
+    try {
+      self.in(0.1, 'Unwired');
+      self.in(0.2, 'Unwired2');
+      for (let i = 0; i < 5; i++) iterateFixedUpdate(handle, 0.1);
+    } finally {
+      console.warn = origWarn;
+    }
+    expect(warnings).toHaveLength(1); // warned ONCE, not per event
+    expect(String(warnings[0])).toMatch(/no onHook dispatcher/);
   });
 
   it('delegates to an injected scheduler in DES mode', () => {

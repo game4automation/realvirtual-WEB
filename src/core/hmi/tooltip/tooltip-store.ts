@@ -102,6 +102,9 @@ export class TooltipStore {
   /** Cursor positions for each tooltip (ref-based, not in snapshot). */
   private cursorPositions = new Map<string, { x: number; y: number }>();
 
+  /** Active hover-suppression tokens — while non-empty, hover tooltips are hidden. */
+  private hoverSuppressors = new Set<string>();
+
   // ── useSyncExternalStore interface ──
 
   private _listeners = new Set<() => void>();
@@ -170,6 +173,25 @@ export class TooltipStore {
   }
 
   /**
+   * Globally suppress all hover-lifecycle tooltips while `token` is held;
+   * pinned tooltips stay visible. The drag stores (signal drag, node-link
+   * drag) hold a token for the duration of a drag so no hover bubble can
+   * overlap a drop target. Idempotent per token; entries keep updating
+   * underneath and re-resolve on the last release.
+   */
+  suppressHover(token: string): void {
+    if (this.hoverSuppressors.has(token)) return;
+    this.hoverSuppressors.add(token);
+    this.notify();
+  }
+
+  /** Release a hover-suppression token (see {@link suppressHover}). */
+  releaseHover(token: string): void {
+    if (!this.hoverSuppressors.delete(token)) return;
+    this.notify();
+  }
+
+  /**
    * Register a model-cleared handler on the viewer to auto-clear all tooltips.
    * Prevents stale Object3D references after scene reload.
    */
@@ -203,13 +225,15 @@ export class TooltipStore {
   private resolveVisible(): VisibleTooltip[] {
     if (this.entries.size === 0) return [];
 
-    // 1. Bucket by lifecycle
+    // 1. Bucket by lifecycle. While a suppression token is held (drag in
+    //    progress), hover entries are dropped here — pinned ones pass through.
+    const hoverSuppressed = this.hoverSuppressors.size > 0;
     const hovers: TooltipEntry[] = [];
     const pinned: TooltipEntry[] = [];
     for (const entry of this.entries.values()) {
       if ((entry.lifecycle ?? 'hover') === 'pinned') {
         pinned.push(entry);
-      } else {
+      } else if (!hoverSuppressed) {
         hovers.push(entry);
       }
     }

@@ -4,7 +4,7 @@
 import type { Object3D } from 'three';
 import { RVDrive, type IDriveBehavior } from './rv-drive';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponentSchema } from './rv-component-registry';
+import { registerComponentSchema, loadSchemaFromSpec } from './rv-component-registry';
 import { NodeRegistry } from './rv-node-registry';
 import type { SignalStore } from './rv-signal-store';
 import { debug } from './rv-debug';
@@ -24,13 +24,8 @@ import { debug } from './rv-debug';
  * Implements RVComponent — wired via schema + init() like all other components.
  */
 export class RVErraticDriver implements IDriveBehavior, RVComponent {
-  static readonly schema: ComponentSchema = {
-    MinPos: { type: 'number', default: 0 },
-    MaxPos: { type: 'number', default: 100 },
-    Speed: { type: 'number', default: 100 },
-    IterateBetweenMaxAndMin: { type: 'boolean', default: false },
-    SignalEnable: { type: 'componentRef' },
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('Drive_ErraticPosition');
 
   readonly node: Object3D;
   isOwner = true;

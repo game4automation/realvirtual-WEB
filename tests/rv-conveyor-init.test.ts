@@ -127,12 +127,12 @@ describe('Conveyor init flow (Drive_Simple → signal → TransportSurface)', ()
     expect(drive.jogForward).toBe(true);
   });
 
-  it('should auto-start when signal is false (fallback)', () => {
+  it('does not invent a jog command when the Drive_Simple signal is false', () => {
     const { drive } = simulateConveyorLoading({ signalValue: false });
 
-    // Auto-start in TransportSurface.init() should set jogForward=true
-    // even when signal is false
-    expect(drive.jogForward).toBe(true);
+    // TransportSurface consumes drive speed; it does not own the drive command.
+    expect(drive.jogForward).toBe(false);
+    expect(drive.jogBackward).toBe(false);
   });
 
   it('should have non-zero currentSpeed after first drive update', () => {

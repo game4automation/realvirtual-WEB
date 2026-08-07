@@ -17,7 +17,7 @@
  * duplicate suffix). Patterns support `*` (any chars), `?` (one char), and
  * the wildcard `'*'` (applies to every loaded model).
  *
- * Lifecycle: on every `model-loaded` event the manager (1) invokes behaviors
+ * Lifecycle: on every `model-logic-activated` event the manager (1) invokes behaviors
  * matching the loaded GLB filename, scoped to the scene root, and (2) scans the
  * scene for placed LayoutObjects and dispatches behaviors matching each one,
  * scoped to that object's subtree. The layout planner also calls
@@ -39,6 +39,7 @@ import {
   type KinematizeReport,
 } from './behavior-runtime';
 import { instanceScope } from './engine/rv-instance-scope';
+import { NodeRegistry } from './engine/rv-node-registry';
 // Glob matcher lives in its own dependency-free module (cycle break — see the
 // re-export note below). Imported here for this module's own internal use.
 import { matchesAny, extractGlbName } from './glob-match';
@@ -132,7 +133,7 @@ export class BehaviorManager {
   }
 
   /**
-   * Attach to a viewer-like host: subscribe to model-loaded/model-cleared
+   * Attach to a viewer-like host: subscribe to model-logic-activated/model-cleared
    * and forward fixed-update ticks to active bind contexts.
    *
    * Returns a dispose function that detaches all listeners.
@@ -148,7 +149,7 @@ export class BehaviorManager {
       for (const a of this.active) iterateFixedUpdate(a.handle, dt);
     };
 
-    this.modelLoadedOff = host.on('model-loaded', () => {
+    this.modelLoadedOff = host.on('model-logic-activated', () => {
       const root = getCurrentRoot();
       if (!root) return;
       this.disposeAll();
@@ -236,6 +237,8 @@ export class BehaviorManager {
     const store = this.host?.signalStore;
     if (!store) { console.warn(`[behaviors] registerBehaviorSignals: no signalStore on host — ${accum.signals?.length ?? 0} behavior signal(s) DROPPED`); return null; }
     if (!accum.signals || accum.signals.length === 0) return null;
+    const seedWriter = store.createWriter?.('behavior:signal-registration', 'behavior');
+    const writeSeed = seedWriter?.set.bind(seedWriter) ?? store.set.bind(store);
 
     // Materialise hierarchy nodes only when the registry exposes the write
     // surface. Test / minimal hosts (registry: null) skip it gracefully and fall
@@ -250,6 +253,16 @@ export class BehaviorManager {
     // `/`-separated (the technical hierarchy address, not the symbol).
     const scope = instanceScope(root);
 
+    // Register under the node's REAL scene path (parent chain included), not the
+    // bare scope name. A placed LayoutObject lives under the model root
+    // (`<modelRoot>/Turntable_2`), so a scope-only path (`Turntable_2/Signals/…`)
+    // diverges from the physical `Signals` container — the hierarchy then shows
+    // every signal TWICE (a phantom root branch with values + the real subtree
+    // without), and the real nodes' badges read no live value. Detached roots
+    // (no parent yet, e.g. tests / pre-attach binds) fall back to the root name.
+    const rootPath = reg?.getPathForNode?.(root)
+      ?? (NodeRegistry.computeNodePath(root) || root.name);
+
     // One render-free `Signals` container per root (idempotent), created lazily
     // on the first materialised signal — mirrors the GLB `Signals` group.
     let container: Object3D | null = null;
@@ -263,7 +276,7 @@ export class BehaviorManager {
         const local = scope && sig.name.startsWith(`${scope}.`) ? sig.name.slice(scope.length + 1) : sig.name;
         const seed = store.get(sig.name) ?? sig.initialValue ?? (sig.type.includes('Bool') ? false : 0);
         container ??= this.getOrCreateSignalsContainer(root);
-        const path = scope ? `${scope}/${SIGNALS_CONTAINER_NAME}/${local}` : `${SIGNALS_CONTAINER_NAME}/${local}`;
+        const path = rootPath ? `${rootPath}/${SIGNALS_CONTAINER_NAME}/${local}` : `${SIGNALS_CONTAINER_NAME}/${local}`;
         // Idempotent per container — a re-bind must not append a duplicate node.
         let node = container.children.find((n) => n.name === local) ?? null;
         if (!node) {
@@ -286,7 +299,7 @@ export class BehaviorManager {
         if (sig.initialValue === undefined) continue;
         if (store.get(sig.name) !== undefined) continue;
         if (store.register) store.register(sig.name, sig.name, sig.initialValue, sig.type);
-        else store.set(sig.name, sig.initialValue);
+        else writeSeed(sig.name, sig.initialValue);
         registered++;
       }
     }
@@ -300,13 +313,21 @@ export class BehaviorManager {
     return container;
   }
 
-  /** Find-or-create the render-free `Signals` container under `root` (mirrors
-   *  the GLB `Signals` group; marked with `_rvSignals` so it stays unique). */
+  /** Find-or-create the render-free `Signals` container under `root`.
+   *
+   *  Reuses ANY existing `Signals` child — whether GLB-native (no marker, created
+   *  by `processExtras` from the exported asset) OR behavior-created (`_rvSignals`).
+   *  Without this, a GLB that already ships a `Signals` group would get a SECOND,
+   *  separate behavior container → the same signals appear twice in the hierarchy
+   *  (the GLB one without live values, the behavior one with). Merging into the
+   *  existing node keeps signals in ONE place under the component, with values. */
   private getOrCreateSignalsContainer(root: Object3D): Object3D {
-    const existing = root.children.find(
-      (c) => c.name === SIGNALS_CONTAINER_NAME && (c.userData as Record<string, unknown>)?._rvSignals === true,
-    );
-    if (existing) return existing;
+    const existing = root.children.find((c) => c.name === SIGNALS_CONTAINER_NAME);
+    if (existing) {
+      // Stamp the marker so the merged node renders consistently as a signals group.
+      (existing.userData as Record<string, unknown>)._rvSignals = true;
+      return existing;
+    }
     const container = new Object3D();
     container.name = SIGNALS_CONTAINER_NAME;
     (container.userData as Record<string, unknown>)._rvSignals = true;

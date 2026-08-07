@@ -6,13 +6,17 @@ import { createTestViewer } from './helpers/test-viewer';
 import { SimControllerPlugin, SIM_CONTROLLER_PAUSE_REASON } from '../src/plugins/sim-controller';
 
 describe('SimControllerPlugin — lifecycle', () => {
-  test('registers the leading toolbar-button slot (sim controls)', () => {
+  test('registers the leading toolbar-button slot and the mode-switch overlay', () => {
     const plugin = new SimControllerPlugin();
     // plan-198: the old Realtime/DES execution toggle (SimModeToggle) was removed
-    // from the toolbar (DES is now a workspace mode), so only the Play/Pause +
-    // Reset controls slot remains.
-    expect(plugin.slots.length).toBe(1);
-    expect(plugin.slots.every(s => s.slot === 'toolbar-button-leading')).toBe(true);
+    // from the toolbar (DES is now a workspace mode). What remains:
+    //   • 'toolbar-button-leading' — Play/Pause + Reset + Speed controls
+    //     (hidden in DES/HMI modes via a visibility rule, plan-194)
+    //   • 'overlay' — ModeSwitchNotice, always mounted, warns that switching
+    //     workspace clears MUs.
+    expect(plugin.slots.length).toBe(2);
+    expect(plugin.slots.some(s => s.slot === 'toolbar-button-leading')).toBe(true);
+    expect(plugin.slots.some(s => s.slot === 'overlay')).toBe(true);
   });
 
   test('exposes a stable plugin id', () => {

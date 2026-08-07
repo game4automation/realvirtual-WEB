@@ -21,6 +21,10 @@ import type { UISlotEntry, UISlotProps } from '../core/rv-ui-plugin';
 import type { RVViewer } from '../core/rv-viewer';
 import type { ErrorEntry } from '../core/engine/rv-error-store';
 import { TileCard } from '../core/hmi/TileCard';
+import { pulseSeverityOutline } from '../core/hmi/severity-pulse';
+import { collectNodeAiContext } from '../core/hmi/search-ai-context';
+import { AskAiButton } from '../core/hmi/AskAiButton';
+import { useSearchDiagnosisAvailable } from './diagnose/search-diagnose-registry';
 
 // ─── Constants (inline, glanceable) ─────────────────────────────────────
 
@@ -51,17 +55,36 @@ function useActiveErrors(viewer: RVViewer): ErrorEntry[] {
   );
 }
 
+function AskAiAction({ viewer, error }: { viewer: RVViewer; error: ErrorEntry }) {
+  const handleClick = () => {
+    const context = collectNodeAiContext(viewer, error.path);
+    viewer.emit('diagnose-request', {
+      nodePath: error.path,
+      label: error.text || 'Error',
+      source: 'web-error',
+      ...(context?.docHints?.length ? { docHints: context.docHints } : {}),
+      ...(context?.machineContext ? { machineContext: context.machineContext } : {}),
+    });
+  };
+
+  return (
+    <AskAiButton onClick={handleClick} />
+  );
+}
+
 // ─── Panel ──────────────────────────────────────────────────────────────
 
 export function WebErrorPanel({ viewer }: UISlotProps) {
   const errors = useActiveErrors(viewer);
+  const aiAvailable = useSearchDiagnosisAvailable();
   const [hovered, setHovered] = useState(false);
 
   if (errors.length === 0) return null;
 
+  // Frame the faulting part and pulse its outline in the severity color
+  // (same alarm effect as the Toray showcase, generalized in severity-pulse).
   const focusError = (path: string) => {
-    viewer.focusByPath(path);
-    viewer.highlightByPath(path, true);
+    pulseSeverityOutline(viewer, path, 'error');
   };
 
   // Single error → render the plain card (no stack chrome).
@@ -75,7 +98,9 @@ export function WebErrorPanel({ viewer }: UISlotProps) {
           severity="error"
           icon="warning"
           timestamp={formatSince(e.since)}
+          componentPath={e.path}
           onAction={() => focusError(e.path)}
+          actions={aiAvailable ? <AskAiAction viewer={viewer} error={e} /> : undefined}
         />
       </Box>
     );
@@ -139,6 +164,7 @@ export function WebErrorPanel({ viewer }: UISlotProps) {
               icon="warning"
               timestamp={formatSince(e.since)}
               onAction={() => focusError(e.path)}
+              actions={aiAvailable ? <AskAiAction viewer={viewer} error={e} /> : undefined}
             />
           </Box>
         ))}

@@ -6,8 +6,8 @@
  * category fallback, and the matching entry filter.
  */
 import { describe, test, expect } from 'vitest';
-import { deriveChips, filterByChip } from '../src/plugins/layout-planner/library-chips';
-import type { LibraryCatalogEntry } from '../src/plugins/layout-planner/rv-layout-store';
+import { deriveChips, filterByChip } from '../src/core/library/library-chips';
+import type { LibraryCatalogEntry } from '../src/core/library/library-types';
 
 function entry(
   id: string,

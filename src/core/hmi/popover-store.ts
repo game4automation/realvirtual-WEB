@@ -24,6 +24,9 @@ export interface PopoverRequest {
   getWorld: () => [number, number, number];
   /** Screen-space offset from the projected anchor (px). Default { x: 20, y: -10 }. */
   offset?: { x: number; y: number };
+  /** Optional title — when set, the drag titlebar shows it + a close button
+   *  (compact window), so the content can omit its own header. */
+  title?: string;
   /** Called when the popover is dismissed (Escape / close / replaced). */
   onClose?: () => void;
 }

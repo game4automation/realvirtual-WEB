@@ -15,8 +15,24 @@ import type { ModelOptionDef } from '../model-option-plugin';
 /** Base GLB (filename without .glb) these options apply to. */
 export const baseModel = 'DemoRealvirtualWeb';
 
-/** Selectable supplier variants. Behaviour lives in index.ts `applyModelOption`. */
-export const modelOptions: ModelOptionDef[] = [
+/**
+ * Selector entries — intentionally EMPTY (plan-373 F5).
+ *
+ * The two supplier variants are the same GLB with a different AAS mapping, so
+ * three near-identical rows in the model list were more confusing than useful.
+ * The generic expander in main.ts skips a module with no options, which is all
+ * it takes to drop them from every model selection.
+ */
+export const modelOptions: ModelOptionDef[] = [];
+
+/**
+ * Deep-link-only variants: unreachable from the UI, still reachable — and
+ * shareable and reload-stable — via `?option=<id>`. Behaviour lives in index.ts
+ * `applyModelOption`; this list is what tells the URL contract which option ids
+ * this base model actually understands (so a foreign one gets dropped instead of
+ * leaking on to the next model).
+ */
+export const deepLinkOptions: ModelOptionDef[] = [
   { id: 'bosch', label: 'Bosch' },
   { id: 'sew', label: 'SEW' },
 ];

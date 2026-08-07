@@ -144,9 +144,9 @@ export function MobileSelectionSheet() {
         </Box>
       )}
 
-      {/* Inspector content (embedded — no panel chrome) */}
+      {/* Inspector content */}
       <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        <PropertyInspector viewer={viewer} embedded />
+        <PropertyInspector viewer={viewer} />
       </Box>
     </Paper>
   );

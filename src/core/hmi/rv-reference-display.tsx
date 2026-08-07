@@ -29,6 +29,7 @@ import {
   getRefSignalColor,
   getSensorRefColor,
 } from './rv-inspector-helpers';
+import { SignalBadge, type SignalDirection } from './rv-signal-badge';
 
 // ── navigateToRef ────────────────────────────────────────────────────────
 
@@ -55,8 +56,28 @@ export function ReferenceDisplay({ value, viewer, signalStore }: {
 
   const handleClick = useCallback(() => navigateToRef(viewer, value.path), [viewer, value.path]);
 
-  // Signal references -> single combined badge with live value, gray when off
+  // Signal references -> the unified interactive SignalBadge (plan-246): same
+  // hover tooltip (with click-to-navigate on the title), click-to-force,
+  // Shift+Drag linking and global chip variant as every other signal chip.
+  // Falls back to the legacy static chip only when the store name can't be
+  // resolved (e.g. signal not registered) or no viewer is available.
   if (isSignalRefType(value.componentType)) {
+    const signalName = signalStore?.nameForPath(value.path) ?? undefined;
+    if (viewer && signalName) {
+      const direction: SignalDirection = shortType.startsWith('PLCOutput') ? 'output'
+        : shortType.startsWith('PLCInput') ? 'input' : 'unknown';
+      return (
+        <SignalBadge
+          viewer={viewer}
+          signalName={signalName}
+          displayName={shortName}
+          direction={direction}
+          plcType={shortType}
+        />
+      );
+    }
+
+    // Fallback: legacy static chip (navigate-on-click) when the store name is unresolved.
     const liveColor = isLinked ? getRefSignalColor(shortType, signalStore, value.path) : '#ef5350';
     const typeLabel = signalTypeLabel(shortType);
     const valueStr = formatRefSignalValue(shortType, signalStore, value.path);

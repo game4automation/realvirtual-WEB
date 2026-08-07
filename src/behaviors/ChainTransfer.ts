@@ -60,6 +60,19 @@ type State =
   | 'discharging'
   | 'lowering';
 
+// Map the internal FSM phase to a CANONICAL utilization category (Plan 201): the
+// part is engaged / riding across the transfer → Working; the lift lowers back
+// EMPTY after discharge → Setup; it holds a part it cannot dispatch → Blocked;
+// nothing on it → Empty. Reported via self.statState (both modes, de-duped).
+function chainCat(s: State): string {
+  switch (s) {
+    case 'idle': return 'Empty';
+    case 'holding': return 'Blocked';
+    case 'lowering': return 'Setup';
+    default: return 'Working'; // engage_in / receiving / engage_out / discharging
+  }
+}
+
 type Axis = 'X' | 'Z';
 
 interface ChainTransferLocal {
@@ -225,6 +238,7 @@ const setState = (self: ChainTransferSelf, next: State): void => {
   if (next !== self.local.state) dbg(self, `${self.local.state} → ${next}`);
   self.local.state = next;
   self.setState(next);
+  self.statState(chainCat(next)); // utilization category (both modes, de-duped)
 };
 
 /**
@@ -407,6 +421,7 @@ const def = {
 
     self.sig.Run.set(true);
     self.setState('idle');
+    self.statState('Empty'); // reset baseline (both modes)
     self.stamp('ChainTransferBehavior', {
       TransportZ: l.zNode.name, TransportX: l.xNode.name,
       Lift: l.liftNode.name, Sensor: l.sensorNode.name,
@@ -441,8 +456,7 @@ const def = {
         self.signals.set(portOccupiedSignal(sp.id), true);
       }
 
-      self.signals.on(l.sensorNode!.name, (v) => {
-        const present = v === true;
+      self.onSensorChanged(l.sensorNode!, (present) => {
         if (present && !l.sensorOccupied) self.sig.PartCount.set(++l.partCount);
         l.sensorOccupied = present;
         if (present && l.state === 'receiving') onPartAtCenter(self);
@@ -531,6 +545,10 @@ const def = {
   // FREE output (a blocked Z output naturally overflows onto the branch). The
   // rich receive→route lift sequence is continuous-first.
   des: {
+    // onAccept samples the MU's LIVE position for its transit tween endpoints
+    // (transit-timing leadingEdge) — keep the per-event-time tween settle
+    // active while a chain-transfer instance exists (plan-262 Phase 2).
+    samplesLiveGeometry: true,
     onAccept(self: ChainTransferSelf, mu: RV.MU): boolean {
       const l = self.local;
       l.transitMUs.set(mu.id, self.in(l.timer!.transitTime, 'Arrival', mu, l.timer!.tween(mu)));

@@ -1,0 +1,180 @@
+{
+  "name": "Conveyor + MUs + sensors",
+  "source": "public/models/DemoRealvirtualWeb.glb",
+  "output": "public/embed/vignettes/conveyor-sensor.glb",
+  "budgetBytes": 3145728,
+  "selection": [
+    "DemoCell/Conveyors",
+    "DemoCell/Sensors",
+    "DemoCell/Sink",
+    "DemoCell/Turbine",
+    "DemoCell/MUs",
+    "DemoCell/PLCInterface/--- Entry and Exit Conveyor  ----/EntryConveyorStart",
+    "DemoCell/PLCInterface/--- Entry and Exit Conveyor  ----/ExitConveyorStart",
+    "DemoCell/PLCInterface/--- Entry and Exit Conveyor  ----/EntryConveyorSensor",
+    "DemoCell/PLCInterface/--- Entry and Exit Conveyor  ----/ExitConveyorSensor"
+  ],
+  "metadataNode": "DemoCell",
+  "componentOverrides": {
+    "DemoCell/Conveyors/ConveyorEntry1": {
+      "Drive": {
+        "JogForward": true,
+        "TargetSpeed": 650
+      }
+    },
+    "DemoCell/Conveyors/ConveyorEntry2": {
+      "Drive": {
+        "JogForward": true,
+        "TargetSpeed": 650
+      }
+    },
+    "DemoCell/Conveyors/ConveyorExit1": {
+      "Drive": {
+        "JogForward": true,
+        "TargetSpeed": 650
+      }
+    },
+    "DemoCell/Conveyors/ConveyorExit2": {
+      "Drive": {
+        "JogForward": true,
+        "TargetSpeed": 650
+      }
+    },
+    "DemoCell/Turbine": {
+      "Source": {
+        "AutomaticGeneration": true,
+        "Interval": 1,
+        "GenerateIfDistance": 800
+      }
+    },
+    "DemoCell/PLCInterface/--- Entry and Exit Conveyor  ----/EntryConveyorStart": {
+      "PLCOutputBool": {
+        "Status": {
+          "Connected": false,
+          "ValueOverride": false,
+          "Value": true,
+          "OldValue": true
+        }
+      }
+    },
+    "DemoCell/PLCInterface/--- Entry and Exit Conveyor  ----/ExitConveyorStart": {
+      "PLCOutputBool": {
+        "Status": {
+          "Connected": false,
+          "ValueOverride": false,
+          "Value": true,
+          "OldValue": true
+        }
+      }
+    },
+    "DemoCell/PLCInterface/--- Entry and Exit Conveyor  ----/EntryConveyorSensor": {
+      "PLCInputBool": {
+        "Status": {
+          "Connected": false,
+          "ValueOverride": false,
+          "Value": false,
+          "OldValue": false
+        }
+      }
+    },
+    "DemoCell/PLCInterface/--- Entry and Exit Conveyor  ----/ExitConveyorSensor": {
+      "PLCInputBool": {
+        "Status": {
+          "Connected": false,
+          "ValueOverride": false,
+          "Value": false,
+          "OldValue": false
+        }
+      }
+    }
+  },
+  "rvExtras": {
+    "StartCameraPosition": {
+      "_fullTypeName": "realvirtual.StartCameraPosition",
+      "_version": 2,
+      "_enabled": true,
+      "Name": "conveyor-overview",
+      "Position": [
+        6.5,
+        3.45,
+        1.8
+      ],
+      "Target": [
+        2.2,
+        0.35,
+        0.1
+      ]
+    },
+    "StandaloneBehavior": {
+      "_fullTypeName": "realvirtual.StandaloneBehavior",
+      "_version": 1,
+      "_enabled": true,
+      "Mode": "Autonomous",
+      "Source": "DemoCell/Turbine",
+      "Drives": [
+        "DemoCell/Conveyors/ConveyorEntry1",
+        "DemoCell/Conveyors/ConveyorEntry2",
+        "DemoCell/Conveyors/ConveyorExit1",
+        "DemoCell/Conveyors/ConveyorExit2"
+      ],
+      "Sensors": [
+        "DemoCell/Sensors/EntrySensor",
+        "DemoCell/Sensors/ExitSensor"
+      ],
+      "Description": "Source generates MUs at one-second intervals; all conveyor drives jog forward and sensors write local signals without PLC or CONNECT."
+    },
+    "Director": {
+      "Scripts": {
+        "conveyor-loop": {
+          "steps": [
+            {
+              "camera": {
+                "focus": "DemoCell",
+                "padding": 1.08
+              },
+              "duration": 1400
+            },
+            {
+              "wait": 1200
+            },
+            {
+              "ghostCursor": {
+                "moveTo": "DemoCell/Sensors/EntrySensor",
+                "duration": 900,
+                "visible": true
+              }
+            },
+            {
+              "contextMenu": {
+                "at": "DemoCell/Sensors/EntrySensor",
+                "items": [
+                  "EntryConveyorSensor"
+                ]
+              }
+            },
+            {
+              "wait": 2600
+            },
+            {
+              "contextMenu": {
+                "open": false
+              }
+            },
+            {
+              "wait": 1000
+            }
+          ],
+          "loop": true
+        }
+      }
+    }
+  },
+  "compression": {
+    "geometry": "draco",
+    "encodeSpeed": 5,
+    "decodeSpeed": 5,
+    "quantizePosition": 14,
+    "textures": "keep",
+    "textureDecision": "The cropped conveyor materials already fit the 3 MiB transmission budget; KTX2 would add a second decoder runtime without a meaningful budget benefit for this vignette."
+  }
+}

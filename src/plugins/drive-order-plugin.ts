@@ -13,6 +13,7 @@ import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { RVViewer } from '../core/rv-viewer';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import type { RVDrive } from '../core/engine/rv-drive';
+import { NodeRegistry } from '../core/engine/rv-node-registry';
 
 export class DriveOrderPlugin implements RVViewerPlugin {
   readonly id = 'drive-order';
@@ -22,75 +23,91 @@ export class DriveOrderPlugin implements RVViewerPlugin {
 
   onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
     const sorted = this.topologicalSort(viewer.drives);
+    // `topologicalSort` returns the SAME array instance when there is nothing to
+    // reorder (no CAM/Gear dependencies). `sorted` would then alias viewer.drives,
+    // so `length = 0` empties BOTH and the push re-adds nothing — silently wiping
+    // every drive from the simulation (they stop ticking, jog does nothing).
+    // Identity-check before the destructive in-place rewrite.
+    if (sorted === viewer.drives) return;
     viewer.drives.length = 0;
     viewer.drives.push(...sorted);
   }
 
   private topologicalSort(drives: RVDrive[]): RVDrive[] {
-    // Build dependency graph: drivePath -> [dependsOnPaths...]
-    const driveByPath = new Map<string, RVDrive>();
-    const deps = new Map<string, string[]>();
-
+    // Index drives by full node path and by name for master-ref resolution.
+    const byPath = new Map<string, RVDrive>();
+    const byName = new Map<string, RVDrive[]>();
     for (const d of drives) {
-      const path = (d.node.userData?.rv as Record<string, unknown> | undefined)?.['path'] as string
-        ?? d.name;
-      driveByPath.set(path, d);
+      byPath.set(NodeRegistry.computeNodePath(d.node), d);
+      const list = byName.get(d.name) ?? [];
+      list.push(d);
+      byName.set(d.name, list);
+    }
 
-      const camExtras = d.BehaviorExtras['Drive_CAM'];
-      const gearExtras = d.BehaviorExtras['Drive_Gear'];
-      const masterRefs: string[] = [];
-      if (camExtras?.['MasterDrive']) masterRefs.push(camExtras['MasterDrive'] as string);
-      if (gearExtras?.['MasterDrive']) masterRefs.push(gearExtras['MasterDrive'] as string);
-      if (masterRefs.length > 0) deps.set(path, masterRefs);
+    // MasterDrive in the behavior extras is a raw ComponentReference object
+    // ({ type, path, componentType }); older callers may hand us a bare string.
+    const extractPath = (ref: unknown): string | null => {
+      if (!ref) return null;
+      if (typeof ref === 'string') return ref;
+      const p = (ref as { path?: string }).path;
+      return typeof p === 'string' ? p : null;
+    };
+    const resolveMaster = (refPath: string): RVDrive | null => {
+      const exact = byPath.get(refPath);
+      if (exact) return exact;
+      // Fallback: match by node name (last path segment). Robust to kinematic
+      // re-parenting, which rewrites the path prefix but not the drive node name.
+      // Only accept an unambiguous single match.
+      const name = refPath.split('/').pop() ?? refPath;
+      const named = byName.get(name);
+      return named && named.length === 1 ? named[0] : null;
+    };
+
+    // Build dependency edges (slave → its masters) as RVDrive references, so the
+    // sort never relies on fragile string-key equality.
+    const masters = new Map<RVDrive, RVDrive[]>();
+    let hasDeps = false;
+    for (const d of drives) {
+      const refs: RVDrive[] = [];
+      for (const key of ['Drive_CAM', 'Drive_Gear']) {
+        const refPath = extractPath(d.BehaviorExtras[key]?.['MasterDrive']);
+        if (!refPath) continue;
+        const m = resolveMaster(refPath);
+        if (m && m !== d && !refs.includes(m)) refs.push(m);
+      }
+      if (refs.length > 0) { masters.set(d, refs); hasDeps = true; }
     }
 
     // No dependencies? Return as-is (no sorting needed)
-    if (deps.size === 0) return drives;
+    if (!hasDeps) return drives;
 
-    // Kahn's algorithm for topological sort
-    const inDegree = new Map<string, number>();
-    for (const [, d] of driveByPath) {
-      const p = (d.node.userData?.rv as Record<string, unknown> | undefined)?.['path'] as string ?? d.name;
-      inDegree.set(p, 0);
-    }
-    for (const [path, masters] of deps) {
-      let degree = 0;
-      for (const m of masters) {
-        if (driveByPath.has(m)) degree++;
-      }
-      inDegree.set(path, degree);
-    }
-
-    const queue: string[] = [];
-    for (const [path, deg] of inDegree) {
-      if (deg === 0) queue.push(path);
-    }
+    // Kahn's algorithm over RVDrive nodes. Seeding the queue from `drives` (input
+    // order) keeps the sort stable for independent drives.
+    const inDegree = new Map<RVDrive, number>();
+    for (const d of drives) inDegree.set(d, masters.get(d)?.length ?? 0);
 
     const result: RVDrive[] = [];
-    const visited = new Set<string>();
+    const visited = new Set<RVDrive>();
+    const queue: RVDrive[] = drives.filter(d => (inDegree.get(d) ?? 0) === 0);
 
     while (queue.length > 0) {
-      const path = queue.shift()!;
-      if (visited.has(path)) continue;
-      visited.add(path);
-      const drive = driveByPath.get(path);
-      if (drive) result.push(drive);
+      const d = queue.shift()!;
+      if (visited.has(d)) continue;
+      visited.add(d);
+      result.push(d);
 
-      // Find drives that depend on this one and decrement their in-degree
-      for (const [depPath, masters] of deps) {
-        if (masters.includes(path) && !visited.has(depPath)) {
-          const newDeg = (inDegree.get(depPath) ?? 0) - 1;
-          inDegree.set(depPath, newDeg);
-          if (newDeg <= 0) queue.push(depPath);
+      // Any slave whose master is d loses one in-degree.
+      for (const [slave, ms] of masters) {
+        if (!visited.has(slave) && ms.includes(d)) {
+          const nd = (inDegree.get(slave) ?? 0) - 1;
+          inDegree.set(slave, nd);
+          if (nd <= 0) queue.push(slave);
         }
       }
     }
 
-    // Add any drives not in the graph (shouldn't happen, but be safe)
-    for (const d of drives) {
-      const p = (d.node.userData?.rv as Record<string, unknown> | undefined)?.['path'] as string ?? d.name;
-      if (!visited.has(p)) result.push(d);
-    }
+    // Append any leftovers (cycles / unresolved masters), preserving input order.
+    for (const d of drives) if (!visited.has(d)) result.push(d);
 
     return result;
   }

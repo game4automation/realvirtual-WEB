@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-label="Conveyor sensor vignette poster">
+  <rect width="1200" height="720" fill="#151a1f"/>
+  <g fill="none" stroke="#33414b" stroke-width="8">
+    <path d="M120 420h960"/>
+    <path d="M180 420v130m840-130v130"/>
+  </g>
+  <g fill="#26333c" stroke="#4fc3f7" stroke-width="4">
+    <rect x="180" y="340" width="190" height="76" rx="4"/>
+    <rect x="505" y="340" width="190" height="76" rx="4"/>
+    <rect x="830" y="340" width="190" height="76" rx="4"/>
+  </g>
+  <g fill="#4fc3f7">
+    <circle cx="600" cy="240" r="16"/>
+    <path d="M590 264h20v64h-20z"/>
+  </g>
+  <text x="600" y="625" fill="#9ba9b4" font-family="Inter,Arial,sans-serif" font-size="28" text-anchor="middle">realvirtual conveyor · loading live simulation</text>
+</svg>

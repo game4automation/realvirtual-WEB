@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Box, IconButton, Tooltip } from '@mui/material';
 import { ChevronRight, ChevronLeft } from '@mui/icons-material';
 import { useViewer } from '../../hooks/use-viewer';
@@ -15,13 +15,27 @@ import {
   toggleMessagePanelMinimized,
 } from './message-panel-store';
 import { MaintenancePanel } from './MaintenancePanel';
+import { useOverlayVisible } from '../../hooks/use-overlay-visible';
+import { registerOverlayProducer, unregisterOverlayProducer } from '../overlay-visibility-store';
+import { useActiveContexts, evaluateVisibilityRule } from './ui-context-store';
 
 /** Core layout container for messages (right side). Renders 'messages' slot entries.
  *  When maintenance mode is active, swaps to the MaintenancePanel stepper.
  *  Desktop supports a minimized peek mode that expands individual cards on hover. */
 export function MessagePanel() {
   const viewer = useViewer();
-  const entries = useSlot('messages');
+  // Honour `visibilityRule` exactly as ActivityBar and ButtonPanel do. Entries
+  // WITHOUT a rule stay always-visible (the documented UISlotEntry invariant);
+  // mode-gated ones (the UI registry injects `shownOnlyInAny: ['mode:<id>']`
+  // for any plugin declaring `modes`) must not count towards the panel's
+  // content check, or a planner-only tile would keep the whole message column
+  // — minimize chevron and 'status' overlay presence included — alive in every
+  // other mode while rendering nothing.
+  const contexts = useActiveContexts();
+  const allEntries = useSlot('messages');
+  const entries = allEntries.filter(
+    (e) => !e.visibilityRule || evaluateVisibilityRule(e.visibilityRule, contexts),
+  );
   const isMobile = useMobileLayout();
   const [expandedIdx, setExpandedIdx] = useState(-1);
   const [hoveredIdx, setHoveredIdx] = useState(-1);
@@ -31,6 +45,19 @@ export function MessagePanel() {
   const topOffset = useViewportInsets().top;
 
   const isMaintenanceActive = maintenanceState.mode !== 'idle';
+
+  // Overlay-visibility (plan-250): the right-side message/alarm stack is part of
+  // the 'status' category. Content-driven presence (register only while there is
+  // something to show), registered BEFORE the visibility gate.
+  const catVisible = useOverlayVisible('status');
+  const hasStatusContent = isMaintenanceActive || (messagePanelOpen && entries.length > 0);
+  useEffect(() => {
+    if (!hasStatusContent) return;
+    registerOverlayProducer('status');
+    return () => unregisterOverlayProducer('status');
+  }, [hasStatusContent]);
+
+  if (!catVisible) return null; // 'status' overlay category switched off
 
   // ── Maintenance Mode: show MaintenancePanel instead of messages ──
   if (isMaintenanceActive) {

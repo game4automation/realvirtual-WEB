@@ -75,7 +75,9 @@ function DocsButton({ viewer }: UISlotProps) {
       viewer.raycastManager.setAllowFilter(null);
     }
     deactivateContext('docs');
-    viewer.markRenderDirty?.();
+    // markShadowsDirty: restores `.visible` on model nodes — the batched
+    // render path re-syncs instance visibility from it.
+    viewer.markShadowsDirty?.();
     setActive(false);
   }, [viewer]);
 
@@ -109,7 +111,7 @@ function DocsButton({ viewer }: UISlotProps) {
     }
 
     activateContext('docs');
-    viewer.markRenderDirty?.();
+    viewer.markShadowsDirty?.();
     setActive(true);
   }, [viewer]);
 

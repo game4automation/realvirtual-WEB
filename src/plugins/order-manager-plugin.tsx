@@ -48,7 +48,14 @@ import type {
   OrderManagerConfig,
 } from '../core/types/plugin-types';
 import { loadAasxById, type AasParsedData } from './aas-link-parser';
-import { parseTags, extractAttr } from '../core/hmi/tooltip/MetadataTooltipContent';
+import { isAasNodeVisible } from './aas-resolution';
+import {
+  parseTags,
+  findValueByLabels,
+  DEFAULT_ARTICLE_LABELS,
+  DEFAULT_DESCRIPTION_LABELS,
+  DEFAULT_MANUFACTURER_LABELS,
+} from '../core/hmi/tooltip/MetadataTooltipContent';
 import { NavButton } from '../core/hmi/NavButton';
 import { LeftPanel } from '../core/hmi/LeftPanel';
 import { ORDER_PANEL_WIDTH } from '../core/hmi/layout-constants';
@@ -159,15 +166,13 @@ export function extractOrderData(parsed: AasParsedData): Partial<OrderItem> {
 }
 
 // ── Metadata Order Data Extraction ──────────────────────────────────
-
-const DEFAULT_ARTICLE_LABELS = ['Article', 'ArticleNumber', 'OrderCode', 'PartNumber'];
-const DEFAULT_DESCRIPTION_LABELS = ['English', 'Description', 'Designation'];
-const DEFAULT_MANUFACTURER_LABELS = ['Manufacturer', 'ManufacturerName'];
+// Label defaults + matching live in MetadataTooltipContent (findValueByLabels)
+// so the pinned-tooltip cart button and this plugin resolve identically.
 
 /**
  * Extract order-relevant fields from RuntimeMetadata content string.
  * Parses `<value label="...">text</value>` tags and matches against
- * configurable label lists (case-insensitive).
+ * configurable label lists (case-insensitive, exact match preferred).
  *
  * Returns null if no article number is found (component is not orderable).
  */
@@ -179,27 +184,14 @@ export function extractMetadataOrderData(
   manufacturerLabels: string[] = DEFAULT_MANUFACTURER_LABELS,
 ): Partial<OrderItem> | null {
   const tags = parseTags(content);
-  const normalize = (s: string): string => s.replace(/[\s_-]/g, '').toLowerCase();
 
-  const getByLabels = (candidates: string[]): string => {
-    for (const candidate of candidates) {
-      const nc = normalize(candidate);
-      for (const t of tags) {
-        if (t.tag !== 'value') continue;
-        const label = extractAttr(t.attributes, 'label') ?? '';
-        if (normalize(label).includes(nc)) return t.text;
-      }
-    }
-    return '';
-  };
-
-  const articleNumber = getByLabels(articleLabels);
+  const articleNumber = findValueByLabels(tags, articleLabels);
   if (!articleNumber) return null; // No article = not orderable
 
   // Use <name> tag as fallback display name
   const nameTag = tags.find(t => t.tag === 'name');
-  const displayName = getByLabels(descriptionLabels) || nameTag?.text || nodeName;
-  const manufacturer = getByLabels(manufacturerLabels);
+  const displayName = findValueByLabels(tags, descriptionLabels) || nameTag?.text || nodeName;
+  const manufacturer = findValueByLabels(tags, manufacturerLabels);
 
   return {
     aasId: articleNumber, // Use article number as unique ID
@@ -219,17 +211,7 @@ export function hasMetadataArticle(
 ): boolean {
   const meta = node.userData?._rvMetadata as { content: string } | undefined;
   if (!meta?.content) return false;
-  const tags = parseTags(meta.content);
-  const normalize = (s: string): string => s.replace(/[\s_-]/g, '').toLowerCase();
-  for (const candidate of articleLabels) {
-    const nc = normalize(candidate);
-    for (const t of tags) {
-      if (t.tag !== 'value') continue;
-      const label = extractAttr(t.attributes, 'label') ?? '';
-      if (normalize(label).includes(nc)) return !!t.text;
-    }
-  }
-  return false;
+  return !!findValueByLabels(parseTags(meta.content), articleLabels);
 }
 
 // ── Store mutation functions ──────────────────────────────────────────
@@ -417,15 +399,18 @@ export class OrderManagerPlugin implements RVViewerPlugin, OrderManagerPluginAPI
           order: 55,
           dividerBefore: true,
           condition: (target) => {
-            // Show if node has AAS data OR RuntimeMetadata with article number
+            // Show if node has AAS data OR RuntimeMetadata with article number.
+            // An AAS the deployment cannot resolve is NOT orderable — offering it
+            // here would contradict the tooltip that already hides it, and the
+            // .catch below would file a nameless, article-less cart entry.
             const aas = target.node.userData?._rvAasLink as { aasId?: string } | undefined;
-            if (aas?.aasId) return true;
+            if (aas?.aasId && isAasNodeVisible(target.node)) return true;
             return hasMetadataArticle(target.node, artLabels);
           },
           action: (target) => {
             // Try AAS first
             const aas = target.node.userData?._rvAasLink as { aasId: string; description?: string } | undefined;
-            if (aas?.aasId) {
+            if (aas?.aasId && isAasNodeVisible(target.node)) {
               loadAasxById(aas.aasId).then(parsed => {
                 const orderData = extractOrderData(parsed);
                 this.addItem(

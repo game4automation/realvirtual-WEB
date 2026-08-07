@@ -62,6 +62,8 @@ function makeMockSelf(opts: {
   type: string;
   outputs?: Port[];
   props?: Record<string, unknown>;
+  /** Whether the (mock) downstream can accept — drives the ZPA back-pressure path. */
+  canAccept?: boolean;
 } = { kind: 'source', type: 'Source' }): MockSelf {
   const transfers: MockSelf['transfers'] = [];
   const schedules: MockSelf['schedules'] = [];
@@ -101,13 +103,16 @@ function makeMockSelf(opts: {
     freeOutputs: () => outs,
     downstreamOccupied: () => false,
     setState: () => { /* no-op */ },
+    statState: () => { /* no-op */ },
     state: 'idle',
     transfer: (mu: MU, from?: Port) => { transfers.push({ mu, from }); },
     spawn: (): MU => ({ id: ++muId, prop: {} }),
-    downstreamCanAccept: () => true,
+    downstreamCanAccept: () => opts.canAccept ?? true,
     mus: [],
     currentLoad: 0,
     contextMenu: () => { /* no-op */ },
+    // Per-instance DES state slot (Source holds its pending ZPA MU here).
+    local: { pending: null },
     prop: (opts.props ?? {}) as Record<string, never>,
     // Capture surface for assertions.
     transfers,
@@ -231,6 +236,53 @@ describe('Source — des.onGenerate', () => {
     def.des!.onGenerate!(self);
     def.des!.onGenerate!(self);
     expect(self.transfers.map(t => t.mu.id)).toEqual([1, 2]);
+  });
+
+  // ── ZPA back-pressure (plan-225 F5/B2) ──
+
+  it('holds the MU and keeps RETRYING when the downstream is full (ZPA heartbeat)', () => {
+    const def = getMaterialFlow('Source')!;
+    const out = fakePort('line-in');
+    const self = makeMockSelf({ kind: 'source', type: 'Source', outputs: [out], canAccept: false });
+    def.des!.onGenerate!(self);
+    // Full downstream → nothing handed over, the MU is held...
+    expect(self.transfers).toHaveLength(0);
+    // ...but generation RE-ARMS a retry tick (heartbeat), so a missed one-shot
+    // onDownstreamReady wake can never permanently stall the source.
+    expect(self.schedules).toHaveLength(1);
+    expect(self.schedules[0].hook).toBe('Generate');
+  });
+
+  it('does not spawn a second MU while one is pending (no flood, only retries the held one)', () => {
+    const def = getMaterialFlow('Source')!;
+    const out = fakePort('line-in');
+    const self = makeMockSelf({ kind: 'source', type: 'Source', outputs: [out], canAccept: false });
+    def.des!.onGenerate!(self); // spawn id 1 → blocked → held
+    def.des!.onGenerate!(self); // still blocked + already held → retries the SAME MU, no new spawn
+    expect(self.transfers).toHaveLength(0);
+    // Free the downstream and pull: the transferred MU must be id 1 — proof that
+    // no second MU was minted while one was pending (id 2 would mean a flood).
+    (self as unknown as { downstreamCanAccept: () => boolean }).downstreamCanAccept = () => true;
+    def.des!.onDownstreamReady!(self, undefined as never);
+    expect(self.transfers).toHaveLength(1);
+    expect(self.transfers[0].mu.id).toBe(1);
+  });
+
+  it('resumes on onDownstreamReady once the downstream frees up (pull)', () => {
+    const def = getMaterialFlow('Source')!;
+    const out = fakePort('line-in');
+    const self = makeMockSelf({ kind: 'source', type: 'Source', outputs: [out], canAccept: false });
+    def.des!.onGenerate!(self);               // blocked → held, no transfer
+    expect(self.transfers).toHaveLength(0);
+
+    // Downstream frees up → pull resumes.
+    (self as unknown as { downstreamCanAccept: () => boolean }).downstreamCanAccept = () => true;
+    def.des!.onDownstreamReady!(self, undefined as never);
+
+    expect(self.transfers).toHaveLength(1);
+    expect(self.transfers[0].from).toBe(out);
+    expect(self.schedules).toHaveLength(1);
+    expect(self.schedules[0].hook).toBe('Generate');
   });
 });
 

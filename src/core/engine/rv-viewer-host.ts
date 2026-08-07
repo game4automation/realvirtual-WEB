@@ -35,6 +35,8 @@ export interface ViewerHost {
   // Event-API (von EventEmitter<ViewerEvents> geerbt — RVViewer hat das)
   on: EventEmitter<ViewerEvents>['on'];
   emit: EventEmitter<ViewerEvents>['emit'];
+  /** Central signature-provenance execution gate (older test hosts may omit). */
+  readonly logicRunState?: 'active' | 'gated' | 'activating';
 
   // Subsystem-Zugriff (Subsets)
   readonly registry: ViewerHostRegistry | null;

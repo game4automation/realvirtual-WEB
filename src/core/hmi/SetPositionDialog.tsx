@@ -201,7 +201,7 @@ export function SetPositionDialog() {
         zIndex: 2000,
         width: 320,
         bgcolor: 'rgba(30, 30, 30, 0.95)',
-        backdropFilter: 'blur(12px)',
+        backdropFilter: 'blur(calc(12px * var(--rv-ui-blur-scale, 1)))',
         border: '1px solid rgba(255,255,255,0.1)',
         borderRadius: 1,
         pointerEvents: 'auto',

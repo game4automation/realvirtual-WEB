@@ -39,6 +39,7 @@ import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { RVViewer } from '../core/rv-viewer';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import { RVXRManager, type XRSupport } from '../core/engine/rv-xr-manager';
+import { disposeSubtree } from '../core/engine/rv-traverse-utils';
 import { tooltipStore } from '../core/hmi/tooltip/tooltip-store';
 
 const DEAD_ZONE = 0.15;
@@ -574,12 +575,7 @@ export class WebXRPlugin implements RVViewerPlugin {
     this.hitTestMode = false;
     if (this.hitReticle) {
       this.hitReticle.removeFromParent();
-      this.hitReticle.traverse((child) => {
-        if (child instanceof Mesh) {
-          child.geometry.dispose();
-          (child.material as MeshBasicMaterial).dispose();
-        }
-      });
+      disposeSubtree(this.hitReticle);
       this.hitReticle = null;
     }
 
@@ -1383,12 +1379,7 @@ export class WebXRPlugin implements RVViewerPlugin {
     if (this.arButton) { this.arButton.remove(); this.arButton = null; }
     if (this.teleportReticle) {
       this.teleportReticle.removeFromParent();
-      this.teleportReticle.traverse((child) => {
-        if (child instanceof Mesh) {
-          child.geometry.dispose();
-          (child.material as MeshBasicMaterial).dispose();
-        }
-      });
+      disposeSubtree(this.teleportReticle);
       this.teleportReticle = null;
     }
     if (this.teleportArc) {
@@ -1401,12 +1392,7 @@ export class WebXRPlugin implements RVViewerPlugin {
     this.teardownMobileARTouch();
     if (this.hitReticle) {
       this.hitReticle.removeFromParent();
-      this.hitReticle.traverse((child) => {
-        if (child instanceof Mesh) {
-          child.geometry.dispose();
-          (child.material as MeshBasicMaterial).dispose();
-        }
-      });
+      disposeSubtree(this.hitReticle);
       this.hitReticle = null;
     }
     this.hitTestSource = null;

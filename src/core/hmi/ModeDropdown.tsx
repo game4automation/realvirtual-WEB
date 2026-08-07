@@ -16,11 +16,12 @@
 import { useState, type ComponentType, type ReactElement } from 'react';
 import { Box, Menu, MenuItem, ListItemIcon, ListItemText, Typography, ButtonBase, Paper } from '@mui/material';
 import {
-  ArrowDropDown, Check, ViewQuilt, AccountTree, GridView, ViewInAr, Dashboard,
+  ArrowDropDown, Check, ViewQuilt, AccountTree, GridView, ViewInAr, Dashboard, Edit,
 } from '@mui/icons-material';
 import { useMode } from '../../hooks/use-mode';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
 import { useUIZoom } from './visual-settings-store';
+import { useUIVisible } from './ui-context-store';
 import type { ModeId } from '../rv-mode-manager';
 
 /** Primary-blue glow used in place of the default elevation shadow (half spread). */
@@ -31,7 +32,8 @@ const ICONS: Record<string, ComponentType<{ fontSize?: 'small' | 'medium' }>> = 
   hmi: ViewQuilt,
   des: AccountTree,
   planner: GridView,
-  ViewQuilt, AccountTree, GridView, ViewInAr, Dashboard,
+  editor: Edit,
+  ViewQuilt, AccountTree, GridView, ViewInAr, Dashboard, Edit,
 };
 
 function iconFor(idOrName: string | undefined, fallback: string): ReactElement {
@@ -46,10 +48,15 @@ export function ModeDropdown() {
   // The menu renders in a portal OUTSIDE the zoomed HMIShell, so it doesn't
   // inherit the UI scale — apply it explicitly (mirrors HMIShell's zoom).
   const uiZoom = useUIZoom();
+  // Embedding a viewer in a foreign page must not offer a way out into the full
+  // app (plan-387 F5). Driven by the `embedded` CONTEXT (set once at boot in
+  // main.ts) rather than by reading `window.self !== window.top` here, so a
+  // deployment can override the rule and tests need no real iframe.
+  const switcherVisible = useUIVisible('mode-switcher', { hiddenIn: ['embedded'] });
 
   // Hidden when the workspace is locked to a single mode (kiosk / HMI-only
-  // deployments like Mauser) or when nothing is registered yet.
-  if (locked || modes.length === 0) return null;
+  // deployments like Mauser), when embedded, or when nothing is registered yet.
+  if (locked || !switcherVisible || modes.length === 0) return null;
 
   const current = modes.find((m) => m.id === active) ?? modes[0];
   const open = !!anchor;
@@ -118,7 +125,7 @@ export function ModeDropdown() {
               // Portal content doesn't inherit HMIShell's zoom — apply UI scale here.
               zoom: uiZoom,
               bgcolor: 'rgba(30, 30, 30, 0.95)',
-              backdropFilter: 'blur(12px)',
+              backdropFilter: 'blur(calc(12px * var(--rv-ui-blur-scale, 1)))',
               border: '1px solid rgba(255,255,255,0.1)',
               boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
               '& .MuiList-root': { py: 0.5 },

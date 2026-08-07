@@ -29,26 +29,27 @@ import type {
 import {
   baseLabelOf, metaOf, newSceneId, makeDraftScene, scenesEqual, isValidSceneV2,
 } from './rv-scene-types';
-import type { PublishedSceneEntry } from './rv-published-scenes';
+import { publishedSceneUrl, type PublishedSceneEntry } from './rv-published-scenes';
 import {
-  type EditOp, type PrimitiveEditOp, type SceneEditsSettings,
+  type EditOp, type PrimitiveEditOp, type SceneEditsSettings, type MaterialisedEdits,
   MAX_OP_HISTORY, COALESCE_WINDOW_MS,
-  freshOpId, canCoalesce, mergeOps, describeOp, opsEqual,
+  freshOpId, canCoalesce, mergeOps, describeOp, opsEqual, materialise,
 } from './rv-scene-edits';
 import {
   listMetas, readScene, writeScene, deleteScene,
-  readActiveId, writeActiveId, readDraft, writeDraft, clearDraft,
+  readActiveId, readDraft, writeDraft, clearDraft,
   readSceneDraft, writeSceneDraft, clearSceneDraft,
 } from './rv-scene-storage';
+import { emitSceneMutation, setActiveSceneId } from './rv-scene-mutations';
 import { applyForward, applyInverse } from './rv-scene-executors';
 import { showInfoOverlay, hideInfoOverlay } from '../info-overlay-store';
-
-// ─── Legacy compat type (used by the `loadScene` shim) ──────────────────
-
-/** @deprecated Source descriptor for the legacy `loadScene` shim. */
-export type SceneSource =
-  | { kind: 'glb'; url: string; label: string }
-  | { kind: 'layout'; id: string; name: string; modifiedAt: string };
+import { nextOptionParam } from '../../../plugins/models/model-option-plugin';
+import { writeSettingsIntoModel } from './rv-scene-settings-into-model';
+import { getProjectStore } from '../../project/project-store';
+import type { ProjectBackend } from '../../project/backends/project-backend';
+import { isSupported as isFileSystemAccessSupported } from '../../engine/rv-local-filesystem';
+import { saveStartPos } from '../camera-startpos-store';
+import { deriveModelKey } from '../../../plugins/camera-startpos-plugin';
 
 // ─── Snapshot ───────────────────────────────────────────────────────────
 
@@ -61,7 +62,7 @@ export interface SceneSnapshot {
   dirty: boolean;
   scenes: RvSceneMeta[];
   builtins: BuiltinSceneEntry[];
-  /** Read-only "Example" scenes shipped under public/scenes/. */
+  /** Read-only "Example" scenes of the DemoRealvirtual project. */
   published: PublishedSceneEntry[];
   /** urlName of the open published example, for Examples-row highlight; null otherwise. */
   activePublishedName: string | null;
@@ -71,6 +72,79 @@ export interface SceneSnapshot {
   /** Tooltip text "Undo: <action>" / "Redo: <action>"; null when disabled. */
   undoLabel: string | null;
   redoLabel: string | null;
+}
+
+// ─── Save settings into model ───────────────────────────────────────────
+
+/** Result of {@link SceneStore.saveSettingsIntoModel}. Every failure carries its reason. */
+export type SaveSettingsIntoModelOutcome =
+  | {
+      kind: 'saved';
+      /** The name actually used — may carry a `_1` suffix after a collision. */
+      fileName: string;
+      relPath: string;
+      /** glTF nodes that received at least one field. */
+      nodes: number;
+      /** Individual fields written or deleted. */
+      fields: number;
+      /** A now-invalid signature was dropped — the written file is unsigned. */
+      signatureDropped: boolean;
+    }
+  /** The scene has no property overrides; the file would be an exact copy. */
+  | { kind: 'nothing-to-save' }
+  /** Edits that cannot live in node extras — listed for the user. */
+  | { kind: 'structural-ops'; details: string[] }
+  /** An empty base has no model file to write into. */
+  | { kind: 'no-model-base' }
+  | { kind: 'no-writable-project'; reason: string }
+  /** A folder project on a browser without File System Access. */
+  | { kind: 'unsupported' }
+  /** The user switched scenes mid-write; the file exists but was not adopted. */
+  | { kind: 'scene-changed'; fileName: string; relPath: string }
+  | { kind: 'error'; message: string };
+
+/**
+ * Name the edits that cannot be represented as node extras.
+ *
+ * Only `setField` / `unsetField` / `setCode` reach `overlay`. Everything else
+ * would need new `nodes[]` entries, `children[]` splicing, or merging a second
+ * GLB's buffers into the BIN chunk — which is precisely the byte-identity this
+ * feature exists to preserve. Refusing with a list beats writing a file that
+ * looks complete and silently is not.
+ */
+function describeStructuralEdits(edits: MaterialisedEdits): string[] {
+  const out: string[] = [];
+  const n = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
+  if (edits.placements.length) out.push(n(edits.placements.length, 'planner placement', 'planner placements'));
+  if (edits.addedNodes.length) out.push(n(edits.addedNodes.length, 'added node', 'added nodes'));
+  if (edits.nodeTransforms.length) out.push(n(edits.nodeTransforms.length, 'moved node', 'moved nodes'));
+  if (edits.connections.length) out.push(n(edits.connections.length, 'connection', 'connections'));
+  if (edits.connectionTypes.length) out.push(n(edits.connectionTypes.length, 'connection type', 'connection types'));
+  return out;
+}
+
+/** Scene name → a safe GLB file stem. Mirrors the asset editor's rule. */
+function sanitizeModelFileName(name: string): string {
+  const stem = name.trim().replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, '_').replace(/\.glb$/i, '');
+  return stem || 'Untitled';
+}
+
+/** Append `_1`, `_2`, … until the name is free in the project's `models/`. */
+async function uniqueModelFileName(backend: ProjectBackend, fileName: string): Promise<string> {
+  let taken: Set<string>;
+  try {
+    const models = await backend.listModels();
+    taken = new Set(models.map((m) => (m.path.split('/').pop() ?? '').toLowerCase()));
+  } catch {
+    return fileName; // Listing is a convenience; never block a bake on it.
+  }
+  if (!taken.has(fileName.toLowerCase())) return fileName;
+
+  const stem = fileName.replace(/\.glb$/i, '');
+  for (let i = 1; ; i++) {
+    const candidate = `${stem}_${i}.glb`;
+    if (!taken.has(candidate.toLowerCase())) return candidate;
+  }
 }
 
 // ─── Internal state ─────────────────────────────────────────────────────
@@ -123,6 +197,9 @@ export class SceneStore {
 
   // Debounced draft autosave timer
   private _draftAutosaveTimer: number | null = null;
+
+  // Lazy-hydration pre-fetch (installed by ProjectStore; null when no project)
+  private _hydrator: ((id: string) => Promise<boolean>) | null = null;
 
   // React subscribers
   private _listeners = new Set<() => void>();
@@ -179,7 +256,7 @@ export class SceneStore {
     this._redoStack = [];
     this._saved = null;
     this._viewer.currentScene = this._buildDraft();
-    writeActiveId(null);
+    setActiveSceneId(null);
     this._notify();
   }
 
@@ -191,8 +268,41 @@ export class SceneStore {
 
   // ─── Workspace lifecycle ────────────────────────────────────────────
 
+  /**
+   * Install a pre-fetch hook consulted when a scene body is missing from the
+   * cache. Set by `ProjectStore` so a lazily-hydrated project scene can be
+   * pulled off disk on demand; null restores the plain cache-only behaviour.
+   */
+  setSceneHydrator(fn: ((id: string) => Promise<boolean>) | null): void {
+    this._hydrator = fn;
+  }
+
+  /**
+   * Ensure a scene body is present in the cache, pulling it through the
+   * hydrator if one is installed. Returns false when it cannot be produced.
+   */
+  async ensureSceneHydrated(id: string): Promise<boolean> {
+    if (readScene(id)) return true;
+    if (!this._hydrator) return false;
+    try {
+      return await this._hydrator(id);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Re-read the scene index from storage (after an external hydration). */
+  refreshScenesFromStorage(): void {
+    this._refreshScenes();
+    this._notify();
+  }
+
   /** Open a saved scene by id. */
   async openScene(id: string): Promise<void> {
+    // With lazy project hydration the body may not be cached yet. Without
+    // this pre-fetch, a Models-panel click and `web_scene_open` would both
+    // throw "Scene <id> not found" on a perfectly valid project scene.
+    if (!readScene(id)) await this.ensureSceneHydrated(id);
     const scene = readScene(id);
     if (!scene) throw new Error(`Scene ${id} not found`);
     // Restore any in-progress draft for this saved scene on top of the
@@ -207,7 +317,7 @@ export class SceneStore {
     // saved scene. Without this, `?scene=` stays empty and reload falls
     // through to the legacy default-model boot path (which then clears the
     // active-id pointer via markGlbActive — see scene-store.ts).
-    updateUrlSceneParam(scene.id);
+    updateUrlSceneParam(scene.id, baseLabelForOption(scene.base));
   }
 
   /** Open a built-in. Auto-resumes the per-base draft if one was autosaved. */
@@ -216,12 +326,12 @@ export class SceneStore {
     const restored = readDraft(base);
     const scene = restored ?? makeDraftScene(base, label);
     await this._loadIntoWorkspace(scene, null);
-    updateUrlSceneParam(urlValueForBase(base));
+    updateUrlSceneParam(urlValueForBase(base), baseLabelForOption(base));
   }
 
   /**
    * Open a "published" scene transiently — a read-only RvScene fetched from a
-   * static asset (e.g. `public/scenes/<name>.scene.json`) and routed via
+   * static asset (e.g. the project's `scenes/<name>.scene.json`) and routed via
    * `?scene=published:<name>`. Unlike a saved scene it is NOT written to
    * localStorage, so a shared public link has no side effects on the visitor's
    * stored scenes. `name` is only used to keep the URL stable across reloads.
@@ -234,7 +344,7 @@ export class SceneStore {
     // Mark which example is active so the Examples row can highlight (transient
     // scenes have no saved id / non-builtin base to match against).
     this._activePublishedName = name;
-    updateUrlSceneParam(`published:${name}`);
+    updateUrlSceneParam(`published:${name}`, baseLabelForOption(scene.base));
     this._notify();
   }
 
@@ -289,6 +399,7 @@ export class SceneStore {
       if (!readScene(persisted.id)) {
         throw new Error('Could not save the example — browser storage is full.');
       }
+      emitSceneMutation({ type: 'upsert', id: persisted.id, scene: persisted });
       this._refreshScenes();
       this._notify();
       await this.openScene(persisted.id);
@@ -309,9 +420,9 @@ export class SceneStore {
     return `${base} (${n})`;
   }
 
-  /** Fetch + validate a published scene JSON from public/scenes/. */
+  /** Fetch + validate a published scene JSON from the DemoRealvirtual project. */
   private async _fetchPublishedScene(entry: PublishedSceneEntry): Promise<RvScene> {
-    const resp = await fetch(`${import.meta.env.BASE_URL}scenes/${entry.file}`, { cache: 'no-store' });
+    const resp = await fetch(publishedSceneUrl(entry.file), { cache: 'no-store' });
     if (!resp.ok) throw new Error(`Failed to fetch example scene ${entry.file}: HTTP ${resp.status}`);
     const scene = await resp.json();
     if (!isValidSceneV2(scene)) {
@@ -343,7 +454,7 @@ export class SceneStore {
     clearDraft(base);
     const scene = makeDraftScene(base, 'Untitled');
     await this._loadIntoWorkspace(scene, null);
-    updateUrlSceneParam('empty');
+    updateUrlSceneParam('empty', null);
   }
 
   /**
@@ -360,7 +471,7 @@ export class SceneStore {
     const restored = readDraft(base);
     const scene = restored ?? makeDraftScene(base, 'Untitled');
     await this._loadIntoWorkspace(scene, null);
-    updateUrlSceneParam('empty');
+    updateUrlSceneParam('empty', null);
   }
 
   /** Duplicate a saved scene as a fresh draft. */
@@ -414,7 +525,7 @@ export class SceneStore {
     showInfoOverlay(`Loading ${sceneLabel}…`);
     try {
       await this._viewer.loadScene(scene);
-      writeActiveId(saved?.id ?? null);
+      setActiveSceneId(saved?.id ?? null);
     } finally {
       this._loading = false;
       this._busy = false;
@@ -448,7 +559,8 @@ export class SceneStore {
     this._activePublishedName = null;  // now a saved My Scene, not the example
     this._baselineOps = persisted.edits.ops;
     // _ops stays as-is (now matches baseline)
-    writeActiveId(persisted.id);
+    emitSceneMutation({ type: 'upsert', id: persisted.id, scene: persisted });
+    setActiveSceneId(persisted.id);
     // Clear both draft slots: the per-base slot (legacy / pre-fix path that
     // accumulated edits before the workspace had a saved id) AND the new
     // per-saved-scene slot (defensive — clean baseline post-save).
@@ -481,7 +593,8 @@ export class SceneStore {
     this._saved = persisted;
     this._activePublishedName = null;  // now a saved My Scene, not the example
     this._baselineOps = persisted.edits.ops;
-    writeActiveId(persisted.id);
+    emitSceneMutation({ type: 'upsert', id: persisted.id, scene: persisted });
+    setActiveSceneId(persisted.id);
     // See save() above for the dual-slot rationale.
     clearDraft(persisted.base);
     clearSceneDraft(persisted.id);
@@ -511,7 +624,9 @@ export class SceneStore {
   rename(id: string, name: string): void {
     const s = readScene(id);
     if (!s) return;
+    const prevName = s.name;
     const updated = writeScene({ ...s, name });
+    emitSceneMutation({ type: 'rename', id, scene: updated, prevName });
     if (this._saved?.id === id) {
       this._saved = updated;
       if (this._workspace?.id === id) this._workspace = { ...this._workspace, name };
@@ -519,6 +634,27 @@ export class SceneStore {
     }
     this._refreshScenes();
     this._notify();
+  }
+
+  /**
+   * Create an empty saved scene **without** opening it.
+   *
+   * `newEmpty()` is the other half of this pair and replaces the workspace,
+   * which is the right gesture from the viewport but the wrong one from the
+   * Projects dashboard: there the user is cataloguing, not switching. Creating
+   * the row first lets them name it and choose when to leave the screen — and
+   * because it is written straight away (same `upsert` seam `duplicate()`
+   * uses), it survives a reload as an empty scene rather than as nothing.
+   *
+   * Returns the new id so the caller can select the card it just made.
+   */
+  createEmpty(name = 'Untitled'): string {
+    const scene = makeDraftScene({ kind: 'empty' }, this._uniqueSceneName(name));
+    const persisted = writeScene({ ...scene, id: newSceneId() });
+    emitSceneMutation({ type: 'upsert', id: persisted.id, scene: persisted });
+    this._refreshScenes();
+    this._notify();
+    return persisted.id;
   }
 
   duplicate(id: string): string {
@@ -533,7 +669,8 @@ export class SceneStore {
       modifiedAt: now,
       parentId: src.id,
     };
-    writeScene(dup);
+    const persistedDup = writeScene(dup);
+    emitSceneMutation({ type: 'upsert', id: persistedDup.id, scene: persistedDup });
     this._refreshScenes();
     this._notify();
     return dup.id;
@@ -542,6 +679,7 @@ export class SceneStore {
   async delete(id: string): Promise<void> {
     const wasActive = this._saved?.id === id;
     deleteScene(id);
+    emitSceneMutation({ type: 'delete', id });
     // Clean up any orphaned draft for this saved scene — otherwise
     // re-creating a scene with the same id (extremely unlikely but
     // possible via JSON import) would inherit a stale draft.
@@ -590,14 +728,160 @@ export class SceneStore {
       modifiedAt: now,
       parentId: parsed.id,
     };
-    writeScene(fresh);
+    const persistedImport = writeScene(fresh);
+    emitSceneMutation({ type: 'upsert', id: persistedImport.id, scene: persistedImport });
     this._refreshScenes();
     this._notify();
     return fresh.id;
   }
 
-  async exportSceneGLB(_id: string): Promise<Blob> {
-    throw new Error('GLB export coming soon');
+  // ─── GLB bake ───────────────────────────────────────────────────────
+
+  /**
+   * Write the working scene's property overrides INTO a copy of its base GLB,
+   * then adopt that GLB as the new baseline.
+   *
+   * The point is portability: after this the configuration travels with the
+   * file. A signal binding made here survives a cleared localStorage, a
+   * different browser, and a customer who only ever receives the `.glb`.
+   *
+   * The geometry is not re-encoded — only the JSON chunk is rewritten (see
+   * `rv-scene-glb-bake.ts`). Structural edits (planner placements, added or
+   * moved nodes, connections) cannot be expressed as node extras, so a scene
+   * carrying any of them is refused rather than half-baked.
+   *
+   * Must be called from a user gesture — a folder project prompts for File
+   * System Access permission.
+   */
+  saveSettingsIntoModel(name: string): Promise<SaveSettingsIntoModelOutcome> {
+    // The WHOLE transaction runs inside the op queue, not just a drain in front
+    // of it. Fetching 35 MB and writing it back takes seconds, and `applyOp` /
+    // `undo` / `redo` all queue here — draining first and then working outside
+    // would let an edit land mid-flight, be visibly applied, and then be erased
+    // by the empty op log this method installs at the end.
+    return this._enqueueResult(() => this._saveSettingsIntoModel(name));
+  }
+
+  private async _saveSettingsIntoModel(name: string): Promise<SaveSettingsIntoModelOutcome> {
+    const workspaceAtStart = this._workspace;
+    if (!workspaceAtStart) return { kind: 'error', message: 'No scene is open.' };
+
+    const base = workspaceAtStart.base;
+    if (base.kind !== 'builtin') return { kind: 'no-model-base' };
+
+    const edits = materialise(this._ops);
+    const blocking = describeStructuralEdits(edits);
+    if (blocking.length > 0) return { kind: 'structural-ops', details: blocking };
+    if (Object.keys(edits.overlay.nodes).length === 0) return { kind: 'nothing-to-save' };
+
+    // Same guard sequence as `saveAssetToCustomLibrary` — the distinction
+    // between "no project", "read-only project" and "browser cannot do folder
+    // projects" is what makes the message actionable.
+    const backend = getProjectStore().getBackend();
+    if (!backend) return { kind: 'no-writable-project', reason: 'No project is open.' };
+    if (!backend.writable) {
+      return {
+        kind: 'no-writable-project',
+        reason: backend.kind === 'bundled'
+          ? 'This project ships with the application and cannot be written to. Create or open your own project to save into a model.'
+          : 'The open project is read-only.',
+      };
+    }
+    if (backend.kind === 'folder' && !isFileSystemAccessSupported()) return { kind: 'unsupported' };
+
+    const registry = this._viewer.registry;
+    if (!registry) return { kind: 'error', message: 'No model is loaded.' };
+
+    this._busy = true;
+    this._notify();
+    // Set once the blob is on disk. Any later failure has to take it back down
+    // again — an orphan in `models/` looks exactly like a finished delivery.
+    let writtenPath: string | null = null;
+    try {
+      // The deduplicated name is the ONLY name from here on: reporting the
+      // requested one would tell the user about a file that does not exist.
+      const fileName = await uniqueModelFileName(backend, `${sanitizeModelFileName(name)}.glb`);
+      const relPath = `models/${fileName}`;
+
+      // Re-fetched rather than retained: holding a 35 MB source buffer for the
+      // lifetime of every model is exactly the double-buffering that caused
+      // out-of-memory blank scenes on mobile (see `loadAndPrepareGLTF`). This is
+      // a rare, explicit action, so one fetch is the better trade — and
+      // `expectedNames` below covers the risk that fetch brings back a
+      // different file than the one the node indices were captured from.
+      const response = await fetch(base.url);
+      if (!response.ok) throw new Error(`Could not read the model file (${response.status}): ${base.url}`);
+      const source = await response.arrayBuffer();
+
+      const result = writeSettingsIntoModel(
+        source,
+        edits.overlay,
+        (path) => registry.getGltfNodeIndex(path),
+        { expectedNames: registry.getGltfNodeNames() },
+      );
+
+      await backend.writeBlob(relPath, new Blob([result.glb as BlobPart], { type: 'model/gltf-binary' }));
+      writtenPath = relPath;
+
+      // Scene loads do NOT go through the op queue, so the user can still have
+      // switched scenes while we fetched and wrote. Adopting now would install
+      // this model over whatever they moved to. The file stays (it is valid and
+      // named after their scene); only the adoption is abandoned.
+      if (this._workspace !== workspaceAtStart) {
+        writtenPath = null;
+        return { kind: 'scene-changed', fileName, relPath };
+      }
+
+      // Same resolution the Projects dashboard uses to open a project model
+      // (`ProjectsDashboardHost.openModel`). It drops the backend's `release()`
+      // on purpose — revoking the object URL would pull the bytes out from
+      // under the model the user is about to look at.
+      const resolvedUrl = await getProjectStore().resolveAssetUrl(relPath);
+      if (!resolvedUrl) throw new Error(`The model was written but could not be resolved back: ${relPath}`);
+
+      // Adopting the new file as the base reloads from the bytes we just wrote,
+      // which is also the cheapest possible proof that the result is loadable.
+      // `openBuiltin` gives the empty op log and the fresh draft slot for free.
+      const label = fileName.replace(/\.glb$/i, '');
+      await this.openBuiltin(resolvedUrl, label);
+      writtenPath = null; // adopted — the file is the scene's base now, never roll it back
+      // The old base's autosave snapshot still holds the ops we just wrote in;
+      // left alone it would re-apply them on top of the new model next time
+      // that base is opened.
+      clearDraft(base);
+
+      // The camera preset lives outside the model file, keyed by model URL —
+      // carry it across by hand rather than refuse over it.
+      if (edits.cameraStart) {
+        const key = deriveModelKey(this._viewer.currentModelUrl);
+        if (key) saveStartPos(key, edits.cameraStart);
+      }
+
+      return {
+        kind: 'saved',
+        fileName,
+        relPath,
+        nodes: result.nodes,
+        fields: result.fields,
+        signatureDropped: result.signatureDropped,
+      };
+    } catch (e) {
+      console.error('[scene-store] saving settings into the model failed:', e);
+      if (writtenPath) {
+        // Best-effort: a failed run must not leave a file that looks finished.
+        try { await backend.deleteBlob(writtenPath); } catch (cleanup) {
+          console.warn('[scene-store] could not remove the partially written model:', cleanup);
+          return {
+            kind: 'error',
+            message: `${e instanceof Error ? e.message : String(e)} — and "${writtenPath}" could not be removed; delete it by hand.`,
+          };
+        }
+      }
+      return { kind: 'error', message: e instanceof Error ? e.message : String(e) };
+    } finally {
+      this._busy = false;
+      this._notify();
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -803,6 +1087,18 @@ export class SceneStore {
     return next;
   }
 
+  /**
+   * `_enqueue` for work that returns something.
+   *
+   * Same single-flight guarantee — the queue is what makes a long transaction
+   * (fetch, patch, write) safe against ops landing halfway through it.
+   */
+  private _enqueueResult<T>(work: () => Promise<T>): Promise<T> {
+    const next = this._opQueue.then(() => work(), () => work());
+    this._opQueue = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
   // ─── Internals ──────────────────────────────────────────────────────
 
   private _refreshBuiltins(): void {
@@ -858,24 +1154,6 @@ export class SceneStore {
     for (const l of this._listeners) l();
   }
 
-  // ════════════════════════════════════════════════════════════════════
-  // Legacy compat shims — keep SceneWindow.tsx working.
-  // ════════════════════════════════════════════════════════════════════
-
-  /** @deprecated Use `openScene` / `openBuiltin`. */
-  async loadScene(source: SceneSource): Promise<void> {
-    if (source.kind === 'glb') return this.openBuiltin(source.url, source.label);
-    return this.openScene(source.id);
-  }
-
-  /** @deprecated Use `newEmpty()` then `saveAs(name)`. */
-  async createNewLayout(name: string): Promise<string> {
-    await this.newEmpty();
-    return this.saveAs(name);
-  }
-
-  /** @deprecated Use `exportSceneJSON(id)`. */
-  exportLayoutJSON(id: string): void { this.exportSceneJSON(id); }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -904,16 +1182,41 @@ function freshShell(base: SceneBase, name: string): WorkspaceShell {
  * Sync `?scene=<value>` in the address bar. Pass null to drop the param.
  * Always called via history.replaceState — no navigation, just URL refresh
  * so a browser reload picks up exactly where the user left off.
+ *
+ * `?option=` (the deep-link model variant, plan-373 F6) is deliberately NOT
+ * touched for the base it belongs to — that is what makes the deep link survive
+ * a reload. It IS removed when switching to a base that does not declare the
+ * option, because `ModelOptionPlugin` falls back to `window.location.search` and
+ * a leftover `option=bosch` would otherwise keep applying to every later model.
+ *
+ * @param baseLabel Base model label (GLB filename without .glb) the new scene
+ *                  sits on, or null when there is none (empty / saved scenes).
+ *                  Pass `undefined` to leave `option` untouched.
  */
-function updateUrlSceneParam(value: string | null): void {
+function updateUrlSceneParam(value: string | null, baseLabel?: string | null): void {
   if (typeof window === 'undefined' || typeof window.history?.replaceState !== 'function') return;
   try {
     const url = new URL(window.location.href);
     if (value === null) url.searchParams.delete('scene');
     else url.searchParams.set('scene', value);
     url.searchParams.delete('model');
+    if (baseLabel !== undefined) {
+      const option = url.searchParams.get('option');
+      if (option && !nextOptionParam(baseLabel, option)) url.searchParams.delete('option');
+    }
     window.history.replaceState(window.history.state, '', url.toString());
   } catch { /* ignore */ }
+}
+
+/**
+ * The base model label a `?option=` deep link would apply to — the GLB filename
+ * without extension, matching `model-options.ts` `baseModel`. Null for any base
+ * that is not a built-in GLB, which drops the parameter.
+ */
+function baseLabelForOption(base: SceneBase): string | null {
+  if (base.kind !== 'builtin') return null;
+  const filename = base.url.split('?')[0].split('/').pop() ?? '';
+  return filename.replace(/\.glb$/i, '') || null;
 }
 
 /** Compute the `?scene=<value>` form for a given workspace base. */

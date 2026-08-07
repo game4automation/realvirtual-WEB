@@ -8,6 +8,11 @@
  * every signal in the SignalStore with the correct type/direction, and that a
  * subsequent `data` delta updates those signals. This is the viewer-side guard
  * against "import_answer without values → 0 signals registered".
+ *
+ * Since Phase B4 the WebSocket transport lives in a Web Worker, so this test
+ * drives the interface through a mock TransportPort (the worker/main protocol)
+ * rather than intercepting the global WebSocket. The `import_answer`/`delta`
+ * outbound messages are exactly what the worker posts after parsing the wire.
  */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -16,33 +21,28 @@ import type { InterfaceSettings } from '../src/interfaces/interface-settings-sto
 import type { LoadResult } from '../src/core/engine/rv-scene-loader';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
+import type {
+  TransportInboundMessage,
+  TransportOutboundMessage,
+} from '../src/interfaces/signal-transport-core';
 
-// ── Mock WebSocket ──────────────────────────────────────────────────────────
+// ── Mock TransportPort (worker ⇄ main protocol) ──────────────────────────────
 
-class MockWebSocket {
-  static readonly CONNECTING = 0;
-  static readonly OPEN = 1;
-  static readonly CLOSING = 2;
-  static readonly CLOSED = 3;
+class MockPort {
+  inbound: TransportInboundMessage[] = [];
+  terminated = false;
+  private handler: ((msg: TransportOutboundMessage) => void) | null = null;
 
-  readyState = MockWebSocket.CONNECTING;
+  postMessage(msg: TransportInboundMessage): void { this.inbound.push(msg); }
+  terminate(): void { this.terminated = true; }
+  onMessage(cb: (msg: TransportOutboundMessage) => void): void { this.handler = cb; }
+  emit(msg: TransportOutboundMessage): void { this.handler?.(msg); }
+}
 
-  onopen: ((event: unknown) => void) | null = null;
-  onmessage: ((event: { data: string }) => void) | null = null;
-  onclose: ((event: { code: number; reason: string }) => void) | null = null;
-  onerror: (() => void) | null = null;
-
-  send = vi.fn();
-  close = vi.fn(() => { this.readyState = MockWebSocket.CLOSED; });
-
-  simulateOpen(): void {
-    this.readyState = MockWebSocket.OPEN;
-    this.onopen?.({});
-  }
-
-  simulateMessage(data: string): void {
-    this.onmessage?.({ data });
-  }
+/** Test subclass injecting the mock port instead of a real Worker. */
+class TestWsInterface extends WebSocketRealtimeInterface {
+  readonly port = new MockPort();
+  protected override createPort() { return this.port; }
 }
 
 function defaultSettings(): InterfaceSettings {
@@ -75,47 +75,37 @@ function stubViewer(signalStore: SignalStore): RVViewer {
 describe('WebSocketRealtimeInterface — import_answer registration', () => {
   it('importAnswerThenData: registers all signals with correct types, then applies data delta', async () => {
     const signalStore = new SignalStore();
-    const iface = new WebSocketRealtimeInterface();
+    const iface = new TestWsInterface();
 
     // Wire the viewer/signalStore via the plugin lifecycle.
     iface.onModelLoaded({} as LoadResult, stubViewer(signalStore));
 
-    // Intercept the WebSocket constructor.
-    let mockWs!: MockWebSocket;
-    const OriginalWebSocket = globalThis.WebSocket;
-    (globalThis as unknown as { WebSocket: unknown }).WebSocket = class extends MockWebSocket {
-      constructor(_url: string) {
-        super();
-        mockWs = this;
-        setTimeout(() => this.simulateOpen(), 0);
+    // Auto-drive the worker: `connect`→open, `discover`→import_answer with
+    // TYPES and VALUES (R15). This is what the real worker posts after parsing.
+    const origPost = iface.port.postMessage.bind(iface.port);
+    iface.port.postMessage = (msg) => {
+      origPost(msg);
+      if (msg.type === 'connect') {
+        queueMicrotask(() => iface.port.emit({ type: 'open' }));
+      } else if (msg.type === 'discover') {
+        queueMicrotask(() => iface.port.emit({
+          type: 'import_answer',
+          signalTypes: {
+            Motor_Start: 'PLCInputBool',
+            ActualTemp: 'PLCInputInt',
+            Pressure: 'PLCInputFloat',
+          },
+          signals: {
+            Motor_Start: false,
+            ActualTemp: 234,
+            Pressure: 1.5,
+          },
+        }));
       }
-    } as unknown as typeof WebSocket;
-    (globalThis.WebSocket as unknown as Record<string, number>).OPEN = MockWebSocket.OPEN;
-    (globalThis.WebSocket as unknown as Record<string, number>).CONNECTING = MockWebSocket.CONNECTING;
+    };
 
     try {
-      const connectPromise = iface.connect(defaultSettings());
-
-      // Wait a tick for the mock to open and for import_request to be sent.
-      await new Promise(r => setTimeout(r, 5));
-
-      // Server answers with TYPES and VALUES (R15).
-      mockWs.simulateMessage(JSON.stringify({
-        type: 'import_answer',
-        version: 2,
-        signalTypes: {
-          Motor_Start: 'PLCInputBool',
-          ActualTemp: 'PLCInputInt',
-          Pressure: 'PLCInputFloat',
-        },
-        signals: {
-          Motor_Start: false,
-          ActualTemp: 234,
-          Pressure: 1.5,
-        },
-      }));
-
-      await connectPromise;
+      await iface.connect(defaultSettings());
 
       // All 3 signals discovered with the correct type + direction.
       const discovered = iface.discoveredSignals;
@@ -131,13 +121,9 @@ describe('WebSocketRealtimeInterface — import_answer registration', () => {
       expect(signalStore.get('ActualTemp')).toBe(234);
       expect(signalStore.get('Pressure')).toBe(1.5);
 
-      // A subsequent data delta is buffered and flushed to the store.
-      mockWs.simulateMessage(JSON.stringify({
-        type: 'data',
-        version: 2,
-        signals: { Motor_Start: true, ActualTemp: 240 },
-      }));
-      // Flush the incoming buffer (normally driven by onFixedUpdatePre).
+      // A subsequent coalesced delta (posted by the worker) is buffered and
+      // flushed to the store in onFixedUpdatePre — the unchanged flush path.
+      iface.port.emit({ type: 'delta', signals: { Motor_Start: true, ActualTemp: 240 } });
       iface.onFixedUpdatePre(0.016);
 
       expect(signalStore.get('Motor_Start')).toBe(true);
@@ -146,7 +132,6 @@ describe('WebSocketRealtimeInterface — import_answer registration', () => {
       expect(signalStore.get('Pressure')).toBe(1.5);
     } finally {
       iface.disconnect();
-      (globalThis as unknown as { WebSocket: unknown }).WebSocket = OriginalWebSocket;
     }
   });
 });

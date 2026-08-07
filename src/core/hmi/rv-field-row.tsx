@@ -29,6 +29,9 @@ import { FieldEditor } from './rv-field-editors';
 import { ReferenceDisplay, ScriptableObjectDisplay } from './rv-reference-display';
 import { InspectorRow } from './rv-inspector-row';
 
+const INK_LOW = 'rgba(255,255,255,0.5)';
+const HIT_MIN = 24;
+
 // ── Editability decision (pure, React-free → unit-testable) ─────────────────
 
 /**
@@ -36,13 +39,21 @@ import { InspectorRow } from './rv-inspector-row';
  * A field is editable only when it is a CONSUMED schema field, is not a
  * structural reference, and its schema descriptor does not mark it read-only for
  * display (`readonly:true` OR `scope:'des'` — DES-only config is never editable).
+ *
+ * plan-325: SIGNAL references (`isSignalRefType`) are the one reference kind
+ * that IS editable — as Unlink/Change through the SignalSlotRow binding path,
+ * never through a value editor. Pass `isSignalRef` to open the gate for them;
+ * sensor/drive/other structural references stay read-only.
  */
 export function isFieldEditable(
   status: FieldStatus,
   isReference: boolean,
   descriptor?: FieldDescriptor,
+  isSignalRef = false,
 ): boolean {
-  return status === 'consumed' && !isReference && !isFieldDisplayReadonly(descriptor);
+  return status === 'consumed'
+    && (!isReference || isSignalRef)
+    && !isFieldDisplayReadonly(descriptor);
 }
 
 // ── FieldRow ──────────────────────────────────────────────────────────────
@@ -59,9 +70,12 @@ export interface FieldRowProps {
   /** Schema descriptor for this field — supplies the optional `readonly` flag.
    *  Looked up and passed by the caller (rv-component-section). */
   descriptor?: FieldDescriptor;
+  /** Optional unit suffix for numeric fields (e.g. "mm", "mm/s"). Rendered inside
+   *  the number input (right) when editable, or after the value when read-only. */
+  unit?: string;
 }
 
-export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onReset, viewer, signalStore, descriptor }: FieldRowProps) {
+export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onReset, viewer, signalStore, descriptor, unit }: FieldRowProps) {
   const fieldType = inferFieldType(fieldName, value);
   const isReference = fieldType === 'reference' || fieldType === 'scriptableobject';
   // References are always read-only (structural links, not user-editable values);
@@ -71,21 +85,19 @@ export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onRes
   // value is consumed by the discrete-event scheduler, not the live view.
   const isDes = descriptor?.scope === 'des';
 
-  // Tooltip text
+  // Tooltip text \u2014 NOTE: reference fields intentionally get no row tooltip.
+  // The ReferenceDisplay / ScriptableObjectDisplay chip carries its own (richer)
+  // tooltip; adding a row tooltip too would show two overlapping tooltips at once.
   let tooltipText = '';
   if (status === 'ignored') tooltipText = 'Not used by WebViewer';
   else if (status === 'unknown') tooltipText = 'Unknown field \u2014 not mapped in WebViewer';
-  else if (isReference) {
-    if (isComponentRef(value)) {
-      const resolved = viewer?.registry?.getNode(value.path);
-      tooltipText = resolved ? `Linked \u2192 ${value.path}` : `Unlinked: ${value.path} not found`;
-    } else {
-      tooltipText = 'ScriptableObject reference';
-    }
-  } else if (isOverridden) tooltipText = 'Overridden \u2014 click dot to reset';
+  else if (isReference) tooltipText = '';
+  else if (isOverridden) tooltipText = 'Overridden \u2014 click dot to reset';
 
-  // Composite editors can't fit a 40% cap — let them span the full field width.
-  const fullWidthField = fieldType === 'vector3' || (fieldType === 'object' && isEditable);
+  // The editable object expander still spans the full field width; the (now
+  // compact) Vector3 editor fits the capped field column and right-aligns with
+  // the other input fields.
+  const fullWidthField = fieldType === 'object' && isEditable;
 
   const labelNode = (
     <>
@@ -93,7 +105,7 @@ export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onRes
       {isDes && (
         <Box
           component="span"
-          sx={{ ml: 0.5, fontSize: 9, color: 'text.disabled', fontStyle: 'italic' }}
+          sx={{ ml: 0.5, fontSize: 11, color: INK_LOW, fontStyle: 'italic' }}
         >
           (DES)
         </Box>
@@ -105,18 +117,18 @@ export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onRes
     <InspectorRow
       label={labelNode}
       labelTitle={isDes ? `${fieldName} — DES-only config (read-only in live view)` : fieldName}
-      labelColor={isEditable || isReference ? 'text.primary' : 'text.disabled'}
+      labelColor={isEditable || isReference ? 'text.primary' : INK_LOW}
       fullWidthField={fullWidthField}
       alignField={isReference ? 'end' : 'stretch'}
-      opacity={isEditable || isReference ? 1 : (status === 'consumed' ? 1 : 0.4)}
-      py={0.375}
+      opacity={isEditable || isReference ? 1 : (status === 'consumed' ? 1 : 0.5)}
       rowTooltip={tooltipText}
       dot={isOverridden ? (
         <IconButton
           size="small"
           onClick={(e) => { e.stopPropagation(); onReset(); }}
-          sx={{ p: 0, color: '#4fc3f7' }}
+          sx={{ width: HIT_MIN, height: HIT_MIN, p: 0, color: '#4fc3f7' }}
           title="Reset to default"
+          aria-label={`reset ${fieldName} to default`}
         >
           <Circle sx={{ fontSize: 7 }} />
         </IconButton>
@@ -127,19 +139,22 @@ export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onRes
       ) : isScriptableObject(value) ? (
         <ScriptableObjectDisplay value={value as Record<string, unknown>} />
       ) : isEditable ? (
-        <FieldEditor value={value} onChange={onEdit} fieldType={fieldType} fieldName={fieldName} editable />
+        <FieldEditor value={value} onChange={onEdit} fieldType={fieldType} fieldName={fieldName} editable unit={unit} />
       ) : (
         <Typography
           sx={{
             fontSize: 11,
             fontFamily: 'monospace',
-            color: 'text.disabled',
+            color: INK_LOW,
             overflow: 'hidden',
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
           }}
         >
           {formatDisplayValue(value)}
+          {unit && typeof value === 'number' ? (
+            <Box component="span" sx={{ color: INK_LOW, ml: 0.5 }}>{unit}</Box>
+          ) : null}
         </Typography>
       )}
     </InspectorRow>

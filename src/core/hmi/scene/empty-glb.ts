@@ -30,8 +30,14 @@ function emptySceneJson(): string {
   });
 }
 
-/** Build a binary GLB from the JSON above and return it as a blob: URL. */
-function buildEmptyGlbUrl(): string {
+/**
+ * The minimal valid GLB as a blob.
+ *
+ * Exported because a new *asset* has to be written to disk, not just handed to
+ * a loader: "New asset" creates a row that survives a reload, which means real
+ * bytes in the project's `library/` rather than an in-memory URL.
+ */
+export function buildEmptyGlbBlob(): Blob {
   // 1) JSON chunk payload — must be 4-byte aligned, pad with spaces (0x20).
   const enc = new TextEncoder();
   let json = emptySceneJson();
@@ -55,8 +61,7 @@ function buildEmptyGlbUrl(): string {
   // 5) JSON payload
   new Uint8Array(buf, 20, jsonBytes.byteLength).set(jsonBytes);
 
-  const blob = new Blob([buf], { type: 'model/gltf-binary' });
-  return URL.createObjectURL(blob);
+  return new Blob([buf], { type: 'model/gltf-binary' });
 }
 
 /**
@@ -65,6 +70,6 @@ function buildEmptyGlbUrl(): string {
  * leaking a new blob: URL each time the user creates a new layout.
  */
 export function getEmptyGlbUrl(): string {
-  if (!_cachedUrl) _cachedUrl = buildEmptyGlbUrl();
+  if (!_cachedUrl) _cachedUrl = URL.createObjectURL(buildEmptyGlbBlob());
   return _cachedUrl;
 }

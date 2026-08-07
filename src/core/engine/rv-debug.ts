@@ -9,7 +9,12 @@
  * Specific:    ?debug=playback,loader  or  localStorage.setItem('rv-debug', 'playback,loader')
  * Disable:     ?debug=none  or  localStorage.removeItem('rv-debug')
  *
- * In dev mode (Vite), 'loader' category is enabled by default.
+ * `verbose` is a MODIFIER, not a category: ?debug=loader,verbose additionally prints the
+ * per-item trace lines (one per node, mesh or alias) that {@link debugVerbose} emits.
+ * Without it those lines are buffered but stay off the console — a single demo model
+ * produces ~90 of them and buries the summaries that are worth reading.
+ *
+ * In dev mode (Vite), 'loader' category is enabled by default (without `verbose`).
  *
  * All log entries are always buffered in a ring buffer (500 entries) regardless
  * of active categories. Console output is still gated by active categories.
@@ -66,6 +71,9 @@ const LOG_BUFFER_SIZE = 500;
 /** Active debug categories (gate console output only, buffer always records) */
 const activeCategories = new Set<DebugCategory>();
 
+/** Verbose modifier — gates the per-item trace lines of the active categories */
+let verboseEnabled = false;
+
 /** Ring buffer for structured log entries */
 const logBuffer = new RingBuffer<LogEntry>(LOG_BUFFER_SIZE);
 
@@ -82,11 +90,18 @@ function init(): void {
   const params = new URLSearchParams(window.location.search);
   const debugParam = params.get('debug') ?? localStorage.getItem('rv-debug') ?? '';
 
-  if (debugParam === 'all') {
+  // 'verbose' is a modifier that travels in the same list as the categories — pull it
+  // out before matching the rest against ALL_CATEGORIES so that 'all,verbose' still
+  // enables every category (a plain === 'all' comparison would miss it).
+  const tokens = debugParam.split(',').map((t) => t.trim()).filter(Boolean);
+  verboseEnabled = tokens.includes('verbose');
+  const categories = tokens.filter((t) => t !== 'verbose');
+
+  if (categories.includes('all')) {
     ALL_CATEGORIES.forEach((c) => activeCategories.add(c));
-  } else if (debugParam && debugParam !== 'none') {
-    for (const cat of debugParam.split(',')) {
-      const trimmed = cat.trim() as DebugCategory;
+  } else if (categories.length > 0 && !categories.includes('none')) {
+    for (const cat of categories) {
+      const trimmed = cat as DebugCategory;
       if (ALL_CATEGORIES.includes(trimmed)) {
         activeCategories.add(trimmed);
       }
@@ -99,7 +114,7 @@ function init(): void {
   }
 
   if (activeCategories.size > 0) {
-    console.log(`[rv-debug] Active categories: ${[...activeCategories].join(', ')}`);
+    console.log(`[rv-debug] Active categories: ${[...activeCategories].join(', ')}${verboseEnabled ? ' (verbose)' : ''}`);
   }
 }
 
@@ -134,6 +149,16 @@ export function disableDebug(category: DebugCategory): void {
   activeCategories.delete(category);
 }
 
+/** Check if the verbose modifier is on */
+export function isVerboseEnabled(): boolean {
+  return verboseEnabled;
+}
+
+/** Toggle the verbose modifier at runtime */
+export function setVerbose(on: boolean): void {
+  verboseEnabled = on;
+}
+
 /** Structured debug log — always buffers, only prints to console if category is active */
 export function debug(category: DebugCategory, message: string, ...args: unknown[]): void {
   logBuffer.push({
@@ -145,6 +170,27 @@ export function debug(category: DebugCategory, message: string, ...args: unknown
     data: args.length === 1 ? args[0] : args.length > 0 ? args : undefined,
   });
   if (!activeCategories.has(category)) return;
+  console.log(`[${category}] ${message}`, ...args);
+}
+
+/**
+ * Per-item trace log — one line per node, mesh or alias.
+ *
+ * Always buffered at level 'trace' so the diagnostics panel and {@link queryLogs} keep the
+ * complete picture, but printed to the console ONLY when the category is active AND the
+ * `verbose` modifier is set (`?debug=loader,verbose`). Use this for anything that scales
+ * with model size; use {@link debug} for the summary that follows it.
+ */
+export function debugVerbose(category: DebugCategory, message: string, ...args: unknown[]): void {
+  logBuffer.push({
+    level: 'trace',
+    category,
+    message,
+    timestamp: Date.now(),
+    elapsed: elapsed(),
+    data: args.length === 1 ? args[0] : args.length > 0 ? args : undefined,
+  });
+  if (!verboseEnabled || !activeCategories.has(category)) return;
   console.log(`[${category}] ${message}`, ...args);
 }
 

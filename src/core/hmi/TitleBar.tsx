@@ -45,7 +45,7 @@ export function TitleBar() {
         gap: 1,
         px: 2,
         bgcolor: 'rgba(38,38,38,0.95)',
-        backdropFilter: 'blur(12px)',
+        backdropFilter: 'blur(calc(12px * var(--rv-ui-blur-scale, 1)))',
         borderBottom: '1px solid rgba(255,255,255,0.08)',
         color: 'rgba(255,255,255,0.92)',
         pointerEvents: 'auto',

@@ -27,8 +27,10 @@
 import type { RVViewer } from '../../core/rv-viewer';
 import type { RVViewerPlugin } from '../../core/rv-plugin';
 import type { UISlotEntry } from '../../core/rv-ui-plugin';
+import { modeContext } from '../../core/rv-mode-manager';
 import { USER_PAUSE_REASON } from '../../core/engine/rv-constants';
 import { SimControllerToolbar } from './SimControllerToolbar';
+import { ModeSwitchNotice } from './ModeSwitchNotice';
 
 /** The pause-reason key used by this plugin. Exported so tests + adjacent
  *  modules (e.g. config helpers) can reference it without typo risk.
@@ -50,13 +52,40 @@ export class SimControllerPlugin implements RVViewerPlugin {
 
   readonly slots: UISlotEntry[] = [
     // Leading slot renders BEFORE the Hierarchy button — primary sim controls
-    // (Play/Pause + Reset) live at the very start of the TopBar, right after
-    // the realvirtual logo / online indicator.
-    { slot: 'toolbar-button-leading', component: SimControllerToolbar, order: 10 },
-    // NOTE (plan-198): the old Realtime/DES execution toggle (SimModeToggle)
-    // was removed from the toolbar — DES is now a first-class workspace mode
-    // selected via the TopBar mode dropdown. The kernel execution mode (if the
-    // unified-sim path is enabled) is surfaced in the DES workspace instead.
+    // (Play/Pause + Reset + Speed) live at the very start of the TopBar, right
+    // after the realvirtual logo / online indicator.
+    //
+    // Visible only in the Planner workspace. Hidden in:
+    //   • DES (`mode:des`)  — the DESControllerToolbar (registered by
+    //     DESWorkspacePlugin) takes this slot instead, so the leading controls
+    //     reflect the active DES execution kernel.
+    //   • HMI (`mode:hmi`)  — the operator / monitoring view exposes no
+    //     Play/Pause/Reset/Speed controls; the twin is observed (or driven
+    //     externally in Live mode), not authored from this view.
+    // (plan-194 / plan-198.)
+    {
+      slot: 'toolbar-button-leading',
+      component: SimControllerToolbar,
+      order: 10,
+      visibilityId: 'sim-controller-continuous',
+      // Also hidden in the Editor workspace — it edits raw CAD geometry and has
+      // no simulation to play/pause/reset — and in the Viewer (plan-387), which
+      // is a pure spectator: the kinematics run, but nobody drives them from here.
+      visibilityRule: {
+        hiddenIn: [
+          modeContext('des'), modeContext('hmi'),
+          modeContext('editor'), modeContext('viewer'),
+        ],
+      },
+    },
+    // Always-mounted overlay (no visibility rule) so it catches every workspace
+    // switch and informs the user that switching clears MUs (no cross-mode
+    // continuity yet).
+    {
+      slot: 'overlay',
+      component: ModeSwitchNotice,
+      order: 10,
+    },
   ];
 
   /** Set in `onModelLoaded`. Used by `dispose()` for safety-net cleanup

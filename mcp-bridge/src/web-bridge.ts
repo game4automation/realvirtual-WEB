@@ -26,8 +26,16 @@ interface PendingCall {
 export interface WebBridgeOptions {
   port?: number;
   host?: string;
+  /** Fail when the requested port is busy instead of drifting upward. */
+  strictPort?: boolean;
   callTimeoutMs?: number;
   logger: Logger;
+  /** Same-port EADDRINUSE retries before drifting to the next port (default 12). */
+  bindRetries?: number;
+  /** Delay between same-port retries, ms (default 300). */
+  bindRetryDelayMs?: number;
+  /** How many ports above the requested one to probe before degrading (default 20). */
+  maxPortDrift?: number;
 }
 
 export interface WebBridgeEvents {
@@ -51,6 +59,10 @@ export class WebBridge {
   private _port: number;
   private readonly _callTimeoutMs: number;
   private readonly _log: Logger;
+  private readonly _strictPort: boolean;
+  private readonly _bindRetries: number;
+  private readonly _bindRetryDelayMs: number;
+  private readonly _maxPortDrift: number;
 
   private _wss: WebSocketServer | null = null;
   private _browser: WebSocket | null = null;
@@ -65,6 +77,10 @@ export class WebBridge {
     this._port = opts.port ?? DEFAULT_WEB_PORT;
     this._callTimeoutMs = opts.callTimeoutMs ?? 15000;
     this._log = opts.logger;
+    this._strictPort = opts.strictPort ?? false;
+    this._bindRetries = opts.bindRetries ?? 12;
+    this._bindRetryDelayMs = opts.bindRetryDelayMs ?? 300;
+    this._maxPortDrift = opts.maxPortDrift ?? 20;
   }
 
   on<E extends keyof WebBridgeEvents>(event: E, cb: WebBridgeEvents[E]): void {
@@ -86,65 +102,111 @@ export class WebBridge {
   }
 
   /**
-   * Start the WS server. Idempotent. Resolves once listening or on a graceful
-   * bind failure.
+   * Start the WS server. Idempotent. Resolves once listening or — only after
+   * exhausting both the same-port retries and the port-drift range — on a
+   * graceful bind failure.
    *
-   * On EADDRINUSE the port is usually held by a bridge from a just-killed host
-   * session that has not finished releasing it yet (TIME_WAIT / async close).
-   * Rather than degrade immediately, retry with a short backoff: combined with
-   * the host-death exit in index.ts, the previous owner frees the port within a
-   * few hundred ms and this bind then succeeds — turning a hard failure into a
-   * brief, self-healing delay. Only after exhausting the retries do we degrade.
+   * Two distinct EADDRINUSE causes are handled in order:
+   *
+   * 1. A bridge from a *just-killed* host session has not finished releasing the
+   *    canonical port yet (TIME_WAIT / async close). Retrying the SAME port with
+   *    a short backoff lets the previous owner free it within a few hundred ms,
+   *    so the reconnecting session keeps its canonical port (e.g. 18715). This
+   *    combines with the host-death exit in index.ts into a self-healing delay.
+   *
+   * 2. The canonical port is held by a *live concurrent* session (a second
+   *    Claude client). Retrying never helps, so instead of degrading to 0 tools
+   *    we DRIFT to the next free port and bind there: this session still gets a
+   *    fully working bridge (tools register normally); only the browser must be
+   *    pointed at the new port (WebViewer ▸ Settings ▸ AI Bridge). The bound port
+   *    is surfaced via `get port()` and the status frame.
    */
-  start(): Promise<void> {
-    if (this._wss) return Promise.resolve();
-    const maxAttempts = 12;
-    const retryDelayMs = 300;
+  async start(): Promise<void> {
+    if (this._wss) return;
+    const requestedPort = this._port;
 
-    const tryBind = (attempt: number): Promise<void> =>
-      new Promise((resolve) => {
-        let settled = false;
-        const wss = new WebSocketServer({ host: this._host, port: this._port });
-        this._wss = wss;
+    // Phase 1 — the canonical port, with backoff (self-heal a dying predecessor).
+    for (let attempt = 0; attempt <= this._bindRetries; attempt++) {
+      const outcome = await this._bindOnce(requestedPort);
+      if (outcome === 'listening') return;
+      if (outcome !== 'inuse') { this._failBind(`WebSocket server bind error: ${outcome.error.message}`); return; }
+      if (attempt < this._bindRetries) {
+        this._log.warn(
+          `Port ${requestedPort} busy (EADDRINUSE) — retry ${attempt + 1}/${this._bindRetries} in ` +
+            `${this._bindRetryDelayMs}ms (a previous bridge may still be releasing the port).`,
+        );
+        await this._delay(this._bindRetryDelayMs);
+      }
+    }
 
-        wss.on('listening', () => {
-          settled = true;
-          const addr = wss.address() as AddressInfo;
-          this._port = addr.port;
-          this._bindFailed = false;
-          this._log.info(`WebSocket bridge listening on ws://${this._host}:${this._port}/webviewer`);
-          resolve();
-        });
+    if (this._strictPort) {
+      this._bindFailed = true;
+      throw new Error(
+        `Strict WebViewer bridge port ${requestedPort} is already in use. ` +
+          'Stop the owning process or choose another --web-port; port drift is disabled.',
+      );
+    }
 
-        wss.on('connection', (ws) => this._onConnection(ws));
+    // Phase 2 — a live concurrent session owns the canonical port: drift upward
+    // to the next free port instead of degrading to 0 tools.
+    for (let offset = 1; offset <= this._maxPortDrift; offset++) {
+      const port = requestedPort + offset;
+      const outcome = await this._bindOnce(port);
+      if (outcome === 'listening') {
+        this._log.warn(
+          `Port ${requestedPort} is owned by another live WebViewer bridge (concurrent session). ` +
+            `This session bound the next free port ${port} instead — point the browser at ${port} ` +
+            `(WebViewer ▸ Settings ▸ AI Bridge) to connect it.`,
+        );
+        return;
+      }
+      if (outcome !== 'inuse') { this._failBind(`WebSocket server bind error on port ${port}: ${outcome.error.message}`); return; }
+    }
 
-        wss.on('error', (err: NodeJS.ErrnoException) => {
-          if (!settled) {
-            settled = true;
-            this._wss = null;
-            if (err.code === 'EADDRINUSE' && attempt < maxAttempts) {
-              this._log.warn(
-                `Port ${this._port} busy (EADDRINUSE) — retry ${attempt + 1}/${maxAttempts} in ${retryDelayMs}ms ` +
-                  `(a previous bridge is likely still releasing the port).`,
-              );
-              setTimeout(() => { void tryBind(attempt + 1).then(resolve); }, retryDelayMs);
-              return;
-            }
-            this._bindFailed = true;
-            this._log.error(
-              err.code === 'EADDRINUSE'
-                ? `Port ${this._port} still in use after ${maxAttempts} retries — another WebViewer bridge owns it. ` +
-                    `web_* tools will report "not connected". Use a different --web-port for a second session.`
-                : `WebSocket server bind error: ${err.message}`,
-            );
-            resolve();
-          } else {
-            this._log.error(`WebSocket server runtime error: ${err.message}`);
-          }
-        });
+    // Both phases exhausted — degrade.
+    this._failBind(
+      `No free WebViewer bridge port in ${requestedPort}..${requestedPort + this._maxPortDrift} — ` +
+        `web_* tools will report "not connected". Close some sessions or set a distinct --web-port.`,
+    );
+  }
+
+  /** One bind attempt. Resolves 'listening' (fully wired up), 'inuse', or a hard error. */
+  private _bindOnce(port: number): Promise<'listening' | 'inuse' | { error: Error }> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const wss = new WebSocketServer({ host: this._host, port });
+      this._wss = wss;
+
+      wss.on('listening', () => {
+        settled = true;
+        const addr = wss.address() as AddressInfo;
+        this._port = addr.port;
+        this._bindFailed = false;
+        this._log.info(`WebSocket bridge listening on ws://${this._host}:${this._port}/webviewer`);
+        resolve('listening');
       });
 
-    return tryBind(0);
+      wss.on('connection', (ws) => this._onConnection(ws));
+
+      wss.on('error', (err: NodeJS.ErrnoException) => {
+        if (!settled) {
+          settled = true;
+          this._wss = null;
+          resolve(err.code === 'EADDRINUSE' ? 'inuse' : { error: err });
+        } else {
+          this._log.error(`WebSocket server runtime error: ${err.message}`);
+        }
+      });
+    });
+  }
+
+  private _failBind(message: string): void {
+    this._bindFailed = true;
+    this._log.error(message);
+  }
+
+  private _delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   private _onConnection(ws: WebSocket): void {

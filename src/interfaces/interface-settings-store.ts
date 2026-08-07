@@ -41,6 +41,14 @@ export interface InterfaceSettings {
   mqttUsername: string;
   mqttPassword: string;
   mqttTopicPrefix: string;
+
+  // ── Signal table import (last-used, for pre-selection on next import) ──
+  /** Display name of the last imported signal table file. */
+  lastSignalTableName?: string;
+  /** Last tab filter pattern used for multi-tab (xlsx) imports. */
+  lastSheetPattern?: string;
+  /** Last MQTT topic prefix used for multi-tab (xlsx) imports. */
+  lastTopicPrefix?: string;
 }
 
 export const INTERFACE_DEFAULTS: InterfaceSettings = {
@@ -58,6 +66,10 @@ export const INTERFACE_DEFAULTS: InterfaceSettings = {
   mqttUsername: '',
   mqttPassword: '',
   mqttTopicPrefix: 'rv/',
+
+  lastSignalTableName: '',
+  lastSheetPattern: '',
+  lastTopicPrefix: '',
 };
 
 /** Load settings from localStorage (merged with defaults for forward-compat). */

@@ -11,9 +11,16 @@
  * Caching: Each AASX file is fetched and parsed once; the resulting
  * Promise is cached by filename. On rejection the cache entry is
  * deleted to allow retry.
+ *
+ * JSZip is pulled in through a DYNAMIC import at its single point of use
+ * (`doLoad`), not statically here. Statically it added ~96 kB to the entry
+ * chunk — the bundle every visitor downloads before the first frame — for a
+ * library that only runs when someone actually opens an AASX file. `import
+ * type` keeps the type available at zero runtime cost. Guarded by
+ * `tests/bundle-splitting.test.ts`.
  */
 
-import JSZip from 'jszip';
+import type JSZip from 'jszip';
 
 // ─── Types ──────────────────────────────────────────────────────────────
 
@@ -57,10 +64,26 @@ export interface AasIndexEntry {
   demoNote?: string;
 }
 
+/**
+ * Discriminated outcome of loading `aasx/index.json`.
+ *
+ * `loadIndex()` collapses every failure to `{}`, which cannot tell "the AASX
+ * feature was never shipped" (CONNECT embed: the whole `aasx/` folder is
+ * filtered out of the bundle) from "the index is there but broken" (network,
+ * 5xx, invalid JSON). The viewer must hide AAS surfaces in the first case and
+ * keep the visible error in the second — so the two are kept apart here.
+ */
+export type AasIndexResult =
+  | { kind: 'available'; index: Record<string, AasIndexEntry> }
+  /** 404, or an SPA history-fallback HTML page served with HTTP 200. */
+  | { kind: 'missing' }
+  /** Network failure, 5xx, or unparsable JSON — a broken deployment, not an absent feature. */
+  | { kind: 'error'; reason: string };
+
 // ─── Index ──────────────────────────────────────────────────────────────
 
 /** Per-basePath index cache. Empty string key = default (public/aasx). */
-const indexCache = new Map<string, Promise<Record<string, AasIndexEntry>>>();
+const indexCache = new Map<string, Promise<AasIndexResult>>();
 
 /**
  * Maps AAS IDs to their basePath so that tooltip components can load
@@ -70,11 +93,14 @@ const indexCache = new Map<string, Promise<Record<string, AasIndexEntry>>>();
 const aasIdBasePathMap = new Map<string, string>();
 
 /**
- * Fetch and cache the aasx/index.json. Returns empty object on failure.
+ * Fetch and cache the aasx/index.json, keeping "not shipped" apart from "broken".
+ * This is the canonical API; `loadIndex()` is a thin wrapper on the SAME cached
+ * promise, so there is never a second network round-trip.
+ *
  * @param basePath Optional base path for project-specific AASX (e.g. '/private-assets/myproject/').
  *                 Must end with '/'. When omitted, loads from the default public/aasx/ folder.
  */
-export function loadIndex(basePath?: string): Promise<Record<string, AasIndexEntry>> {
+export function loadIndexResult(basePath?: string): Promise<AasIndexResult> {
   const key = basePath ?? '';
   const existing = indexCache.get(key);
   if (existing) return existing;
@@ -82,10 +108,44 @@ export function loadIndex(basePath?: string): Promise<Record<string, AasIndexEnt
   const base = basePath ?? `${import.meta.env.BASE_URL}`;
   const url = `${base}aasx/index.json`;
   const promise = fetch(url, { signal: AbortSignal.timeout(10_000) })
-    .then(r => r.ok ? r.json() as Promise<Record<string, AasIndexEntry>> : {})
-    .catch(() => ({}));
+    .then(async (r): Promise<AasIndexResult> => {
+      if (r.status === 404) return { kind: 'missing' };
+      if (!r.ok) return { kind: 'error', reason: `HTTP ${r.status}` };
+      // SPA history fallback: a missing file comes back as index.html with 200.
+      // Content-Type is the only way to tell it apart — but a plain static host
+      // may serve valid JSON without a JSON type, so ONLY html is rejected here.
+      const contentType = r.headers?.get?.('content-type') ?? '';
+      if (/text\/html/i.test(contentType)) return { kind: 'missing' };
+      try {
+        const index = await r.json() as Record<string, AasIndexEntry>;
+        if (!index || typeof index !== 'object' || Array.isArray(index)) {
+          return { kind: 'error', reason: 'aasx/index.json is not an object' };
+        }
+        return { kind: 'available', index };
+      } catch (e) {
+        return { kind: 'error', reason: e instanceof Error ? e.message : String(e) };
+      }
+    })
+    .catch((e): AasIndexResult => ({
+      kind: 'error',
+      reason: e instanceof Error ? e.message : String(e),
+    }));
   indexCache.set(key, promise);
   return promise;
+}
+
+/**
+ * Fetch and cache the aasx/index.json. Returns empty object on failure.
+ *
+ * Legacy shape kept for every caller that only needs the entries: both `missing`
+ * and `error` collapse to `{}` exactly as before. Callers that must distinguish
+ * the two (the AAS resolution marking) use {@link loadIndexResult}.
+ *
+ * @param basePath Optional base path for project-specific AASX (e.g. '/private-assets/myproject/').
+ *                 Must end with '/'. When omitted, loads from the default public/aasx/ folder.
+ */
+export function loadIndex(basePath?: string): Promise<Record<string, AasIndexEntry>> {
+  return loadIndexResult(basePath).then(r => r.kind === 'available' ? r.index : {});
 }
 
 /** Reset the index cache (for testing). */
@@ -156,7 +216,9 @@ async function doLoad(filename: string, basePath?: string): Promise<AasParsedDat
   if (!response.ok) throw new Error(`Failed to load ${filename}: ${response.status}`);
 
   const cacheKey = basePath ? `${basePath}::${filename}` : filename;
-  const zipPromise = JSZip.loadAsync(await response.arrayBuffer());
+  // Kept off the entry chunk on purpose — see the module header.
+  const { default: JSZipLib } = await import('jszip');
+  const zipPromise = JSZipLib.loadAsync(await response.arrayBuffer());
   zipCache.set(cacheKey, zipPromise);
   const zip = await zipPromise;
 

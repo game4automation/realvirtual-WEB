@@ -16,7 +16,11 @@
 import type { Object3D, Vector2, Vector3, Quaternion } from 'three';
 import type { EventEmitter } from './rv-events';
 import type { ViewerEvents } from './rv-viewer-events';
-import type { SignalStore } from './engine/rv-signal-store';
+import type {
+  SignalStore,
+  SignalWriter,
+  SignalWriterKind,
+} from './engine/rv-signal-store';
 import type { NodeRegistry } from './engine/rv-node-registry';
 import type { RVDrive } from './engine/rv-drive';
 import type { RVTransportSurface } from './engine/rv-transport-surface';
@@ -114,9 +118,13 @@ export interface SimLoopFacade {
  * - Subscriptions immer via `BaseViewerPlugin.sub(off)` registrieren, damit
  *   `flushSubs()` bei `onModelCleared` automatisch aufräumt.
  */
+export type PluginSignalFacade =
+  Pick<SignalStore, 'get' | 'subscribe'>
+  & Pick<SignalWriter, 'set' | 'setMany'>;
+
 export interface PluginContext {
   /** Live-Getter: Subset von SignalStore. Null vor loadModel(). */
-  readonly signals: Pick<SignalStore, 'get' | 'set' | 'setMany' | 'subscribe'> | null;
+  readonly signals: PluginSignalFacade | null;
 
   /** Live-Getter: Subset von NodeRegistry. Null vor loadModel(). */
   readonly nodes: Pick<NodeRegistry, 'getNode' | 'getPathForNode' | 'forEachNode'> | null;
@@ -175,8 +183,14 @@ export class PluginContextImpl implements PluginContext {
   // Lazy-cached transport facade, invalidated when transportManager changes.
   private _transportCache: TransportFacade | null = null;
   private _transportCacheKey: object | null = null;
+  private _signalFacadeCache: PluginSignalFacade | null = null;
+  private _signalFacadeCacheKey: SignalStore | null = null;
 
-  constructor(private readonly _viewer: RVViewer) {
+  constructor(
+    private readonly _viewer: RVViewer,
+    private readonly _writerId = 'plugin-context',
+    private readonly _writerKind: SignalWriterKind = 'plugin',
+  ) {
     this.scene    = new SceneFacadeImpl(_viewer);
     this.camera   = new CameraFacadeImpl(_viewer);
     this.controls = new ControlsFacadeImpl(_viewer);
@@ -185,8 +199,32 @@ export class PluginContextImpl implements PluginContext {
 
   // ── Live getters: null vor loadModel(), neuer Pointer nach clearModel/loadModel ──
 
-  get signals(): Pick<SignalStore, 'get' | 'set' | 'setMany' | 'subscribe'> | null {
-    return this._viewer.signalStore;
+  get signals(): PluginSignalFacade | null {
+    const store = this._viewer.signalStore;
+    if (!store) {
+      this._signalFacadeCache = null;
+      this._signalFacadeCacheKey = null;
+      return null;
+    }
+    if (this._signalFacadeCacheKey !== store) {
+      const createWriter = store.createWriter?.bind(store);
+      const writer = createWriter
+        ? createWriter(this._writerId, this._writerKind)
+        : store;
+      this._signalFacadeCache = {
+        get: store.get.bind(store),
+        set: writer.set.bind(writer),
+        setMany: writer.setMany.bind(writer),
+        subscribe: store.subscribe.bind(store),
+      };
+      this._signalFacadeCacheKey = store;
+    }
+    return this._signalFacadeCache;
+  }
+
+  /** Create the capability bundle passed to one registered plugin. */
+  forPlugin(pluginId: string): PluginContextImpl {
+    return new PluginContextImpl(this._viewer, pluginId, pluginSignalWriterKind(pluginId));
   }
 
   get nodes(): Pick<NodeRegistry, 'getNode' | 'getPathForNode' | 'forEachNode'> | null {
@@ -225,7 +263,7 @@ export class PluginContextImpl implements PluginContext {
     };
   }
 
-  loadModel = (url: string, _opts?: { signalMap?: string }): Promise<void> => {
+  loadModel = (url: string, opts?: { signalMap?: string }): Promise<void> => {
     // RVViewer.loadModel returns Promise<LoadResult>; we discard the result (void contract).
     // The PluginContext.loadModel opts ({ signalMap? }) differ from RVViewer's ({ overlay? });
     // for Phase 4a we forward URL only — overlay support can be added in Phase 4b if needed.
@@ -242,4 +280,12 @@ export class PluginContextImpl implements PluginContext {
     // function; the cast routes through the untyped overload.
     (this._viewer.emit as (event: string, data?: unknown) => void)(event, data);
   };
+}
+
+/** Taxonomy overrides for built-in plugins with a more specific write origin. */
+export function pluginSignalWriterKind(pluginId: string): SignalWriterKind {
+  if (pluginId === 'multiuser') return 'remote';
+  if (pluginId === 'mcp-bridge') return 'mcp';
+  if (pluginId === 'debug-endpoint') return 'debug';
+  return 'plugin';
 }

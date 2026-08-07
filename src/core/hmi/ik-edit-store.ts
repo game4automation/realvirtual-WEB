@@ -21,20 +21,38 @@ export interface IKEditValues {
   pickAndPlace: boolean;
 }
 
+/** Numeric pose components editable in the quick-edit (world frame). */
+export type PoseField = 'x' | 'y' | 'z' | 'rx' | 'ry' | 'rz';
+
 export interface IKEditActive extends IKEditValues {
   /** Target node path (stable identity for React keys). */
   path: string;
   name: string;
   /** True while the current pose is reachable by the solver (red ring otherwise). */
   reachable: boolean;
+  /** Reachable IK configurations at the current pose (0 = no live solve). */
+  solutionCount: number;
+  /** 0-based index of the applied configuration within the reachable set (-1 = unknown). */
+  solutionIndex: number;
+  /** World position in millimeters (rounded to 0.1). */
+  poseMm: [number, number, number];
+  /** World rotation as XYZ Euler in degrees (rounded to 0.1). */
+  poseDeg: [number, number, number];
 }
 
 export interface IKEditController {
   setProp<K extends keyof IKEditValues>(field: K, value: IKEditValues[K]): void;
+  /** Set one world-pose component (mm for x/y/z, degrees for rx/ry/rz). */
+  setPose(field: PoseField, value: number): void;
+  /** Align the TCP orientation: nearest axis exactly world-down / snap to world axes. */
+  align(mode: 'down' | 'world'): void;
   /** Insert a new waypoint before / after the active one (interpolated pose). */
   addPoint(where: 'before' | 'after'): void;
   deleteTarget(): void;
-  driveHere(): void;
+  /** Step to the previous/next reachable IK configuration (elbow/shoulder/wrist branch). */
+  cycleSolution(dir: 1 | -1): void;
+  /** Show (dir) / hide (null) a ghost preview of the neighboring configuration. */
+  previewSolution(dir: 1 | -1 | null): void;
   close(): void;
 }
 
@@ -52,7 +70,7 @@ class IKEditStore {
     this._active = active; this._controller = controller; this._notify();
   }
   /** Merge changed editable values (after an edit) and re-render. */
-  updateValues(v: Partial<IKEditValues> & { reachable?: boolean }): void {
+  updateValues(v: Partial<IKEditValues> & Partial<Pick<IKEditActive, 'reachable' | 'solutionCount' | 'solutionIndex' | 'poseMm' | 'poseDeg'>>): void {
     if (!this._active) return;
     this._active = { ...this._active, ...v };
     this._notify();

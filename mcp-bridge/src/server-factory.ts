@@ -11,6 +11,8 @@ import { DEFAULT_WEB_PORT, type BridgeStatus } from './protocol.js';
 export interface BridgeServerOptions {
   port?: number;
   host?: string;
+  /** Fail when the requested WS port is busy instead of probing higher ports. */
+  strictPort?: boolean;
   /** Server `instructions` advertised at the MCP initialize handshake. */
   instructions?: string;
   callTimeoutMs?: number;
@@ -44,6 +46,7 @@ export function createBridgeServer(opts: BridgeServerOptions = {}): BridgeServer
   const bridge = new WebBridge({
     port: opts.port ?? DEFAULT_WEB_PORT,
     host: opts.host,
+    strictPort: opts.strictPort,
     callTimeoutMs: opts.callTimeoutMs,
     logger,
   });
@@ -107,17 +110,27 @@ export function createBridgeServer(opts: BridgeServerOptions = {}): BridgeServer
     }
 
     try {
-      const result = await bridge.callBrowser(name, args);
-      // Image tools return { __rvImage: { data, mimeType } } → emit MCP image content
-      // so the assistant sees an actual image instead of a base64 blob.
+      // Long-running tools (screenshot bursts, editor drive verify) announce a
+      // per-tool timeout in discover; undefined falls back to the bridge default.
+      const result = await bridge.callBrowser(name, args, registry.timeoutMs(name));
+      // Image tools return { __rvImage: { data, mimeType, ...metadata } } →
+      // emit MCP image content so the assistant sees an actual image. Any
+      // EXTRA fields (idmask legend, camera pose, bounds, crop rect, …) ride
+      // along as a second text block — machine-readable metadata instead of
+      // pixels burned into the frame.
       if (result.includes('__rvImage')) {
         try {
-          const img = (JSON.parse(result) as { __rvImage?: { data?: string; mimeType?: string } }).__rvImage;
-          if (img && typeof img.data === 'string' && img.data.length > 0) {
-            return {
-              content: [{ type: 'image', data: img.data, mimeType: img.mimeType ?? 'image/png' }],
-              isError: false,
-            };
+          const img = (JSON.parse(result) as { __rvImage?: Record<string, unknown> }).__rvImage;
+          const data = img?.data;
+          if (img && typeof data === 'string' && data.length > 0) {
+            const { data: _d, mimeType, width, height, ...meta } = img;
+            const content: Array<
+              { type: 'image'; data: string; mimeType: string } | { type: 'text'; text: string }
+            > = [{ type: 'image', data, mimeType: (mimeType as string) ?? 'image/png' }];
+            if (Object.keys(meta).length > 0) {
+              content.push({ type: 'text', text: JSON.stringify({ width, height, ...meta }) });
+            }
+            return { content, isError: false };
           }
         } catch { /* not an image payload — fall through to text */ }
       }

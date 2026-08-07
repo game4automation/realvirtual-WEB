@@ -4,11 +4,18 @@
 /**
  * Tests for the LayoutPlannerPlugin live-draft drag-in model.
  *
- * The dragged object is FULLY instantiated + registered on drag-ENTER (a real,
+ * The dragged object is instantiated + registered on drag-ENTER (a real,
  * selectable, gizmo-bearing placement) — only the store/undo commit is deferred
  * to drop. On cancel it is fully torn down. These tests drive that lifecycle at
- * the plugin level using a VIRTUAL catalog entry (a wireframe placeholder) so no
- * GLB has to be fetched.
+ * the plugin level using a VIRTUAL catalog entry (a wireframe gizmo) so no GLB
+ * has to be fetched.
+ *
+ * SCOPE (plan-371): a virtual entry takes the UNCHANGED branch of `_startDraft`
+ * — it needs no network, so it is instantiated in FULL mode immediately and
+ * never becomes a pending placement. The GLB branch, where a placeholder is
+ * registered in `light` mode and the real geometry swaps in later, is covered
+ * by `layout-planner-async-placement.test.ts`. `_startDraft` still returns a
+ * promise for this branch, hence the `await`s below.
  */
 import { describe, test, expect, vi } from 'vitest';
 import { Group, PerspectiveCamera } from 'three';
@@ -35,7 +42,7 @@ function createMockViewer() {
     markRenderDirty: vi.fn(),
     markShadowsDirty: vi.fn(),
     fitToNodes: vi.fn(),
-    highlighter: { highlight: vi.fn(), clear: vi.fn() },
+    highlighter: { highlight: vi.fn(), clear: vi.fn(), setAuxEmphasis: vi.fn() },
     outlineManager: {
       available: false, hasOutlines: false,
       setStyle: vi.fn(), setOutlined: vi.fn(), clear: vi.fn(), setSize: vi.fn(),
@@ -88,7 +95,19 @@ function internals(plugin: LayoutPlannerPlugin) {
   };
 }
 
-describe('LayoutPlannerPlugin — live-draft drag-in', () => {
+describe('LayoutPlannerPlugin — live-draft drag-in (virtual entries)', () => {
+  test('ENTER: a virtual entry never becomes a pending placeholder', async () => {
+    const { plugin } = makePlugin();
+    const p = internals(plugin);
+
+    await p._startDraft(VIRTUAL_ENTRY);
+
+    // Virtual entries are routed by the `virtual` FLAG, not by glbUrl
+    // truthiness — theirs is the empty string, not undefined (plan-371 §2.9).
+    expect(VIRTUAL_ENTRY.glbUrl).toBe('');
+    expect(p._draft!.node.userData._rvPendingPlaceholder).toBeUndefined();
+  });
+
   test('ENTER: _startDraft registers a hidden, real (non-ghost) draft', async () => {
     const { plugin } = makePlugin();
     const p = internals(plugin);

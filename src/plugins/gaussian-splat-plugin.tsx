@@ -23,7 +23,7 @@
  * Registration: viewer.registerLazy('gaussian-splat', ...)
  */
 
-import { Group, Points, PointsMaterial, BufferGeometry, Color, Vector3, Quaternion, Matrix4, Ray, Sphere, Box3 } from 'three';
+import { MathUtils, Group, Points, PointsMaterial, BufferGeometry, Color, Vector3, Quaternion, Matrix4, Ray, Sphere, Box3 } from 'three';
 import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { RVViewer } from '../core/rv-viewer';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
@@ -70,7 +70,7 @@ function showDomOverlay(message: string): void {
     <div style="display:flex;align-items:center;gap:14px;padding:14px 22px;
                 background:rgba(20,20,20,0.9);color:#fff;border-radius:8px;
                 box-shadow:0 8px 24px rgba(0,0,0,0.6);
-                border:1px solid rgba(255,255,255,0.08);backdrop-filter:blur(12px);">
+                border:1px solid rgba(255,255,255,0.08);backdrop-filter:blur(calc(12px * var(--rv-ui-blur-scale, 1)));">
       <div style="width:22px;height:22px;border:3px solid rgba(255,255,255,0.2);
                   border-top-color:#fff;border-radius:50%;
                   animation:rv-splat-spin 0.8s linear infinite;"></div>
@@ -384,9 +384,9 @@ export class GaussianSplatPlugin implements RVViewerPlugin {
       if (this._config.rotation) {
         const [x, y, z] = this._config.rotation;
         container.rotation.set(
-          x * Math.PI / 180,
-          y * Math.PI / 180,
-          z * Math.PI / 180,
+          MathUtils.degToRad(x),
+          MathUtils.degToRad(y),
+          MathUtils.degToRad(z),
         );
       }
       if (this._config.scale) {

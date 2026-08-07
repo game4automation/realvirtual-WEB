@@ -19,10 +19,13 @@
 import {
   Box3,
   BoxGeometry,
+  BufferAttribute,
+  BufferGeometry,
   CanvasTexture,
   CylinderGeometry,
   EdgesGeometry,
   Group,
+  Line,
   LineSegments,
   LineBasicMaterial,
   BackSide,
@@ -41,6 +44,11 @@ import { GizmoMaterialCache } from './rv-gizmo-material-cache';
 import { computeSubtreeAABB, traverseMeshesWithDepth } from './rv-traverse-utils';
 import { ISOLATE_FOCUS_LAYER, HIGHLIGHT_OVERLAY_LAYER } from './rv-group-registry';
 import { NO_AO_LAYER } from './rv-constants';
+import {
+  subscribeOverlayVisibility, getHiddenOverlays,
+  registerOverlayProducer, unregisterOverlayProducer,
+  type OverlayCategory,
+} from '../overlay-visibility-store';
 
 // ─── Public Types ─────────────────────────────────────────────────────
 
@@ -68,7 +76,12 @@ export type GizmoShape =
   | 'sphere-glow-hull'
   | 'sprite'
   | 'text'
-  | 'floor-disk';
+  | 'floor-disk'
+  /** Connection "cable" between two nodes (plan-259): a dedicated 2-point
+   *  BufferGeometry Line. Endpoints are updated PER FRAME by the owner via
+   *  {@link GizmoOverlayManager.updateLinkLine} — position writes + one
+   *  needsUpdate flag, never a rebuild/dispose per frame (no GC). */
+  | 'link-line';
 
 /** Options for creating or updating a gizmo. */
 export interface GizmoOptions {
@@ -97,6 +110,12 @@ export interface GizmoOptions {
   textAnchor?: 'top' | 'bottom';
   /** For shape='floor-disk' only — radius in world meters. Default = half of subtree XZ diagonal. */
   radius?: number;
+  /** For shape='mesh-edges' only — EdgesGeometry threshold angle in degrees: an
+   *  edge is drawn only where adjacent face normals diverge by more than this.
+   *  Default 30 (matches the hover/selection highlight silhouette — crisp
+   *  feature edges instead of a dense facet wireframe on curved parts).
+   *  Create-time only; not updatable via handle.update(). */
+  edgeThresholdDeg?: number;
   /** Optional emissive intensity for shape='sphere'. When > 0, the sphere uses a
    *  MeshStandardMaterial with `emissive: color, emissiveIntensity` so it glows
    *  through the existing UnrealBloomPass (when bloom is enabled). 0 / undefined
@@ -147,6 +166,13 @@ export interface GizmoOptions {
    *  it must be occluded by closer scene geometry. Such gizmos render with the
    *  scene and therefore still contribute to SSAO. */
   keepInComposer?: boolean;
+  /** Overlay-visibility category (plan-250). When set, this gizmo registers as
+   *  a producer of the category and is hidden whenever the user switches the
+   *  category off in the Display panel — on top of its own `visible` flag. */
+  category?: OverlayCategory;
+  /** For shape='link-line' only — the second endpoint node. The FIRST endpoint
+   *  is the gizmo's own `node`. Required for link-line. */
+  linkTo?: Object3D;
 }
 
 /** Handle returned when a gizmo is created. */
@@ -191,6 +217,8 @@ interface GizmoEntry {
   textAnchor?: 'top' | 'bottom';
   /** Floor-disk radius in world meters. */
   radius?: number;
+  /** 'mesh-edges' only: EdgesGeometry threshold angle in degrees. */
+  edgeThresholdDeg: number;
   /** Emissive intensity for sphere shape (>0 → MeshStandardMaterial; 0 → MeshBasic). */
   emissiveIntensity: number;
   /** Hull-scale multiplier for 'sphere-glow-hull' shape. */
@@ -215,6 +243,12 @@ interface GizmoEntry {
   /** When true the gizmo stays in the composer (bloom / depth-occlusion) and is
    *  NOT moved to the overlay layer. Auto-true for emissive (bloom) gizmos. */
   keepInComposer: boolean;
+  /** Overlay-visibility category (plan-250) or undefined if uncategorized. */
+  category?: OverlayCategory;
+  /** link-line only: the second endpoint node (first = entry.node). */
+  linkTo?: Object3D;
+  /** link-line only: the dedicated 2-point geometry (disposed with the entry). */
+  linkGeometry?: BufferGeometry;
 }
 
 // ─── Shared geometry cache ─────────────────────────────────────────────
@@ -250,6 +284,31 @@ function getDiskGeometry(): CylinderGeometry {
 
 const BLINK_LOW_MULT = 0.3;
 const MAX_OVERLAY_DEPTH = 5;
+
+/** Default 'mesh-edges' threshold (degrees) — same angle the hover/selection
+ *  highlight uses, so both render the same crisp silhouette edges. */
+const DEFAULT_MESH_EDGES_THRESHOLD_DEG = 30;
+
+/** EdgesGeometry cache for 'mesh-edges', keyed by source geometry → threshold.
+ *  Mirrors the RVHighlightManager edge cache: repeated highlights of the same
+ *  target reuse the once-computed edges instead of building (and leaking) a new
+ *  EdgesGeometry per create — entries free themselves when the source geometry
+ *  is garbage-collected. */
+const _meshEdgesCache = new WeakMap<BufferGeometry, Map<number, EdgesGeometry>>();
+
+function getCachedMeshEdges(geometry: BufferGeometry, thresholdDeg: number): EdgesGeometry {
+  let perThreshold = _meshEdgesCache.get(geometry);
+  if (!perThreshold) {
+    perThreshold = new Map();
+    _meshEdgesCache.set(geometry, perThreshold);
+  }
+  let edges = perThreshold.get(thresholdDeg);
+  if (!edges) {
+    edges = new EdgesGeometry(geometry, thresholdDeg);
+    perThreshold.set(thresholdDeg, edges);
+  }
+  return edges;
+}
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -302,6 +361,13 @@ export class GizmoOverlayManager {
   private _globalVisible = true;
   private _shapeOverride: GizmoShape | null = null;
   private _tagFilter: string | null = null;
+  /** User-hidden overlay categories (plan-250). Kept in sync via the store
+   *  subscription; consulted in `_shouldBeVisible`. */
+  private _hiddenCategories: ReadonlySet<OverlayCategory> = getHiddenOverlays();
+  /** Unsubscribe from the overlay-visibility store. Set up ONCE in the ctor and
+   *  torn down ONLY in `destroy()` (final viewer teardown) — NOT in `dispose()`,
+   *  which runs on every model switch. */
+  private _unsubscribeOverlay: () => void;
 
   // Preallocated temps (no GC)
   private _tmpV = new Vector3();
@@ -323,7 +389,17 @@ export class GizmoOverlayManager {
       addAuxRaycastTarget(mesh: Object3D, owner: Object3D): void;
       removeAuxRaycastTarget(mesh: Object3D): void;
     } | null,
-  ) {}
+  ) {
+    // Overlay-category subscription lives for the manager's whole life (the
+    // manager is a per-viewer singleton). On any category toggle, re-apply
+    // visibility to every current entry. NOT unsubscribed in dispose().
+    this._unsubscribeOverlay = subscribeOverlayVisibility(() => {
+      this._hiddenCategories = getHiddenOverlays();
+      for (const entry of this._entries.values()) {
+        entry.root.visible = this._shouldBeVisible(entry);
+      }
+    });
+  }
 
   private get raycastManager(): {
     addAuxRaycastTarget(mesh: Object3D, owner: Object3D): void;
@@ -382,6 +458,7 @@ export class GizmoOverlayManager {
       textOffsetY: opts.textOffsetY,
       textAnchor: opts.textAnchor,
       radius: opts.radius,
+      edgeThresholdDeg: opts.edgeThresholdDeg ?? DEFAULT_MESH_EDGES_THRESHOLD_DEG,
       emissiveIntensity: Math.max(0, opts.emissiveIntensity ?? 0),
       // Bloom gizmos need UnrealBloom (inside the composer) to glow → they can't
       // be moved to the post-composer overlay layer without losing the look.
@@ -403,12 +480,18 @@ export class GizmoOverlayManager {
       excludeFromRaycast: opts.excludeFromRaycast === true,
       userDataMarker: opts.userDataMarker,
       auxOwner: opts.auxOwner,
+      category: opts.category,
+      linkTo: opts.linkTo,
     };
 
     this._buildShape(entry);
 
     // Apply initial visibility (also considering global filters)
     entry.root.visible = this._shouldBeVisible(entry);
+
+    // Overlay-visibility presence (plan-250): count this gizmo as a live
+    // producer of its category (drives the Display panel's category list).
+    if (entry.category) registerOverlayProducer(entry.category);
 
     this._entries.set(id, entry);
     let ids = this._nodeToIds.get(node);
@@ -484,10 +567,14 @@ export class GizmoOverlayManager {
     }
   }
 
-  /** Per-frame blink tick — called directly from RVViewer.fixedUpdate. */
-  tick(_elapsedMs: number): void {
-    if (this._entries.size === 0) return;
+  /** Per-frame blink tick — called directly from RVViewer.fixedUpdate.
+   *  Returns true when at least one material opacity was written this tick,
+   *  so the caller can mark the render dirty (a blink phase flip must produce
+   *  a redraw even under the on-demand render loop). */
+  tick(_elapsedMs: number): boolean {
+    if (this._entries.size === 0) return false;
     const t = performance.now();
+    let changed = false;
     for (const meta of this._cache.values()) {
       if (meta.blinkHz <= 0) continue;
       const phase = Math.sin(2 * Math.PI * meta.blinkHz * t / 1000) > 0 ? 'on' : 'off';
@@ -497,7 +584,9 @@ export class GizmoOverlayManager {
       const baseOp = meta.baseOpacity;
       (mat as { opacity: number }).opacity =
         phase === 'on' ? baseOp : baseOp * BLINK_LOW_MULT;
+      changed = true;
     }
+    return changed;
   }
 
   dispose(): void {
@@ -507,6 +596,15 @@ export class GizmoOverlayManager {
     this._entries.clear();
     this._nodeToIds.clear();
     this._cache.clear();
+  }
+
+  /** Final teardown (plan-250): dispose entries AND unsubscribe from the
+   *  overlay-visibility store. Call this ONLY at true viewer teardown — the
+   *  per-model `dispose()` must NOT drop the subscription (it runs on every
+   *  model switch, which would leave later models unresponsive to toggles). */
+  destroy(): void {
+    this.dispose();
+    this._unsubscribeOverlay();
   }
 
   // ─── Shape factories ────────────────────────────────────────────────
@@ -545,6 +643,9 @@ export class GizmoOverlayManager {
         break;
       case 'floor-disk':
         this._buildFloorDisk(entry);
+        break;
+      case 'link-line':
+        this._buildLinkLine(entry);
         break;
     }
 
@@ -675,7 +776,7 @@ export class GizmoOverlayManager {
       MAX_OVERLAY_DEPTH,
       (m) => {
         if (m.userData?._rvGizmo) return;
-        const edges = new EdgesGeometry(m.geometry);
+        const edges = getCachedMeshEdges(m.geometry, entry.edgeThresholdDeg);
         const lines = new LineSegments(edges, lineMat);
         m.updateWorldMatrix(true, false);
         lines.position.setFromMatrixPosition(m.matrixWorld);
@@ -685,7 +786,7 @@ export class GizmoOverlayManager {
         lines.scale.copy(scl);
         lines.renderOrder = entry.renderOrder;
         group.add(lines);
-        // Track for dispose; per-mesh EdgesGeometry NOT shared (geometry-specific)
+        // Cached EdgesGeometry is shared across entries — never disposed here.
         entry.overlayMeshes.push(lines as unknown as Mesh);
       },
       '[GizmoOverlayManager] mesh-edges',
@@ -910,6 +1011,44 @@ export class GizmoOverlayManager {
     this.scene.add(mesh);
   }
 
+  /** Connection cable (plan-259): dedicated 2-point BufferGeometry Line from
+   *  `entry.node` to `entry.linkTo`, world-space, updated per frame via
+   *  {@link updateLinkLine} (setXYZ + needsUpdate — never rebuilt). */
+  private _buildLinkLine(entry: GizmoEntry): void {
+    const mat = this._getOrCreateLineMaterial(entry);
+    const geometry = new BufferGeometry();
+    const positions = new Float32Array(6);
+    geometry.setAttribute('position', new BufferAttribute(positions, 3));
+    const line = new Line(geometry, mat);
+    line.frustumCulled = false; // endpoints move every frame — skip stale-bounds culling
+    line.renderOrder = entry.renderOrder;
+    entry.root = line;
+    entry.material = mat;
+    entry.linkGeometry = geometry;
+    this.scene.add(line);
+    this._syncLinkLine(entry); // initial endpoint write
+  }
+
+  /** Write the CURRENT world positions of both endpoint nodes into the
+   *  link-line geometry (no allocation, no rebuild). */
+  private _syncLinkLine(entry: GizmoEntry): void {
+    const geo = entry.linkGeometry;
+    if (!geo || !entry.linkTo) return;
+    const attr = geo.getAttribute('position') as BufferAttribute;
+    entry.node.getWorldPosition(this._tmpV);
+    attr.setXYZ(0, this._tmpV.x, this._tmpV.y, this._tmpV.z);
+    entry.linkTo.getWorldPosition(this._tmpV);
+    attr.setXYZ(1, this._tmpV.x, this._tmpV.y, this._tmpV.z);
+    attr.needsUpdate = true;
+  }
+
+  /** Per-frame endpoint sync for one link-line handle (owner calls this from
+   *  its onRender hook). No-op for non-link-line handles. */
+  updateLinkLine(handleId: string): void {
+    const entry = this._entries.get(handleId);
+    if (entry?.shape === 'link-line') this._syncLinkLine(entry);
+  }
+
   private _buildText(entry: GizmoEntry): void {
     const label = entry.text ?? '';
     const canvas = makeTextCanvas(label, entry.color);
@@ -980,7 +1119,7 @@ export class GizmoOverlayManager {
     // prefix (note: emissive spheres are released under the no-prefix path,
     // matching the original behavior; the `em_` cache entry remains until
     // manager dispose).
-    const kind: 'mesh' | 'line' = entry.shape === 'box' ? 'line' : 'mesh';
+    const kind: 'mesh' | 'line' = (entry.shape === 'box' || entry.shape === 'link-line') ? 'line' : 'mesh';
     this._cache.release(this._cacheInputs(entry), kind);
   }
 
@@ -1121,6 +1260,8 @@ export class GizmoOverlayManager {
   private _shouldBeVisible(entry: GizmoEntry): boolean {
     if (!this._globalVisible) return false;
     if (!entry.visible) return false;
+    // Overlay-visibility category gate (plan-250).
+    if (entry.category && this._hiddenCategories.has(entry.category)) return false;
     if (this._tagFilter !== null) {
       const tag = entry.node.userData?._rvTag;
       if (tag !== this._tagFilter) return false;
@@ -1129,8 +1270,13 @@ export class GizmoOverlayManager {
   }
 
   private _disposeEntry(entry: GizmoEntry): void {
+    // Idempotency guard (plan-250): `handle.dispose()` may run after `clearNode`
+    // or twice. Without this, `unregisterOverlayProducer` would fire more than
+    // once and corrupt the shared category refcount.
+    if (!this._entries.has(entry.id)) return;
     this._disposeEntryVisuals(entry);
     this._entries.delete(entry.id);
+    if (entry.category) unregisterOverlayProducer(entry.category);
     const ids = this._nodeToIds.get(entry.node);
     if (ids) {
       ids.delete(entry.id);
@@ -1164,6 +1310,11 @@ export class GizmoOverlayManager {
     } else {
       // Shared materials: refcount
       this._releaseMaterial(entry);
+    }
+    // link-line: the 2-point geometry is dedicated (per entry) — free it.
+    if (entry.linkGeometry) {
+      entry.linkGeometry.dispose();
+      entry.linkGeometry = undefined;
     }
     entry.overlayMeshes.length = 0;
   }

@@ -11,13 +11,14 @@
  * remove), not every render frame.
  */
 
-import { useSyncExternalStore, useCallback, useMemo, useState, type MouseEvent } from 'react';
-import { PlayArrow, Pause, Replay, Speed } from '@mui/icons-material';
-import { Menu, MenuItem } from '@mui/material';
+import { useSyncExternalStore, useCallback, useMemo, useState, useEffect, type MouseEvent } from 'react';
+import { PlayArrow, Pause, Replay, Speed, Schedule } from '@mui/icons-material';
+import { Menu, MenuItem, Box } from '@mui/material';
 import type { UISlotProps } from '../../core/rv-ui-plugin';
 import { ActionSegment, ActionDivider } from '../../core/hmi/action-group';
 import { SIM_CONTROLLER_PAUSE_REASON } from './index';
 import { getDriveSpeedOverride, setDriveSpeedOverride, subscribeDriveSpeedOverride } from '../../core/engine/rv-speed-override';
+import { formatSimClock } from './format-sim-time';
 
 /** Snapshot shape returned by `getPauseSnapshot`. Compared by reference so
  *  `useSyncExternalStore` re-renders only when the underlying state changes. */
@@ -28,12 +29,14 @@ interface PauseSnapshot {
   version: number;
 }
 
-export function SimControllerToolbar({ viewer }: UISlotProps) {
-  // Local version counter — bumped on every pause-changed event. The snapshot
-  // factory closes over this counter, so React sees a stable object identity
-  // between events and re-renders only when something actually changes.
-  // We persist the version + last snapshot on the viewer via WeakMap-like
-  // attachment so concurrent toolbar consumers share the same source of truth.
+/**
+ * Play/Pause toggle segment — toggles the user pause reason and reflects the
+ * ACTUAL sim state (paused by ANY reason). Exported so other toolbars (e.g. the
+ * DES controller toolbar) reuse the exact same control + behaviour. Works for
+ * both the continuous and the DES execution mode: pausing holds the whole fixed
+ * loop, so `kernel.tick()` (continuous OR DES) is skipped uniformly.
+ */
+export function PlayPauseSegment({ viewer }: UISlotProps) {
   const { subscribe, getSnapshot } = useMemo(() => makeStore(viewer), [viewer]);
   const snap = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
@@ -42,10 +45,6 @@ export function SimControllerToolbar({ viewer }: UISlotProps) {
   const handleTogglePlayPause = useCallback(() => {
     viewer.setSimulationPaused(SIM_CONTROLLER_PAUSE_REASON, !userPaused);
   }, [viewer, userPaused]);
-
-  const handleReset = useCallback(() => {
-    viewer.resetSimulation();
-  }, [viewer]);
 
   // Icon reflects the ACTUAL sim state (paused by ANY reason — user, planner
   // 'layout-edit', AR, …) so the toolbar shows "paused" whenever the sim is
@@ -66,26 +65,75 @@ export function SimControllerToolbar({ viewer }: UISlotProps) {
   const pausedByOther = snap.paused && !userPaused;
   const playPauseColor = userPaused ? 'primary.main' : pausedByOther ? 'warning.main' : 'inherit';
 
+  return (
+    <ActionSegment
+      title={playPauseTitle}
+      onClick={handleTogglePlayPause}
+      color={playPauseColor}
+      icon={playPauseIcon}
+      buttonProps={{ 'data-testid': 'sim-controller-playpause' }}
+    />
+  );
+}
+
+/**
+ * Reset segment — clears MUs + LogicSteps via `resetSimulation()` (which also
+ * resets the active kernel executor, so it works in DES mode too). Exported for
+ * reuse by the DES controller toolbar.
+ */
+export function ResetSegment({ viewer }: UISlotProps) {
+  const handleReset = useCallback(() => {
+    viewer.resetSimulation();
+  }, [viewer]);
+
+  return (
+    <ActionSegment
+      title="Reset MUs and LogicSteps (Shift+R)"
+      onClick={handleReset}
+      icon={<Replay />}
+      buttonProps={{ 'data-testid': 'sim-controller-reset' }}
+    />
+  );
+}
+
+/**
+ * Elapsed-simulation-time display (DD:HH:MM:SS.s). Polls `viewer.simTime` (the
+ * continuous fixed-step accumulator) so the planner shows the running sim clock
+ * during Play — the continuous parallel to the DES toolbar clock. Holds while
+ * paused, returns to 0 on Reset.
+ */
+function SimClockSegment({ viewer }: UISlotProps) {
+  const [t, setT] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setT(viewer.simTime ?? 0), 200);
+    return () => clearInterval(id);
+  }, [viewer]);
+  return (
+    <Box
+      sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.5, px: 0.75, height: '100%', whiteSpace: 'nowrap' }}
+      data-testid="sim-clock"
+      title="Elapsed simulation time"
+    >
+      <Schedule sx={{ fontSize: 18, color: 'text.secondary' }} />
+      <Box component="span" sx={{ fontFamily: 'ui-monospace, monospace', fontSize: 11, fontWeight: 600, color: '#4fc3f7', letterSpacing: 0.3 }}>
+        {formatSimClock(t)}
+      </Box>
+    </Box>
+  );
+}
+
+export function SimControllerToolbar({ viewer }: UISlotProps) {
   // Segmented action group (shared design): full-height rectangular segments
   // split by a divider. The pill wrapper is provided by the host (TopBar).
   return (
     <>
-      <ActionSegment
-        title={playPauseTitle}
-        onClick={handleTogglePlayPause}
-        color={playPauseColor}
-        icon={playPauseIcon}
-        buttonProps={{ 'data-testid': 'sim-controller-playpause' }}
-      />
+      <PlayPauseSegment viewer={viewer} />
       <ActionDivider />
-      <ActionSegment
-        title="Reset MUs and LogicSteps (Shift+R)"
-        onClick={handleReset}
-        icon={<Replay />}
-        buttonProps={{ 'data-testid': 'sim-controller-reset' }}
-      />
+      <ResetSegment viewer={viewer} />
       <ActionDivider />
       <SpeedSelector />
+      <ActionDivider />
+      <SimClockSegment viewer={viewer} />
     </>
   );
 }

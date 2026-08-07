@@ -13,8 +13,9 @@
  */
 
 import { useEffect, useRef, useSyncExternalStore, createElement } from 'react';
-import { Box } from '@mui/material';
+import { Box, Typography, IconButton } from '@mui/material';
 import DragIndicatorIcon from '@mui/icons-material/DragIndicator';
+import CloseIcon from '@mui/icons-material/Close';
 import { popoverStore, popoverContentRegistry } from './popover-store';
 import { projectPointToScreen } from './tooltip/tooltip-utils';
 import { getUIZoom } from './visual-settings-store';
@@ -53,8 +54,19 @@ export function AnchoredPopover() {
         const s = projectPointToScreen(req.getWorld(), viewer.camera, viewer.renderer);
         if (s.visible) {
           const zoom = getUIZoom() || 1;
-          el.style.left = ((s.x + ox + dragRef.current.x) / zoom) + 'px';
-          el.style.top = ((s.y + oy + dragRef.current.y) / zoom) + 'px';
+          const margin = 8;
+          const vw = window.innerWidth / zoom;
+          const vh = window.innerHeight / zoom;
+          const w = el.offsetWidth;
+          const h = el.offsetHeight;
+          let left = (s.x + ox + dragRef.current.x) / zoom;
+          let top = (s.y + oy + dragRef.current.y) / zoom;
+          // Clamp into the viewport so the whole panel stays visible (never clipped
+          // off-screen); if it is larger than the viewport, pin to the top-left margin.
+          if (w > 0) left = Math.min(Math.max(margin, left), Math.max(margin, vw - w - margin));
+          if (h > 0) top = Math.min(Math.max(margin, top), Math.max(margin, vh - h - margin));
+          el.style.left = left + 'px';
+          el.style.top = top + 'px';
           el.style.visibility = 'visible';
         } else {
           el.style.visibility = 'hidden';
@@ -88,23 +100,49 @@ export function AnchoredPopover() {
       sx={{
         position: 'fixed', left: 0, top: 0, visibility: 'hidden',
         pointerEvents: 'auto', zIndex: 1250,
-        bgcolor: 'rgba(18,18,18,0.92)', backdropFilter: 'blur(12px)',
+        // Same translucent grey glass as the theme's Paper default (and the
+        // error/alarm tiles), so every draggable window shares one surface tier.
+        bgcolor: 'rgba(30,30,30,0.6)', backdropFilter: 'blur(calc(16px * var(--rv-ui-blur-scale, 1)))',
         border: '1px solid rgba(255,255,255,0.12)', borderRadius: 1,
-        boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
+        // The popover floats outside the app's font cascade — without this,
+        // plain (non-Typography) content falls back to the browser serif.
+        fontFamily: (t) => t.typography.fontFamily,
         willChange: 'left, top',
       }}
     >
-      {/* Drag grip — move the panel aside if it covers something. */}
+      {/* Drag titlebar — shows the title + close when the request provides one
+          (compact window), else just the drag grip. */}
       <Box
         onPointerDown={onGripDown}
         sx={{
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          height: 16, cursor: 'move', color: 'rgba(255,255,255,0.4)',
+          display: 'flex', alignItems: 'center', gap: 0.5,
+          px: req.title ? 1 : 0, minHeight: req.title ? 22 : 16, cursor: 'move',
+          color: 'rgba(255,255,255,0.4)',
           borderBottom: '1px solid rgba(255,255,255,0.08)',
           borderRadius: '4px 4px 0 0', '&:hover': { color: 'rgba(255,255,255,0.7)' },
         }}
       >
-        <DragIndicatorIcon sx={{ fontSize: 14, transform: 'rotate(90deg)' }} />
+        {req.title ? (
+          <>
+            <DragIndicatorIcon sx={{ fontSize: 13, transform: 'rotate(90deg)', flexShrink: 0 }} />
+            <Typography sx={{ fontSize: 11, fontWeight: 700, color: '#4fc3f7', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {req.title}
+            </Typography>
+            <IconButton
+              size="small"
+              aria-label="close"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => popoverStore.hide(req.id)}
+              sx={{ p: 0.25, color: 'rgba(255,255,255,0.6)', '&:hover': { color: '#fff' } }}
+            >
+              <CloseIcon sx={{ fontSize: 14 }} />
+            </IconButton>
+          </>
+        ) : (
+          <Box sx={{ flex: 1, display: 'flex', justifyContent: 'center' }}>
+            <DragIndicatorIcon sx={{ fontSize: 14, transform: 'rotate(90deg)' }} />
+          </Box>
+        )}
       </Box>
       <Box sx={{ px: 1.25, py: 1 }}>{createElement(Content)}</Box>
     </Box>

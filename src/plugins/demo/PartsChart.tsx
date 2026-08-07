@@ -10,7 +10,7 @@
 
 import { useEffect } from 'react';
 import { Box } from '@mui/material';
-import { ChartPanel } from '../../core/hmi/ChartPanel';
+import { FloatingPanel } from '../../core/hmi/FloatingPanel';
 import { useKpiData } from '../../hooks/use-kpi-data';
 import { movingAverage } from '../../core/hmi/kpi-utils';
 import { useEChart } from '../../hooks/use-echart';
@@ -30,10 +30,10 @@ function barColor(value: number, target: number): string {
 
 export function PartsChart({ open, onClose }: PartsChartProps) {
   const kpi = useKpiData();
-  const { containerRef: chartRef, chartInstance } = useEChart({ open });
+  const { containerRef: chartRef, chartInstance, isReady } = useEChart({ open });
 
   useEffect(() => {
-    if (!open || !kpi) return;
+    if (!open || !kpi || !isReady) return;
     const timer = setTimeout(() => {
       const chart = chartInstance.current;
       if (!chart) return;
@@ -93,10 +93,10 @@ export function PartsChart({ open, onClose }: PartsChartProps) {
       );
     }, 100);
     return () => clearTimeout(timer);
-  }, [open, kpi]);
+  }, [open, kpi, isReady]);
 
   return (
-    <ChartPanel
+    <FloatingPanel
       open={open}
       onClose={onClose}
       title="Parts per Hour"
@@ -107,6 +107,6 @@ export function PartsChart({ open, onClose }: PartsChartProps) {
       zIndex={1400}
     >
       <Box ref={chartRef} sx={{ flex: 1, minHeight: 0 }} />
-    </ChartPanel>
+    </FloatingPanel>
   );
 }

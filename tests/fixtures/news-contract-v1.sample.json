@@ -1,0 +1,41 @@
+{
+  "contract": 1,
+  "items": [
+    {
+      "id": "66a111111111111111111111",
+      "title": "Geplantes Wartungsfenster",
+      "body": "Am Samstag wird die Plattform zwischen **08:00 und 09:00 UTC** gewartet. Laufende lokale Simulationen sind davon nicht betroffen.",
+      "link": null,
+      "validFrom": "2026-07-25T09:00:00.000Z",
+      "validTo": null,
+      "updatedAt": "2026-07-25T09:30:00.000Z"
+    },
+    {
+      "id": "66a222222222222222222222",
+      "title": "Neuer Layout Planner verfügbar",
+      "body": "Der Layout Planner unterstützt jetzt schnellere Snap-Vorschläge und eine übersichtlichere Komponentenbibliothek.",
+      "link": "https://doc.realvirtual.io/release-notes",
+      "validFrom": "2026-07-24T08:00:00.000Z",
+      "validTo": "2026-09-01T00:00:00.000Z",
+      "updatedAt": "2026-07-24T08:15:00.000Z"
+    },
+    {
+      "id": "66a333333333333333333333",
+      "title": "CONNECT Diagnose verbessert",
+      "body": "Neue Diagnoseansichten helfen beim Prüfen von Signalqualität, Verbindungen und Gateway-Status.",
+      "link": "https://doc.realvirtual.io",
+      "validFrom": "2026-07-23T12:00:00.000Z",
+      "validTo": null,
+      "updatedAt": "2026-07-23T12:20:00.000Z"
+    },
+    {
+      "id": "66a444444444444444444444",
+      "title": "Hinweis zu Release Notes",
+      "body": "Die vollständigen Änderungen und Hinweise zur Kompatibilität finden Sie in den aktuellen Release Notes.",
+      "link": null,
+      "validFrom": "2026-07-22T07:00:00.000Z",
+      "validTo": "2026-08-31T23:59:59.000Z",
+      "updatedAt": "2026-07-22T07:05:00.000Z"
+    }
+  ]
+}

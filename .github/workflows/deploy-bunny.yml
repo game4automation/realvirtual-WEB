@@ -35,6 +35,8 @@ jobs:
           BUNNY_STORAGE_KEY: ${{ secrets.BUNNY_STORAGE_KEY }}
           BUNNY_ACCOUNT_KEY: ${{ secrets.BUNNY_ACCOUNT_KEY }}
           GA_MEASUREMENT_ID: ${{ secrets.GA_MEASUREMENT_ID }}
+          NEWS_API_URL: ${{ vars.NEWS_API_URL }}
+          NEWS_DISABLE: ${{ vars.NEWS_DISABLE }}
         run: npm run deploy
 
       - name: Public URL

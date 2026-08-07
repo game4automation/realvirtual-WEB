@@ -280,6 +280,29 @@ describe('computeModePluginSets — participation math', () => {
     expect(s.deactivateHooks.map((p) => p.id)).toEqual(['hmi1']);
   });
 
+  it('keeps the default predicate byte-equivalent to an explicit no-op', () => {
+    const disabled = new Set(['plan1']);
+    const isDisabled = (id: string) => disabled.has(id);
+    expect(computeModePluginSets(all, isDisabled, 'hmi', 'planner')).toEqual(
+      computeModePluginSets(all, isDisabled, 'hmi', 'planner', () => false),
+    );
+  });
+
+  it('keeps user-disabled plugins out of enable and both mode hook sets', () => {
+    const disabled = new Set(['plan1']);
+    const userDisabled = new Set(['hmi1', 'plan1']);
+    const s = computeModePluginSets(
+      all,
+      (id) => disabled.has(id),
+      'hmi',
+      'planner',
+      (id) => userDisabled.has(id),
+    );
+    expect(s.enable).toEqual([]);
+    expect(s.activateHooks).toEqual([]);
+    expect(s.deactivateHooks).toEqual([]);
+  });
+
   it('modeContext formats the context name', () => {
     expect(modeContext('planner')).toBe('mode:planner');
   });

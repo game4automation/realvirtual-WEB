@@ -35,6 +35,10 @@ export const PLUGIN_ORDER = {
   MULTIUSER: 15,
   /** UI-critical: annotation overlays, sim-controller HMI. */
   UI_CRITICAL: 50,
+  /** Virtual PLC scan cycle (plan-242). Runs in TickStage.PRE AFTER the
+   *  signalBindingManager flush (order 50) so every scan reads the freshest
+   *  live signal values, and before the drive physics consume the outputs. */
+  PLC_RUNTIME: 60,
   /** Default order if not specified. */
   SIM_DEFAULT: 100,
   /** Demo / process-specific (process-industry, machine-control). */

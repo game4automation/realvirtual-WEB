@@ -11,6 +11,6 @@
 
 import type { RVViewer } from '../core/rv-viewer';
 
-export function registerPrivatePlugins(_viewer: RVViewer): void {
+export async function registerPrivatePlugins(_viewer: RVViewer): Promise<void> {
   // No private plugins available in public build
 }

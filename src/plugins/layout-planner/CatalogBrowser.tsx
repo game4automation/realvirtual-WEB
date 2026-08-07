@@ -20,7 +20,7 @@ import type { ReactNode } from 'react';
 import { Box, Typography, TextField, Chip, Tooltip, IconButton, InputAdornment } from '@mui/material';
 import { Search } from '@mui/icons-material';
 import { RV_SCROLL_CLASS, filterChipSx } from '../../core/hmi/shared-sx';
-import type { LibraryChip } from './library-chips';
+import type { LibraryChip } from '../../core/library/library-chips';
 
 export interface CatalogBrowserAction {
   key: string;
@@ -31,7 +31,27 @@ export interface CatalogBrowserAction {
   color?: string;
 }
 
+/**
+ * How dense the card grid is (plan-372 Phase 6).
+ *
+ * `compact` is the planner's narrow left panel; `comfortable` is the Projects
+ * dashboard, which has the full viewport width and can afford readable cards.
+ * The variant is the *only* thing that decides column width — there is exactly
+ * one grid definition in the codebase and it lives below, so a second browser
+ * can never drift out of alignment with the first.
+ */
+export type CatalogBrowserVariant = 'compact' | 'comfortable';
+
+/** Minimum card width per variant. Single source of truth for the grid. */
+export const CARD_MIN_WIDTH_PX: Record<CatalogBrowserVariant, number> = {
+  compact: 72,
+  comfortable: 148,
+};
+
 export interface CatalogBrowserProps {
+  /** Grid density. Defaults to `compact` (the planner panel's historical look). */
+  variant?: CatalogBrowserVariant;
+
   /** Leading header icon (e.g. folder / cloud). Omit for plain catalogs. */
   headerIcon?: ReactNode;
   /** Header text — typically "<n> assets — <name>". Omit to hide the header. */
@@ -72,6 +92,7 @@ const SEARCH_ROOT_SX = {
 } as const;
 
 export function CatalogBrowser({
+  variant = 'compact',
   headerIcon,
   headerText,
   headerActions,
@@ -170,7 +191,7 @@ export function CatalogBrowser({
             sx={{
               px: 0.75,
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fill, minmax(72px, 1fr))',
+              gridTemplateColumns: `repeat(auto-fill, minmax(${CARD_MIN_WIDTH_PX[variant]}px, 1fr))`,
               gap: 0.75,
             }}
           >

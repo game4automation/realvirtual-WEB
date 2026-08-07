@@ -32,6 +32,10 @@ export interface ToolEntry {
   methodKey: string;
   /** Ordered parameter definitions */
   params: ParamEntry[];
+  /** Per-call timeout in ms for the Node bridge (overrides its 15 s default). */
+  timeoutMs?: number;
+  /** Side-effect classification; drives `annotations.readOnlyHint` in discover. */
+  readOnly?: boolean;
 }
 
 export interface ParamEntry {
@@ -45,6 +49,18 @@ export interface ParamEntry {
   required: boolean;
 }
 
+/**
+ * MCP standard tool annotations (spec revision 2025-03-26, unchanged since).
+ *
+ * Only `readOnlyHint` is announced: the bridge servers use it as the write gate, and the MCP
+ * client shows it. It is a HINT, never an authorisation boundary — the browser decides what a
+ * tool actually does, so a server-side name list would be no stronger. Both bridges therefore
+ * treat a missing or false hint as a write (secure by default).
+ */
+export interface McpToolAnnotations {
+  readOnlyHint: boolean;
+}
+
 export interface ToolSchema {
   name: string;
   description: string;
@@ -53,6 +69,10 @@ export interface ToolSchema {
     properties: Record<string, { type: string; description: string }>;
     required: string[];
   };
+  /** Standard MCP annotations; forwarded verbatim to `tools/list` by both bridges. */
+  annotations?: McpToolAnnotations;
+  /** Per-call timeout hint for the bridge; stripped before the MCP client sees the tool list. */
+  timeoutMs?: number;
 }
 
 // ── Metadata storage ──
@@ -98,13 +118,32 @@ export function toSnakeCase(str: string): string {
 
 // ── Decorators ──
 
+/** Optional per-tool settings for {@link McpTool}. */
+export interface McpToolOptions {
+  /** Per-call timeout in ms the bridge should apply (default: its 15 s). */
+  timeoutMs?: number;
+  /**
+   * Side-effect classification, announced as `annotations.readOnlyHint`.
+   *
+   * `true` only for tools that change NOTHING an operator or a later call can observe — not the
+   * model, not signals, not the simulation, and not the viewport. Camera moves, selection and
+   * isolation are therefore `false`: they persist nothing, but a watching operator sees the view
+   * jump, which is a surprise on a running plant, not a feature.
+   *
+   * Every tool must set this explicitly — `rv-mcp-tool-conventions.test.ts` fails otherwise. A
+   * missing value means "write" everywhere downstream, so an unclassified tool silently
+   * disappears for read-only clients instead of leaking a mutation.
+   */
+  readOnly?: boolean;
+}
+
 /**
  * Marks a method as an MCP tool (like Unity's [McpTool]).
  *
  * The method must return `Promise<string>` (JSON-encoded result).
  * The tool name is auto-generated as snake_case from the method name.
  */
-export function McpTool(description: string) {
+export function McpTool(description: string, options?: McpToolOptions) {
   return function (_target: object, propertyKey: string, _descriptor: PropertyDescriptor) {
     const entries = getToolEntries(_target);
     const paramMap = getParamEntries(_target);
@@ -125,6 +164,8 @@ export function McpTool(description: string) {
       description,
       methodKey: propertyKey,
       params,
+      ...(options?.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options?.readOnly === undefined ? {} : { readOnly: options.readOnly }),
     });
   };
 }
@@ -174,6 +215,10 @@ export function generateToolSchemas(instance: object): ToolSchema[] {
       ),
       required: entry.params.filter((p) => p.required).map((p) => p.name),
     },
+    // Emitted for BOTH values, never omitted for `false`: the bridges must be able to tell
+    // "classified as a write" apart from "never classified" when a stale browser connects.
+    ...(entry.readOnly === undefined ? {} : { annotations: { readOnlyHint: entry.readOnly } }),
+    ...(entry.timeoutMs ? { timeoutMs: entry.timeoutMs } : {}),
   }));
 }
 
@@ -193,6 +238,53 @@ export function buildToolDispatcher(instance: object): Map<string, {
       methodKey: entry.methodKey,
       paramNames: entry.params.map((p) => p.name),
     });
+  }
+  return map;
+}
+
+// ── Multi-instance variants (delegate-object pattern) ──
+//
+// Decorator metadata lives per-prototype, so tools spread across several
+// classes (e.g. McpBridgePlugin + McpViewTools + McpEditorTools) are merged
+// here. Subclassing does NOT work for splitting — the symbol own-property on
+// a subclass prototype would shadow the base list.
+
+/**
+ * Generate merged tool schemas from several decorated instances.
+ * Throws on duplicate tool names (dev-time guard against silent shadowing).
+ */
+export function generateToolSchemasMulti(instances: readonly object[]): ToolSchema[] {
+  const seen = new Set<string>();
+  const out: ToolSchema[] = [];
+  for (const instance of instances) {
+    for (const schema of generateToolSchemas(instance)) {
+      if (seen.has(schema.name)) {
+        throw new Error(`Duplicate MCP tool name across instances: ${schema.name}`);
+      }
+      seen.add(schema.name);
+      out.push(schema);
+    }
+  }
+  return out;
+}
+
+/**
+ * Build a merged dispatcher over several decorated instances. Each entry
+ * carries the owning instance so the caller applies the method on it.
+ */
+export function buildMultiDispatcher(instances: readonly object[]): Map<string, {
+  instance: object;
+  methodKey: string;
+  paramNames: string[];
+}> {
+  const map = new Map<string, { instance: object; methodKey: string; paramNames: string[] }>();
+  for (const instance of instances) {
+    for (const [name, entry] of buildToolDispatcher(instance)) {
+      if (map.has(name)) {
+        throw new Error(`Duplicate MCP tool name across instances: ${name}`);
+      }
+      map.set(name, { instance, ...entry });
+    }
   }
   return map;
 }

@@ -16,7 +16,7 @@
  * Opt-in via `distanceAdaptiveNav: true` in visual settings (default: false).
  */
 
-import { PerspectiveCamera } from 'three';
+import { MathUtils, PerspectiveCamera } from 'three';
 import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { RVViewer } from '../core/rv-viewer';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
@@ -43,10 +43,6 @@ export const PAN_DIST_FACTOR = 0.12;
 export const MIN_FACTOR = 0.15;
 /** Maximum factor clamp — prevents runaway speeds at extreme distance. */
 export const MAX_FACTOR = 10.0;
-
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}
 
 export class AdaptiveNavPlugin implements RVViewerPlugin {
   readonly id = 'adaptive-nav';
@@ -88,8 +84,8 @@ export class AdaptiveNavPlugin implements RVViewerPlugin {
     if (!Number.isFinite(dist)) return;
 
     const safeDist = Math.max(dist, 0.01);
-    controls.zoomSpeed = this._baseZoom * clamp(Math.sqrt(safeDist * ZOOM_DIST_FACTOR), MIN_FACTOR, MAX_FACTOR);
-    controls.panSpeed = this._basePan * clamp(Math.sqrt(safeDist * PAN_DIST_FACTOR), MIN_FACTOR, MAX_FACTOR);
+    controls.zoomSpeed = this._baseZoom * MathUtils.clamp(Math.sqrt(safeDist * ZOOM_DIST_FACTOR), MIN_FACTOR, MAX_FACTOR);
+    controls.panSpeed = this._basePan * MathUtils.clamp(Math.sqrt(safeDist * PAN_DIST_FACTOR), MIN_FACTOR, MAX_FACTOR);
   }
 
   dispose(): void {

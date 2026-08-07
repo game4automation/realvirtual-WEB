@@ -18,6 +18,10 @@
  * How to read this file: SIGNALS (the PLC contract) → the `logic` functions (the
  * shared brain) → the `def` object (schema, signals, state, setup, continuous, des).
  *
+ * The Transport drive carries a `Drive_Simple` model (added in setup via
+ * `self.addComponent`): its standard control/feedback signals live in the
+ * component's `Signals` folder and mirror the real belt state every tick.
+ *
  * Full authoring guide: doc-behavior-modelling.md
  */
 
@@ -65,15 +69,27 @@ function onPartAtSensor(self: ConveyorSelf, present: boolean): void {
   l.partAtSensor = present;
 }
 function tryRelease(self: ConveyorSelf, mu: RV.MU): boolean {
-  // ZPA release: release only when the belt is running AND the downstream can
-  // accept. Otherwise the part stays on the belt (parked in blockedMUs) and is
-  // retried on onDownstreamReady / run-signal. The object handshake is the
-  // authority and parks the MU when the downstream is full.
+  // ZPA release: hand off only when the belt runs AND the downstream can accept.
+  // Otherwise park the part on the belt and retry on onDownstreamReady / run-signal.
   const out = self.outputs()[0];
   if (self.sig.Run.get() && self.downstreamCanAccept(mu, out)) {
-    self.transfer(mu, out); self.local.partAtSensor = false; return true;
+    self.transfer(mu, out);
+    self.local.partAtSensor = false;
+    return true;
   }
-  self.local.blockedMUs.push(mu); return false;
+  self.local.blockedMUs.push(mu);
+  return false;
+}
+// Canonical utilization category (shared: continuous + DES). Blocked = a part sits at
+// the exit and the downstream zone is full (DES: parked in blockedMUs; continuous: the
+// interlock is occupied). Working = a part is on the belt (in transit, at the sensor,
+// or overlapping the surface). Empty = no part. Reported via self.statState so the
+// continuous StateStatistics AND the DES component both capture it (de-duped).
+function conveyorStat(self: ConveyorSelf, occ: boolean): void {
+  const l = self.local;
+  const blocked = l.blockedMUs.length > 0 || (l.partAtSensor && (l.interlock?.occupied() ?? false));
+  const hasPart = blocked || l.partAtSensor || l.transitMUs.size > 0 || occ;
+  self.statState(blocked ? 'Blocked' : hasPart ? 'Working' : 'Empty');
 }
 
 const def = {
@@ -92,11 +108,8 @@ const def = {
   // nothing for the user to configure here. See _shared/transit-timing.ts.
   schema: {},
 
-  // The material-flow interop signals — published under the type-neutral `Flow`
-  // namespace (NOT `Conveyor.*`), auto-declared as `Flow.<key>` + typed self.sig.
+  // Type-neutral interop signals — auto-declared as `Flow.<key>` + typed self.sig.
   signalNamespace: 'Flow' as const,
-  // Public 4-signal material-flow contract — auto-declared (by createSelf) as
-  // `Flow.<key>` and exposed as typed `self.sig.<key>` accessors.
   signals: SIGNALS,
 
   // Per-instance state slot (type-inferred). Used by BOTH the continuous shim and
@@ -108,32 +121,31 @@ const def = {
 
   logic: { shouldFlow, onPartAtSensor },
 
-  // Mode-agnostic init (continuous AND DES): resolve nodes, set the Run=true
-  // default, resolve the DES timing model, stamp the marker, build the context
-  // menu. The signals are already declared (by createSelf, both paths); the
-  // finders are path-agnostic, so this is the single resolve point for belt/sensor.
+  // Runs once for continuous AND DES: resolve nodes, add components, wire signals.
   setup(self: ConveyorSelf): void {
     const l = self.local;
-    l.belt = self.findTransport();
-    l.sensor = self.findSensor();
+    l.belt = self.find('transport');
+    l.sensor = self.find('sensor');
     if (!l.belt || !l.sensor) return self.disable('missing Transport-*/Sensor-* node');
 
-    // Reset transient DES flow state — setup() re-runs on Reset-on-Switch /
-    // DESRunner.start(), so clear any leftover transit/blocked bookkeeping.
     l.partAtSensor = false;
     l.blockedMUs.length = 0;
     l.transitMUs.clear();
 
-    // Run defaults TRUE (the belt runs unless told to stop) — the only signal
-    // whose initial value differs from the type-default (createSelf declares
-    // Run=false with the rest); override it here on both paths.
-    self.sig.Run.set(true);
-    // Stamp the inspector/hierarchy marker with the resolved nodes.
+    // The belt runs unless told to stop (a live CONNECT source owns Run when bound).
+    if (!self.isWired) self.sig.Run.set(true);
     self.stamp('ConveyorBehavior', { Belt: l.belt.name, Sensor: l.sensor.name });
-    // Resolve the DES timing model once (speed from the Transport Drive, length
-    // from the belt geometry, full-belt transit time + tween endpoints).
-    // Mode-agnostic: harmless in continuous (the belt physics owns motion
-    // there), authoritative for the DES transit schedule.
+
+    // AddComponent (Unity-style): attach a Drive_Simple to the belt and create +
+    // wire its control signals — visibly. A PLC binds Transport.Forward/Backward to
+    // drive the belt (see the isWired guard); the drive's other standard slots
+    // auto-provision under the belt node.
+    self.addComponent(l.belt, 'Drive_Simple', {
+      Forward:  self.addSignal(l.belt, 'Transport.Forward',  'PLCOutputBool'),
+      Backward: self.addSignal(l.belt, 'Transport.Backward', 'PLCOutputBool'),
+    });
+
+    // DES transit timing: speed from the Transport drive, length from the belt geometry.
     l.timer = createTransitTimer(self, l.belt);
     self.contextMenu(l.belt, [
       { id: 'run',  label: 'Run',  action: () => self.sig.Run.set(true) },
@@ -142,10 +154,6 @@ const def = {
     ]);
   },
 
-  // Lifecycle: clear the per-run flow state on reset (part-at-sensor flag, part
-  // counter, blocked/transit bookkeeping) and zero the published outputs; the
-  // belt drive itself is reset by RVDrive.reset(). `start` re-asserts Run so the
-  // belt resumes after a reset.
   reset(self: ConveyorSelf): void {
     const l = self.local;
     l.partAtSensor = false;
@@ -157,25 +165,25 @@ const def = {
     self.sig.Running.set(false);
   },
   start(self: ConveyorSelf): void {
-    self.sig.Run.set(true);
+    if (!self.isWired) self.sig.Run.set(true);
   },
 
   continuous: {
-    // Continuous-only wiring — reads the self.local nodes resolved by the shared
-    // setup() above: belt handle, the downstream interlock, and the AABB-sensor
-    // subscription are the continuous trigger/effect plumbing.
     setup(self: ConveyorSelf): void {
       const l = self.local;
       l.beltHandle = self.attachBelt(l.belt!);
       l.interlock = self.downstreamInterlock();
-      self.signals.on(l.sensor!.name, (v) => onPartAtSensor(self, v === true));
+      self.onSensorChanged(l.sensor!, (occupied) => onPartAtSensor(self, occupied));
     },
     fixedUpdate(self: ConveyorSelf): void {
       const l = self.local;
-      self.sig.Occupied.set(self.surfaceOccupied(l.belt!));
+      if (self.isWired) return;          // an interface controls the belt → stay silent
+      const occ = self.surfaceOccupied(l.belt!);
+      self.sig.Occupied.set(occ);
       const moving = shouldFlow(self);
       self.sig.Running.set(moving);
       l.beltHandle!.run(moving);
+      conveyorStat(self, occ); // utilization: Working / Blocked / Empty (de-duped)
     },
   },
 
@@ -188,6 +196,7 @@ const def = {
     onAccept(self: ConveyorSelf, mu: RV.MU): boolean {
       const l = self.local;
       l.transitMUs.set(mu.id, self.in(l.timer!.transitTime, 'Arrival', mu, l.timer!.tween(mu)));
+      conveyorStat(self, false); // part entered transit → Working
       return true;
     },
     // Arrival at the discharge point (belt exit): mark the part present (the
@@ -197,10 +206,12 @@ const def = {
       self.local.transitMUs.delete(mu.id);
       onPartAtSensor(self, true);
       tryRelease(self, mu);
+      conveyorStat(self, false); // released → Empty, or parked → Blocked
     },
     onDownstreamReady(self: ConveyorSelf): void {
       const mu = self.local.blockedMUs.shift();
       if (mu) tryRelease(self, mu);
+      conveyorStat(self, false); // unblocked → Empty/Working, or re-parked → Blocked
     },
   },
 };

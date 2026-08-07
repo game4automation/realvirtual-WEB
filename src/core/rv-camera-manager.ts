@@ -69,7 +69,12 @@ export interface CameraAnimation {
   endTgt: Vector3;
   elapsed: number;
   duration: number;
+  easing: CameraEasing;
 }
+
+/** Camera-flight easing. `easeOut` = snappy response to a user click (default);
+ *  `easeInOut` = cinematic start-and-stop-smooth (MCP/agent-driven flights). */
+export type CameraEasing = 'easeOut' | 'easeInOut';
 
 /**
  * Projection-swap animation state. Element-wise lerp between two camera
@@ -170,6 +175,52 @@ export class CameraManager {
     this.state.orthoCamera.updateProjectionMatrix();
   }
 
+  /**
+   * Re-express the current VISIBLE ortho framing as a pure camera distance:
+   * fold the OrbitControls wheel zoom (`camera.zoom`) into the position along
+   * the view direction, reset zoom to 1 and re-sync the frustum. The rendered
+   * image is unchanged. Needed before programmatic camera moves — their
+   * framing math (fitDistance et al.) assumes the view scale follows distance,
+   * which is only true at zoom 1.
+   */
+  private _normalizeOrthoPose(): void {
+    const cam = this.state.orthoCamera;
+    if (this.state._activeCamera !== cam) return;
+    const target = this.state.controls.target;
+    const halfHVisible = (cam.top - cam.bottom) / 2 / cam.zoom;
+    const dist = halfHVisible / Math.tan((this.state.perspCamera.fov * Math.PI / 180) / 2);
+    this._tmpPos.subVectors(cam.position, target);
+    if (this._tmpPos.lengthSq() < 1e-12) return; // degenerate: camera on target
+    this._tmpPos.normalize();
+    cam.position.copy(target).addScaledVector(this._tmpPos, dist);
+    cam.zoom = 1;
+    this.syncOrthoFrustum();
+  }
+
+  /**
+   * Distance the perspective camera needs to fit `maxDim` vertically in view,
+   * scaled by `margin` (the canonical `maxDim / (2·tan(fov/2)) · margin` fit
+   * formula — every camera-framing path delegates here so the math cannot
+   * drift between copies).
+   */
+  fitDistance(maxDim: number, margin = 1): number {
+    const fov = this.state.perspCamera.fov * (Math.PI / 180);
+    return (maxDim / (2 * Math.tan(fov / 2))) * margin;
+  }
+
+  /**
+   * Like {@link fitDistance}, but fits BOTH axes: the larger of the vertical
+   * and horizontal (aspect-corrected) fit distances, scaled by `margin`.
+   */
+  fitDistanceBothAxes(maxDim: number, margin = 1): number {
+    const fov = this.state.perspCamera.fov * (Math.PI / 180);
+    const halfTan = Math.tan(fov / 2);
+    const aspect = this.state.perspCamera.aspect;
+    const distV = maxDim / (2 * halfTan);
+    const distH = maxDim / (2 * halfTan * aspect);
+    return Math.max(distV, distH) * margin;
+  }
+
   // ─── Camera Animation ─────────────────────────────────────────────
 
   /** Whether a camera animation is currently in progress. */
@@ -183,9 +234,13 @@ export class CameraManager {
   /**
    * Smoothly animate the camera to a new position and orbit target.
    */
-  animateCameraTo(position: Vector3, target: Vector3, duration = 0.6): void {
+  animateCameraTo(position: Vector3, target: Vector3, duration = 0.6, easing: CameraEasing = 'easeOut'): void {
     const xr = (this.state.renderer as unknown as Record<string, unknown>).xr as Record<string, unknown> | undefined;
     if (xr?.isPresenting) return;
+    // In ortho the visible scale must follow camera distance (the frustum is
+    // re-synced every animation tick) — fold any wheel zoom into distance
+    // first so the flight starts from the exact same visible framing.
+    this._normalizeOrthoPose();
     this.cameraAnim = {
       startPos: this.state._activeCamera.position.clone(),
       endPos: position.clone(),
@@ -193,6 +248,7 @@ export class CameraManager {
       endTgt: target.clone(),
       elapsed: 0,
       duration,
+      easing,
     };
   }
 
@@ -201,10 +257,19 @@ export class CameraManager {
     if (!this.cameraAnim) return;
     this.cameraAnim.elapsed += dtSec;
     const t = Math.min(this.cameraAnim.elapsed / this.cameraAnim.duration, 1);
-    const e = 1 - Math.pow(1 - t, 3); // Smooth ease-out (cubic)
+    // easeOut (cubic): instant response, smooth stop — right for user clicks.
+    // easeInOut (cubic): smooth start AND stop — right for scripted flights.
+    const e = this.cameraAnim.easing === 'easeInOut'
+      ? (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2)
+      : 1 - Math.pow(1 - t, 3);
 
     this.state._activeCamera.position.lerpVectors(this.cameraAnim.startPos, this.cameraAnim.endPos, e);
     this.state.controls.target.lerpVectors(this.cameraAnim.startTgt, this.cameraAnim.endTgt, e);
+
+    // Ortho zoom follows camera distance: without this the flight moves the
+    // camera but the view scale never changes (frustum was only re-synced on
+    // projection switch / canvas resize).
+    if (this.state._activeCamera === this.state.orthoCamera) this.syncOrthoFrustum();
 
     if (t >= 1) this.cameraAnim = null;
   }

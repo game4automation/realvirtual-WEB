@@ -250,7 +250,7 @@ export function LeftPanel({
         {toolbar}
 
         {/* Close button */}
-        <IconButton size="small" onClick={onClose} sx={{ color: 'text.secondary', p: 0.25, flexShrink: 0 }}>
+        <IconButton size="small" aria-label="Close panel" onClick={onClose} sx={{ color: 'text.secondary', p: 0.25, flexShrink: 0 }}>
           <Close sx={{ fontSize: 16 }} />
         </IconButton>
       </Box>

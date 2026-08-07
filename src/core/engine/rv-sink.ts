@@ -5,7 +5,7 @@ import { Object3D } from 'three';
 import { AABB } from './rv-aabb';
 import type { RVMovingUnit, InstancedMovingUnit } from './rv-mu';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponent } from './rv-component-registry';
+import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import { debug } from './rv-debug';
 
 /**
@@ -15,7 +15,8 @@ import { debug } from './rv-debug';
  * In WebViewer, we use explicit AABB overlap checks.
  */
 export class RVSink implements RVComponent {
-  static readonly schema: ComponentSchema = {};
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('Sink');
 
   readonly node: Object3D;
   readonly aabb: AABB;
@@ -65,8 +66,8 @@ registerComponent({
   schema: RVSink.schema,
   needsAABB: true,
   capabilities: {
+    authorable: true,   // addable in the asset editor (schema-complete)
     badgeColor: '#ef5350',
-    simulationActive: true,
   },
   create: (node, aabb) => new RVSink(node, aabb!),
 });

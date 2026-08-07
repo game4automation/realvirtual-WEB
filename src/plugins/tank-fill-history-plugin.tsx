@@ -5,7 +5,7 @@
  * TankFillHistoryPlugin — Process-industry trend display of tank fill-levels.
  *
  * Registers a button in the left sidebar (button-group slot) that toggles a
- * floating, draggable, resizable ChartPanel showing a rolling 5-minute
+ * floating, draggable, resizable FloatingPanel showing a rolling 5-minute
  * historian-style trend chart: one line per tank, colored by its current
  * `resourceName` (medium).
  *
@@ -30,7 +30,7 @@ import type { LoadResult } from '../core/engine/rv-scene-loader';
 import type { RVViewer } from '../core/rv-viewer';
 import type { UISlotEntry, UISlotProps } from '../core/rv-ui-plugin';
 import type { RVTank } from '../core/engine/rv-tank';
-import { ChartPanel } from '../core/hmi/ChartPanel';
+import { FloatingPanel } from '../core/hmi/FloatingPanel';
 import { NavButton } from '../core/hmi/NavButton';
 import { useEChart } from '../hooks/use-echart';
 import { DARK_AXIS_LABEL, DARK_AXIS_LINE, DARK_SPLIT_LINE, DARK_TEXT_STYLE, DARK_TOOLTIP_BASE } from '../core/hmi/chart-theme';
@@ -319,14 +319,14 @@ function TankFillHistoryPanel({ viewer, open, onClose }: { viewer: RVViewer; ope
   };
 
   // Center-ish default position so first-time open is obviously on screen.
-  // ChartPanel additionally clamps to the viewport whenever `open` goes true.
+  // FloatingPanel additionally clamps to the viewport whenever `open` goes true.
   const defaultPos = useMemo(() => ({
     x: Math.max(80, Math.round(window.innerWidth / 2 - DEFAULT_WIDTH / 2)),
     y: Math.max(24, Math.round(window.innerHeight / 2 - DEFAULT_HEIGHT / 2) - 60),
   }), []);
 
   return (
-    <ChartPanel
+    <FloatingPanel
       open={open}
       onClose={onClose}
       title="Tank Fill History"
@@ -399,6 +399,6 @@ function TankFillHistoryPanel({ viewer, open, onClose }: { viewer: RVViewer; ope
           </Box>
         </Box>
       )}
-    </ChartPanel>
+    </FloatingPanel>
   );
 }

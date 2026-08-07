@@ -10,11 +10,145 @@ import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, create
 import { join, resolve, dirname, extname } from 'node:path';
 
 // ─── Private content detection ──────────────────────────────────────────
-const PRIVATE_DIR = resolve(__dirname, '../realvirtual-WebViewer-Private~/src');
+const PRIVATE_ROOT_CANDIDATES = [
+  resolve(__dirname, '../realvirtual-WebViewer-Private~'),
+  resolve(__dirname, '../realvirtual-web-pro'),
+];
+const PRIVATE_ROOT = PRIVATE_ROOT_CANDIDATES.find((candidate) => existsSync(resolve(candidate, 'src')))
+  ?? PRIVATE_ROOT_CANDIDATES[0];
+const PRIVATE_DIR = resolve(PRIVATE_ROOT, 'src');
 const HAS_PRIVATE = existsSync(PRIVATE_DIR) && !process.env.VITE_PUBLIC_BUILD;
 console.log(`[rv-build] ${HAS_PRIVATE ? 'Private' : 'Public'} build${process.env.VITE_PUBLIC_BUILD ? ' (forced public via VITE_PUBLIC_BUILD)' : ''}`);
-import { exec } from 'node:child_process';
+import { exec, execSync } from 'node:child_process';
 
+// ─── HMR back-channel through the CONNECT proxy (plan-363 Phase 2) ──────
+// When CONNECT supervises this dev server, the browser talks to the CONNECT port, not to this one:
+// the page is loaded through the proxy, and the dev port is loopback-only. Vite's HMR client dials
+// the port it is TOLD to, so CONNECT passes its own port in RV_HMR_CLIENT_PORT and it is applied to
+// `server.hmr.clientPort` below. Unset — every start that is not through CONNECT — leaves the HMR
+// configuration absent entirely, which is the behaviour that shipped before this plan.
+const RV_HMR_CLIENT_PORT = (() => {
+  const raw = process.env.RV_HMR_CLIENT_PORT;
+  if (!raw) return undefined;
+  const port = Number.parseInt(raw, 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.warn(`[rv-build] RV_HMR_CLIENT_PORT='${raw}' is not a usable port — ignoring it.`);
+    return undefined;
+  }
+  return port;
+})();
+
+// ─── Build / version info (baked into the bundle via `define`) ──────────
+// version:  framework-synced semver from package.json (kept in step with the
+//           Unity realvirtual release, e.g. 6.3.0).
+// webBuild: web-specific build number = commit count of THIS repo
+//           (realvirtual-WEB-DEV), independent of the Unity framework.
+// commit/buildDate: short hash and date of the built commit.
+// All git calls are guarded so a git-less build (tarball, CI without .git)
+// still produces a valid bundle.
+function rvGit(cmd: string, fallback: string): string {
+  try {
+    return execSync(cmd, { cwd: __dirname, stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().trim() || fallback;
+  } catch {
+    return fallback;
+  }
+}
+const RV_VERSION = JSON.parse(
+  readFileSync(resolve(__dirname, 'package.json'), 'utf-8'),
+).version as string;
+const RV_WEB_BUILD = rvGit('git rev-list --count HEAD', '0');
+const RV_COMMIT = rvGit('git rev-parse --short HEAD', '');
+const RV_BUILD_DATE = rvGit(
+  'git log -1 --format=%cd --date=short',
+  new Date().toISOString().slice(0, 10),
+);
+console.log(
+  `[rv-build] realvirtual WEB v${RV_VERSION} · web build ${RV_WEB_BUILD}` +
+  `${RV_COMMIT ? ` (${RV_COMMIT})` : ''} · ${RV_BUILD_DATE}`,
+);
+
+// ─── Dev-server session info (serve only, never built) ──────────────────
+// Answers "which checkout is this dev server actually serving?" — the tab
+// alone cannot tell a worktree session apart from the canonical checkout, and
+// getting that wrong is expensive: an unattended run once wrote a worktree
+// plan's changes into the canonical tree and it only surfaced afterwards.
+// The SERVED DIRECTORY is the authority here; branch and plan are derived.
+//
+// `rv-worktree.ps1` writes .rv-session.json one level above the repo, so its
+// presence alone distinguishes a worktree from the canonical checkout.
+interface RVSessionManifest {
+  plans?: number[];
+  slug?: string;
+  vite_port?: number;
+}
+
+function rvSessionManifest(): RVSessionManifest | null {
+  try {
+    const raw = readFileSync(resolve(__dirname, '..', '.rv-session.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as RVSessionManifest;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    // No manifest (canonical checkout), unreadable, or corrupt — all mean
+    // "no session", which the badge renders as the canonical warning state.
+    return null;
+  }
+}
+
+/** Serialised `__RV_SERVE_INFO__` value; `'null'` for every non-serve command. */
+function rvServeInfoLiteral(command: string): string {
+  if (command !== 'serve') return 'null';
+  const session = rvSessionManifest();
+  return JSON.stringify({
+    root: __dirname,
+    branch: rvGit('git rev-parse --abbrev-ref HEAD', ''),
+    plans: session?.plans ?? null,
+    slug: session?.slug ?? null,
+    vitePort: session?.vite_port ?? null,
+  });
+}
+
+
+/**
+ * Vite plugin: lets realvirtual CONNECT prove WHICH dev server is on a port before adopting it.
+ *
+ * plan-363 Phase 2. CONNECT starts and proxies this dev server, but a port that answers is not
+ * evidence of anything — it could be an unrelated service or a Vite belonging to a different
+ * workspace (in the session this was built, a foreign CONNECT sat on the neighbouring port).
+ * CONNECT therefore reads this endpoint and adopts only when `root` is the workspace it was
+ * configured for; anything else is reported as a port conflict and left running untouched.
+ *
+ * `apply: 'serve'` is load-bearing: the endpoint must not exist in a production build, where the
+ * folder layout of the machine that built it is nobody's business.
+ */
+function devServerIdentityPlugin() {
+  return {
+    name: 'rv-devserver-identity',
+    apply: 'serve' as const,
+    configureServer(server: { middlewares: { use: Function } }) {
+      server.middlewares.use((req: { url?: string; socket?: { remoteAddress?: string } }, res: any, next: Function) => {
+        if ((req.url ?? '').split('?')[0] !== '/__api/rv-devserver') {
+          next();
+          return;
+        }
+        // Loopback only, like every other /__api/* route: the answer names a local directory, and a
+        // directory name is exactly the kind of detail that has no business leaving the machine.
+        const peer = req.socket?.remoteAddress ?? '';
+        if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(peer)) {
+          res.writeHead(403);
+          res.end();
+          return;
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({
+          server: 'realvirtual-web-vite',
+          root: __dirname,
+          hmrClientPort: RV_HMR_CLIENT_PORT ?? null,
+        }));
+      });
+    },
+  };
+}
 
 /** Vite plugin: exposes /__api/tests endpoints so the app can discover and run vitest tests */
 function testRunnerPlugin() {
@@ -315,7 +449,10 @@ function presetSavePlugin() {
 }
 
 // ─── Private project directory (contains project subfolders with models/) ────
-const PRIVATE_PROJECTS_DIR = resolve(__dirname, '../realvirtual-WebViewer-Private~/projects');
+const PRIVATE_PROJECTS_DIR = [
+  resolve(PRIVATE_ROOT, 'projects'),
+  resolve(__dirname, '../projects'),
+].find((candidate) => existsSync(candidate)) ?? resolve(PRIVATE_ROOT, 'projects');
 
 /** MIME types for static assets served from private projects. */
 const PRIVATE_ASSET_MIME: Record<string, string> = {
@@ -492,7 +629,8 @@ function privateResolverPlugin() {
       // Only intercept bare imports from files in the private folder
       if (!importer) return null;
       const normalizedImporter = importer.replace(/\\/g, '/');
-      if (!normalizedImporter.includes('realvirtual-WebViewer-Private')) return null;
+      if (!normalizedImporter.includes('realvirtual-WebViewer-Private')
+          && !normalizedImporter.includes('realvirtual-web-pro')) return null;
       // Skip relative/absolute imports, virtual modules, and already-resolved paths
       if (source.startsWith('.') || source.startsWith('/') || source.startsWith('\0')) return null;
       if (/^[A-Za-z]:/.test(source)) return null; // Windows absolute paths like C:\...
@@ -500,6 +638,43 @@ function privateResolverPlugin() {
       // This ensures ESM exports maps are respected (unlike createRequire which returns CJS paths).
       const resolved = await this.resolve(source, mainImporter, { skipSelf: true });
       return resolved;
+    },
+  };
+}
+
+/**
+ * Vite plugin: resolve MISSING private stubs to an empty module in public builds.
+ *
+ * In a forced-public build on a machine WITH the private folder, import.meta.glob
+ * still discovers private project files on disk, and Rollup loads every module
+ * they import during the scan phase — even when the importing branch is dead
+ * (`__RV_HAS_PRIVATE__` gate). `@rv-private/...` then aliases to src/private-stubs/,
+ * and any private-only import WITHOUT a stub file breaks the build with ENOENT.
+ *
+ * This plugin resolves such nonexistent stub paths to a virtual empty module with
+ * synthetic named exports (every named import becomes undefined, no build warnings).
+ * The code is unreachable at runtime — the __RV_HAS_PRIVATE__ gate in
+ * rv-model-plugin-manager.ts keeps private project plugins out of the public
+ * runtime, and Rollup drops the dead chunks entirely.
+ */
+function missingStubResolverPlugin() {
+  // Only relevant for a public build with the private folder present on disk.
+  if (!existsSync(PRIVATE_DIR) || HAS_PRIVATE) return null;
+  const STUBS_DIR = resolve(__dirname, 'src/private-stubs').replace(/\\/g, '/');
+  const EMPTY_ID = '\0rv-missing-private-stub';
+  const EXT_PROBES = ['', '.ts', '.tsx', '.js', '.jsx', '/index.ts', '/index.tsx'];
+  return {
+    name: 'rv-missing-stub-resolver',
+    resolveId(source: string) {
+      const normalized = source.replace(/\\/g, '/');
+      if (!normalized.startsWith(STUBS_DIR)) return null;
+      const exists = EXT_PROBES.some((ext) => existsSync(normalized + ext));
+      if (exists) return null; // real stub — let Vite resolve it normally
+      return { id: EMPTY_ID, syntheticNamedExports: true };
+    },
+    load(id: string) {
+      if (id !== EMPTY_ID) return null;
+      return 'export default {};';
     },
   };
 }
@@ -542,28 +717,72 @@ function dracoDecoderPlugin() {
   };
 }
 
-export default defineConfig({
+/**
+ * Vite plugin: Strip the impeccable-live dev script from PRODUCTION builds.
+ *
+ * The impeccable live tool injects `<script src="http://localhost:8400/live.js">`
+ * (wrapped in `<!-- impeccable-live-start/end -->` markers) into index.html for
+ * design sessions. That toggle is dev-only — if it is accidentally left ON, this
+ * plugin guarantees it never reaches dist/ (and thus never a deploy). Dev serve
+ * is untouched, so impeccable can switch it on/off as usual.
+ */
+function stripImpeccableLivePlugin() {
+  return {
+    name: 'rv-strip-impeccable-live',
+    apply: 'build' as const,
+    transformIndexHtml(html: string) {
+      return html
+        .replace(/<!-- impeccable-live-start -->[\s\S]*?<!-- impeccable-live-end -->\s*/g, '')
+        .replace(/^.*localhost:\d+\/live\.js.*\r?\n?/gm, '');
+    },
+  };
+}
+
+export default defineConfig(({ command }) => ({
   base: process.env.VITE_BASE || './',
   plugins: [
     privateResolverPlugin(),
+    missingStubResolverPlugin(),
     privateModelsPlugin(),
     react(),
     // VitePWA disabled – no service worker, always fresh content
+    devServerIdentityPlugin(),
     testRunnerPlugin(),
     debugApiPlugin(),
     thumbnailSavePlugin(),
     presetSavePlugin(),
     dracoDecoderPlugin(),
+    stripImpeccableLivePlugin(),
   ].filter(Boolean),
+  // Worker builds are a SEPARATE Rollup pass that does NOT inherit the main `plugins`.
+  // The STEP-import worker (`step-import-worker.ts`) lives in the private sibling folder and
+  // imports bare npm deps like `occt-import-js`; without privateResolverPlugin here, Rollup walks
+  // up from the worker file (which has no node_modules) and fails to resolve them. Register the
+  // same resolver for the worker pass so private-folder bare imports hit the main node_modules.
+  worker: {
+    // ES format is required because the STEP-import worker code-splits (it dynamically loads the
+    // occt-import-js WASM chunk); Vite's default 'iife' worker format rejects code-splitting builds.
+    format: 'es',
+    plugins: () => [privateResolverPlugin()].filter(Boolean),
+  },
   resolve: {
     dedupe: ['three'],
+    // Worktree sessions link the private sibling folder in as a JUNCTION to the canonical
+    // checkout. Resolving through the realpath would move `hmi-entry.tsx` into the canonical
+    // tree, and its relative `../../../realvirtual-WebViewer~/src/...` imports would then load
+    // a SECOND copy of the whole HMI layer (App, HMIShell, use-viewer, …) from there. Two
+    // module instances mean two ViewerContext objects: the provider set by main.ts is invisible
+    // to the consumers, every `useViewer()` throws, and React unmounts the entire UI (the
+    // 3D canvas survives because it never goes through React). Keeping the link path also
+    // keeps @fontsource inside `server.fs.allow`, which the canonical path is not (→ 403).
+    preserveSymlinks: true,
     alias: {
       '@rv': resolve(__dirname, 'src'),
       '@rv-private': HAS_PRIVATE
         ? PRIVATE_DIR
         : resolve(__dirname, 'src/private-stubs'),
       '@rv-projects': HAS_PRIVATE
-        ? resolve(__dirname, '../realvirtual-WebViewer-Private~/projects')
+        ? PRIVATE_PROJECTS_DIR
         : resolve(__dirname, 'src/private-stubs/projects'),
       // Explicit aliases for React JSX runtime — needed so that files imported from
       // the private folder (outside the project root) resolve the JSX runtime from
@@ -577,16 +796,89 @@ export default defineConfig({
   define: {
     __RV_HAS_PRIVATE__: JSON.stringify(HAS_PRIVATE),
     __RV_COMMERCIAL__: JSON.stringify(!!process.env.RV_COMMERCIAL),
+    // Internal/dev-only features (DES, IK solver, STEP import, layout cloud, …).
+    // Dev server (and vitest, which runs in serve mode) always ON; production
+    // builds only with RV_INTERNAL=1. Customer deploys (stagePrivateProject /
+    // deploy:private) never set it, so Rollup eliminates the gated dynamic
+    // import in internal code paths and its chunks never reach the bundle.
+    __RV_INTERNAL__: JSON.stringify(command === 'serve' || !!process.env.RV_INTERNAL),
+    __RV_VERSION__: JSON.stringify(RV_VERSION),
+    __RV_WEB_BUILD__: JSON.stringify(RV_WEB_BUILD),
+    __RV_COMMIT__: JSON.stringify(RV_COMMIT),
+    __RV_BUILD_DATE__: JSON.stringify(RV_BUILD_DATE),
+    // Dev server only. Every built bundle substitutes the literal `null`, so
+    // Rollup eliminates the badge subtree and no machine path is ever shipped.
+    // Stricter than __RV_INTERNAL__, which is also true for internal *builds*.
+    __RV_SERVE_INFO__: rvServeInfoLiteral(command),
   },
   optimizeDeps: {
     // Pre-bundle read-excel-file so the lazy `await import('read-excel-file')`
     // in s7-tag-table.ts doesn't trigger a dev-mode pre-bundling stall.
-    include: ['read-excel-file'],
+    // monaco-editor is lazy-imported on the first PLC-editor open (private,
+    // internal tier) — pre-bundle to avoid a mid-session dev-server reload
+    // on first discovery (which also aborts running vitest browser suites:
+    // "Vite unexpectedly reloaded a test").
+    // GLTFLoader is imported by the Onshape import validation (plan-237,
+    // @rv-private) — pre-bundle for the same "unexpected reload" reason.
+    // USDZLoader + fflate are lazy-imported by the USD import provider
+    // (plan-252, @rv-private) — pre-bundle for the same reason.
+    // FBXLoader is lazy-imported by the FBX import provider (@rv-private) —
+    // same reason again; without it every fbx-to-three test times out on the
+    // reload rather than failing with an assertion.
+    // echarts sub-entries (core/charts/components/renderers, all via
+    // echarts-setup.ts) MUST be pre-bundled together: without pinning, a
+    // mid-session dep re-optimization can split echarts into two optimized
+    // instances, and the second instance re-runs its component registration
+    // against a core that already has them → uncaught "axisPointer
+    // CartesianAxisPointer exists". Pinning keeps a single echarts instance.
+    include: [
+      'read-excel-file',
+      'monaco-editor/esm/vs/editor/editor.api',
+      'three/examples/jsm/loaders/GLTFLoader.js',
+      'three/examples/jsm/loaders/USDZLoader.js',
+      'three/examples/jsm/loaders/FBXLoader.js',
+      'three/examples/jsm/libs/fflate.module.js',
+      'echarts/core',
+      'echarts/charts',
+      'echarts/components',
+      'echarts/renderers',
+    ],
+    // three-mesh-bvh/worker (lazily imported by rv-bvh-build-port.ts) MUST be
+    // excluded, not included: pre-bundling relocates the module to
+    // .vite/deps/, which breaks its internal
+    // `new Worker(new URL('./generateMeshBVH.worker.js', import.meta.url))` —
+    // the worker file does not exist next to the pre-bundled chunk, the
+    // Worker dies on load ("GenerateMeshBVHWorker: undefined") and every BVH
+    // build falls back to the inline main-thread path. Excluding serves the
+    // module from node_modules source so import.meta.url resolves correctly,
+    // AND avoids the mid-session reload just the same (excluded deps are
+    // never optimized, so their discovery cannot trigger a re-bundle).
+    // @dimforge/rapier3d-compat (plan-276) is an OUT-OF-BAND dependency (not
+    // in package.json — Omniverse pattern §2.8): the private Rapier loader
+    // contains a PROD-only literal dynamic import that the dev optimizer
+    // would otherwise discover and re-bundle on every physics test run
+    // (esbuild "build was canceled" churn). In dev/vitest the loader uses the
+    // /node_modules URL import, so the package must never be optimized.
+    exclude: ['three-mesh-bvh/worker', '@dimforge/rapier3d-compat'],
   },
   server: {
     host: true,
     open: true,
     https: !!process.env.HTTPS,
+    // Only present when CONNECT started this server (see RV_HMR_CLIENT_PORT above). Spreading an
+    // empty object keeps the shipped default — no `hmr` key at all, client follows window.location —
+    // exactly as it was before plan-363.
+    ...(RV_HMR_CLIENT_PORT ? { hmr: { clientPort: RV_HMR_CLIENT_PORT } } : {}),
+    // Allow serving worker entries from the private sibling folder (e.g. the
+    // STEP-import worker `new Worker(new URL('./step-import-worker.ts', …))`).
+    // Normal @rv-private imports go through the module graph, but a worker URL
+    // is fs-served and would otherwise be blocked as "outside the allow list".
+    fs: {
+      allow: [
+        __dirname,
+        ...(HAS_PRIVATE ? [PRIVATE_ROOT, resolve(__dirname, '../projects')] : []),
+      ],
+    },
     // Allow Tailscale MagicDNS hostnames (*.ts.net) when testing via `tailscale serve`.
     // Without this, Vite returns 403 due to DNS-rebinding protection on non-localhost Host headers.
     allowedHosts: ['.ts.net'],
@@ -605,6 +897,10 @@ export default defineConfig({
     watch: {
       usePolling: true,
       interval: 100,
+      // The File System Access work folder (library/Custom saves, thumbnails,
+      // CAD cache) lives inside the project during development — asset-editor
+      // saves write files here and must NOT trigger a dev-server full reload.
+      ignored: ['**/LocalFolderTest/**', '**/public/models/library/**'],
     },
   },
   build: {
@@ -614,23 +910,54 @@ export default defineConfig({
     rollupOptions: {
       output: {
         banner: '/* realvirtual WEB | AGPL-3.0-only | Copyright (C) 2025 realvirtual GmbH | https://realvirtual.io */',
+        // plan-344 Phase 4: `react-pdf` deliberately has NO manual entry.
+        // `DocViewerOverlay` already imports it dynamically, so Rollup splits it
+        // on its own. Naming it here did the opposite of what it looked like: the
+        // manual group pulled shared React internals into the react-pdf chunk, so
+        // the entry chunk ended up importing symbols FROM it and the browser
+        // modulepreloaded a PDF renderer on every cold start. Leave it to the
+        // automatic split; verified by tests/bundle-splitting.test.ts.
         manualChunks: {
           three: ['three'],
           echarts: ['echarts'],
-          'react-pdf': ['react-pdf', 'pdfjs-dist'],
           'gaussian-splat': ['@mkkellogg/gaussian-splats-3d'],
         },
       },
     },
   },
   test: {
-    include: ['tests/**/*.test.{ts,tsx}'],
-    exclude: ['tests/**/*.node.test.ts'],
+    // Tests for private-only subsystems (the CAD importers: STEP, JT, USD, Onshape)
+    // live in the private sibling so the public mirror does not carry the shape of
+    // modules it cannot build. The glob matches nothing in a public-only checkout.
+    include: [
+      'tests/**/*.test.{ts,tsx}',
+      '../realvirtual-WebViewer-Private~/tests/**/*.test.{ts,tsx}',
+    ],
+    // COMMUNITY edition (private sibling physically absent — deliberately NOT the
+    // VITE_PUBLIC_BUILD flag): tests importing private modules can never resolve
+    // them, so the generated list excludes them. See
+    // scripts/gen-private-test-excludes.mjs + the guard test
+    // tests/private-test-excludes.node.test.ts.
+    exclude: [
+      'tests/**/*.node.test.ts',
+      ...(existsSync(PRIVATE_DIR)
+        ? []
+        : JSON.parse(readFileSync(resolve(__dirname, 'tests/private-dependent-tests.json'), 'utf-8')) as string[]),
+    ],
     browser: {
       enabled: true,
       provider: playwright(),
       instances: [{ browser: 'chromium' }],
       api: { port: 5177 },
+      // plan-375 phase 0a: pin headless instead of letting it follow
+      // `process.env.CI` (vitest's default), which is unset locally and made
+      // every local `npm test` pop a visible Chromium window. A visible window
+      // costs compositor work per test file and — worse for a suite that
+      // measures frame timings — makes results depend on whether the window
+      // happens to be focused or occluded.
+      // Opt out for visual debugging with `npx vitest --browser.headless=false`
+      // (see CLAUDE.md and doc-web-debugging.md).
+      headless: true,
     },
   },
-});
+}));

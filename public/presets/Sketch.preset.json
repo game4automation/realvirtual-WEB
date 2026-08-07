@@ -57,17 +57,17 @@
     "bloomIntensity": 0.25,
     "bloomThreshold": 0.8,
     "bloomRadius": 0.4,
-    "toonBands": 3,
-    "toonMetallic": 1,
-    "toonMetallicColor": "#babfca",
+    "toonBands": 4,
+    "toonMetallic": 0.5,
+    "toonMetallicColor": "#6e748c",
     "toonAlbedoMinBrightness": 0.1,
     "toonAlbedoMaxBrightness": 1,
     "toonAlbedoSaturation": 0.4,
-    "toonOutlineAmount": 0.4,
+    "toonOutlineAmount": 0.3,
     "toonOutlineThickness": 1,
     "toonOutlineThreshold": 0.2,
     "toonOutlineDistance": 100,
-    "toonOutlineSupersample": true,
+    "toonOutlineSupersample": false,
     "toonOutlineColor": "#000000",
     "toonCoolShadows": true,
     "groundEnabled": true,
@@ -77,6 +77,8 @@
     "checkerContrast": 0.5,
     "reflectionEnabled": false,
     "reflectionStrength": 0.8,
-    "reflectionBlur": 1
+    "reflectionBlur": 1,
+    "envReflectionsEnabled": false,
+    "envReflectionsIntensity": 0.3
   }
 }

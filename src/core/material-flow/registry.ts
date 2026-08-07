@@ -91,7 +91,7 @@ export function registerMaterialFlow(def: MaterialFlowDefinition): void {
   //    GUARD: when an engine component FACTORY already owns this type (e.g.
   //    'Source' → RVSource, 'Sink' → RVSink), it has already registered the
   //    richer schema (incl. its own CONSUMED fields) and capabilities (badge
-  //    colour, simulationActive). Overwriting them here would clobber the
+  //    colour, hoverable). Overwriting them here would clobber the
   //    engine's inspector schema/badge with the generic MaterialFlow ones — a
   //    regression. The continuous-matcher entry + reserved DES action names
   //    above are all the material-flow registry needs for such types; the engine

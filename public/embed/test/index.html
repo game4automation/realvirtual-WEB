@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>rv-embed deployment smoke test</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, system-ui, sans-serif;
+      background: #0e1216;
+      color: #e5edf3;
+    }
+    body {
+      margin: 0;
+      padding: 20px;
+    }
+    header,
+    main {
+      width: min(1040px, 100%);
+      margin: 0 auto;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 20px;
+      font-weight: 600;
+    }
+    p {
+      margin: 0 0 14px;
+      color: #9ba9b4;
+      font-size: 13px;
+    }
+    #status {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 6px;
+      margin-bottom: 14px;
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    #status span {
+      padding: 7px 9px;
+      border: 1px solid #33414b;
+      border-radius: 4px;
+      background: #161d23;
+      color: #8998a4;
+    }
+    #status span[data-state="ok"] {
+      border-color: #286277;
+      color: #4fc3f7;
+    }
+    #status span[data-state="error"] {
+      border-color: #a64747;
+      color: #ff8c8c;
+    }
+    #vignettes {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    article {
+      min-width: 0;
+    }
+    article > span {
+      display: block;
+      margin-bottom: 5px;
+      color: #aab6bf;
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    rv-embed {
+      height: 260px;
+      border: 1px solid #293640;
+      border-radius: 4px;
+      background: #151a1f;
+    }
+    #errors {
+      min-height: 18px;
+      margin-top: 10px;
+      color: #ff8c8c;
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+      white-space: pre-wrap;
+    }
+    @media (max-width: 640px) {
+      body {
+        padding: 10px;
+      }
+      #status {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      #vignettes {
+        grid-template-columns: 1fr;
+        gap: 8px;
+      }
+      rv-embed {
+        height: 220px;
+      }
+    }
+  </style>
+  <script>
+    window.__rvEmbedTest = {
+      bundleLoaded: false,
+      ready: [],
+      errors: [],
+      viewers: [],
+      workers: [],
+    };
+    const NativeWorker = window.Worker;
+    window.Worker = class RVEmbedObservedWorker extends NativeWorker {
+      constructor(url, options) {
+        super(url, options);
+        window.__rvEmbedTest.workers.push(String(url));
+        window.dispatchEvent(new Event('rv-test-worker'));
+      }
+    };
+    window.__rvEmbedBundleLoaded = () => {
+      window.__rvEmbedTest.bundleLoaded = true;
+      window.dispatchEvent(new Event('rv-test-bundle'));
+    };
+    window.__rvEmbedBundleFailed = () => {
+      window.__rvEmbedTest.errors.push('rv-embed.js failed to load');
+      window.dispatchEvent(new Event('rv-test-error'));
+    };
+  </script>
+  <script
+    type="module"
+    src="../rv-embed.js"
+    onload="window.__rvEmbedBundleLoaded()"
+    onerror="window.__rvEmbedBundleFailed()"></script>
+</head>
+<body>
+  <header>
+    <h1>rv-embed deployment smoke test</h1>
+    <p>Two live instances intentionally exercise the page-wide single-simulation rule.</p>
+    <div id="status" aria-live="polite">
+      <span data-check="bundle">Bundle: waiting</span>
+      <span data-check="decoder">Decoder + GLB: waiting</span>
+      <span data-check="worker">Worker: waiting</span>
+      <span data-check="instances">Instances: 0 / 2 ready</span>
+    </div>
+  </header>
+  <main>
+    <section id="vignettes">
+      <article>
+        <span>Vignette A</span>
+        <rv-embed
+          id="vignette-a"
+          src="../vignettes/conveyor-sensor.glb"
+          poster="./poster.svg"
+          background="#151a1f"
+          run="when-visible"
+          interactive="orbit-on-click"
+          director="conveyor-loop"></rv-embed>
+      </article>
+      <article>
+        <span>Vignette B</span>
+        <rv-embed
+          id="vignette-b"
+          src="../vignettes/conveyor-sensor.glb"
+          poster="./poster.svg"
+          background="#151a1f"
+          run="when-visible"
+          interactive="orbit-on-click"
+          director="conveyor-loop"></rv-embed>
+      </article>
+    </section>
+    <div id="errors" role="alert"></div>
+  </main>
+  <script>
+    const state = window.__rvEmbedTest;
+    const statuses = {
+      bundle: document.querySelector('[data-check="bundle"]'),
+      decoder: document.querySelector('[data-check="decoder"]'),
+      worker: document.querySelector('[data-check="worker"]'),
+      instances: document.querySelector('[data-check="instances"]'),
+    };
+    const errors = document.querySelector('#errors');
+    const setStatus = (name, text, value) => {
+      statuses[name].textContent = text;
+      statuses[name].dataset.state = value;
+    };
+    const refresh = () => {
+      if (state.bundleLoaded) setStatus('bundle', 'Bundle: loaded', 'ok');
+      if (state.ready.length > 0) setStatus('decoder', 'Decoder + GLB: loaded', 'ok');
+      if (state.workers.length > 0) setStatus('worker', `Worker: ${state.workers.length} loaded`, 'ok');
+      setStatus(
+        'instances',
+        `Instances: ${state.ready.length} / 2 ready`,
+        state.ready.length === 2 ? 'ok' : undefined,
+      );
+      if (state.errors.length > 0) {
+        errors.textContent = state.errors.join('\n');
+        for (const status of Object.values(statuses)) {
+          if (status.dataset.state !== 'ok') status.dataset.state = 'error';
+        }
+      }
+    };
+    window.addEventListener('rv-test-bundle', refresh);
+    window.addEventListener('rv-test-worker', refresh);
+    window.addEventListener('rv-test-error', refresh);
+    for (const element of document.querySelectorAll('rv-embed')) {
+      element.addEventListener('rv-ready', (event) => {
+        state.ready.push(element.id);
+        state.viewers.push(event.detail.viewer);
+        refresh();
+      }, { once: true });
+      element.addEventListener('rv-error', (event) => {
+        state.errors.push(`${element.id}: ${event.detail.message}`);
+        refresh();
+      });
+    }
+    refresh();
+  </script>
+</body>
+</html>

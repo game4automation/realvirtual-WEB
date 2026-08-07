@@ -12,6 +12,11 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useViewer } from './use-viewer';
+import {
+  createSignalWriter,
+  type SignalStore,
+  type SignalWriter,
+} from '../core/engine/rv-signal-store';
 
 /** Subscribe to a signal value. Re-renders only when the value changes. */
 export function useSignal(addr: string): boolean | number | undefined {
@@ -53,11 +58,19 @@ export function useSignal(addr: string): boolean | number | undefined {
 export function useSignalWrite(addr: string): (v: boolean | number) => void {
   const viewer = useViewer();
   const addrRef = useRef(addr);
+  const writerStoreRef = useRef<SignalStore | null>(null);
+  const writerRef = useRef<SignalWriter | null>(null);
   addrRef.current = addr;
 
   return useCallback(
     (v: boolean | number) => {
-      viewer.signalStore?.set(addrRef.current, v);
+      const store = viewer.signalStore;
+      if (!store) return;
+      if (writerStoreRef.current !== store) {
+        writerStoreRef.current = store;
+        writerRef.current = createSignalWriter(store, 'hmi:use-signal', 'hmi');
+      }
+      writerRef.current!.set(addrRef.current, v);
     },
     [viewer],
   );

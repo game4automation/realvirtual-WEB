@@ -3,7 +3,7 @@
 **Browser-Based 3D HMI, Machine Information System, and Digital Twin Viewer for Industrial Automation**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://www.typescriptlang.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-blue.svg)](https://www.typescriptlang.org/)
 [![Three.js](https://img.shields.io/badge/Three.js-WebGL%20%7C%20WebGPU-green.svg)](https://threejs.org/)
 [![AI-Driven Development](https://img.shields.io/badge/AI--Driven_Development-MCP_Enabled-blueviolet.svg)](https://github.com/game4automation/realvirtual-MCP)
 
@@ -21,7 +21,10 @@ realvirtual WEB replaces traditional desktop HMI and SCADA visualization with a 
 
 ### Key Capabilities
 
+- **Workspace Modes** — One application, four workspaces, switchable from the toolbar or via `?mode=viewer|hmi|planner|des`: **Viewer** (just show the machine — model and running kinematics, no panels and no authoring), **HMI** (operate and monitor), **Planner** (assemble layouts), **DES** (event-driven material-flow analysis).
 - **Live 3D HMI** — Real-time PLC signal visualization via WebSocket or MQTT. Drive monitoring, sensor states, KPI overlays, alarm dashboards, and production charts powered by [Apache ECharts](https://echarts.apache.org/).
+- **Signal Linking by Drag & Drop** — Drag a live interface signal straight onto a component slot (Forward, TargetSpeed, SensorOccupied, …). Direction and value type are checked, connections are saved with the layout, and signals can be monitored and forced.
+- **Collision Detection** — Give a node one of six collision roles (Tool, Workpiece, Machine, Robot, Environment, None); while the simulation runs, every pair of bodies with *different* roles is checked against each other.
 - **Machine Information System** — Attach documents, maintenance guides, technical drawings, and manuals directly to 3D components. Technicians click a part and see its documentation in context — accessible from any device on the shop floor.
 - **Transport Simulation** — Full in-browser simulation engine at 60 Hz fixed timestep: conveyor surfaces, sources, sinks, sensors with AABB collision, grippers, and material flow.
 - **LogicStep Sequencing** — Serial/parallel containers, signal conditions, delays, drive commands — ported from realvirtual.io Professional based on Unity.
@@ -29,7 +32,7 @@ realvirtual WEB replaces traditional desktop HMI and SCADA visualization with a 
 - **Layout Planning** *(Beta)* — Assemble factory layouts directly in the browser: drag reusable parts from a library onto a grid, connect them with typed snap points, and position them with transform gizmos. Ships with a standard parts library and can load any GLB catalog straight from a GitHub repository.
 - **Multiuser Sessions** *(Beta)* — Real-time collaboration with avatars, shared camera views, role management, and late-join state sync.
 - **Plugin Architecture** — Extend with custom plugins for project-specific HMI, KPI dashboards, maintenance workflows, and industrial interfaces.
-- **AI-Ready (MCP)** — Built-in [Model Context Protocol](https://modelcontextprotocol.io) bridge lets AI assistants like Claude inspect, control, and debug the running viewer — read drive states, set signals, query scene hierarchy, and automate testing through natural language. Uses the [realvirtual MCP Server](https://github.com/game4automation/realvirtual-MCP).
+- **AI-Ready (MCP)** — Built-in [Model Context Protocol](https://modelcontextprotocol.io) bridge lets AI assistants like Claude inspect, control, and debug a running realvirtual WEB instance — read drive states, set signals, query scene hierarchy, and automate testing through natural language. Uses the [realvirtual MCP Server](https://github.com/game4automation/realvirtual-MCP).
 
 ## Use Cases
 
@@ -78,20 +81,39 @@ Drop `.glb` files exported from [realvirtual.io](https://realvirtual.io) into `p
 ```bash
 npm run build        # Production build -> dist/ (local only, nothing published)
 npm run preview      # Preview production build
-npm run deploy       # Build AND publish to the public CDN (web.realvirtual.io)
+npx tsc --noEmit     # Type check (community view)
 npm test             # Run browser tests (headless Chromium via Playwright)
 npm run test:node    # Run Node.js tests (fs, glob, ESLint instance)
 npm run test:all     # Run both Node + browser tests
+npm run e2e          # Run Playwright end-to-end tests (e2e/)
 npm run lint         # ESLint (flat-config, boundaries rule)
 ```
+
+**Type checking:** plain `npx tsc --noEmit` is the **community view** — the base `tsconfig.json`
+excludes the generated list of private-dependent tests (`tests/private-dependent-tests.json`), so it
+type-checks exactly what a clone of this repository actually contains. `npm run typecheck` is the
+*maintainer* full check: it uses `tsconfig.full.json` and **requires the private sibling repository**
+`../realvirtual-WebViewer-Private~`, which is not part of this repository — running it without that
+folder produces a wall of unresolvable `@rv-private/*` errors. Use `npx tsc --noEmit`.
+
+Publishing is maintainer-only: `npm run deploy` uploads to realvirtual's own Bunny CDN
+(`web.realvirtual.io`) and needs `BUNNY_*` credentials that ship with no clone. To host a build
+yourself, serve the `dist/` folder produced by `npm run build` from any static web server — see
+[doc-deploy.md](doc-deploy.md) for the deployment details.
 
 ## Operating Modes
 
 | Mode | Description |
 |------|-------------|
-| **Standalone** | Pure browser simulation — no Unity, no PLC. Fixed-timestep simulation loop runs the full digital twin offline. |
-| **Live** | Connected via WebSocket or MQTT — real-time PLC signal streaming with live signal visualization (WebSocket Realtime, MQTT, Bosch ctrlX, TwinCAT HMI; a bridge application covers OPC UA, S7, ADS, etc.). |
-| **Direct** | Direct REST/MQTT connection to PLC without Unity in the loop. |
+| **Standalone** | Pure browser simulation — no gateway, no PLC. The fixed-timestep simulation loop runs the full digital twin offline. |
+| **Live** | Connected to a **realvirtual CONNECT** gateway over WebSocket — CONNECT talks to the PLC and streams signals into the browser in real time. This is the usual arrangement for PLC protocols (OPC UA, S7, ADS, Modbus, …), because the browser cannot speak them directly. |
+| **Direct** | The browser connects straight to the equipment over a browser-capable protocol (MQTT over WebSocket, REST) — no gateway in the loop. |
+
+**realvirtual CONNECT** is the gateway that makes Live mode work: it speaks the industrial
+protocols a browser cannot, and hands the signals to realvirtual WEB over one WebSocket. It is a
+separate product and is documented at
+[realvirtual.io/doc/web/connect](https://realvirtual.io/doc/web/connect/) — this repository holds
+only the browser side of the contract (see [doc-webviewer-interface.md](doc-webviewer-interface.md)).
 
 ## Deployment Options
 
@@ -106,9 +128,9 @@ npm run lint         # ESLint (flat-config, boundaries rule)
 |-----------|-----------|
 | 3D Rendering | [Three.js](https://threejs.org/) (WebGL + WebGPU *(Beta)* + WebXR) |
 | UI Framework | React 19 + MUI 7 |
-| Charts | Apache ECharts 5 |
+| Charts | Apache ECharts 6 |
 | Build Tool | Vite 6 |
-| Language | TypeScript 5.7 |
+| Language | TypeScript 5.9 |
 | Testing | Vitest (browser-mode) + Playwright |
 
 ## Industrial Connectivity
@@ -140,6 +162,8 @@ src/
   plugins/           # Built-in plugins (multiuser, annotations, FPV, XR)
     demo/            # Demo charts and HMI (OEE, cycle time, energy, drive/sensor overlays)
     models/          # Per-model plugins (auto-loaded when a model is selected)
+  private-stubs/     # No-op stubs for commercial modules — what makes this community
+                     #   edition build and run without the private sibling repository
 tests/               # Vitest browser-mode tests
 e2e/                 # Playwright E2E tests
 public/models/       # GLB model files
@@ -165,7 +189,7 @@ class MyPlugin implements RVViewerPlugin {
   id = 'my-plugin';
 
   init(viewer: RVViewer) {
-    // Access drives, signals, scene — all from the viewer API
+    // Access drives, signals, scene — all from the RVViewer API
     viewer.on('model-loaded', () => {
       const drives = viewer.drives;          // all drives in the scene
       const signals = viewer.signalStore;    // PLC signal store
@@ -196,7 +220,8 @@ For the full plugin API — UI slots, event bus, hooks, context menus, and toolt
 
 ## Documentation
 
-Start with **[Architecture](doc-webviewer.md)**. The full documentation set:
+End users start at the **[realvirtual WEB documentation site](https://realvirtual.io/doc/web/)**.
+Developers start with **[Architecture](doc-webviewer.md)**. The full in-repo documentation set:
 
 **Getting started & architecture**
 | Document | Contents |
@@ -204,6 +229,7 @@ Start with **[Architecture](doc-webviewer.md)**. The full documentation set:
 | [Architecture](doc-webviewer.md) | Full architecture, component reference, configuration, workspace modes |
 | [From Unity to the Web](doc-unity-to-web.md) | Porting patterns and the AI coding-agent workflow |
 | [Lifecycle](doc-lifecycle.md) | Runtime lifecycle: model load, fixed-step loop, pause, reset, dispose, events |
+| [Node Paths](doc-node-paths.md) | How component, signal and kinematic references are written and resolved |
 
 **Building & extending**
 | Document | Contents |
@@ -211,8 +237,11 @@ Start with **[Architecture](doc-webviewer.md)**. The full documentation set:
 | [Plugin Development](doc-extending-webviewer.md) | Plugin system, custom components, UI slots, hooks |
 | [Events & Hooks](doc-events-and-hooks.md) | Typed event bus and plugin/component lifecycle hooks |
 | [Component Behaviors](doc-behaviors.md) | Per-node TypeScript behaviors and naming conventions |
+| [Component Scripting](doc-scripting.md) | JavaScript behaviors authored inside the GLB, run in a QuickJS sandbox |
 | [Behavior Modelling](doc-behavior-modelling.md) | Continuous vs DES material-flow modelling (beginner's guide) |
 | [Signal Architecture](doc-signal-architecture.md) | Signal store: GLB import to React UI, PLC direction, batching |
+| [Signal Connection Logic](doc-signal-connection-logic.md) | Slots, connection states, drag & drop linking, forcing, persistence |
+| [UI Visibility](doc-ui-visibility.md) | Which axis decides what is shown: plugin modes vs. UI visibility rules |
 
 **Authoring & operations**
 | Document | Contents |
@@ -237,12 +266,18 @@ Start with **[Architecture](doc-webviewer.md)**. The full documentation set:
 
 ## AI-Enabled Development (MCP)
 
-realvirtual WEB and [realvirtual.io](https://realvirtual.io) are fully AI-enabled through the **Model Context Protocol (MCP)**. AI coding assistants like [Claude Code](https://claude.ai/code) can directly interact with both the Unity Editor and the running realvirtual WEB instance:
+realvirtual WEB and [realvirtual.io](https://realvirtual.io) are fully AI-enabled through the **Model Context Protocol (MCP)**. AI coding assistants like [Claude Code](https://claude.ai/code) can drive the running scene directly.
 
-The [**realvirtual MCP Server**](https://github.com/game4automation/realvirtual-MCP) is the recommended AI bridge. It connects AI assistants to:
+**The MCP server ships inside [realvirtual CONNECT](https://realvirtual.io/doc/web/connect/)** — there is
+nothing extra to install. CONNECT hosts the endpoint at `http://localhost:5100/mcp`; point your
+assistant at it and the `web_*` tools reach the browser scene over the same origin that serves it:
 
-- **realvirtual WEB** — List drives and positions, read/write PLC signals, query the scene hierarchy, inspect sensor states, debug transport simulation — all from the running browser scene.
-- **Unity Editor** *(optional)* — When used with [realvirtual.io](https://realvirtual.io), 80+ additional tools are available: create GameObjects, set component properties, run simulations, manage scenes, take screenshots, and run tests.
+- **realvirtual WEB** — list drives and positions, read/write PLC signals, query the scene
+  hierarchy, inspect sensor states, debug transport simulation, take screenshots of the running
+  scene.
+- **Unity Editor** *(optional)* — with [realvirtual.io](https://realvirtual.io) Professional, the
+  separate realvirtual MCP package adds 80+ editor tools: create GameObjects, set component
+  properties, run simulations, manage scenes, run tests.
 
 This means AI assistants can design, build, test, and debug industrial digital twins end-to-end.
 
@@ -278,7 +313,7 @@ license your contribution under its commercial license.
 
 ## License
 
-Copyright (C) 2025 [realvirtual GmbH](https://realvirtual.io)
+Copyright (C) 2025–2026 [realvirtual GmbH](https://realvirtual.io)
 
 This program is licensed under the **GNU Affero General Public License v3 (AGPL-3.0)**.
 
@@ -298,4 +333,4 @@ Contact: [realvirtual.io/en/company/license](https://realvirtual.io/en/company/l
 
 ---
 
-**[realvirtual.io](https://realvirtual.io)** | [Live Demo](https://web.realvirtual.io/demo) | [Documentation](https://doc.realvirtual.io) | [YouTube](https://youtube.com/@realvirtualio) | [Forum](https://forum.realvirtual.io)
+**[realvirtual.io](https://realvirtual.io)** | [Live Demo](https://web.realvirtual.io/demo) | [realvirtual WEB Documentation](https://realvirtual.io/doc/web/) | [realvirtual.io Documentation](https://doc.realvirtual.io) | [YouTube](https://youtube.com/@realvirtualio) | [Forum](https://forum.realvirtual.io)

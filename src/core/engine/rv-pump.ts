@@ -14,7 +14,7 @@
 
 import type { Object3D } from 'three';
 import type { ComponentSchema } from './rv-component-registry';
-import { applySchema, setComponentInstance } from './rv-component-registry';
+import { applySchema, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import { validateExtras } from './rv-extras-validator';
 import { NodeRegistry } from './rv-node-registry';
 import { registerTooltipComponent } from './rv-tooltip-component';
@@ -32,32 +32,8 @@ export class RVPump {
   static readonly tooltipType = 'pump';
   static readonly displayName = 'Pump';
 
-  static readonly schema: ComponentSchema = {
-    flowRate: { type: 'number', default: 0 },
-    pipe: { type: 'componentRef' },
-    /** Authoring-time grouping: pumps with the same non-negative `circuitId`
-     *  share a fluid circuit with pipes/tanks of the same id, even when the
-     *  pipe-reference traversal can't connect them. `-1` = unassigned. */
-    circuitId: { type: 'number', default: -1 },
-    /** Medium currently flowing through the pump. Assigned by ProcessIndustryPlugin
-     *  during `reassignFluids()` based on the pump's subgraph. Empty when not part
-     *  of a known fluid network. */
-    resourceName: { type: 'string', default: '' },
-    // Industry-typical instrumentation (all optional — 0 / 'ok' = "not shown" or "nominal")
-    state: { type: 'string', default: 'ok' },          // 'ok' | 'warning' | 'fault'
-    suctionPressure: { type: 'number', default: 0 },   // bar gauge
-    dischargePressure: { type: 'number', default: 0 }, // bar gauge
-    speedRpm: { type: 'number', default: 0 },          // motor RPM
-    speedPercent: { type: 'number', default: 0 },      // VFD command 0..100 %
-    powerKw: { type: 'number', default: 0 },           // shaft power kW
-    currentA: { type: 'number', default: 0 },          // motor current A
-    bearingTempC: { type: 'number', default: 0 },      // °C
-    motorTempC: { type: 'number', default: 0 },        // °C
-    vibrationMmS: { type: 'number', default: 0 },      // mm/s RMS (ISO 10816)
-    npshAvailable: { type: 'number', default: 0 },     // m
-    npshRequired: { type: 'number', default: 0 },      // m
-    runHours: { type: 'number', default: 0 },          // total operating hours
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('Pump');
 
   readonly node: Object3D;
 

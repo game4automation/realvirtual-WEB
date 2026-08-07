@@ -76,7 +76,7 @@ function MetadataContentRenderer({ value }: FieldRendererProps) {
               return (
                 <Box key={i} sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 1 }}>
                   <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>{label}</Typography>
-                  <SignalBadge direction={info?.direction ?? 'unknown'} plcType={info?.plcType} raw={info?.raw} />
+                  <SignalBadge direction={info?.direction ?? 'unknown'} plcType={info?.plcType} raw={info?.raw} viewer={viewer} signalName={sigName} />
                 </Box>
               );
             }
@@ -92,7 +92,7 @@ function MetadataContentRenderer({ value }: FieldRendererProps) {
             return (
               <Box key={i} sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 1 }}>
                 <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>{t.text}</Typography>
-                <SignalBadge direction={info?.direction ?? 'unknown'} plcType={info?.plcType} raw={info?.raw} />
+                <SignalBadge direction={info?.direction ?? 'unknown'} plcType={info?.plcType} raw={info?.raw} viewer={viewer} signalName={t.text} />
               </Box>
             );
           }

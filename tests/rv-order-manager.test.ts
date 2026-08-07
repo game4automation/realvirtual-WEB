@@ -6,6 +6,8 @@ import {
   subscribeOrderStore,
   getOrderSnapshot,
   extractOrderData,
+  extractMetadataOrderData,
+  hasMetadataArticle,
   OrderManagerPlugin,
   _resetOrderStore,
 } from '../src/plugins/order-manager-plugin';
@@ -326,5 +328,81 @@ describe('OrderManagerPlugin lifecycle', () => {
     expect(items).toHaveLength(2);
     // Ensure it's a copy
     expect(items).not.toBe(getOrderSnapshot().items);
+  });
+});
+
+// ─── Metadata order data (RuntimeMetadata content) ───────────────────
+
+describe('extractMetadataOrderData', () => {
+  // German ERP parts-list export (Mauser CL30 pattern). "Artikeltyp" and
+  // "Artikelhauptgruppe" deliberately come BEFORE "Artikel" to prove that
+  // exact label matches win over substring matches.
+  const GERMAN_CONTENT =
+    '<name>GRIPPER ARM</name>' +
+    '<value label="ID">1-07-930-1-26-06-158.ipt</value>' +
+    '<value label="Artikeltyp">Bauteil</value>' +
+    '<value label="Artikelhauptgruppe">Cageline</value>' +
+    '<value label="Artikel">0993224 </value>' +
+    '<value label="Beschreibung">GREIFARM</value>' +
+    '<value label="Hersteller">Mauser</value>';
+
+  const ENGLISH_CONTENT =
+    '<name>DISTANCE PLATE</name>' +
+    '<value label="Article">0993328</value>' +
+    '<value label="English">M1 DISTANCE PLATE</value>' +
+    '<value label="German">M1 DISTANZBLECH</value>';
+
+  it('should extract German labels (Artikel/Beschreibung/Hersteller)', () => {
+    const data = extractMetadataOrderData(GERMAN_CONTENT, 'Node');
+    expect(data).not.toBeNull();
+    expect(data!.articleNumber).toBe('0993224'); // trimmed, exact "Artikel" — not "Artikeltyp"
+    expect(data!.displayName).toBe('GREIFARM');
+    expect(data!.manufacturer).toBe('Mauser');
+    expect(data!.aasId).toBe('0993224');
+  });
+
+  it('should still extract English labels (Article/English)', () => {
+    const data = extractMetadataOrderData(ENGLISH_CONTENT, 'Node');
+    expect(data).not.toBeNull();
+    expect(data!.articleNumber).toBe('0993328');
+    expect(data!.displayName).toBe('M1 DISTANCE PLATE');
+  });
+
+  it('should return null when no article label matches', () => {
+    const data = extractMetadataOrderData(
+      '<name>Frame</name><value label="Material">Steel</value>',
+      'Node',
+    );
+    expect(data).toBeNull();
+  });
+
+  it('should fall back to <name> when no description label matches', () => {
+    const data = extractMetadataOrderData(
+      '<name>Bracket</name><value label="Artikel">123</value>',
+      'Node',
+    );
+    expect(data!.displayName).toBe('Bracket');
+  });
+});
+
+describe('hasMetadataArticle', () => {
+  const fakeNode = (content: string | undefined) =>
+    ({ userData: content !== undefined ? { _rvMetadata: { content } } : {} }) as unknown as import('three').Object3D;
+
+  it('should detect German "Artikel" label', () => {
+    expect(hasMetadataArticle(fakeNode('<value label="Artikel">0993224 </value>'))).toBe(true);
+  });
+
+  it('should detect English "Article" label', () => {
+    expect(hasMetadataArticle(fakeNode('<value label="Article">0993328</value>'))).toBe(true);
+  });
+
+  it('should reject whitespace-only article values', () => {
+    expect(hasMetadataArticle(fakeNode('<value label="Artikel">  </value>'))).toBe(false);
+  });
+
+  it('should return false without metadata or article', () => {
+    expect(hasMetadataArticle(fakeNode(undefined))).toBe(false);
+    expect(hasMetadataArticle(fakeNode('<value label="Material">Steel</value>'))).toBe(false);
   });
 });

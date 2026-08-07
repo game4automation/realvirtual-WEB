@@ -15,113 +15,26 @@
  * (ErrorStore) is the only new building block.
  */
 
-import { CanvasTexture, type Object3D, type Texture } from 'three';
+import { type Object3D, type Texture } from 'three';
 import type { ComponentContext, ComponentSchema, RVComponent } from './rv-component-registry';
-import { registerComponent, setComponentInstance } from './rv-component-registry';
+import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import type { GizmoHandle } from './rv-gizmo-manager';
-import { computeSubtreeAABB } from './rv-traverse-utils';
 import { NodeRegistry } from './rv-node-registry';
-
-// ─── Constants (inline, glanceable) ─────────────────────────────────────
-
-/** ISA-101 alarm red used for the 3D highlight + badge border. */
-const ERROR_COLOR = 0xff2020;
-/** 2 Hz flash for the active highlight (matches WebSensor 'error' state). */
-const ERROR_BLINK_HZ = 2;
-/** Wider outline so small parts are visible from far (matches WebSensor). */
-const HIGHLIGHT_OUTLINE_SCALE = 2.0;
-/** Bounding-box diagonal below this (in meters) → small part → floor-disk ring.
- *  ~150 mm threshold (Auto heuristic, plan §2.4 / open question — calibratable). */
-const SMALL_PART_DIAGONAL_M = 0.15;
-
-/** 3D highlight style — accepts the C# enum as string or int index. */
-type HighlightStyle = 'Auto' | 'FlashObject' | 'Circle';
-
-/** Normalize a string/int HighlightStyle to a named value (defensive). */
-function normalizeHighlightStyle(raw: unknown): HighlightStyle {
-  if (raw === 'FlashObject' || raw === 1 || raw === '1') return 'FlashObject';
-  if (raw === 'Circle' || raw === 2 || raw === '2') return 'Circle';
-  return 'Auto';
-}
-
-// ─── Backed error-text badge sprite (dark panel + red border + white text) ──
-
-/** Build a CanvasTexture badge: dark rounded panel, red border, white text.
- *  Pattern mirrors MeasurementRenderer._createLabelSprite. Returns the texture
- *  plus its canvas aspect (w/h) so the caller can scale the sprite correctly. */
-function buildBadgeTexture(text: string): { texture: CanvasTexture; aspect: number } {
-  const label = text && text.trim() ? text : 'Error';
-  const fontSize = 32;
-  const border = 3;
-  const radius = 8;
-  const pad = 16;
-
-  const measureCanvas = document.createElement('canvas');
-  const mctx = measureCanvas.getContext('2d')!;
-  mctx.font = `bold ${fontSize}px sans-serif`;
-  const textWidth = Math.ceil(mctx.measureText(label).width);
-
-  const w = textWidth + pad * 2 + border * 2;
-  const h = fontSize + pad;
-  const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext('2d')!;
-  ctx.clearRect(0, 0, w, h);
-
-  const drawRoundedRect = (x: number, y: number, rw: number, rh: number, r: number) => {
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.lineTo(x + rw - r, y);
-    ctx.quadraticCurveTo(x + rw, y, x + rw, y + r);
-    ctx.lineTo(x + rw, y + rh - r);
-    ctx.quadraticCurveTo(x + rw, y + rh, x + rw - r, y + rh);
-    ctx.lineTo(x + r, y + rh);
-    ctx.quadraticCurveTo(x, y + rh, x, y + rh - r);
-    ctx.lineTo(x, y + r);
-    ctx.quadraticCurveTo(x, y, x + r, y);
-    ctx.closePath();
-  };
-
-  // Red border (full rect) → dark panel inset
-  const hex = ERROR_COLOR.toString(16).padStart(6, '0');
-  ctx.fillStyle = `#${hex}`;
-  drawRoundedRect(0, 0, w, h, radius);
-  ctx.fill();
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
-  drawRoundedRect(border, border, w - border * 2, h - border * 2, Math.max(0, radius - border));
-  ctx.fill();
-
-  // White text
-  ctx.fillStyle = '#ffffff';
-  ctx.font = `bold ${fontSize}px sans-serif`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(label, w / 2, h / 2 + 1);
-
-  const texture = new CanvasTexture(canvas);
-  texture.needsUpdate = true;
-  return { texture, aspect: w / h };
-}
+import {
+  normalizeHighlightStyle,
+  resolveUseRing,
+  createErrorHighlightGizmo,
+  createErrorBadgeGizmo,
+  type HighlightStyle,
+} from './rv-error-visual';
 
 // ─── RVWebError ──────────────────────────────────────────────────────────
 
 export class RVWebError implements RVComponent {
-  static readonly schema: ComponentSchema = {
-    SignalError: { type: 'componentRef' },
-    ErrorText:   { type: 'string', default: '' },
-    HighlightStyle: {
-      type: 'enum',
-      // Enum-tolerant: accepts the C# enum serialized as a string ('Auto') OR an
-      // int index ('0'). UnityGLTF serializes enums via .ToString() → string, but
-      // the int form is normalized defensively in init() as well.
-      enumMap: {
-        Auto: 'Auto', FlashObject: 'FlashObject', Circle: 'Circle',
-        '0': 'Auto', '1': 'FlashObject', '2': 'Circle',
-      },
-      default: 'Auto',
-    },
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  // HighlightStyle stays enum-tolerant: the spec's enumMap accepts the C# enum
+  // string ('Auto') OR the legacy int index ('0'), like HIGHLIGHT_STYLE_FIELD did.
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('WebError');
 
   readonly node: Object3D;
   isOwner = true;
@@ -182,60 +95,20 @@ export class RVWebError implements RVComponent {
     this._ctx = ctx;
 
     // ── 3D highlight gizmo (red flash / floor-disk ring) ──
-    const useRing = this._resolveUseRing();
-    if (useRing) {
-      this._highlightGizmo = ctx.gizmoManager.create(this.node, {
-        shape: 'floor-disk',
-        color: ERROR_COLOR,
-        opacity: 0.45,
-        blinkHz: ERROR_BLINK_HZ,
-        visible: false,
-      });
-    } else {
-      this._highlightGizmo = ctx.gizmoManager.create(this.node, {
-        shape: 'mesh-glow-hull',
-        color: ERROR_COLOR,
-        opacity: 0.95,
-        blinkHz: ERROR_BLINK_HZ,
-        outlineScale: HIGHLIGHT_OUTLINE_SCALE,
-        visible: false,
-      });
-    }
+    this._highlightGizmo = createErrorHighlightGizmo(ctx.gizmoManager, this.node, this.HighlightStyle);
 
     // ── Backed error-text badge (dark panel + red border + white text) ──
-    const { texture, aspect } = buildBadgeTexture(this.ErrorText);
-    this._badgeTexture = texture;
-    const { size } = computeSubtreeAABB(this.node);
-    // World height of the badge ≈ a fraction of the part height (min 0.08 m).
-    const badgeHeight = Math.max(0.08, size.y * 0.4);
-    this._badgeGizmo = ctx.gizmoManager.create(this.node, {
-      shape: 'sprite',
-      color: 0xffffff,
-      opacity: 1.0,
-      spriteTexture: texture,
-      worldSize: badgeHeight,
-      depthTest: false,
-      renderOrder: 12,
-      excludeFromRaycast: true,
-      visible: false,
-    });
-    // Lift the badge above the part (sprite default sits at the AABB center).
-    if (this._badgeGizmo) {
-      // Sprite worldSize is the badge HEIGHT; width = height × aspect.
-      this._badgeGizmo.root.scale.set(badgeHeight * aspect, badgeHeight, 1);
-      this._badgeGizmo.root.position.y += size.y * 0.5 + badgeHeight;
-    }
+    const badge = createErrorBadgeGizmo(ctx.gizmoManager, this.node, this.ErrorText);
+    this._badgeGizmo = badge.gizmo;
+    this._badgeTexture = badge.texture;
 
     // Apply the captured initial state now that gizmos exist.
     this._applyActive(this._active);
   }
 
+  /** Test/inspection helper retained for the existing rv-web-error tests. */
   private _resolveUseRing(): boolean {
-    if (this.HighlightStyle === 'Circle') return true;
-    if (this.HighlightStyle === 'FlashObject') return false;
-    // Auto: small parts (short diagonal) → floor-disk ring, else mesh flash.
-    const { size } = computeSubtreeAABB(this.node);
-    return size.length() < SMALL_PART_DIAGONAL_M;
+    return resolveUseRing(this.node, this.HighlightStyle);
   }
 
   private _onChange(active: boolean): void {
@@ -280,6 +153,7 @@ registerComponent({
   displayName: 'Error',
   schema: RVWebError.schema,
   capabilities: {
+    authorable: true,   // addable in the asset editor (schema-complete)
     hoverable: false,
     selectable: false,
     filterLabel: 'Web Errors',

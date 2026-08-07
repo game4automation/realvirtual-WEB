@@ -1,0 +1,3128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://realvirtual.io/schema/odt/v1/rv-odt.json",
+  "title": "realvirtual Open Digital Twin Format (rv-ODT)",
+  "description": "Machine-readable specification of the realvirtual Open Digital Twin Format. Component data is carried per glTF node under extras.realvirtual. Where the human-readable specification.md and this file disagree, this file is normative. Licensed under CC BY 4.0 (see schema/LICENSE).",
+  "formatVersion": "1.0",
+  "$defs": {
+    "ComponentReference": {
+      "type": "object",
+      "description": "Reference to a component or PLC signal on another glTF node, identified by its scene path. The 'path' field is the ONLY identity carried today; a stable node-id field may be added alongside it in a future minor version, in which case 'path' remains valid and consumers prefer the id when both are present.",
+      "properties": {
+        "type": {
+          "const": "ComponentReference"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Node path identifying the target, built from glTF node NAMES. NORMATIVE RULES. (1) Root inclusion: the path is absolute and STARTS AT the exported scene root node — the root's own name is the first segment, so a reference to the root itself is exactly that name and a reference to a same-named direct child is 'X/X'. The glTF scene object itself contributes no segment. (2) Separator: '/'. glTF node names may legally contain '/', but Three.js' GLTFLoader strips it from every name it loads (see rule 3), so a conforming path is unambiguously splittable on '/'; producers MUST NOT emit a name containing '/'. (3) Which name: the node's glTF name as written in the file (nodes[i].name), BEFORE any consumer-side transformation. Three.js in particular applies PropertyBinding.sanitizeNodeName (whitespace to '_', then the reserved characters [ ] . : / removed) and then appends a '_N' suffix to make names unique FILE-GLOBALLY. Neither the sanitization nor the dedup suffix belongs in this field. (4) Uniqueness: producers SHOULD ensure paths are unique within the file; where two nodes anywhere in the file share a name, producers SHOULD warn, because consumers that dedup names will break every path leading THROUGH such a node. (5) Consumer fallbacks, permitted in this order and no other: (a) exact match on the written path; (b) match after applying the consumer's own name transformation to the query (e.g. space to '_'); (c) match against a pre-transformation alias the consumer recorded for a node it renamed, including for that node's descendants; (d) unique proper-suffix match, i.e. a registered path ending in '/' + the query. A consumer MUST NOT resolve step (d) when more than one distinct target matches — it MUST report the ambiguity and treat the reference as unresolved rather than pick one. Steps (b) to (d) are tolerance for imperfect producers, not part of the contract: a conforming producer is resolved entirely by step (a)."
+        },
+        "componentType": {
+          "type": "string",
+          "description": "Target component type, e.g. 'PLCOutputBool', 'Drive', 'Sensor'."
+        },
+        "componentIndex": {
+          "type": "integer",
+          "default": 0
+        }
+      },
+      "required": [
+        "type",
+        "path",
+        "componentType"
+      ]
+    },
+    "Vector3": {
+      "type": "object",
+      "description": "3D vector. Coordinate convention per field: see the 'unityCoords' vocabulary keyword.",
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "z": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ]
+    },
+    "Quaternion": {
+      "type": "object",
+      "description": "Rotation quaternion (x, y, z, w).",
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "z": {
+          "type": "number"
+        },
+        "w": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z",
+        "w"
+      ]
+    },
+    "ActiveOnly": {
+      "type": "string",
+      "description": "Connection-state gate: whether a component participates in simulation depending on the viewer's live-connection state.",
+      "enum": [
+        "Always",
+        "Connected",
+        "Disconnected",
+        "Never",
+        "DontChange"
+      ],
+      "default": "Always"
+    },
+    "Drive": {
+      "type": "object",
+      "description": "Linear or rotational motion control along a local axis. The base Drive component.",
+      "properties": {
+        "Direction": {
+          "type": "string",
+          "enum": [
+            "LinearX",
+            "LinearY",
+            "LinearZ",
+            "RotationX",
+            "RotationY",
+            "RotationZ",
+            "Virtual"
+          ],
+          "description": "Motion axis of the drive in Unity local coordinates; 'Virtual' drives no transform."
+        },
+        "ReverseDirection": {
+          "type": "boolean",
+          "default": false,
+          "description": "Set to true if the direction needs to be inverted."
+        },
+        "Offset": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Start offset of the drive from zero position in millimeters or degrees."
+        },
+        "StartPosition": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Start position of the drive in millimeters or degrees."
+        },
+        "TargetSpeed": {
+          "type": "number",
+          "default": 100,
+          "unit": "mm/s",
+          "description": "The target speed of the drive in millimeters per second (degrees per second for rotational drives)."
+        },
+        "Acceleration": {
+          "type": "number",
+          "default": 100,
+          "unit": "mm/s2",
+          "description": "The acceleration in millimeters per second squared."
+        },
+        "UseAcceleration": {
+          "type": "boolean",
+          "default": false,
+          "description": "If set to true the drive uses the acceleration."
+        },
+        "UseLimits": {
+          "type": "boolean",
+          "default": false,
+          "description": "If set to true the drive motion is limited to the range between LowerLimit and UpperLimit."
+        },
+        "LowerLimit": {
+          "type": "number",
+          "default": -180,
+          "unit": "mm",
+          "description": "Lower drive limit in millimeters or degrees."
+        },
+        "UpperLimit": {
+          "type": "number",
+          "default": 180,
+          "unit": "mm",
+          "description": "Upper drive limit in millimeters or degrees."
+        },
+        "JogForward": {
+          "type": "boolean",
+          "default": false,
+          "description": "Jog the drive continuously forward at TargetSpeed."
+        },
+        "JogBackward": {
+          "type": "boolean",
+          "default": false,
+          "description": "Jog the drive continuously backward at TargetSpeed."
+        },
+        "TargetPosition": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "The destination position of the drive in millimeters or degrees."
+        }
+      }
+    },
+    "Drive_Simple": {
+      "type": "object",
+      "description": "Drive behavior: simple jog control with speed and directional bits plus feedback signals.",
+      "properties": {
+        "Speed": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputFloat",
+          "description": "PLC output for the speed of the drive in millimeters per second; can be scaled by ScaleSpeed."
+        },
+        "Accelaration": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputFloat",
+          "description": "PLC output for the acceleration of the drive in millimeters per second squared; field name keeps the original C# spelling."
+        },
+        "Forward": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Signal to move the drive forward."
+        },
+        "Backward": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Signal to move the drive backward."
+        },
+        "IsAtPosition": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputFloat",
+          "description": "Signal for the current position of the drive in millimeters."
+        },
+        "IsAtSpeed": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputFloat",
+          "description": "Signal for the current speed of the drive in millimeters per second."
+        },
+        "IsDriving": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true while the drive is driving."
+        },
+        "ScaleSpeed": {
+          "type": "number",
+          "default": 1,
+          "description": "Scale factor for the input and output speed and acceleration."
+        },
+        "CurrentPositionScale": {
+          "type": "number",
+          "default": 1,
+          "description": "Scale factor for the current position feedback."
+        },
+        "CurrentPositionOffset": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Offset applied to the position feedback in millimeters."
+        },
+        "ScaleFeedbackPosition": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true, applies scale and offset to the position feedback."
+        }
+      }
+    },
+    "Drive_Cylinder": {
+      "type": "object",
+      "description": "Drive behavior: two-position pneumatic/hydraulic cylinder with in/out command and end-position feedback.",
+      "properties": {
+        "MinPos": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Minimum position of the cylinder in millimeters."
+        },
+        "MaxPos": {
+          "type": "number",
+          "default": 100,
+          "unit": "mm",
+          "description": "Maximum position of the cylinder in millimeters."
+        },
+        "TimeOut": {
+          "type": "number",
+          "default": 1,
+          "unit": "s",
+          "description": "Time for moving out from minimum to maximum position in seconds."
+        },
+        "TimeIn": {
+          "type": "number",
+          "default": 1,
+          "unit": "s",
+          "description": "Time for moving in from maximum to minimum position in seconds."
+        },
+        "OneBitCylinder": {
+          "type": "boolean",
+          "default": false,
+          "description": "If set to true only one bit controls the cylinder; when Out is false the cylinder moves in."
+        },
+        "InvertOutputLogic": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, inverts the Out/In signal logic (Out=false extends, Out=true retracts)."
+        },
+        "Out": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Signal for moving the cylinder out."
+        },
+        "In": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Signal for moving the cylinder in."
+        },
+        "IsOut": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true when the cylinder is out or stopped by the Max sensor."
+        },
+        "IsIn": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true when the cylinder is in or stopped by the Min sensor."
+        },
+        "IsMax": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true when the cylinder is at the maximum position."
+        },
+        "IsMin": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true when the cylinder is at the minimum position."
+        },
+        "IsMovingOut": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true while the cylinder is moving out."
+        },
+        "IsMovingIn": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true while the cylinder is moving in."
+        }
+      }
+    },
+    "Drive_Speed": {
+      "type": "object",
+      "description": "Drive behavior: speed-controlled motion via PLC target-speed signal with speed/position feedback.",
+      "properties": {
+        "SignalTargetSpeed": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputFloat",
+          "description": "Target (maximum) speed of the drive in millimeters per second."
+        },
+        "SignalAcceleration": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputFloat",
+          "description": "Acceleration of the drive in millimeters per second squared."
+        },
+        "SignalCurrentSpeed": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputFloat",
+          "description": "Signal for the current drive speed in millimeters per second."
+        },
+        "SignalCurrentPosition": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputFloat",
+          "description": "Signal for the current drive position in millimeters."
+        },
+        "SignalIsDriving": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true while the drive is driving."
+        },
+        "TargetSpeed": {
+          "type": "number",
+          "default": 100,
+          "unit": "mm/s",
+          "description": "Default target speed in millimeters per second when no signal is wired."
+        },
+        "Acceleration": {
+          "type": "number",
+          "default": 100,
+          "unit": "mm/s2",
+          "description": "Default acceleration in millimeters per second squared when no signal is wired."
+        },
+        "CurrentPositionScale": {
+          "type": "number",
+          "default": 1,
+          "description": "Scale factor for the current position feedback."
+        },
+        "CurrentPositionOffset": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Offset applied to the position feedback in millimeters."
+        },
+        "ScaleFeedbackPosition": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true, applies scale and offset to the position feedback."
+        }
+      }
+    },
+    "Drive_Gear": {
+      "type": "object",
+      "description": "Drive behavior: slaves this node's Drive to a master Drive position with gear ratio and offset.",
+      "properties": {
+        "MasterDrive": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Master drive which defines the position of this drive."
+        },
+        "GearFactor": {
+          "type": "number",
+          "default": 1,
+          "description": "Gear factor between master and slave position."
+        },
+        "Offset": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Offset of the gear in millimeters."
+        }
+      }
+    },
+    "Drive_FollowPosition": {
+      "type": "object",
+      "description": "Drive behavior: directly follows a PLC position signal (no ramping) with position feedback.",
+      "properties": {
+        "Position": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputFloat",
+          "description": "Signal (PLC output) for the commanded position of the drive."
+        },
+        "CurrentPosition": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputFloat",
+          "description": "PLC input for the current position of the drive (without offset and scaling)."
+        },
+        "Offset": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Offset in millimeters added to the position signal."
+        },
+        "Scale": {
+          "type": "number",
+          "default": 1,
+          "description": "Scale factor applied to the position value."
+        },
+        "CurrentPositionScale": {
+          "type": "number",
+          "default": 1,
+          "description": "Scale factor for the current position feedback."
+        },
+        "ScaleFeedbackPosition": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true, applies scale and offset to the position feedback."
+        }
+      }
+    },
+    "Drive_DestinationMotor": {
+      "type": "object",
+      "description": "Drive behavior: point-to-point positioning motor. Start command drives to a destination with speed/acceleration commands and rich feedback.",
+      "properties": {
+        "StartDrive": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Start-to-drive signal; a value change starts motion towards Destination."
+        },
+        "Destination": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputFloat",
+          "description": "Destination position of the drive in millimeters."
+        },
+        "TargetSpeed": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputFloat",
+          "description": "Target (maximum) speed of the drive in millimeters per second."
+        },
+        "Acceleration": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputFloat",
+          "description": "Acceleration of the drive in millimeters per second squared."
+        },
+        "IsAtPosition": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputFloat",
+          "description": "Signal for the current position of the drive in millimeters."
+        },
+        "IsAtSpeed": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputFloat",
+          "description": "Signal for the current drive speed in millimeters per second."
+        },
+        "IsAtDestination": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true when the drive is at the destination."
+        },
+        "IsDriving": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true while the drive is currently driving."
+        },
+        "CurrentPositionScale": {
+          "type": "number",
+          "default": 1,
+          "description": "Scale factor for the current position feedback."
+        },
+        "CurrentPositionOffset": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Offset applied to the position command and feedback in millimeters."
+        },
+        "ScaleFeedbackPosition": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true, applies scale and offset to the position feedback."
+        }
+      }
+    },
+    "Drive_PositionSwitch": {
+      "type": "object",
+      "description": "Drive behavior: boolean output signal that is true while the drive position is inside configured areas.",
+      "properties": {
+        "OutputSignal": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Output signal to the PLC; true when the drive position is inside any configured area (inverted when InvertAreas is true)."
+        },
+        "InvertAreas": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, areas define false zones instead of true zones (inverts the output)."
+        },
+        "PositionOffset": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Global offset in millimeters or degrees applied to the drive position before area checking."
+        }
+      }
+    },
+    "Drive_ErraticPosition": {
+      "type": "object",
+      "description": "Drive behavior: moves the drive to random (or alternating min/max) positions — demo/test motion.",
+      "properties": {
+        "MinPos": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Minimum position of the range where the drive is allowed to move to, in millimeters."
+        },
+        "MaxPos": {
+          "type": "number",
+          "default": 100,
+          "unit": "mm",
+          "description": "Maximum position of the range where the drive is allowed to move to, in millimeters."
+        },
+        "Speed": {
+          "type": "number",
+          "default": 100,
+          "unit": "mm/s",
+          "description": "Speed of the drive in millimeters per second."
+        },
+        "IterateBetweenMaxAndMin": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the drive only iterates between MinPos and MaxPos; if false it moves to random positions."
+        },
+        "SignalEnable": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "While this signal is true the drive moves to erratic positions; when unwired it is always enabled."
+        }
+      }
+    },
+    "Sensor": {
+      "type": "object",
+      "description": "Presence sensor. Collision mode uses AABB overlap; raycast mode casts a ray and reports MU hits.",
+      "properties": {
+        "UseRaycast": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the sensor uses raycast mode instead of collider (AABB overlap) mode."
+        },
+        "RayCastDirection": {
+          "$ref": "#/$defs/Vector3",
+          "unityCoords": true,
+          "description": "Raycast direction vector in Unity local coordinates (readers negate X in glTF space)."
+        },
+        "RayCastLength": {
+          "type": "number",
+          "default": 1000,
+          "unit": "mm",
+          "description": "Raycast length in millimeters."
+        },
+        "SensorOccupied": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Boolean PLC input for the sensor signal; true when the sensor is occupied."
+        },
+        "SensorNotOccupied": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Boolean PLC input for the sensor; true when the sensor is NOT occupied."
+        },
+        "AutoRay": {
+          "type": "boolean",
+          "default": false,
+          "description": "Derives the ray beam from the node bounding box (naming-convention sensors)."
+        },
+        "PhysicsMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true and the sensor overlaps a physics zone, the sensor is physics-managed: collision mode uses a physics sensor collider (enter/leave events), raycast mode a physics raycast. Physics-managed sensors detect only physics-owned MUs; sensors that must detect kinematic MUs keep the default false."
+        }
+      },
+      "rawFields": {
+        "Mode": {
+          "type": "string",
+          "description": "Legacy mode string ('Raycast'/'Collision'); readers SHOULD convert it to UseRaycast when UseRaycast is absent."
+        }
+      }
+    },
+    "TransportSurface": {
+      "type": "object",
+      "description": "Conveyor surface that moves MUs along a direction at the referenced Drive's speed.",
+      "properties": {
+        "TransportDirection": {
+          "$ref": "#/$defs/Vector3",
+          "unityCoords": true,
+          "description": "Transport direction in Unity local coordinates, set by the Drive component at export (readers negate X in glTF space)."
+        },
+        "Radial": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the surface transports radially around the drive axis (turntables)."
+        },
+        "TextureScale": {
+          "type": "number",
+          "default": 1,
+          "description": "Texture animation speed multiplier in texture units per meter."
+        },
+        "HeightOffsetOverride": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Manual override for the transport height offset in millimeters."
+        },
+        "AnimateSurface": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enables texture animation to visualize surface movement."
+        },
+        "DriveReference": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Optional drive reference for special cases; normally empty to use the auto-detected parent drive."
+        },
+        "Accumulate": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true MUs on this surface accumulate: each MU clamps its advance to the free distance up to the next MU in move direction (no penetration). Ignored on Radial surfaces."
+        },
+        "MinGap": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Minimum front gap in millimeters kept between accumulated MUs."
+        },
+        "PhysicsMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true and the surface lies fully inside a physics zone, the surface runs in physics mode: a kinematic conveyor body carries MUs via friction and jams/stacking are simulated physically. Ignored on Radial surfaces (v1 exclusion) and when the deployment switch simulation.physicsSurfaceDefault is false."
+        }
+      }
+    },
+    "Source": {
+      "type": "object",
+      "description": "Spawns new MU (Movable Unit) instances at intervals or by distance to the last spawned MU.",
+      "properties": {
+        "AutomaticGeneration": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatic generation of MUs when the last MU is farther than GenerateIfDistance from the source."
+        },
+        "Interval": {
+          "type": "number",
+          "default": 0,
+          "unit": "s",
+          "description": "Interval in seconds between the generation of MUs; 0 disables interval generation."
+        },
+        "GenerateIfDistance": {
+          "type": "number",
+          "default": 300,
+          "unit": "mm",
+          "description": "Distance in millimeters from the source at which new MUs are generated."
+        },
+        "PlaceOnTransportSurface": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true newly spawned MUs are placed onto the transport surface below the source."
+        },
+        "ThisObjectAsMU": {
+          "type": "string",
+          "default": "",
+          "description": "Name of the GameObject used as the MU prototype; defaults to this node when empty."
+        },
+        "CollisionRoleForMUs": {
+          "type": "string",
+          "enum": [
+            "None",
+            "Tool",
+            "Workpiece",
+            "Machine",
+            "Robot",
+            "Environment"
+          ],
+          "default": "None",
+          "description": "Collision role assigned to every MU spawned by this source. 'None' = spawned MUs take part in no collision check."
+        }
+      },
+      "aliases": {
+        "Interval": [
+          "SpawnInterval"
+        ],
+        "GenerateIfDistance": [
+          "SpawnDistance"
+        ]
+      },
+      "rawFields": {
+        "Spawn": {
+          "type": "string",
+          "description": "Legacy spawn-mode hint consumed by the reference implementation's spawn-config derivation."
+        }
+      }
+    },
+    "Sink": {
+      "type": "object",
+      "description": "Destroys MUs that touch it. Carries no configuration fields in v1.",
+      "properties": {}
+    },
+    "Grip": {
+      "type": "object",
+      "description": "Gripper for pick-and-place: picks MUs in range on a pick signal and places them on a place signal.",
+      "properties": {
+        "GripRange": {
+          "type": "number",
+          "default": 50,
+          "unit": "mm",
+          "description": "Search radius in millimeters for automatic MU detection when no sensor is assigned."
+        },
+        "OneBitControl": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true a single signal controls the gripper (rising edge picks, falling edge places)."
+        },
+        "PlaceMode": {
+          "type": "string",
+          "enum": [
+            "Auto",
+            "Static",
+            "Physics"
+          ],
+          "default": "Auto",
+          "description": "Controls how MUs are released on place: Auto (context-dependent), Static (stays kinematic) or Physics (falls onto surface)."
+        },
+        "GripTargetSearchRadius": {
+          "type": "number",
+          "default": 500,
+          "unit": "mm",
+          "description": "Search radius in millimeters for finding the nearest GripTarget on place."
+        },
+        "SignalPick": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Signal that triggers picking."
+        },
+        "SignalPlace": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Signal that triggers placing."
+        },
+        "PartToGrip": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Sensor identifying the MU to be gripped; when empty, auto-detection uses GripRange."
+        }
+      }
+    },
+    "GripTarget": {
+      "type": "object",
+      "description": "Placement marker for precise MU positioning during Grip auto-place.",
+      "properties": {
+        "AlignPosition": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true the MU position is snapped to the GripTarget position when placed."
+        },
+        "AlignRotation": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true the MU rotation is aligned to the GripTarget rotation when placed."
+        }
+      }
+    },
+    "ConnectSignal": {
+      "type": "object",
+      "description": "One-way signal bridge: copies the value of the referenced source signal onto this node's own signal.",
+      "properties": {
+        "ConnectedSignal": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Source signal whose value is copied onto this node's own signal on every change."
+        }
+      }
+    },
+    "Lamp": {
+      "type": "object",
+      "description": "Signal lamp: drives the emissive color of its first child mesh from a PLC signal.",
+      "properties": {
+        "SignalLampOn": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Bool signal driving the on state."
+        },
+        "SingalLampFlashing": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Bool signal driving the flashing state. Field name keeps the Unity spelling."
+        },
+        "Intensity": {
+          "type": "number",
+          "default": 2.0,
+          "description": "HDR emission intensity multiplier applied to OnColor."
+        },
+        "Flashing": {
+          "type": "boolean",
+          "default": false,
+          "description": "Lamp flashes instead of holding steady."
+        },
+        "Period": {
+          "type": "number",
+          "default": 1.0,
+          "unit": "s",
+          "description": "Flashing period in seconds; half on, half off."
+        },
+        "LampOn": {
+          "type": "boolean",
+          "default": false,
+          "description": "On state used when no signal is bound."
+        }
+      },
+      "aliases": {
+        "SingalLampFlashing": [
+          "SignalLampFlashing"
+        ]
+      },
+      "rawFields": {
+        "OnColor": {
+          "type": "object",
+          "description": "Unity Color {r,g,b,a} (floats 0..1) for the lit state; read raw (no schema field type for colors)."
+        }
+      }
+    },
+    "EnergyChain": {
+      "type": "object",
+      "description": "Turns a rigid CAD energy-chain (cable carrier) mesh into an animated chain: straight strand, half-circle bend travelling at half the follower speed, constant length. Drive axis, bend radius, link height and chain length are MEASURED from the CAD rest pose; every numeric field left at 0 means auto-calibrate.",
+      "properties": {
+        "Anchor": {
+          "$ref": "#/$defs/ComponentReference",
+          "readonly": true,
+          "description": "Node the fixed chain end is attached to (Unity: public Transform Anchor, wire componentType UnityEngine.Transform). Empty = auto. Shown read-only; corrected via web_editor_set_field."
+        },
+        "Follower": {
+          "$ref": "#/$defs/ComponentReference",
+          "readonly": true,
+          "description": "Node the moving chain end (the carrier) is attached to. Empty = auto. Shown read-only; corrected via web_editor_set_field."
+        },
+        "BendRadius": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Centerline bend radius. 0 = measure from the rest pose."
+        },
+        "ChainLength": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Total centerline length. 0 = measure from the rest pose."
+        },
+        "Axis": {
+          "enum": ["Auto", "X", "Y", "Z"],
+          "default": "Auto",
+          "description": "Travel axis in the chain-local frame. Auto = longest AABB extent."
+        },
+        "BendUp": {
+          "type": "boolean",
+          "default": true,
+          "description": "Moving strand runs above the fixed one. Flip when the measured assignment is upside down."
+        },
+        "Bones": {
+          "type": "number",
+          "default": 24,
+          "description": "Bone count of the runtime rig. Clamped up to the minimum derived from the 15 deg linear-blend-skinning limit (21); the clamp is reported in the status line."
+        },
+        "Enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Animate the chain. Off leaves it in the CAD rest pose."
+        }
+      }
+    },
+    "CollisionRole": {
+      "type": "object",
+      "description": "Collision role of this node's subtree. Bodies of different roles are checked against each other while the simulation runs; identical roles never collide.",
+      "properties": {
+        "CollisionRole": {
+          "type": "string",
+          "enum": [
+            "None",
+            "Tool",
+            "Workpiece",
+            "Machine",
+            "Robot",
+            "Environment"
+          ],
+          "default": "None",
+          "description": "Collision role of this node's subtree. Bodies of different roles are checked against each other; identical roles never collide. 'None' = not checked."
+        }
+      }
+    },
+    "WebSensor": {
+      "type": "object",
+      "description": "3D-HMI marker: visualizes a bool or int signal as Low/High/Warning/Error states on the node.",
+      "properties": {
+        "SignalBool": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Binary input: false = Low, true = High; use for 2-state sensors."
+        },
+        "SignalInt": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Integer input: value mapped to a state via IntStateMap; use for sensors with more states."
+        },
+        "IntStateMap": {
+          "type": "string",
+          "default": "",
+          "description": "Mapping of integer signal values to visual states, e.g. '0=Low;1=High;2=Warning;3=Error'."
+        },
+        "Label": {
+          "type": "string",
+          "default": "",
+          "description": "Optional label shown in the tooltip and sensor list."
+        }
+      }
+    },
+    "WebDiagnostics": {
+      "type": "object",
+      "description": "3D-HMI marker: couples a PLC error signal to the AI error diagnosis; a rising edge triggers a diagnose request for this node.",
+      "properties": {
+        "SignalBool": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Error signal: rising edge (false to true) triggers the diagnosis; falling edge clears it."
+        },
+        "SignalInt": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Error-code signal: any change to a non-zero value triggers the diagnosis with that code; 0 clears it."
+        },
+        "DocFilter": {
+          "type": "string",
+          "default": "",
+          "description": "Metadata filter passed to the diagnosis backend (machine, component or error-code range)."
+        },
+        "ErrorId": {
+          "type": "string",
+          "default": "",
+          "description": "Stable error ID used as the key for the shared operator comment store; defaults to the node path."
+        },
+        "Label": {
+          "type": "string",
+          "default": "",
+          "description": "Optional human-readable label shown on the diagnosis card."
+        },
+        "AutoOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true the diagnosis dialog opens automatically on a rising edge; if false only the card is shown."
+        }
+      }
+    },
+    "WebSafetyDoor": {
+      "type": "object",
+      "description": "3D-HMI marker: safety-door overlay with hazard-zone halo and floating label.",
+      "properties": {
+        "HazardZoneRadius": {
+          "type": "number",
+          "default": 1500,
+          "unit": "mm",
+          "description": "Hazard-zone halo radius in millimeters."
+        },
+        "LabelHeight": {
+          "type": "number",
+          "default": 200,
+          "unit": "mm",
+          "description": "Label position above the floor in millimeters."
+        }
+      }
+    },
+    "WebPhysicsZone": {
+      "type": "object",
+      "description": "Physics zone: 3D box volume inside which MUs are simulated as free dynamic rigid bodies (falling, sliding, tipping, stacking). Strictly opt-in — without this component no physics engine is loaded. The zone volume comes from the node's BoxCollider extras.",
+      "properties": {
+        "ZoneEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enables physics simulation inside this zone."
+        },
+        "WholeScene": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the box volume is ignored and the whole scene bounding box becomes the physics zone."
+        },
+        "Friction": {
+          "type": "number",
+          "default": 0.8,
+          "description": "Default friction coefficient for MUs inside the zone."
+        },
+        "Restitution": {
+          "type": "number",
+          "default": 0,
+          "description": "Bounciness of MUs inside the zone (0 = none)."
+        },
+        "RemoveBelowY": {
+          "type": "number",
+          "default": -10,
+          "unit": "m",
+          "description": "MUs falling below this world Y (meters) are removed."
+        },
+        "ShowGizmo": {
+          "type": "boolean",
+          "default": true,
+          "description": "Shows the zone as a wireframe box in the viewer."
+        }
+      },
+      "rawFields": {
+        "StaticColliders": {
+          "type": "array",
+          "description": "Node paths (string array) of additional static collision geometry (chutes, bins, machine frames); resolved via the node registry at zone build time; read raw (no string-array field type)."
+        }
+      }
+    },
+    "WebError": {
+      "type": "object",
+      "description": "3D-HMI marker: semantic error state bound to a bool signal, rendered as flashing highlight plus badge.",
+      "properties": {
+        "SignalError": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Error signal: true = error active, false = OK; leave empty for a static hint marker."
+        },
+        "ErrorText": {
+          "type": "string",
+          "default": "",
+          "description": "Human-readable error message shown as 3D badge and in the message panel."
+        },
+        "HighlightStyle": {
+          "type": "string",
+          "enum": [
+            "Auto",
+            "FlashObject",
+            "Circle"
+          ],
+          "default": "Auto",
+          "enumMap": {
+            "0": "Auto",
+            "1": "FlashObject",
+            "2": "Circle",
+            "Auto": "Auto",
+            "FlashObject": "FlashObject",
+            "Circle": "Circle"
+          },
+          "description": "How the faulty part is highlighted: Auto (by part size), FlashObject or Circle. Writers MUST emit the named string; readers additionally accept the legacy integer index per the enumMap."
+        }
+      }
+    },
+    "WebVisibility": {
+      "type": "object",
+      "description": "3D-HMI marker: shows/hides the node (and additional targets) from a bool signal; optionally carries an error state.",
+      "properties": {
+        "SignalVisible": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Visibility signal: true = visible, false = hidden; leave empty to use DefaultVisible."
+        },
+        "InvertSignal": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the visibility signal logic is inverted (signal false = visible)."
+        },
+        "DefaultVisible": {
+          "type": "boolean",
+          "default": true,
+          "description": "Visibility used when no visibility signal is bound."
+        },
+        "AdditionalTargets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ComponentReference"
+          },
+          "default": [],
+          "description": "Optional additional objects (node references) that are shown/hidden together with this object."
+        },
+        "SignalError": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Error signal: true = error active (red, flashing), false = OK; leave empty for no error state."
+        },
+        "ErrorText": {
+          "type": "string",
+          "default": "",
+          "description": "Human-readable error message shown as 3D badge and in the message panel."
+        },
+        "HighlightStyle": {
+          "type": "string",
+          "enum": [
+            "Auto",
+            "FlashObject",
+            "Circle"
+          ],
+          "default": "Auto",
+          "enumMap": {
+            "0": "Auto",
+            "1": "FlashObject",
+            "2": "Circle",
+            "Auto": "Auto",
+            "FlashObject": "FlashObject",
+            "Circle": "Circle"
+          },
+          "description": "How the faulty part is highlighted: Auto (by part size), FlashObject or Circle. Writers MUST emit the named string; readers additionally accept the legacy integer index per the enumMap."
+        },
+        "BlinkSpeed": {
+          "type": "number",
+          "default": 2,
+          "unit": "Hz",
+          "description": "Blink speed of the error highlight in Hz; higher is faster."
+        }
+      },
+      "rawFields": {
+        "ErrorColor": {
+          "type": "object",
+          "description": "Unity Color {r,g,b,a} (floats 0..1) for the error highlight; read raw (no schema field type for colors)."
+        }
+      }
+    },
+    "CustomRuntimeInstruction": {
+      "type": "object",
+      "description": "3D-HMI marker: operator instruction (info/maintenance/warning/error/success) bound to an activation signal.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "Info",
+            "Maintenance",
+            "Warning",
+            "Error",
+            "Success"
+          ],
+          "default": "Info",
+          "enumMap": {
+            "0": "info",
+            "1": "maintenance",
+            "2": "warning",
+            "3": "error",
+            "4": "success",
+            "Info": "info",
+            "Maintenance": "maintenance",
+            "Warning": "warning",
+            "Error": "error",
+            "Success": "success"
+          },
+          "description": "Instruction category (Info, Maintenance, Warning, Error, Success). Writers MUST emit the C# enum name; readers map it to the lowercase internal value and additionally accept the legacy integer index per the enumMap."
+        },
+        "dismissible": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true the operator can dismiss the instruction via an OK/close button (offered on the last step only). Once dismissed it reappears only on the next rising signal edge. If false the instruction stays until the signal goes low."
+        },
+        "Isolate": {
+          "type": "boolean",
+          "default": false,
+          "description": "realvirtual WEB only: when the operator clicks the message, the step's target objects are additionally isolated (rest of the scene dimmed) for a clearer view, on top of the camera focus and highlight."
+        },
+        "signal": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Activation signal; the instruction is shown while the signal is true."
+        },
+        "BlinkSpeed": {
+          "type": "number",
+          "default": 2,
+          "unit": "Hz",
+          "description": "Blink speed of the attention highlight in Hz. 0 = no blinking, the part is only highlighted; higher = faster."
+        }
+      },
+      "rawFields": {
+        "steps": {
+          "type": "array",
+          "description": "Instruction steps: array of { instruction, targetObjects (array of node paths, highlighted in parallel), targetObject (legacy single node path), url }; read raw (nested object list)."
+        },
+        "UseCustomErrorColor": {
+          "type": "boolean",
+          "description": "Enables ErrorColor; read raw."
+        },
+        "ErrorColor": {
+          "type": "object",
+          "description": "Unity Color {r,g,b,a} for the error highlight; read raw."
+        }
+      }
+    },
+    "RuntimeMetadata": {
+      "type": "object",
+      "description": "Tooltip/annotation content for an object. XML-like markup string.",
+      "properties": {
+        "content": {
+          "type": "string",
+          "default": "",
+          "description": "XML-like annotation markup shown as tooltip content for the object."
+        }
+      }
+    },
+    "IKPath": {
+      "type": "object",
+      "description": "Robot inverse-kinematics path: ordered list of IKTarget references with start/end signals.",
+      "properties": {
+        "SpeedOverride": {
+          "type": "number",
+          "default": 1,
+          "description": "Speed override factor for this path."
+        },
+        "SetNewTCP": {
+          "type": "boolean",
+          "default": false,
+          "description": "Sets a new TCP (tool center point) for this path."
+        },
+        "DrawPath": {
+          "type": "boolean",
+          "default": true,
+          "description": "Draws the path in the scene view."
+        },
+        "DrawTargets": {
+          "type": "boolean",
+          "default": true,
+          "description": "Draws the targets in the scene view."
+        },
+        "DebugPath": {
+          "type": "boolean",
+          "default": false,
+          "description": "Debugs the path by drawing points."
+        },
+        "DebugBlending": {
+          "type": "boolean",
+          "default": false,
+          "description": "Logs detailed blending state transitions for debugging."
+        },
+        "StartPath": {
+          "type": "boolean",
+          "default": false,
+          "description": "Starts the path on simulation start."
+        },
+        "LoopPath": {
+          "type": "boolean",
+          "default": false,
+          "description": "Loops the path after it has ended."
+        },
+        "SignalStart": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Signal to start the path."
+        },
+        "SignalIsStarted": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Signal that the path is started."
+        },
+        "SignalEnded": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Signal that the path has ended."
+        },
+        "Path": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ComponentReference"
+          },
+          "description": "Ordered list of IKTarget references forming the path."
+        }
+      },
+      "rawFields": {
+        "StartNextPath": {
+          "type": "object",
+          "description": "ComponentReference to the IKPath started when this path ends; read raw."
+        }
+      }
+    },
+    "IKTarget": {
+      "type": "object",
+      "description": "Robot inverse-kinematics target: pose plus interpolation, blending, signal and pick/place settings.",
+      "properties": {
+        "FollowInEditMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true the target follows the robot in edit mode."
+        },
+        "SpeedToTarget": {
+          "type": "number",
+          "default": 1,
+          "description": "Speed to target as a factor of the axis speeds."
+        },
+        "LinearAcceleration": {
+          "type": "number",
+          "default": 100,
+          "unit": "mm/s2",
+          "description": "Linear acceleration in millimeters per second squared."
+        },
+        "InterpolationToTarget": {
+          "type": "string",
+          "enum": [
+            "PointToPoint",
+            "PointToPointUnsynced",
+            "Linear"
+          ],
+          "default": "PointToPoint",
+          "description": "Interpolation to the target: PointToPoint, PointToPointUnsynced or Linear."
+        },
+        "LinearSpeedToTarget": {
+          "type": "number",
+          "default": 500,
+          "unit": "mm/s",
+          "description": "Linear speed to the target in millimeters per second."
+        },
+        "TurnCorrection": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the robot applies the 180-degree turn correction of axes 4 and 6."
+        },
+        "SetSignalDuration": {
+          "type": "number",
+          "default": 0.5,
+          "unit": "s",
+          "description": "Duration of the set signal in seconds."
+        },
+        "WaitForSeconds": {
+          "type": "number",
+          "default": 0,
+          "unit": "s",
+          "description": "Wait time in seconds after the target is reached."
+        },
+        "PickAndPlace": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enables pick/place handling at this target."
+        },
+        "Pick": {
+          "type": "boolean",
+          "default": false,
+          "description": "Picks with the assigned grip when the target is reached."
+        },
+        "Place": {
+          "type": "boolean",
+          "default": false,
+          "description": "Places with the assigned grip when the target is reached."
+        },
+        "EnableBlending": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enables zone blending: the robot transitions to the next target at BlendRadius distance instead of stopping exactly at this target."
+        },
+        "BlendRadius": {
+          "type": "number",
+          "default": 25,
+          "unit": "mm",
+          "description": "Radius in millimeters of the blending zone around this target."
+        },
+        "SetSignal": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Signal set when the target is reached."
+        },
+        "WaitForSignal": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Signal to wait for after the target is reached."
+        }
+      },
+      "rawFields": {
+        "AxisPos": {
+          "type": "array",
+          "description": "Pre-computed joint-angle solution (number[6], degrees) serialized by the Unity IK solver; read raw."
+        },
+        "gripTarget": {
+          "type": "object",
+          "description": "ComponentReference to the Grip used for pick/place at this target; read raw."
+        },
+        "fixer": {
+          "type": "object",
+          "description": "ComponentReference to a Fixer used for pick/place (fallback when gripTarget is absent); read raw."
+        }
+      }
+    },
+    "RobotIK": {
+      "type": "object",
+      "description": "Robot inverse-kinematics solver configuration on the robot root node.",
+      "properties": {
+        "WristType": {
+          "type": "string",
+          "enum": [
+            "Spherical",
+            "NonSpherical"
+          ],
+          "default": "Spherical",
+          "readonly": true,
+          "description": "Wrist topology: Spherical (standard industrial robot, analytical solution) or NonSpherical (cobot with wrist offsets)."
+        },
+        "ElbowInUnityX": {
+          "type": "boolean",
+          "default": false,
+          "readonly": true,
+          "description": "If true the elbow axis is oriented along Unity X."
+        },
+        "DrawGizmos": {
+          "type": "boolean",
+          "default": true,
+          "description": "Draws IK debug gizmos."
+        }
+      }
+    },
+    "CADLink": {
+      "type": "object",
+      "description": "Pure metadata on an imported CAD root: original file reference plus import parameters. Enables CAD re-import.",
+      "properties": {
+        "File": {
+          "type": "string",
+          "default": "",
+          "readonly": true,
+          "description": "Original CAD file name this subtree was imported from."
+        },
+        "Sha256": {
+          "type": "string",
+          "default": "",
+          "readonly": true,
+          "description": "Content hash of the original CAD file."
+        },
+        "Quality": {
+          "type": "string",
+          "default": "standard",
+          "readonly": true,
+          "description": "Tessellation quality preset used at import."
+        },
+        "ImportScaleFactor": {
+          "type": "number",
+          "default": 0.001,
+          "readonly": true,
+          "description": "Scale factor applied at import (CAD units to meters)."
+        },
+        "ZIsUpVector": {
+          "type": "boolean",
+          "default": true,
+          "readonly": true,
+          "description": "If true the CAD source used Z-up orientation."
+        }
+      }
+    },
+    "JTData": {
+      "type": "object",
+      "description": "CAD metadata read from a JT file by the rv-jt reader: part name, mass, source units, layer and the stable body uid. Pure import provenance - read-only, never hand-edited, and replaced (not merged) on CAD re-import. Every field is optional: the reader omits what the source file does not provide rather than emitting 0 or null.",
+      "properties": {
+        "ContractVersion": {
+          "type": "number",
+          "readonly": true,
+          "description": "Version of the JTData contract this block was written with."
+        },
+        "PartName": {
+          "type": "string",
+          "readonly": true,
+          "description": "Part name from the CAD system (CAD_PARTNAME)."
+        },
+        "Mass": {
+          "type": "number",
+          "readonly": true,
+          "description": "Mass of the part. The unit is not recorded in JT files and is therefore unknown."
+        },
+        "MassSource": {
+          "type": "string",
+          "readonly": true,
+          "description": "Where the mass came from: 'asserted' (user-set, assembly level) or 'cad' (computed, part level). These describe different objects and must not be summed."
+        },
+        "SourceUnits": {
+          "type": "string",
+          "readonly": true,
+          "description": "Length unit of the source model, raw - before the mm to m conversion the reader applies."
+        },
+        "Layer": {
+          "type": "string",
+          "readonly": true,
+          "description": "CAD layer of the part."
+        },
+        "BodyUid": {
+          "type": "string",
+          "readonly": true,
+          "description": "Stable per-body CAD uid, suitable for matching a part across revisions."
+        }
+      }
+    },
+    "Pipe": {
+      "type": "object",
+      "description": "Process-industry pipe segment: fluid resource, flow and instrumentation values for the 3D-HMI tooltip.",
+      "properties": {
+        "resourceName": {
+          "type": "string",
+          "default": "",
+          "description": "Name of the fluid/resource flowing through the pipe."
+        },
+        "flowRate": {
+          "type": "number",
+          "default": 0,
+          "description": "Current flow rate through the pipe."
+        },
+        "source": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Reference to the upstream component (tank, pump or pipe)."
+        },
+        "destination": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Reference to the downstream component (tank, pump or pipe)."
+        },
+        "uvDirection": {
+          "type": "number",
+          "default": 1,
+          "description": "Texture flow-animation direction (+1/-1)."
+        },
+        "circuitId": {
+          "type": "number",
+          "default": -1,
+          "description": "Fluid-circuit grouping id; -1 = unassigned."
+        },
+        "pressure": {
+          "type": "number",
+          "default": 0,
+          "unit": "bar",
+          "description": "Gauge pressure in bar."
+        },
+        "temperatureC": {
+          "type": "number",
+          "default": 0,
+          "unit": "Cel",
+          "description": "Fluid temperature in degrees Celsius."
+        },
+        "velocityMs": {
+          "type": "number",
+          "default": 0,
+          "unit": "m/s",
+          "description": "Flow velocity in meters per second."
+        },
+        "dnSize": {
+          "type": "number",
+          "default": 0,
+          "description": "Nominal pipe diameter (DN), e.g. 50, 100, 200."
+        }
+      }
+    },
+    "Pump": {
+      "type": "object",
+      "description": "Process-industry pump: flow, circuit assignment and instrumentation values for the 3D-HMI tooltip.",
+      "properties": {
+        "flowRate": {
+          "type": "number",
+          "default": 0,
+          "description": "Current flow rate delivered by the pump."
+        },
+        "pipe": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Reference to the connected pipe."
+        },
+        "circuitId": {
+          "type": "number",
+          "default": -1,
+          "description": "Fluid-circuit grouping id; -1 = unassigned."
+        },
+        "resourceName": {
+          "type": "string",
+          "default": "",
+          "description": "Medium currently flowing through the pump."
+        },
+        "state": {
+          "type": "string",
+          "default": "ok",
+          "description": "Pump state: 'ok', 'warning' or 'fault'."
+        },
+        "suctionPressure": {
+          "type": "number",
+          "default": 0,
+          "unit": "bar",
+          "description": "Suction-side gauge pressure in bar."
+        },
+        "dischargePressure": {
+          "type": "number",
+          "default": 0,
+          "unit": "bar",
+          "description": "Discharge-side gauge pressure in bar."
+        },
+        "speedRpm": {
+          "type": "number",
+          "default": 0,
+          "unit": "/min",
+          "description": "Motor speed in revolutions per minute."
+        },
+        "speedPercent": {
+          "type": "number",
+          "default": 0,
+          "unit": "%",
+          "description": "VFD speed command in percent (0..100)."
+        },
+        "powerKw": {
+          "type": "number",
+          "default": 0,
+          "unit": "kW",
+          "description": "Shaft power in kilowatts."
+        },
+        "currentA": {
+          "type": "number",
+          "default": 0,
+          "unit": "A",
+          "description": "Motor current in amperes."
+        },
+        "bearingTempC": {
+          "type": "number",
+          "default": 0,
+          "unit": "Cel",
+          "description": "Bearing temperature in degrees Celsius."
+        },
+        "motorTempC": {
+          "type": "number",
+          "default": 0,
+          "unit": "Cel",
+          "description": "Motor temperature in degrees Celsius."
+        },
+        "vibrationMmS": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm/s",
+          "description": "Vibration velocity in mm/s RMS (ISO 10816)."
+        },
+        "npshAvailable": {
+          "type": "number",
+          "default": 0,
+          "unit": "m",
+          "description": "Net positive suction head available in meters."
+        },
+        "npshRequired": {
+          "type": "number",
+          "default": 0,
+          "unit": "m",
+          "description": "Net positive suction head required in meters."
+        },
+        "runHours": {
+          "type": "number",
+          "default": 0,
+          "unit": "h",
+          "description": "Total operating hours."
+        }
+      }
+    },
+    "ResourceTank": {
+      "type": "object",
+      "description": "Process-industry tank: fluid resource, fill level and instrumentation values for the 3D-HMI tooltip.",
+      "properties": {
+        "resourceName": {
+          "type": "string",
+          "default": "",
+          "description": "Name of the stored fluid/resource."
+        },
+        "capacity": {
+          "type": "number",
+          "default": 0,
+          "description": "Tank capacity."
+        },
+        "amount": {
+          "type": "number",
+          "default": 0,
+          "description": "Current fill amount."
+        },
+        "pressure": {
+          "type": "number",
+          "default": 0,
+          "unit": "bar",
+          "description": "Gauge pressure in bar."
+        },
+        "temperature": {
+          "type": "number",
+          "default": 0,
+          "unit": "Cel",
+          "description": "Fluid temperature in degrees Celsius."
+        },
+        "density": {
+          "type": "number",
+          "default": 0,
+          "unit": "kg/m3",
+          "description": "Fluid density in kilograms per cubic meter."
+        },
+        "ph": {
+          "type": "number",
+          "default": 0,
+          "unit": "[pH]",
+          "description": "pH value; 0 = not measured."
+        },
+        "agitatorOn": {
+          "type": "boolean",
+          "default": false,
+          "description": "True while the mixer/agitator is running."
+        },
+        "heatingOn": {
+          "type": "boolean",
+          "default": false,
+          "description": "True while the jacket heater is on."
+        },
+        "tempHighLimit": {
+          "type": "number",
+          "default": 0,
+          "unit": "Cel",
+          "description": "High temperature alarm limit in degrees Celsius; 0 = no alarm."
+        },
+        "tempLowLimit": {
+          "type": "number",
+          "default": 0,
+          "unit": "Cel",
+          "description": "Low temperature alarm limit in degrees Celsius; 0 = no alarm."
+        },
+        "pressureHighLimit": {
+          "type": "number",
+          "default": 0,
+          "unit": "bar",
+          "description": "High pressure alarm limit in bar; 0 = no alarm."
+        }
+      }
+    },
+    "ProcessingUnit": {
+      "type": "object",
+      "description": "Production machine/station: OEE and production telemetry values for the 3D-HMI tooltip.",
+      "properties": {
+        "connections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ComponentReference"
+          },
+          "description": "References to connected upstream/downstream components."
+        },
+        "state": {
+          "type": "string",
+          "default": "idle",
+          "description": "Machine state: 'running', 'idle', 'down', 'setup' or 'maintenance'."
+        },
+        "availability": {
+          "type": "number",
+          "default": 0,
+          "description": "OEE availability factor (0..1)."
+        },
+        "performance": {
+          "type": "number",
+          "default": 0,
+          "description": "OEE performance factor (0..1)."
+        },
+        "quality": {
+          "type": "number",
+          "default": 0,
+          "description": "OEE quality factor (0..1)."
+        },
+        "cycleTimeS": {
+          "type": "number",
+          "default": 0,
+          "unit": "s",
+          "description": "Current actual cycle time in seconds."
+        },
+        "cycleTargetS": {
+          "type": "number",
+          "default": 0,
+          "unit": "s",
+          "description": "Target (ideal) cycle time in seconds."
+        },
+        "throughputPerHour": {
+          "type": "number",
+          "default": 0,
+          "unit": "/h",
+          "description": "Throughput in units per hour."
+        },
+        "goodCount": {
+          "type": "number",
+          "default": 0,
+          "description": "Good units produced shift-to-date."
+        },
+        "scrapCount": {
+          "type": "number",
+          "default": 0,
+          "description": "Scrap units produced shift-to-date."
+        },
+        "mtbfHours": {
+          "type": "number",
+          "default": 0,
+          "unit": "h",
+          "description": "Mean time between failures in hours."
+        },
+        "mttrMinutes": {
+          "type": "number",
+          "default": 0,
+          "unit": "min",
+          "description": "Mean time to repair in minutes."
+        },
+        "runHours": {
+          "type": "number",
+          "default": 0,
+          "unit": "h",
+          "description": "Run time in hours this period."
+        },
+        "downHours": {
+          "type": "number",
+          "default": 0,
+          "unit": "h",
+          "description": "Down time in hours this period."
+        },
+        "lastFault": {
+          "type": "string",
+          "default": "",
+          "description": "Description of the last fault."
+        }
+      }
+    },
+    "PLCOutputBool": {
+      "type": "object",
+      "description": "PLC output signal (bool): written by the PLC, read by the twin.",
+      "properties": {
+        "Name": {
+          "type": "string",
+          "default": "",
+          "description": "Signal name; falls back to the node name when empty."
+        },
+        "Comment": {
+          "type": "string",
+          "default": "",
+          "description": "Human-readable comment shown in signal tooltips."
+        },
+        "OriginDataType": {
+          "type": "string",
+          "default": "",
+          "description": "Original PLC data type of the signal (e.g. BOOL, DINT, REAL)."
+        },
+        "Settings": {
+          "type": "object",
+          "description": "Writer-specific signal settings object (e.g. { Active, Override })."
+        },
+        "Metadata": {
+          "type": "object",
+          "description": "Free-form protocol metadata object."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate for the signal."
+        },
+        "Status": {
+          "type": "object",
+          "description": "Runtime status object; Status.Value seeds the initial signal value.",
+          "readonly": true
+        }
+      }
+    },
+    "PLCInputBool": {
+      "type": "object",
+      "description": "PLC input signal (bool): written by the twin, read by the PLC.",
+      "properties": {
+        "Name": {
+          "type": "string",
+          "default": "",
+          "description": "Signal name; falls back to the node name when empty."
+        },
+        "Comment": {
+          "type": "string",
+          "default": "",
+          "description": "Human-readable comment shown in signal tooltips."
+        },
+        "OriginDataType": {
+          "type": "string",
+          "default": "",
+          "description": "Original PLC data type of the signal (e.g. BOOL, DINT, REAL)."
+        },
+        "Settings": {
+          "type": "object",
+          "description": "Writer-specific signal settings object (e.g. { Active, Override })."
+        },
+        "Metadata": {
+          "type": "object",
+          "description": "Free-form protocol metadata object."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate for the signal."
+        },
+        "Status": {
+          "type": "object",
+          "description": "Runtime status object; Status.Value seeds the initial signal value.",
+          "readonly": true
+        }
+      }
+    },
+    "PLCOutputFloat": {
+      "type": "object",
+      "description": "PLC output signal (float): written by the PLC, read by the twin.",
+      "properties": {
+        "Name": {
+          "type": "string",
+          "default": "",
+          "description": "Signal name; falls back to the node name when empty."
+        },
+        "Comment": {
+          "type": "string",
+          "default": "",
+          "description": "Human-readable comment shown in signal tooltips."
+        },
+        "OriginDataType": {
+          "type": "string",
+          "default": "",
+          "description": "Original PLC data type of the signal (e.g. BOOL, DINT, REAL)."
+        },
+        "Settings": {
+          "type": "object",
+          "description": "Writer-specific signal settings object (e.g. { Active, Override })."
+        },
+        "Metadata": {
+          "type": "object",
+          "description": "Free-form protocol metadata object."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate for the signal."
+        },
+        "Status": {
+          "type": "object",
+          "description": "Runtime status object; Status.Value seeds the initial signal value.",
+          "readonly": true
+        }
+      }
+    },
+    "PLCInputFloat": {
+      "type": "object",
+      "description": "PLC input signal (float): written by the twin, read by the PLC.",
+      "properties": {
+        "Name": {
+          "type": "string",
+          "default": "",
+          "description": "Signal name; falls back to the node name when empty."
+        },
+        "Comment": {
+          "type": "string",
+          "default": "",
+          "description": "Human-readable comment shown in signal tooltips."
+        },
+        "OriginDataType": {
+          "type": "string",
+          "default": "",
+          "description": "Original PLC data type of the signal (e.g. BOOL, DINT, REAL)."
+        },
+        "Settings": {
+          "type": "object",
+          "description": "Writer-specific signal settings object (e.g. { Active, Override })."
+        },
+        "Metadata": {
+          "type": "object",
+          "description": "Free-form protocol metadata object."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate for the signal."
+        },
+        "Status": {
+          "type": "object",
+          "description": "Runtime status object; Status.Value seeds the initial signal value.",
+          "readonly": true
+        }
+      }
+    },
+    "PLCOutputInt": {
+      "type": "object",
+      "description": "PLC output signal (int): written by the PLC, read by the twin.",
+      "properties": {
+        "Name": {
+          "type": "string",
+          "default": "",
+          "description": "Signal name; falls back to the node name when empty."
+        },
+        "Comment": {
+          "type": "string",
+          "default": "",
+          "description": "Human-readable comment shown in signal tooltips."
+        },
+        "OriginDataType": {
+          "type": "string",
+          "default": "",
+          "description": "Original PLC data type of the signal (e.g. BOOL, DINT, REAL)."
+        },
+        "Settings": {
+          "type": "object",
+          "description": "Writer-specific signal settings object (e.g. { Active, Override })."
+        },
+        "Metadata": {
+          "type": "object",
+          "description": "Free-form protocol metadata object."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate for the signal."
+        },
+        "Status": {
+          "type": "object",
+          "description": "Runtime status object; Status.Value seeds the initial signal value.",
+          "readonly": true
+        }
+      }
+    },
+    "PLCInputInt": {
+      "type": "object",
+      "description": "PLC input signal (int): written by the twin, read by the PLC.",
+      "properties": {
+        "Name": {
+          "type": "string",
+          "default": "",
+          "description": "Signal name; falls back to the node name when empty."
+        },
+        "Comment": {
+          "type": "string",
+          "default": "",
+          "description": "Human-readable comment shown in signal tooltips."
+        },
+        "OriginDataType": {
+          "type": "string",
+          "default": "",
+          "description": "Original PLC data type of the signal (e.g. BOOL, DINT, REAL)."
+        },
+        "Settings": {
+          "type": "object",
+          "description": "Writer-specific signal settings object (e.g. { Active, Override })."
+        },
+        "Metadata": {
+          "type": "object",
+          "description": "Free-form protocol metadata object."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate for the signal."
+        },
+        "Status": {
+          "type": "object",
+          "description": "Runtime status object; Status.Value seeds the initial signal value.",
+          "readonly": true
+        }
+      }
+    },
+    "LogicStep_SerialContainer": {
+      "type": "object",
+      "description": "LogicStep: sequential container — child nodes (in hierarchy order) execute one after another; the top-level container loops.",
+      "properties": {
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_ParallelContainer": {
+      "type": "object",
+      "description": "LogicStep: parallel container — child nodes execute concurrently; the container ends when all children ended.",
+      "properties": {
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_SetSignalBool": {
+      "type": "object",
+      "description": "LogicStep: sets a bool signal.",
+      "properties": {
+        "Signal": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Bool signal to set."
+        },
+        "SetToTrue": {
+          "type": "boolean",
+          "default": true,
+          "description": "Value written to the signal."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_WaitForSignalBool": {
+      "type": "object",
+      "description": "LogicStep: waits until a bool signal has the expected value.",
+      "properties": {
+        "Signal": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Bool signal to wait for."
+        },
+        "WaitForTrue": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expected signal value."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_WaitForSensor": {
+      "type": "object",
+      "description": "LogicStep: waits until a sensor is (not) occupied.",
+      "properties": {
+        "Sensor": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Sensor to wait for."
+        },
+        "WaitForOccupied": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true waits for occupied, otherwise for not occupied."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_Delay": {
+      "type": "object",
+      "description": "LogicStep: waits for a fixed duration.",
+      "properties": {
+        "Duration": {
+          "type": "number",
+          "default": 1,
+          "unit": "s",
+          "description": "Wait duration in seconds."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_DriveToPosition": {
+      "type": "object",
+      "description": "LogicStep: drives a Drive to a destination and waits until it arrives.",
+      "properties": {
+        "drive": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Drive to move."
+        },
+        "Destination": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Destination position in millimeters or degrees."
+        },
+        "Relative": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true Destination is relative to the current position."
+        },
+        "Direction": {
+          "type": "string",
+          "description": "Reserved; consumed for parity, not evaluated by the v1 reference implementation."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_DriveTo": {
+      "type": "object",
+      "description": "LogicStep: drives a Drive to a destination and waits until it arrives (alias semantics of DriveToPosition).",
+      "properties": {
+        "drive": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Drive to move."
+        },
+        "Destination": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Destination position in millimeters or degrees."
+        },
+        "Relative": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true Destination is relative to the current position."
+        },
+        "Direction": {
+          "type": "string",
+          "description": "Reserved; consumed for parity, not evaluated by the v1 reference implementation."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_StartDriveTo": {
+      "type": "object",
+      "description": "LogicStep: starts a Drive towards a destination without waiting for arrival.",
+      "properties": {
+        "drive": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Drive to start."
+        },
+        "Destination": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Destination position in millimeters or degrees."
+        },
+        "Relative": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true Destination is relative to the current position."
+        },
+        "Direction": {
+          "type": "string",
+          "description": "Reserved; consumed for parity, not evaluated by the v1 reference implementation."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_SetDriveSpeed": {
+      "type": "object",
+      "description": "LogicStep: sets a Drive's target speed.",
+      "properties": {
+        "drive": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Drive whose target speed is set."
+        },
+        "Speed": {
+          "type": "number",
+          "default": 100,
+          "unit": "mm/s",
+          "description": "Target speed in millimeters per second."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_StartDriveSpeed": {
+      "type": "object",
+      "description": "LogicStep: starts a Drive at a target speed without waiting.",
+      "properties": {
+        "drive": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Drive to start."
+        },
+        "Speed": {
+          "type": "number",
+          "default": 100,
+          "unit": "mm/s",
+          "description": "Target speed in millimeters per second."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_WaitForDrivesAtTarget": {
+      "type": "object",
+      "description": "LogicStep: waits until all referenced Drives reached their targets.",
+      "properties": {
+        "Drives": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ComponentReference"
+          },
+          "description": "Drives that must all reach their targets."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_Enable": {
+      "type": "object",
+      "description": "LogicStep: enables/disables (shows/hides) a target object by node path.",
+      "properties": {
+        "Target": {
+          "type": "string",
+          "default": "",
+          "description": "Scene path of the object to enable/disable."
+        },
+        "Enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true the target is enabled (shown), otherwise disabled (hidden)."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_Pause": {
+      "type": "object",
+      "description": "LogicStep: debugging breakpoint; a conforming runtime MAY treat it as a no-op.",
+      "properties": {
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_SetSignalFloat": {
+      "type": "object",
+      "description": "LogicStep: sets a float signal.",
+      "properties": {
+        "Signal": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Float signal to set."
+        },
+        "Value": {
+          "type": "number",
+          "default": 0,
+          "description": "Value written to the signal."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_WaitForSignalFloat": {
+      "type": "object",
+      "description": "LogicStep: waits until a float signal satisfies a comparison.",
+      "properties": {
+        "Signal": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Float signal to wait for."
+        },
+        "Comparison": {
+          "type": "string",
+          "default": "Equals",
+          "description": "Comparison operator name (e.g. Equals, Greater, Smaller)."
+        },
+        "Value": {
+          "type": "number",
+          "default": 0,
+          "description": "Comparison value."
+        },
+        "Tolerance": {
+          "type": "number",
+          "default": 0.0001,
+          "description": "Tolerance for the Equals comparison."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_GripPick": {
+      "type": "object",
+      "description": "LogicStep: triggers a Grip pick.",
+      "properties": {
+        "Grip": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Grip that picks."
+        },
+        "Blocking": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the step waits until the pick completed."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_GripPlace": {
+      "type": "object",
+      "description": "LogicStep: triggers a Grip place.",
+      "properties": {
+        "Grip": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Grip that places."
+        },
+        "Blocking": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the step waits until the place completed."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_JumpOnSignal": {
+      "type": "object",
+      "description": "LogicStep: jumps to a named step in the parent container when a bool signal matches.",
+      "properties": {
+        "Signal": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Bool signal evaluated for the jump."
+        },
+        "JumpOn": {
+          "type": "boolean",
+          "default": true,
+          "description": "Signal value that triggers the jump."
+        },
+        "JumpToStep": {
+          "type": "string",
+          "default": "",
+          "description": "Step (node) name inside the parent container to jump to."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_IKPath": {
+      "type": "object",
+      "description": "LogicStep: starts an IKPath and waits until it ended.",
+      "properties": {
+        "IKPath": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "IKPath to start; the step waits until the path ended."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_SetActiveOnly": {
+      "type": "object",
+      "description": "LogicStep: switches component ActiveOnly modes (Unity runtime feature; a web runtime MAY treat it as a no-op).",
+      "properties": {
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_CinemachineCamera": {
+      "type": "object",
+      "description": "LogicStep: activates a Cinemachine camera (Unity-only; a web runtime MAY treat it as a no-op).",
+      "properties": {
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_StatStartCycle": {
+      "type": "object",
+      "description": "LogicStep: statistics — marks the start of a cycle (a web runtime MAY treat it as a no-op).",
+      "properties": {
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_StatEndCycle": {
+      "type": "object",
+      "description": "LogicStep: statistics — marks the end of a cycle (a web runtime MAY treat it as a no-op).",
+      "properties": {
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_StatState": {
+      "type": "object",
+      "description": "LogicStep: statistics — sets a state on a statistics component (a web runtime MAY treat it as a no-op).",
+      "properties": {
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "LogicStep_StatOutput": {
+      "type": "object",
+      "description": "LogicStep: statistics — increments an output counter (a web runtime MAY treat it as a no-op).",
+      "properties": {
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: whether this step participates depending on the live-connection state."
+        }
+      }
+    },
+    "Group": {
+      "type": "object",
+      "description": "Named group membership of a node. Multiple Group entries per node are serialized as 'Group', 'Group1', 'Group2', ...",
+      "properties": {
+        "GroupName": {
+          "type": "string",
+          "default": "Group",
+          "description": "Name of the group this node belongs to."
+        },
+        "GroupNamePrefix": {
+          "type": "string",
+          "readonly": true,
+          "description": "Scene path of a node whose name prefixes GroupName (resolved group name = prefixNode.name + GroupName). Shown when present in the GLB, never stamped on newly authored components."
+        }
+      }
+    },
+    "Kinematic": {
+      "type": "object",
+      "description": "Kinematic re-structuring directive (from the Unity Kinematic tool): re-parents group members under this node and/or re-parents this node under another node after load.",
+      "properties": {
+        "IntegrateGroupEnable": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, top-level members of the named group are re-parented under this node after load."
+        },
+        "GroupName": {
+          "type": "string",
+          "default": "",
+          "description": "Group whose members are re-parented under this node."
+        },
+        "GroupNamePrefix": {
+          "type": "string",
+          "default": "",
+          "description": "Scene path of a prefix node (resolved group name = prefixNode.name + GroupName)."
+        },
+        "SimplifyHierarchy": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true only mesh nodes of the group are re-parented."
+        },
+        "KinematicParentEnable": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true this node is re-parented under Parent after load."
+        },
+        "Parent": {
+          "type": "string",
+          "default": "",
+          "description": "Scene path of the new parent node."
+        }
+      }
+    },
+    "MU": {
+      "type": "object",
+      "description": "Movable Unit template marker. The node marked with MU is the template cloned by Source components. Carries no consumed configuration fields in v1.",
+      "properties": {}
+    },
+    "BoxCollider": {
+      "type": "object",
+      "description": "Axis-aligned collider volume in node-local space, used for sensors, transport surfaces, sources and sinks.",
+      "properties": {
+        "center": {
+          "$ref": "#/$defs/Vector3",
+          "unityCoords": true,
+          "description": "Collider center in Unity node-local coordinates (readers negate X in glTF space)."
+        },
+        "size": {
+          "$ref": "#/$defs/Vector3",
+          "description": "Absolute box dimensions in node-local units (no coordinate flip)."
+        }
+      }
+    },
+    "LayoutObject": {
+      "type": "object",
+      "description": "Layout-planner marker on a placed library object.",
+      "properties": {
+        "Label": {
+          "type": "string",
+          "default": "",
+          "description": "Display label of the placed object."
+        },
+        "CatalogId": {
+          "type": "string",
+          "default": "",
+          "description": "Library catalog id the object was placed from."
+        },
+        "Locked": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the object is locked against layout edits."
+        },
+        "Visible": {
+          "type": "boolean",
+          "default": true,
+          "description": "Visibility of the placed object."
+        }
+      }
+    },
+    "Splat": {
+      "type": "object",
+      "description": "Gaussian-splat placement settings (axis inversion and local-frame crop box).",
+      "properties": {
+        "InvertX": {
+          "type": "boolean",
+          "default": false,
+          "description": "Inverts the splat along X."
+        },
+        "InvertY": {
+          "type": "boolean",
+          "default": false,
+          "description": "Inverts the splat along Y."
+        },
+        "InvertZ": {
+          "type": "boolean",
+          "default": false,
+          "description": "Inverts the splat along Z."
+        },
+        "CropMinX": {
+          "type": "number",
+          "default": -1000,
+          "description": "Local-frame crop box minimum X; splats outside the box are culled."
+        },
+        "CropMaxX": {
+          "type": "number",
+          "default": 1000,
+          "description": "Local-frame crop box maximum X."
+        },
+        "CropMinY": {
+          "type": "number",
+          "default": -1000,
+          "description": "Local-frame crop box minimum Y (raise to hide floor noise)."
+        },
+        "CropMaxY": {
+          "type": "number",
+          "default": 1000,
+          "description": "Local-frame crop box maximum Y (lower to hide ceilings)."
+        },
+        "CropMinZ": {
+          "type": "number",
+          "default": -1000,
+          "description": "Local-frame crop box minimum Z."
+        },
+        "CropMaxZ": {
+          "type": "number",
+          "default": 1000,
+          "description": "Local-frame crop box maximum Z."
+        }
+      }
+    },
+    "AASLink": {
+      "type": "object",
+      "description": "Asset Administration Shell link: connects the node to an AAS on a server.",
+      "properties": {
+        "AASId": {
+          "type": "string",
+          "default": "",
+          "description": "AAS identifier (e.g. 'http://smart.festo.com/aas/9992020...')."
+        },
+        "Description": {
+          "type": "string",
+          "default": "",
+          "description": "Optional description shown in the tooltip header."
+        },
+        "ServerUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional AAS server URL; when empty the AASX is loaded from the local aasx/ folder."
+        }
+      }
+    },
+    "WebComponent": {
+      "type": "object",
+      "description": "JavaScript behavior component stored in the GLB: sandboxed script executed by the viewer's QuickJS runtime when scripting is enabled (trust gate).",
+      "properties": {
+        "Active": {
+          "type": "boolean",
+          "default": true,
+          "description": "If false the component is parsed but never executed."
+        },
+        "ApiVersion": {
+          "type": "number",
+          "default": 1,
+          "description": "Component-SDK contract version the code was written against."
+        },
+        "Language": {
+          "type": "string",
+          "default": "js",
+          "description": "Source language of Code; stored code is always conservative JavaScript."
+        },
+        "DesSafe": {
+          "type": "boolean",
+          "default": false,
+          "description": "Author claim that the script uses only event-driven primitives (checked by the DES lint)."
+        },
+        "TypeId": {
+          "type": "string",
+          "default": "",
+          "description": "Library/type identity for reuse, inspector display and statistics."
+        },
+        "Code": {
+          "type": "string",
+          "default": "",
+          "description": "JavaScript source following the global setup(self) contract; empty means no VM is created."
+        }
+      }
+    },
+    "Path": {
+      "type": "object",
+      "description": "WebViewer-native arc-length path (plan-268): a chain of line/arc segments for path-based movement (AGV/FTS, overhead conveyors). The structured fields — 'segments' (array of { kind:'line', from, to } | { kind:'arc', center, radius, startAngle, degrees, clockwise?, plane? }), 'successors' (string[] path-id graph edges), 'align' ([x,y,z] up vector, default [0,1,0]) and the 'type'/'id' discriminators — are parsed by parsePathExtras() in rv-path.ts (the executable TS-SSOT); only the scalar fields are listed here. Detection is coupled to this payload (inner type 'Path' or absent), never to node names.",
+      "properties": {
+        "version": {
+          "type": "number",
+          "default": 1,
+          "description": "Path schema version (migration anchor). Unknown versions parse best-effort with a warning."
+        },
+        "closed": {
+          "type": "boolean",
+          "default": false,
+          "description": "Circulating path (overhead conveyor / loop): arc-length addresses wrap modulo length."
+        }
+      }
+    },
+    "DrivesRecorder": {
+      "type": "object",
+      "description": "Playback settings for a recorded drive sequence.",
+      "properties": {
+        "PlayOnStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true playback starts automatically on simulation start."
+        },
+        "ReplayStartFrame": {
+          "type": "number",
+          "default": 0,
+          "description": "First frame of the replay range."
+        },
+        "ReplayEndFrame": {
+          "type": "number",
+          "default": 0,
+          "description": "Last frame of the replay range; 0 = to end."
+        },
+        "Loop": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the replay loops."
+        },
+        "DrivesRecording": {
+          "type": "object",
+          "description": "Inline recording data (Unity ScriptableObject serialization)."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: controls playback in connected/disconnected mode."
+        }
+      }
+    },
+    "DrivesRecording_compact": {
+      "type": "object",
+      "description": "Compact drive recording: flat position array indexed as positions[frame * driveCount + driveIndex].",
+      "properties": {
+        "fixedDeltaTime": {
+          "type": "number",
+          "default": 0.02,
+          "unit": "s",
+          "description": "Fixed timestep of the recording in seconds."
+        },
+        "numberFrames": {
+          "type": "number",
+          "default": 0,
+          "description": "Number of recorded frames."
+        },
+        "driveCount": {
+          "type": "number",
+          "default": 0,
+          "description": "Number of recorded drives."
+        },
+        "drives": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Array of { id, path } drive descriptors."
+        },
+        "sequences": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Optional array of { name, startFrame, endFrame } named sequences."
+        },
+        "positions": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "Flat drive positions array indexed as positions[frame * driveCount + driveIndex]."
+        }
+      }
+    },
+    "ReplayRecording": {
+      "type": "object",
+      "description": "Signal-triggered replay of a named sequence from a DrivesRecording.",
+      "properties": {
+        "Sequence": {
+          "type": "string",
+          "default": "",
+          "description": "Name of the sequence inside the recording to replay."
+        },
+        "StartOnSignal": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Bool signal that starts the replay on a rising edge."
+        },
+        "IsReplayingSignal": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Bool signal set true while the replay is running."
+        },
+        "Active": {
+          "$ref": "#/$defs/ActiveOnly",
+          "description": "Connection-state gate: controls replay in connected/disconnected mode."
+        }
+      }
+    },
+    "Connections": {
+      "type": "object",
+      "description": "Typed, directed connections between components (plan-259). Carried once per scene (typically on the root node) under extras.realvirtual.Connections. A connection is a named bidirectional call: the source invokes the target with request parameters, the target answers (usually deferred) with response parameters.",
+      "properties": {
+        "connections": {
+          "type": "array",
+          "description": "Flat edge list (serialization truth; adjacency is a runtime index). 1:n fan-out/fan-in via repeated source/target paths."
+        },
+        "connectionTypes": {
+          "type": "array",
+          "description": "User-defined connection type signatures. Built-in types (StopOnExit) are registered in code and need no entry."
+        }
+      }
+    },
+    "RvConnection": {
+      "type": "object",
+      "description": "One directed connection edge between two nodes, identified by scene paths.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Stable edge id, unique within the scene."
+        },
+        "source": {
+          "type": "string",
+          "description": "Slash-separated node path of the source (caller) end."
+        },
+        "target": {
+          "type": "string",
+          "description": "Slash-separated node path of the target (callee) end."
+        },
+        "type": {
+          "type": "string",
+          "description": "Connection type name — built-in (StopOnExit) or user-defined via connectionTypes."
+        },
+        "config": {
+          "type": "object",
+          "description": "Type-specific per-edge configuration, e.g. { ProcessTime: 3.0 } for StopOnExit."
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "target",
+        "type"
+      ]
+    },
+    "ConnectionType": {
+      "type": "object",
+      "description": "User-defined connection type signature: request/response parameter schemas. Makes a GLB self-describing — the viewer renders typed inspector fields and validates call parameters without any code.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Type name referenced by RvConnection.type."
+        },
+        "request": {
+          "type": "object",
+          "description": "Request parameter schema: parameter name to wire type (bool | int | float | string)."
+        },
+        "response": {
+          "type": "object",
+          "description": "Response parameter schema: parameter name to wire type (bool | int | float | string)."
+        }
+      },
+      "required": [
+        "type"
+      ]
+    }
+  },
+  "components": {
+    "Drive": {
+      "$ref": "#/$defs/Drive"
+    },
+    "Drive_Simple": {
+      "$ref": "#/$defs/Drive_Simple"
+    },
+    "Drive_Cylinder": {
+      "$ref": "#/$defs/Drive_Cylinder"
+    },
+    "Drive_Speed": {
+      "$ref": "#/$defs/Drive_Speed"
+    },
+    "Drive_Gear": {
+      "$ref": "#/$defs/Drive_Gear"
+    },
+    "Drive_FollowPosition": {
+      "$ref": "#/$defs/Drive_FollowPosition"
+    },
+    "Drive_DestinationMotor": {
+      "$ref": "#/$defs/Drive_DestinationMotor"
+    },
+    "Drive_PositionSwitch": {
+      "$ref": "#/$defs/Drive_PositionSwitch"
+    },
+    "Drive_ErraticPosition": {
+      "$ref": "#/$defs/Drive_ErraticPosition"
+    },
+    "Sensor": {
+      "$ref": "#/$defs/Sensor"
+    },
+    "TransportSurface": {
+      "$ref": "#/$defs/TransportSurface"
+    },
+    "Source": {
+      "$ref": "#/$defs/Source"
+    },
+    "Sink": {
+      "$ref": "#/$defs/Sink"
+    },
+    "Grip": {
+      "$ref": "#/$defs/Grip"
+    },
+    "GripTarget": {
+      "$ref": "#/$defs/GripTarget"
+    },
+    "ConnectSignal": {
+      "$ref": "#/$defs/ConnectSignal"
+    },
+    "Lamp": {
+      "$ref": "#/$defs/Lamp"
+    },
+    "EnergyChain": {
+      "$ref": "#/$defs/EnergyChain"
+    },
+    "CollisionRole": {
+      "$ref": "#/$defs/CollisionRole"
+    },
+    "WebSensor": {
+      "$ref": "#/$defs/WebSensor"
+    },
+    "WebDiagnostics": {
+      "$ref": "#/$defs/WebDiagnostics"
+    },
+    "WebSafetyDoor": {
+      "$ref": "#/$defs/WebSafetyDoor"
+    },
+    "WebPhysicsZone": {
+      "$ref": "#/$defs/WebPhysicsZone"
+    },
+    "WebError": {
+      "$ref": "#/$defs/WebError"
+    },
+    "WebVisibility": {
+      "$ref": "#/$defs/WebVisibility"
+    },
+    "CustomRuntimeInstruction": {
+      "$ref": "#/$defs/CustomRuntimeInstruction"
+    },
+    "RuntimeMetadata": {
+      "$ref": "#/$defs/RuntimeMetadata"
+    },
+    "IKPath": {
+      "$ref": "#/$defs/IKPath"
+    },
+    "IKTarget": {
+      "$ref": "#/$defs/IKTarget"
+    },
+    "RobotIK": {
+      "$ref": "#/$defs/RobotIK"
+    },
+    "CADLink": {
+      "$ref": "#/$defs/CADLink"
+    },
+    "JTData": {
+      "$ref": "#/$defs/JTData"
+    },
+    "Pipe": {
+      "$ref": "#/$defs/Pipe"
+    },
+    "Pump": {
+      "$ref": "#/$defs/Pump"
+    },
+    "ResourceTank": {
+      "$ref": "#/$defs/ResourceTank"
+    },
+    "ProcessingUnit": {
+      "$ref": "#/$defs/ProcessingUnit"
+    },
+    "WebComponent": {
+      "$ref": "#/$defs/WebComponent"
+    },
+    "Path": {
+      "$ref": "#/$defs/Path"
+    }
+  },
+  "signals": {
+    "PLCOutputBool": {
+      "$ref": "#/$defs/PLCOutputBool"
+    },
+    "PLCInputBool": {
+      "$ref": "#/$defs/PLCInputBool"
+    },
+    "PLCOutputFloat": {
+      "$ref": "#/$defs/PLCOutputFloat"
+    },
+    "PLCInputFloat": {
+      "$ref": "#/$defs/PLCInputFloat"
+    },
+    "PLCOutputInt": {
+      "$ref": "#/$defs/PLCOutputInt"
+    },
+    "PLCInputInt": {
+      "$ref": "#/$defs/PLCInputInt"
+    }
+  },
+  "logicSteps": {
+    "LogicStep_SerialContainer": {
+      "$ref": "#/$defs/LogicStep_SerialContainer"
+    },
+    "LogicStep_ParallelContainer": {
+      "$ref": "#/$defs/LogicStep_ParallelContainer"
+    },
+    "LogicStep_SetSignalBool": {
+      "$ref": "#/$defs/LogicStep_SetSignalBool"
+    },
+    "LogicStep_WaitForSignalBool": {
+      "$ref": "#/$defs/LogicStep_WaitForSignalBool"
+    },
+    "LogicStep_WaitForSensor": {
+      "$ref": "#/$defs/LogicStep_WaitForSensor"
+    },
+    "LogicStep_Delay": {
+      "$ref": "#/$defs/LogicStep_Delay"
+    },
+    "LogicStep_DriveToPosition": {
+      "$ref": "#/$defs/LogicStep_DriveToPosition"
+    },
+    "LogicStep_DriveTo": {
+      "$ref": "#/$defs/LogicStep_DriveTo"
+    },
+    "LogicStep_StartDriveTo": {
+      "$ref": "#/$defs/LogicStep_StartDriveTo"
+    },
+    "LogicStep_SetDriveSpeed": {
+      "$ref": "#/$defs/LogicStep_SetDriveSpeed"
+    },
+    "LogicStep_StartDriveSpeed": {
+      "$ref": "#/$defs/LogicStep_StartDriveSpeed"
+    },
+    "LogicStep_WaitForDrivesAtTarget": {
+      "$ref": "#/$defs/LogicStep_WaitForDrivesAtTarget"
+    },
+    "LogicStep_Enable": {
+      "$ref": "#/$defs/LogicStep_Enable"
+    },
+    "LogicStep_Pause": {
+      "$ref": "#/$defs/LogicStep_Pause"
+    },
+    "LogicStep_SetSignalFloat": {
+      "$ref": "#/$defs/LogicStep_SetSignalFloat"
+    },
+    "LogicStep_WaitForSignalFloat": {
+      "$ref": "#/$defs/LogicStep_WaitForSignalFloat"
+    },
+    "LogicStep_GripPick": {
+      "$ref": "#/$defs/LogicStep_GripPick"
+    },
+    "LogicStep_GripPlace": {
+      "$ref": "#/$defs/LogicStep_GripPlace"
+    },
+    "LogicStep_JumpOnSignal": {
+      "$ref": "#/$defs/LogicStep_JumpOnSignal"
+    },
+    "LogicStep_IKPath": {
+      "$ref": "#/$defs/LogicStep_IKPath"
+    },
+    "LogicStep_SetActiveOnly": {
+      "$ref": "#/$defs/LogicStep_SetActiveOnly"
+    },
+    "LogicStep_CinemachineCamera": {
+      "$ref": "#/$defs/LogicStep_CinemachineCamera"
+    },
+    "LogicStep_StatStartCycle": {
+      "$ref": "#/$defs/LogicStep_StatStartCycle"
+    },
+    "LogicStep_StatEndCycle": {
+      "$ref": "#/$defs/LogicStep_StatEndCycle"
+    },
+    "LogicStep_StatState": {
+      "$ref": "#/$defs/LogicStep_StatState"
+    },
+    "LogicStep_StatOutput": {
+      "$ref": "#/$defs/LogicStep_StatOutput"
+    }
+  },
+  "structure": {
+    "Group": {
+      "$ref": "#/$defs/Group"
+    },
+    "Kinematic": {
+      "$ref": "#/$defs/Kinematic"
+    },
+    "MU": {
+      "$ref": "#/$defs/MU"
+    },
+    "BoxCollider": {
+      "$ref": "#/$defs/BoxCollider"
+    },
+    "LayoutObject": {
+      "$ref": "#/$defs/LayoutObject"
+    },
+    "Splat": {
+      "$ref": "#/$defs/Splat"
+    },
+    "AASLink": {
+      "$ref": "#/$defs/AASLink"
+    }
+  },
+  "recording": {
+    "DrivesRecorder": {
+      "$ref": "#/$defs/DrivesRecorder"
+    },
+    "DrivesRecording_compact": {
+      "$ref": "#/$defs/DrivesRecording_compact"
+    },
+    "ReplayRecording": {
+      "$ref": "#/$defs/ReplayRecording"
+    }
+  },
+  "connections": {
+    "Connections": {
+      "$ref": "#/$defs/Connections"
+    },
+    "RvConnection": {
+      "$ref": "#/$defs/RvConnection"
+    },
+    "ConnectionType": {
+      "$ref": "#/$defs/ConnectionType"
+    }
+  }
+}

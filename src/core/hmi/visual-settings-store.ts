@@ -6,7 +6,17 @@
 import { useSyncExternalStore } from 'react';
 import { getAppConfig } from '../rv-app-config';
 import { lsSave } from './ls-store-utils';
+import { applyUIBlurScale, clampUIBlurScale, DEFAULT_UI_BLUR_SCALE } from './rv-ui-blur';
 import { RENDER_MODES, RENDER_MODE_IDS, DEFAULT_RENDER_MODE, isRenderMode, type RenderMode } from '../rv-render-modes';
+import {
+  PHYSICS_FLAG_KEY,
+  PHYSICS_FULL_FLAG_KEY,
+  isPhysicsFlagEnabled,
+  isFullPhysicsFlagEnabled,
+  computePhysicsEnabled,
+  computeFullPhysics,
+  physicsSettings,
+} from '../engine/rv-physics-registry';
 
 const STORAGE_KEY = 'rv-visual-settings';
 /** Standalone scalar key for the "show source markers" toggle (plan-181).
@@ -144,8 +154,16 @@ export interface VisualSettings {
   envReflectionsEnabled: boolean;
   /** Unlit env-reflection strength → scene.environmentIntensity (0–2). */
   envReflectionsIntensity: number;
+  /** Whether the drive axis gizmo (double arrow / rotation ring) is shown on
+   *  selected Drive nodes (plan-249). */
+  showDriveAxisGizmo: boolean;
   /** Zoom factor for the React HMI overlay (0.5–2.0, default 1.0). */
   uiZoom: number;
+  /** Dimensionless scale for every HMI `backdrop-filter` blur radius (0.1–1,
+   *  default 1 = every glass surface keeps its authored radius). Lowering it cuts
+   *  the per-frame compositor cost of blurring the live 3D canvas behind the
+   *  overlay; the `Fast` visual preset sets 0.25. See `rv-ui-blur.ts`. */
+  uiBlurScale: number;
   /** OrbitControls rotate speed multiplier (0.1–3.0, default 1.0). */
   orbitRotateSpeed: number;
   /** OrbitControls pan speed multiplier (0.1–3.0, default 1.0). */
@@ -246,7 +264,9 @@ const DEFAULTS: VisualSettings = {
   reflectionBlur: 1.0,
   envReflectionsEnabled: false,
   envReflectionsIntensity: 0.3,
+  showDriveAxisGizmo: true,
   uiZoom: 1.0,
+  uiBlurScale: DEFAULT_UI_BLUR_SCALE,
   orbitRotateSpeed: 1.0,
   orbitPanSpeed: 1.0,
   orbitZoomSpeed: 1.0,
@@ -339,7 +359,9 @@ export function loadVisualSettings(): VisualSettings {
     reflectionBlur: fromStorage.reflectionBlur,
     envReflectionsEnabled: fromStorage.envReflectionsEnabled,
     envReflectionsIntensity: fromStorage.envReflectionsIntensity,
+    showDriveAxisGizmo: fromStorage.showDriveAxisGizmo,
     uiZoom: fromStorage.uiZoom,
+    uiBlurScale: fromStorage.uiBlurScale,
     orbitRotateSpeed: clampNavNumber(
       override.orbitRotateSpeed,
       NAVIGATION_RANGES.rotateSpeed,
@@ -494,9 +516,18 @@ function loadFromLocalStorage(): VisualSettings {
     const envReflectionsIntensityRaw = (parsed as Record<string, unknown>).envReflectionsIntensity;
     const envReflectionsIntensity = (typeof envReflectionsIntensityRaw === 'number' && envReflectionsIntensityRaw >= 0 && envReflectionsIntensityRaw <= 2)
       ? envReflectionsIntensityRaw : DEFAULTS.envReflectionsIntensity;
+    const showDriveAxisGizmoRaw = (parsed as Record<string, unknown>).showDriveAxisGizmo;
+    const showDriveAxisGizmo = typeof showDriveAxisGizmoRaw === 'boolean'
+      ? showDriveAxisGizmoRaw : DEFAULTS.showDriveAxisGizmo;
     const uiZoomRaw = (parsed as Record<string, unknown>).uiZoom;
     const uiZoom = (typeof uiZoomRaw === 'number' && uiZoomRaw >= 0.5 && uiZoomRaw <= 2)
       ? uiZoomRaw : DEFAULTS.uiZoom;
+    // A blob written before plan-344 carries no `uiBlurScale`; the default (1)
+    // then keeps every glass surface at exactly its authored radius, so no
+    // migration is needed for existing installs.
+    const uiBlurScaleRaw = (parsed as Record<string, unknown>).uiBlurScale;
+    const uiBlurScale = typeof uiBlurScaleRaw === 'number'
+      ? clampUIBlurScale(uiBlurScaleRaw) : DEFAULTS.uiBlurScale;
     const orbitRotateSpeed = clampNavNumber(
       (parsed as Record<string, unknown>).orbitRotateSpeed,
       NAVIGATION_RANGES.rotateSpeed,
@@ -561,7 +592,9 @@ function loadFromLocalStorage(): VisualSettings {
       reflectionBlur,
       envReflectionsEnabled,
       envReflectionsIntensity,
+      showDriveAxisGizmo,
       uiZoom,
+      uiBlurScale,
       orbitRotateSpeed,
       orbitPanSpeed,
       orbitZoomSpeed,
@@ -577,6 +610,12 @@ function loadFromLocalStorage(): VisualSettings {
 
 export function saveVisualSettings(settings: VisualSettings): void {
   lsSave(STORAGE_KEY, settings);
+  // Every settings change funnels through here (preset apply, Visual tab,
+  // auto-quality watchdog), so pushing the blur factor to the CSS custom
+  // property at this one point is what makes the token reactive — no new
+  // subscription mechanism, and no MUI theme rebuild (the theme is memoised on
+  // the branding colors only, App.tsx).
+  applyUIBlurScale(settings.uiBlurScale);
 }
 
 /** True when the user already has persisted visual settings (i.e. NOT a fresh
@@ -634,29 +673,57 @@ export function useUIZoom(): number {
   );
 }
 
+// ─── Persisted scalar-boolean store factory ───────────────────────────
+// One implementation for all the toggle flags below (source markers, vanish
+// MUs, toolbar labels, snap-flip icons): load-from-localStorage with default,
+// early-return set with best-effort persist, subscribe set, stable hook fns.
+
+interface PersistedBoolStore {
+  get(): boolean;
+  set(value: boolean): void;
+  subscribe(cb: () => void): () => void;
+  /** Stable pair for useSyncExternalStore — call as `useSyncExternalStore(s.subscribe, s.get)`. */
+}
+
+function createPersistedBoolStore(key: string, defaultValue: boolean): PersistedBoolStore {
+  const load = (): boolean => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw === null) return defaultValue;
+      return raw === 'true';
+    } catch {
+      return defaultValue;
+    }
+  };
+  let value = load();
+  const listeners = new Set<() => void>();
+  return {
+    get: () => value,
+    set(next: boolean): void {
+      if (value === next) return;
+      value = next;
+      try {
+        localStorage.setItem(key, next ? 'true' : 'false');
+      } catch {
+        /* quota exceeded or storage disabled — ignore */
+      }
+      for (const l of listeners) l();
+    },
+    subscribe(cb: () => void): () => void {
+      listeners.add(cb);
+      return () => { listeners.delete(cb); };
+    },
+  };
+}
+
 // ─── Reactive Source-Markers-Visible Store (plan-181) ─────────────────
 // Pure scalar boolean persisted to its own localStorage slot so other
 // `VisualSettings` consumers don't have to know about it. Default: true.
 
-const DEFAULT_SOURCE_MARKERS_VISIBLE = true;
-
-function loadSourceMarkersVisible(): boolean {
-  try {
-    const raw = localStorage.getItem(SOURCE_MARKERS_KEY);
-    if (raw === null) return DEFAULT_SOURCE_MARKERS_VISIBLE;
-    return raw === 'true';
-  } catch {
-    return DEFAULT_SOURCE_MARKERS_VISIBLE;
-  }
-}
-
-let _sourceMarkersVisible: boolean = loadSourceMarkersVisible();
-const _sourceMarkersListeners = new Set<() => void>();
-
-function notifySourceMarkers(): void { for (const l of _sourceMarkersListeners) l(); }
+const _sourceMarkers = createPersistedBoolStore(SOURCE_MARKERS_KEY, true);
 
 /** Read the current source-markers-visible toggle (non-reactive). */
-export function getSourceMarkersVisible(): boolean { return _sourceMarkersVisible; }
+export function getSourceMarkersVisible(): boolean { return _sourceMarkers.get(); }
 
 /**
  * Update the source-markers-visible flag, persist to localStorage, and
@@ -664,29 +731,14 @@ export function getSourceMarkersVisible(): boolean { return _sourceMarkersVisibl
  * subscribe via {@link subscribeSourceMarkersVisible} to apply the change
  * to every source's `_markerNode.visible`.
  */
-export function setSourceMarkersVisible(visible: boolean): void {
-  if (_sourceMarkersVisible === visible) return;
-  _sourceMarkersVisible = visible;
-  try {
-    localStorage.setItem(SOURCE_MARKERS_KEY, visible ? 'true' : 'false');
-  } catch {
-    /* quota exceeded or storage disabled — ignore */
-  }
-  notifySourceMarkers();
-}
+export function setSourceMarkersVisible(visible: boolean): void { _sourceMarkers.set(visible); }
 
 /** Subscribe to source-markers-visible changes. Returns unsubscribe handle. */
-export function subscribeSourceMarkersVisible(cb: () => void): () => void {
-  _sourceMarkersListeners.add(cb);
-  return () => { _sourceMarkersListeners.delete(cb); };
-}
+export function subscribeSourceMarkersVisible(cb: () => void): () => void { return _sourceMarkers.subscribe(cb); }
 
 /** React hook: returns the current source-markers-visible flag (reactive). */
 export function useSourceMarkersVisible(): boolean {
-  return useSyncExternalStore(
-    (cb) => { _sourceMarkersListeners.add(cb); return () => { _sourceMarkersListeners.delete(cb); }; },
-    () => _sourceMarkersVisible,
-  );
+  return useSyncExternalStore(_sourceMarkers.subscribe, _sourceMarkers.get);
 }
 
 // ─── Reactive Vanish-MUs Store ────────────────────────────────────────
@@ -696,55 +748,105 @@ export function useSourceMarkersVisible(): boolean {
 // Pure scalar boolean persisted to its own localStorage slot. Default: true
 // (an MU that runs off the end of a line should disappear, not pile up).
 
-const VANISH_MUS_KEY = 'rv-vanish-mus';
-const DEFAULT_VANISH_MUS = true;
-
-function loadVanishMUs(): boolean {
-  try {
-    const raw = localStorage.getItem(VANISH_MUS_KEY);
-    if (raw === null) return DEFAULT_VANISH_MUS;
-    return raw === 'true';
-  } catch {
-    return DEFAULT_VANISH_MUS;
-  }
-}
-
-let _vanishMUs: boolean = loadVanishMUs();
-const _vanishMUsListeners = new Set<() => void>();
-
-function notifyVanishMUs(): void { for (const l of _vanishMUsListeners) l(); }
+const _vanishMUs = createPersistedBoolStore('rv-vanish-mus', true);
 
 /** Read the current vanish-MUs toggle (non-reactive). */
-export function getVanishMUs(): boolean { return _vanishMUs; }
+export function getVanishMUs(): boolean { return _vanishMUs.get(); }
 
 /**
  * Update the vanish-MUs flag, persist to localStorage, and notify subscribers.
  * `RVViewer.setVanishMUs` subscribes via {@link subscribeVanishMUs} to push the
  * value onto the live transport manager.
  */
-export function setVanishMUs(enabled: boolean): void {
-  if (_vanishMUs === enabled) return;
-  _vanishMUs = enabled;
-  try {
-    localStorage.setItem(VANISH_MUS_KEY, enabled ? 'true' : 'false');
-  } catch {
-    /* quota exceeded or storage disabled — ignore */
-  }
-  notifyVanishMUs();
-}
+export function setVanishMUs(enabled: boolean): void { _vanishMUs.set(enabled); }
 
 /** Subscribe to vanish-MUs changes. Returns unsubscribe handle. */
-export function subscribeVanishMUs(cb: () => void): () => void {
-  _vanishMUsListeners.add(cb);
-  return () => { _vanishMUsListeners.delete(cb); };
-}
+export function subscribeVanishMUs(cb: () => void): () => void { return _vanishMUs.subscribe(cb); }
 
 /** React hook: returns the current vanish-MUs flag (reactive). */
 export function useVanishMUs(): boolean {
-  return useSyncExternalStore(
-    (cb) => { _vanishMUsListeners.add(cb); return () => { _vanishMUsListeners.delete(cb); }; },
-    () => _vanishMUs,
-  );
+  return useSyncExternalStore(_vanishMUs.subscribe, _vanishMUs.get);
+}
+
+// ─── Reactive Physics-Whole-Scene Store (plan-276 F10/F16) ────────────
+// Settings → Simulation → "Physics (whole scene)". Deliberately NOT a
+// createPersistedBoolStore: the persisted value lives under the engine's
+// `rv.physics` activation key with 'on' / 'off' semantics (rv-physics-registry
+// reads it at boot via isPhysicsFlagEnabled). Load-time-only: flipping the
+// toggle takes effect on the NEXT model load (physicsSettings is written once
+// at boot / evaluated by the physics plugin per load).
+
+let _physicsWholeScene = isPhysicsFlagEnabled();
+const _physicsListeners = new Set<() => void>();
+const _physicsSubscribe = (cb: () => void): (() => void) => {
+  _physicsListeners.add(cb);
+  return () => { _physicsListeners.delete(cb); };
+};
+const _physicsGet = (): boolean => _physicsWholeScene;
+
+/** Read the current physics-whole-scene toggle (non-reactive). */
+export function getPhysicsWholeScene(): boolean { return _physicsWholeScene; }
+
+/** Update the physics toggle: persists 'on' / 'off' under `rv.physics` and
+ *  refreshes the LIVE gate so the next model load picks it up without a page
+ *  reload (still load-time-only for the running model, plan-276 F10). */
+export function setPhysicsWholeScene(enabled: boolean): void {
+  if (_physicsWholeScene === enabled) return;
+  _physicsWholeScene = enabled;
+  try {
+    localStorage.setItem(PHYSICS_FLAG_KEY, enabled ? 'on' : 'off');
+  } catch {
+    /* quota exceeded or storage disabled — ignore */
+  }
+  // Keep the load-time gate coherent for the NEXT model load (the settings.json
+  // kill-switch still wins — same AND as the boot block in main.ts). The
+  // derived full gate (F17) depends on `enabled`, so it is re-evaluated too.
+  physicsSettings.enabled = computePhysicsEnabled(getAppConfig().simulation?.physicsEnabled);
+  physicsSettings.full = computeFullPhysics(getAppConfig().simulation?.physicsEnabled);
+  for (const l of _physicsListeners) l();
+}
+
+/** React hook: returns the current physics-whole-scene flag (reactive). */
+export function usePhysicsWholeScene(): boolean {
+  return useSyncExternalStore(_physicsSubscribe, _physicsGet);
+}
+
+// ─── Reactive Full-Physics Store (plan-276 F17, Beta) ─────────────────
+// Settings → Simulation → "Full physics — all conveyors (Beta)". Same
+// engine-key semantics as the whole-scene toggle above: persisted 'on'/'off'
+// under `rv.physics.full`, load-time-only. Only EFFECTIVE when the main
+// physics toggle is also on (strict AND — computeFullPhysics); the UI
+// disables this switch while the main toggle is off.
+
+let _physicsFull = isFullPhysicsFlagEnabled();
+const _physicsFullListeners = new Set<() => void>();
+const _physicsFullSubscribe = (cb: () => void): (() => void) => {
+  _physicsFullListeners.add(cb);
+  return () => { _physicsFullListeners.delete(cb); };
+};
+const _physicsFullGet = (): boolean => _physicsFull;
+
+/** Read the current full-physics (Beta) toggle (non-reactive). */
+export function getPhysicsFull(): boolean { return _physicsFull; }
+
+/** Update the full-physics (Beta) toggle: persists 'on' / 'off' under
+ *  `rv.physics.full` and refreshes the LIVE derived gate for the next model
+ *  load (still load-time-only for the running model, plan-276 F17). */
+export function setPhysicsFull(enabled: boolean): void {
+  if (_physicsFull === enabled) return;
+  _physicsFull = enabled;
+  try {
+    localStorage.setItem(PHYSICS_FULL_FLAG_KEY, enabled ? 'on' : 'off');
+  } catch {
+    /* quota exceeded or storage disabled — ignore */
+  }
+  physicsSettings.full = computeFullPhysics(getAppConfig().simulation?.physicsEnabled);
+  for (const l of _physicsFullListeners) l();
+}
+
+/** React hook: returns the current full-physics (Beta) flag (reactive). */
+export function usePhysicsFull(): boolean {
+  return useSyncExternalStore(_physicsFullSubscribe, _physicsFullGet);
 }
 
 // ─── Reactive Toolbar-Show-Labels Store ───────────────────────────────
@@ -752,42 +854,14 @@ export function useVanishMUs(): boolean {
 // Models, Annotations, Multiuser, VR/AR, Settings) render a text label next
 // to their icon. Always collapsed on mobile regardless of this setting.
 
-const TOOLBAR_LABELS_KEY = 'rv-toolbar-show-labels';
-const DEFAULT_TOOLBAR_SHOW_LABELS = false;
+const _toolbarLabels = createPersistedBoolStore('rv-toolbar-show-labels', false);
 
-function loadToolbarShowLabels(): boolean {
-  try {
-    const raw = localStorage.getItem(TOOLBAR_LABELS_KEY);
-    if (raw === null) return DEFAULT_TOOLBAR_SHOW_LABELS;
-    return raw === 'true';
-  } catch {
-    return DEFAULT_TOOLBAR_SHOW_LABELS;
-  }
-}
+export function getToolbarShowLabels(): boolean { return _toolbarLabels.get(); }
 
-let _toolbarShowLabels: boolean = loadToolbarShowLabels();
-const _toolbarLabelsListeners = new Set<() => void>();
-
-function notifyToolbarLabels(): void { for (const l of _toolbarLabelsListeners) l(); }
-
-export function getToolbarShowLabels(): boolean { return _toolbarShowLabels; }
-
-export function setToolbarShowLabels(show: boolean): void {
-  if (_toolbarShowLabels === show) return;
-  _toolbarShowLabels = show;
-  try {
-    localStorage.setItem(TOOLBAR_LABELS_KEY, show ? 'true' : 'false');
-  } catch {
-    /* quota exceeded or storage disabled — ignore */
-  }
-  notifyToolbarLabels();
-}
+export function setToolbarShowLabels(show: boolean): void { _toolbarLabels.set(show); }
 
 export function useToolbarShowLabels(): boolean {
-  return useSyncExternalStore(
-    (cb) => { _toolbarLabelsListeners.add(cb); return () => { _toolbarLabelsListeners.delete(cb); }; },
-    () => _toolbarShowLabels,
-  );
+  return useSyncExternalStore(_toolbarLabels.subscribe, _toolbarLabels.get);
 }
 
 // ─── Reactive Snap-Flip-Icons Store (plan-190) ────────────────────────
@@ -796,49 +870,18 @@ export function useToolbarShowLabels(): boolean {
 // snap. Default: true. Kept as its own scalar key so existing visual-settings
 // consumers stay schema-stable.
 
-const SNAP_FLIP_ICONS_KEY = 'rv-snap-flip-icons-visible';
-const DEFAULT_SNAP_FLIP_ICONS_VISIBLE = true;
-
-function loadSnapFlipIconsVisible(): boolean {
-  try {
-    const raw = localStorage.getItem(SNAP_FLIP_ICONS_KEY);
-    if (raw === null) return DEFAULT_SNAP_FLIP_ICONS_VISIBLE;
-    return raw === 'true';
-  } catch {
-    return DEFAULT_SNAP_FLIP_ICONS_VISIBLE;
-  }
-}
-
-let _snapFlipIconsVisible: boolean = loadSnapFlipIconsVisible();
-const _snapFlipIconsListeners = new Set<() => void>();
-
-function notifySnapFlipIcons(): void { for (const l of _snapFlipIconsListeners) l(); }
+const _snapFlipIcons = createPersistedBoolStore('rv-snap-flip-icons-visible', true);
 
 /** Read the current snap-flip-icons-visible toggle (non-reactive). */
-export function getSnapFlipIconsVisible(): boolean { return _snapFlipIconsVisible; }
+export function getSnapFlipIconsVisible(): boolean { return _snapFlipIcons.get(); }
 
 /** Set the snap-flip-icons-visible flag and persist to localStorage. */
-export function setSnapFlipIconsVisible(visible: boolean): void {
-  if (_snapFlipIconsVisible === visible) return;
-  _snapFlipIconsVisible = visible;
-  try {
-    localStorage.setItem(SNAP_FLIP_ICONS_KEY, visible ? 'true' : 'false');
-  } catch {
-    /* quota exceeded or storage disabled — ignore */
-  }
-  notifySnapFlipIcons();
-}
+export function setSnapFlipIconsVisible(visible: boolean): void { _snapFlipIcons.set(visible); }
 
 /** Subscribe to snap-flip-icons-visible changes. Returns unsubscribe handle. */
-export function subscribeSnapFlipIconsVisible(cb: () => void): () => void {
-  _snapFlipIconsListeners.add(cb);
-  return () => { _snapFlipIconsListeners.delete(cb); };
-}
+export function subscribeSnapFlipIconsVisible(cb: () => void): () => void { return _snapFlipIcons.subscribe(cb); }
 
 /** React hook: returns the current snap-flip-icons-visible flag (reactive). */
 export function useSnapFlipIconsVisible(): boolean {
-  return useSyncExternalStore(
-    (cb) => { _snapFlipIconsListeners.add(cb); return () => { _snapFlipIconsListeners.delete(cb); }; },
-    () => _snapFlipIconsVisible,
-  );
+  return useSyncExternalStore(_snapFlipIcons.subscribe, _snapFlipIcons.get);
 }

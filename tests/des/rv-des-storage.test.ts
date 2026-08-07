@@ -104,11 +104,12 @@ describe('DES Storage', () => {
     const ids: string[] = [];
     for (let i = 0; i < 3; i++) {
       const mu: DESMU = {
-        id: i, customId: `MU-${i}`, priority: 0, visual: null,
+        id: i, generation: 0, customId: `MU-${i}`, priority: 0, visual: null,
         currentComponent: null, nextComponent: null, route: [], routeStep: 0,
         entryTime: 0, plannedExitTime: -1, creationTime: 0, totalTimeInSystem: 0,
         isBlocked: false, isInTransit: false, isProcessing: false,
         isLoaded: false, loadedOn: null, loadedOnNode: null,
+        childMUs: [], parentMU: null,
         prop: {}, componentsVisited: 0, blockedCount: 0,
         totalBlockedTime: 0, totalProcessingTime: 0, totalTransitTime: 0,
       };
@@ -141,11 +142,12 @@ describe('DES Storage', () => {
     const priorities = [1, 5, 3, 10, 2];
     for (let i = 0; i < priorities.length; i++) {
       const mu: DESMU = {
-        id: i, customId: `MU-P${priorities[i]}`, priority: priorities[i], visual: null,
+        id: i, generation: 0, customId: `MU-P${priorities[i]}`, priority: priorities[i], visual: null,
         currentComponent: null, nextComponent: null, route: [], routeStep: 0,
         entryTime: 0, plannedExitTime: -1, creationTime: 0, totalTimeInSystem: 0,
         isBlocked: false, isInTransit: false, isProcessing: false,
         isLoaded: false, loadedOn: null, loadedOnNode: null,
+        childMUs: [], parentMU: null,
         prop: {}, componentsVisited: 0, blockedCount: 0,
         totalBlockedTime: 0, totalProcessingTime: 0, totalTransitTime: 0,
       };
@@ -177,11 +179,12 @@ describe('DES Storage', () => {
     // Add 2 MUs (at capacity)
     for (let i = 0; i < 2; i++) {
       const mu: DESMU = {
-        id: i, customId: `MU-${i}`, priority: 0, visual: null,
+        id: i, generation: 0, customId: `MU-${i}`, priority: 0, visual: null,
         currentComponent: null, nextComponent: null, route: [], routeStep: 0,
         entryTime: 0, plannedExitTime: -1, creationTime: 0, totalTimeInSystem: 0,
         isBlocked: false, isInTransit: false, isProcessing: false,
         isLoaded: false, loadedOn: null, loadedOnNode: null,
+        childMUs: [], parentMU: null,
         prop: {}, componentsVisited: 0, blockedCount: 0,
         totalBlockedTime: 0, totalProcessingTime: 0, totalTransitTime: 0,
       };
@@ -191,11 +194,12 @@ describe('DES Storage', () => {
 
     // Third MU should be rejected
     const mu3: DESMU = {
-      id: 2, customId: 'MU-2', priority: 0, visual: null,
+      id: 2, generation: 0, customId: 'MU-2', priority: 0, visual: null,
       currentComponent: null, nextComponent: null, route: [], routeStep: 0,
       entryTime: 0, plannedExitTime: -1, creationTime: 0, totalTimeInSystem: 0,
       isBlocked: false, isInTransit: false, isProcessing: false,
       isLoaded: false, loadedOn: null, loadedOnNode: null,
+      childMUs: [], parentMU: null,
       prop: {}, componentsVisited: 0, blockedCount: 0,
       totalBlockedTime: 0, totalProcessingTime: 0, totalTransitTime: 0,
     };

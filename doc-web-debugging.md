@@ -6,7 +6,9 @@ Guide for debugging realvirtual WEB — structured logging, HTTP debug API, Clau
 
 ## 1. Structured Logging System
 
-realvirtual WEB uses a category-based structured logging system (`rv-debug.ts`) with an always-on ring buffer. All log entries are captured regardless of whether a category is enabled for console output.
+realvirtual WEB uses a category-based structured logging system with an always-on ring buffer. All log entries are captured regardless of whether a category is enabled for console output.
+
+The module is **`src/core/engine/rv-debug.ts`**. The import paths in the samples below are written from `src/`; adjust the relative depth for the file you are editing (most callers inside `src/core/engine/` simply use `'./rv-debug'`).
 
 ### Debug Categories
 
@@ -59,7 +61,7 @@ Five severity levels, ordered: `trace` < `debug` < `info` < `warn` < `error`
 **Category-based logging** — console output gated by active categories, but always buffered:
 
 ```ts
-import { debug, debugWarn, debugError } from './rv-debug';
+import { debug, debugWarn, debugError } from './core/engine/rv-debug';
 
 debug('signal', 'value changed', { name, value });     // level: debug
 debugWarn('drive', 'speed limit exceeded', speed);      // level: warn, captures stack
@@ -69,7 +71,7 @@ debugError('loader', 'failed to parse node', err);      // level: error, capture
 **System-level logging** — always prints to console AND buffers:
 
 ```ts
-import { logInfo, logWarn, logError } from './rv-debug';
+import { logInfo, logWarn, logError } from './core/engine/rv-debug';
 
 logInfo('Model loaded successfully');
 logWarn('WebSocket reconnecting...');
@@ -81,7 +83,7 @@ logError('Critical failure', errorObj);
 The ring buffer holds the last 500 entries. Query it programmatically:
 
 ```ts
-import { getLogBuffer, getLastLogs, queryLogs, clearLogBuffer, getLogBufferSize } from './rv-debug';
+import { getLogBuffer, getLastLogs, queryLogs, clearLogBuffer, getLogBufferSize } from './core/engine/rv-debug';
 
 getLogBuffer();                  // All 500 entries (oldest first)
 getLastLogs(10);                 // Last 10 entries
@@ -228,7 +230,7 @@ This gives Claude Code direct access to the browser's accessibility tree, DOM st
 
 ### Playwright MCP Setup
 
-The Playwright MCP server is configured in `.mcp.json`:
+The Playwright MCP server is configured in the Unity project's `.mcp.json` — that file lives at the **Unity project root, two levels above this directory** (next to `Assets/`), not in `Assets/realvirtual-WebViewer~/`:
 
 ```json
 {
@@ -249,6 +251,28 @@ This provides Claude Code with browser navigation, element clicking, form fillin
 
 Automated end-to-end tests in `e2e/` verify realvirtual WEB functionality using Playwright.
 
+### Watching a vitest browser run (headless opt-out)
+
+The vitest suite (`tests/*.test.ts`, run with `npm test`) drives a real Chromium through the
+Playwright provider. Since plan-375 it runs **headless by default** — `browser.headless: true`
+is pinned in `vite.config.ts` rather than left to vitest's default, which follows
+`process.env.CI` and is therefore `false` on a developer machine.
+
+When you need to *see* what a failing test does — a misplaced overlay, a gizmo that never
+appears, a canvas that stays black — opt out for that invocation only:
+
+```bash
+npx vitest --browser.headless=false                        # watch mode, visible browser
+npx vitest run --browser.headless=false tests/foo.test.ts  # single file, visible browser
+```
+
+Do not flip the config value to debug: a visible window changes what the suite measures.
+Chromium throttles and repaints differently when a window is focused, occluded or minimized,
+and several tests read frame timings or `document.visibilityState`.
+
+Note that this is orthogonal to `npm run e2e:headed`, which controls the *Playwright* e2e
+runner in `e2e/` — a different runner with a different browser session.
+
 ### Running Tests
 
 ```bash
@@ -261,7 +285,14 @@ npx playwright test e2e/debug-endpoint.spec.ts # Debug API tests only
 npx playwright test e2e/perf-smoke.spec.ts    # Performance benchmark
 ```
 
-The dev server starts automatically on port 5177 (configured in `playwright.config.ts`).
+`playwright.config.ts` starts **two** web servers, both with `reuseExistingServer`:
+
+| Server | Port | Serves |
+|--------|------|--------|
+| `npm run dev -- --port 5177` | 5177 | the dev server — `baseURL` of the `chromium` project, which runs every spec except `embed-smoke.spec.ts` |
+| `npm run preview:embed` | 4178 | the **built** embed artifact from `dist-embed/` — `baseURL` of the `embed-chromium` project, which runs `embed-smoke.spec.ts` only |
+
+The embed server previews a production build, so `npm run build:embed` has to have produced `dist-embed/` before `embed-smoke.spec.ts` can pass.
 
 ### Test Suites
 
@@ -305,8 +336,39 @@ The dev server starts automatically on port 5177 (configured in `playwright.conf
 - Sink consumes them
 
 **`webgpu-smoke.spec.ts`** — Rendering backend smoke test:
-- Boots the viewer in both WebGL and WebGPU rendering modes without JS errors
+- Boots realvirtual in both WebGL and WebGPU rendering modes without JS errors
 - Headless Chromium falls back to WebGL
+
+**`collision.spec.ts`** — Collision manager end-to-end:
+- Collisions report as cards in the right-side messages panel
+- The highlight survives a workspace mode change
+- Cards clear when the overlap ends / the type is ignored
+
+**`inline-signal-linking.spec.ts`** — Inline signal linking:
+- Every signal slot of a selected element shows as a row (empty ones as *not linked*)
+- A slot binds to an internal model signal through the picker and goes live without a CONNECT provider
+- Unlinking restores *not linked*
+
+**`signal-link-mode.spec.ts`** — Signal link mode:
+- Toggle visible in hmi and planner mode, hidden in fpv; persisted across reload
+- Badge click opens the direct bind popover (mouse and touch)
+- Unwired drives stay *pending* without CONNECT and go live with it
+- Model switch and reload leave no stale or duplicate badges
+
+**`slot-authority.spec.ts`** — Slot write authority:
+- bind → force → unforce round trip and the authority state after each
+- The held live source value is redispatched onto the slot on unforce
+- A model switch cleans the state up
+
+**`connect-embed-e2e.spec.ts`** — CONNECT embed gate (`connect-embed` UI context):
+- The minimal gate loads, closes and restarts the standalone CONNECT demo from the model row
+- The row close action is keyboard reachable and 44 px on a coarse pointer
+- The signal hint stays visible and unobstructed next to a maximally wide CONNECT panel
+
+**`embed-smoke.spec.ts`** — the **built** `rv-embed` artifact (runs against the preview server on 4178, not the dev server):
+- Loads the Draco vignette
+- Enforces the mobile single-simulation limit
+- Disposes cleanly when removed by an SPA
 
 ### Writing New E2E Tests
 
@@ -379,17 +441,25 @@ Context menus are managed by `ContextMenuStore` (`context-menu-store.ts`). When 
 
 4. **Menu doesn't open at all** — The drag guard suppresses context menus after a pointer-move exceeding 8px. If you moved the mouse slightly during right-click, the menu is intentionally suppressed. On touch devices, a 500ms long-press is required.
 
-5. **Debugging UI context visibility** — Check which contexts are active:
+5. **Debugging UI context visibility** — Check which contexts are active (`isUIElementVisible` takes the active-context set as its second argument):
    ```js
    import { getActiveContexts, isUIElementVisible } from './core/hmi/ui-context-store';
    console.log('Active contexts:', getActiveContexts());
-   console.log('bottomBar visible:', isUIElementVisible('bottomBar'));
+   console.log('button-panel visible:', isUIElementVisible('button-panel', getActiveContexts()));
    ```
 
-6. **Context overrides from settings.json** — If elements appear/disappear unexpectedly, check `settings.json` for `uiVisibility` rules that may override the programmatic defaults:
+6. **Context overrides from settings.json** — If elements appear/disappear unexpectedly, check `settings.json` for `ui.visibilityOverrides` rules that may override the programmatic defaults. Each entry maps a registered element id to a `UIVisibilityRule` — arrays of contexts under `hiddenIn`, `shownOnlyIn` and/or `shownOnlyInAny`, never a per-context boolean map:
    ```json
-   { "uiVisibility": { "bottomBar": { "planner": false } } }
+   {
+     "ui": {
+       "visibilityOverrides": {
+         "button-panel": { "hiddenIn": ["planner", "xr"] },
+         "help": { "shownOnlyIn": ["kiosk"] }
+       }
+     }
+   }
    ```
+   `hiddenIn` hides when ANY listed context is active, `shownOnlyIn` shows only when ALL are, `shownOnlyInAny` shows when at least one is; they combine with AND. Config overrides beat the code-declared defaults — see [`doc-ui-visibility.md`](doc-ui-visibility.md).
 
 ### Enabling Verbose Logging for a Specific Area
 

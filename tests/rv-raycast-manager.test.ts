@@ -2,8 +2,21 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, it, expect, vi } from 'vitest';
-import { Object3D, Mesh, BoxGeometry, MeshBasicMaterial } from 'three';
-import { resolveHit, type FaceRange } from '../src/core/engine/rv-raycast-geometry';
+import { Object3D, Group, Mesh, BoxGeometry, BufferGeometry, MeshBasicMaterial, Raycaster, Vector3 } from 'three';
+import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
+import {
+  resolveHit, buildRaycastGeometries, refitRaycastGroupsForSubtrees,
+  type FaceRange, type RaycastGeometrySet,
+} from '../src/core/engine/rv-raycast-geometry';
+import { NodeRegistry } from '../src/core/engine/rv-node-registry';
+import { registerComponentSchema } from '../src/core/engine/rv-component-registry';
+import '../src/core/editor/rv-cadlink'; // side effect: CADLink capability registration
+
+// buildRaycastGroup calls geometry.computeBoundsTree() — installed lazily by
+// the scene loader in production, so install it here for direct builder tests.
+BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+Mesh.prototype.raycast = acceleratedRaycast;
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -85,6 +98,156 @@ describe('resolveHit (face-range binary search)', () => {
     expect(resolveHit(singleFace, 0)).toBe('Root/Tiny');
     expect(resolveHit(singleFace, 1)).toBe('Root/Tiny2');
     expect(resolveHit(singleFace, 2)).toBeNull();
+  });
+});
+
+// ─── Content-ancestor resolution (CADLink per-part picking) ─────────
+
+// Synthetic hoverable type standing in for Drive/Sensor/etc. so the test
+// doesn't import heavy component modules for their registration side effects.
+registerComponentSchema('TestPickRoot', {}, { hoverable: true, selectable: true });
+
+function makePart(name: string): Mesh {
+  const mesh = new Mesh(new BoxGeometry(1, 1, 1), new MeshBasicMaterial());
+  mesh.name = name;
+  return mesh;
+}
+
+function buildAndRegister(root: Object3D): NodeRegistry {
+  const registry = new NodeRegistry();
+  root.traverse((n) => registry.registerNode(NodeRegistry.computeNodePath(n), n));
+  return registry;
+}
+
+describe('buildRaycastGeometries content-ancestor resolution', () => {
+  it('meshes inside a CADLink-only subtree resolve to their OWN path (per-part picking)', () => {
+    const root = new Group(); root.name = 'Asset';
+    const cadRoot = new Group(); cadRoot.name = 'Gearbox';
+    cadRoot.userData.realvirtual = { CADLink: { File: 'g.step' } };
+    const sub = new Group(); sub.name = 'SubAssy';
+    const housing = makePart('Housing');
+    const shaft = makePart('Shaft');
+    sub.add(housing, shaft); cadRoot.add(sub); root.add(cadRoot);
+
+    const registry = buildAndRegister(root);
+    const geo = buildRaycastGeometries(root, [], registry, new Set());
+
+    const paths = geo.staticGroup!.faceRanges.map((r) => r.objectPath);
+    expect(paths).toContain(registry.getPathForNode(housing)!);
+    expect(paths).toContain(registry.getPathForNode(shaft)!);
+    expect(paths).not.toContain(registry.getPathForNode(cadRoot)!);
+  });
+
+  it('a CADLink root that also carries another hoverable component stays a bubble target', () => {
+    const root = new Group(); root.name = 'Asset';
+    const cadRoot = new Group(); cadRoot.name = 'Gearbox';
+    cadRoot.userData.realvirtual = { CADLink: { File: 'g.step' }, TestPickRoot: {} };
+    const part = makePart('Housing');
+    cadRoot.add(part); root.add(cadRoot);
+
+    const registry = buildAndRegister(root);
+    const geo = buildRaycastGeometries(root, [], registry, new Set());
+
+    const paths = geo.staticGroup!.faceRanges.map((r) => r.objectPath);
+    expect(paths).toEqual([registry.getPathForNode(cadRoot)!]);
+  });
+
+  it('non-CADLink hoverable ancestors still bubble child meshes to the component root', () => {
+    const root = new Group(); root.name = 'Asset';
+    const machine = new Group(); machine.name = 'Machine';
+    machine.userData.realvirtual = { TestPickRoot: {} };
+    const part = makePart('Cover');
+    machine.add(part); root.add(machine);
+
+    const registry = buildAndRegister(root);
+    const geo = buildRaycastGeometries(root, [], registry, new Set());
+
+    const paths = geo.staticGroup!.faceRanges.map((r) => r.objectPath);
+    expect(paths).toEqual([registry.getPathForNode(machine)!]);
+  });
+});
+
+// ─── Transform refit (fast path) ────────────────────────────────────
+
+describe('refitRaycastGroupsForSubtrees (transform fast path)', () => {
+  /** Two independently pickable 1×1×1 boxes at x=0 (A) and x=5 (B). */
+  function buildTwoPartScene() {
+    const root = new Group(); root.name = 'Asset';
+    const partA = makePart('PartA');
+    partA.userData.realvirtual = { TestPickRoot: {} };
+    const partB = makePart('PartB');
+    partB.userData.realvirtual = { TestPickRoot: {} };
+    partB.position.set(5, 0, 0);
+    root.add(partA, partB);
+    root.updateMatrixWorld(true);
+    const registry = buildAndRegister(root);
+    const set = buildRaycastGeometries(root, [], registry, new Set());
+    return { root, partA, partB, registry, set };
+  }
+
+  /** Cast straight down at (x, z) against the static group; resolved path or null. */
+  function pickAt(set: RaycastGeometrySet, x: number, z: number): string | null {
+    const group = set.staticGroup!;
+    const ray = new Raycaster(new Vector3(x, 10, z), new Vector3(0, -1, 0));
+    const hits = ray.intersectObject(group.mesh, false);
+    if (hits.length === 0 || hits[0].faceIndex == null) return null;
+    return resolveHit(group.faceRanges, hits[0].faceIndex);
+  }
+
+  it('re-bakes a moved subtree in place — pick follows, BVH refit, no rebuild', () => {
+    const { partA, registry, set } = buildTwoPartScene();
+    const pathA = registry.getPathForNode(partA)!;
+
+    expect(pickAt(set, 0, 0)).toBe(pathA); // before the move
+    const geometryBefore = set.staticGroup!.mesh.geometry;
+
+    partA.position.set(10, 0, 0);
+    partA.updateMatrixWorld(true);
+    expect(refitRaycastGroupsForSubtrees(set, [partA])).toBe(true);
+
+    expect(pickAt(set, 10, 0)).toBe(pathA);   // pick follows the move
+    expect(pickAt(set, 0, 0)).toBeNull();     // old position is empty
+    // In-place update — same geometry object (highlight proxies share it).
+    expect(set.staticGroup!.mesh.geometry).toBe(geometryBefore);
+  });
+
+  it('leaves untouched siblings alone', () => {
+    const { partA, partB, registry, set } = buildTwoPartScene();
+    partA.position.set(10, 0, 0);
+    partA.updateMatrixWorld(true);
+    refitRaycastGroupsForSubtrees(set, [partA]);
+    expect(pickAt(set, 5, 0)).toBe(registry.getPathForNode(partB)!);
+  });
+
+  it('refits when the moved node is an ANCESTOR of the source meshes', () => {
+    const root = new Group(); root.name = 'Asset';
+    const machine = new Group(); machine.name = 'Machine';
+    machine.userData.realvirtual = { TestPickRoot: {} };
+    const part = makePart('Cover');
+    machine.add(part); root.add(machine);
+    root.updateMatrixWorld(true);
+    const registry = buildAndRegister(root);
+    const set = buildRaycastGeometries(root, [], registry, new Set());
+    const path = registry.getPathForNode(machine)!;
+
+    machine.position.set(-7, 0, 0);
+    machine.updateMatrixWorld(true);
+    expect(refitRaycastGroupsForSubtrees(set, [machine])).toBe(true);
+    expect(pickAt(set, -7, 0)).toBe(path);
+  });
+
+  it('returns false when a source geometry changed size (structural — needs rebuild)', () => {
+    const { partA, set } = buildTwoPartScene();
+    partA.geometry = new BoxGeometry(2, 2, 2, 2, 2, 2); // different vertex count
+    expect(refitRaycastGroupsForSubtrees(set, [partA])).toBe(false);
+  });
+
+  it('no-ops (true) when no source mesh is under the moved nodes', () => {
+    const { root, set } = buildTwoPartScene();
+    const unrelated = new Group();
+    root.add(unrelated);
+    expect(refitRaycastGroupsForSubtrees(set, [unrelated])).toBe(true);
+    expect(refitRaycastGroupsForSubtrees(set, [])).toBe(true);
   });
 });
 

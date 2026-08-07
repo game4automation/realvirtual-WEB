@@ -208,7 +208,7 @@ function InfoOverlayBridge() {
           minWidth: 220,
           borderRadius: 2,
           bgcolor: 'rgba(20,20,20,0.85)',
-          backdropFilter: 'blur(12px)',
+          backdropFilter: 'blur(calc(12px * var(--rv-ui-blur-scale, 1)))',
           boxShadow: '0 8px 24px rgba(0,0,0,0.6)',
           border: '1px solid rgba(255,255,255,0.08)',
         }}

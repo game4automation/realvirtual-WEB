@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { applyNavigationSettingsToControls } from '../src/core/rv-viewer';
+import { applyNavigationSettingsToControls } from '../src/core/engine/rv-orbit-controls-config';
 
 describe('applyNavigationSettingsToControls', () => {
   it('applies all 4 settings to controls object', () => {

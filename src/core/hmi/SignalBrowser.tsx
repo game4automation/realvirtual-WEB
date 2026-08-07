@@ -48,7 +48,7 @@ export function SignalBrowser({ sort, onSortChange }: SignalBrowserProps) {
           label={label}
           size="small"
           onClick={() => onSortChange(key)}
-          sx={filterChipSx(sort === key, 16, 8)}
+          sx={filterChipSx(sort === key)}
         />
       ))}
     </Box>

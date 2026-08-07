@@ -2,10 +2,12 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Typography, Box, Button, CircularProgress, Switch } from '@mui/material';
+import { Typography, Box, Button, CircularProgress, Switch, TextField } from '@mui/material';
 import { PlayArrow, CleaningServices } from '@mui/icons-material';
 import { useViewer } from '../../../hooks/use-viewer';
 import { StatRow, BudgetRow, budgetPct, SettingsSection, FieldRow } from './settings-helpers';
+import { isMetadataLoadingEnabled, DISABLE_METADATA_LS_KEY } from '../../engine/rv-dev-load-flags';
+import type { RenderBackendId, RenderBackendStatus } from '../../render-backend/rv-render-backend';
 import { ModelCache } from '../../../plugins/layout-planner/model-cache';
 import { clearCache as clearLibrarySnapCache } from '../../../plugins/snap-point/library-snap-index';
 
@@ -45,10 +47,43 @@ interface DevStats {
   uberDisposedSourceGeometries: number;
   staticMergeIn: number;
   staticMergeOut: number;
+  texBatchIn: number;
+  texBatchOut: number;
+  batchUniqueGeometries: number;
+  batchArenaVertices: number;
   kinMergeGroups: number;
   kinMergeIn: number;
   kinMergeOut: number;
+  // Picking & Highlight (pick-path metrics, EMA + last sample, pre-formatted ms)
+  pickRaycastMs: string;
+  pickRaycastLast: string;
+  pickStaticMs: string;
+  pickKinematicMs: string;
+  pickOtherMs: string;
+  pickResolveMs: string;
+  pickHighlightMs: string;
+  pickHighlightLast: string;
+  pickStrategy: string;
+  pickCount: number;
+  pickHits: number;
+  pickBvhPending: number;
+  pickOverlayObjects: number;
+  // Metadata load stats (from LoadResult.metadataStats)
+  metadataNodes: number;
+  metadataAabbCount: number;
+  metadataAabbMs: string;
+  hoverableRanges: number;
 }
+
+/** Display label per pick-path highlight strategy id. */
+const PICK_STRATEGY_LABEL: Record<string, string> = {
+  'outline': 'OutlinePass',
+  'fill-proxy': 'Fill Proxy',
+  'overlay-legacy': 'Overlay (legacy)',
+  'bbox': 'BBox fallback',
+  'mu-overlay': 'MU overlay',
+  'none': '—',
+};
 
 const PERF_BUDGETS = {
   triangles: 2_000_000,
@@ -145,6 +180,122 @@ function PipelineRow({ label, before, after }: { label: string; before: string; 
   );
 }
 
+/** Human-readable label for a render-backend status. */
+const RENDER_BACKEND_STATUS_LABEL: Record<RenderBackendStatus, string> = {
+  idle: 'Three.js active',
+  connecting: 'Connecting…',
+  streaming: 'Streaming',
+  loading: 'Loading scene…',
+  waiting: 'Waiting for Omniverse',
+  error: 'Error',
+};
+
+/**
+ * Render-backend toggle (plan-256) — INTERNAL/experimental. Switches the 3D
+ * render layer between Three.js (default) and an Omniverse RTX WebRTC stream.
+ * Only rendered behind `__RV_INTERNAL__` (see caller) so it never ships in
+ * customer deploys. HMI panels are unaffected by the switch.
+ */
+function RenderBackendSection() {
+  const viewer = useViewer();
+  const [backend, setBackend] = useState<RenderBackendId>(viewer.renderBackend);
+  const [status, setStatus] = useState<RenderBackendStatus>(viewer.renderBackendStatus);
+  const [switching, setSwitching] = useState(false);
+  // Connection + drive-bridge config (plan-256). Local string state so the input
+  // stays editable; committed to the viewer on change.
+  const [signalingPort, setSignalingPort] = useState<string>(
+    String((viewer.omniverseBackendConfig.signalingPort as number | undefined) ?? ''),
+  );
+  const [signalName, setSignalName] = useState<string>(viewer.omniverseDriveBridge.signalName ?? '');
+
+  useEffect(() => {
+    const offBackend = viewer.onRenderBackendChange((b) => setBackend(b));
+    const offStatus = viewer.onRenderBackendStatusChange((s) => setStatus(s));
+    // Sync in case state changed before subscription.
+    setBackend(viewer.renderBackend);
+    setStatus(viewer.renderBackendStatus);
+    return () => { offBackend(); offStatus(); };
+  }, [viewer]);
+
+  const omniverseAvailable = viewer.hasRenderBackend('omniverse');
+
+  const onToggle = useCallback(async (useOmniverse: boolean) => {
+    setSwitching(true);
+    try {
+      await viewer.setRenderBackend(useOmniverse ? 'omniverse' : 'three');
+    } catch (e) {
+      console.warn('[DevTools] Render backend switch failed:', e);
+    } finally {
+      setSwitching(false);
+    }
+  }, [viewer]);
+
+  const onSignalingPortChange = useCallback((raw: string) => {
+    setSignalingPort(raw);
+    const port = Number.parseInt(raw, 10);
+    if (Number.isFinite(port)) viewer.setOmniverseBackendConfig({ signalingPort: port });
+  }, [viewer]);
+
+  const onSignalNameChange = useCallback((raw: string) => {
+    setSignalName(raw);
+    // Empty → clear (fall back to the first drive's CurrentPosition).
+    viewer.setOmniverseDriveBridge({ signalName: raw.trim() === '' ? undefined : raw.trim() });
+  }, [viewer]);
+
+  return (
+    <SettingsSection id="devtools-render-backend" title="3D Backend (experimental)">
+      <FieldRow label="Omniverse RTX Stream">
+        <Switch
+          size="small"
+          checked={backend === 'omniverse'}
+          disabled={switching || !omniverseAvailable}
+          onChange={(_, v) => { void onToggle(v); }}
+        />
+      </FieldRow>
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, mt: 0.5 }}>
+        <StatRow label="Backend" value={backend === 'omniverse' ? 'Omniverse' : 'Three.js'} />
+        {backend === 'omniverse' && (
+          <StatRow
+            label="Status"
+            value={RENDER_BACKEND_STATUS_LABEL[status]}
+            color={status === 'streaming' ? '#66bb6a' : status === 'error' ? '#ef5350' : '#ffa726'}
+          />
+        )}
+      </Box>
+      {omniverseAvailable && (
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75, mt: 0.75 }}>
+          <FieldRow label="Signaling Port">
+            <TextField
+              size="small"
+              type="number"
+              value={signalingPort}
+              placeholder="49100"
+              onChange={(e) => onSignalingPortChange(e.target.value)}
+              sx={{ width: 96 }}
+              inputProps={{ style: { fontSize: 11, padding: '2px 6px' } }}
+            />
+          </FieldRow>
+          <FieldRow label="Drive Signal">
+            <TextField
+              size="small"
+              value={signalName}
+              placeholder="first drive"
+              onChange={(e) => onSignalNameChange(e.target.value)}
+              sx={{ width: 140 }}
+              inputProps={{ style: { fontSize: 11, padding: '2px 6px' } }}
+            />
+          </FieldRow>
+        </Box>
+      )}
+      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.25)', mt: 0.75 }}>
+        {omniverseAvailable
+          ? 'Replaces the Three.js 3D view with an Omniverse RTX WebRTC stream. HMI, signals and charts are unchanged. The port applies on the next connect; leave the signal empty to push the first drive’s position.'
+          : 'Omniverse backend not registered in this build (internal tier only).'}
+      </Typography>
+    </SettingsSection>
+  );
+}
+
 export function DevToolsTab() {
   const viewer = useViewer();
   const [stats, setStats] = useState<DevStats | null>(null);
@@ -200,7 +351,22 @@ export function DevToolsTab() {
       const gpuLowPower = gpu?.lowPower
         ? `${gpu.lowPower.vendor} ${gpu.lowPower.device}`.trim()
         : undefined;
-      const hash = `${viewer.currentFps}|${info.triangles}|${info.drawCalls}|${info.programs}|${info.materialsUnique}|${heapMB}|${viewer.drives.length}|${gpuActive}|${gpuHighPerf ?? ''}|${gpuLowPower ?? ''}|${analysis?.severity ?? ''}|${analysis?.tier ?? ''}`;
+      const pick = viewer.getPickMetrics();
+      const metaStats = viewer.getMetadataLoadStats();
+      // Pre-format ms to 0.01 precision — the formatted strings feed both the
+      // change-hash (bounded churn) and the rendered rows.
+      const pickFmt = {
+        raycast: pick.raycastMs.toFixed(2),
+        raycastLast: pick.lastRaycastMs.toFixed(2),
+        static: pick.raycastStaticMs.toFixed(2),
+        kinematic: pick.raycastKinematicMs.toFixed(2),
+        other: pick.raycastOtherMs.toFixed(2),
+        resolve: pick.resolveMs.toFixed(2),
+        highlight: pick.highlightMs.toFixed(2),
+        highlightLast: pick.lastHighlightMs.toFixed(2),
+      };
+      const hash = `${viewer.currentFps}|${info.triangles}|${info.drawCalls}|${info.programs}|${info.materialsUnique}|${heapMB}|${viewer.drives.length}|${gpuActive}|${gpuHighPerf ?? ''}|${gpuLowPower ?? ''}|${analysis?.severity ?? ''}|${analysis?.tier ?? ''}`
+        + `|${pickFmt.raycast}|${pickFmt.raycastLast}|${pickFmt.highlight}|${pickFmt.highlightLast}|${pickFmt.resolve}|${pick.strategy}|${pick.raycastCount}|${pick.bvhPending}|${pick.overlayObjects}`;
       if (hash === prevStatsHashRef.current) return;
       prevStatsHashRef.current = hash;
       setStats({
@@ -233,9 +399,30 @@ export function DevToolsTab() {
         uberDisposedSourceGeometries: info.uberDisposedSourceGeometries,
         staticMergeIn: info.uberMergeOriginal,
         staticMergeOut: info.uberMergeCreated,
+        texBatchIn: info.texMergeOriginal,
+        texBatchOut: info.texMergeCreated,
+        batchUniqueGeometries: info.batchUniqueGeometries,
+        batchArenaVertices: info.batchArenaVertices,
         kinMergeGroups: info.kinGroupsMerged,
         kinMergeIn: info.kinSourceMeshes,
         kinMergeOut: info.kinChunksCreated,
+        pickRaycastMs: pickFmt.raycast,
+        pickRaycastLast: pickFmt.raycastLast,
+        pickStaticMs: pickFmt.static,
+        pickKinematicMs: pickFmt.kinematic,
+        pickOtherMs: pickFmt.other,
+        pickResolveMs: pickFmt.resolve,
+        pickHighlightMs: pickFmt.highlight,
+        pickHighlightLast: pickFmt.highlightLast,
+        pickStrategy: PICK_STRATEGY_LABEL[pick.strategy] ?? pick.strategy,
+        pickCount: pick.raycastCount,
+        pickHits: pick.hitCount,
+        pickBvhPending: pick.bvhPending,
+        pickOverlayObjects: pick.overlayObjects,
+        metadataNodes: metaStats?.metadataNodes ?? 0,
+        metadataAabbCount: metaStats?.aabbCount ?? 0,
+        metadataAabbMs: metaStats ? metaStats.aabbBuildMs.toFixed(1) : '--',
+        hoverableRanges: metaStats?.hoverableFaceRanges ?? 0,
       });
     }, 200);
     return () => clearInterval(interval);
@@ -247,6 +434,9 @@ export function DevToolsTab() {
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
 
+      {/* 3D render backend (plan-256) — internal/experimental only */}
+      {__RV_INTERNAL__ && <RenderBackendSection />}
+
       {/* Profiler toggles */}
       <SettingsSection id="devtools-profiler" title="Profiler">
         <FieldRow label="FPS / GPU Overlay">
@@ -254,6 +444,15 @@ export function DevToolsTab() {
         </FieldRow>
         <FieldRow label="Console Perf Log">
           <Switch size="small" checked={infoLogging} onChange={(_, v) => { viewer.setDebugLogging(v); setInfoLogging(v); }} />
+        </FieldRow>
+        {/* Perf-diagnosis kill-switch: load as if the GLB carried no
+            Runtime* interaction components at all (rv-dev-load-flags.ts). */}
+        <FieldRow label="Metadata Components" hint="Off = strip RuntimeMetadata / Interactable / UI-Window extras at load — no hover, no select, no tooltips (perf test). Reloads the viewer.">
+          <Switch
+            size="small"
+            checked={isMetadataLoadingEnabled()}
+            onChange={(_, v) => { localStorage.setItem(DISABLE_METADATA_LS_KEY, v ? '0' : '1'); window.location.reload(); }}
+          />
         </FieldRow>
       </SettingsSection>
 
@@ -265,6 +464,9 @@ export function DevToolsTab() {
           <StatRow label="Drives" value={s ? String(s.drives) : '--'} />
           <StatRow label="GLB Size" value={s?.glbSize ?? '--'} />
           <StatRow label="Load Time" value={s?.loadTime ?? '--'} />
+          <StatRow label="Metadata Nodes" value={s ? s.metadataNodes.toLocaleString() : '--'} />
+          <StatRow label="AABB Build" value={s ? `${s.metadataAabbCount.toLocaleString()} in ${s.metadataAabbMs} ms` : '--'} />
+          <StatRow label="Hoverable Ranges" value={s ? s.hoverableRanges.toLocaleString() : '--'} />
         </Box>
       </SettingsSection>
 
@@ -294,14 +496,23 @@ export function DevToolsTab() {
             }
           />
           <PipelineRow
-            label="Static Merge"
+            label="Static Batch"
             before={s ? s.staticMergeIn.toLocaleString() : '--'}
-            after={s ? `${s.staticMergeOut} meshes` : '--'}
+            after={s ? `${s.staticMergeOut} batch` : '--'}
           />
           <PipelineRow
-            label="Kinematic Merge"
-            before={s ? `${s.kinMergeIn.toLocaleString()} (${s.kinMergeGroups} groups)` : '--'}
-            after={s ? `${s.kinMergeOut} meshes` : '--'}
+            label="Textured Batch"
+            before={s ? s.texBatchIn.toLocaleString() : '--'}
+            after={s ? `${s.texBatchOut} batches` : '--'}
+          />
+          <StatRow
+            label="Arena"
+            value={s ? `${s.batchUniqueGeometries.toLocaleString()} geoms / ${s.batchArenaVertices.toLocaleString()} verts` : '--'}
+          />
+          <PipelineRow
+            label="Kinematic Batch"
+            before={s ? `${s.kinMergeIn.toLocaleString()} (${s.kinMergeGroups} drives)` : '--'}
+            after={s ? `${s.kinMergeOut} batches` : '--'}
           />
         </Box>
       </SettingsSection>
@@ -317,6 +528,26 @@ export function DevToolsTab() {
           <StatRow label="Programs" value={s ? String(s.programs) : '--'} />
           <StatRow label="JS Heap" value={s ? `${s.heapMB} MB` : '--'} />
           <StatRow label="Renderer" value={s?.renderer ?? '--'} />
+        </Box>
+      </SettingsSection>
+
+      {/* Picking & Highlight — pick-path timings (EMA over ~10 picks, "last" = raw sample) */}
+      <SettingsSection id="devtools-picking" title="Picking & Highlight">
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+          <StatRow label="Raycast" value={s ? `${s.pickRaycastMs} ms (last ${s.pickRaycastLast})` : '--'} />
+          <StatRow label="· Static BVH" value={s ? `${s.pickStaticMs} ms` : '--'} />
+          <StatRow label="· Drive BVHs" value={s ? `${s.pickKinematicMs} ms` : '--'} />
+          <StatRow label="· MU / Aux" value={s ? `${s.pickOtherMs} ms` : '--'} />
+          <StatRow label="Resolve" value={s ? `${s.pickResolveMs} ms` : '--'} />
+          <StatRow label="Highlight Apply" value={s ? `${s.pickHighlightMs} ms (last ${s.pickHighlightLast})` : '--'} />
+          <StatRow label="Strategy" value={s?.pickStrategy ?? '--'} />
+          <StatRow
+            label="BVH"
+            value={s ? (s.pickBvhPending > 0 ? `${s.pickBvhPending} pending (native fallback)` : 'ready') : '--'}
+            color={s ? (s.pickBvhPending > 0 ? '#ffa726' : '#66bb6a') : undefined}
+          />
+          <StatRow label="Picks / Hits" value={s ? `${s.pickCount.toLocaleString()} / ${s.pickHits.toLocaleString()}` : '--'} />
+          <StatRow label="Overlay Objects" value={s ? String(s.pickOverlayObjects) : '--'} />
         </Box>
       </SettingsSection>
 

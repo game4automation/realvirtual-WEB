@@ -20,6 +20,7 @@
  */
 
 import type { Object3D } from 'three';
+import type { SignalWriter, SignalWriterKind } from './engine/rv-signal-store';
 import type { ContextMenuItem } from './hmi/context-menu-store';
 import type { StatisticsManager } from './material-flow/rv-statistics-manager';
 import { getSchemaDefaults } from './engine/rv-component-registry';
@@ -526,6 +527,10 @@ export interface BindContextHost {
   signalStore: {
     get(name: string): boolean | number | undefined;
     set(name: string, value: boolean | number): void;
+    createWriter?(
+      writerId: string,
+      writerKind: SignalWriterKind,
+    ): SignalWriter;
     subscribe(name: string, cb: (value: boolean | number) => void): () => void;
     /** Optional: register a signal with initialValue + PLC type. The BehaviorManager
      *  calls this after applying a bind's KinematicsSpec so behavior-declared signals
@@ -743,6 +748,12 @@ export function createBindContext(
   // ancestor) → empty scope → names unchanged. See rv-instance-scope.ts.
   const signalScope = instanceScope(root);
   const sn = (name: string): string => scopeSignalName(signalScope, name);
+  const signalWriter = host.signalStore
+    ? host.signalStore.createWriter?.(
+        `behavior:${signalScope || root.name || 'root'}`,
+        'behavior',
+      ) ?? { set: host.signalStore.set.bind(host.signalStore) }
+    : null;
 
   const ctx: RVBindContext = {
     root,
@@ -796,7 +807,7 @@ export function createBindContext(
         return v as unknown as T;
       },
       set(name: string, value: boolean | number): void {
-        host.signalStore?.set(sn(name), value);
+        signalWriter?.set(sn(name), value);
       },
       on(name: string, cb: (value: boolean | number) => void): void {
         if (internals.disposed) return;

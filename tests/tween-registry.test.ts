@@ -123,6 +123,33 @@ describe('TweenRegistry — FastForward (no transform write)', () => {
   });
 });
 
+describe('TweenRegistry — settle (leaving FastForward)', () => {
+  it('writes running tweens at simNow even though fastforward would skip them', () => {
+    const reg = new TweenRegistry(8);
+    const t = makePosTarget();
+    reg.addPosition(t, new Vector3(0, 0, 0), new Vector3(10, 0, 0), 0, 2);
+
+    // FastForward left the part stranded (no write for the still-running tween).
+    reg.onRender(1, 'fastforward');
+    expect(t.writes).toBe(0);
+    expect(t.pos.x).toBe(0);
+
+    // settle() snaps it to the exact sim position (50% → x=5) and keeps it alive.
+    reg.settle(1);
+    expect(t.pos.x).toBeCloseTo(5);
+    expect(reg.activeCount).toBe(1);
+  });
+
+  it('reaps finished tweens at their final value', () => {
+    const reg = new TweenRegistry(8);
+    const t = makePosTarget();
+    reg.addPosition(t, new Vector3(0, 0, 0), new Vector3(10, 0, 0), 0, 2);
+    reg.settle(2); // at/after end → final value + reaped
+    expect(t.pos.x).toBeCloseTo(10);
+    expect(reg.activeCount).toBe(0);
+  });
+});
+
 describe('TweenRegistry — robustness (V4)', () => {
   it('duration=0 never produces NaN', () => {
     const reg = new TweenRegistry(8);
@@ -167,6 +194,77 @@ describe('TweenRegistry — robustness (V4)', () => {
     reg.cancel(h);
     expect(() => reg.cancel(h)).not.toThrow();
     expect(reg.activeCount).toBe(0);
+  });
+});
+
+describe('TweenRegistry — headless MU records (plan-262 Phase 3)', () => {
+  it('null target WITHOUT muId keeps the legacy behaviour (no record, handle −1)', () => {
+    const reg = new TweenRegistry(8);
+    expect(reg.addPosition(null, new Vector3(), new Vector3(1, 0, 0), 0, 1)).toBe(-1);
+    expect(reg.activeCount).toBe(0);
+  });
+
+  it('null target WITH muId creates a record: no write, window kept, reaped normally', () => {
+    const reg = new TweenRegistry(8);
+    const h = reg.addPosition(null, new Vector3(0, 0, 0), new Vector3(10, 0, 0), 0, 2, 7);
+    expect(h).not.toBe(-1);
+    expect(reg.activeCount).toBe(1);
+
+    // Rendering a headless record must not crash and must not write anything.
+    expect(() => reg.onRender(1, 'animated')).not.toThrow();
+    expect(reg.activeCount).toBe(1); // still running
+
+    // Finished → reaped like any other record (no leak).
+    reg.onRender(2.5, 'animated');
+    expect(reg.activeCount).toBe(0);
+  });
+
+  it('activeWindowForMu returns the containing window; the LATEST-starting one wins; null otherwise', () => {
+    const reg = new TweenRegistry(8);
+    reg.addPosition(null, new Vector3(0, 0, 0), new Vector3(10, 0, 0), 0, 10, 7);   // belt transit
+    reg.addPosition(null, new Vector3(5, 0, 0), new Vector3(5, 0, 9), 4, 4, 7);     // later ride
+    reg.addPosition(null, new Vector3(99, 0, 0), new Vector3(99, 0, 9), 0, 10, 8);  // other MU
+
+    // t=2: only the transit window contains it.
+    const w2 = reg.activeWindowForMu(7, 2);
+    expect(w2).not.toBeNull();
+    expect(w2!.t0).toBe(0);
+    expect(w2!.to.x).toBeCloseTo(10);
+
+    // t=5: both windows contain it → the later-starting ride wins.
+    const w5 = reg.activeWindowForMu(7, 5);
+    expect(w5!.t0).toBe(4);
+    expect(w5!.to.z).toBeCloseTo(9);
+
+    // Unknown MU / time outside every window / untracked id → null.
+    expect(reg.activeWindowForMu(99, 5)).toBeNull();
+    expect(reg.activeWindowForMu(7, 20)).toBeNull();
+    expect(reg.activeWindowForMu(-1, 5)).toBeNull();
+  });
+
+  it('attachTargetForMu re-targets running headless records; subsequent renders write the visual', () => {
+    const reg = new TweenRegistry(8);
+    const t = makePosTarget();
+    reg.addPosition(null, new Vector3(0, 0, 0), new Vector3(10, 0, 0), 0, 2, 7);
+
+    expect(reg.attachTargetForMu(7, t)).toBe(1);
+    reg.onRender(1, 'animated');
+    expect(t.pos.x).toBeCloseTo(5); // the tween now moves the materialised visual
+
+    // Records that already carry a target are left alone; unknown ids attach nothing.
+    expect(reg.attachTargetForMu(7, makePosTarget())).toBe(0);
+    expect(reg.attachTargetForMu(42, t)).toBe(0);
+  });
+
+  it('a reused pool record does not leak the previous muId', () => {
+    const reg = new TweenRegistry(1); // force reuse of the same slot
+    reg.addPosition(null, new Vector3(), new Vector3(1, 0, 0), 0, 1, 7);
+    reg.onRender(2, 'animated'); // reap
+    expect(reg.activeCount).toBe(0);
+
+    const t = makePosTarget();
+    reg.addPosition(t, new Vector3(), new Vector3(1, 0, 0), 2, 1); // no muId
+    expect(reg.activeWindowForMu(7, 2.5)).toBeNull(); // stale id must not resolve
   });
 });
 

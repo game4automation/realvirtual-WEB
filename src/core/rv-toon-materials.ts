@@ -25,7 +25,9 @@
  *     and normalized linear depth in A of ONE ordinary RGBA8 color buffer
  *     (written by a custom override material) — deliberately NOT a hardware
  *     DepthTexture, which is non-portable across GPUs. Composer-only, so on
- *     WebGPU toon renders as banded materials without lines.
+ *     WebGPU toon renders as banded materials without lines. The full-screen
+ *     SATURATION grade, however, does run under WebGPU: it uses the shared
+ *     Rec601 saturation node on the TSL post pipeline (plan-271 Phase 3).
  *
  * Lifecycle (driven by RVViewer): `enable(root)` / `disable(root)` swap +
  * restore materials and toggle the edge pass; `convert(root)` handles a model
@@ -35,6 +37,7 @@
  */
 
 import {
+  MathUtils,
   Color,
   DataTexture,
   LinearFilter,
@@ -45,6 +48,7 @@ import {
   NearestFilter,
   Object3D,
   OrthographicCamera,
+  Plane,
   PerspectiveCamera,
   RGBAFormat,
   Scene,
@@ -53,11 +57,18 @@ import {
   WebGLRenderTarget,
   WebGLRenderer,
   type IUniform,
+  type Texture,
 } from 'three';
 import type { Renderer } from 'three/webgpu';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import type { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { getTslMaterials } from './engine/materials/material-factory';
+import type {
+  ToonRecolorStateTsl,
+  ToonSourceMaterialLike,
+} from './engine/materials/rv-toon-materials-tsl';
+import type { TslPostPipeline } from './engine/materials/rv-post-processing-tsl';
 
 /**
  * Minimal viewer surface this manager needs. Mirrors the `OutlineHostViewer` /
@@ -82,12 +93,37 @@ export interface ToonHostViewer {
   _ensureComposer(): void;
   /** The composer once `_ensureComposer` has run; null on WebGPU. */
   readonly _composer: EffectComposer | null;
+  /** Lazily creates the TSL post pipeline (WebGPURenderer paths only —
+   *  plan-271 Phase 3). Optional so lightweight test hosts stay valid. */
+  _ensureTslPost?(): TslPostPipeline | null;
   /** Mark the next frame as needing a render. */
   markRenderDirty(): void;
 }
 
 const MIN_BANDS = 2;
 const MAX_BANDS = 6;
+
+/** Common surface of the classic MeshToonMaterial and the TSL
+ *  MeshToonNodeMaterial variant — everything the manager touches after
+ *  conversion (gradient swap + disposal). */
+type ToonLikeMaterial = Material & { gradientMap: Texture | null };
+
+// Module-local warn-once flag (repo convention — no external warnOnce util).
+// Fires only as a FALLBACK: WebGPURenderer active but the TSL material module
+// was not pre-warmed (plan-271 Phase 2) — toon then keeps cel banding, but
+// the metal tint + albedo grade recolor is skipped (onBeforeCompile is
+// silently ignored under WebGPURenderer).
+let _warnedToonWebGPU = false;
+function warnToonRecolorWebGPUOnce(): void {
+  if (_warnedToonWebGPU) return;
+  _warnedToonWebGPU = true;
+  console.warn(
+    '[ToonMaterials] WebGPU renderer active but the TSL material module is ' +
+    'not preloaded — toon keeps the cel banding, but the metal tint / albedo ' +
+    'grade recolor is disabled (onBeforeCompile is silently ignored under ' +
+    'WebGPURenderer).',
+  );
+}
 
 /**
  * Store an internal back-reference on a `userData`/`Material.userData` bag as a
@@ -103,7 +139,7 @@ function setHidden(bag: Record<string, unknown>, key: string, value: unknown): v
   Object.defineProperty(bag, key, { value, enumerable: false, writable: true, configurable: true });
 }
 
-function clamp01(v: number): number { return v < 0 ? 0 : v > 1 ? 1 : v; }
+const clamp01 = (v: number): number => MathUtils.clamp(v, 0, 1);
 function clampBands(n: number): number {
   return Math.max(MIN_BANDS, Math.min(MAX_BANDS, Math.round(n)));
 }
@@ -186,13 +222,23 @@ const ALBEDO_INJECT = /* glsl */`{
 
 // ─── Normal+depth gbuffer override material (portable, no DepthTexture) ──────
 
+// This material is applied via `scene.overrideMaterial`, so it renders EVERY
+// object in the scene — including the BatchedMesh arenas of the batched render
+// pipeline. Any such override material MUST be batching-aware: the renderer
+// injects `#define USE_BATCHING` and binds the batching textures per object,
+// but only the <batching_pars_vertex> / <batching_vertex> chunks make the
+// per-instance matrix available; <defaultnormal_vertex> and <project_vertex>
+// then apply it. Without these includes, batched geometry renders with its
+// instance transforms unapplied and the gbuffer (and thus every edge) is wrong.
 const GBUFFER_VERT = /* glsl */`
 #include <common>
+#include <batching_pars_vertex>
 uniform float uNear;
 uniform float uFar;
 varying vec3 vNrm;
 varying float vDepth;
 void main() {
+  #include <batching_vertex>
   #include <beginnormal_vertex>
   #include <defaultnormal_vertex>
   vNrm = normalize(transformedNormal);
@@ -279,8 +325,15 @@ export class RVToonMaterialManager {
 
   private _active = false;
 
-  // Material cache: original material instance → its toon counterpart.
-  private readonly toonByOriginal = new Map<Material, MeshToonMaterial>();
+  // Material cache: original material instance → its toon counterpart
+  // (classic MeshToonMaterial on WebGL, MeshToonNodeMaterial via the TSL
+  // module under WebGPURenderer — plan-271 Phase 2).
+  private readonly toonByOriginal = new Map<Material, ToonLikeMaterial>();
+
+  // Shared TSL recolor uniforms (WebGPURenderer path only) — mirrors the
+  // shared _albedoUniforms/_metalUniforms of the GLSL path; created lazily on
+  // the first TSL conversion and kept in sync by the setters below.
+  private _tslRecolorState: ToonRecolorStateTsl | null = null;
 
   // Shared cel gradient (reassigned to every toon material on change).
   private _gradient: DataTexture | null = null;
@@ -322,11 +375,17 @@ export class RVToonMaterialManager {
   private readonly _outlineColor = new Color(0x1a1a1a);
   private _gbufferRT: WebGLRenderTarget | null = null;
   private _gbufferMat: ShaderMaterial | null = null;
+  /** Section planes for the override normal/depth gbuffer material. */
+  private _clippingPlanes: Plane[] | null = null;
   private _sobelPass: ShaderPass | null = null;
-  // Full-screen saturation post-process (WebGL only). Appended last in the
-  // composer so it grades the final composited image; enabled only when
-  // saturation != 1. See `_ensureSaturationPass`.
+  // Full-screen saturation post-process. WebGL: a ShaderPass appended last in
+  // the composer; enabled only when saturation != 1. WebGPURenderer paths:
+  // the shared Rec601 saturation node on the TSL post pipeline instead
+  // (plan-271 Phase 3). See `_ensureSaturationPass`.
   private _saturationPass: ShaderPass | null = null;
+  // TSL post pipeline once linked (WebGPURenderer paths) — carries the
+  // saturation uniform the setters below write to.
+  private _tslPost: TslPostPipeline | null = null;
   // Supersample the depth/normal gbuffer at 2× resolution for higher-quality
   // edges (heavier). Edge AA otherwise comes from MSAA on the gbuffer.
   private _supersample = false;
@@ -336,6 +395,16 @@ export class RVToonMaterialManager {
 
   constructor(host: ToonHostViewer) {
     this.host = host;
+  }
+
+  /** Keep the Toon outline prepass consistent with the clipped beauty pass. */
+  setClippingPlanes(planes: Plane[] | null): void {
+    this._clippingPlanes = planes;
+    if (this._gbufferMat) {
+      this._gbufferMat.clippingPlanes = planes;
+      this._gbufferMat.needsUpdate = true;
+    }
+    this.host.markRenderDirty();
   }
 
   // ─── Public read accessors (for the viewer's delegating proxies) ──────────
@@ -359,11 +428,14 @@ export class RVToonMaterialManager {
    *  grade (banding itself is in-material and needs no composer). */
   get passActive(): boolean { return this.outlineActive || this.saturationActive; }
 
-  /** True when the full-screen saturation post-process should run (toon active,
-   *  WebGL, and saturation != 1). */
+  /** True when the full-screen saturation post-process should run (toon
+   *  active and saturation != 1). WebGL: ShaderPass; WebGPURenderer paths:
+   *  the shared saturation node on the TSL post pipeline. */
   get saturationActive(): boolean {
+    if (this.host.isWebGPU) {
+      return this._active && !!this._tslPost && this._albedoSaturation !== 1;
+    }
     return this._active
-      && !this.host.isWebGPU
       && !!this._saturationPass
       && this._saturationPass.enabled;
   }
@@ -402,6 +474,7 @@ export class RVToonMaterialManager {
     this._active = false;
     if (this._sobelPass) this._sobelPass.enabled = false;
     if (this._saturationPass) this._saturationPass.enabled = false;
+    this._applyTslSaturation(); // TSL path: back to identity (saturation 1)
     this.host.markRenderDirty();
   }
 
@@ -448,6 +521,7 @@ export class RVToonMaterialManager {
   setMetallic(strength: number): void {
     this._metallic = clamp01(strength);
     this._metalUniforms.uMetalReflectivity.value = this._metallic;
+    if (this._tslRecolorState) this._tslRecolorState.uMetalReflectivity.value = this._metallic;
     this.host.markRenderDirty();
   }
 
@@ -455,6 +529,7 @@ export class RVToonMaterialManager {
   setMetallicColor(colorHex: string): void {
     this._metalColor.set(colorHex);
     this._metalUniforms.uMetalColor.value.copy(this._metalColor);
+    if (this._tslRecolorState) this._tslRecolorState.uMetalColor.value.copy(this._metalColor);
     this.host.markRenderDirty();
   }
 
@@ -470,9 +545,15 @@ export class RVToonMaterialManager {
     this._albedoSaturation = Math.max(0, Math.min(2, saturation));
     this._albedoUniforms.uAlbedoMinBright.value = this._albedoMinBright;
     this._albedoUniforms.uAlbedoMaxBright.value = this._albedoMaxBright;
+    if (this._tslRecolorState) {
+      this._tslRecolorState.uAlbedoMinBright.value = this._albedoMinBright;
+      this._tslRecolorState.uAlbedoMaxBright.value = this._albedoMaxBright;
+    }
     // Saturation is a post-process pass (guard: setAlbedo can run before toon is
     // enabled, e.g. applying settings at load — the pass is built in `enable`).
-    if (this._saturationPass) {
+    if (this.host.isWebGPU) {
+      this._applyTslSaturation();
+    } else if (this._saturationPass) {
       this._saturationPass.uniforms.uSaturation.value = this._albedoSaturation;
       this._saturationPass.enabled = this._active && this._albedoSaturation !== 1;
     }
@@ -672,11 +753,60 @@ export class RVToonMaterialManager {
     }
   }
 
+  /** Lazily create + seed the shared TSL recolor uniform state (WebGPU path). */
+  private _ensureTslRecolorState(
+    tsl: NonNullable<ReturnType<typeof getTslMaterials>>,
+  ): ToonRecolorStateTsl {
+    if (!this._tslRecolorState) {
+      const state = tsl.createToonRecolorStateTsl();
+      state.uMetalColor.value.copy(this._metalColor);
+      state.uMetalReflectivity.value = this._metallic;
+      state.uAlbedoMinBright.value = this._albedoMinBright;
+      state.uAlbedoMaxBright.value = this._albedoMaxBright;
+      this._tslRecolorState = state;
+    }
+    return this._tslRecolorState;
+  }
+
   /** Convert one material (cached). Non-Standard materials pass through unchanged. */
   private _toToon(src: Material): Material {
-    if (!(src instanceof MeshStandardMaterial)) return src;
+    // Convertible sources: classic MeshStandardMaterial, or the shared uber
+    // MeshStandardNodeMaterial (TSL variant, plan-271 port coupling #1→#2).
+    const isStandard = src instanceof MeshStandardMaterial;
+    const isStandardNode =
+      (src as { isMeshStandardNodeMaterial?: boolean }).isMeshStandardNodeMaterial === true;
+    if (!isStandard && !isStandardNode) return src;
     const cached = this.toonByOriginal.get(src);
     if (cached) return cached;
+
+    // WebGPURenderer (both backends): onBeforeCompile is silently ignored —
+    // the recolor (metal tint + albedo grade) runs as a TSL colorNode chain
+    // instead (plan-271 Phase 2 port #2). The saturation grade runs on the
+    // TSL post pipeline (Phase 3); only the Sobel edge lines stay disabled
+    // under WebGPU (open item).
+    if (this.host.isWebGPU) {
+      const tsl = getTslMaterials();
+      if (tsl) {
+        const state = this._ensureTslRecolorState(tsl);
+        const isUber = src.name === '__rvUberMaterial';
+        const toon = tsl.createToonMaterialTsl(src as unknown as ToonSourceMaterialLike, {
+          state,
+          gradientMap: this._gradient,
+          isUber,
+        }) as ToonLikeMaterial;
+        toon.name = (src.name || 'material') + '__toon';
+        setHidden(toon.userData, '_rvToonOf', src);
+        this.toonByOriginal.set(src, toon);
+        return toon;
+      }
+      // Fallback (no pre-warm): classic MeshToonMaterial below still gives
+      // cel banding under WebGPURenderer — only the recolor patch is lost.
+      warnToonRecolorWebGPUOnce();
+    }
+
+    // Classic (GLSL) path — requires a real MeshStandardMaterial source (the
+    // uber node material only ever exists when the TSL module is loaded).
+    if (!(src instanceof MeshStandardMaterial)) return src;
     const toon = new MeshToonMaterial({
       color: src.color.clone(),
       map: src.map ?? null,
@@ -776,14 +906,28 @@ export class RVToonMaterialManager {
     this._sobelPass!.enabled = this._outlineAmount > 0 && this._outlineThickness > 0;
   }
 
+  /** Push the current toon saturation into the TSL pipeline's shared node
+   *  (WebGPURenderer paths). Identity (1) while toon is inactive. */
+  private _applyTslSaturation(): void {
+    this._tslPost?.setSaturation(this._active ? this._albedoSaturation : 1);
+  }
+
   /**
    * Lazily build the saturation pass and append it LAST in the composer (after
    * OutputPass and the Sobel outline), so it grades the final composited image.
-   * Idempotent; no-op on WebGPU. Enabled state is driven by `setAlbedo` / `enable`
-   * (only on when saturation != 1).
+   * Idempotent. On the WebGPURenderer paths the grade runs as the shared
+   * Rec601 saturation node on the TSL post pipeline instead (plan-271
+   * Phase 3). Enabled state is driven by `setAlbedo` / `enable` (only on when
+   * saturation != 1).
    */
   private _ensureSaturationPass(): void {
-    if (this.host.isWebGPU) return;
+    if (this.host.isWebGPU) {
+      if (!this._tslPost && this.host._ensureTslPost) {
+        this._tslPost = this.host._ensureTslPost() ?? null;
+      }
+      this._applyTslSaturation();
+      return;
+    }
     this.host._ensureComposer();
     const composer = this.host._composer;
     if (!composer) return;
@@ -812,6 +956,7 @@ export class RVToonMaterialManager {
       uniforms: { uNear: { value: 0.1 }, uFar: { value: 1000 } },
       vertexShader: GBUFFER_VERT,
       fragmentShader: GBUFFER_FRAG,
+      clippingPlanes: this._clippingPlanes,
     });
 
     this._sobelPass = new ShaderPass({

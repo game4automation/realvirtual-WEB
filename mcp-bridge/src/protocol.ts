@@ -17,11 +17,25 @@ export interface ToolInputSchema {
   required: string[];
 }
 
+/**
+ * MCP standard tool annotations (spec revision 2025-03-26). Announced by the browser and
+ * forwarded verbatim to the MCP client — the SAME wire field CONNECT reads, so both transports
+ * announce identically. A hint, never an authorisation boundary: missing or false means write.
+ */
+export interface ToolAnnotations {
+  readOnlyHint?: boolean;
+}
+
 /** A browser-announced tool. */
 export interface ToolSchema {
   name: string;
   description: string;
   inputSchema: ToolInputSchema;
+  /** Side-effect classification; passed through to the MCP client unchanged. */
+  annotations?: ToolAnnotations;
+  /** Per-call timeout hint in ms (long-running tools like screenshot bursts).
+   *  Bridge-internal — stripped before the tool list is served to the MCP client. */
+  timeoutMs?: number;
 }
 
 // ── browser → server ──

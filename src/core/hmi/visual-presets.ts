@@ -25,6 +25,7 @@ import {
   type VisualSettings,
 } from './visual-settings-store';
 import { markEnvironmentUserModified } from './environment-presets';
+import { deepCloneJSON } from '../ops/rv-op-utils';
 
 /** VisualSettings keys a preset captures — the "full visual look + antialias".
  *  Deliberately excludes camera bookmarks, FPV/orbit navigation, and UI zoom. */
@@ -42,6 +43,11 @@ export const VISUAL_PRESET_FIELDS = [
   'backgroundBrightness', 'checkerContrast',
   'reflectionEnabled', 'reflectionStrength', 'reflectionBlur',
   'envReflectionsEnabled', 'envReflectionsIntensity',
+  // UI compositor cost (plan-344 Phase 2). The ONLY UI field a preset captures —
+  // it belongs here because it is a quality/performance dial like the render
+  // fields, not a layout preference. See the explicit normalisation in
+  // `applyVisualPreset` for why it does not follow the generic preserve rule.
+  'uiBlurScale',
 ] as const;
 
 export type VisualPresetField = typeof VISUAL_PRESET_FIELDS[number];
@@ -61,7 +67,7 @@ const LOCAL_KEY = 'rv-visual-presets';
 function pickPresetFields(s: VisualSettings): VisualPresetSettings {
   const out: Record<string, unknown> = {};
   for (const k of VISUAL_PRESET_FIELDS) out[k] = s[k];
-  return JSON.parse(JSON.stringify(out)) as VisualPresetSettings;
+  return deepCloneJSON(out) as VisualPresetSettings;
 }
 
 /** True when every field the preset *explicitly defines* (deeply, including the
@@ -127,6 +133,16 @@ function mergePresetOverBase(base: VisualSettings, preset: VisualPreset): Visual
   return {
     ...base,
     ...ps,
+    // ── Documented exception to the generic preserve semantics (plan-344 R6) ──
+    // Everywhere else, a field a preset omits is left at its previous value
+    // (see presetDefinedFieldsMatch: omitted = unconstrained). For
+    // `uiBlurScale` that would be a user-visible bug: switching from `Fast`
+    // (0.25) to an older `Default` preset that predates the field would leave
+    // the HMI on Fast's blur while the dropdown says "Default". So this ONE
+    // field normalises to its default when the preset does not define it. The
+    // generic rule and the test that protects it stay untouched, and
+    // `schemaVersion` stays 1 — no preset file needs migrating.
+    uiBlurScale: ps.uiBlurScale ?? def.uiBlurScale,
     modeSettings: {
       simple:  { ...def.modeSettings.simple,  ...base.modeSettings.simple,  ...(psModes.simple  ?? {}) },
       default: { ...def.modeSettings.default, ...base.modeSettings.default, ...(psModes.default ?? {}) },

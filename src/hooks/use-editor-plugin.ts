@@ -34,6 +34,7 @@ function getEmptySnapshot(): ExtrasEditorState {
     editableNodes: [],
     selectedNodePath: null,
     revealPath: null,
+    revealCollapseOthers: false,
     showInspector: false,
     settingsOpen: false,
   };

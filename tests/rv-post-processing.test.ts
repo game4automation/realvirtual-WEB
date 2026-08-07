@@ -100,23 +100,47 @@ describe('PostProcessingManager — bloomEnabled side-effects', () => {
   it('skips composer creation on WebGPU', () => {
     const gpuHost = makeHost({ isWebGPU: true });
     const gpuMgr = new PostProcessingManager(gpuHost);
+    gpuMgr.bloomIntensity = 0.24;
     gpuMgr.bloomEnabled = true;
     expect(gpuMgr.composer).toBeNull();
     // State still tracked so it re-applies if the renderer falls back later.
     expect(gpuMgr.bloomEnabled).toBe(true);
+    // WebGL compatibility scaling must not leak into the separate WebGPU state.
+    expect(gpuMgr.bloomIntensity).toBeCloseTo(0.24);
   });
 });
 
 describe('PostProcessingManager — bloom property setters', () => {
-  it('forward intensity / threshold / radius to the underlying pass', () => {
+  it('applies the r171 bloom compatibility factor only inside the WebGL composer', () => {
     const mgr = new PostProcessingManager(makeHost());
     mgr.bloomEnabled = true; // ensures composer + bloomPass exist
     mgr.bloomIntensity = 1.5;
     expect(mgr.bloomIntensity).toBeCloseTo(1.5);
+    const bloomPass = mgr.composer!.passes.find(
+      (p) => (p as { strength?: number }).strength !== undefined,
+    ) as unknown as { strength: number };
+    expect(bloomPass.strength).toBeCloseTo(0.5);
     mgr.bloomThreshold = 0.42;
     expect(mgr.bloomThreshold).toBeCloseTo(0.42);
     mgr.bloomRadius = 0.7;
     expect(mgr.bloomRadius).toBeCloseTo(0.7);
+  });
+
+  it('preserves bloom settings assigned before the lazy pass exists', () => {
+    const mgr = new PostProcessingManager(makeHost());
+    mgr.bloomIntensity = 0.24;
+    mgr.bloomThreshold = 0.91;
+    mgr.bloomRadius = 0.35;
+
+    mgr.bloomEnabled = true;
+
+    const bloomPass = mgr.composer!.passes.find(
+      (p) => (p as { strength?: number }).strength !== undefined,
+    ) as unknown as { strength: number; threshold: number; radius: number };
+    expect(mgr.bloomIntensity).toBeCloseTo(0.24);
+    expect(bloomPass.strength).toBeCloseTo(0.08);
+    expect(bloomPass.threshold).toBeCloseTo(0.91);
+    expect(bloomPass.radius).toBeCloseTo(0.35);
   });
 
   it('returns defaults when no composer exists yet', () => {

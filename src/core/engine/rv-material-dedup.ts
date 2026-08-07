@@ -3,7 +3,7 @@
 
 import { Object3D, Mesh, Material, Color, Texture, MeshStandardMaterial } from 'three';
 import { debug } from './rv-debug';
-import { traverseMeshes } from './rv-traverse-utils';
+import { isRuntimeRigMesh, traverseMeshes } from './rv-traverse-utils';
 
 export interface DedupResult {
   /** Number of Material references present in the scene before dedup */
@@ -47,6 +47,34 @@ export function deduplicateMaterials(root: Object3D): DedupResult {
   let disposedCount = 0;
 
   traverseMeshes(root, (mesh) => {
+    // Runtime deformation-rig sidecars (EnergyChain SkinnedMeshes + the
+    // invisible picking proxy, plan-362). Retain their materials so
+    // clearModel() still disposes them, but keep them out of the
+    // value-fingerprint map — a SkinnedMesh must keep its own material
+    // instance, and the proxy must never donate one to real geometry.
+    if (isRuntimeRigMesh(mesh)) {
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const material of materials) {
+        if (!material) continue;
+        originalCount++;
+        uniqueMaterials.add(material);
+      }
+      return;
+    }
+
+    // Lamp materials are instance-local runtime state. Count and retain them,
+    // but never place them in the value-fingerprint map where an equivalent
+    // non-lamp material could replace the clone.
+    if (mesh.userData?._rvLampMesh || mesh.parent?.userData?._rvLampMesh) {
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const material of materials) {
+        if (!material) continue;
+        originalCount++;
+        uniqueMaterials.add(material);
+      }
+      return;
+    }
+
     if (Array.isArray(mesh.material)) {
       // Multi-material mesh — replace array elements in place, NEVER the
       // array reference itself, or geometry.groups misaligns.
@@ -108,8 +136,12 @@ export function deduplicateMaterials(root: Object3D): DedupResult {
  * like 0.5 vs 0.500001. Textures are compared by source URL rather than UUID
  * because GLTFLoader can wrap the same image in distinct Texture objects with
  * different UUIDs.
+ *
+ * Exported so the Materials window can report duplicate-material groups using
+ * the SAME equivalence the dedup pass acts on — a warning that disagreed with
+ * what "Merge duplicates" actually collapses would be worse than no warning.
  */
-function fingerprint(mat: Material): string {
+export function fingerprint(mat: Material): string {
   const m = mat as MeshStandardMaterial;
   const q = (v: number | undefined): string =>
     v === undefined || v === null ? '-' : String(Math.round(v * 1000));

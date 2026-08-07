@@ -39,6 +39,7 @@ import SlideshowOutlinedIcon from '@mui/icons-material/SlideshowOutlined';
 import CloseIcon from '@mui/icons-material/Close';
 import TouchAppIcon from '@mui/icons-material/TouchApp';
 import type { UISlotEntry, UISlotProps } from '../core/rv-ui-plugin';
+import { modeContext } from '../core/rv-mode-manager';
 import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import type { RVViewer } from '../core/rv-viewer';
@@ -135,9 +136,19 @@ export class KioskPlugin implements RVViewerPlugin {
   readonly order = 250;   // after DriveOrder(0), Physics(~100), Maintenance(200), MachineControl(210)
   readonly core = true;   // plugin persists across model loads
 
+  // Mixed plugin: a button AND an overlay. Only the OVERLAY is gated for the
+  // Viewer (plan-387). Declaring `modes` instead would break two things at once:
+  // the ruleless `button-group` entry below is currently hidden outside hmi by
+  // ButtonPanel's focused-mode branch, and a compiled rule would make it appear
+  // in DES/Planner/Editor (§2.2a/B2); and `core: true` exists so the kiosk idle
+  // tour survives model loads, which must not change.
   readonly slots: UISlotEntry[] = [
     { slot: 'button-group', component: DemoButton, order: 55 },
-    { slot: 'overlay', component: KioskChrome, order: 100 },
+    {
+      slot: 'overlay', component: KioskChrome, order: 100,
+      visibilityId: 'kiosk-chrome',
+      visibilityRule: { hiddenIn: [modeContext('viewer')] },
+    },
   ];
 
   private _viewer: RVViewer | null = null;

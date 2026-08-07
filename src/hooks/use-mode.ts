@@ -20,7 +20,11 @@ export interface UseModeResult {
   active: ModeId | null;
   /** Registered modes, sorted by order (for the dropdown). */
   modes: ModeDescriptor[];
-  /** Switch to a mode (no-op if already active / unknown / switching / locked). */
+  /**
+   * Switch to a mode through the GUARDED path (runs the leaving mode's exit
+   * guards, e.g. the asset editor's unsaved-changes prompt). No-op if already
+   * active / unknown / switching / locked / vetoed.
+   */
   setMode: (id: ModeId) => void;
   /** True when the workspace is locked to a single mode (dropdown hidden). */
   locked: boolean;
@@ -33,7 +37,7 @@ export function useMode(): UseModeResult {
   return {
     active: viewer.modes.activeMode,
     modes: viewer.modes.list(),
-    setMode: (id: ModeId) => viewer.modes.setMode(id),
+    setMode: (id: ModeId) => { void viewer.modes.requestMode(id); },
     locked: viewer.modes.lockedMode !== null,
   };
 }

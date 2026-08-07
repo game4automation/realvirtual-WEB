@@ -111,8 +111,9 @@ describe('DESRunner — hook int-dispatch + Animated', () => {
     runner.start([def as MaterialFlowDefinition], { root: node });
     expect(fired).toContain('setup');
 
-    // Manually fire onGenerate (def is 'conveyor' so start() does not auto-fire).
-    def.des!.onGenerate!(self);
+    // start() auto-fires every DECLARED des.onGenerate exactly once (plan-268
+    // Phase 3: declaration-gated, no longer kind-gated to source/downtime) —
+    // the Arrival above is already scheduled 2s out.
 
     // Advance < 2s — no arrival yet.
     runner.tick(1.0);
@@ -176,7 +177,7 @@ describe('DESRunner — sub-modes (B4 no-drop / FastForward / Step)', () => {
     expect(runner.getManager().pendingEventCount).toBe(0);
   });
 
-  it('FastForward drains the whole queue', () => {
+  it('standalone FastForward (SimModeToggle path — no runFastForward()) drains the whole queue via tick()', () => {
     const processed = { n: 0 };
     const def = makeBurstDef(3000, processed);
     const runner = new DESRunner({ subMode: 'fastforward', frameEventBudget: 5000 });
@@ -188,12 +189,96 @@ describe('DESRunner — sub-modes (B4 no-drop / FastForward / Step)', () => {
     const adapter = runner.addInstance(def as MaterialFlowDefinition, self, node);
     runner.start([def as MaterialFlowDefinition], { root: node });
 
+    // plan-262 Phase 1: the tick()-FF branch is a time-based deadline loop
+    // (12 ms slices of 2000-event inner batches) — a dense 3000-event burst
+    // drains within very few frames instead of one fixed batch per frame.
     let frames = 0;
     while (runner.getManager().pendingEventCount > 0 && frames < 50) {
       runner.tick(0.016);
       frames++;
     }
     expect(processed.n).toBe(3000);
+  });
+
+  it('runFastForward() drains the whole queue asynchronously and resolves true (plan-262)', async () => {
+    const processed = { n: 0 };
+    const def = makeBurstDef(3000, processed);
+    const runner = new DESRunner({ subMode: 'animated' });
+    const node = new Object3D(); node.name = 'Burst2b';
+    const self = createSelf(makeBindContext(node), def, {
+      mode: 'des',
+      scheduler: runner.makeScheduler(def as MaterialFlowDefinition, () => adapter.entityId),
+    });
+    const adapter = runner.addInstance(def as MaterialFlowDefinition, self, node);
+    runner.start([def as MaterialFlowDefinition], { root: node });
+
+    // Real await chain — the drain loop yields via yieldToBrowser (no rIC).
+    const done = await runner.runFastForward();
+    expect(done).toBe(true);
+    expect(processed.n).toBe(3000);
+    expect(runner.getManager().pendingEventCount).toBe(0);
+    expect(runner.subMode).toBe('fastforward');
+    expect(runner.ffProgress).toBeUndefined(); // run finished → no in-flight progress
+
+    // Idempotence: a completed run re-triggers cleanly (queue already empty).
+    await expect(runner.runFastForward()).resolves.toBe(true);
+  });
+
+  it('runFastForward() while already running resolves false immediately; cancel resolves the first promise false (plan-262 R3)', async () => {
+    // Self-rescheduling stream — FastForward never completes on its own.
+    const def = defineMaterialFlow<MaterialFlowSelf>({
+      type: 'InfiniteBurst', kind: 'source', schema: {}, continuous: {},
+      des: {
+        onGenerate(self) { self.in(0.001, 'Arrival', null); },
+        onArrival(self) { self.in(0.001, 'Arrival', null); },
+      },
+    });
+    const runner = new DESRunner({ subMode: 'animated', durationSeconds: 1e9 });
+    const node = new Object3D(); node.name = 'Infinite1';
+    const self = createSelf(makeBindContext(node), def, {
+      mode: 'des',
+      scheduler: runner.makeScheduler(def as MaterialFlowDefinition, () => adapter.entityId),
+    });
+    const adapter = runner.addInstance(def as MaterialFlowDefinition, self, node);
+    runner.start([def as MaterialFlowDefinition], { root: node });
+
+    const p1 = runner.runFastForward();
+    expect(runner.ffProgress).toBeDefined();          // in flight
+    await expect(runner.runFastForward()).resolves.toBe(false); // second call: false immediately
+
+    runner.cancelFastForward();                        // synchronous resolve (R3)
+    await expect(p1).resolves.toBe(false);
+    expect(runner.ffProgress).toBeUndefined();
+    runner.dispose();
+  });
+
+  it('Animated/Hybrid stop at the sim END time (consistent with FastForward)', () => {
+    const processed = { n: 0 };
+    // Two events: one inside the end time (t=1), one beyond it (t=5). End = 2s.
+    const def = defineMaterialFlow<MaterialFlowSelf>({
+      type: 'EndStop', kind: 'source', schema: {}, continuous: {},
+      des: {
+        onGenerate(self) { self.at(1.0, 'Arrival', null); self.at(5.0, 'Arrival', null); },
+        onArrival() { processed.n++; },
+      },
+    });
+    const runner = new DESRunner({ subMode: 'animated', durationSeconds: 2 });
+    const node = new Object3D(); node.name = 'EndStop1';
+    const self = createSelf(makeBindContext(node), def, {
+      mode: 'des',
+      scheduler: runner.makeScheduler(def as MaterialFlowDefinition, () => adapter.entityId),
+    });
+    const adapter = runner.addInstance(def as MaterialFlowDefinition, self, node);
+    runner.start([def as MaterialFlowDefinition], { root: node });
+
+    // Advance far past the end: the render clock must CLAMP at 2s and the event
+    // at t=5 must never process (previously animated drifted past the end, and a
+    // later FastForward — capped at the end — then looked frozen).
+    for (let i = 0; i < 10; i++) { runner.tick(1.0); runner.lateTick(1.0); }
+    expect(processed.n).toBe(1);                    // only the t=1 event
+    expect(runner.simTime).toBeCloseTo(1.0);        // clock stops at the last event ≤ end
+    expect(runner.renderClock).toBeCloseTo(2.0);    // render clock clamped at the end
+    expect(runner.getManager().pendingEventCount).toBe(1); // t=5 stays queued
   });
 
   it('Step processes exactly one event per step()', () => {
@@ -224,7 +309,7 @@ describe('DESRunner — tween integration', () => {
     resetDESMUCounter();
   });
 
-  it('Animated drives the tween registry on lateTick; FastForward does not write', () => {
+  it('Animated drives the tween registry on lateTick; FastForward does NOT write parts (no animation, max throughput)', () => {
     const target = { pos: new Vector3(), writes: 0, setPosition(v: Vector3) { this.pos.copy(v); this.writes++; } };
 
     const def = defineMaterialFlow<MaterialFlowSelf>({
@@ -247,15 +332,121 @@ describe('DESRunner — tween integration', () => {
     runner.getTweenRegistry().addPosition(target, new Vector3(0, 0, 0), new Vector3(10, 0, 0), 0, 2);
 
     runner.tick(1.0);      // simNow → 1.0
-    runner.lateTick(1.0);  // render at 1.0 → 50%
+    runner.lateTick(1.0);  // animated → render at 1.0 → 50%
     expect(target.pos.x).toBeCloseTo(5);
 
-    // Switch to FastForward — lateTick must not write.
+    // Interactive FastForward is for MAX THROUGHPUT: lateTick must NOT write part
+    // positions (the noWrite 'fastforward' sub) — the parts do NOT animate; only the
+    // sim clock + event queue advance. Switching back to a slower factor resumes
+    // animation from the live sim state.
     runner.setSubMode('fastforward');
     const writesBefore = target.writes;
     runner.tick(0.5);
     runner.lateTick(0.5);
-    expect(target.writes).toBe(writesBefore);
+    expect(target.writes).toBe(writesBefore); // no per-part writes during FastForward
+  });
+
+  it('leaving FastForward settles running tweens to the exact sim position (no teleport)', () => {
+    const target = { pos: new Vector3(), writes: 0, setPosition(v: Vector3) { this.pos.copy(v); this.writes++; } };
+
+    // onGenerate schedules a single event at t=4s so FastForward advances the sim
+    // clock to 4.0 (in DES the clock moves by EVENTS, not by dt).
+    const def = defineMaterialFlow<MaterialFlowSelf>({
+      type: 'Mover2', kind: 'source', schema: {}, continuous: {},
+      // samplesLiveGeometry keeps the per-event-time settle wired (plan-262
+      // Phase 2 gating) — this test asserts exactly that settle behavior.
+      des: { samplesLiveGeometry: true, onGenerate(self) { self.at(4.0, 'Arrival', null); }, onArrival() { /* no-op */ } },
+    });
+    const runner = new DESRunner({ subMode: 'fastforward' });
+    const node = new Object3D(); node.name = 'Mover2';
+    const self = createSelf(makeBindContext(node), def, {
+      mode: 'des',
+      scheduler: runner.makeScheduler(def as MaterialFlowDefinition, () => adapter.entityId),
+    });
+    const adapter = runner.addInstance(def as MaterialFlowDefinition, self, node);
+    runner.start([def as MaterialFlowDefinition], { root: node });
+
+    // A long position tween (0→100 over 10s) so it stays RUNNING across the FF window.
+    runner.getTweenRegistry().addPosition(target, new Vector3(0, 0, 0), new Vector3(100, 0, 0), 0, 10);
+
+    // FastForward drains the event → sim clock advances to 4.0. The event-time
+    // settle (manager.onTimeAdvance → tweens.settle) writes the part at EXACTLY
+    // the event time, so even in FF it sits at its true sim position (40% → x=40).
+    runner.tick(0.016);
+    runner.lateTick(0.016);
+    expect(runner.simTime).toBeCloseTo(4.0);
+    expect(target.pos.x).toBeCloseTo(40);
+
+    // Switching back to an animating sub-mode keeps the exact position (the exit
+    // settle is idempotent here) — no teleport on the first continuous frame.
+    runner.setSubMode('animated');
+    expect(target.pos.x).toBeCloseTo(40);
+  });
+
+  it('remembers the pre-FastForward sub-mode so the FF toggle returns to the previous speed', () => {
+    // Hybrid 5× → FF → the runner remembers 'hybrid' (the UI toggle returns there
+    // WITHOUT re-picking the speed in the dropdown).
+    const runner = new DESRunner({ subMode: 'hybrid', multiplier: 5 });
+    expect(runner.preFastForwardSubMode).toBe('hybrid');
+    runner.setSubMode('fastforward');
+    expect(runner.preFastForwardSubMode).toBe('hybrid');
+    // Re-setting FF while already in FF must NOT overwrite the memory.
+    runner.setSubMode('fastforward');
+    expect(runner.preFastForwardSubMode).toBe('hybrid');
+    runner.setSubMode(runner.preFastForwardSubMode);
+    expect(runner.subMode).toBe('hybrid');
+    expect(runner.multiplier).toBe(5);
+
+    // Animated → FF → back lands on animated.
+    runner.setSubMode('animated');
+    runner.setSubMode('fastforward');
+    expect(runner.preFastForwardSubMode).toBe('animated');
+  });
+
+  it('starting directly in FastForward derives the return mode from the multiplier', () => {
+    // Persisted mode = FastForward with a time-lapse factor → return to hybrid.
+    const ff5 = new DESRunner({ subMode: 'fastforward', multiplier: 5 });
+    expect(ff5.preFastForwardSubMode).toBe('hybrid');
+    // No factor → return to real-time.
+    const ff1 = new DESRunner({ subMode: 'fastforward' });
+    expect(ff1.preFastForwardSubMode).toBe('animated');
+  });
+
+  it('event handlers sample visuals at the EXACT event time (settle-before-dispatch)', () => {
+    const target = { pos: new Vector3(), writes: 0, setPosition(v: Vector3) { this.pos.copy(v); this.writes++; } };
+    const sampled: number[] = [];
+
+    // onGenerate: two events. At t=2 the handler SAMPLES the target's position —
+    // the tween (0→10 over 2s) must already be settled to x=10 (finished at t=2)
+    // BEFORE the handler runs, even though no render happened in between (FF).
+    const def = defineMaterialFlow<MaterialFlowSelf>({
+      type: 'Sampler', kind: 'source', schema: {}, continuous: {},
+      des: {
+        // The handler samples live geometry → declare it (plan-262 Phase 2
+        // gating would otherwise skip the settle this test asserts).
+        samplesLiveGeometry: true,
+        onGenerate(self) { self.at(2.0, 'Arrival', null); self.at(3.0, 'Arrival', null); },
+        onArrival() { sampled.push(target.pos.x); },
+      },
+    });
+    const runner = new DESRunner({ subMode: 'fastforward' });
+    const node = new Object3D(); node.name = 'Sampler1';
+    const self = createSelf(makeBindContext(node), def, {
+      mode: 'des',
+      scheduler: runner.makeScheduler(def as MaterialFlowDefinition, () => adapter.entityId),
+    });
+    const adapter = runner.addInstance(def as MaterialFlowDefinition, self, node);
+    runner.start([def as MaterialFlowDefinition], { root: node });
+
+    runner.getTweenRegistry().addPosition(target, new Vector3(0, 0, 0), new Vector3(10, 0, 0), 0, 2);
+
+    // One FF frame processes BOTH events back-to-back without a render between.
+    runner.tick(0.016);
+    runner.lateTick(0.016);
+
+    expect(sampled.length).toBe(2);
+    expect(sampled[0]).toBeCloseTo(10); // t=2: tween finished exactly now → settled to 10
+    expect(sampled[1]).toBeCloseTo(10); // t=3: still 10 (tween reaped at settle)
   });
 });
 

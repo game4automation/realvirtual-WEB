@@ -2,17 +2,21 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * RVHighlightManager — OutlinePass vs overlay routing.
+ * RVHighlightManager — mode-driven strategy resolution.
  *
- * OutlinePass can only outline VISIBLE meshes. Statically-merged objects (e.g.
- * RuntimeMetadata) keep their originals hidden (visible=false), so the highlight
- * must fall back to the overlay path (fill+edge meshes built from the hidden
- * geometry) when a subtree has no visible mesh. A subtree WITH a visible mesh
- * (e.g. a Drive's kinematic merged chunk) keeps using OutlinePass.
+ * The visual is decided by the active HighlightProfile (overlay for HMI/DES,
+ * outline for planner/editor) plus a per-root capability fallback matrix
+ * (resolveStrategy). Key rules under test:
+ *   - overlay profile NEVER takes the OutlinePass path, even for rendered meshes;
+ *   - outline profile falls back per root when the subtree is fully batched
+ *     (mask 0) or the OutlinePass is unavailable;
+ *   - the bbox budget cap still applies on the overlay family;
+ *   - per-call `visual` overrides the profile.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Scene, Object3D, Mesh, BoxGeometry, MeshBasicMaterial } from 'three';
-import { RVHighlightManager } from '../src/core/engine/rv-highlight-manager';
+import { RVHighlightManager, resolveStrategy } from '../src/core/engine/rv-highlight-manager';
+import { MODE_HIGHLIGHT_PROFILES } from '../src/core/engine/rv-highlight-profiles';
 
 /** Minimal stand-in for RVOutlineManager that reports available + records calls. */
 function makeMockOutline() {
@@ -31,20 +35,67 @@ function makeMockOutline() {
   };
 }
 
-function makeMesh(visible: boolean): Mesh {
+function makeMesh(rendered: boolean): Mesh {
   const m = new Mesh(new BoxGeometry(1, 1, 1), new MeshBasicMaterial());
-  m.visible = visible;
+  if (!rendered) m.layers.mask = 0; // batched-source contract: visible=true, mask=0
   return m;
 }
 
 /** Count overlay meshes the manager added to the scene. */
 function overlayCount(scene: Scene): number {
   let n = 0;
-  scene.traverse(o => { if (o.userData?._highlightOverlay) n++; });
+  scene.traverse(o => { if (o.userData?._highlightOverlay && o.parent) n++; });
   return n;
 }
 
-describe('RVHighlightManager — OutlinePass vs overlay routing', () => {
+describe('resolveStrategy — fallback matrix', () => {
+  const base = {
+    outlineAvailable: true,
+    hasRenderedMesh: true,
+    proxyAvailable: false,
+    meshCount: 5,
+    maxMeshes: 200,
+  };
+
+  it('overlay profile never resolves to outline, even with rendered meshes', () => {
+    expect(resolveStrategy({ ...base, desired: 'overlay' }))
+      .toEqual({ strategy: 'overlay', fallback: false });
+  });
+
+  it('overlay profile takes fill-proxy when the proxy is available', () => {
+    expect(resolveStrategy({ ...base, desired: 'overlay', proxyAvailable: true }))
+      .toEqual({ strategy: 'fill-proxy', fallback: false });
+  });
+
+  it('overlay profile caps at bbox above the mesh budget (fallback)', () => {
+    expect(resolveStrategy({ ...base, desired: 'overlay', meshCount: 500 }))
+      .toEqual({ strategy: 'bbox', fallback: true });
+  });
+
+  it('outline profile uses outline when available and rendered', () => {
+    expect(resolveStrategy({ ...base, desired: 'outline' }))
+      .toEqual({ strategy: 'outline', fallback: false });
+  });
+
+  it('outline profile falls back to overlay for a fully batched root', () => {
+    expect(resolveStrategy({ ...base, desired: 'outline', hasRenderedMesh: false }))
+      .toEqual({ strategy: 'overlay', fallback: true });
+  });
+
+  it('outline profile falls back to overlay when OutlinePass is unavailable (WebGPU)', () => {
+    expect(resolveStrategy({ ...base, desired: 'outline', outlineAvailable: false }))
+      .toEqual({ strategy: 'overlay', fallback: true });
+  });
+
+  it('outline fallback still honors the proxy and the bbox cap', () => {
+    expect(resolveStrategy({ ...base, desired: 'outline', hasRenderedMesh: false, proxyAvailable: true }))
+      .toEqual({ strategy: 'fill-proxy', fallback: true });
+    expect(resolveStrategy({ ...base, desired: 'outline', outlineAvailable: false, meshCount: 500 }))
+      .toEqual({ strategy: 'bbox', fallback: true });
+  });
+});
+
+describe('RVHighlightManager — profile-driven routing', () => {
   let scene: Scene;
   let mgr: RVHighlightManager;
   let outline: ReturnType<typeof makeMockOutline>;
@@ -56,72 +107,103 @@ describe('RVHighlightManager — OutlinePass vs overlay routing', () => {
     mgr.setOutlineManager(outline as never);
   });
 
-  it('uses OutlinePass when the subtree has a visible mesh', () => {
+  it('overlay profile (HMI default): rendered mesh gets overlay pairs, NOT OutlinePass', () => {
     const root = new Object3D();
     root.add(makeMesh(true));
     scene.add(root);
 
     mgr.highlight(root);
 
-    expect(outline.hoverOutlined).toEqual([root]); // outline path
-    expect(overlayCount(scene)).toBe(0);           // no overlay meshes built
+    expect(outline.hoverOutlined).toEqual([]);      // outline branch never taken
+    expect(overlayCount(scene)).toBeGreaterThan(0); // fill+edges built
   });
 
-  it('falls back to overlay when the subtree has only hidden (merged) meshes', () => {
+  it('overlay profile: batched-only root gets the identical overlay look', () => {
     const root = new Object3D();
-    const hidden = makeMesh(false);
-    hidden.userData._rvStaticUberSource = true; // as the static merge marks originals
-    root.add(hidden);
+    root.add(makeMesh(false));
     scene.add(root);
 
     mgr.highlight(root);
 
-    expect(outline.hoverOutlined).toEqual([]);     // NOT the outline path
-    expect(overlayCount(scene)).toBeGreaterThan(0); // overlay built from hidden geometry
-  });
-
-  it('uses OutlinePass when the subtree has ANY visible mesh (mixed merged product)', () => {
-    // Documented rule (rv-highlight-manager): OutlinePass is used whenever the
-    // subtree has AT LEAST ONE visible mesh; the overlay path is the fallback
-    // only when the subtree is FULLY invisible. A mixed product (some merged/
-    // hidden meshes + some visible ones) therefore stays on the OutlinePass path.
-    const root = new Object3D();
-    const visible = makeMesh(true);
-    const hidden = makeMesh(false);
-    hidden.userData._rvStaticUberSource = true;
-    root.add(visible);
-    root.add(hidden);
-    scene.add(root);
-
-    mgr.highlight(root);
-
-    expect(outline.hoverOutlined).toEqual([root]); // OutlinePass on the visible mesh
-    expect(overlayCount(scene)).toBe(0);           // no overlay built
-  });
-
-  it('selection: hidden-only subtree uses the overlay path too', () => {
-    const root = new Object3D();
-    const hidden = makeMesh(false);
-    hidden.userData._rvStaticUberSource = true;
-    root.add(hidden);
-    scene.add(root);
-
-    mgr.highlightSelection([root]);
-
-    expect(outline.selectionOutlined).toEqual([]);
+    expect(outline.hoverOutlined).toEqual([]);
     expect(overlayCount(scene)).toBeGreaterThan(0);
   });
 
-  it('clearing hover removes the overlay meshes', () => {
+  it('outline profile (planner): rendered mesh gets OutlinePass, no overlays', () => {
+    mgr.setProfile(MODE_HIGHLIGHT_PROFILES.planner);
     const root = new Object3D();
-    const hidden = makeMesh(false);
-    hidden.userData._rvStaticUberSource = true;
-    root.add(hidden);
+    root.add(makeMesh(true));
+    scene.add(root);
+
+    mgr.highlight(root);
+
+    expect(outline.hoverOutlined).toEqual([root]);
+    expect(overlayCount(scene)).toBe(0);
+  });
+
+  it('outline profile: fully batched root falls back to overlay pairs per root', () => {
+    mgr.setProfile(MODE_HIGHLIGHT_PROFILES.planner);
+    const root = new Object3D();
+    root.add(makeMesh(false));
+    scene.add(root);
+
+    mgr.highlight(root);
+
+    expect(outline.hoverOutlined).toEqual([]);
+    expect(overlayCount(scene)).toBeGreaterThan(0);
+  });
+
+  it('per-call visual override forces overlay in an outline mode', () => {
+    // Planner is the outline-visual profile (editor is overlay by default).
+    mgr.setProfile(MODE_HIGHLIGHT_PROFILES.planner);
+    const root = new Object3D();
+    root.add(makeMesh(true));
+    scene.add(root);
+
+    mgr.highlightMultiple([root], { visual: 'overlay' });
+
+    expect(outline.hoverOutlined).toEqual([]);
+    expect(overlayCount(scene)).toBeGreaterThan(0);
+  });
+
+  it('selection: outline profile pushes roots to the selection channel; clearing restores', () => {
+    mgr.setProfile(MODE_HIGHLIGHT_PROFILES.planner);
+    const root = new Object3D();
+    root.add(makeMesh(true));
+    scene.add(root);
+
+    mgr.highlightSelection([root]);
+    expect(outline.selectionOutlined).toEqual([root]);
+    expect(mgr.isSelectionActive).toBe(true);
+
+    mgr.clearSelection();
+    expect(outline.selectionOutlined).toEqual([]);
+    expect(mgr.isSelectionActive).toBe(false);
+  });
+
+  it('clearing hover removes the overlay meshes (pooled wrappers leave the scene)', () => {
+    const root = new Object3D();
+    root.add(makeMesh(false));
     scene.add(root);
 
     mgr.highlight(root);
     expect(overlayCount(scene)).toBeGreaterThan(0);
     mgr.clear();
     expect(overlayCount(scene)).toBe(0);
+  });
+
+  it('pooling: re-highlighting reuses wrapper objects instead of allocating', () => {
+    const root = new Object3D();
+    root.add(makeMesh(false));
+    scene.add(root);
+
+    mgr.highlight(root);
+    const first = scene.children.filter(o => o.userData?._highlightOverlay);
+    mgr.clear();
+    mgr.highlight(root);
+    const second = scene.children.filter(o => o.userData?._highlightOverlay);
+    expect(second.length).toBe(first.length);
+    // Same wrapper instances came back from the pool.
+    for (const o of second) expect(first).toContain(o);
   });
 });

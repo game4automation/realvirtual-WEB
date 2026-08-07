@@ -28,6 +28,7 @@ import {
   registerComponent,
   registerCapabilities,
   setComponentInstance,
+  loadSchemaFromSpec,
   type RVComponent,
   type ComponentContext,
   type ComponentSchema,
@@ -41,9 +42,8 @@ export class RVMetadata implements RVComponent {
   static readonly tooltipType = 'metadata';
   static readonly displayName = 'Metadata';
 
-  static readonly schema: ComponentSchema = {
-    content: { type: 'string', default: '' },
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('RuntimeMetadata');
 
   readonly node: Object3D;
   readonly aabb: AABB | null;
@@ -77,6 +77,7 @@ registerComponent({
   schema: RVMetadata.schema,
   needsAABB: true,
   capabilities: {
+    authorable: true,   // addable in the asset editor (schema-complete)
     hoverable: true,
     selectable: true,
     tooltipType: 'metadata',

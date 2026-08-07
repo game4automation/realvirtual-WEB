@@ -18,12 +18,15 @@
  * resolver below): snap-graph primary via `classifyConnections`/
  * `findOutputPairings`; autoConnect fallback is a documented stub for now.
  *
- * `self.in` / `self.at` are DES-only scheduling. In continuous mode they
- * dev-throw (caught early in tests) so a continuous block that accidentally
- * schedules an event fails loudly instead of silently no-op'ing.
+ * `self.in` / `self.at` / `self.cancel` / `self.now` are kernel-agnostic
+ * Tier-0 primitives (plan-210 §6b): in DES mode they delegate to the injected
+ * `SelfScheduler` (private runner, unchanged); in continuous mode they run on
+ * a lazily-created `RVEventHeap` drained by the fixed tick (`time <= now`).
+ * Due hooks dispatch through `CreateSelfOptions.onHook`; without a wired
+ * dispatcher the drain warns once instead of silently dropping events.
  */
 
-import type { Object3D } from 'three';
+import type { Object3D, Quaternion, Vector3 } from 'three';
 import type { ContextMenuItem } from '../hmi/context-menu-store';
 import type {
   RVBindContext,
@@ -47,10 +50,18 @@ import {
   type OutputPairing,
 } from '../../behaviors/_shared/snap-graph-helpers';
 import {
-  findTransport,
-  findSensor,
-  findRotaryDrive,
+  findFirst,
+  findAll as findAllNodes,
+  NODE_KIND_TESTS,
 } from '../library-component-loader';
+import { RVEventHeap } from '../sdk/rv-event-heap';
+
+/** A convention node kind — derived from the finder table, so adding a kind to
+ *  `NODE_KIND_TESTS` extends `self.find`/`self.findAll` with no other change. */
+export type NodeKind = keyof typeof NODE_KIND_TESTS;
+
+// (findTransport/findSensor/findRotaryDrive live in NODE_KIND_TESTS as
+//  'transport'/'sensor'/'rotary' — self.find(kind) is the single generic finder.)
 import {
   attachBelt,
   attachDrive,
@@ -59,6 +70,19 @@ import {
   type DriveHandle,
 } from '../../behaviors/_shared/lazy-drive';
 import { isSurfaceOccupied } from '../../behaviors/_shared/surface-occupancy';
+import {
+  attachDriveBehaviorByCode,
+  addSignal,
+  type AddSignalOpts,
+  type AttachableDriveBehaviorType,
+  type DriveBehaviorHostViewer,
+  type SignalHandle,
+  type SignalWiring,
+} from '../engine/rv-signal-construction';
+import type { RVComponent, PlcSignalType } from '../engine/rv-component-registry';
+import type { RVSensor } from '../engine/rv-sensor';
+import { instanceScope } from '../engine/rv-instance-scope';
+import { isAnyLiveControlled } from '../engine/rv-slot-authority';
 
 // Re-export the handle types the toolkit returns so the behavior-kit `RV`
 // namespace can alias them without importing `_shared/lazy-drive` directly.
@@ -96,10 +120,63 @@ export interface SelfDrive extends BindContextDrive {
  */
 export interface MU {
   readonly id: number;
+  readonly generation?: number;
   /** The visual moving-unit (RVMovingUnit) — null until/unless rendered. */
   visual?: unknown;
   /** Per-MU snapshot-safe custom state. */
   prop?: Record<string, JsonValue>;
+  childMUs?: MuRef[];
+  parentMU?: MuRef | null;
+  carrierType?: string;
+  carrierCapacity?: number;
+  visualTemplateId?: string;
+}
+
+/** Stable moving-unit reference used by persisted kernel contracts. */
+export interface MuRef {
+  readonly id: number;
+  readonly gen: number;
+}
+
+/** JSON record for one active downstream-capacity reservation. */
+export interface ReservationRecord {
+  readonly id: number;
+  readonly holderId: string;
+  readonly targetId: string;
+  readonly port?: string;
+  readonly n: number;
+  readonly carrier?: { readonly ref: MuRef; readonly slots: number };
+  state: 'reserved' | 'committed' | 'rolledback';
+}
+
+/** Runtime facade for a persisted reservation record. */
+export interface ReservationHandle {
+  readonly record: ReservationRecord;
+  commitMany(mus: readonly MU[]): boolean;
+  rollback(): void;
+}
+
+/** JSON-only tween state stored while a component is failed. */
+export interface FrozenTweenDescriptor {
+  readonly kind: 'position' | 'path';
+  readonly muRef: MuRef | null;
+  readonly pathRef?: string;
+  readonly from?: readonly [number, number, number];
+  readonly to?: readonly [number, number, number];
+  readonly fromS?: number;
+  readonly toS?: number;
+  readonly remaining: number;
+}
+
+/** JSON-only scheduled work stored while a component is failed. */
+export interface FrozenDescriptor {
+  readonly action: string;
+  readonly muRef: MuRef | null;
+  readonly payload: unknown;
+  readonly remaining: number;
+  readonly tween?: FrozenTweenDescriptor;
+  /** Multiple tweens owned by one barrier event (for synchronous indexed motion). */
+  readonly tweens?: readonly FrozenTweenDescriptor[];
 }
 
 /** Hook name as authored in a `des` block (e.g. 'Arrival', 'RotateComplete'). */
@@ -114,8 +191,9 @@ export type DesHookName = string;
  * onto `TweenRegistry.addPosition` / `addDrive`.
  *
  * Pass it as the `data` argument of `self.in(delay, hook, mu, { tween })` (the
- * scheduler reads `data.tween`); in continuous/mock mode (no scheduler) it is
- * inert because `self.in` itself is a dev-throw there.
+ * scheduler reads `data.tween`); in continuous/mock mode (no DES scheduler) it
+ * is inert — the continuous event heap carries the data through to the hook
+ * but registers no tween (the transport sim animates continuously anyway).
  */
 export interface TweenSpec {
   /** Position tween: lerp `target.position` from `from` to `to` over the interval. */
@@ -126,6 +204,13 @@ export interface TweenSpec {
         readonly target: unknown | null;
         readonly from: readonly [number, number, number];
         readonly to: readonly [number, number, number];
+        /**
+         * Integer id of the MU this tween moves (plan-262 Phase 3, optional).
+         * Lets the DES runner keep the tween WINDOW for a HEADLESS MU
+         * (`target === null` in FastForward) so the MU can be positioned and
+         * re-connected when it is materialised on FastForward exit.
+         */
+        readonly muId?: number;
       }
     | {
         readonly kind: 'drive';
@@ -133,6 +218,49 @@ export interface TweenSpec {
         readonly drive: unknown | null;
         readonly from: number;
         readonly to: number;
+      }
+    | {
+        readonly kind: 'path';
+        /**
+         * Arc-length sampler (structurally a `PathTweenSampler`, tween-registry
+         * — typically an `RVPath`): `getAbsPosition(meters, out)` plus optional
+         * `getAbsDirection`/`align` for the pose. Kept `unknown` like `target`
+         * so the public spec stays import-free (plan-268 Phase 3).
+         */
+        /** Legacy live sampler fallback. New persisted events use `pathRef`. */
+        readonly path?: unknown | null;
+        /** Stable id resolved from the path registry at execution/restore time. */
+        readonly pathRef?: string;
+        /** Arc-length START address on the path, in METERS. */
+        readonly fromS: number;
+        /** Arc-length END address on the path, in METERS. */
+        readonly toS: number;
+        /**
+         * The visual to move (a `PathTweenTarget` — e.g. the lazily-created
+         * root pose target `self.pathTween` defaults to). Null → the runner
+         * registers nothing (headless — the end state is set by the des hook).
+         */
+        readonly target?: unknown | null;
+        /** Optional MU whose visual is resolved lazily at execution/restore. */
+        readonly muId?: number;
+      }
+    | {
+        readonly kind: 'axes';
+        /** Stable hierarchy path of the RobotIK anchor. */
+        readonly anchorRef: string;
+        /** Normalized visual windows inside the enclosing DES event duration. */
+        readonly phases: readonly {
+          readonly at0: number;
+          readonly at1: number;
+          readonly axes: readonly {
+            /** Stable hierarchy path of one axis Drive node. */
+            readonly driveRef: string;
+            readonly from: number;
+            readonly to: number;
+          }[];
+        }[];
+        /** Axes default to smoothstep; explicit linear is supported. */
+        readonly ease?: 'linear' | 'scurve';
       };
 }
 
@@ -148,6 +276,13 @@ export interface Port extends TransportLink {
   readonly role: 'input' | 'output';
   /** The partner LayoutObject root (alias of `TransportLink.partnerRoot`). */
   readonly ownerRoot: Object3D;
+  /**
+   * THIS component's OWN local port snap node (its `.position` is root-local).
+   * Routers (turntable) feed it to the angle math — the local snap is the
+   * correct frame, NOT `ownerRoot` (the partner root, scene-positioned). Optional:
+   * distance-fallback ports have no snap, so consumers use `snapNode ?? ownerRoot`.
+   */
+  readonly snapNode?: Object3D;
   /**
    * The partner's MaterialFlowInstance for the DES object-handshake. Fills the
    * `partnerComponent` slot Plan-196 reserved (null on the continuous path).
@@ -231,32 +366,91 @@ export interface MaterialFlowSelf<
 
   // ── Toolkit: convention-based node resolution + handles (delegate to the
   //    _shared/loader helpers with self.root / selfDrives(self) / self.viewer).
-  /** First `Transport-X/Y/Z` belt node under root, or null. */
-  findTransport(): Object3D | null;
-  /** First `Sensor[-id]` node under root, or null. */
-  findSensor(): Object3D | null;
-  /** First `Drive-Rot-X/Y/Z` rotary node under root, or null. */
-  findRotaryDrive(): Object3D | null;
+  /**
+   * First convention node of `kind` under root, or null — like Unity
+   * `GetComponentInChildren`. `self.find('transport')` / `'sensor'` / `'rotary'`.
+   */
+  find(kind: NodeKind): Object3D | null;
+  /**
+   * ALL convention nodes of `kind` under root — like Unity
+   * `GetComponentsInChildren`. Use when a component has several of a kind (e.g. a
+   * transfer with an X and a Z transport axis). `find(kind)` === `findAll(kind)[0]`.
+   */
+  findAll(kind: NodeKind): Object3D[];
   /** Lazy belt handle (`run(forward)`) for a transport node. */
   attachBelt(node: Object3D | null): BeltHandle;
   /** Lazy positioned-drive handle (`run/moveTo/isAtTarget/stop`) for a drive node. */
   attachDrive(node: Object3D | null): DriveHandle;
+  /**
+   * Unity-style AddComponent: attach a drive behavior model (`Drive_Simple`,
+   * `Drive_DestinationMotor`) to a drive node. Its schema-declared standard
+   * signals are created via {@link addSignal}, wired into the component
+   * properties and stamped into rv_extras — identical to a GLB-imported
+   * component. Pass `wiring` to connect individual slots to your own signals
+   * (from `self.addSignal`) instead; wired slots are not auto-created.
+   * Idempotent; returns the (existing or new) instance, or null when the node
+   * is absent / carries no Drive.
+   */
+  addComponent(node: Object3D | null, type: AttachableDriveBehaviorType, wiring?: SignalWiring): RVComponent | null;
+  /**
+   * Unity-style AddSignal: create ONE signal for this component. The leaf lands
+   * in the component's `Signals` folder (or under `opts.at` for any other
+   * hierarchy level), is registered in store + hierarchy and returned as a
+   * handle whose `path` wires straight into a component property.
+   */
+  addSignal(node: Object3D, slot: string, type: PlcSignalType, opts?: AddSignalOpts): SignalHandle;
+  /**
+   * Subscribes to occupancy changes of the Sensor component on `node`.
+   * The listener is automatically removed with the behavior context.
+   */
+  onSensorChanged(node: Object3D, cb: (occupied: boolean) => void): void;
   /** True when a live MU is physically on a transport surface under `node`. */
   surfaceOccupied(node: Object3D): boolean;
   /** Declare the public 4-signal material-flow contract (Flow.Run/Occupied/Running/PartCount). */
   declareFlowSignals(): void;
   /** Cached single-successor downstream interlock for the continuous hot path. */
   downstreamInterlock(): { occupied(): boolean };
+  /**
+   * True when this component is connected to a live signal — i.e. ANY of its
+   * signals is bound to a source from realvirtual CONNECT (a PLC) or the built-in
+   * virtual PLC. When wired the component's internal simulation should defer to
+   * the live values (the relay is authoritative). Standard detection — no
+   * per-signal name-building in the component code.
+   */
+  readonly isWired: boolean;
   /** Disable this instance: warn + set local.disabled — the factory then gates setup/fixedUpdate. */
   disable(reason: string): void;
   /** True once `self.disable()` has been called (factory gate). */
   readonly disabled: boolean;
 
-  // Scheduling — DES-only. Continuous mode dev-throws.
+  // Scheduling — kernel-agnostic (plan-210 §6b): DES scheduler when injected,
+  // continuous event heap (drained by the fixed tick) otherwise.
   in(delay: number, hook: DesHookName, mu?: MU | null, data?: unknown): number;
   at(time: number, hook: DesHookName, mu?: MU | null, data?: unknown): number;
   cancel(eventId: number): void;
   readonly now: number;
+  /**
+   * Build a PATH tween spec (plan-268 Phase 3) for a DES duration event: pass
+   * it as the `data` of `self.in(transit, 'Arrival', mu, self.pathTween(...))`
+   * and the private runner samples `getAbsPosition` over the scheduled window —
+   * a curved transit renders ON the curve instead of cutting the chord.
+   * FastForward writes no transforms; the final value lands on the arc-length
+   * END position (tween-registry contract).
+   *
+   * `path` is the arc-length sampler (an `RVPath`), `fromM`/`toM` the arc
+   * addresses in METERS. `target` defaults to a lazily-created pose target
+   * that writes THIS component's root position + quaternion (allocated once
+   * per self); pass an explicit target to move something else, or `null` to
+   * register no visual. Pure data — inert in continuous mode like every
+   * TweenSpec (the continuous sim animates via fixedUpdate anyway).
+   */
+  pathTween(path: unknown, fromM: number, toM: number, target?: unknown | null, muId?: number): TweenSpec;
+  /** Build a JSON-safe multi-axis tween over normalized phase windows. */
+  axesTween(
+    anchorRef: string,
+    phases: Extract<TweenSpec['tween'], { kind: 'axes' }>['phases'],
+    ease?: 'linear' | 'scurve',
+  ): TweenSpec;
 
   // Drives.
   drive(ref: NodeRef): SelfDrive | null;
@@ -273,8 +467,20 @@ export interface MaterialFlowSelf<
   setState(name: string): void;
   readonly state: string;
 
+  /**
+   * Book a CANONICAL statistics category (Working | Blocked | Empty | Setup |
+   * Failure) for utilization tracking. Separate from `setState` so an FSM
+   * component (Turntable, ChainTransfer) keeps its internal phase in `self.state`
+   * while reporting a clean category to the stats — and so a non-FSM component
+   * (Conveyor) can report its category without inventing an FSM. Booked into the
+   * StateStatistics sink (continuous) and forwarded via `onStatState` to the DES
+   * component (DES), so the SAME component code captures stats in BOTH modes.
+   * De-duped: re-stating the current category is a no-op (the interval runs on).
+   */
+  statState(name: string): void;
+
   // Statistics (Plan 201). When the self has a StateStatistics sink these book
-  // into it; otherwise they are no-ops. `setState` already feeds state time.
+  // into it; otherwise they are no-ops. `statState` feeds state time.
   /** Count completed output (parts) for throughput statistics. */
   statOutput(n?: number): void;
   /** Start a cycle timer (statistics). */
@@ -299,9 +505,19 @@ export interface MaterialFlowSelf<
    * plain structural MU. Use this in `des.onGenerate` instead of fabricating a
    * `{ id }` literal so the model-load flow tracks every part.
    */
-  spawn(): MU;
+  spawn(visualTemplateId?: string): MU;
   readonly mus: ReadonlyArray<MU>;
   readonly currentLoad: number;
+  /** Capacity promised to upstream holders but not committed yet. */
+  readonly reservedLoad: number;
+  downstreamFreeCapacity(port?: Port): number;
+  reserveDownstream(
+    n: number,
+    port?: Port,
+    carrier?: { ref: MuRef; slots: number },
+  ): ReservationHandle;
+  /** Resolve a restored active reservation by id for an event payload. */
+  reservation(id: number): ReservationHandle | null;
 
   contextMenu(target: NodeRef, items: ContextMenuItem[]): void;
 
@@ -365,6 +581,7 @@ function portFromConnection(rv: RVBindContext, c: PortConnection): Port {
     id: c.pairedSnap.id,
     role: c.role,
     ownerRoot: c.ownerRoot,
+    snapNode: c.snap.object3D, // this component's own local snap (angle-math frame)
     ownerComponent: null, // continuous path; DES runner fills it (P5)
   };
 }
@@ -377,6 +594,7 @@ function portFromPairing(rv: RVBindContext, pr: OutputPairing): Port {
     id: pr.pairedSnap.id,
     role: 'output',
     ownerRoot: pr.ownerRoot,
+    snapNode: pr.snap.object3D, // this component's own local snap (angle-math frame)
     ownerComponent: null,
   };
 }
@@ -482,9 +700,19 @@ export interface CreateSelfOptions<
   signals?: SIG;
   /**
    * DES scheduling backend (P5). When present, `self.in/at/cancel/now` delegate
-   * to it. Absent (continuous) → `in/at` dev-throw, `now` reads the host loop.
+   * to it. Absent (continuous) → they run on a lazily-created continuous event
+   * heap advanced by the fixed tick (plan-210 §6b — kernel-agnostic timers).
    */
   scheduler?: SelfScheduler | null;
+  /**
+   * Continuous hook dispatcher (plan-210 §6b): receives every due timer event
+   * (`self.in`/`self.at`) drained by the fixed tick when NO DES scheduler is
+   * injected. The SDK adapter (and, later, the library-component factory)
+   * wires it to the component's `des.on(hook, mu, data)` handler so timer
+   * hooks run identically in both kernels. Without it, a due event warns once
+   * and is dropped (visible, not silent).
+   */
+  onHook?: (hook: DesHookName, mu: MU | null, data: unknown) => void;
   /**
    * DES MU-transfer backend (P5). When present, `self.transfer(mu, fromPort)`
    * delegates the blocking handshake (canAccept → accept → release / block)
@@ -497,13 +725,27 @@ export interface CreateSelfOptions<
    * MU. Absent (continuous) → `self.spawn()` returns a plain structural MU with a
    * locally-incremented id.
    */
-  spawnMU?: (() => MU) | null;
+  spawnMU?: ((visualTemplateId?: string) => MU) | null;
   /**
    * DES downstream-acceptance probe (P5). When present, `self.downstreamCanAccept`
    * delegates to it (the runner queries the resolved downstream adapter). Absent
    * (continuous) → `downstreamCanAccept` returns `true`.
    */
   canAcceptDownstream?: ((mu: MU, port?: Port) => boolean) | null;
+  /** Adapter-owned canonical MU collection (DES); omitted on continuous. */
+  mus?: (() => ReadonlyArray<MU>) | null;
+  /** Adapter-owned incoming reservation count (DES); omitted on continuous. */
+  reservedLoad?: (() => number) | null;
+  /** Remaining downstream component slots after active reservations. */
+  downstreamFreeCapacity?: ((port?: Port) => number) | null;
+  /** Persisted downstream-reservation backend (DES only). */
+  reserveDownstream?: ((
+    n: number,
+    port?: Port,
+    carrier?: { ref: MuRef; slots: number },
+  ) => ReservationHandle) | null;
+  /** Resolve a restored reservation record by stable id (DES only). */
+  reservation?: ((id: number) => ReservationHandle | null) | null;
   /** Per-instance state object exposed as `self.local` (defaults to `{}`). */
   local?: S;
   /**
@@ -514,6 +756,14 @@ export interface CreateSelfOptions<
    * (`() => viewer.simTime`) and registers it for aggregation.
    */
   statistics?: StateStatistics | null;
+  /**
+   * DES statistics forwarder (Plan 201, both-modes). When present, `self.statState`
+   * ALSO forwards the canonical category here. The DES bind wires it to the live
+   * `DESComponent.setState` so the discrete-event stats capture the same Working /
+   * Blocked / Empty / Setup categories the continuous `StateStatistics` does.
+   * Absent (continuous) → only the `statistics` sink is fed.
+   */
+  onStatState?: ((name: string) => void) | null;
 }
 
 /** DES scheduling backend the DESRunner injects (P5). */
@@ -546,8 +796,15 @@ export function createSelf<
   const onTransfer = opts.onTransfer ?? null;
   const spawnMU = opts.spawnMU ?? null;
   const canAcceptDownstream = opts.canAcceptDownstream ?? null;
+  const adapterMus = opts.mus ?? null;
+  const adapterReservedLoad = opts.reservedLoad ?? null;
+  const downstreamFreeCapacity = opts.downstreamFreeCapacity ?? null;
+  const reserveDownstream = opts.reserveDownstream ?? null;
+  const reservation = opts.reservation ?? null;
   const local = (opts.local ?? {}) as S;
   const statistics = opts.statistics ?? null;
+  const onStatState = opts.onStatState ?? null;
+  let lastStat = ''; // last canonical category booked via statState (de-dupe)
   let localMuId = 0;
 
   // Build the typed `self.sig` accessor map from the optional `signals` shape.
@@ -581,6 +838,14 @@ export function createSelf<
   let state = 'idle';
   let disabled = false;
 
+  // Instance scope is fixed for the lifetime of this self (rv.root never
+  // re-parents during a bind) — compute the live-control prefix ONCE instead
+  // of walking the parent chain on every `isWired` read (per fixed tick).
+  const liveControlPrefix = (() => {
+    const scope = instanceScope(rv.root);
+    return scope ? `${scope}.` : '';
+  })();
+
   // Lazy: only allocate the shared interlock when an instance actually calls
   // self.downstreamOccupied() / self.downstreamInterlock() (behaviours that
   // never gate on the downstream don't pay for it). The SAME cached object backs
@@ -589,11 +854,45 @@ export function createSelf<
   const getInterlock = (): { occupied(): boolean } =>
     (interlock ??= createDownstreamInterlock(rv));
 
-  const throwContinuous = (fn: string): never => {
-    throw new Error(
-      `[material-flow] self.${fn}() is DES-only and was called in continuous mode ` +
-        `(type='${def.type}'). Schedule events only from the des block.`,
-    );
+  // ── Continuous timers (plan-210 §6b) ─────────────────────────────────────
+  // Without a DES scheduler, `self.in/at/cancel/now` run on a lazily-created
+  // event heap: the fixed tick advances the virtual clock and drains all
+  // events with `time <= now` (delta-cycle drain). The heap + tick hook are
+  // only allocated when an instance actually schedules (or reads `now`), so
+  // pure tick-polled behaviours pay nothing. NEVER used in DES mode — there
+  // the injected scheduler (private runner) dispatches, unchanged.
+  const onHook = opts.onHook ?? null;
+  // Default path-tween target (plan-268 Phase 3): writes THIS component's root
+  // pose. Allocated ONCE per self on first use — the specs are per event, the
+  // target is not (GC discipline).
+  let rootPoseTarget: {
+    setPosition(v: Vector3): void;
+    setQuaternion(q: Quaternion): void;
+  } | null = null;
+  let continuousTimers: RVEventHeap | null = null;
+  let continuousNow = 0;
+  let warnedNoHook = false;
+  const getContinuousTimers = (): RVEventHeap => {
+    if (!continuousTimers) {
+      const heap = new RVEventHeap();
+      continuousTimers = heap;
+      heap.addListener((ev) => {
+        if (onHook) {
+          onHook(ev.hook, (ev.mu ?? null) as MU | null, ev.data);
+        } else if (!warnedNoHook) {
+          warnedNoHook = true;
+          console.warn(
+            `[material-flow] timer hook '${ev.hook}' fired in continuous mode but no ` +
+              `onHook dispatcher is wired (type='${def.type}') — pass CreateSelfOptions.onHook`,
+          );
+        }
+      });
+      rv.onFixedUpdate((dt) => {
+        continuousNow += dt;
+        heap.drainUntil(continuousNow);
+      });
+    }
+    return continuousTimers;
   };
 
   const self: MaterialFlowSelf<S, SIG> = {
@@ -617,20 +916,48 @@ export function createSelf<
     },
 
     // ── Toolkit (delegates to the _shared/loader helpers) ──────────────────
-    findTransport(): Object3D | null {
-      return findTransport(rv.root);
+    // Generic, table-driven node finders: the kind selects a name predicate from
+    // NODE_KIND_TESTS, so adding a convention kind needs no new method here.
+    find(kind: NodeKind): Object3D | null {
+      return findFirst(rv.root, NODE_KIND_TESTS[kind]);
     },
-    findSensor(): Object3D | null {
-      return findSensor(rv.root);
-    },
-    findRotaryDrive(): Object3D | null {
-      return findRotaryDrive(rv.root);
+    findAll(kind: NodeKind): Object3D[] {
+      return findAllNodes(rv.root, NODE_KIND_TESTS[kind]);
     },
     attachBelt(node: Object3D | null): BeltHandle {
       return attachBelt(selfDrives(self), node);
     },
     attachDrive(node: Object3D | null): DriveHandle {
       return attachDrive(selfDrives(self), node);
+    },
+    addComponent(node: Object3D | null, type: AttachableDriveBehaviorType, wiring?: SignalWiring): RVComponent | null {
+      if (!node) return null;
+      return attachDriveBehaviorByCode(rv.viewer as unknown as DriveBehaviorHostViewer, node, type, wiring);
+    },
+    addSignal(node: Object3D, slot: string, type: PlcSignalType, opts?: AddSignalOpts): SignalHandle {
+      const host = rv.viewer as unknown as DriveBehaviorHostViewer | undefined;
+      if (!host || !host.signalStore || !host.registry) {
+        // Headless self (no store yet, e.g. unit tests) — return a stub handle so
+        // setup() stays robust; the paired addComponent no-ops in the same
+        // condition, so this handle is never actually wired.
+        return { name: slot, path: '', node };
+      }
+      const handle = addSignal(node, slot, type, host.signalStore, host.registry, opts);
+      host.signalStore.buildIndex();
+      return handle;
+    },
+    onSensorChanged(node: Object3D, cb: (occupied: boolean) => void): void {
+      const host = rv.viewer as unknown as {
+        transportManager?: { sensors?: RVSensor[] } | null;
+      };
+      const sensor = host.transportManager?.sensors?.find(candidate => candidate.node === node);
+      if (!sensor) {
+        console.warn(`[material-flow] Sensor component not found on '${node.name}'`);
+        return;
+      }
+      const listener = (): void => cb(sensor.occupied);
+      sensor.addFeedbackListener(listener);
+      rv.onDispose(() => sensor.removeFeedbackListener(listener));
     },
     surfaceOccupied(node: Object3D): boolean {
       return isSurfaceOccupied(rv.viewer, node);
@@ -640,6 +967,9 @@ export function createSelf<
     },
     downstreamInterlock(): { occupied(): boolean } {
       return getInterlock();
+    },
+    get isWired(): boolean {
+      return isAnyLiveControlled(liveControlPrefix);
     },
     disable(reason: string): void {
       disabled = true;
@@ -651,19 +981,65 @@ export function createSelf<
     },
 
     in(delay, hook, mu, data): number {
-      if (!scheduler) return throwContinuous('in');
-      return scheduler.in(delay, hook, mu, data);
+      if (scheduler) return scheduler.in(delay, hook, mu, data);
+      return getContinuousTimers().schedule(continuousNow + delay, hook, mu ?? null, data);
     },
     at(time, hook, mu, data): number {
-      if (!scheduler) return throwContinuous('at');
-      return scheduler.at(time, hook, mu, data);
+      if (scheduler) return scheduler.at(time, hook, mu, data);
+      return getContinuousTimers().schedule(time, hook, mu ?? null, data);
     },
     cancel(eventId: number): void {
-      if (!scheduler) return throwContinuous('cancel');
-      scheduler.cancel(eventId);
+      if (scheduler) {
+        scheduler.cancel(eventId);
+        return;
+      }
+      continuousTimers?.cancel(eventId);
     },
     get now(): number {
-      return scheduler ? scheduler.now : 0;
+      if (scheduler) return scheduler.now;
+      // Lazily start the continuous clock on first read — otherwise a
+      // component that reads `now` before ever scheduling would see a frozen 0.
+      getContinuousTimers();
+      return continuousNow;
+    },
+    pathTween(path: unknown, fromM: number, toM: number, target?: unknown | null, muId?: number): TweenSpec {
+      // `undefined` target → the shared root pose target (position + quaternion
+      // of this component's root). An EXPLICIT null stays null (no visual).
+      if (target === undefined) {
+        rootPoseTarget ??= {
+          setPosition: (v: Vector3): void => { rv.root.position.copy(v); },
+          setQuaternion: (q: Quaternion): void => { rv.root.quaternion.copy(q); },
+        };
+        target = rootPoseTarget;
+      }
+      return {
+        tween: {
+          kind: 'path',
+          ...(
+            typeof (path as { id?: unknown } | null)?.id === 'string'
+              ? { pathRef: (path as { id: string }).id }
+              : { path: path ?? null }
+          ),
+          fromS: fromM,
+          toS: toM,
+          target: target ?? null,
+          ...(typeof muId === 'number' ? { muId } : {}),
+        },
+      };
+    },
+    axesTween(
+      anchorRef: string,
+      phases: Extract<TweenSpec['tween'], { kind: 'axes' }>['phases'],
+      ease: 'linear' | 'scurve' = 'scurve',
+    ): TweenSpec {
+      return {
+        tween: {
+          kind: 'axes',
+          anchorRef,
+          phases,
+          ease,
+        },
+      };
     },
 
     drive(ref: NodeRef): SelfDrive | null {
@@ -692,10 +1068,16 @@ export function createSelf<
     },
 
     setState(name: string): void {
+      // FSM phase ONLY (e.g. Turntable 'receiving'/'aligning_in'). Statistics go
+      // through the canonical `statState` channel so an FSM name never pollutes
+      // the utilization buckets and the deadlock-guard on `self.state` is intact.
       state = name;
-      // Plan 201: feed the state-statistics sink (no-op when absent). This is the
-      // single source of state time — DES and continuous both go through here.
-      statistics?.setState(name);
+    },
+    statState(name: string): void {
+      if (name === lastStat) return; // re-stating current category → interval runs on
+      lastStat = name;
+      statistics?.setState(name); // continuous sink (no-op when absent)
+      onStatState?.(name);        // DES forwarder → DESComponent (no-op when absent)
     },
     get state(): string {
       return state;
@@ -716,10 +1098,12 @@ export function createSelf<
       // hand-off (the transport manager moves MUs surface→surface).
       if (onTransfer) onTransfer(mu, fromPort);
     },
-    spawn(): MU {
+    spawn(visualTemplateId?: string): MU {
       // DES: a real runner-backed MU (manager-tracked, global id, visual). Else
       // a plain structural MU with a local id (continuous/mock).
-      return spawnMU ? spawnMU() : { id: ++localMuId, prop: {} };
+      return spawnMU
+        ? spawnMU(visualTemplateId)
+        : { id: ++localMuId, prop: {}, ...(visualTemplateId ? { visualTemplateId } : {}) };
     },
     downstreamCanAccept(mu: MU, port?: Port): boolean {
       // DES: probe the resolved downstream adapter; continuous/mock: always true
@@ -727,10 +1111,25 @@ export function createSelf<
       return canAcceptDownstream ? canAcceptDownstream(mu, port) : true;
     },
     get mus(): ReadonlyArray<MU> {
-      return mus;
+      return adapterMus ? adapterMus() : mus;
     },
     get currentLoad(): number {
-      return mus.length;
+      return adapterMus ? adapterMus().length : mus.length;
+    },
+    get reservedLoad(): number {
+      return adapterReservedLoad?.() ?? 0;
+    },
+    downstreamFreeCapacity(port): number {
+      return downstreamFreeCapacity?.(port) ?? Number.POSITIVE_INFINITY;
+    },
+    reserveDownstream(n, port, carrier): ReservationHandle {
+      if (!reserveDownstream) {
+        throw new Error(`[material-flow] reserveDownstream is unavailable in ${mode} mode`);
+      }
+      return reserveDownstream(n, port, carrier);
+    },
+    reservation(id: number): ReservationHandle | null {
+      return reservation?.(id) ?? null;
     },
 
     contextMenu(target: NodeRef, items: ContextMenuItem[]): void {

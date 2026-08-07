@@ -12,7 +12,14 @@ import { attachAasLink, SEW_DRIVE_AAS, isDriveDatasheetNode } from '../src/behav
 // Side-effect import registers the real 'aas' data resolver; also pull the
 // documentation-mode motor-bbox hover resolver for direct testing.
 import { findGatedAasAtPoint } from '../src/plugins/aas-link-plugin';
+import { AAS_RESOLUTION_KEY, type AasResolution } from '../src/plugins/aas-resolution';
 import { tooltipRegistry } from '../src/core/hmi/tooltip/tooltip-registry';
+
+/** Since plan-373 an AAS surface only shows for a node the index could resolve. */
+function withResolution(node: Object3D, resolution: AasResolution = 'resolved'): Object3D {
+  node.userData[AAS_RESOLUTION_KEY] = resolution;
+  return node;
+}
 
 describe('attachAasLink', () => {
   it('writes the standard AAS representation + gated flag', () => {
@@ -27,6 +34,12 @@ describe('attachAasLink', () => {
       serverUrl: '',
       gated: true,
     });
+  });
+
+  it('marks the node pending so no AAS surface shows before the index answered', () => {
+    const node = new Object3D();
+    attachAasLink(node, SEW_DRIVE_AAS.aasId, SEW_DRIVE_AAS.description);
+    expect(node.userData[AAS_RESOLUTION_KEY]).toBe('pending');
   });
 
   it('is a no-op for a null node', () => {
@@ -62,10 +75,10 @@ describe('attachAasLink', () => {
 describe('aas resolver documentation-mode gating', () => {
   const resolver = tooltipRegistry.getDataResolver('aas');
 
-  function nodeWith(aas: Record<string, unknown>): Object3D {
+  function nodeWith(aas: Record<string, unknown>, resolution: AasResolution = 'resolved'): Object3D {
     const n = new Object3D();
     n.userData._rvAasLink = aas;
-    return n;
+    return withResolution(n, resolution);
   }
   function viewerWith(hideDriveDocs: boolean | undefined): any {
     return { getPlugin: (id: string) => (id === 'layout-planner' && hideDriveDocs !== undefined ? { hideDriveDocs } : undefined) };
@@ -116,7 +129,7 @@ describe('findGatedAasAtPoint (planner doc-mode motor bbox)', () => {
     node.userData._rvAasLink = { aasId: 'urn:sew', description: 'SEW', gated: true };
     node.add(new Mesh(new BoxGeometry(2, 2, 2), new MeshBasicMaterial()));
     node.position.set(x, 0, 0);
-    return node;
+    return withResolution(node);
   }
 
   function buildScene(): { root: Object3D; drive: Object3D } {

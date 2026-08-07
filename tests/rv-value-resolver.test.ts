@@ -242,7 +242,15 @@ describe('isEphemeralField', () => {
     const { viewer } = makeViewerWithDrive();
     expect(isEphemeralField(viewer, 'Root/Conveyor', 'Drive', 'CurrentPosition')).toBe(true);
     expect(isEphemeralField(viewer, 'Root/Conveyor', 'Drive', 'IsRunning')).toBe(true);
-    expect(isEphemeralField(viewer, 'Root/Conveyor', 'Drive', 'JogForward')).toBe(true);
+  });
+
+  it('is false for JogForward — it is an authored, persistable config setpoint', () => {
+    const { viewer } = makeViewerWithDrive();
+    // JogForward is live AND in the schema: GLBs really do author `JogForward: true`
+    // (Unity serializes it), so an edit to it is a meaningful persistable override —
+    // same class as TargetSpeed, NOT an ephemeral readout like CurrentPosition.
+    expect(isEphemeralField(viewer, 'Root/Conveyor', 'Drive', 'JogForward')).toBe(false);
+    expect(isEphemeralField(viewer, 'Root/Conveyor', 'Drive', 'JogBackward')).toBe(false);
   });
 
   it('is false for a field that is both live AND schema (config setpoint)', () => {

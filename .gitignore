@@ -1,11 +1,21 @@
 node_modules/
 dist/
 dist-private/
+dist-embed/
 .vite/
+
+# CONNECT's workspace runtime folder (plan-363 Phase 4). In Dev mode CONNECT keeps
+# its data AND its connect-config.json here — the latter carries the InfluxDB token,
+# and the folder also collects the CAD conversion caches, which reach hundreds of MB.
+# Neither may ever enter a changeset, least of all in a tree that is mirrored to a
+# public remote.
+.runtime/
 .playwright-profile
 test-results/
 *.local
 *.tsbuildinfo
+.mcp.json
+.vscode/
 
 # Bunny deploy credentials — never commit. (.env.production is auto-loaded by
 # Vite on prod builds, so it must stay ignored too.)
@@ -18,8 +28,36 @@ LocalFolderTest/
 # Oversized AASX asset (exceeds GitHub 100 MB limit)
 public/aasx/26_SEW_KA47-DRN90M4.aasx
 
-# Test / dev demo models — excluded from the public deploy by the model allowlist
-# and kept out of the repo (only DemoRealvirtual* + the library ship publicly).
-public/models/DemoRobotIK.glb
-public/models/EuropalletEmpty.glb
-public/models/tests.glb
+# Test / dev demo models are tracked via Git LFS since plan-360 — the test
+# suites need them in every worktree. They stay excluded from the public deploy
+# by the model allowlist (only DemoRealvirtual* + the library ship publicly).
+
+# Private customer models — canonical location is
+# ../realvirtual-WebViewer-Private~/projects/<name>/models/ (served via
+# /private-models/ in dev, staged by stagePrivateProject on private deploys).
+# Listed here as a hard guard so a stray local copy can never be committed.
+public/models/MauserCageline30.glb
+public/models/Toray.glb
+
+# Generated caches — rebuilt on demand, never source. The condensed cache alone
+# reached 1.8 GB locally, which must never enter the repo (public remote is an
+# unfiltered mirror).
+public/models/.condensed-cache/
+public/models/library/.thumbnails/
+
+# Local CAD import experiments (Jul 2026, ~144 MB). Scratch files from a
+# side-cutter import session — not library content. Kept out of the repo for
+# size and because customer-derived geometry belongs in
+# ../realvirtual-WebViewer-Private~/projects/<name>/models/, never here.
+public/models/library/Custom/SideCuttingMachine.glb
+public/models/library/Custom/sidecutterv1.glb
+public/models/library/Custom/testsidecut.glb
+public/models/library/Custom/sstest.glb
+public/models/library/Custom/dddd.glb
+public/models/library/Custom/Side Cutting.glb
+
+# Kinematics import session (Jul 2026, ~216 MB). Same reason as above: customer
+# geometry, and far past GitHub's 100 MB per-file limit.
+public/models/library/Custom/P1002_M46_Deckelhandling_Kinematik.glb
+public/_tmp/
+public/models/D5347024_1-matrices.glb

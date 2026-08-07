@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useMemo, useEffect } from 'react';
 import { Typography, Box, Button } from '@mui/material';
 import { RestartAlt, FileDownload, FileUpload, CleaningServices, Cookie } from '@mui/icons-material';
 import { useViewer } from '../../../hooks/use-viewer';
 import { clearAllRVStorage } from '../rv-storage-keys';
+import { clearCadGlbCache, getCadGlbCacheSize } from '../../import/rv-cad-glb-cache';
 import { isSettingsLocked } from '../../rv-app-config';
 import { isAnalyticsConfigured, useAnalyticsConsent, resetAnalyticsConsent } from '../../consent-store';
 import { SettingsSection } from './settings-helpers';
@@ -84,6 +85,20 @@ export function BackupTab() {
     localStorage.setItem('rv-scenes-cleared-legacy', 'true');
     window.location.reload();
   }, []);
+
+  // Imported CAD (STEP→GLB) cache size, for the "Clear CAD import cache" button.
+  const [cadCacheBytes, setCadCacheBytes] = useState<number | null>(null);
+  useEffect(() => {
+    void getCadGlbCacheSize().then(setCadCacheBytes).catch(() => setCadCacheBytes(null));
+  }, []);
+  const handleClearCadCache = useCallback(() => {
+    const mb = cadCacheBytes != null ? (cadCacheBytes / 1048576).toFixed(1) : '?';
+    if (!confirm(
+      `Clear the imported CAD cache (~${mb} MB of converted STEP/GLB meshes)? ` +
+      `Scene layouts are unaffected — a part re-converts on its next import.`,
+    )) return;
+    void clearCadGlbCache().then(() => window.location.reload());
+  }, [cadCacheBytes]);
 
   const handleExport = useCallback(() => {
     const bundle = collectSettingsBundle(viewer.currentModelUrl ?? null);
@@ -233,6 +248,27 @@ export function BackupTab() {
             </Button>
             <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 0.5, fontSize: 10 }}>
               Removes orphaned entries from the previous Layout / overlay storage scheme. Saved scenes are unaffected.
+            </Typography>
+          </Box>
+        </SettingsSection>
+      )}
+
+      {/* Imported CAD cache — content-addressed converted GLBs from STEP import. */}
+      {!isSettingsLocked() && (cadCacheBytes ?? 0) > 0 && (
+        <SettingsSection id="model-cad-cache" title="Imported CAD Data">
+          <Box>
+            <Button
+              variant="outlined"
+              size="small"
+              color="inherit"
+              startIcon={<CleaningServices sx={{ fontSize: 14 }} />}
+              onClick={handleClearCadCache}
+              sx={{ fontSize: 11, textTransform: 'none' }}
+            >
+              Clear CAD import cache ({Math.max(1, Math.round((cadCacheBytes ?? 0) / 1048576))} MB)
+            </Button>
+            <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 0.5, fontSize: 10 }}>
+              Frees the browser store of converted STEP/CAD meshes. Parts re-convert on next import; scene layouts are unaffected.
             </Typography>
           </Box>
         </SettingsSection>

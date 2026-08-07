@@ -30,6 +30,41 @@ interface FakeBeltDrive {
   stop(): void;
 }
 
+function installSensorDouble(
+  host: BindContextHost,
+  root: Object3D,
+  signalStore: { set(name: string, value: boolean | number): void },
+): void {
+  const node = root.children.find(child => child.name.startsWith('Sensor'));
+  if (!node) return;
+  const listeners = new Set<() => void>();
+  const sensor = {
+    node,
+    occupied: false,
+    addFeedbackListener(cb: () => void) { listeners.add(cb); },
+    removeFeedbackListener(cb: () => void) { listeners.delete(cb); },
+  };
+  const target = host as unknown as {
+    transportManager?: { sensors?: typeof sensor[]; surfaces?: unknown[]; mus?: unknown[] } | null;
+  };
+  const manager = target.transportManager ?? {};
+  manager.sensors ??= [];
+  manager.surfaces ??= [];
+  manager.mus ??= [];
+  manager.sensors.push(sensor);
+  target.transportManager = manager;
+
+  const originalSet = signalStore.set.bind(signalStore);
+  signalStore.set = (name, value) => {
+    originalSet(name, value);
+    if (name !== node.name && !name.endsWith(`.${node.name}`)) return;
+    const occupied = value === true;
+    if (occupied === sensor.occupied) return;
+    sensor.occupied = occupied;
+    for (const listener of listeners) listener();
+  };
+}
+
 function setup() {
   const signalSubs = new Map<string, Set<(v: boolean | number) => void>>();
   const signalValues = new Map<string, boolean | number>();
@@ -72,6 +107,7 @@ function setup() {
   };
 
   const accum: KinematicsSpec = {};
+  installSensorDouble(host, root, signalStore);
   const { ctx, handle } = createBindContext(root, host, accum);
   Conveyor.bind(ctx);
 
@@ -147,6 +183,7 @@ describe('Conveyor behavior — bind is robust when the drive is missing at bind
       drives: [],
       registry: null,
     };
+    installSensorDouble(host, root, signalStore);
     const { ctx, handle } = createBindContext(root, host, {});
     Conveyor.bind(ctx);
 
@@ -215,6 +252,7 @@ describe('Conveyor behavior — unknown downstream is permissive', () => {
       getPlugin: (id: string) => (id === 'snap-point' ? { getRegistry: () => reg } : undefined),
     };
 
+    installSensorDouble(host, A_root, signalStore);
     const a = createBindContext(A_root, host, {});
     Conveyor.bind(a.ctx);
     signalStore.set('ConvA.Flow.Run', true);
@@ -340,6 +378,7 @@ describe('Conveyor behavior — per-port downstream interlock (turntable input)'
       registry: null,
       getPlugin: (id: string) => (id === 'snap-point' ? { getRegistry: () => reg } : undefined),
     };
+    installSensorDouble(host, A_root, signalStore);
     const a = createBindContext(A_root, host, {});
     Conveyor.bind(a.ctx);
     return { A_drive, handle: a.handle };
@@ -430,6 +469,8 @@ describe('Conveyor behavior — two-conveyor line (ZPA back-pressure)', () => {
     // `rv.viewer` is this host at runtime; expose the fake transport manager for
     // surface-based occupancy (not part of the narrow BindContextHost type).
     (host as unknown as { transportManager: unknown }).transportManager = transportManager;
+    installSensorDouble(host, A.root, signalStore);
+    installSensorDouble(host, B.root, signalStore);
 
     const a = createBindContext(A.root, host, {});
     const b = createBindContext(B.root, host, {});

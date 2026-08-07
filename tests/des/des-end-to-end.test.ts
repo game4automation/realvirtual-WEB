@@ -175,15 +175,18 @@ describe('DES end-to-end — Source → 2 Conveyors → Sink', () => {
     // Run ~30 s of sim time (animated 1×, 1/60 ticks).
     for (let i = 0; i < 60 * 30; i++) runner.tick(1 / 60);
 
-    // The source generates every 3 s; each MU transits C1 (1 s) + C2 (2 s).
-    // After 30 s the sink must have consumed several MUs.
+    // The DES source is demand-driven (AutomaticGeneration → ASAP, no production
+    // rate): it emits the instant the line can take a part, so throughput is gated
+    // by the SLOWEST conveyor (C2 = 2 s), NOT by the Interval. Each MU transits C1
+    // (1 s) + C2 (2 s); after 30 s at ~1 MU / 2 s the sink has consumed ~13-14.
     expect(runner.getManager().muCount).toBeGreaterThan(0);
-    expect(consumed.length).toBeGreaterThan(0);
-    // Throughput sanity: at 1 MU / 3 s, ≤ ~10 generated in 30 s.
-    expect(consumed.length).toBeLessThanOrEqual(12);
+    // Line-limited throughput: well above the old 1-MU/3-s interval cap (~10) and
+    // bounded by the C2 bottleneck — proves the source is NOT rate-throttled.
+    expect(consumed.length).toBeGreaterThanOrEqual(10);
+    expect(consumed.length).toBeLessThanOrEqual(16);
 
-    // No events dropped — the queue drains (the source re-arms, so a couple of
-    // pending generate/transit events at the cutoff are expected, but bounded).
-    expect(runner.getManager().pendingEventCount).toBeLessThanOrEqual(3);
+    // No events dropped — the queue drains (the source keeps one heartbeat Generate
+    // armed as a safety net, plus a couple of transit events in flight at the cutoff).
+    expect(runner.getManager().pendingEventCount).toBeLessThanOrEqual(4);
   });
 });

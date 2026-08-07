@@ -6,10 +6,17 @@
  *
  * Replaces the old scrollable tab strip with a single full-width dropdown:
  * the trigger shows the active library (full name, type icon), and the menu
- * lists every loaded library with a per-row remove (and, for local folders,
- * refresh) action plus an "Add library…" entry. Scales to any number of
- * libraries without truncation or scroll arrows, and makes removal a visible,
- * one-click action instead of a hidden right-click menu.
+ * lists every loaded library. Scales to any number of libraries without
+ * truncation or scroll arrows.
+ *
+ * ## Switching only — managing lives in the Projects dashboard
+ *
+ * Since plan-702 this selector no longer adds or removes libraries. That whole
+ * surface existed twice (here and in the Assets tab of the Projects window) on
+ * top of one shared `LibraryStore`, and two front-ends for one store is how
+ * they drift. What stays is what BROWSING a library needs: pick one, re-scan a
+ * local folder, re-grant its permission. The single management route is the
+ * "Manage libraries…" entry in the dropdown foot.
  */
 
 import { useState, type ReactNode } from 'react';
@@ -29,9 +36,8 @@ import {
 import {
   ArrowDropDown,
   Check,
-  Delete,
   Refresh,
-  Add,
+  Tune,
   Cloud,
   GitHub,
   FolderOpen,
@@ -58,13 +64,13 @@ export interface LibrarySelectorProps {
   items: LibraryItem[];
   activeId: string | null;
   onSelect: (id: string) => void;
-  onRemove: (id: string) => void;
   /** Refresh a local-folder library (re-scan files). */
   onRefresh?: (id: string) => void;
-  onAdd: () => void;
-  /** Compact mode (mobile): collapse the inline refresh/remove/add buttons into
-   *  a single "⋮" overflow menu and tighten padding, so the header row stays
-   *  small. Default false keeps the desktop inline-actions layout. */
+  /** Open the Projects dashboard on its Assets tab — the only management route. */
+  onManage: () => void;
+  /** Compact mode (mobile): collapse the inline refresh button into a single
+   *  "⋮" overflow menu and tighten padding, so the header row stays small.
+   *  Default false keeps the desktop inline-actions layout. */
   compact?: boolean;
 }
 
@@ -81,7 +87,7 @@ function kindIcon(kind: LibraryKind, status: LibraryItem['cloudStatus'], error?:
   }
 }
 
-export function LibrarySelector({ items, activeId, onSelect, onRemove, onRefresh, onAdd, compact = false }: LibrarySelectorProps) {
+export function LibrarySelector({ items, activeId, onSelect, onRefresh, onManage, compact = false }: LibrarySelectorProps) {
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const close = () => setAnchor(null);
   // Compact-mode overflow ("⋮") menu anchor — separate from the library dropdown.
@@ -92,7 +98,9 @@ export function LibrarySelector({ items, activeId, onSelect, onRemove, onRefresh
   const triggerLabel = active?.label ?? (items.length === 0 ? 'Add a library…' : 'Select library');
 
   const handleTriggerClick = (e: React.MouseEvent<HTMLElement>) => {
-    if (items.length === 0) { onAdd(); return; } // nothing to pick — go straight to Add
+    // Nothing to pick — send the user where libraries are actually attached
+    // rather than opening an empty dropdown.
+    if (items.length === 0) { onManage(); return; }
     setAnchor(e.currentTarget);
   };
 
@@ -128,7 +136,7 @@ export function LibrarySelector({ items, activeId, onSelect, onRemove, onRefresh
         </Box>
       </Button>
 
-      {/* Actions for the ACTIVE library. Desktop: inline refresh/remove/add.
+      {/* Actions for the ACTIVE library. Desktop: an inline refresh button.
           Compact (mobile): a single "⋮" overflow menu to keep the row small. */}
       {compact ? (
         <>
@@ -142,13 +150,9 @@ export function LibrarySelector({ items, activeId, onSelect, onRemove, onRefresh
                 Refresh folder
               </MenuItem>
             )}
-            <MenuItem disabled={!active} onClick={() => { if (active) onRemove(active.id); closeActions(); }} sx={{ fontSize: 12 }}>
-              <ListItemIcon sx={{ minWidth: 26 }}><Delete sx={{ fontSize: 16 }} /></ListItemIcon>
-              Remove library
-            </MenuItem>
-            <MenuItem onClick={() => { onAdd(); closeActions(); }} sx={{ fontSize: 12 }}>
-              <ListItemIcon sx={{ minWidth: 26 }}><Add sx={{ fontSize: 16 }} /></ListItemIcon>
-              Add library…
+            <MenuItem onClick={() => { onManage(); closeActions(); }} sx={{ fontSize: 12 }}>
+              <ListItemIcon sx={{ minWidth: 26 }}><Tune sx={{ fontSize: 16 }} /></ListItemIcon>
+              Manage libraries…
             </MenuItem>
           </Menu>
         </>
@@ -161,25 +165,6 @@ export function LibrarySelector({ items, activeId, onSelect, onRemove, onRefresh
               </IconButton>
             </Tooltip>
           )}
-          <Tooltip title={active ? 'Remove this library' : 'No library to remove'}>
-            {/* span wrapper so the tooltip works while the button is disabled */}
-            <span>
-              <IconButton
-                size="small"
-                disabled={!active}
-                onClick={() => { if (active) onRemove(active.id); }}
-                sx={{ p: 0.5, color: active ? 'text.secondary' : 'text.disabled', '&:hover': { color: '#ef5350' } }}
-                aria-label="Remove library"
-              >
-                <Delete sx={{ fontSize: 16 }} />
-              </IconButton>
-            </span>
-          </Tooltip>
-          <Tooltip title="Add library">
-            <IconButton size="small" onClick={onAdd} sx={{ p: 0.5 }} aria-label="Add library">
-              <Add sx={{ fontSize: 16 }} />
-            </IconButton>
-          </Tooltip>
         </>
       )}
 
@@ -220,11 +205,13 @@ export function LibrarySelector({ items, activeId, onSelect, onRemove, onRefresh
 
         {items.length > 0 && <Divider />}
 
-        <MenuItem onClick={() => { onAdd(); close(); }} sx={{ fontSize: 12, py: 0.5 }}>
+        {/* The one management route. Adding, removing and connecting all live
+            in the Projects dashboard's Assets tab since plan-702. */}
+        <MenuItem onClick={() => { onManage(); close(); }} sx={{ fontSize: 12, py: 0.5 }}>
           <ListItemIcon sx={{ minWidth: 26 }}>
-            <Add sx={{ fontSize: 16 }} />
+            <Tune sx={{ fontSize: 16 }} />
           </ListItemIcon>
-          <Typography sx={{ fontSize: 12 }}>Add library…</Typography>
+          <Typography sx={{ fontSize: 12 }}>Manage libraries…</Typography>
         </MenuItem>
       </Menu>
     </Box>

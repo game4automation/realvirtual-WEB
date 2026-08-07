@@ -11,13 +11,43 @@
  *
  * Invocation: `npm run test:node` (see package.json).
  */
-import { defineConfig } from 'vitest/config';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { defaultExclude, defineConfig } from 'vitest/config';
+
+// Same @rv-private convention as vite.config.ts: resolve to the private repo
+// when present, otherwise to the public stubs (plan-237 — the onshape-url
+// node test imports from @rv-private).
+const PRIVATE_DIR = [
+  resolve(__dirname, '../realvirtual-WebViewer-Private~/src'),
+  resolve(__dirname, '../realvirtual-web-pro/src'),
+].find((candidate) => existsSync(candidate)) ?? resolve(__dirname, '../realvirtual-WebViewer-Private~/src');
+const HAS_PRIVATE = existsSync(PRIVATE_DIR);
+
+// COMMUNITY edition (no private sibling): tests that import private modules can
+// never resolve them, so they are excluded here. The list is generated — see
+// scripts/gen-private-test-excludes.mjs; the guard test
+// tests/private-test-excludes.node.test.ts fails when it drifts.
+const PRIVATE_DEPENDENT_TESTS: string[] = HAS_PRIVATE
+  ? []
+  : JSON.parse(readFileSync(resolve(__dirname, 'tests/private-dependent-tests.json'), 'utf8'));
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@rv': resolve(__dirname, 'src'),
+      '@rv-private': HAS_PRIVATE ? PRIVATE_DIR : resolve(__dirname, 'src/private-stubs'),
+    },
+  },
   test: {
     name: 'node',
     environment: 'node',
-    include: ['tests/**/*.node.test.ts'],
+    // Internal ops tooling (Forgejo hub onboarding, CONNECT fetch, Influx
+    // provisioning) lives in the private sibling repo so it never reaches the
+    // public AGPL remote. Its tests run here when that repo is present; the
+    // glob simply matches nothing in a public-only checkout.
+    include: ['tests/**/*.node.test.ts', '../realvirtual-WebViewer-Private~/tests/**/*.node.test.ts'],
+    exclude: [...defaultExclude, ...PRIVATE_DEPENDENT_TESTS],
     pool: 'forks',
   },
 });

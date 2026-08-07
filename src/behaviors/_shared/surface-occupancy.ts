@@ -21,6 +21,12 @@ interface TransportLike {
   mus: readonly MULike[];
 }
 
+/** Own-surface list per queried node, keyed on the manager's `surfaces` array
+ *  identity + length (the manager's own self-heal signature): planner mutations
+ *  reassign or grow that array, which invalidates the entry. Avoids the
+ *  per-tick `collectSurfacesUnder` allocation + ancestor walk per conveyor. */
+const _ownSurfaces = new WeakMap<Object3D, { src: readonly SurfaceLike[]; len: number; list: SurfaceLike[] }>();
+
 /**
  * True if any live MU is physically on a transport surface under `node`.
  *
@@ -30,6 +36,10 @@ interface TransportLike {
 export function isSurfaceOccupied(host: unknown, node: Object3D): boolean {
   const tm = (host as { transportManager?: TransportLike | null }).transportManager;
   if (!tm) return false;
-  const surfaces = collectSurfacesUnder(node, tm.surfaces);
-  return surfaces.length > 0 && anyMUOnSurfaces(surfaces, tm.mus);
+  let entry = _ownSurfaces.get(node);
+  if (!entry || entry.src !== tm.surfaces || entry.len !== tm.surfaces.length) {
+    entry = { src: tm.surfaces, len: tm.surfaces.length, list: collectSurfacesUnder(node, tm.surfaces) };
+    _ownSurfaces.set(node, entry);
+  }
+  return entry.list.length > 0 && anyMUOnSurfaces(entry.list, tm.mus);
 }

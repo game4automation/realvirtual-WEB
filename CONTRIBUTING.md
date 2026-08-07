@@ -7,6 +7,52 @@ and under a commercial license offered by realvirtual GmbH. To keep this
 dual-licensing model legally possible, every contribution requires the grant of
 rights described below.
 
+## Development & Required Checks
+
+```bash
+npm install
+npm run dev          # Vite dev server with HMR
+```
+
+Before opening a pull request, all of the following must be green:
+
+```bash
+npx tsc --noEmit     # Type check — the community view (see below)
+npm run lint         # ESLint (flat config, boundaries rule)
+npm test             # Browser tests (headless Chromium via Playwright)
+npm run test:node    # Node tests (fs, glob, ESLint instance)
+```
+
+Use plain `npx tsc --noEmit`. It type-checks against the base `tsconfig.json`, which is the
+**community view**: it excludes the generated list of tests that depend on modules only
+maintainers have. `npm run typecheck` is the maintainer full check — it needs the private
+sibling repository `../realvirtual-WebViewer-Private~`, which is not part of this
+repository, and without it fails with unresolvable `@rv-private/*` errors.
+
+### Private-dependent tests must stay registered
+
+Some tests import `@rv-private/*` / `@rv-projects/*`, or reach into a private sibling
+repository by path. Those imports can never resolve in a clone of this repository, so such
+tests are listed in the generated `tests/private-dependent-tests.json` (and in the matching
+`exclude` block of `tsconfig.json`) and are skipped here.
+
+If you add, remove, or change such an import in a test file, regenerate the list:
+
+```bash
+node scripts/gen-private-test-excludes.mjs
+```
+
+Never edit the list or the `tsconfig.json` exclude block by hand. The guard test
+`tests/private-test-excludes.node.test.ts` recomputes the scan and fails whenever the
+generated list has drifted.
+
+### What is not in this repository
+
+Some subsystems of realvirtual WEB are commercial and are not part of this repository — most
+notably the CAD import providers (STEP, JT, USD, Onshape) and the PLC runtime. In this
+repository, GLB/glTF is the import format, and the stubs in `src/private-stubs/` stand in for
+the commercial modules so the community edition builds and runs on its own.
+
 ## Grant of Rights (Contribution License)
 
 By submitting a contribution to this repository — for example a pull request,

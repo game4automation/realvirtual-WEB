@@ -15,6 +15,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { Button, IconButton, Badge } from '@mui/material';
 import { AutoAwesome, History } from '@mui/icons-material';
 import { TileCard } from '../../../core/hmi/TileCard';
+import { pulseSeverityOutline } from '../../../core/hmi/severity-pulse';
 import { openPdfViewer } from '../../../core/hmi/pdf-viewer-store';
 import type { UISlotProps } from '../../../core/rv-ui-plugin';
 import { SYST_320_SCENARIO } from './alarm-seed-data';
@@ -22,32 +23,13 @@ import { loadNotes } from './alarm-notes-store';
 import { AskAiDialog } from './AskAiDialog';
 import { AlarmHistoryDialog } from './AlarmHistoryDialog';
 
-const ALARM_PULSE_DURATION_MS = 3500;
-
 /**
- * Frame the robot in 3D and pulse a red alarm outline for a few seconds. Mirrors
- * the demo's `pulseMotorAlarm` pattern (camera-only fit + outline pass, no focus
- * event). Pure visual cue.
+ * Frame the robot in 3D and flash it red for a few seconds. Delegates to the
+ * shared severity flash (camera-only fit, no focus event, selection outline
+ * untouched). Pure visual cue.
  */
 function pulseRobotAlarm(viewer: UISlotProps['viewer'], path: string): void {
-  const node = viewer.registry?.getNode(path);
-  if (!node) return;
-  const outline = viewer.outlineManager;
-  const prevStyle = outline.getStyle();
-  outline.setStyle({
-    visibleEdgeColor: 0xff3030,
-    hiddenEdgeColor: 0x8a1a1a,
-    edgeStrength: 20,
-    edgeThickness: 10,
-    edgeGlow: 1.5,
-    pulsePeriod: 0.6,
-  });
-  outline.setOutlined([node]);
-  viewer.fitToNodes([node]);
-  window.setTimeout(() => {
-    outline.setStyle({ ...prevStyle });
-    outline.clear();
-  }, ALARM_PULSE_DURATION_MS);
+  pulseSeverityOutline(viewer, path, 'error');
 }
 
 export function RobotContactForceAlarm({ viewer }: UISlotProps) {

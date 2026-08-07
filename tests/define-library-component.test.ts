@@ -181,7 +181,7 @@ describe('defineLibraryComponent — self.disable() gating', () => {
 });
 
 describe('defineLibraryComponent — statistics registration (Plan 201)', () => {
-  it('registers stats with the manager and books state time via self.setState', () => {
+  it('registers stats with the manager and books state time via self.statState', () => {
     const mgr = new StatisticsManager();
     let simTime = 0;
     const root = new Object3D(); root.name = 'Foo';
@@ -191,7 +191,7 @@ describe('defineLibraryComponent — statistics registration (Plan 201)', () => 
 
     const behavior = defineLibraryComponent<FooLocal>(makeDef({
       continuous: {
-        setup(self) { self.setState('Working'); },
+        setup(self) { self.statState('Working'); },
         fixedUpdate(self) { self.local.ticks += 1; },
       },
     }));

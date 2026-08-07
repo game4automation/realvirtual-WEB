@@ -1,87 +1,251 @@
 # AI Integration & the MCP Bridge
 
 realvirtual WEB exposes its running 3D scene to AI assistants (Claude Code, Claude
-Desktop) through a local **MCP bridge**. Once connected, the assistant can inspect
+Desktop) through an **MCP bridge**. Once connected, the assistant can inspect
 and control the live browser scene — read drives, signals, sensors and transport
 state, drive the simulation, capture screenshots, and build layouts in the Layout
 Planner — using a set of `web_*` tools.
 
-This document covers the architecture, setup, the in-app **AI Bridge** status panel,
-the AI activity indicator, the `web_screenshot` cropping options, and troubleshooting.
-For the exhaustive per-tool reference see [`webviewer.mcp.md`](webviewer.mcp.md).
+**realvirtual CONNECT is the default transport.** It hosts the MCP endpoint itself, so
+nothing extra has to be installed. The local **Node bridge** remains fully supported as the
+documented emergency fallback — it is not deprecated and not scheduled for removal here.
+
+This document covers the architecture, setup, the client matrix, the fallback route, the
+in-app **AI Bridge** status panel, the AI activity indicator, the `web_screenshot` cropping
+options, and troubleshooting. For the exhaustive per-tool reference see
+[`webviewer.mcp.md`](webviewer.mcp.md).
+
+## Tool ownership: which server serves what
+
+Exactly one MCP host owns each tool family. There is no overlap:
+
+| Host | Owns | Tool prefix |
+|------|------|-------------|
+| **realvirtual CONNECT** (C#, `http://localhost:5100/mcp`) | the `web_*` browser tools **and** the CONNECT gateway tools (`signal_list`, `signal_read`, `interfaces_status`, `health`) | `mcp__realvirtual-CONNECT__…` |
+| **Unity MCP server** (Python, `unity_mcp_server.py`) | the 80+ Unity Editor tools (scene, prefabs, play mode, recompile) | `mcp__UnityMCP__…` |
+
+CONNECT is the default transport for `web_*`: it is same-origin with the delivered HMI,
+needs neither Node nor Vite on the customer machine, and is the only path that works for a
+static WebViewer delivery.
+
+The Python server still carries a historic `web_*` proxy on port 18712. It is **not** the
+intended path. Its `--no-webviewer` switch exists, but is deliberately **not** armed on the
+start paths yet — so the Python server may still announce `web_*` tools alongside CONNECT.
+Ignore them and always call `web_*` through CONNECT.
 
 ## Architecture
 
-The connection is a three-link chain:
+The connection is a three-link chain. Only the middle link differs between the two transports:
 
 ```
-   Claude (MCP host)                 Node bridge                     Browser (realvirtual WEB)
- ┌───────────────────┐   stdio    ┌──────────────────────┐  WebSocket  ┌──────────────────────┐
- │ Claude Code /      │  (MCP) ⟷  │ mcp-bridge/dist/      │   :<port>   │ McpBridgePlugin       │
- │ Claude Desktop     │           │ index.js              │   /webviewer│  → RVViewer scene     │
- └───────────────────┘           └──────────────────────┘  ⟷ browser  └──────────────────────┘
-        host                       stdio MCP server +                    web_* tools live here
-                                   WebSocket server
+  CONNECT (default)
+
+   Claude (MCP host)              realvirtual CONNECT              Browser (realvirtual WEB)
+ ┌───────────────────┐  HTTP    ┌──────────────────────┐ WebSocket ┌──────────────────────┐
+ │ Claude Code /      │ (MCP) ⟷ │ :5100/mcp             │  :5100    │ McpBridgePlugin       │
+ │ Claude Code Desktop│         │ embedded C# MCP server│ /webviewer│  → RVViewer scene     │
+ └───────────────────┘         └──────────────────────┘ ⟷ browser └──────────────────────┘
+
+  Node bridge (fallback)
+
+   Claude (MCP host)                 Node bridge                   Browser (realvirtual WEB)
+ ┌───────────────────┐  stdio   ┌──────────────────────┐ WebSocket ┌──────────────────────┐
+ │ Claude Code /      │ (MCP) ⟷ │ mcp-bridge/dist/      │  :<port>  │ McpBridgePlugin       │
+ │ Claude Desktop     │         │ index.js              │ /webviewer│  → RVViewer scene     │
+ └───────────────────┘         └──────────────────────┘ ⟷ browser └──────────────────────┘
 ```
 
-- **Claude** launches the **Node bridge** as a stdio child process (from `.mcp.json` /
-  the Claude Desktop config). It speaks MCP (JSON-RPC) over stdin/stdout.
-- The **bridge** also hosts a WebSocket server. The **browser** connects to it as a
-  client at `ws://localhost:<port>/webviewer`.
+- **CONNECT** is already running as the gateway; its MCP server is a hosted endpoint, not a
+  child process. `McpEnabled` and `McpAllowWrite` both default to **`true`**, so nothing has
+  to be switched on locally. The tray icon still offers both (*MCP server ▸ Enabled*, takes
+  effect after a CONNECT restart; *Allow write access*, live) for installations that want
+  them off. Access from another machine needs the CONNECT API key.
+- The **Node bridge** is instead launched by Claude as a stdio child process (from
+  `.mcp.json` / the Claude Desktop config) and hosts its own WebSocket server.
+- Either way the **browser** connects as a WebSocket client to `/webviewer`.
 - The browser **owns the tools**: on connect it sends a `discover` message with the
   `web_*` tool schemas (generated from `@McpTool` decorators in
   `src/plugins/mcp-bridge-plugin.ts`) plus the `webviewer.mcp.md` instructions. The
-  bridge registers them as MCP tools and forwards every tool call to the browser.
+  server registers them as MCP tools and forwards every tool call to the browser.
 
-Because the browser defines the tools, the bridge needs no tool knowledge — it is a
-generic relay. A tool added to `McpBridgePlugin` appears automatically after a reconnect.
+Because the browser defines the tools, neither server needs tool knowledge — both are
+generic relays. A tool added to `McpBridgePlugin` appears automatically after a reconnect.
 
 ### Ports
 
-Each AI client drives its own bridge on its own port, so several can coexist:
+The browser connects to **exactly one** port at a time — that decides which assistant
+drives it. Switch it in the AI Bridge panel (see below), or with `?mcpPort=<port>` in the
+URL.
 
 | Port  | Bridge                          | Driven by        |
 |-------|---------------------------------|------------------|
-| 18714 | Node bridge                     | Claude Desktop   |
-| 18715 | Node bridge                     | Claude Code      |
-| 18712 | Python bridge (Unity MCP server)| Unity Editor MCP |
+| 5100  | CONNECT (`/mcp` + `/webviewer`) | **default** — any MCP client on `:5100/mcp` |
+| 18714 | Node bridge                     | Claude Desktop (fallback) |
+| 18715 | Node bridge                     | Claude Code (fallback) |
+| 18712 | Python bridge (Unity MCP server)| historic `web_*` proxy — **do not use**, see *Tool ownership* |
 
-The browser connects to **exactly one** port at a time — that decides which assistant
-drives it. Switch it in the AI Bridge panel (see below).
+CONNECT does **not** drift to another port when 5100 is taken, unlike the Node bridge
+(which walks `+1..+20`). Clients address CONNECT by URL — `.mcp.json`, the HMI, the REST
+API and the `/ws` signal channel all name 5100 — so a silent drift would point every one
+of them at a dead port. A collision is reported and refused instead. For a second instance
+(e.g. a parallel worktree) set `REALVIRTUAL_CONNECT_PORT` on the CONNECT side and use the
+matching `?mcpPort=` in the browser.
+
+### Which client needs what
+
+There is no single answer for "Claude" — the three clients differ:
+
+| Client | Reaches CONNECT via | Needs `mcp-remote`? |
+|--------|---------------------|---------------------|
+| **Claude Code (CLI)** | native Streamable HTTP; `"type": "http"` entry in `.mcp.json`. Custom headers via `--header` / `headers` | No |
+| **Claude Code Desktop** | same engine and same configuration files as the CLI | No |
+| **Claude Desktop (classic)** | local stdio only — `npx -y mcp-remote http://localhost:5100/mcp --allow-http`. Requires Node.js on the user machine | Yes |
+
+**Remote Custom Connectors (claude.ai / Cowork) are not supported.** That path connects from
+Anthropic's cloud and would require exposing CONNECT publicly, which contradicts the rule that
+realvirtual does not host productive machine endpoints. Putting your own gateway in front of
+CONNECT is possible but out of scope and at your own risk.
 
 ## Setup
 
-1. **Build the bridge** (one-time, and after bridge code changes):
+1. **Nothing to enable.** CONNECT's MCP server and its write access are on by default; an
+   installation that predates this default is migrated once on first load. Only if someone
+   turned them off: tray icon ▸ *MCP server ▸ Enabled* (writes `McpEnabled` to
+   `connect-config.json`; restart CONNECT) and ▸ *Allow write access* (`McpAllowWrite`, live).
+
+2. **Register CONNECT with your client.** In Unity:
+   *Tools ▸ realvirtual ▸ Settings ▸ Configure Claude Desktop MCP* writes both client
+   configurations. Or add it by hand to `.mcp.json` (Claude Code / Code Desktop):
+
+   ```json
+   "realvirtual-CONNECT": {
+     "type": "http",
+     "url": "http://localhost:5100/mcp"
+   }
+   ```
+
+   For **Claude Desktop (classic)** in `claude_desktop_config.json`:
+
+   ```json
+   "realvirtual-CONNECT": {
+     "command": "npx",
+     "args": ["-y", "mcp-remote", "http://localhost:5100/mcp", "--allow-http"]
+   }
+   ```
+
+3. **Restart the client**, then enable **AI Bridge** in the WebViewer (toggle in the panel).
+   Leave **CONNECT** selected under *Connect to*. This also works against the Vite dev
+   server on 5173 — the default already targets 5100, and `?mcpPort=5100` pins it
+   explicitly.
+
+### Authentication
+
+If CONNECT has an `ApiKey` configured:
+
+- The **MCP client** sends it as a header — `Authorization: Bearer <key>` or the legacy
+  `X-API-Key`. A key in the query string is rejected on `/mcp`.
+- The **browser** proves itself on the `/webviewer` WebSocket handshake with either CONNECT's
+  session cookie or `?apikey=`, because the browser WebSocket API cannot set headers. The key
+  is taken from the WS Realtime interface setting (`wsAuthToken`).
+  - **Same-origin** (the HMI served by CONNECT) uses the **cookie** and keeps the key out of
+    the URL — a credential in a URL is written to every proxy and server log on the way. The
+    cookie comes from opening the gateway once as `?apikey=<key>`.
+  - **Cross-origin** (Vite dev on 5173, a pinned port, an `AllowedOrigins` host) keeps
+    `?apikey=`: a `SameSite=Strict` cookie is not sent cross-site, so it is the only proof a
+    browser can present there.
+  - If a cookie-only handshake fails — an expired cookie, most likely — the client falls back
+    to `?apikey=` for the rest of the session rather than reconnect-looping on a 401.
+
+### What the guardrails do and do not cover
+
+Stated plainly, because a half-described boundary is worse than a named one:
+
+- **The write gate** (`McpAllowWrite`, plus the per-tool `readOnlyHint`) prevents *accidental*
+  mutation by an agent. It does not defend against a manipulated browser — the browser decides
+  what a tool actually does, and could offer mutating behaviour under a read-only name.
+- **Timeouts do not guarantee "not executed".** When a call exceeds its `timeoutMs`, CONNECT
+  reports the browser call id together with `outcome: unknown` and does **not** retry. The work
+  may well have completed in the browser. There is deliberately **no idempotency key and no
+  cancellation acknowledgement**: a client that retries on its own can therefore trigger a
+  mutation twice (a CAD import running twice, for example). Treat a timed-out writing tool as
+  "state unknown" and verify before repeating it.
+- **A late result never reaches the MCP client.** After a `tools/call` error the protocol has no
+  way back. Late results land in a bounded, TTL-limited audit and in the browser log only.
+- **DNS rebinding against `/webviewer` remains possible without a configured `ApiKey`.** The
+  same-origin rule cannot close it, because CONNECT is meant to serve remote HMIs under arbitrary
+  host names — during a rebind the attacker's Origin and Host agree. The effective countermeasure
+  is an `ApiKey` or a narrow `AllowedOrigins` list, not the gate.
+- **`/ws` has no Origin gate** (only `/mcp` and `/webviewer` do). That is the signal channel of
+  every HMI and was left unchanged deliberately.
+
+CONNECT also validates the browser `Origin` on `/mcp` and `/webviewer`. Loopback origins
+(including the Vite dev server on 5173) and pages served by CONNECT itself always pass. A
+WebViewer hosted on a **foreign** origin — e.g. loaded from a CDN domain while talking to a
+CONNECT elsewhere — is rejected with 403; add that origin to CONNECT's `AllowedOrigins` to
+allow it. Behind a reverse proxy, `X-Forwarded-For` is honoured only when the proxy address
+is listed in `TrustedProxies` (empty by default, and absent from the shipped
+`appsettings.json` — set it explicitly).
+
+## Falling back to the Node bridge
+
+The Node bridge is the documented emergency route when CONNECT is unavailable. It is not
+deprecated, and switching in either direction is a single move.
+
+1. **Build it once** (`dist/` is git- and Plastic-ignored):
 
    ```bash
    cd Assets/realvirtual-WebViewer~/mcp-bridge
    npm run setup        # = npm install && npm run build  (or double-click setup.cmd)
    ```
 
-   `dist/` is git-ignored, so it must be built before first use.
+2. **Activate the client entry.** In the project `.mcp.json` the bridge is parked under the
+   top-level `_disabledMcpServers` key, which Claude Code never launches (it reads
+   `mcpServers` only — a merely renamed key stays active). Move the `WebViewerMCP` block
+   into `mcpServers` and restart the client. To go back, move it there again.
 
-2. **Register the bridge with Claude.** Easiest in Unity:
-   *Tools ▸ realvirtual ▸ Settings ▸ Configure Claude Desktop MCP*. Or add it to your
-   `.mcp.json` (Claude Code) / `claude_desktop_config.json` (Claude Desktop):
+   In `claude_desktop_config.json` the configurator removes an active entry instead of
+   parking it, because that file belongs to a third-party app. The previous file is kept as
+   `claude_desktop_config.json.backup`; to restore the fallback, add:
 
    ```json
-   "WebViewerMCP": {
+   "realvirtual-WebViewerMCP": {
      "command": "node",
      "args": [
        "<project>/Assets/realvirtual-WebViewer~/mcp-bridge/dist/index.js",
-       "--web-port", "18715"
+       "--web-port", "18714"
      ]
    }
    ```
 
-3. **Restart Claude** so it launches the bridge, then enable **AI Bridge** in the
-   WebViewer (toggle in the panel) and pick the matching port.
+3. **Point the browser at it** — *Connect to ▸ Node · Desktop* (18714) or *Node · Code*
+   (18715) in the AI Bridge panel, or open realvirtual with `?mcpPort=18714`.
+
+> `claude mcp add|remove --scope project` rewrites `.mcp.json` from `mcpServers` alone and
+> silently drops `_disabledMcpServers` and `_ownership`. Restore both by hand after using it.
 
 ## The AI Bridge panel
 
 Open it from the **AI Bridge** button in the activity bar, or *Settings ▸ AI*. The
 status section shows the **full chain** — not just the WebSocket link, but whether a
 live AI client is actually attached and what it is doing.
+
+The button is always offered, whether or not a bridge is connected — a deploy can still
+remove it through the activity-bar feature matrix. On mobile the activity bar has no room
+for it, so *Settings ▸ AI* is the only entry there.
+
+Two things happen before the panel appears:
+
+- **No CONNECT answered.** CONNECT hosts the MCP server, so without it there is nothing to
+  configure. The click answers with a short note and the CONNECT download (stable, plus beta
+  when one exists) instead of an empty panel.
+- **First open on this device.** A one-time dialog states what a connected assistant may
+  reach — the full scene, every PLC signal including writes, and the simulation — and how far
+  that reaches: usable on this machine without any configuration, answerable from another
+  machine only with a valid `ApiKey`. *Got it* and *Configure…* both record the
+  acknowledgement and open the panel; *Not now* (or Escape) leaves without agreeing to
+  anything. The acknowledgement is stored per device under the key `rv-ai-bridge-consent`,
+  and it stores the accepted **scope version**, so widening what the bridge may reach asks
+  once more. It is never granted implicitly.
 
 ![The AI Bridge panel: full-chain status, port presets, server controls and the live tool list](docs/images/screenshot-ai-bridge-panel.png)
 
@@ -100,8 +264,10 @@ live AI client is actually attached and what it is doing.
 
 ### Controls
 
-- **Connect to** — one-click switch between **Desktop** (18714), **Code** (18715) and
-  **Python** (18712). The **Port** field sets any custom port.
+- **Connect to** — one-click switch between **CONNECT** (5100, the default), **Node · Desktop**
+  (18714) and **Node · Code** (18715). The **Port** field sets any custom port; picking
+  CONNECT's default port also restores same-origin resolution, so an HMI served by a remote
+  CONNECT keeps using its own origin instead of `localhost`.
 - **Pause / Resume** — stop or resume accepting browser connections.
 - **Shutdown** — ask the bridge process to exit (it can only be relaunched by the AI
   host, not from the browser).
@@ -121,21 +287,87 @@ The accent color follows the theme, so custom branding recolors it automatically
 
 ## Tools overview
 
-The `web_*` tools fall into four groups (full reference in
+The `web_*` tools fall into these groups (full reference in
 [`webviewer.mcp.md`](webviewer.mcp.md)):
 
 - **Inspect** — `web_status`, `web_drive_list`, `web_signal_list`, `web_sensor_list`,
-  `web_transport_status`, `web_logic_flow`, `web_find`, `web_hierarchy`,
-  `web_component_get`, `web_component_get_all`, `web_components_by_type`, `web_logs`.
+  `web_transport_status`, `web_logic_flow`, `web_node_find`, `web_node_tree`,
+  `web_component_get`, `web_component_get_all`, `web_component_list`, `web_logs`.
 - **Control** — `web_signal_set_bool`, `web_signal_set_float`, `web_drive_jog`,
   `web_drive_stop`, `web_drive_speed_override`, `web_sim_play_pause`, `web_sim_reset`,
-  `web_set_source_markers`.
-- **Screenshot** — `web_screenshot` (see below).
-- **Authoring** (Layout Planner) — `web_set_mode`, `web_library_list`,
-  `web_library_describe`, `web_place`, `web_move`, `web_remove`, `web_placement_list`,
-  `web_snap_list`, `web_snap_suggest`, `web_snap_attach`, `web_component_set`,
-  `web_scene_new`, `web_scene_save`, `web_scene_open`, `web_scene_list`,
-  `web_scene_export`.
+  `web_view_source_markers`.
+- **Screenshot** — `web_screenshot`, `web_screenshot_burst`, `web_screenshot_annotated`,
+  `web_screenshot_analyze` (see below).
+- **Authoring** (Layout Planner) — `web_mode_set`, `web_library_list`,
+  `web_library_describe`, `web_layout_place`, `web_layout_move`, `web_layout_remove`,
+  `web_layout_list`, `web_layout_snap_list`, `web_layout_snap_suggest`,
+  `web_layout_snap_attach`, `web_component_set`, `web_scene_new`, `web_scene_save`,
+  `web_scene_open`, `web_scene_list`, `web_scene_export`.
+- **Help** — `web_help(topic)` serves the deep workflow guides
+  (`src/plugins/mcp-bridge/help/*.md`) on demand; the always-loaded server
+  instructions stay a compact map.
+- **Perceive & navigate** (all modes) — `web_node_bounds`, `web_view_pick`,
+  `web_view_gaze`, `web_view_isolate`, `web_screenshot_annotated`, `web_camera_get`,
+  `web_camera_set`, `web_camera_focus`, `web_camera_orbit`, `web_select`,
+  `web_selection_get`, `web_select_similar`. Camera tools animate the REAL viewport
+  camera, so a watching user sees exactly what the agent looks at.
+- **Measure & analyse** (`McpObserveTools`, all read-only) — `web_measure` (pairwise
+  distances, per-axis gaps and AABB separation between parts), `web_node_shape` (PCA
+  shape class and the functional rotation axis of a part), `web_scene_query` (read-only
+  JavaScript over a frozen plain-data scene snapshot — the escape hatch for questions no
+  dedicated tool answers) and `web_render` (offscreen render from an arbitrary camera
+  pose, `beauty` or a flat-colored `idmask` segmentation view with a color→path legend,
+  never touching the user's viewport or selection).
+- **Asset Editor** — the `web_editor_*` family: lifecycle (`open`/`close`/`status`/
+  `undo`/`redo`/`save`/`import_glb`/`import_cad`), transform + pivot + structure +
+  component + signal + material primitives, the compounds `web_editor_kinematize` /
+  `web_editor_materialize` (one undo step each), and `web_editor_verify_drive`
+  (pose-sweep montage with exact restore). Every tool calls the same action functions
+  the Quick Edit / Materials panel buttons call, against the op-logged AssetDocument —
+  agent edits are undoable and reflected live in the UI.
+
+### Naming, description & response rules (enforced)
+
+Tool discoverability rules — linted by `tests/rv-mcp-tool-conventions.test.ts`
+(a new tool that violates them fails CI):
+
+- **Names**: `web_<domain>_<action>`, snake_case (auto-derived from the camelCase
+  method name). Approved domains: node, component, view, camera, select(ion),
+  screenshot, drive, signal, sensor, sim, transport, logic, mode, layout, library,
+  scene, editor, des, plc — extend the whitelist AND the domain table in
+  `webviewer.mcp.md` deliberately. Root-level tools (`web_status`, `web_logs`,
+  `web_errors`, `web_help`) are the fixed exceptions.
+- **Descriptions**: verb-first keyword sentence, then when-to-use (point to the
+  better sibling), units/gotchas, return shape. Budget ≤ ~110 words; deep lore
+  belongs in a `web_help` topic, not the description.
+- **Responses teach**: every error names the fix or the discovery tool that finds
+  valid input (e.g. "use web_layout_list"); workflow-tool successes carry one
+  `next` hint; plain reads stay hint-free.
+
+### Tool delegate architecture & per-tool timeouts
+
+Tools are declared browser-side via `@McpTool` decorators and merged from **five**
+delegate objects at `discover` time (`_sendDiscover` in
+`src/plugins/mcp-bridge-plugin.ts`): `McpBridgePlugin` itself (the historical set),
+`McpViewTools` (`rv-mcp-view-tools.ts`), `McpObserveTools` (`rv-mcp-observe-tools.ts` —
+`web_measure`, `web_node_shape`, `web_scene_query`, `web_render`), `McpEditorTools`
+(`rv-mcp-editor-tools.ts`) and `McpHelpTool` (`rv-mcp-help-tool.ts`), all under
+`src/plugins/mcp-bridge/`. The merge uses
+`generateToolSchemasMulti` / `buildMultiDispatcher` (`rv-mcp-tools.ts`) — decorator
+metadata is per-prototype, so splitting by delegate objects (not subclassing) is the
+supported pattern; duplicate tool names throw at discover time. `McpEditorTools`
+loads the asset-editor action modules via dynamic import so the editor stays a lazy
+chunk.
+
+Long-running tools declare `@McpTool(desc, { timeoutMs })`; the hint travels in the
+`discover` schema and **both** servers apply it per call, stripping it from the
+client-visible tool list. Default remains 15 s, capped at 600 s. Tools also declare
+`readOnly`, which travels as the standard MCP `annotations.readOnlyHint` and drives
+CONNECT's write gate (missing or `false` counts as writing). **The Node bridge must be
+rebuilt once (`npm run setup` in `mcp-bridge/`) after pulling this change** — an old
+bridge ignores the hints and long tools (e.g. `web_editor_verify_drive`,
+`web_screenshot_burst`) time out early. CONNECT embeds `webviewer.mcp.md` at build time,
+so changing that file requires a CONNECT rebuild.
 
 ### web_screenshot — full frame or cropped
 
@@ -152,31 +384,107 @@ whole view. It can also crop to a sub-region:
 ## Operating with and without Unity
 
 - **Standalone** — run the WebViewer dev server (`npm run dev`, `localhost:5173`) or a
-  built/deployed instance. The Node bridge connects Claude directly to the browser; no
-  Unity required.
-- **With Unity** — the Unity MCP server adds 80+ editor/scene tools. Point its
-  WebViewer bridge at port 18712 (Python) if you want Unity's MCP host to drive the
-  browser, or keep the browser on the Node bridge (18714/18715) for Claude.
+  built/deployed instance. CONNECT serves the `web_*` tools; no Unity required. Without a
+  CONNECT instance, fall back to the Node bridge as described under
+  *Falling back to the Node bridge*.
+- **With Unity** — the Unity MCP server adds its 80+ editor/scene tools on top. It does
+  **not** drive the browser: `web_*` stays with CONNECT, so both hosts can be registered
+  side by side without competing for the same tool names.
 
 ## Troubleshooting
 
 - **No `web_*` tools in the assistant.** The tools register only after the browser
   connects to the bridge. Confirm the AI Bridge panel shows *Connected* with an
   **AI client** and a non-zero tool count, and that the browser port matches the
-  client's bridge port. If the tools never appear, restart the AI client so it spawns
-  a fresh bridge.
+  client's bridge port. If the tools never appear, restart the AI client.
+
+- **Only some `web_*` tools appear.** CONNECT's write gate was closed (`McpAllowWrite=false`;
+  the default is `true`), so only tools annotated `readOnly` are listed. Re-enable it in the
+  tray — it protects against accidental mutation by an agent, not against a manipulated
+  browser.
+
+- **`/mcp` returns 404.** `McpEnabled` was switched off (the default is `true`). Enable it via
+  the tray icon and restart CONNECT.
+
+- **The browser cannot connect to CONNECT (401 / 403).** 401 means the request satisfied
+  neither half of the access rule — it did not come from CONNECT's own machine and carried no
+  valid key. For a remote HMI set the `?apikey=` token under the WS Realtime interface
+  settings (the same token `/ws` uses), or open the gateway once as `?apikey=<key>` to trade
+  it for a session cookie. 403 means the Origin **or** Host gate refused the page: loopback and
+  CONNECT's own pages pass, a foreign origin needs to be listed in `AllowedOrigins`, and the
+  `Host` header must name the machine — a loopback name, a bare IP address, or a configured
+  origin's host. A DNS name that is not configured is refused even from the same machine,
+  because that is what a rebinding attack looks like.
 
 - **"Connected" but no AI client.** The *Browser → Bridge* link is up but no live AI
   host is attached — the **AI client** row makes this explicit. Restart the AI client
-  (Claude Code reload / Claude Desktop restart) so a bridge with a live host owns the port.
+  (Claude Code reload / Claude Desktop restart).
 
-- **Port already in use.** Two AI clients cannot share one port. Give each its own
+- **Port already in use.** Two AI clients cannot share one Node bridge port. Give each its own
   `--web-port`. When a host quits or reloads, its bridge exits and releases the port,
   and a replacement binds it after a short retry — so a reload self-heals within a
-  few seconds.
+  few seconds. CONNECT behaves differently: it refuses to start on an occupied port rather
+  than drifting (see *Ports*).
 
 - **Wrong assistant is driving the browser.** Use **Connect to** in the AI Bridge
-  panel to point the browser at the intended client's port (Desktop / Code / Python).
+  panel to point the browser at the intended host (CONNECT / Node · Desktop / Node · Code).
+
+## Ask AI in the global search
+
+The global search bar (bottom center) can send the typed text as a free-text
+question to the machine documentation through CONNECT's RAG diagnosis endpoint
+(`POST {diagnoseUrl}/diagnose`, the same backend the `WebDiagnostics` error
+diagnosis uses — see [`doc-webviewer.md`](doc-webviewer.md)).
+
+- **Capability-gated.** An **Ask AI** button appears at the end of the expanded
+  search bar only when `diagnostics.diagnoseUrl` is configured in `settings.json`
+  AND the CONNECT gateway reports `diagnose: true` on `/health` at startup.
+  Without both, the search bar is a pure node search and knows nothing about
+  CONNECT. The probe runs once at init — a CONNECT started after realvirtual
+  needs a page reload. With the button present, the expanded bar widens to take
+  full typed questions.
+- **Explicit trigger only.** The AI request runs only on an **Ask AI** click
+  (disabled while the field is empty) — never on-type (CONNECT rate-limits
+  `/diagnose`). The instant node search stays synchronous and is never blocked
+  by the AI request.
+- **Answer dialog.** The answer opens as an *AI Assistant* dialog: a live
+  elapsed-seconds indicator while the documentation is searched (a RAG + LLM
+  answer typically takes 25–35 s), then typewriter-revealed **Answer** /
+  **Recommendation** sections plus cited PDF sources — each source is a page
+  deep-link into the embedded PDF viewer (relative source URLs are resolved
+  against the CONNECT base URL). On transient errors (rate limit, timeout,
+  network) a *Try again* button re-runs the question — successful answers are
+  deterministic backend-side, so there is no general re-run. Closing the
+  dialog aborts an in-flight request. The reveal respects
+  `prefers-reduced-motion`, and the content region announces itself to screen
+  readers (`role="status"`, `aria-live="polite"`).
+- **Keyboard route.** `/` (or Ctrl/Cmd+K) expands and focuses the global
+  search from anywhere — except while typing in another input field.
+
+### Model context in the answer
+
+Beyond the plain documentation search, an Ask AI request carries what only the
+digital twin knows about the current node, so answers combine the manual with the
+live machine state:
+
+- **Selection context.** With a node selected, the request adds its `nodePath`,
+  `docHints` (the exact PDFs linked to the node via `_rvPdfLinks`, node + parents)
+  and a compact, size-capped `machineContext` block — component type, whitelisted
+  rv_extras (e.g. Drive `TargetSpeed`/limits), current values of the node's signals,
+  and its active alarms. The backend gives the hinted documents a small retrieval
+  boost (never a hard filter) and injects the state block into the prompt as a
+  clearly delimited **data** block. A removable context chip in the dialog shows
+  the included node; removing it re-runs the question without context. An
+  expandable *Context sent* line shows exactly what travelled with the request.
+- **Query→part matching (no selection needed).** Even without a selection, the
+  docs of the top node search hits for the typed question are added as `docHints`,
+  so a question that names a part still gets a part-specific answer.
+- **Affected parts.** Each answer lists the scene nodes whose linked documentation
+  matches the cited sources as clickable **Affected parts** chips — clicking one
+  selects and focuses the part in 3D (the dialog stays open).
+- **Privacy switch.** Sending the live state to the (cloud) chat model can be
+  disabled operator-side with `Diagnosis:MachineContext=false` in CONNECT; the
+  documentation search still works, only the state block is suppressed.
 
 ## Related documentation
 

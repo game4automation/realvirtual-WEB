@@ -11,8 +11,14 @@
  *    fire tooltipStore.show() for each matched section.
  * 2. Generic PDF links: also checks node.userData._rvPdfLinks and auto-stacks
  *    a 'pdf' section at the bottom of the tooltip bubble.
- * 3. On selection: same pattern for pinned tooltips.
- * 4. Drive focus: separate useEffect for the drive-focus concept.
+ * 3. Drive focus: separate useEffect for the drive-focus concept.
+ * 4. 3D-click selection: pins tooltips for a limited time (PIN_AUTOHIDE_MS)
+ *    so links inside the tooltip (PDFs, documents) stay clickable.
+ *
+ * Selections that do NOT come from a 3D click (hierarchy row click, inspector)
+ * intentionally do not pin tooltips — the inspector already shows the data.
+ * The distinction is `selectionManager.lastHitPoint`, which only the 3D click
+ * path sets.
  *
  * Renders null — purely a state bridge, no UI.
  */
@@ -29,6 +35,10 @@ import { getCapabilities } from '../../engine/rv-component-registry';
 import type { TooltipData } from './tooltip-store';
 import type { PdfLink } from '../pdf-viewer-store';
 
+/** How long a 3D-click pinned tooltip stays before auto-hiding (ms). Long
+ *  enough to move the mouse over and click a PDF/document link. */
+const PIN_AUTOHIDE_MS = 10_000;
+
 /** Check if a node has generic PDF links attached. */
 function hasPdfLinks(node: import('three').Object3D): boolean {
   const links = node.userData?._rvPdfLinks as PdfLink[] | undefined;
@@ -42,6 +52,7 @@ export function GenericTooltipController() {
   const selection = useSelection();
   const prevHoverIds = useRef<string[]>([]);
   const prevPinnedIds = useRef<Set<string>>(new Set());
+  const pinAutohideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Hover: check ALL rv_extras keys on the resolved node ──
   useEffect(() => {
@@ -111,12 +122,13 @@ export function GenericTooltipController() {
   // ── Drive focus tooltip (unique to Drive — no other type has this concept) ──
   useEffect(() => {
     if (focus.drive && focus.node) {
-      const path = viewer.registry?.getPathForNode(focus.node) ?? focus.drive.name;
+      const nodePath = viewer.registry?.getPathForNode(focus.node) ?? undefined;
+      const path = nodePath ?? focus.drive.name;
       tooltipStore.show({
         id: 'drive-focus',
         lifecycle: 'hover',
         targetPath: path,
-        data: { type: 'drive', driveName: focus.drive.name },
+        data: { type: 'drive', driveName: focus.drive.name, nodePath },
         mode: 'world',
         worldTarget: focus.node,
         priority: 10,
@@ -126,65 +138,73 @@ export function GenericTooltipController() {
     }
   }, [focus.drive, focus.node, viewer]);
 
-  // ── Selection: pinned tooltips ──
+  // ── 3D-click selection: temporarily pinned tooltips ──
+  // Only selections made by clicking in the 3D scene pin tooltips (so PDF /
+  // document links inside stay reachable). Hierarchy or inspector selections
+  // don't set lastHitPoint and therefore never pin. Pins auto-hide after
+  // PIN_AUTOHIDE_MS unless the selection changes first.
   useEffect(() => {
+    if (pinAutohideTimer.current) { clearTimeout(pinAutohideTimer.current); pinAutohideTimer.current = null; }
     const newPinnedIds = new Set<string>();
+    const clickedIn3D = viewer.selectionManager?.lastHitPoint != null;
 
-    for (const path of selection.selectedPaths) {
-      const node = viewer.registry?.getNode(path);
-      if (!node) continue;
-      const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
+    if (clickedIn3D) {
+      for (const path of selection.selectedPaths) {
+        const node = viewer.registry?.getNode(path);
+        if (!node) continue;
+        const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
 
-      if (rv) {
-        for (const key of Object.keys(rv)) {
-          if (typeof rv[key] !== 'object') continue;
+        if (rv) {
+          for (const key of Object.keys(rv)) {
+            if (typeof rv[key] !== 'object') continue;
 
-          const caps = getCapabilities(key);
-          if (!caps.tooltipType) continue;
+            const caps = getCapabilities(key);
+            if (!caps.tooltipType) continue;
 
-          const resolver = tooltipRegistry.getDataResolver(caps.tooltipType);
-          if (!resolver) continue;
+            const resolver = tooltipRegistry.getDataResolver(caps.tooltipType);
+            if (!resolver) continue;
 
-          const data = resolver(node, viewer);
-          if (!data) continue;
+            const data = resolver(node, viewer);
+            if (!data) continue;
 
-          const pinId = `tooltip-pin:${caps.tooltipType}:${path}`;
-          newPinnedIds.add(pinId);
+            const pinId = `tooltip-pin:${caps.tooltipType}:${path}`;
+            newPinnedIds.add(pinId);
 
-          tooltipStore.show({
-            id: pinId,
-            lifecycle: 'pinned',
-            targetPath: path,
-            data: data as TooltipData,
-            mode: 'world',
-            worldTarget: node,
-            worldAnchor: viewer.selectionManager?.lastHitPoint
-              ? worldToLocal(viewer.selectionManager.lastHitPoint, node)
-              : undefined,
-            priority: caps.pinPriority ?? 3,
-          });
+            tooltipStore.show({
+              id: pinId,
+              lifecycle: 'pinned',
+              targetPath: path,
+              data: data as TooltipData,
+              mode: 'world',
+              worldTarget: node,
+              worldAnchor: viewer.selectionManager?.lastHitPoint
+                ? worldToLocal(viewer.selectionManager.lastHitPoint, node)
+                : undefined,
+              priority: caps.pinPriority ?? 3,
+            });
+          }
         }
-      }
 
-      // Generic PDF links — auto-stack at bottom of pinned tooltip
-      if (hasPdfLinks(node)) {
-        const pdfResolver = tooltipRegistry.getDataResolver('pdf');
-        const pdfData = pdfResolver?.(node, viewer);
-        if (pdfData) {
-          const pdfPinId = `tooltip-pin:pdf:${path}`;
-          newPinnedIds.add(pdfPinId);
-          tooltipStore.show({
-            id: pdfPinId,
-            lifecycle: 'pinned',
-            targetPath: path,
-            data: pdfData as TooltipData,
-            mode: 'world',
-            worldTarget: node,
-            worldAnchor: viewer.selectionManager?.lastHitPoint
-              ? worldToLocal(viewer.selectionManager.lastHitPoint, node)
-              : undefined,
-            priority: 1,
-          });
+        // Generic PDF links — auto-stack at bottom of pinned tooltip
+        if (hasPdfLinks(node)) {
+          const pdfResolver = tooltipRegistry.getDataResolver('pdf');
+          const pdfData = pdfResolver?.(node, viewer);
+          if (pdfData) {
+            const pdfPinId = `tooltip-pin:pdf:${path}`;
+            newPinnedIds.add(pdfPinId);
+            tooltipStore.show({
+              id: pdfPinId,
+              lifecycle: 'pinned',
+              targetPath: path,
+              data: pdfData as TooltipData,
+              mode: 'world',
+              worldTarget: node,
+              worldAnchor: viewer.selectionManager?.lastHitPoint
+                ? worldToLocal(viewer.selectionManager.lastHitPoint, node)
+                : undefined,
+              priority: 1,
+            });
+          }
         }
       }
     }
@@ -194,13 +214,43 @@ export function GenericTooltipController() {
       if (!newPinnedIds.has(oldId)) tooltipStore.hide(oldId);
     }
     prevPinnedIds.current = newPinnedIds;
+
+    // Auto-hide: the pins disappear after a while (nothing else clicked).
+    if (newPinnedIds.size > 0) {
+      pinAutohideTimer.current = setTimeout(() => {
+        pinAutohideTimer.current = null;
+        for (const id of prevPinnedIds.current) tooltipStore.hide(id);
+        prevPinnedIds.current = new Set();
+      }, PIN_AUTOHIDE_MS);
+    }
   }, [selection.selectedPaths, viewer]);
+
+  // ── Camera interaction dismisses pins ──
+  // As soon as the user starts orbiting/panning/zooming (controls 'start',
+  // fired on pointerdown on the canvas), any pinned tooltip is dismissed.
+  // This also guarantees the bubble (pointerEvents: auto) can never sit in
+  // the way of the NEXT drag gesture.
+  useEffect(() => {
+    const controls = viewer.controls as unknown as {
+      addEventListener?: (type: string, cb: () => void) => void;
+      removeEventListener?: (type: string, cb: () => void) => void;
+    } | undefined;
+    if (!controls?.addEventListener) return;
+    const onInteractStart = () => {
+      if (pinAutohideTimer.current) { clearTimeout(pinAutohideTimer.current); pinAutohideTimer.current = null; }
+      for (const id of prevPinnedIds.current) tooltipStore.hide(id);
+      prevPinnedIds.current = new Set();
+    };
+    controls.addEventListener('start', onInteractStart);
+    return () => controls.removeEventListener?.('start', onInteractStart);
+  }, [viewer]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
       for (const id of prevHoverIds.current) tooltipStore.hide(id);
       for (const id of prevPinnedIds.current) tooltipStore.hide(id);
+      if (pinAutohideTimer.current) clearTimeout(pinAutohideTimer.current);
     };
   }, []);
 

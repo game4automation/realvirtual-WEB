@@ -102,49 +102,30 @@ export function markNoAO(object: Object3D): void {
 /**
  * Tag a node and all descendants with ISOLATE_FOCUS_LAYER. Idempotent.
  *
- * Special-case `_rvStaticUberSource` meshes: the static uber merge collapses
- * many sources into chunks at scene root and hides the originals. A normal
- * `enable()` would tag the invisible originals — pass 3 (focus only) would
- * still skip them and the chunk lives outside the isolated subtree, so the
- * static-merged geometry of the isolated group never renders bright.
- *
- * Workaround: while isolated, restore the original mesh's visibility and
- * restrict it to ISOLATE_FOCUS_LAYER only (no layer 0). The mesh now renders
- * solely in pass 3; the chunk at scene root still renders only in pass 1
- * (dim backdrop). No double-render, no z-fighting.
- *
- * Saves prior `visible` and `layers.mask` under userData markers so
- * `untagIsolateSubtree()` can fully restore on deactivate.
+ * Batched render path: sources of BatchedMesh instances carry
+ * `layers.mask = 0` (not rendered normally). `layers.enable` gives them the
+ * focus bit, so isolated batch sources render individually — and in full
+ * color — in the focus pass (pass 3), while the arena keeps drawing the dim
+ * backdrop in pass 1. {@link untagIsolateSubtree}'s `layers.disable` restores
+ * the 0-mask exactly. No extra bookkeeping needed.
  */
 export function tagIsolateSubtree(root: Object3D): void {
   root.traverse(o => {
+    // BatchedMesh arenas never join the focus pass — their (mask-0) source
+    // meshes get the focus bit instead and render individually in pass 3.
+    // Tagging the arena too would double-draw the same geometry.
+    if (o.userData?._rvBatchedRender) return;
     o.layers.enable(ISOLATE_FOCUS_LAYER);
-    if (o.userData?._rvStaticUberSource && !o.userData._rvIsoTagged) {
-      o.userData._rvIsoSavedVisible = o.visible;
-      o.userData._rvIsoSavedLayerMask = o.layers.mask;
-      o.userData._rvIsoTagged = true;
-      o.visible = true;
-      o.layers.set(ISOLATE_FOCUS_LAYER);
-    }
   });
 }
 
 /**
- * Reverse of {@link tagIsolateSubtree}. Removes ISOLATE_FOCUS_LAYER from every
- * descendant and restores any saved visibility/layer mask on
- * `_rvStaticUberSource` meshes that were forced visible during isolate.
+ * Reverse of {@link tagIsolateSubtree}. Removes ISOLATE_FOCUS_LAYER from
+ * every descendant.
  */
 export function untagIsolateSubtree(root: Object3D): void {
   root.traverse(o => {
-    if (o.userData._rvIsoTagged) {
-      o.visible = o.userData._rvIsoSavedVisible as boolean;
-      o.layers.mask = o.userData._rvIsoSavedLayerMask as number;
-      delete o.userData._rvIsoTagged;
-      delete o.userData._rvIsoSavedVisible;
-      delete o.userData._rvIsoSavedLayerMask;
-    } else {
-      o.layers.disable(ISOLATE_FOCUS_LAYER);
-    }
+    o.layers.disable(ISOLATE_FOCUS_LAYER);
   });
 }
 
@@ -185,7 +166,9 @@ export class GroupRegistry {
   /**
    * Register a node under a group name.
    * If the group does not exist yet, it is created with visible=true.
-   * If the group already exists, the node is added to its nodes list.
+   * If the group already exists, the node is added to its nodes list
+   * (deduplicated — registering the same node twice is a no-op) and the
+   * group's current visibility is applied to the new root.
    */
   register(resolvedName: string, node: Object3D): void {
     let group = this._groups.get(resolvedName);
@@ -193,7 +176,42 @@ export class GroupRegistry {
       group = { name: resolvedName, nodes: [], visible: true };
       this._groups.set(resolvedName, group);
     }
+    if (group.nodes.includes(node)) return;
     group.nodes.push(node);
+    if (!group.visible) node.visible = false;
+  }
+
+  /**
+   * Remove a node from a group (live-edit path — the editor removed a Group
+   * component). Restores `node.visible = true` if the group was hidden.
+   * When the group's node list empties, the group entry is deleted (clearing
+   * isolate state if it was the isolated group, and its kinematic mark).
+   * Returns true when something changed.
+   */
+  unregister(resolvedName: string, node: Object3D): boolean {
+    const group = this._groups.get(resolvedName);
+    if (!group) return false;
+    const idx = group.nodes.indexOf(node);
+    if (idx === -1) return false;
+    group.nodes.splice(idx, 1);
+    if (!group.visible) node.visible = true;
+    if (group.nodes.length === 0) {
+      if (this._isolateActiveName === resolvedName) {
+        this._clearIsolateState();
+      }
+      this._groups.delete(resolvedName);
+      this._kinematicGroups.delete(resolvedName);
+    }
+    return true;
+  }
+
+  /** Names of all groups that contain the given node, sorted alphabetically. */
+  getGroupNamesForNode(node: Object3D): string[] {
+    const names: string[] = [];
+    for (const group of this._groups.values()) {
+      if (group.nodes.includes(node)) names.push(group.name);
+    }
+    return names.sort();
   }
 
   /** Get all groups as an array, sorted alphabetically by name. */

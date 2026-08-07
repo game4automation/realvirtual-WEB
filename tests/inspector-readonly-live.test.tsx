@@ -86,6 +86,24 @@ describe('ComponentSection — readOnlyLive', () => {
     expect(onClick).toHaveBeenCalledTimes(1);
   });
 
+  it('activates role=button cells with Enter and Space', () => {
+    const onClick = vi.fn();
+    renderReadOnlyLive({ 'Paired with': runtimeRow('RollConveyor-3m_2', { onClick }) });
+
+    const valueButton = screen.getByRole('button', { name: 'RollConveyor-3m_2' });
+    expect(valueButton.getAttribute('tabindex')).toBe('0');
+    fireEvent.keyDown(valueButton, { key: 'Enter' });
+    fireEvent.keyDown(valueButton, { key: ' ' });
+    expect(onClick).toHaveBeenCalledTimes(2);
+
+    const sectionButton = screen.getByRole('button', { name: 'CONVEYOR' });
+    expect(sectionButton.getAttribute('tabindex')).toBe('0');
+    fireEvent.keyDown(sectionButton, { key: 'Enter' });
+    expect(screen.queryByText('RollConveyor-3m_2')).toBeNull();
+    fireEvent.keyDown(sectionButton, { key: ' ' });
+    expect(screen.getByText('RollConveyor-3m_2')).toBeTruthy();
+  });
+
   it('hides field underscore-prefixed internal keys', () => {
     renderReadOnlyLive({ Type: runtimeRow('roller'), _internal: runtimeRow('hidden') });
     expect(screen.getByText('Type')).toBeTruthy();

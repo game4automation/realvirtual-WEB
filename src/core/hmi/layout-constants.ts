@@ -40,6 +40,24 @@ export const LEFT_PANEL_ZINDEX = 1200;
  */
 export const LEFT_PANEL_MOBILE_ZINDEX = 10000;
 
+/**
+ * Z-index of the full-screen Projects dashboard (plan-372 §2.14).
+ *
+ * It covers the viewport and every docked panel, so it must sit above the
+ * mobile panel layer — otherwise a left panel left open before the dashboard
+ * was invoked would punch through it. It deliberately stays *below*
+ * {@link MOBILE_CHROME_ZINDEX}: the mobile ActivityBar pill is the only way
+ * back out on a phone, so it has to remain reachable.
+ */
+export const PROJECTS_DASHBOARD_ZINDEX = 10500;
+
+/**
+ * Z-index of the mobile chrome that must stay usable above the dashboard —
+ * today the ActivityBar pill. Being trapped in a full-screen overlay with no
+ * visible exit is the failure this constant exists to prevent.
+ */
+export const MOBILE_CHROME_ZINDEX = 10600;
+
 /** Width of the Settings panel. */
 export const SETTINGS_PANEL_WIDTH = 540;
 
@@ -64,13 +82,86 @@ export const SCENE_PANEL_WIDTH = 340;
 /** Width of the Order Manager panel. */
 export const ORDER_PANEL_WIDTH = 320;
 
-/** Width of the CONNECT panel. */
+/** Width of the Annotations panel — shared by the panel itself and the
+ *  ActivityBar toggle that registers the slot, so the reserved viewport inset
+ *  always matches the width the panel actually renders with. */
+export const ANNOTATION_PANEL_WIDTH = 280;
+
+/** Default width of the editor's Kinematics window (right-docked, resizable). */
+export const KINEMATICS_PANEL_WIDTH = 340;
+
+/** Resize bounds for the Kinematics window. */
+export const KINEMATICS_PANEL_MIN_WIDTH = 300;
+export const KINEMATICS_PANEL_MAX_WIDTH = 560;
+
+/** localStorage key for the user-resized Kinematics window width. */
+export const LS_KEY_KINEMATICS_PANEL_WIDTH = 'rv-kinematics-panel-width';
+
+/** Materials window — wider default than Quick Edit to fit the swatch grid. */
+export const MATERIALS_PANEL_WIDTH = 360;
+export const MATERIALS_PANEL_MIN_WIDTH = 300;
+export const MATERIALS_PANEL_MAX_WIDTH = 560;
+export const LS_KEY_MATERIALS_PANEL_WIDTH = 'rv-materials-panel-width';
+
+export function getStoredMaterialsPanelWidth(): number {
+  try {
+    const raw = localStorage.getItem(LS_KEY_MATERIALS_PANEL_WIDTH);
+    if (raw) {
+      const n = Number(raw);
+      if (Number.isFinite(n)) {
+        return Math.max(MATERIALS_PANEL_MIN_WIDTH, Math.min(MATERIALS_PANEL_MAX_WIDTH, n));
+      }
+    }
+  } catch { /* storage unavailable — fall through to the default */ }
+  return MATERIALS_PANEL_WIDTH;
+}
+
+/** The Kinematics window width to use right now: the user's persisted resize
+ *  (clamped to the bounds) or the default. Shared by the panel and its
+ *  toolbar toggle so the viewport shift always matches the rendered width. */
+export function getStoredKinematicsPanelWidth(): number {
+  try {
+    const raw = localStorage.getItem(LS_KEY_KINEMATICS_PANEL_WIDTH);
+    if (raw != null) {
+      const n = Number(raw);
+      if (!Number.isNaN(n))
+        return Math.max(KINEMATICS_PANEL_MIN_WIDTH, Math.min(KINEMATICS_PANEL_MAX_WIDTH, n));
+    }
+  } catch { /* storage unavailable — fall through to default */ }
+  return KINEMATICS_PANEL_WIDTH;
+}
+
+/** Default width of the CONNECT panel (resizable — see getStoredConnectPanelWidth). */
 export const CONNECT_PANEL_WIDTH = 360;
+
+/** Resize bounds for the CONNECT panel (LeftPanel resizable range, hierarchy-browser convention). */
+export const CONNECT_PANEL_MIN_WIDTH = 280;
+export const CONNECT_PANEL_MAX_WIDTH = 640;
+
+/** localStorage key for the user-resized CONNECT panel width. */
+export const LS_KEY_CONNECT_PANEL_WIDTH = 'rv-connect-panel-width';
+
+/**
+ * The CONNECT panel width to use right now: the user's persisted resize (clamped to the bounds)
+ * or the default. Shared by the panel itself and by connect-plugin's open/toggle call so the
+ * viewport shift (LeftPanelManager) always matches the rendered width.
+ */
+export function getStoredConnectPanelWidth(): number {
+  try {
+    const raw = localStorage.getItem(LS_KEY_CONNECT_PANEL_WIDTH);
+    if (raw != null) {
+      const n = Number(raw);
+      if (!Number.isNaN(n))
+        return Math.max(CONNECT_PANEL_MIN_WIDTH, Math.min(CONNECT_PANEL_MAX_WIDTH, n));
+    }
+  } catch { /* storage unavailable — fall through to default */ }
+  return CONNECT_PANEL_WIDTH;
+}
 
 // ── Property-Inspector row layout ───────────────────────────────────────────
 // Shared dimensions for the uniform `label → field` grid used by every
 // inspector row (see rv-inspector-row.tsx). A scalar row is a 4-track grid:
-//   [dot gutter] [label ≤40%] [flexible gap] [field ≤40%]
+//   [dot gutter] [label ≤40%] [flexible gap] [field ≤50%]
 // so the label hugs the left, the field hugs the right, and both columns line
 // up across every row regardless of label length.
 
@@ -81,7 +172,7 @@ export const INSPECTOR_DOT_GUTTER = 14;
 export const INSPECTOR_LABEL_MAX = '40%';
 
 /** Max width of the scalar field column (CSS %). */
-export const INSPECTOR_FIELD_MAX = '40%';
+export const INSPECTOR_FIELD_MAX = '50%';
 
 /** Floor (px) so the field column stays usable on a 240px-wide panel. */
 export const INSPECTOR_FIELD_MIN = 72;

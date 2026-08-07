@@ -137,6 +137,17 @@ export class RVDrivesPlayback {
     return this._isPlaying;
   }
 
+  get boundDrives(): readonly (RVDrive | null)[] {
+    return this.driveBindings;
+  }
+
+  private get _liveControlled(): boolean {
+    for (const drive of this.driveBindings) {
+      if (drive?.liveControlled) return true;
+    }
+    return false;
+  }
+
   get loop(): boolean {
     return this._loop;
   }
@@ -165,12 +176,16 @@ export class RVDrivesPlayback {
 
   /** Start playback — enables positionOverwrite on all bound drives.
    *  Skips drives with isOwner=false (multiuser: server has authority). */
-  play(): void {
-    if (this.recording.numberFrames <= 0) return;
+  play(): boolean {
+    if (this.recording.numberFrames <= 0) return false;
+    if (this._liveControlled) {
+      debug('playback', 'play() skipped - a recorded drive is live-controlled');
+      return false;
+    }
     // Don't start if drives are not owned (multiuser client mode)
     if (this.driveBindings.some(d => d && !d.isOwner)) {
       debug('playback', 'play() skipped — drives are not owned (multiuser client mode)');
-      return;
+      return false;
     }
     this._isPlaying = true;
     this._pendingRelease = false;
@@ -180,6 +195,7 @@ export class RVDrivesPlayback {
     }
     this.applyFrame(this.currentFrame);
     debug('playback', `play() from frame ${this._startFrame}, loop=${this._loop}`);
+    return true;
   }
 
   /** Stop playback — disables positionOverwrite */
@@ -200,6 +216,10 @@ export class RVDrivesPlayback {
 
   /** Play a named sequence (non-looping). Used by RVReplayRecording. */
   playSequence(name: string): boolean {
+    if (this._liveControlled) {
+      debug('playback', `playSequence("${name}") skipped - a recorded drive is live-controlled`);
+      return false;
+    }
     const seq = this.recording.sequences?.find((s) => s.name === name);
     if (!seq) {
       debugWarn('playback', `Sequence "${name}" not found`);
@@ -229,6 +249,23 @@ export class RVDrivesPlayback {
     }
     this.applyFrame(this.currentFrame);
     return true;
+  }
+
+  /**
+   * Release all recorded drives as one unit while any is live-controlled.
+   * Called every fixed tick independently of playback and ActiveOnly state.
+   * Frame and accumulator remain unchanged so playback can resume later.
+   */
+  syncLiveControl(): void {
+    if (!this._liveControlled) return;
+    if (!this._isPlaying && !this._pendingRelease && !this._holdsOverwrite()) return;
+
+    this._isPlaying = false;
+    this._pendingRelease = false;
+    for (const drive of this.driveBindings) {
+      if (drive) drive.positionOverwrite = false;
+    }
+    debug('playback', 'Released all recorded drives for live control');
   }
 
   /** Seek to a specific percentage (0..1) */
@@ -302,6 +339,13 @@ export class RVDrivesPlayback {
         drive.currentPosition = positions[offset + i];
       }
     }
+  }
+
+  private _holdsOverwrite(): boolean {
+    for (const drive of this.driveBindings) {
+      if (drive?.positionOverwrite) return true;
+    }
+    return false;
   }
 
   /** Validate recording data integrity */

@@ -3,40 +3,20 @@
 
 import type { Object3D } from 'three';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponentSchema } from './rv-component-registry';
+import { registerComponentSchema, loadSchemaFromSpec } from './rv-component-registry';
 import { RVDrive } from './rv-drive';
 import { NodeRegistry } from './rv-node-registry';
 import { debug } from './rv-debug';
+import { createSignalWriter } from './rv-signal-store';
 
-/**
- * RVDriveCylinder — TypeScript port of Drive_Cylinder.cs
- *
- * Pneumatic/hydraulic cylinder: extends to MaxPos on Out signal, retracts to MinPos on In signal.
- * Speed = stroke / time. Supports OneBitCylinder mode (single signal toggles direction)
- * and InvertOutputLogic. Writes feedback signals for position state.
- */
+/** Two-position pneumatic/hydraulic drive behavior. */
 export class RVDriveCylinder implements RVComponent {
-  static readonly schema: ComponentSchema = {
-    MinPos: { type: 'number', default: 0 },
-    MaxPos: { type: 'number', default: 100 },
-    TimeOut: { type: 'number', default: 1 },
-    TimeIn: { type: 'number', default: 1 },
-    OneBitCylinder: { type: 'boolean', default: false },
-    InvertOutputLogic: { type: 'boolean', default: false },
-    Out: { type: 'componentRef' },
-    In: { type: 'componentRef' },
-    IsOut: { type: 'componentRef' },
-    IsIn: { type: 'componentRef' },
-    IsMax: { type: 'componentRef' },
-    IsMin: { type: 'componentRef' },
-    IsMovingOut: { type: 'componentRef' },
-    IsMovingIn: { type: 'componentRef' },
-  };
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('Drive_Cylinder');
 
   readonly node: Object3D;
   isOwner = true;
+  liveControlled = false;
 
-  // Schema properties (PascalCase matching C#)
   MinPos = 0;
   MaxPos = 100;
   TimeOut = 1;
@@ -44,7 +24,6 @@ export class RVDriveCylinder implements RVComponent {
   OneBitCylinder = false;
   InvertOutputLogic = false;
 
-  // ComponentRef → resolved to signal address strings
   Out: string | null = null;
   In: string | null = null;
   IsOut: string | null = null;
@@ -54,115 +33,137 @@ export class RVDriveCylinder implements RVComponent {
   IsMovingOut: string | null = null;
   IsMovingIn: string | null = null;
 
+  private drive: RVDrive | null = null;
+  private feedbackCb: ((drive: RVDrive) => void) | null = null;
+  private readonly feedbackListeners: (() => void)[] = [];
+
   constructor(node: Object3D) {
     this.node = node;
   }
 
+  commandOut(value: boolean | number): void {
+    const drive = this.drive;
+    if (!drive) return;
+    let active = value === true;
+    if (this.InvertOutputLogic) active = !active;
+    const stroke = Math.abs(this.MaxPos - this.MinPos);
+    if (this.OneBitCylinder) {
+      drive.targetSpeed = stroke / (active ? this.TimeOut : this.TimeIn);
+      drive.startMove(active ? this.MaxPos : this.MinPos);
+      return;
+    }
+    if (active) {
+      drive.targetSpeed = stroke / this.TimeOut;
+      drive.startMove(this.MaxPos);
+    }
+  }
+
+  commandIn(value: boolean | number): void {
+    const drive = this.drive;
+    if (!drive || this.OneBitCylinder) return;
+    let active = value === true;
+    if (this.InvertOutputLogic) active = !active;
+    if (!active) return;
+    drive.targetSpeed = Math.abs(this.MaxPos - this.MinPos) / this.TimeIn;
+    drive.startMove(this.MinPos);
+  }
+
+  neutralizeOut(): void { this.drive?.stop(); }
+  neutralizeIn(): void { this.drive?.stop(); }
+
+  addFeedbackListener(cb: () => void): void {
+    if (!this.feedbackListeners.includes(cb)) this.feedbackListeners.push(cb);
+  }
+
+  removeFeedbackListener(cb: () => void): void {
+    const index = this.feedbackListeners.indexOf(cb);
+    if (index >= 0) this.feedbackListeners.splice(index, 1);
+  }
+
+  readFeedbackSlot(slot: string): boolean | number {
+    const drive = this.drive;
+    if (!drive) return false;
+    const atMax = Math.abs(drive.currentPosition - this.MaxPos) < 0.01;
+    const atMin = Math.abs(drive.currentPosition - this.MinPos) < 0.01;
+    if (slot === 'IsOut' || slot === 'IsMax') return atMax;
+    if (slot === 'IsIn' || slot === 'IsMin') return atMin;
+    if (slot === 'IsMovingOut') return drive.isRunning && drive.targetPosition === this.MaxPos;
+    if (slot === 'IsMovingIn') return drive.isRunning && drive.targetPosition === this.MinPos;
+    throw new Error(`[Drive_Cylinder] Unknown feedback slot "${slot}"`);
+  }
+
   init(context: ComponentContext): void {
     const path = NodeRegistry.computeNodePath(this.node);
+    const writer = createSignalWriter(
+      context.signalStore,
+      `component:Drive_Cylinder:${path}`,
+      'component',
+      { slotContext: path },
+    );
     const drive = context.registry.getByPath<RVDrive>('Drive', path);
     if (!drive) return;
+    this.drive = drive;
 
     const minPos = this.MinPos;
     const maxPos = this.MaxPos;
-    const timeOut = this.TimeOut;
-    const timeIn = this.TimeIn;
-    const oneBit = this.OneBitCylinder;
-    const invertLogic = this.InvertOutputLogic;
-    const stroke = Math.abs(maxPos - minPos);
+    debug('loader', `Drive_Cylinder "${drive.name}": min=${minPos} max=${maxPos} timeOut=${this.TimeOut}s timeIn=${this.TimeIn}s oneBit=${this.OneBitCylinder} invert=${this.InvertOutputLogic}`);
 
-    debug('loader', `Drive_Cylinder "${drive.name}": min=${minPos} max=${maxPos} timeOut=${timeOut}s timeIn=${timeIn}s oneBit=${oneBit} invert=${invertLogic}`);
-
-    // Set initial position
     drive.currentPosition = minPos;
     drive.applyToNode();
 
-    // Out signal subscription
     if (this.Out) {
-      const addr = this.Out;
-      context.signalStore.subscribeByPath(addr, (value) => {
-        let outVal = value === true;
-        if (invertLogic) outVal = !outVal;
-        if (oneBit) {
-          if (outVal) {
-            drive.targetSpeed = stroke / timeOut;
-            drive.startMove(maxPos);
-            debug('drive', `Cylinder "${drive.name}": OUT → ${maxPos}mm at ${drive.targetSpeed.toFixed(0)}mm/s`);
-          } else {
-            drive.targetSpeed = stroke / timeIn;
-            drive.startMove(minPos);
-            debug('drive', `Cylinder "${drive.name}": IN → ${minPos}mm at ${drive.targetSpeed.toFixed(0)}mm/s`);
-          }
-        } else {
-          if (outVal) {
-            drive.targetSpeed = stroke / timeOut;
-            drive.startMove(maxPos);
-            debug('drive', `Cylinder "${drive.name}": OUT → ${maxPos}mm at ${drive.targetSpeed.toFixed(0)}mm/s`);
-          }
-        }
-      });
-      debug('loader', `  Drive_Cylinder "${drive.name}": Out signal="${addr}"`);
+      const address = this.Out;
+      context.signalStore.subscribeByPath(address, (value) => this.commandOut(value));
+      debug('loader', `  Drive_Cylinder "${drive.name}": Out signal="${address}"`);
+    }
+    if (this.In && !this.OneBitCylinder) {
+      const address = this.In;
+      context.signalStore.subscribeByPath(address, (value) => this.commandIn(value));
+      debug('loader', `  Drive_Cylinder "${drive.name}": In signal="${address}"`);
     }
 
-    // In signal subscription (only when NOT oneBit)
-    if (this.In && !oneBit) {
-      const addr = this.In;
-      context.signalStore.subscribeByPath(addr, (value) => {
-        let inVal = value === true;
-        if (invertLogic) inVal = !inVal;
-        if (inVal) {
-          drive.targetSpeed = stroke / timeIn;
-          drive.startMove(minPos);
-        }
-      });
-      debug('loader', `  Drive_Cylinder "${drive.name}": In signal="${addr}"`);
-    }
-
-    // Feedback signals
     const feedbackRefs: { key: string; addr: string }[] = [];
-    for (const [key, addr] of [
+    for (const [key, address] of [
       ['IsOut', this.IsOut], ['IsIn', this.IsIn],
       ['IsMax', this.IsMax], ['IsMin', this.IsMin],
       ['IsMovingOut', this.IsMovingOut], ['IsMovingIn', this.IsMovingIn],
     ] as [string, string | null][]) {
-      if (addr) {
-        feedbackRefs.push({ key, addr });
-        debug('loader', `  Drive_Cylinder "${drive.name}": ${key} feedback="${addr}"`);
+      if (address) feedbackRefs.push({ key, addr: address });
+    }
+
+    const feedback = new Map(feedbackRefs.map((entry) => [entry.key, entry.addr]));
+    let previousOut = false;
+    let previousIn = true;
+    this.feedbackCb = () => {
+      const atMax = Boolean(this.readFeedbackSlot('IsMax'));
+      const atMin = Boolean(this.readFeedbackSlot('IsMin'));
+      const movingOut = Boolean(this.readFeedbackSlot('IsMovingOut'));
+      const movingIn = Boolean(this.readFeedbackSlot('IsMovingIn'));
+      if (atMax !== previousOut) {
+        if (feedback.has('IsOut')) writer.setByPath(feedback.get('IsOut')!, atMax);
+        if (feedback.has('IsMax')) writer.setByPath(feedback.get('IsMax')!, atMax);
+        previousOut = atMax;
       }
-    }
+      if (atMin !== previousIn) {
+        if (feedback.has('IsIn')) writer.setByPath(feedback.get('IsIn')!, atMin);
+        if (feedback.has('IsMin')) writer.setByPath(feedback.get('IsMin')!, atMin);
+        previousIn = atMin;
+      }
+      if (feedback.has('IsMovingOut')) writer.setByPath(feedback.get('IsMovingOut')!, movingOut);
+      if (feedback.has('IsMovingIn')) writer.setByPath(feedback.get('IsMovingIn')!, movingIn);
+      for (let i = 0; i < this.feedbackListeners.length; i++) this.feedbackListeners[i]();
+    };
+    drive.addAfterUpdate(this.feedbackCb);
+  }
 
-    if (feedbackRefs.length > 0) {
-      const fbMap = new Map(feedbackRefs.map(f => [f.key, f.addr]));
-      let prevIsOut = false;
-      let prevIsIn = true;
-
-      drive.onAfterUpdate = (d) => {
-        const atMax = Math.abs(d.currentPosition - maxPos) < 0.01;
-        const atMin = Math.abs(d.currentPosition - minPos) < 0.01;
-        const isOut = atMax;
-        const isIn = atMin;
-        const movingOut = d.isRunning && d.targetPosition === maxPos;
-        const movingIn = d.isRunning && d.targetPosition === minPos;
-
-        if (isOut !== prevIsOut) {
-          debug('drive', `Cylinder "${d.name}" IsOut changed: ${prevIsOut}→${isOut} (pos=${d.currentPosition.toFixed(4)}, maxPos=${maxPos}, overwrite=${d.positionOverwrite})`);
-          if (fbMap.has('IsOut')) context.signalStore.setByPath(fbMap.get('IsOut')!, isOut);
-          if (fbMap.has('IsMax')) context.signalStore.setByPath(fbMap.get('IsMax')!, atMax);
-          prevIsOut = isOut;
-        }
-        if (isIn !== prevIsIn) {
-          if (fbMap.has('IsIn')) context.signalStore.setByPath(fbMap.get('IsIn')!, isIn);
-          if (fbMap.has('IsMin')) context.signalStore.setByPath(fbMap.get('IsMin')!, atMin);
-          prevIsIn = isIn;
-        }
-        if (fbMap.has('IsMovingOut')) context.signalStore.setByPath(fbMap.get('IsMovingOut')!, movingOut);
-        if (fbMap.has('IsMovingIn')) context.signalStore.setByPath(fbMap.get('IsMovingIn')!, movingIn);
-      };
-    }
+  dispose(): void {
+    if (this.drive && this.feedbackCb) this.drive.removeAfterUpdate(this.feedbackCb);
+    this.feedbackCb = null;
+    this.drive = null;
+    this.feedbackListeners.length = 0;
   }
 }
 
-// Register schema for auto-derivation of CONSUMED fields
 registerComponentSchema('Drive_Cylinder', RVDriveCylinder.schema, {
   badgeColor: '#29b6f6',
 });

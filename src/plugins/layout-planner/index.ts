@@ -44,19 +44,18 @@ import type { ProcessExtrasResult } from '../../core/engine/rv-scene-loader';
 import type { RVViewer } from '../../core/rv-viewer';
 import type { UISlotEntry, UISlotProps } from '../../core/rv-ui-plugin';
 import type { RvExtrasEditorPlugin } from '../../core/hmi/rv-extras-editor';
-import type { HighlightStyle } from '../../core/engine/rv-highlight-manager';
-import { DEFAULT_SELECTION_STYLE } from '../../core/engine/rv-highlight-manager';
 import type { SelectionSnapshot } from '../../core/engine/rv-selection-manager';
-import type { OutlineStyle } from '../../core/engine/rv-outline-manager';
-import { DEFAULT_HOVER_OUTLINE_STYLE } from '../../core/engine/rv-outline-manager';
 import {
   LayoutStore,
   serializeLayout,
-  deserializeLayout,
   isGitHubCatalogUrl,
   type PlacedComponent,
   type LibraryCatalogEntry,
+  type SignalMapping,
 } from './rv-layout-store';
+import { getLibraryStore } from '../../core/library/library-store-singleton';
+import { getConnectSnapshot, subscribeConnectStore } from '../../core/hmi/connect-store';
+import { mergeWithAutoBinds, type AutoBindSignal } from '../signal-bind/auto-bind';
 import {
   getWorkFolder,
   requestWriteAccess,
@@ -72,8 +71,6 @@ export type { PlacementsSnapshot } from '../../core/rv-shared-types';
 import type { PlacementsSnapshot } from '../../core/rv-shared-types';
 import { ModelCache, dropToSurface, dropPivotToSurface, collectDropTargets } from './model-cache';
 import { GhostManager, buildVirtualNode } from './ghost-manager';
-import { ThumbnailRenderer } from './thumbnail-renderer';
-import { ThumbnailCache } from './thumbnail-cache';
 import { FloorGizmo } from './floor-gizmo';
 import { markNoAO } from '../../core/engine/rv-group-registry';
 import {
@@ -83,8 +80,21 @@ import {
   resolveUniqueName as smResolveUniqueName,
   placeAtSnapPoint as smPlaceAtSnapPoint,
   markSnapOccupied as smMarkSnapOccupied,
+  swapPlacedGeometry as smSwapPlacedGeometry,
   type SceneMutationDeps,
+  type PlacementRegistrationMode,
 } from './scene-mutations';
+import {
+  buildPlaceholderNode,
+  disposePlaceholderNode,
+  isPlaceholderNode,
+  setPlaceholderError,
+  resolvePlaceholderSizeMm,
+  type PlaceholderNode,
+} from './placeholder-node';
+import { PendingGeometryRegistry } from './pending-geometry';
+import { PendingPulseController } from './pending-pulse';
+import type { MatchMediaFn } from '../signal-bind/conflict-blink';
 import type { SnapPoint, PlacedComponentId } from '../../core/engine/rv-snap-point-registry';
 import type { SnapPointPlugin } from '../snap-point';
 import { findBestGhostSnap, applyGhostSnapAlignment, type GhostSnapMatch } from '../snap-point/ghost-snap-match';
@@ -108,8 +118,12 @@ import { MultiSelectPivot, type MultiSelectPivotDeps } from './multi-select-pivo
 import { BoxSelectController } from './box-select-controller';
 
 // UI components for slot registration
-import { LayoutLibraryPanel } from './LayoutLibraryPanel';
+// The library panel is code-split (plan-344 Phase 4); the host is the tiny
+// always-mounted gate that pulls its chunk on the first open.
+import { LayoutLibraryPanelHost } from './LayoutLibraryPanelHost';
+import { PendingLoadMessage } from './PendingLoadMessage';
 import { PlannerGridButton, PlannerDropToSurfaceButton, PlannerDeleteButton, PlannerSnapButton, PlannerChainModeButton, PlannerVanishMUsButton, PlannerDocModeButton, PlannerUndoButton, PlannerRedoButton, PlannerLibraryButton } from './PlannerToolbarButtons';
+import { SignalBadgeController } from '../signal-bind/SignalBadgeController';
 import { BboxSnapController } from './bbox-snap';
 import { showInfoOverlay, hideInfoOverlay } from '../../core/hmi/info-overlay-store';
 import { freshOpId as opId } from '../../core/hmi/scene/rv-scene-edits';
@@ -381,7 +395,7 @@ import type {
 // Re-export everything that tests and UI components need
 export { ModelCache, unwrapGltfRoot, pivotToFloorCenter, alignToFloor, dropToSurface, dropPivotToSurface } from './model-cache';
 export { GhostManager } from './ghost-manager';
-export { ThumbnailRenderer } from './thumbnail-renderer';
+export { ThumbnailRenderer } from '../../core/thumbnails/thumbnail-renderer';
 export {
   LayoutStore,
   snapToGrid,
@@ -416,65 +430,9 @@ import { tooltipStore } from '../../core/hmi/tooltip/tooltip-store';
 import type { RVMovingUnit } from '../../core/engine/rv-mu';
 
 // ─── Planner-mode highlight styles ─────────────────────────────────────
-
-/**
- * Selection-style override applied while planner mode is active.
- * Mutes the default RVHighlightManager selection visual entirely —
- * the planner replaces it with a post-process OutlinePass (see
- * PLANNER_OUTLINE_STYLE below). Both overlay and edges suppressed.
- */
-const PLANNER_SELECTION_MUTE_STYLE: HighlightStyle = {
-  ...DEFAULT_SELECTION_STYLE,
-  showOverlay: false,
-  showEdges: false,
-};
-
-/** Hover style applied while planner mode is active. On WebGL the hovered
- *  object is drawn as a vivid-green OutlinePass silhouette (edgeColor) — the
- *  same green as the selection outline, so the focused object always reads as
- *  "green" whether hovered or selected. The overlay fields only matter on the
- *  WebGPU fallback or for fully static-merged objects (no visible mesh to
- *  outline). */
-const PLANNER_HOVER_STYLE: HighlightStyle = {
-  overlayColor: 0x4fc34f,
-  overlayOpacity: 0.10,
-  overlayWireframe: false,
-  edgeColor: 0x4fc34f,
-  edgeOpacity: 0,
-  edgeLinewidth: 1,
-  showOverlay: true,
-  showEdges: false,
-};
-
-/**
- * OutlinePass parameters applied while planner mode is active.
- * Drives the green silhouette around selected layout instances and the
- * placement-preview ghost. Quiet glow, crisp edge.
- */
-const PLANNER_OUTLINE_STYLE: OutlineStyle = {
-  visibleEdgeColor: 0x4fc34f,
-  hiddenEdgeColor: 0x2a6b2a,
-  edgeStrength: 4,
-  edgeThickness: 2,
-  edgeGlow: 0.3,
-  pulsePeriod: 0,
-};
-
-/**
- * OutlinePass parameters for the planner-mode HOVER channel. Deliberately
- * less intense than PLANNER_OUTLINE_STYLE (the selection silhouette): a softer,
- * darker green at lower edge strength/glow so a hovered object reads as a hint
- * while the selected object clearly dominates. Restored to
- * DEFAULT_HOVER_OUTLINE_STYLE on planner exit so HMI hover is unaffected.
- */
-const PLANNER_HOVER_OUTLINE_STYLE: OutlineStyle = {
-  visibleEdgeColor: 0x5fc35f,
-  hiddenEdgeColor: 0x2a6b2a,
-  edgeStrength: 3.5,
-  edgeThickness: 2,
-  edgeGlow: 0.25,
-  pulsePeriod: 0,
-};
+// The planner's green hover/selection styles (overlay fallback + OutlinePass)
+// now live in the 'planner' HighlightProfile (core/engine/rv-highlight-profiles.ts),
+// applied by RVHighlightPolicy on mode-changed — the plugin installs nothing.
 
 // ─── Plugin ─────────────────────────────────────────────────────────────
 
@@ -490,6 +448,10 @@ const DEFAULT_LIBRARY_URLS: string[] = [];
 
 export interface LayoutPlannerOptions {
   catalogUrls?: string[];
+  /** Injectable `window.matchMedia` for the pending-placeholder pulse's
+   *  `prefers-reduced-motion` watch. Tests supply a fake; production leaves it
+   *  undefined and the watcher reads the real preference. */
+  matchMedia?: MatchMediaFn;
 }
 
 /** Max world-space distance (metres) at which two restored snaps count as
@@ -533,7 +495,17 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    *  to planner mode (both the legacy 'planner' context — still set by
    *  setActive — and the new 'mode:planner' context injected by the registry). */
   readonly slots: UISlotEntry[] = [
-    { slot: 'overlay', component: LayoutLibraryPanel as ComponentType<UISlotProps>, order: 100 },
+    { slot: 'overlay', component: LayoutLibraryPanelHost as ComponentType<UISlotProps>, order: 100 },
+    // Pending-load status line (plan-371). Planner-only: the UI registry merges
+    // `shownOnlyInAny: ['mode:planner']` into every slot entry of this plugin,
+    // and MessagePanel evaluates that rule — so outside planner mode this tile
+    // does not even count towards the message column's content check.
+    {
+      slot: 'messages',
+      component: PendingLoadMessage as ComponentType<UISlotProps>,
+      order: 5,
+      visibilityRule: { shownOnlyIn: ['planner'] },
+    },
     // Left-toolbar buttons — visible ONLY while the 'planner' UI context is
     // active. ButtonPanel filters entries by visibilityRule; non-planner
     // toolbar buttons (Drives, Sensors, …) are hidden in planner mode so the
@@ -602,6 +574,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       order: 300,
       visibilityRule: { shownOnlyIn: ['planner'] },
     },
+    // Signal-linking mode (plan-226) — at the very bottom. Self-hides unless the
+    // viewer's `plannerSignalLinking` flag created a binding manager.
   ];
 
   private _viewer: RVViewer | null = null;
@@ -613,6 +587,10 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   private _gridHelper: GridHelper | null = null;
   private _transformControls: FloorGizmo | null = null;
   private _modelCache: ModelCache;
+  /** The decoded-GLB model cache — public read access for the asset editor's
+   *  save-side invalidation (plan-301 §2.8 item 3: a re-saved library asset
+   *  must not be served from its pre-save decoded tree). */
+  get modelCache(): ModelCache { return this._modelCache; }
   private _ghost: GhostManager;
   private _dragEntry: LibraryCatalogEntry | null = null;
   /** The live draft: the dragged object is fully instantiated + registered +
@@ -627,20 +605,31 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   private _draftSnapMatch: GhostSnapMatch | null = null;
   /** Guards against concurrent `_startDraft` calls (build is async). */
   private _startingDraft = false;
+  /**
+   * In-flight placeholder → geometry swaps (plan-371). Pure runtime state:
+   * the store entry of a pending placement is indistinguishable from a
+   * finished one, so nothing here is ever serialized.
+   */
+  private _pending = new PendingGeometryRegistry({
+    hasPlacement: (id) => this._objectMap.has(id),
+    onRetry: (load) => { void this._runPendingLoad(load.id, load.entry, load.generation); },
+    onChange: () => {
+      this._syncPendingPlacements();
+      this._viewer?.markRenderDirty();
+    },
+  });
+  /** The 1.5 Hz "still loading" halo on every pending placeholder (plan-371 F6).
+   *  Built in the constructor because it needs `_options.matchMedia`, which
+   *  field initializers run too early to see. */
+  private _pulse: PendingPulseController;
   /** Set synchronously in onDrop so the dragend-fired `setDragEntry(null)`
    *  knows the draft was committed (keep it) vs cancelled (remove it). */
   private _dropCommitted = false;
-  private _thumbnailRenderer: ThumbnailRenderer | null = null;
-  // ── Auto preview generation ──────────────────────────────────────────
-  /** Persistent (Cache-API) store of generated previews, keyed by glbUrl. */
-  private _thumbCache = new ThumbnailCache();
-  /** entryIds awaiting a preview render. */
-  private _previewQueue: string[] = [];
-  /** glbUrls already queued/generated this session — dedupes across entries. */
-  private _previewSeen = new Set<string>();
-  private _previewRunning = false;
-  /** Unsubscribe for the store listener that auto-enqueues missing previews. */
-  private _previewStoreUnsub: (() => void) | null = null;
+  // ── Preview generation ───────────────────────────────────────────────
+  // The renderer, the cache and the queue moved to the viewer-owned
+  // `ThumbnailService` (plan-372 §2.7). The planner no longer sweeps the whole
+  // catalog on every store change — cards pull their own preview when they
+  // become visible (§2.8), so a large library costs only what is looked at.
   private _objectMap = new Map<string, Object3D>();
   private _unsubs: (() => void)[] = [];
   private _options: LayoutPlannerOptions;
@@ -747,7 +736,14 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
 
   constructor(options?: LayoutPlannerOptions) {
     this._options = options ?? {};
-    this.store = new LayoutStore();
+    // Catalog state is process-wide (plan-372 §2.6.1): the Projects dashboard
+    // in core/ and this plugin must show the same subscriptions. The planner
+    // state around it stays per-plugin.
+    this.store = new LayoutStore(getLibraryStore());
+    this._pulse = new PendingPulseController({
+      gizmoManager: () => this._viewer?.gizmoManager ?? null,
+      matchMedia: this._options.matchMedia,
+    });
 
     // Create layout root
     this._layoutRoot = new Group();
@@ -776,9 +772,15 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     this._layoutFloor.receiveShadow = true;
     this._layoutRoot.add(this._layoutFloor);
 
-    // Own GLTFLoader + DRACOLoader
+    // Own GLTFLoader + DRACOLoader.
+    // The decoder is served from our OWN bundle (`<base>draco/`, emitted by the
+    // vite `rv-copy-draco` plugin and served from node_modules in dev), never
+    // from the gstatic CDN: that CDN intermittently fails behind corporate
+    // proxies and on mobile networks, and when it does, DRACO-compressed
+    // library assets never decode at all. This mirrors the central loader in
+    // `core/engine/rv-glb-parse.ts`; the planner had been the one holdout.
     const dracoLoader = new DRACOLoader();
-    dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
+    dracoLoader.setDecoderPath(`${import.meta.env.BASE_URL}draco/`);
     const gltfLoader = new GLTFLoader();
     gltfLoader.setDRACOLoader(dracoLoader);
 
@@ -789,8 +791,15 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     this._ghost = new GhostManager(this._modelCache);
 
     // Whenever the preview appears, moves into view, hides, or is adopted,
-    // refresh the OutlinePass selection so its silhouette tracks the change.
-    this._ghost.onGhostStateChange = () => this._refreshOutline();
+    // update the aux emphasis so the ghost renders with the selection visual
+    // (green OutlinePass in planner mode) without touching the selection.
+    this._ghost.onGhostStateChange = () => {
+      const ghost = this._ghost.ghost;
+      this._viewer?.highlighter.setAuxEmphasis(
+        'planner-ghost',
+        ghost && this._ghost.visible ? [ghost] : null,
+      );
+    };
   }
 
   // ─── Lifecycle ──────────────────────────────────────────────────────
@@ -800,6 +809,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     this._installLayoutTransformListener(viewer);
     this._installLayoutDeleteListener(viewer);
     this._installSplatSceneStoreListener(viewer);
+    // SignalBindPlugin owns drag, badges, restore and teardown. Keeping those
+    // controllers here as well would double-register listeners on every load.
     // Auto-preview generation is wired in _attachToViewer (so the empty-scene
     // path via ensureAttached gets it too).
     // Entering / being in planner mode no longer stops the simulation — it
@@ -826,6 +837,122 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         if (obj.userData?._isSplat) applySplatTransformFromUserData(obj, viewer);
       }
     });
+  }
+
+  // ── Auto-bind: exact 1:1 CONNECT↔model signal links (no user action) ──
+  private _autoBindUnsubs: (() => void)[] = [];
+  /** Per-element signature of the last applied (manual+derived) mapping list. */
+  private _bindSigCache = new Map<string, string>();
+  /** Signature of the available auto-bind signal NAME set at the last global
+   *  re-bind. Auto-binding depends only on which signals exist, never on their
+   *  live values, so the connect-store tick (which fires on every value update)
+   *  skips the expensive fuzzy re-match unless this signature actually changes. */
+  private _lastAutoBindSignalSig = '';
+
+  /** All CONNECT interface signals available for auto-binding (dedup by name). */
+  private _autoBindSignals(): AutoBindSignal[] {
+    const seen = new Set<string>();
+    const out: AutoBindSignal[] = [];
+    for (const iface of getConnectSnapshot().interfaces) {
+      const all = [...(iface.topics ?? []).flatMap(t => t.signals ?? []), ...(iface.signals ?? [])];
+      for (const s of all) {
+        if (seen.has(s.name)) continue;
+        seen.add(s.name);
+        out.push({ name: s.name, direction: s.type.startsWith('PLCOutput') ? 'output' : 'input' });
+      }
+    }
+    return out;
+  }
+
+  /** Cheap signature of the available auto-bind signal NAME set. Changes only when
+   *  signals are discovered/removed, never on value ticks — so a live connect
+   *  stream can skip the expensive per-slot fuzzy re-match. */
+  private _autoBindSignalSignature(): string {
+    let count = 0;
+    const names: string[] = [];
+    for (const iface of getConnectSnapshot().interfaces) {
+      const all = [...(iface.topics ?? []).flatMap(t => t.signals ?? []), ...(iface.signals ?? [])];
+      for (const s of all) { names.push(s.name); count++; }
+    }
+    return count + '\u0000' + names.join('\u0001');
+  }
+
+  /** Apply only persisted user-confirmed bindings for one placed element. */
+  private _applyElementBindings(id: string, node: Object3D, manual: readonly SignalMapping[]): void {
+    const mgr = this._viewer?.signalBindingManager;
+    if (!mgr) return;
+    if (mgr.getElementSlots(id, node).length === 0) return;
+    const confirmed = manual.map((mapping) => ({ ...mapping }));
+    this._bindSigCache.set(id, JSON.stringify(confirmed));
+    mgr.applyMappings(id, node, confirmed);
+  }
+
+  /**
+   * Re-derive auto-binds for EVERY placed element (global, no popover needed).
+   * A CONNECT signal whose name equals the model-internal signal is "the same"
+   * signal → linked automatically. Only re-applies where the merged mapping list
+   * actually changed (signature cache) so it is cheap on frequent store ticks.
+   */
+  private _refreshAllBindings(): void {
+    const mgr = this._viewer?.signalBindingManager;
+    if (!mgr) return;
+    const signals = this._autoBindSignals();
+    const byId = new Map(this.store.getSnapshot().placed.map(p => [p.id, p] as const));
+    const live = new Set<string>();
+    for (const [id, node] of this._objectMap) {
+      const rec = byId.get(id);
+      if (!rec || rec.splatUrl) continue;
+      const slots = mgr.getElementSlots(id, node);
+      if (slots.length === 0) continue;
+      live.add(id);
+      const confirmed = (rec.signalMappings ?? []).map((mapping) => ({ ...mapping }));
+      const sig = JSON.stringify(confirmed);
+      if (this._bindSigCache.get(id) === sig) continue;
+      this._bindSigCache.set(id, sig);
+      mgr.applyMappings(id, node, confirmed);
+    }
+    for (const id of [...this._bindSigCache.keys()]) if (!live.has(id)) this._bindSigCache.delete(id);
+  }
+
+  /** Re-run the global auto-bind whenever CONNECT signals or placements change. */
+  private _installAutoBindListeners(viewer: RVViewer): void {
+    for (const u of this._autoBindUnsubs) u();
+    this._autoBindUnsubs = [];
+    if (!viewer.signalBindingManager) return;
+    // The connect-store ticks on every signal VALUE update — under a live CONNECT
+    // stream that is continuous. Auto-binding depends only on the set of signal
+    // NAMES, so gate the (expensive, per-slot Fuse.js fuzzy) global re-bind on an
+    // actual change to the signal-name signature; otherwise every value tick ran
+    // the full matcher over every slot and stalled the main thread for ~1s+.
+    this._autoBindUnsubs.push(subscribeConnectStore(() => {
+      const sig = this._autoBindSignalSignature();
+      if (sig === this._lastAutoBindSignalSig) return;
+      this._lastAutoBindSignalSig = sig;
+      this._refreshAllBindings();
+    }));
+    // Placement changes are rare — always re-bind (name set may be unchanged but
+    // the placed elements/slots differ).
+    this._autoBindUnsubs.push(this.store.subscribe(() => this._refreshAllBindings()));
+    // Initial pass for whatever is already placed + connected.
+    this._lastAutoBindSignalSig = this._autoBindSignalSignature();
+    this._refreshAllBindings();
+  }
+
+  /** 3D status-badge controller for Planner Signal Linking (plan-226). */
+  private _signalBadges: SignalBadgeController | null = null;
+  /**
+   * (Re)create the signal-badge controller for the current model. The viewer's
+   * `signalBindingManager` is rebuilt on every model load (fresh signalStore +
+   * registry), so the controller — which hooks `manager.onStateChanged` — must
+   * be recreated against the fresh manager. No-op when the feature flag is off
+   * (no manager → no controller). The controller self-syncs to the persisted
+   * `signalLinkMode` and listens to the layout store for placement changes.
+   */
+  private _installSignalBadges(viewer: RVViewer): void {
+    this._signalBadges?.dispose();
+    this._signalBadges = null;
+    if (!viewer.signalBindingManager) return;
+    this._signalBadges = new SignalBadgeController(viewer, this);
   }
 
   /**
@@ -890,15 +1017,10 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   private _attachToViewer(viewer: RVViewer): void {
     this._viewer = viewer;
 
-    // Auto-generate previews for any library entry that lacks one. Installed
-    // here — not just in onModelLoaded — so the empty-scene path (ensureAttached,
-    // a new layout without a base GLB) also auto-thumbnails. A single store
-    // subscription covers every add path (URL / GitHub / boot restore / local);
-    // enqueue is debounced via the seen-set + queue. Idempotent: drop any prior
-    // listener first so repeated attaches don't stack subscriptions.
-    this._previewStoreUnsub?.();
-    this._previewStoreUnsub = this.store.subscribe(() => this._enqueueMissingPreviews());
-    this._enqueueMissingPreviews();
+    // No preview sweep here any more (plan-372 §2.7). Previews used to be
+    // enqueued from a store subscription that walked every catalog on every
+    // mutation; cards now request their own when they scroll into view, so a
+    // 500-asset library no longer decodes 500 GLBs the user never looks at.
 
     // Double-add guard: only add to scene once
     if (!this._layoutRoot.parent) {
@@ -1152,7 +1274,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       this._muReconciler = new MuReconciler({
         viewer,
         getMUs: () => viewer.transportManager?.mus ?? [],
-        onSelectionDropped: () => this._refreshOutline(),
+        onSelectionDropped: () => this._viewer?.selectionManager.refreshHighlight(),
       });
 
       const canvasDeps: CanvasInteractionDeps = {
@@ -1251,6 +1373,15 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   }
 
   onModelCleared(_viewer: RVViewer): void {
+    // Abandon in-flight placeholder swaps (plan-371 H4). `prepPlacedVisual`
+    // parents placements under `getModelRoot()` = `viewer.currentModel`, so a
+    // model change would otherwise land the real geometry under a parent that
+    // is being disposed in the same breath.
+    this._pending.cancelAll();
+    // Same reason for the halos: the GizmoOverlayManager is cleared on model
+    // switch, so handles kept past this point would dispose entries that are
+    // already gone.
+    this._pulse.stopAll();
     // The previous scene's MUs are disposed on model clear — unregister all
     // MU selectable nodes so we don't hold dangling registry/aux entries.
     this._muReconciler?.disposeAll();
@@ -1267,9 +1398,10 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     this._layoutDeleteUnsub = null;
     this._splatSceneStoreUnsub?.();
     this._splatSceneStoreUnsub = null;
-    // Auto-preview subscription is re-installed by the next onModelLoaded.
-    this._previewStoreUnsub?.();
-    this._previewStoreUnsub = null;
+    // Signal-badge controller is bound to the just-cleared binding manager;
+    // drop it. onModelLoaded recreates it against the fresh manager.
+    this._signalBadges?.dispose();
+    this._signalBadges = null;
   }
 
   /**
@@ -1343,6 +1475,10 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     this._muReconciler = null;
     if (this._viewer?.transportManager) this._viewer.transportManager.preferCloneMU = false;
 
+    // SignalBindPlugin owns badge teardown; RVViewer owns the binding manager.
+    this._signalBadges?.dispose();
+    this._signalBadges = null;
+
     if (this._pairingRebuildTimer !== null) {
       clearTimeout(this._pairingRebuildTimer);
       this._pairingRebuildTimer = null;
@@ -1376,6 +1512,10 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     for (const unsub of this._unsubs) unsub();
     this._unsubs = [];
 
+    for (const u of this._autoBindUnsubs) u();
+    this._autoBindUnsubs = [];
+    this._bindSigCache.clear();
+
     // Remove ancestor override from raycast manager
     if (this._ancestorOverrideFn && this._viewer?.raycastManager) {
       this._viewer.raycastManager.removeAncestorOverride(this._ancestorOverrideFn);
@@ -1385,21 +1525,28 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     this._modelCache.dispose();
     this._ghost.dispose();
 
-    if (this._thumbnailRenderer) {
-      this._thumbnailRenderer.dispose();
-      this._thumbnailRenderer = null;
-    }
-    // Stop the auto preview queue (the drain loop bails once _viewer is null).
-    this._previewStoreUnsub?.();
-    this._previewStoreUnsub = null;
-    this._previewQueue = [];
-    this._previewSeen.clear();
+    // The thumbnail renderer, cache and queue belong to the viewer now
+    // (plan-372 §2.7) and outlive this plugin — nothing to tear down here.
     if (this._gridHelper) {
       disposeSubtree(this._gridHelper);
       this._gridHelper = null;
     }
+    // Abandon every in-flight placeholder → geometry swap before the object map
+    // is emptied, so no late arrival can re-enter a half-torn-down plugin.
+    this._pending.cancelAll();
+    // Releases the pulse gizmos AND the prefers-reduced-motion listener; the
+    // controller is not rebuilt per model, so this is the only place the
+    // watcher can be detached.
+    this._pulse.dispose();
     for (const [, obj] of this._objectMap) {
-      disposeSubtree(obj);
+      // ⛔ A pending placeholder must NOT go through `disposeSubtree`: that
+      // helper duck-types on `.geometry` without an `isMesh` check, and the
+      // placeholder's billboard is a `Sprite` whose geometry is a three.js
+      // MODULE SINGLETON. Disposing it here would silently destroy every
+      // sprite in the app — snap markers, source markers, avatars,
+      // annotations, measurements, gizmo overlays.
+      if (isPlaceholderNode(obj)) disposePlaceholderNode(obj as PlaceholderNode);
+      else disposeSubtree(obj);
     }
     this._objectMap.clear();
     this._selectionUnsub?.();
@@ -1424,6 +1571,10 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     this._editPauseDepth = 0;
     this._dragEntryEditActive = false;
     this._viewer = null;
+    // Detach the library notification bridge (§2.6.2 point 3). The library
+    // store is process-wide and outlives the plugin — without this, every
+    // torn-down planner would leave a listener writing into a dead snapshot.
+    this.store.dispose();
   }
 
   // ─── Public API ───────────────────────────────────────────────────
@@ -1521,24 +1672,13 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       // instance node). Reset on exit.
       if (viewer.transportManager) viewer.transportManager.preferCloneMU = true;
 
-      // 2. Mute the default selection overlay — OutlinePass takes over the
-      //    selection visual via outlineManager. Hover also renders as an
-      //    OutlinePass silhouette (green) on WebGL via highlight(); the overlay
-      //    style fields below only apply to the WebGPU / fully-merged fallback.
-      viewer.highlighter.setSelectionStyle(PLANNER_SELECTION_MUTE_STYLE);
-      viewer.highlighter.setHoverStyle(PLANNER_HOVER_STYLE);
+      // 2.+3. Highlight styles: the green planner profile (overlay fallback +
+      //    OutlinePass hover/selection) is installed by RVHighlightPolicy on
+      //    mode-changed — nothing to do here.
 
-      // 3. Configure the outline pass for planner-mode green silhouette.
-      //    No-op on WebGPU (outlineManager.available === false).
-      //    The hover channel gets a dimmer green than selection so the focused
-      //    (selected) object dominates. setHoverStyle (above) only pushed the
-      //    edge COLOR into the hover channel; override the full style here so the
-      //    reduced strength/glow take effect.
-      viewer.outlineManager.setStyle(PLANNER_OUTLINE_STYLE);
-      viewer.outlineManager.setHoverStyle(PLANNER_HOVER_OUTLINE_STYLE);
-
-      // 4. Subscribe to selection changes — drives TransformControls + multi-pivot
-      //    + OutlinePass selectedObjects (via _refreshOutline).
+      // 4. Subscribe to selection changes — drives TransformControls + multi-pivot.
+      //    The selection visual itself flows through SelectionManager →
+      //    highlightSelection (green OutlinePass under the planner profile).
       this._selectionUnsub = viewer.on('selection-changed',
         this._onSelectionChanged as (data: unknown) => void);
 
@@ -1587,9 +1727,11 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       // works regardless of planner-mode state.
     } else {
       // Leaving planner mode — clear selection FIRST so the existing
-      // overlay meshes / outline are removed before we restore styles.
+      // overlay meshes / outline are removed (styles restore via the
+      // RVHighlightPolicy profile swap on mode-changed).
       viewer.selectionManager.clear();
-      viewer.outlineManager.clear();
+      // Remove the placement-preview ghost emphasis (aux channel).
+      viewer.highlighter.setAuxEmphasis('planner-ghost', null);
       // Unregister MU selectable nodes + stop forcing clone-mode spawning.
       this._muReconciler?.disposeAll();
       if (viewer.transportManager) viewer.transportManager.preferCloneMU = false;
@@ -1611,12 +1753,6 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       this._storeUnsub?.();
       this._storeUnsub = null;
 
-      viewer.highlighter.setSelectionStyle(null);
-      viewer.highlighter.setHoverStyle(null);
-      // Restore the default hover-outline intensity (planner dimmed it) so HMI
-      // hover silhouettes keep their normal strength/glow.
-      viewer.outlineManager.setHoverStyle(DEFAULT_HOVER_OUTLINE_STYLE);
-
       viewer.raycastManager?.setAllowFilter(this._priorAllowFilter);
       this._priorAllowFilter = null;
     }
@@ -1634,11 +1770,10 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     if (!this._active || !this._viewer) return;
     // MUs and layout objects share ONE selection (SelectionManager paths). The
     // gizmo + store sync below filter to `isLayoutInstance`, so MUs are
-    // naturally excluded from the gizmo and persistence; the outline includes
-    // both (see _refreshOutline).
+    // naturally excluded from the gizmo and persistence; the green outline for
+    // both flows through SelectionManager → highlightSelection (planner profile).
     this._syncTransformControlsToSelection(snap);
     this._syncLayoutStoreToSelection(snap);
-    this._refreshOutline();
   };
 
   /** Write a single member's local transform (position + Euler) to the store.
@@ -1710,42 +1845,6 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       if (plane) targets.push(plane);
     }
     return targets;
-  }
-
-  /**
-   * Push the current outlined-objects list to the viewer's OutlinePass.
-   * The list is the union of:
-   *   - all currently selected layout instance roots
-   *   - the placement-preview ghost root (when visible)
-   *
-   * Call this whenever the selection changes, the ghost is shown/hidden/
-   * replaced, or the planner activates/deactivates. Cheap when nothing
-   * outlined; OutlinePass early-outs on empty selectedObjects.
-   */
-  private _refreshOutline(): void {
-    const viewer = this._viewer;
-    if (!viewer) return;
-    if (!this._active) {
-      viewer.outlineManager.clear();
-      return;
-    }
-
-    const objs: Object3D[] = [];
-
-    // Selection: resolve each selected path to a planner-selectable node. This
-    // covers BOTH layout instances AND spawned MUs (registered selectable
-    // scene nodes), so MUs get the same green outline as layout objects.
-    const snap = viewer.selectionManager.getSnapshot();
-    for (const path of snap.selectedPaths) {
-      const node = viewer.registry?.getNode(path);
-      if (node && isPlannerSelectable(node)) objs.push(node);
-    }
-
-    // Ghost: only when visible (and not the same object as selection).
-    const ghost = this._ghost.ghost;
-    if (ghost && this._ghost.visible) objs.push(ghost);
-
-    viewer.outlineManager.setOutlined(objs);
   }
 
   /**
@@ -1841,9 +1940,25 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    */
   private async _startDraft(entry: LibraryCatalogEntry): Promise<void> {
     if (this._draft?.entry.id === entry.id) return; // already drafting this entry
-    if (this._startingDraft) return;                // a build is already in flight
     // Splats aren't dragged as live drafts (place-at-origin via placeComponent).
     if (entry.splatUrl) return;
+
+    // ── Entry-kind routing (plan-371 §2.9). Only ONE of the three kinds has a
+    // latency problem worth a placeholder.
+    //
+    // Virtual / DES entries are detected by the `virtual` FLAG, never by
+    // `glbUrl` truthiness: `normalizeCatalogEntry` gives them `glbUrl: ''`,
+    // not `undefined`, so a truthiness test would route them into the GLB
+    // path and hand `getOrLoad('')` an empty URL.
+    if (entry.virtual !== true) {
+      // GLB asset — synchronous placeholder now, real geometry later.
+      this._startGlbDraft(entry);
+      return;
+    }
+
+    // Virtual / DES: `buildVirtualNode` needs no network, so the existing
+    // ghost path already produces its node effectively immediately. Unchanged.
+    if (this._startingDraft) return;                // a build is already in flight
 
     this._startingDraft = true;
     try {
@@ -1870,6 +1985,142 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     } finally {
       this._startingDraft = false;
     }
+  }
+
+  /**
+   * Start a GLB draft SYNCHRONOUSLY (plan-371 F1).
+   *
+   * Instead of awaiting a decode that can take ten seconds, this registers a
+   * catalog-sized wireframe placeholder in `light` mode right away, so
+   * `_moveDraft` works from the very first pointer frame and the drop can
+   * commit without blocking. The decoded geometry swaps in underneath the SAME
+   * root later — see `_runPendingLoad` / `swapPlacedGeometry`.
+   */
+  private _startGlbDraft(entry: LibraryCatalogEntry): void {
+    if (!this._viewer) return;
+    if (this._draft) this._cancelDraft(); // a different entry was lingering
+
+    const node = buildPlaceholderNode(entry);
+    node.visible = false; // revealed on first move (avoids origin flash)
+    const id = crypto.randomUUID();
+
+    // LIGHT registration only: the placeholder has no `userData.realvirtual`,
+    // and running processExtras on it would create signal/drive registrations
+    // that the swap would then have to duplicate or orphan.
+    this._addPlacedToScene(node, id, entry.name, entry.id, { mode: 'light' });
+
+    this._draft = { id, node, entry, positioned: false, isSource: false };
+    this._draftSnapMatch = null;
+    this._draftDropTargets = this.store.dropToSurface
+      ? this._collectDropTargetsWithTransport(node)
+      : null;
+
+    // Kick the real load. Fire-and-forget by design — the drag gesture, the
+    // drop and the store commit must not wait for it.
+    const gen = this._pending.begin(id, entry);
+    this._pulse.start(id, node, resolvePlaceholderSizeMm(entry));
+    void this._runPendingLoad(id, entry, gen);
+  }
+
+  /**
+   * Await the decoded GLB for a pending placement and swap it in.
+   *
+   * Every result is validated against the generation token AND the placement's
+   * continued existence before it touches the scene: deleting, undoing,
+   * cancelling the drag, reloading the scene, switching models or tearing the
+   * plugin down must never be resurrected by a late arrival (plan-371 R1/F10).
+   */
+  private async _runPendingLoad(
+    id: string,
+    entry: LibraryCatalogEntry,
+    generation: number,
+  ): Promise<void> {
+    const url = entry.glbUrl;
+    if (!url) {
+      this._pending.fail(id, 'Catalog entry has no glbUrl');
+      this._markPendingFailed(id);
+      return;
+    }
+
+    try {
+      const real = await this._modelCache.getOrLoad(url, { signal: this._pending.signalFor(id) });
+      if (!this._pending.isCurrent(id, generation)) return;
+
+      // The pulse gizmo is parented UNDER the placeholder root, and the swap
+      // strips every child. Tear it down first or its LineSegments is orphaned
+      // while the manager still holds (and blinks) its material.
+      this._pulse.stop(id);
+      if (smSwapPlacedGeometry(this._sceneMutDeps, id, real)) {
+        this._pending.cancel(id);
+        this._onGeometrySwapped(id);
+      }
+    } catch (err) {
+      if (!this._pending.isCurrent(id, generation)) return;
+      console.warn(`[LayoutPlanner] Failed to load "${entry.name}":`, err);
+      this._pending.fail(id, String(err));
+      this._markPendingFailed(id);
+    }
+  }
+
+  /** Paint the failed-load state onto a placeholder that is still in the scene. */
+  private _markPendingFailed(id: string): void {
+    // Nothing is loading any more, so the motion cue stops; the failure is
+    // carried by red + dashed outline + warning badge + the HMI status line.
+    this._pulse.stop(id);
+    const node = this._objectMap.get(id);
+    if (node && isPlaceholderNode(node)) setPlaceholderError(node as PlaceholderNode, true);
+    this._viewer?.markRenderDirty();
+  }
+
+  /**
+   * Retry a failed placeholder load (plan-371 F7). Deliberately NOT a new undo
+   * entry: the placement itself was committed and never rolled back — only its
+   * geometry is missing — so the retry bumps the generation and nothing else.
+   */
+  retryPendingPlacement(id: string): void {
+    const load = this._pending.get(id);
+    if (!load || load.status !== 'error') return;
+
+    const node = this._objectMap.get(id);
+    if (node && isPlaceholderNode(node)) {
+      setPlaceholderError(node as PlaceholderNode, false);
+      this._pulse.start(id, node, resolvePlaceholderSizeMm(load.entry));
+    }
+    // Bumps the generation and re-enters `_runPendingLoad` via `onRetry`, so a
+    // late result of the FAILED attempt is discarded when it finally lands.
+    this._pending.retry(id);
+    this._viewer?.markRenderDirty();
+  }
+
+  /** Mirror the registry into the store so the HMI status line can render it. */
+  private _syncPendingPlacements(): void {
+    this.store.setPendingPlacements(
+      this._pending.list().map((load) => ({
+        id: load.id,
+        name: load.entry.name,
+        status: load.status,
+        error: load.error,
+      })),
+    );
+  }
+
+  /** Post-swap housekeeping for a placement whose real geometry just landed. */
+  private _onGeometrySwapped(id: string): void {
+    const draft = this._draft;
+    if (draft && draft.id === id) {
+      // The cached drop-to-surface candidate list excluded the PLACEHOLDER's
+      // meshes; the real ones aren't in it and the object would drop onto
+      // itself. Rebuild it against the geometry that is actually there now.
+      draft.isSource = subtreeHasComponent(draft.node, 'Source');
+      this._draftDropTargets = this.store.dropToSurface
+        ? this._collectDropTargetsWithTransport(draft.node)
+        : null;
+      // The armed bbox-snap state was measured on the placeholder box.
+      if (this._bboxSnap?.isArmed) this._bboxSnap.armForDrag(draft.node);
+    }
+    this._refreshHierarchy();
+    this._viewer?.markShadowsDirty();
+    this._viewer?.markRenderDirty();
   }
 
   /**
@@ -1911,9 +2162,16 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
 
     // Snap-point port mating — self-excluded so the draft's OWN ports (now in
     // the registry) don't match themselves. Overrides XZ + rotation + Y.
+    //
+    // Skipped entirely while the root still carries placeholder geometry
+    // (plan-371 §2.7): the placeholder box has no real ports, so any match
+    // would be against the wrong shape. Grid- and bbox-snapping above, and
+    // drop-to-surface below, work purely on the AABB and stay active. Real
+    // ports become available for the NEXT drag, once the swap has landed —
+    // an object that re-snaps itself after being dropped was rejected.
     const registry = viewer.getPlugin<SnapPointPlugin>('snap-point')?.getRegistry();
     let match: GhostSnapMatch | null = null;
-    if (registry && registry.size > 0) {
+    if (!isPlaceholderNode(node) && registry && registry.size > 0) {
       match = findBestGhostSnap(node, registry, DEFAULT_MAGNET_RADIUS_M, node);
       if (match) applyGhostSnapAlignment(node, match);
     }
@@ -2055,10 +2313,14 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     this._viewer?.markRenderDirty();
   }
 
-  /** Place a component in the scene from a catalog entry. */
+  /** Place a component in the scene from a catalog entry.
+   *
+   *  `opts.skipAutoAlign` (plan-238) skips the AABB floor-center pivot +
+   *  floor align for multi-part CAD imports with a functional origin. */
   async placeComponent(
     entry: LibraryCatalogEntry,
     position: [number, number, number],
+    opts?: { skipAutoAlign?: boolean },
   ): Promise<string> {
     if (!this._viewer) throw new Error('Viewer not initialized');
 
@@ -2091,7 +2353,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       // just mark layout metadata (no pivotToFloorCenter, no alignToFloor)
       this._addSplatPlacedToScene(node, id, entry.name, entry.id, entry.splatUrl!);
     } else {
-      this._addPlacedToScene(node, id, entry.name, entry.id);
+      this._addPlacedToScene(node, id, entry.name, entry.id, opts);
     }
     node.position.x = position[0];
     node.position.z = position[2];
@@ -2185,8 +2447,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     }
     if (muPaths.length > 0) {
       const remaining = selectionPaths.filter(p => !muPaths.includes(p));
+      // selectPaths re-applies the selection highlight itself.
       viewer.selectionManager.selectPaths(remaining);
-      this._refreshOutline();
     }
 
     // Resolve the set of placement IDs to remove. Prefer SelectionManager
@@ -2276,19 +2538,32 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     viewer.markShadowsDirty();
   }
 
-  /** Duplicate the currently selected component. */
-  async duplicateSelected(): Promise<string | null> {
-    const snapshot = this.store.getSnapshot();
-    const id = snapshot.selectedId;
-    if (!id) return null;
-
-    const comp = snapshot.placed.find(c => c.id === id);
-    if (!comp) return null;
-
-    let node: Object3D;
+  /**
+   * Clone one placement: new id, same content, small offset — THE single
+   * routine behind `duplicateSelected` and `pasteClipboard` (plan-376 F6).
+   *
+   * Covers the fresh UUID, the `' (copy)'` label, splat / virtual-DES / GLB
+   * routing, the +0.5 m X-Z offset, the re-drop when drop-to-surface is on,
+   * the new `PlacedComponent` literal (including `signalMappings`, F10), the
+   * store write, the binding re-apply and the op-log entry.
+   *
+   * Leaves autosave, selection and hierarchy refresh to the caller: paste does
+   * them ONCE for the whole clipboard, duplicate does them for its single item.
+   *
+   * @returns The new placement id, or `null` when nothing could be built
+   *          (missing splat plugin, or a GLB record with neither url nor a
+   *          virtual catalog entry). Callers MUST null-check: `autoSave` and
+   *          `_selectObject` would otherwise run on a failed clone and clear
+   *          the current selection.
+   */
+  private async _clonePlacement(comp: PlacedComponent): Promise<string | null> {
     const newId = crypto.randomUUID();
     const label = comp.label + ' (copy)';
     const isSplat = !!comp.splatUrl;
+    // The catalog entry is the source of truth for HOW a component is built
+    // (splat / virtual DES / GLB). Falls back to the record when it is gone.
+    const entry = this._findCatalogEntryById(comp.catalogId);
+    let node: Object3D;
 
     if (isSplat) {
       // Splat duplicate — create a new viewer instance. Resolve the file
@@ -2296,12 +2571,21 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       // load correctly.
       const splatPlugin = await this._viewer!.resolvePlugin('gaussian-splat');
       if (!splatPlugin) return null;
-      const dupEntry = this._findCatalogEntryById(comp.catalogId);
-      const fileExt = extractSplatFileExt({ localPath: dupEntry?.localPath, url: comp.splatUrl });
+      const fileExt = extractSplatFileExt({ localPath: entry?.localPath, url: comp.splatUrl });
       node = await (splatPlugin as unknown as import('./gaussian-splat-plugin-type').GaussianSplatPluginApi).loadSplat(comp.splatUrl!, fileExt);
       this._addSplatPlacedToScene(node, newId, label, comp.catalogId, comp.splatUrl!);
     } else {
-      node = await this._modelCache.getOrLoad(comp.glbUrl);
+      if (entry?.virtual && entry.desType) {
+        // Virtual DES component — rebuild the gizmo. Without this branch the
+        // copy would call `_modelCache.getOrLoad('')`, because virtual entries
+        // carry no glbUrl (plan-376 F7).
+        node = await this._buildVirtualDesNode(entry);
+      } else if (!comp.glbUrl) {
+        console.warn(`[LayoutPlanner] Cannot copy "${comp.label}" — no glbUrl and no virtual catalog entry.`);
+        return null;
+      } else {
+        node = await this._modelCache.getOrLoad(comp.glbUrl);
+      }
       this._addPlacedToScene(node, newId, label, comp.catalogId);
     }
 
@@ -2325,18 +2609,44 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       rotation: [...comp.rotation],
       scale: [...comp.scale],
       ...(isSplat ? { splatUrl: comp.splatUrl } : {}),
+      // plan-376 F10: a manually bound signal link used to vanish on copy —
+      // neither creation path carried the field, and nothing re-derived it.
+      ...(comp.signalMappings ? { signalMappings: comp.signalMappings.map(m => ({ ...m })) } : {}),
     };
     this.store.addComponent(newComp);
-    this.store.autoSave();
-    this._selectObject(newId);
-    this._refreshHierarchy();
-
-    if (this._viewer) this._viewer.markRenderDirty();
+    // Bind the copy's slots to the inherited mappings (component instances were
+    // just built by _addPlacedToScene). Splats have no bindable slots.
+    if (!isSplat && this._viewer) {
+      this._applyElementBindings(newId, node, newComp.signalMappings ?? []);
+    }
 
     emitPlannerOp(this._viewer, {
       id: opId(), ts: Date.now(), schemaV: 1,
       kind: 'addPlacement', placement: { ...newComp },
     });
+
+    return newId;
+  }
+
+  /** Duplicate the currently selected component. */
+  async duplicateSelected(): Promise<string | null> {
+    const snapshot = this.store.getSnapshot();
+    const id = snapshot.selectedId;
+    if (!id) return null;
+
+    const comp = snapshot.placed.find(c => c.id === id);
+    if (!comp) return null;
+
+    const newId = await this._clonePlacement(comp);
+    // Null-check is load-bearing: on a failed clone the selection must stay
+    // where it is and nothing may be persisted.
+    if (!newId) return null;
+
+    this.store.autoSave();
+    this._selectObject(newId);
+    this._refreshHierarchy();
+
+    if (this._viewer) this._viewer.markRenderDirty();
 
     return newId;
   }
@@ -2394,82 +2704,10 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     const newIds: string[] = [];
 
     for (const comp of this._clipboard) {
-      let node: Object3D;
-      const newId = crypto.randomUUID();
-      const label = comp.label + ' (copy)';
-      const isSplat = !!comp.splatUrl;
-
-      // Look up the catalog entry by id — the entry is the source of truth
-      // for how a component is constructed (splat / virtual DES / GLB).
-      // Falls back to the clipboard record when the catalog entry is gone.
-      const entry = this._findCatalogEntryById(comp.catalogId);
-
-      if (isSplat) {
-        const splatPlugin = await this._viewer!.resolvePlugin('gaussian-splat');
-        if (!splatPlugin) continue;
-        const fileExt = extractSplatFileExt({ localPath: entry?.localPath, url: comp.splatUrl });
-        node = await (splatPlugin as unknown as import('./gaussian-splat-plugin-type').GaussianSplatPluginApi).loadSplat(comp.splatUrl!, fileExt);
-        this._addSplatPlacedToScene(node, newId, label, comp.catalogId, comp.splatUrl!);
-      } else if (entry?.virtual && entry.desType) {
-        // Virtual DES component — recreate via createGizmo / createVirtualPlaceholder
-        // (same path as placeComponent). Without this branch, paste would call
-        // _modelCache.getOrLoad('') and fail because virtual entries have no glbUrl.
-        const gizmoSize = entry.gizmoSize ?? [500, 500, 500] as [number, number, number];
-        let gizmoCreated = false;
-        try {
-          const { getRegisteredFactories } = await import('../../core/engine/rv-component-registry');
-          const factories = getRegisteredFactories();
-          const factory = factories.get(entry.desType);
-          if (factory && typeof (factory as any).ctor?.createGizmo === 'function') {
-            node = (factory as any).ctor.createGizmo(gizmoSize);
-            gizmoCreated = true;
-          }
-        } catch { /* fall through to placeholder */ }
-        if (!gizmoCreated) {
-          const { createVirtualPlaceholder } = await import('./ghost-manager');
-          node = createVirtualPlaceholder(gizmoSize, entry.desType);
-        }
-        node!.name = entry.name;
-        node!.userData.realvirtual = { [entry.desType]: entry.desConfig ?? {} };
-        this._addPlacedToScene(node!, newId, label, comp.catalogId);
-      } else {
-        // Standard GLB-based component
-        if (!comp.glbUrl) {
-          console.warn(`[LayoutPlanner] Cannot paste "${comp.label}" — no glbUrl and no virtual catalog entry.`);
-          continue;
-        }
-        node = await this._modelCache.getOrLoad(comp.glbUrl);
-        this._addPlacedToScene(node, newId, label, comp.catalogId);
-      }
-
-      node!.position.set(comp.position[0] + 0.5, node!.position.y, comp.position[2] + 0.5);
-      node!.rotation.set(
-        MathUtils.degToRad(comp.rotation[0]),
-        MathUtils.degToRad(comp.rotation[1]),
-        MathUtils.degToRad(comp.rotation[2]),
-      );
-      if (!isSplat && this.store.dropToSurface && this._viewer) {
-        dropToSurface(node!, this._viewer.scene);
-      }
-
-      const newComp: PlacedComponent = {
-        id: newId,
-        catalogId: comp.catalogId,
-        glbUrl: comp.glbUrl,
-        label,
-        position: [node!.position.x, node!.position.y, node!.position.z],
-        rotation: [...comp.rotation],
-        scale: [...comp.scale],
-        ...(isSplat ? { splatUrl: comp.splatUrl } : {}),
-      };
-      this.store.addComponent(newComp);
-
-      emitPlannerOp(this._viewer, {
-        id: opId(), ts: Date.now(), schemaV: 1,
-        kind: 'addPlacement', placement: { ...newComp },
-      });
-
-      newIds.push(newId);
+      const newId = await this._clonePlacement(comp);
+      // A clone that could not be built (missing splat plugin, no url and no
+      // virtual entry) is skipped — the rest of the clipboard still pastes.
+      if (newId) newIds.push(newId);
     }
 
     if (newIds.length === 0) return [];
@@ -2494,24 +2732,6 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     }
 
     return newIds;
-  }
-
-  /** Select a placed object by ID. */
-  selectById(id: string | null): void {
-    this._selectObject(id);
-  }
-
-  /** Save layout to a downloadable JSON file. */
-  downloadLayout(name: string): void {
-    const layout = this.snapshotAsLayoutFile(name);
-    const json = JSON.stringify(layout, null, 2);
-    const blob = new Blob([json], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${name.replace(/\s+/g, '_')}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
   }
 
   /** Capture the current placed state as a LayoutFile. Used by the
@@ -2546,7 +2766,11 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     const snap = this.store.getSnapshot();
     return {
       placements: snap.placed,
-      catalogUrls: snap.catalogUrls,
+      // §2.6.3 — the scene-bound library list is READ-ONLY compatibility now.
+      // `applyPlacements` still honours it on a legacy scene; the write side
+      // belongs to `project.json.libraries[]` and the global user list, so
+      // nothing is stamped back into the scene here.
+      catalogUrls: [],
       gridSizeMm: snap.gridSizeMm,
     };
   }
@@ -2569,13 +2793,64 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   // ───────────────────────────────────────────────────────────────────
 
   /**
-   * Add a single placement clone from a `PlacedComponent` record (op
-   * forward executor). Idempotent: returns silently if a placement with
-   * the same id already exists.
+   * Build the node for a virtual / DES catalog entry — the component class's
+   * own `createGizmo()` when its factory is registered, else a generic
+   * wireframe placeholder — and stamp name + `realvirtual` config on it.
+   *
+   * Lifted out of `pasteClipboard` (plan-376) so the restore helper and the
+   * clone helper share ONE virtual-DES branch instead of two copies. Virtual
+   * entries carry `glbUrl: ''`, so without this branch they end up in
+   * `_modelCache.getOrLoad('')`, which is never a usable placement.
    */
-  async placeFromRecord(p: PlacedComponent): Promise<void> {
-    if (this._objectMap.has(p.id)) return;
+  private async _buildVirtualDesNode(entry: LibraryCatalogEntry): Promise<Object3D> {
+    const gizmoSize = entry.gizmoSize ?? [500, 500, 500] as [number, number, number];
+    let node: Object3D | null = null;
+    try {
+      const { getRegisteredFactories } = await import('../../core/engine/rv-component-registry');
+      const factories = getRegisteredFactories();
+      const factory = factories.get(entry.desType!);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (factory && typeof (factory as any).ctor?.createGizmo === 'function') {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        node = (factory as any).ctor.createGizmo(gizmoSize) as Object3D;
+      }
+    } catch { /* fall through to placeholder */ }
+    if (!node) {
+      const { createVirtualPlaceholder } = await import('./ghost-manager');
+      node = createVirtualPlaceholder(gizmoSize, entry.desType);
+    }
+    node.name = entry.name;
+    node.userData.realvirtual = { [entry.desType!]: entry.desConfig ?? {} };
+    return node;
+  }
 
+  /**
+   * Turn a `PlacedComponent` record into a living scene object — THE single
+   * routine every restore path uses for the per-item body (plan-376 F1).
+   *
+   * Covers splat-vs-virtual-DES-vs-GLB resolution, loading, scene insertion,
+   * transform, `visible`, the Inspector marker sync, splat overlay overrides
+   * plus their `layout-transform-update` broadcast, and the signal bindings.
+   *
+   * Deliberately does NOT touch the store, the snap-pairing schedule or any
+   * dedup guard: each caller keeps its own batching policy (one bulk
+   * `setComponents` vs. a per-op `addComponent`), its own snap-rebuild timing
+   * and its own `_objectMap.has` guard. Folding those in here would turn the
+   * bulk restore's single `_notify()` into N+1 — the failure mode plan-359
+   * already paid for (`tests/rv-asset-document-bulk-notify.test.ts`).
+   *
+   * @param url Pre-resolved source url from the caller (bulk restore rebases /
+   *            re-downloads before calling). Falls back to the record's own
+   *            url. `||` rather than `??` on purpose: the legacy autosave loop
+   *            hands us the record's EMPTY `glbUrl` for a splat placement.
+   * @returns The scene node, or `null` when the placement was skipped (today:
+   *          only the "gaussian-splat plugin not loaded" case).
+   */
+  private async _buildPlacementFromRecord(
+    p: PlacedComponent,
+    url?: string,
+  ): Promise<Object3D | null> {
+    const entry = this._findCatalogEntryById(p.catalogId);
     let node: Object3D;
 
     if (p.splatUrl) {
@@ -2583,14 +2858,16 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       const splatPlugin = await this._viewer!.resolvePlugin('gaussian-splat');
       if (!splatPlugin) {
         console.warn(`[LayoutPlanner] gaussian-splat plugin not available — skipping "${p.label}"`);
-        return;
+        return null;
       }
-      const pEntry = this._findCatalogEntryById(p.catalogId);
-      const fileExt = extractSplatFileExt({ localPath: pEntry?.localPath, url: p.splatUrl });
-      node = await (splatPlugin as unknown as import('./gaussian-splat-plugin-type').GaussianSplatPluginApi).loadSplat(p.splatUrl, fileExt);
-      this._addSplatPlacedToScene(node, p.id, p.label, p.catalogId, p.splatUrl);
+      const splatSrc = url || p.splatUrl;
+      const fileExt = extractSplatFileExt({ localPath: entry?.localPath, url: splatSrc });
+      node = await (splatPlugin as unknown as import('./gaussian-splat-plugin-type').GaussianSplatPluginApi).loadSplat(splatSrc, fileExt);
+      this._addSplatPlacedToScene(node, p.id, p.label, p.catalogId, splatSrc);
     } else {
-      node = await this._modelCache.getOrLoad(p.glbUrl);
+      node = entry?.virtual && entry.desType
+        ? await this._buildVirtualDesNode(entry)
+        : await this._modelCache.getOrLoad(url || p.glbUrl);
       this._addPlacedToScene(node, p.id, p.label, p.catalogId);
     }
 
@@ -2600,28 +2877,51 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       MathUtils.degToRad(p.rotation[1]),
       MathUtils.degToRad(p.rotation[2]),
     );
-    node.scale.set(p.scale[0], p.scale[1], p.scale[2]);
+    // `|| 1` guards pre-scale autosaves, which have no `scale` array at all —
+    // `set(undefined, …)` would make the whole node NaN-sized and invisible.
+    node.scale.set(p.scale?.[0] || 1, p.scale?.[1] || 1, p.scale?.[2] || 1);
     // Restore visibility flag (defaults to true / visible on legacy entries)
     if (p.visible === false) node.visible = false;
     // Mirror the live Three.js state back into the marker components so the
     // Inspector renders the correct values right after restore.
     syncLayoutMarkerComponents(node, p.visible !== false);
-    // Splat overlay overrides aren't applied by loadGLB (splats are created
-    // after that pass) — copy them out of the op log and push the resulting
-    // scale into the splat library so InvertX/Y/Z visibly stick on reload.
-    if (p.splatUrl) applySplatOverridesFromScene(node, this._viewer!);
-    // Broadcast restored transform so loosely-coupled subscribers (splat
-    // plugin, …) can sync to the just-loaded position/rotation.
-    if (this._viewer && p.splatUrl) {
-      const restoredPath = this._viewer.registry?.getPathForNode(node);
-      if (restoredPath) {
+
+    if (p.splatUrl) {
+      // Splat overlay overrides aren't applied by loadGLB (splats are created
+      // after that pass) — copy them out of the op log and push the resulting
+      // scale into the splat library so InvertX/Y/Z visibly stick on reload.
+      applySplatOverridesFromScene(node, this._viewer!);
+      // Broadcast restored transform so loosely-coupled subscribers (splat
+      // plugin, …) can sync to the just-loaded position/rotation.
+      const restoredPath = this._viewer?.registry?.getPathForNode(node);
+      if (this._viewer && restoredPath) {
         this._viewer.emit('layout-transform-update', {
           path: restoredPath,
           position: p.position,
           rotation: p.rotation,
         });
       }
+    } else if (this._viewer) {
+      // Planner Signal Linking: apply persisted + auto-derived (exact-name)
+      // bindings for this placement (component instances are now built).
+      // No-op when off.
+      this._applyElementBindings(p.id, node, p.signalMappings ?? []);
     }
+
+    return node;
+  }
+
+  /**
+   * Add a single placement clone from a `PlacedComponent` record (op
+   * forward executor). Idempotent: returns silently if a placement with
+   * the same id already exists.
+   */
+  async placeFromRecord(p: PlacedComponent): Promise<void> {
+    if (this._objectMap.has(p.id)) return;
+
+    const node = await this._buildPlacementFromRecord(p);
+    if (!node) return;
+
     // Mirror placement record into the layout store so existing UI
     // (selection, hierarchy) sees the new entry without going through
     // the legacy add path. We've already verified above that no entry
@@ -2722,28 +3022,11 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     for (const o of orphans) o.parent?.remove(o);
   }
 
-  /** Load a layout from a JSON string. Re-places all components. */
-  async loadLayout(json: string): Promise<void> {
-    const layout = deserializeLayout(json);
-    return this.applyPlacements({
-      placements: layout.components,
-      catalogUrls: layout.catalogUrls,
-      gridSizeMm: layout.gridSizeMm,
-    });
-  }
-
   /** Toggle the visible 30 m authoring floor. Called by the Scene window
    *  when entering/leaving a layout scene so baked GLBs aren't covered by
    *  the planner's own floor. */
   setLayoutFloorVisible(visible: boolean): void {
     this._layoutFloor.visible = visible;
-    if (this._viewer) this._viewer.markRenderDirty();
-  }
-
-  /** Resize the visible authoring floor (square, in meters). Default 30 m. */
-  setLayoutFloorSize(meters: number): void {
-    const m = Math.max(1, meters);
-    this._layoutFloor.scale.set(m / 30, m / 30, 1);
     if (this._viewer) this._viewer.markRenderDirty();
   }
 
@@ -2768,7 +3051,9 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     for (const url of snap.catalogUrls) {
       if (isGitHubCatalogUrl(url)) continue;
       if (!this.store.getSnapshot().catalogUrls.includes(url)) {
-        this.store.addCatalog(url).catch(() => {});
+        // Read-compat only (§2.6.3): a legacy scene's list is applied
+        // additively with a non-persisting origin and never written back.
+        this.store.addCatalog(url, 'config').catch(() => {});
       }
     }
 
@@ -2803,6 +3088,10 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     await Promise.all(distinctGlbUrls.map(url =>
       this._modelCache.getOrLoad(url).catch(() => null),
     ));
+    // Per-item `try/catch` is FAILURE ISOLATION, not placement code: without
+    // it a single rejected promise aborts the whole restore loop and every
+    // later placement silently disappears. It stays here even though the
+    // placement body itself moved into `_buildPlacementFromRecord`.
     for (const { comp, url, isSplat } of resolved) {
       try {
         // Dedup: SceneStore op replay (loadScene Phase 4) and the planner's
@@ -2811,7 +3100,14 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         // the prior clone in the scene tree — without this guard the same
         // component would render twice.
         if (this._objectMap.has(comp.id)) continue;
-        if (!url) {
+        // Virtual DES placements have no source url and never will:
+        // `resolvePlacementUrl` has no virtual branch, so it returns null for
+        // them. Let those through to the helper (which builds the gizmo from
+        // the catalog entry); everything else keeps the warn-and-skip.
+        // Without this, a duplicated virtual component vanished on the next
+        // reload — see plan-376 F7c.
+        const isVirtual = this._findCatalogEntryById(comp.catalogId)?.virtual === true;
+        if (!url && !isVirtual) {
           console.warn(
             `[LayoutPlanner] Cannot restore "${comp.label}" (${comp.catalogId}): ` +
             'no source URL could be resolved. ' +
@@ -2820,56 +3116,15 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
           continue;
         }
 
-        if (isSplat) {
-          // Splat placement — load via the splat plugin
-          const splatPlugin = await this._viewer!.resolvePlugin('gaussian-splat');
-          if (!splatPlugin) {
-            console.warn(`[LayoutPlanner] gaussian-splat plugin not available — skipping "${comp.label}"`);
-            continue;
-          }
-          const restoreEntry = this._findCatalogEntryById(comp.catalogId);
-          const fileExt = extractSplatFileExt({ localPath: restoreEntry?.localPath, url });
-          const container = await (splatPlugin as unknown as import('./gaussian-splat-plugin-type').GaussianSplatPluginApi).loadSplat(url, fileExt);
-          this._addSplatPlacedToScene(container, comp.id, comp.label, comp.catalogId, url);
-          container.position.set(comp.position[0], comp.position[1], comp.position[2]);
-          container.rotation.set(
-            MathUtils.degToRad(comp.rotation[0]),
-            MathUtils.degToRad(comp.rotation[1]),
-            MathUtils.degToRad(comp.rotation[2]),
-          );
-          container.scale.set(comp.scale[0] || 1, comp.scale[1] || 1, comp.scale[2] || 1);
-          if (comp.visible === false) container.visible = false;
-          syncLayoutMarkerComponents(container, comp.visible !== false);
-          // See note in applyPlacement: replay Splat overrides here too.
-          applySplatOverridesFromScene(container, this._viewer!);
-          // Broadcast for loose-coupled subscribers (splat plugin) — they
-          // need the new position/rotation to sync their off-graph state.
-          const restoredAutoPath = this._viewer!.registry?.getPathForNode(container);
-          if (restoredAutoPath) {
-            this._viewer!.emit('layout-transform-update', {
-              path: restoredAutoPath,
-              position: comp.position,
-              rotation: comp.rotation,
-            });
-          }
-        } else {
-          const clone = await this._modelCache.getOrLoad(url);
-          this._addPlacedToScene(clone, comp.id, comp.label, comp.catalogId);
-          clone.position.set(comp.position[0], comp.position[1], comp.position[2]);
-          clone.rotation.set(
-            MathUtils.degToRad(comp.rotation[0]),
-            MathUtils.degToRad(comp.rotation[1]),
-            MathUtils.degToRad(comp.rotation[2]),
-          );
-          // Restore scale too — without this a scaled GLB placement reverted to
-          // 1:1 on reload (the splat branch above and placeFromRecord already do
-          // this; this GLB bulk branch silently dropped it).
-          clone.scale.set(comp.scale?.[0] || 1, comp.scale?.[1] || 1, comp.scale?.[2] || 1);
-          if (comp.visible === false) clone.visible = false;
-          syncLayoutMarkerComponents(clone, comp.visible !== false);
-          if (url !== comp.glbUrl) {
-            this.store.updateGlbUrl(comp.id, url);
-          }
+        const node = await this._buildPlacementFromRecord(comp, url ?? undefined);
+        if (!node) continue;
+
+        // Mirror a rebased / re-downloaded url back onto the record. Only for
+        // GLB placements, exactly as before — the splat branch never did this.
+        // (Its effect is overwritten by the `setComponents` below; kept as a
+        // deliberate non-change rather than a silent omission.)
+        if (!isSplat && url && url !== comp.glbUrl) {
+          this.store.updateGlbUrl(comp.id, url);
         }
       } catch (e) {
         console.warn(`[LayoutPlanner] Failed to restore ${comp.label}: ${e}`);
@@ -2959,12 +3214,6 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     if (this._viewer) this._viewer.markRenderDirty();
   }
 
-  /** Fit camera to show all placed objects. */
-  fitToLayout(): void {
-    if (!this._viewer || this._objectMap.size === 0) return;
-    this._viewer.fitToNodes([...this._objectMap.values()]);
-  }
-
   /** Remove all placed components and clear the autosave. */
   clearLayout(): void {
     this._clearPlaced();
@@ -2980,16 +3229,19 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   /**
    * Generate a thumbnail PNG data URL for a catalog entry.
    * Uses the viewer's WebGL renderer with an offscreen target.
+   * Returns `null` under a WebGPURenderer (plan-271) — thumbnails need the
+   * classic WebGLRenderer; the skip is warned once by ThumbnailRenderer.
    */
-  async generateThumbnail(glbUrl: string, size = 256): Promise<string> {
-    if (!this._thumbnailRenderer && this._viewer) {
-      this._thumbnailRenderer = new ThumbnailRenderer(
-        this._viewer.renderer as unknown as WebGLRenderer,
-        this._viewer.scene,
-      );
-    }
+  async generateThumbnail(glbUrl: string, size = 256): Promise<string | null> {
+    const viewer = this._viewer;
+    if (!viewer) return null;
+    // Manual (button-triggered) generation deliberately bypasses the service
+    // queue and the persistent cache: the user pressed "regenerate" precisely
+    // because they do not want the cached picture. It still goes through the
+    // service so both paths share one renderer instance, and `render()` is
+    // synchronous, so it cannot interleave with a queued job mid-render.
     const model = await this._modelCache.getOrLoad(glbUrl);
-    return this._thumbnailRenderer!.render(model, size);
+    return viewer.thumbnails.renderNow(model, size);
   }
 
   /**
@@ -3007,6 +3259,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    */
   async saveThumbnail(entryId: string, glbUrl: string): Promise<string | null> {
     const dataUrl = await this.generateThumbnail(glbUrl);
+    // null = generation skipped (WebGPURenderer, plan-271) — nothing to persist.
+    if (!dataUrl) return null;
     // Immediately show the generated thumbnail as data URL — the user
     // gets feedback even if the persistence step fails or is skipped.
     this.store.setEntryThumbnail(entryId, dataUrl);
@@ -3070,77 +3324,6 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       }
     } catch { /* dev server not available — data URL still shows */ }
     return null;
-  }
-
-  // ─── Auto preview generation ────────────────────────────────────
-
-  /**
-   * Scan all catalog entries and queue a background preview render for every
-   * GLB asset that has no thumbnail yet. Called on model load and on every
-   * store change (new library added, GitHub scan completed, …). Cheap and
-   * idempotent — entries already seen are skipped. No-op on WebGPU (thumbnail
-   * rendering needs the WebGL renderer) — those cards keep the manual button.
-   */
-  private _enqueueMissingPreviews(): void {
-    const viewer = this._viewer;
-    if (!viewer || viewer.isWebGPU) return;
-
-    let added = false;
-    for (const catalog of this.store.getSnapshot().catalogs.values()) {
-      for (const entry of catalog.entries) {
-        const glbUrl = entry.glbUrl;
-        if (!glbUrl || entry.virtual || entry.splatUrl) continue; // GLB assets only
-        if (entry.thumbnailUrl) continue;                          // already has a preview
-        if (this._previewSeen.has(entry.id)) continue;             // already queued/done
-        this._previewSeen.add(entry.id);
-        this.store.setThumbnailPending(entry.id, true);
-        this._previewQueue.push(entry.id);
-        added = true;
-      }
-    }
-    if (added) void this._drainPreviewQueue();
-  }
-
-  /**
-   * Process the preview queue one entry per animation frame so the live sim
-   * and UI stay responsive. Cache hits skip GLB decode + render entirely.
-   */
-  private async _drainPreviewQueue(): Promise<void> {
-    if (this._previewRunning) return;
-    this._previewRunning = true;
-    try {
-      while (this._previewQueue.length > 0 && this._viewer) {
-        const entryId = this._previewQueue.shift()!;
-        const glbUrl = this._findEntryGlbUrl(entryId);
-        try {
-          if (!glbUrl) continue;
-          // Persistent cache → instant, no decode/render.
-          const cached = await this._thumbCache.get(glbUrl);
-          if (!this._viewer) break; // disposed mid-await
-          if (cached) {
-            this.store.setEntryThumbnail(entryId, cached);
-          } else {
-            const dataUrl = await this.generateThumbnail(glbUrl);
-            if (!this._viewer) break;
-            this.store.setEntryThumbnail(entryId, dataUrl);
-            // Persist for future sessions (best-effort).
-            try {
-              const blob = await (await fetch(dataUrl)).blob();
-              await this._thumbCache.put(glbUrl, blob);
-            } catch { /* cache unavailable — in-memory is enough */ }
-          }
-        } catch (e) {
-          // Leave the thumbnail empty; the card falls back to the manual button.
-          console.warn('[layout-planner] auto preview failed for', entryId, e);
-        } finally {
-          this.store.setThumbnailPending(entryId, false);
-        }
-        // Yield a frame between renders to avoid jank on large libraries.
-        await new Promise<void>(r => requestAnimationFrame(() => r()));
-      }
-    } finally {
-      this._previewRunning = false;
-    }
   }
 
   /** Resolve an entry's glbUrl by id across all catalogs (queue items are ids). */
@@ -3232,9 +3415,23 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    * Add a placed layout object to the scene under the model root with full
    * rv-extras processing (signals, drives, components — same pipeline as loadGLB).
    * Delegates to `./scene-mutations.addPlacedToScene`.
+   *
+   * ⚠ `opts.mode` defaults to `'full'` and MUST stay that way. This method is
+   * the shared facade for eight callers — `placeComponent` (which also serves
+   * the MCP `web_layout_place` tool), Duplicate, both Paste branches,
+   * `placeFromRecord` (undo/redo replay) and both boot-restore paths. A `light`
+   * default would leave every one of them registered without signals, drives,
+   * snap ports or raycast targets: no crash, just a dead layout. Exactly ONE
+   * caller passes `'light'` — the pending placeholder in `_startGlbDraft`.
    */
-  private _addPlacedToScene(clone: Object3D, id: string, label: string, catalogId: string): ProcessExtrasResult | null {
-    return smAddPlacedToScene(this._sceneMutDeps, clone, id, label, catalogId);
+  private _addPlacedToScene(
+    clone: Object3D,
+    id: string,
+    label: string,
+    catalogId: string,
+    opts?: { skipAutoAlign?: boolean; mode?: PlacementRegistrationMode },
+  ): ProcessExtrasResult | null {
+    return smAddPlacedToScene(this._sceneMutDeps, clone, id, label, catalogId, opts);
   }
 
   /**
@@ -3522,6 +3719,18 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    * Delegates to `./scene-mutations.removePlacedFromScene`.
    */
   private _removePlacedFromScene(id: string): void {
+    // Single choke point for ALL eight removal paths (plan-371 §2.6): delete,
+    // undo, drag cancel, scene reload, Delete key, hierarchy context menu,
+    // plugin teardown and model change every funnel through here. Cancelling
+    // the pending load centrally is what stops a late swap from resurrecting
+    // the node; the matching RESOURCE dispose sits one level further down, in
+    // `scene-mutations.removePlacedFromScene`.
+    this._pending.cancel(id);
+    // The pulse gizmo hangs under the placement root; `removePlacedFromScene`
+    // takes the root out of the scene but knows nothing about the gizmo
+    // manager, so its entry would survive (and keep blinking a material) unless
+    // it is released here, at the same choke point.
+    this._pulse.stop(id);
     smRemovePlacedFromScene(this._sceneMutDeps, id);
   }
 
@@ -3565,10 +3774,16 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     const constructorUrls = this._options.catalogUrls ?? [];
     const params = new URLSearchParams(window.location.search);
     const paramUrls = params.getAll('library');
-    const allUrls = [...new Set([...DEFAULT_LIBRARY_URLS, ...constructorUrls, ...paramUrls])];
 
-    for (const url of allUrls) {
-      await this.store.addCatalog(url).catch(() => {});
+    // Origins drive the persistence policy (§2.6.3): neither a build default,
+    // a constructor option nor a `?library=` deep link is a user subscription,
+    // so none of them is written into the global localStorage list. A URL the
+    // user later adds by hand is promoted to `'user'` and then persists.
+    for (const url of [...new Set([...DEFAULT_LIBRARY_URLS, ...constructorUrls])]) {
+      await this.store.addCatalog(url, 'config').catch(() => {});
+    }
+    for (const url of new Set(paramUrls)) {
+      await this.store.addCatalog(url, 'urlParam').catch(() => {});
     }
 
     await this.store.restoreFromStorage();
@@ -3599,6 +3814,9 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       showInfoOverlay(`Restoring layout (0/${saved.length})…`);
       let restored = 0;
 
+      // Per-item `try/catch` is FAILURE ISOLATION — see the matching note in
+      // `_restorePlacements`. It survives the move of the placement body into
+      // `_buildPlacementFromRecord`.
       for (const comp of saved) {
         try {
           // Dedup: if SceneStore op replay (loadScene Phase 4) already
@@ -3618,17 +3836,13 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
           if (glbUrl == null) continue;
 
           showInfoOverlay(`Restoring ${comp.label}… (${restored + 1}/${saved.length})`);
-          const clone = await this._modelCache.getOrLoad(glbUrl);
-          this._addPlacedToScene(clone, comp.id, comp.label, comp.catalogId);
-          // Restore saved position (including Y), rotation and scale — don't re-drop
-          clone.position.set(comp.position[0], comp.position[1], comp.position[2]);
-          clone.rotation.set(
-            MathUtils.degToRad(comp.rotation[0]),
-            MathUtils.degToRad(comp.rotation[1]),
-            MathUtils.degToRad(comp.rotation[2]),
-          );
-          clone.scale.set(comp.scale?.[0] || 1, comp.scale?.[1] || 1, comp.scale?.[2] || 1);
-          restored++;
+          // Since plan-376 this path shares the placement body with the other
+          // two restore paths, so it also honours `visible`, runs the Inspector
+          // marker sync and can restore splats — none of which it used to do.
+          const node = await this._buildPlacementFromRecord(comp, glbUrl);
+          // Count only what actually landed: a skipped placement (missing splat
+          // plugin) must not inflate the "Restoring (n/m)" overlay.
+          if (node !== null) restored++;
         } catch (e) {
           console.warn(`[LayoutPlanner] Failed to restore component ${comp.label}:`, e);
         }

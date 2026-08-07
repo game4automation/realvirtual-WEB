@@ -108,7 +108,7 @@ export function GPUWarningBanner() {
         border: `1px solid ${fg}`,
         borderRadius: 2,
         boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
-        backdropFilter: 'blur(8px)',
+        backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
       }}>
         <Icon sx={{ fontSize: 20, color: '#fff', flexShrink: 0 }} />
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>

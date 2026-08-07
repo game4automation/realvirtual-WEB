@@ -13,7 +13,7 @@
 
 import type { Object3D } from 'three';
 import type { ComponentSchema } from './rv-component-registry';
-import { applySchema, setComponentInstance } from './rv-component-registry';
+import { applySchema, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import { validateExtras } from './rv-extras-validator';
 import { NodeRegistry } from './rv-node-registry';
 import { registerTooltipComponent } from './rv-tooltip-component';
@@ -31,24 +31,8 @@ export class RVProcessingUnit {
   static readonly tooltipType = 'processing-unit';
   static readonly displayName = 'ProcessingUnit';
 
-  static readonly schema: ComponentSchema = {
-    connections: { type: 'componentRefArray' },
-    // OEE & production telemetry (all optional — 0 = "not shown" in tooltip)
-    state: { type: 'string', default: 'idle' },         // 'running' | 'idle' | 'down' | 'setup' | 'maintenance'
-    availability: { type: 'number', default: 0 },        // 0..1
-    performance: { type: 'number', default: 0 },         // 0..1
-    quality: { type: 'number', default: 0 },             // 0..1
-    cycleTimeS: { type: 'number', default: 0 },          // current actual, seconds
-    cycleTargetS: { type: 'number', default: 0 },        // target / ideal, seconds
-    throughputPerHour: { type: 'number', default: 0 },   // units/h
-    goodCount: { type: 'number', default: 0 },           // good units shift-to-date
-    scrapCount: { type: 'number', default: 0 },          // scrap units shift-to-date
-    mtbfHours: { type: 'number', default: 0 },           // mean time between failures
-    mttrMinutes: { type: 'number', default: 0 },         // mean time to repair
-    runHours: { type: 'number', default: 0 },            // run-time this period
-    downHours: { type: 'number', default: 0 },           // down-time this period
-    lastFault: { type: 'string', default: '' },          // last fault description
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('ProcessingUnit');
 
   readonly node: Object3D;
 

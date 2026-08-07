@@ -8,12 +8,19 @@
  *   - the `shownOnlyInAny` OR-gate in evaluateVisibilityRule (and that the
  *     existing `shownOnlyIn` ALL-gate is unchanged);
  *   - UIPluginRegistry.register compiling `plugin.modes` into a
- *     `shownOnlyInAny` rule + visibilityId on each slot entry, merging (not
- *     clobbering) any pre-existing rule, and leaving shared plugins untouched.
+ *     `shownOnlyInAny` rule + visibilityId on each slot entry, preserving other
+ *     pre-existing rule keys (`shownOnlyIn`/`hiddenIn`) while REPLACING any
+ *     pre-existing `shownOnlyInAny`, and leaving shared plugins untouched.
+ *
+ * Note: `register` spreads the old rule and overwrites the single key
+ * `shownOnlyInAny` — it is not a merge of that key. The tests below pin both
+ * halves of that distinction. See doc-ui-visibility.md.
  */
 import { describe, it, expect } from 'vitest';
 import { evaluateVisibilityRule } from '../src/core/hmi/ui-context-store';
 import { UIPluginRegistry } from '../src/core/rv-ui-registry';
+import { pluginParticipatesInMode } from '../src/core/rv-mode-manager';
+import type { ModeId } from '../src/core/rv-mode-manager';
 import type { UISlotEntry } from '../src/core/rv-ui-plugin';
 
 const ctx = (...c: string[]) => new Set(c);
@@ -78,7 +85,7 @@ describe('UIPluginRegistry — modes → visibility compile', () => {
     expect(entry.visibilityRule?.shownOnlyInAny).toEqual(['mode:hmi', 'mode:des']);
   });
 
-  it('merges (does not clobber) an existing visibilityRule', () => {
+  it('keeps other rule keys and visibilityId when adding shownOnlyInAny', () => {
     const reg = new UIPluginRegistry();
     reg.register({
       id: 'planner-btn',
@@ -105,5 +112,74 @@ describe('UIPluginRegistry — modes → visibility compile', () => {
     const [entry] = reg.getSlotComponents('messages');
     expect(entry.visibilityRule).toBeUndefined();
     expect(entry.visibilityId).toBeUndefined();
+  });
+
+  // ── plan-391: the two axes, pinned so they cannot drift apart silently ──
+
+  it('core_PlusModes_RuntimeOnUiGated: core runs everywhere, UI stays mode-gated', () => {
+    // The rule that was misread twice: `core: true` + `modes: ['hmi']` means
+    // "runtime runs in every mode, UI appears only in hmi". `core` governs
+    // participation (rv-mode-manager), `modes` governs slot visibility
+    // (rv-ui-registry) — and register() never looks at `core`.
+    const plugin = { id: 'camera-startpos', core: true, modes: ['hmi'] as ModeId[] };
+
+    // Axis A — participation: true in EVERY mode, including the null baseline.
+    const allModes: (ModeId | null)[] = [null, 'hmi', 'planner', 'des'];
+    for (const mode of allModes) {
+      expect(pluginParticipatesInMode(plugin, mode)).toBe(true);
+    }
+
+    // Axis B — presentation: the slot is gated to hmi only, despite core.
+    const reg = new UIPluginRegistry();
+    reg.register({ ...plugin, slots: [{ slot: 'button-group', component: Dummy }] });
+    const [entry] = reg.getSlotComponents('button-group');
+    expect(entry.visibilityRule?.shownOnlyInAny).toEqual(['mode:hmi']);
+    expect(entry.visibilityId).toBeTruthy();
+
+    // And the compiled rule really hides it outside hmi.
+    expect(evaluateVisibilityRule(entry.visibilityRule!, ctx('mode:hmi'))).toBe(true);
+    expect(evaluateVisibilityRule(entry.visibilityRule!, ctx('mode:planner'))).toBe(false);
+  });
+
+  it('registry_ShownOnlyInAny_IsOverwritten: the entry\'s own OR-list is replaced', () => {
+    // register() spreads the old rule and overwrites this ONE key.
+    // The plugin's `modes` win outright; the entry's own list is lost.
+    const reg = new UIPluginRegistry();
+    reg.register({
+      id: 'planner-only',
+      modes: ['planner'],
+      slots: [{
+        slot: 'button-group',
+        component: Dummy,
+        visibilityRule: { shownOnlyInAny: ['mode:des', 'mode:hmi'] },
+      }],
+    });
+    const [entry] = reg.getSlotComponents('button-group');
+    expect(entry.visibilityRule?.shownOnlyInAny).toEqual(['mode:planner']);
+    expect(entry.visibilityRule?.shownOnlyInAny).not.toContain('mode:des');
+    expect(entry.visibilityRule?.shownOnlyInAny).not.toContain('mode:hmi');
+  });
+
+  it('registry_OtherRuleKeys_Preserved: hiddenIn/shownOnlyIn survive the spread', () => {
+    // The exact distinction the old "merging (not clobbering)" comment blurred:
+    // other keys survive, only `shownOnlyInAny` is replaced.
+    const reg = new UIPluginRegistry();
+    reg.register({
+      id: 'planner-grid',
+      modes: ['planner'],
+      slots: [{
+        slot: 'views',
+        component: Dummy,
+        visibilityRule: {
+          shownOnlyIn: ['kiosk'],
+          hiddenIn: ['fpv'],
+          shownOnlyInAny: ['mode:des'],
+        },
+      }],
+    });
+    const [entry] = reg.getSlotComponents('views');
+    expect(entry.visibilityRule?.shownOnlyIn).toEqual(['kiosk']);      // preserved
+    expect(entry.visibilityRule?.hiddenIn).toEqual(['fpv']);           // preserved
+    expect(entry.visibilityRule?.shownOnlyInAny).toEqual(['mode:planner']); // replaced
   });
 });

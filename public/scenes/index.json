@@ -1,3 +1,4 @@
 [
-  { "file": "DemoPlanner.scene.json", "name": "Planner Demo", "mode": "planner" }
+  { "file": "DemoPlanner.scene.json", "name": "Planner Demo", "mode": "planner" },
+  { "file": "Test-DES-Turntable-Loop.scene.json", "name": "Test DES Turntable Loop", "mode": "des" }
 ]

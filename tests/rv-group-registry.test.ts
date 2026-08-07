@@ -192,4 +192,130 @@ describe('GroupRegistry', () => {
     expect(registry.get('GroupA')!.visible).toBe(true);
     expect(registry.get('GroupB')!.visible).toBe(false);
   });
+
+  // ── External isolate channel (used by the selection-driven "Isolate") ──
+
+  it('setExternalIsolated tags the subtree and activates isolate', () => {
+    const root = new Object3D();
+    const child = new Object3D();
+    const grandChild = new Object3D();
+    child.add(grandChild);
+    root.add(child);
+    const other = new Object3D();
+
+    registry.setExternalIsolated([root]);
+
+    expect(registry.isIsolateActive).toBe(true);
+    expect(registry.externalIsolateActive).toBe(true);
+    // Whole subtree carries the focus layer — children come along implicitly.
+    expect(hasFocusLayer(root)).toBe(true);
+    expect(hasFocusLayer(child)).toBe(true);
+    expect(hasFocusLayer(grandChild)).toBe(true);
+    // Unrelated node is untouched.
+    expect(hasFocusLayer(other)).toBe(false);
+    // Subtree-membership drives the raycast isolation gate.
+    expect(registry.isInIsolatedSubtree(grandChild)).toBe(true);
+    expect(registry.isInIsolatedSubtree(other)).toBe(false);
+  });
+
+  it('setExternalIsolated(null) clears the focus layer and isolate state', () => {
+    const root = new Object3D();
+    const child = new Object3D();
+    root.add(child);
+
+    registry.setExternalIsolated([root]);
+    registry.setExternalIsolated(null);
+
+    expect(registry.isIsolateActive).toBe(false);
+    expect(registry.externalIsolateActive).toBe(false);
+    expect(hasFocusLayer(root)).toBe(false);
+    expect(hasFocusLayer(child)).toBe(false);
+    expect(registry.isInIsolatedSubtree(child)).toBe(false);
+  });
+
+  it('setExternalIsolated swaps roots, untagging the previous subtree', () => {
+    const a = new Object3D();
+    const b = new Object3D();
+
+    registry.setExternalIsolated([a]);
+    expect(hasFocusLayer(a)).toBe(true);
+
+    registry.setExternalIsolated([b]);
+    expect(hasFocusLayer(a)).toBe(false);
+    expect(hasFocusLayer(b)).toBe(true);
+    expect(registry.isInIsolatedSubtree(b)).toBe(true);
+  });
+
+  // --- register dedupe / unregister / getGroupNamesForNode (live editing) ---
+
+  it('register deduplicates — same node twice is a no-op', () => {
+    const node = new Object3D();
+    registry.register('Conveyors', node);
+    registry.register('Conveyors', node);
+    expect(registry.get('Conveyors')!.nodes).toHaveLength(1);
+  });
+
+  it('register applies the group\'s current visibility to a new root', () => {
+    const a = new Object3D();
+    const b = new Object3D();
+    registry.register('Robots', a);
+    registry.setVisible('Robots', false);
+    registry.register('Robots', b);
+    expect(b.visible).toBe(false);
+  });
+
+  it('unregister removes the node and reports change', () => {
+    const a = new Object3D();
+    const b = new Object3D();
+    registry.register('Conveyors', a);
+    registry.register('Conveyors', b);
+    expect(registry.unregister('Conveyors', a)).toBe(true);
+    expect(registry.get('Conveyors')!.nodes).toEqual([b]);
+  });
+
+  it('unregister returns false for unknown group or non-member node', () => {
+    const node = new Object3D();
+    registry.register('Conveyors', node);
+    expect(registry.unregister('Nope', node)).toBe(false);
+    expect(registry.unregister('Conveyors', new Object3D())).toBe(false);
+  });
+
+  it('unregister restores visibility when the group was hidden', () => {
+    const node = new Object3D();
+    registry.register('Robots', node);
+    registry.setVisible('Robots', false);
+    expect(node.visible).toBe(false);
+    registry.unregister('Robots', node);
+    expect(node.visible).toBe(true);
+  });
+
+  it('unregister deletes the group when its node list empties', () => {
+    const node = new Object3D();
+    registry.register('Robots', node);
+    registry.markAsKinematic('Robots');
+    registry.unregister('Robots', node);
+    expect(registry.get('Robots')).toBeUndefined();
+    expect(registry.getGroupNames()).not.toContain('Robots');
+    expect(registry.isKinematic('Robots')).toBe(false);
+  });
+
+  it('unregister of the isolated group\'s last node clears isolate state', () => {
+    const node = new Object3D();
+    registry.register('Robots', node);
+    registry.isolate('Robots');
+    expect(registry.isIsolateActive).toBe(true);
+    registry.unregister('Robots', node);
+    expect(registry.isIsolateActive).toBe(false);
+    expect(hasFocusLayer(node)).toBe(false);
+  });
+
+  it('getGroupNamesForNode returns sorted names of containing groups', () => {
+    const node = new Object3D();
+    const other = new Object3D();
+    registry.register('Zebra', node);
+    registry.register('Alpha', node);
+    registry.register('Other', other);
+    expect(registry.getGroupNamesForNode(node)).toEqual(['Alpha', 'Zebra']);
+    expect(registry.getGroupNamesForNode(new Object3D())).toEqual([]);
+  });
 });

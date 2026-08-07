@@ -29,6 +29,7 @@ import type {
   SimulationExecutor,
   SimulationTopology,
 } from './simulation-executor';
+import type { CoreSubsystems } from '../engine/rv-core-subsystems';
 import { ContinuousRunner } from './continuous-runner';
 
 export type SimulationMode = 'continuous' | 'des';
@@ -58,6 +59,82 @@ export interface SimKpiSnapshot {
 }
 
 /**
+ * Lightweight DES clock + event counters the top toolbar reads every poll
+ * (Plan 194). Pure data, all O(1) on the manager — so the toolbar can show the
+ * sim time (DD:HH:MM:SS), the processed/pending counts and the next-event time
+ * without snapshotting the whole queue (that's the Event Queue window's job, and
+ * it lives on the private side). No private types cross the boundary.
+ */
+export interface SimEventStats {
+  /** Canonical simulation time in seconds. */
+  readonly currentTime: number;
+  /** Total events processed since the run started. */
+  readonly processed: number;
+  /** Number of pending events in the queue (including cancelled). */
+  readonly pending: number;
+  /** Time of the next event in seconds, or +Infinity when the queue is empty. */
+  readonly nextEventTime: number;
+}
+
+/**
+ * Per-component runtime snapshot for inspection / debugging (MCP `web_des_*`).
+ * Pure data, no private types — the public side (MCP bridge, debug panels) reads
+ * the live material-flow topology + load without touching the private adapters.
+ */
+export interface SimDesComponentState {
+  /** Component node name (e.g. 'RollConveyor-2m'). */
+  readonly name: string;
+  /** Definition type (e.g. 'Conveyor', 'Turntable', 'Source'). */
+  readonly type: string;
+  /** Material-flow kind ('source' | 'conveyor' | 'sink' | 'router' | …). */
+  readonly kind: string;
+  /** Entity id assigned by the DES manager (-1 before registration). */
+  readonly entityId: number;
+  /** MUs currently held (occupancy). */
+  readonly load: number;
+  /** Capacity (MaxCapacity). */
+  readonly maxCapacity: number;
+  /** MUs in transit (scheduled arrival), when the component tracks it. */
+  readonly inTransit: number;
+  /** MUs parked waiting for a downstream slot (back-pressure), when tracked. */
+  readonly blocked: number;
+  /** True while exit is back-pressured. */
+  readonly isBlocked: boolean;
+  /** Downstream neighbour node names (material-flow wiring). */
+  readonly next: ReadonlyArray<string>;
+  /** Upstream neighbour node names. */
+  readonly prev: ReadonlyArray<string>;
+}
+
+/** Per-component utilization statistics (for MCP / analysis). Percentages 0–100. */
+export interface SimDesComponentStat {
+  readonly path: string;
+  readonly name: string;
+  readonly kind: string;
+  readonly working: number;
+  readonly setup: number;
+  readonly blocked: number;
+  readonly empty: number;
+  readonly failure: number;
+  /** Utilization 0–100 (100 − free-state time). */
+  readonly utilization: number;
+  readonly outputPerHour: number;
+  readonly totalProcessed: number;
+  readonly currentState: string;
+}
+
+/** DES statistics snapshot (per-component in material-flow order + aggregate). */
+export interface SimDesStatistics {
+  readonly simTime: number;
+  /** Per-component, ordered by material flow (sources first, sinks last). */
+  readonly components: ReadonlyArray<SimDesComponentStat>;
+  /** The constraining component (highest Working%); null when nothing is active. */
+  readonly bottleneck: { readonly path: string; readonly name: string; readonly working: number } | null;
+  readonly meanUtilization: number;
+  readonly throughputPerHour: number;
+}
+
+/**
  * The DES sub-mode / KPI control surface the public UI consumes. The active DES
  * executor (the private `DESRunner`) implements this STRUCTURALLY — the public
  * side only ever sees this interface, never the concrete class (Plan 194 V7). The
@@ -68,6 +145,11 @@ export interface SimDesControl {
   readonly subMode: SimSubMode;
   /** Switch the sub-mode (Animated / Hybrid / FastForward / Step). */
   setSubMode(m: SimSubMode): void;
+  /** Sub-mode active before the last switch into FastForward (never
+   *  'fastforward'). The FF toggle returns to this mode directly — no dropdown
+   *  re-pick. Kept on the executor so it survives UI remounts and covers every
+   *  FF entry path (toolbar, MCP, persisted mode). */
+  readonly preFastForwardSubMode?: SimSubMode;
   /** HybridSynced multiplier (≥ 1). */
   readonly multiplier: number;
   /** Set the HybridSynced multiplier. */
@@ -84,14 +166,99 @@ export interface SimDesControl {
   cancelFastForward?(): void;
   /** Current KPI snapshot (throughput / bottleneck / utilization). */
   kpiSnapshot?(): SimKpiSnapshot;
+  /** Lightweight clock + event counters for the toolbar (O(1), polled). */
+  eventStats?(): SimEventStats;
+  /** Sim END time in seconds (the run stops past it); Infinity = run until empty. */
+  readonly endTime?: number;
+  /** Set the sim end time; pass Infinity for "infinite" (run until the queue empties). */
+  setEndTime?(seconds: number): void;
+  /** Sim time at which component statistics reset (warmup); 0 = off. */
+  readonly statResetTime?: number;
+  /** Set the statistics-reset (warmup) time; 0 disables it. */
+  setStatResetTime?(seconds: number): void;
+  /** Per-component runtime states for inspection / debugging (MCP `web_des_*`). */
+  componentStates?(): SimDesComponentState[];
+  /** Per-component utilization statistics + bottleneck (MCP `web_des_stats` /
+   *  `web_des_bottleneck`), ordered by material flow. */
+  statistics?(): SimDesStatistics;
+  /** Serialize the DES manager state to JSON (Save Snapshot). */
+  snapshotJson?(): string;
+  /** Restore the DES manager state from a JSON snapshot (Load Snapshot). */
+  restoreJson?(json: string): void;
+
+  // ── Experiment / snapshot management (plan-261) ────────────────────────
+  // REPO-BOUNDARY RULE (plan-261 B3): everything below transports STRINGS and
+  // primitives only — the manifest crosses as a JSON string (like
+  // `snapshotJson`), NEVER as a private type. The private repo does not exist
+  // at public build time; a private type in a signature would be a
+  // compilability break, not a style issue.
+
+  /** Master PRNG seed of the DES manager. */
+  readonly masterSeed?: number;
+  /** Set the master seed (takes effect for RNG streams from the next reset). */
+  setMasterSeed?(seed: number): void;
+
+  /** All stored {model, experiment} pairs (optionally filtered by model). */
+  listExperiments?(model?: string): Promise<Array<{ model: string; experiment: string }>>;
+  /** The experiment manifest as a JSON string (null when absent). */
+  readManifestJson?(model: string, exp: string): Promise<string | null>;
+  /** Snapshot the CURRENT sim state into the store at the current sim time. */
+  saveSnapshot?(scope: { model: string; exp: string; repl: number }, label?: string): Promise<void>;
+  /** Load a stored snapshot and restore the sim to it (synchronous restore). */
+  loadSnapshot?(scope: { model: string; exp: string; repl: number; t: number }): Promise<void>;
+  /** Delete one stored snapshot. */
+  deleteSnapshot?(scope: { model: string; exp: string; repl: number; t: number }): Promise<void>;
+  /** Delete a replication with all its snapshots (cascading). */
+  deleteReplication?(scope: { model: string; exp: string; repl: number }): Promise<void>;
+  /** Delete an experiment with all replications + snapshots (cascading). */
+  deleteExperiment?(model: string, exp: string): Promise<void>;
+  /** Rename an experiment (moves all snapshot records). */
+  renameExperiment?(model: string, exp: string, newName: string): Promise<void>;
+  /** Export one experiment as a portable NDJSON.gz blob. */
+  exportExperiment?(model: string, exp: string): Promise<Blob>;
+  /** Import an NDJSON.gz experiment; returns the (collision-safe) identity. */
+  importExperiment?(file: Blob): Promise<{ model: string; exp: string }>;
+  /** Browser storage usage estimate (warn threshold / quota UI). */
+  estimateStorage?(): Promise<{ usedBytes: number; quotaBytes: number }>;
+
+  // ── Simulation runs (plan-260) — same string/primitive transport rule ────
+
+  /** JSON of the CURRENT (not yet archived) run — `{ runId, seed, startedAt }`
+   *  — or `null` when no run is in flight. Parse with `parseActiveRunInfo`
+   *  (rv-run-history-store). */
+  activeRunInfoJson?(): string | null;
+  /** Create-or-patch an experiment manifest with PUBLIC metadata. `patchJson`
+   *  is a JSON object with optional `projectId` / `glbHash` / `baseSeed` —
+   *  the project manager tags experiments with their comparison scope this
+   *  way (F5/F6/F11) without a private type crossing the seam. */
+  patchExperimentMetaJson?(model: string, exp: string, patchJson: string): Promise<void>;
+
+  // ── Experiment batch execution (plan-265) — same string/primitive rule ──
+  // The experiment matrix drives N replications per experiment; parameter
+  // overrides / replicationCount / paramScript / enabled travel through the
+  // manifest JSON via `patchExperimentMetaJson` (never a private type here).
+
+  /** Run N replications of ONE experiment (parameters applied before each run,
+   *  seeds derived deterministically; `crn` uses the shared per-slot seed). */
+  runExperimentBatch?(scope: { model: string; exp: string },
+                      opts: { replications: number; crn: boolean }): Promise<void>;
+  /** Run every ENABLED experiment of a model sequentially, N replications each. */
+  runAllExperiments?(model: string, opts: { crn: boolean }): Promise<void>;
+  /** Cancel an in-flight batch; already-finished replications stay archived. */
+  cancelBatch?(): void;
+  /** JSON of the current batch progress — `{ exp, replIndex, total, phase }` —
+   *  or null when no batch is running (drives the per-column running indicator). */
+  batchProgressJson?(): string | null;
 }
 
 /**
  * Factory the private DES side provides; `null` in the public build. Same shape
- * as `private-stubs/des-runner-stub.ts` `CreateDesRunner`.
+ * as `private-stubs/des-runner-stub.ts` `CreateDesRunner`. The optional `core`
+ * is the viewer's CoreSubsystems pipeline the DES runner composes into its
+ * tick (drives/visuals keep running at 60 Hz while the event queue advances).
  */
 export type DesRunnerFactory =
-  | ((defs: MaterialFlowDefinition[], topology: SimulationTopology) => SimulationExecutor)
+  | ((defs: MaterialFlowDefinition[], topology: SimulationTopology, core?: CoreSubsystems) => SimulationExecutor)
   | null;
 
 /** Construction dependencies — the viewer's EXISTING continuous runner + topology. */
@@ -104,6 +271,9 @@ export interface SimulationKernelOptions {
   readonly defs?: MaterialFlowDefinition[];
   /** DES runner factory; defaults to the stub (`null`) → continuous-only public build. */
   readonly desRunnerFactory?: DesRunnerFactory;
+  /** The viewer's CoreSubsystems pipeline, forwarded to the DES runner factory
+   *  (the continuous runner receives it directly at construction). */
+  readonly core?: CoreSubsystems;
   /**
    * Optional callback fired AFTER a successful mode switch (Plan 194 P6). The
    * viewer wires this to emit a `'simulation-mode-changed'` event so the
@@ -130,6 +300,7 @@ export class SimulationKernel {
   private readonly topology: SimulationTopology;
   private readonly defs: MaterialFlowDefinition[];
   private desRunnerFactory: DesRunnerFactory;
+  private readonly core?: CoreSubsystems;
   private readonly onModeChanged?: (mode: SimulationMode) => void;
 
   /** The currently active executor (continuous by default). */
@@ -146,6 +317,7 @@ export class SimulationKernel {
     this.topology = opts.topology;
     this.defs = opts.defs ?? [];
     this.desRunnerFactory = opts.desRunnerFactory ?? null;
+    this.core = opts.core;
     this.onModeChanged = opts.onModeChanged;
     this._active = this.continuousRunner;
   }
@@ -264,11 +436,16 @@ export class SimulationKernel {
     // m === 'des'
     if (this._desRunner) return this._desRunner;
     if (!this.desRunnerFactory) return null;
-    this._desRunner = this.desRunnerFactory(this.defs, this.topology);
+    this._desRunner = this.desRunnerFactory(this.defs, this.topology, this.core);
     return this._desRunner;
   }
 
   // ─── Per-tick delegation ──────────────────────────────────────────────
+
+  /** Pre-PRE pass on the active executor (CoreSubsystems early stage). */
+  earlyTick(dt: number): void {
+    this._active.earlyTick?.(dt);
+  }
 
   /** Advance the active executor one fixed tick. */
   tick(dt: number): void {

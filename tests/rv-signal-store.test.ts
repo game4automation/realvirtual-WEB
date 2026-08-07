@@ -275,3 +275,116 @@ describe('SignalStore', () => {
     expect(store.getByPath('Robot/Entry Conveyor/Start')).toBe(false);
   });
 });
+
+// ── Force / override (operator pin) ──
+
+describe('SignalStore — force', () => {
+  it('forceSignal pins a value and applies it immediately', () => {
+    const store = new SignalStore();
+    store.register('b', 'sig/b', false);
+    store.forceSignal('b', true);
+    expect(store.getBool('b')).toBe(true);
+    expect(store.isForced('b')).toBe(true);
+    expect(store.getForcedValue('b')).toBe(true);
+    expect(store.forcedCount).toBe(1);
+  });
+
+  it('set() is ignored while a signal is forced', () => {
+    const store = new SignalStore();
+    store.register('b', 'sig/b', false);
+    store.forceSignal('b', true);
+    store.set('b', false);            // interface tries to update
+    expect(store.getBool('b')).toBe(true);  // forced value held
+  });
+
+  it('setMany() skips forced signals but updates the rest', () => {
+    const store = new SignalStore();
+    store.register('a', 'sig/a', false);
+    store.register('b', 'sig/b', false);
+    store.forceSignal('a', true);
+    store.setMany({ a: false, b: true });
+    expect(store.getBool('a')).toBe(true);   // forced → unchanged
+    expect(store.getBool('b')).toBe(true);   // not forced → updated
+  });
+
+  it('setByPath() is ignored while forced', () => {
+    const store = new SignalStore();
+    store.register('Grip', 'demoglb/Robot/Grip', false);
+    store.forceSignal('Grip', true);
+    store.setByPath('Robot/Grip', false);
+    expect(store.getBool('Grip')).toBe(true);
+  });
+
+  it('unforce releases so interface updates flow again', () => {
+    const store = new SignalStore();
+    store.register('b', 'sig/b', false);
+    store.forceSignal('b', true);
+    store.unforce('b');
+    expect(store.isForced('b')).toBe(false);
+    store.set('b', false);
+    expect(store.getBool('b')).toBe(false);
+  });
+
+  it('unforceAll clears every forced signal', () => {
+    const store = new SignalStore();
+    store.register('a', 'sig/a', false);
+    store.register('b', 'sig/b', false);
+    store.forceSignal('a', true);
+    store.forceSignal('b', true);
+    expect(store.forcedCount).toBe(2);
+    store.unforceAll();
+    expect(store.forcedCount).toBe(0);
+  });
+
+  it('forceSignal can change a forced value (re-force)', () => {
+    const store = new SignalStore();
+    store.register('i', 'sig/i', 0);
+    store.forceSignal('i', 5);
+    expect(store.getInt('i')).toBe(5);
+    store.forceSignal('i', 9);
+    expect(store.getInt('i')).toBe(9);
+    expect(store.getForcedValue('i')).toBe(9);
+  });
+
+  it('notifies value listeners when a forced value is applied', () => {
+    const store = new SignalStore();
+    store.register('b', 'sig/b', false);
+    const cb = vi.fn();
+    store.subscribe('b', cb);
+    store.forceSignal('b', true);
+    expect(cb).toHaveBeenCalledWith(true);
+  });
+
+  it('subscribeForce fires on force and unforce, and unsubscribes', () => {
+    const store = new SignalStore();
+    store.register('b', 'sig/b', false);
+    const cb = vi.fn();
+    const unsub = store.subscribeForce(cb);
+    store.forceSignal('b', true);
+    store.unforce('b');
+    expect(cb).toHaveBeenCalledTimes(2);
+    unsub();
+    store.forceSignal('b', true);
+    expect(cb).toHaveBeenCalledTimes(2);  // no further calls after unsubscribe
+  });
+
+  it('forceSink receives value on force and null on release', () => {
+    const store = new SignalStore();
+    store.register('b', 'sig/b', false);
+    const sink = vi.fn();
+    store.setForceSink(sink);
+    store.forceSignal('b', true);
+    store.unforce('b');
+    expect(sink).toHaveBeenNthCalledWith(1, 'b', true);
+    expect(sink).toHaveBeenNthCalledWith(2, 'b', null);
+  });
+
+  it('clear() removes forced state', () => {
+    const store = new SignalStore();
+    store.register('b', 'sig/b', false);
+    store.forceSignal('b', true);
+    store.clear();
+    expect(store.forcedCount).toBe(0);
+    expect(store.isForced('b')).toBe(false);
+  });
+});

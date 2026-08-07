@@ -55,6 +55,15 @@ export function isSensorName(name: string): boolean {
   return /^Sensor(-.*)?([_ ]?\(\d+\))?$/.test(name);
 }
 
+/** Carrier — bare `Carrier` or `Carrier-<id>` (e.g. `Carrier-1`, `Carrier-Front`),
+ *  same suffix tolerance as sensors (plan-268 Phase 4). Overhead-conveyor carriers
+ *  are inherently PLURAL, so they are bound via `self.findAll('carrier')` (DFS
+ *  traversal order = deterministic pitch index), NOT via the `requires` block
+ *  (which injects only the first match). */
+export function isCarrierName(name: string): boolean {
+  return /^Carrier(-.*)?([_ ]?\(\d+\))?$/.test(name);
+}
+
 // ─── Node finders (for behavior files) ──────────────────────────────────
 // Behavior files use these to locate kinematics by the same conventions the
 // scanner wires up, instead of hardcoded node names. They live here (not in
@@ -75,11 +84,26 @@ export function findAll(root: Object3D, test: (node: Object3D) => boolean): Obje
   return out;
 }
 
-/** The node-name predicate for each convention-based node kind. */
+/** True when the node carries a WebViewer-native `rv_extras.Path` payload
+ *  (plan-268). Detection is coupled to the PAYLOAD (`userData.realvirtual.Path`
+ *  with inner `type === 'Path'` or no inner type), NEVER to the node name —
+ *  a node merely NAMED "Path" is not a path (plan-268 §10 review risk). */
+export function hasPathExtras(node: Object3D): boolean {
+  const rv = (node.userData as { realvirtual?: Record<string, unknown> } | undefined)?.realvirtual;
+  const p = rv?.['Path'];
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return false;
+  const t = (p as Record<string, unknown>).type;
+  return t === undefined || t === 'Path';
+}
+
+/** The node predicate for each convention-based node kind. All but `path` are
+ *  name-based; `path` is payload-based (see {@link hasPathExtras}). */
 export const NODE_KIND_TESTS = {
   transport: (n: Object3D): boolean => parseTransportName(n.name) !== null,
   sensor: (n: Object3D): boolean => isSensorName(n.name),
   rotary: (n: Object3D): boolean => (parseDriveName(n.name) ?? '').startsWith('Rotation'),
+  path: (n: Object3D): boolean => hasPathExtras(n),
+  carrier: (n: Object3D): boolean => isCarrierName(n.name),
 } as const;
 
 /** First `Transport-X/Y/Z` node — a belt surface (carries a co-located Drive). */

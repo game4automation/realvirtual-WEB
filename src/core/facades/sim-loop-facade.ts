@@ -14,7 +14,7 @@ import { TickStage } from '../rv-tick-stages';
 import type { RVDrive } from '../engine/rv-drive';
 import type { RVViewer } from '../rv-viewer';
 
-interface TickEntry {
+export interface TickEntry {
   callback: (dt: number) => void;
   order: number;
   insertIdx: number;  // for stable secondary sort
@@ -26,6 +26,13 @@ export class SimLoopFacadeImpl implements SimLoopFacade {
     [TickStage.PRE, []],
     [TickStage.SIM, []],
     [TickStage.POST, []],
+  ]);
+  // Cached defensive snapshots — rebuilt lazily after (un)subscribe instead of
+  // allocating a copy on every fixedUpdate tick (3 stages × 60 Hz).
+  private readonly _tickSnapshots: Map<TickStage, TickEntry[] | null> = new Map([
+    [TickStage.PRE, null],
+    [TickStage.SIM, null],
+    [TickStage.POST, null],
   ]);
   private _insertCounter = 0;
 
@@ -49,10 +56,26 @@ export class SimLoopFacadeImpl implements SimLoopFacade {
     list.push(entry);
     // Stable sort: primary by order, secondary by insert index.
     list.sort((a, b) => a.order - b.order || a.insertIdx - b.insertIdx);
+    this._tickSnapshots.set(stage, null);
     return () => {
       const idx = list.indexOf(entry);
-      if (idx >= 0) list.splice(idx, 1);
+      if (idx >= 0) {
+        list.splice(idx, 1);
+        this._tickSnapshots.set(stage, null);
+      }
     };
+  }
+
+  /** Snapshot for defensive iteration during fixedUpdate — a running iteration
+   *  keeps its copy while (un)subscribes only invalidate the cache.
+   *  @internal */
+  _snapshotTicks(stage: TickStage): readonly TickEntry[] {
+    let snap = this._tickSnapshots.get(stage);
+    if (!snap) {
+      snap = this._ticks.get(stage)!.slice();
+      this._tickSnapshots.set(stage, snap);
+    }
+    return snap;
   }
 
   eachDrive(fn: (drive: RVDrive, index: number) => void): void {

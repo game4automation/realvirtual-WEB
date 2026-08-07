@@ -19,6 +19,10 @@ import type { LoadResult } from '../core/engine/rv-scene-loader';
 import type { RVViewer } from '../core/rv-viewer';
 import { getAppConfig } from '../core/rv-app-config';
 import { isCompactWidth } from '../hooks/use-mobile-layout';
+import {
+  getProjectsDashboardSnapshot,
+  subscribeProjectsDashboard,
+} from '../core/hmi/projects/projects-dashboard-store';
 
 // ─── Public types ────────────────────────────────────────────────────
 
@@ -183,6 +187,7 @@ export class OrientationGizmoPlugin implements RVViewerPlugin {
   private _hovered: HandleId | null = null;
   private _lastLabelText = '';
   private _panelUnsub: (() => void) | null = null;
+  private _dashboardUnsub: (() => void) | null = null;
   private _resizeObs: ResizeObserver | null = null;
   private _intendedLabel: string | null = null;
   private _lastCamW = NaN;
@@ -222,6 +227,9 @@ export class OrientationGizmoPlugin implements RVViewerPlugin {
     this._updateCubeRotation();
     this._reorderForDepth();
     this._panelUnsub = viewer.leftPanelManager.subscribe(() => this._refreshPosition());
+    // The dashboard is a body-level overlay, so no resize or panel event fires
+    // when it opens — without this the cube would stay on screen on top of it.
+    this._dashboardUnsub = subscribeProjectsDashboard(() => this._refreshPosition());
     // Track the real 3D viewport rect: ViewportFrame insets #rv-viewport for the
     // title bar, right-docked panels, and UI zoom — observing its size keeps the
     // gizmo glued to the viewport's top-right corner through all of them.
@@ -257,6 +265,8 @@ export class OrientationGizmoPlugin implements RVViewerPlugin {
   dispose(): void {
     this._panelUnsub?.();
     this._panelUnsub = null;
+    this._dashboardUnsub?.();
+    this._dashboardUnsub = null;
     this._resizeObs?.disconnect();
     this._resizeObs = null;
     if (this._container) {
@@ -282,11 +292,27 @@ export class OrientationGizmoPlugin implements RVViewerPlugin {
    *  missing. */
   private _refreshPosition(): void {
     if (!this._container) return;
-    // Compact (phone-width) layout: the gizmo is a desktop mouse tool and would
-    // sit on top of the fullscreen panel headers (covering their close button),
-    // so hide it on narrow viewports. Driven from the same ResizeObserver as the
-    // positioning, so it toggles live when the window crosses the breakpoint.
-    this._container.style.display = isCompactWidth(window.innerWidth) ? 'none' : '';
+    // Two reasons to be invisible, both "there is no viewport to orient":
+    //
+    //  - Compact (phone-width) layout: the gizmo is a desktop mouse tool and
+    //    would sit on top of the fullscreen panel headers, covering their close
+    //    button.
+    //  - The Projects dashboard: it covers the whole viewport, so the cube
+    //    orients nothing and merely overlaps the header controls.
+    //
+    // Hiding is the only option available to us, not merely the tidiest one.
+    // The gizmo is a direct child of <body> at z-index 1100, while the dashboard
+    // lives inside #react-root — which is itself `position: fixed; z-index: 1000`
+    // and therefore a stacking context. Every z-index inside it is resolved
+    // against 1000, so no value the dashboard sets can ever rise above 1100.
+    // Raising #react-root instead would lift the entire HMI over every
+    // body-level overlay, which is a much larger change than this problem.
+    //
+    // Driven from the same ResizeObserver as the positioning, plus the
+    // dashboard subscription, so it toggles live in both directions.
+    const dashboardOpen = getProjectsDashboardSnapshot().open;
+    this._container.style.display =
+      isCompactWidth(window.innerWidth) || dashboardOpen ? 'none' : '';
     const vp = document.getElementById('rv-viewport');
     if (vp) {
       const rect = vp.getBoundingClientRect();
@@ -508,8 +534,8 @@ export class OrientationGizmoPlugin implements RVViewerPlugin {
       background: rgba(20, 20, 20, 0.65);
       border: 1px solid rgba(255, 255, 255, 0.12);
       border-radius: 999px;
-      backdrop-filter: blur(6px);
-      -webkit-backdrop-filter: blur(6px);
+      backdrop-filter: blur(calc(6px * var(--rv-ui-blur-scale, 1)));
+      -webkit-backdrop-filter: blur(calc(6px * var(--rv-ui-blur-scale, 1)));
       cursor: pointer;
       pointer-events: auto;
       transition: background 120ms ease, border-color 120ms ease;

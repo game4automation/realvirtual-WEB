@@ -9,7 +9,7 @@ For plugin basics see [doc-extending-webviewer.md](doc-extending-webviewer.md), 
 
 | I want to… | Use | Source |
 |---|---|---|
-| React to viewer state (model loaded, pause, selection, …) | **ViewerEvent** via `viewer.on(...)` | [rv-events.ts](src/core/rv-events.ts), [rv-viewer.ts](src/core/rv-viewer.ts) |
+| React to viewer state (model loaded, pause, selection, …) | **ViewerEvent** via `viewer.on(...)` | [rv-viewer-events.ts](src/core/rv-viewer-events.ts) (the `ViewerEvents` catalog), [rv-events.ts](src/core/rv-events.ts) (the `EventEmitter`), [rv-viewer.ts](src/core/rv-viewer.ts) |
 | Run on every 60-Hz tick (read signals, set drives) | **Plugin-Lifecycle** (`onFixedUpdatePre/Post`) | [rv-plugin.ts](src/core/rv-plugin.ts) |
 | React to hover/click/selection per 3D component | **Component-Callback** (`onHover/onClick/onSelect`) | [rv-component-registry.ts](src/core/engine/rv-component-registry.ts) |
 | Bind custom React UI to viewer state | **React Hook** from [src/hooks/](src/hooks/) | – |
@@ -42,14 +42,15 @@ viewer.use(myPlugin);
 | Callback | When | Typical Use |
 |---|---|---|
 | `init(viewer, context?)` | When the plugin is registered via `viewer.use(plugin)` (before any model load) | Initialize plugin state, store the viewer reference, establish connections |
-| `onModelLoaded(result, viewer)` | After GLB load, before the `'model-loaded'` event. Also called retroactively for plugins registered after a model is already loaded. | Find components, initialize custom managers |
+| `onModelLoaded(result, viewer)` | After GLB load, before the `'model-loaded'` event. Also called retroactively for plugins registered after a model is already loaded — **except** when the plugin is disabled or declares `modes` and none is active; then the call is parked and replayed on the mode transition that enables it. | Find components, initialize custom managers |
 | `onModelCleared(viewer)` | At the start of `clearModel()`, **before** state reset | Clear own caches |
 | `onConnectionStateChanged(state, viewer)` | When `viewer.setConnectionState(...)` changes | Pause/resume polling |
 | `onFixedUpdatePre(dt)` | 60 Hz, **before** drive physics & transport | Drive targets, ErraticDriver, replay, CAM |
 | `onFixedUpdatePost(dt)` | 60 Hz, **after** drive physics & transport | DriveRecorder, SensorMonitor, KPIs |
 | `onRender(frameDt)` | Per render frame, **after** `renderer.render()` | Custom overlays, post effects |
 | `onModeActivate(mode, viewer)` | When entering a workspace mode this plugin participates in | Install mode-specific scene overlays, interaction handlers, raycast filters, gizmos |
-| `onModeDeactivate(mode, viewer)` | When leaving such a mode, before the plugin is disabled (scene/model still valid) | Tear down everything created in onModeActivate |
+| `onModeDeactivate(mode, viewer)` | When leaving such a mode, before the plugin is disabled (scene/model still valid). `mode` is `null` only in unusual boot edge cases. | Tear down everything created in onModeActivate |
+| `onRenderBackendChanged(backend, viewer)` | When the active 3D render backend changes (plan-256), e.g. `'three'` → `'omniverse'` | Tear down open gizmos / drag handlers — Three interaction is meaningless under a non-Three backend |
 | `dispose()` | Viewer is destroyed | Clean up listeners / DOM |
 
 ### Plugin Properties
@@ -108,6 +109,7 @@ Known combinations:
 | `sensor` | `changed` | `{ occupied: boolean }` | [sensor-monitor-plugin.ts](src/plugins/sensor-monitor-plugin.ts) |
 | `mu` | `spawned` | `{ totalSpawned: number }` | [transport-stats-plugin.ts](src/plugins/transport-stats-plugin.ts) |
 | `mu` | `consumed` | `{ totalConsumed: number }` | [transport-stats-plugin.ts](src/plugins/transport-stats-plugin.ts) |
+| `drive` | `at-target` | `{ position: number }` | Declared as a known kind in [rv-viewer-events.ts](src/core/rv-viewer-events.ts); no core emitter today — subscribe defensively |
 
 Plugins can emit arbitrary `componentType` / `kind` combinations without modifying the core.
 
@@ -135,8 +137,8 @@ Plugins can emit arbitrary `componentType` / `kind` combinations without modifyi
 | `object-hover` | `ObjectHoverData \| null` |
 | `object-unhover` | `ObjectUnhoverData` |
 | `object-click` | `ObjectClickData` (declared, see `object-clicked`) |
-| `object-clicked` | `{ path: string; node: Object3D }` |
-| `object-focus` | `{ path: string; node: Object3D }` |
+| `object-clicked` | `{ path: string; node: Object3D; hitPoint?: [number, number, number] }` |
+| `object-focus` | `{ path: string; node: Object3D; openInspector?: boolean }` — `openInspector === false` (F shortcut) frames the camera only |
 | `object-blur` | `void` — previous focus pin was cleared (`clearFocus()`) |
 | `selection-changed` | `SelectionSnapshot` |
 | `context-menu-request` | `{ pos: {x,y}; path; node }` |
@@ -199,7 +201,30 @@ Every 3D component (`RVDrive`, `RVSensor`, …) implements `RVComponent` from [r
 | `getLiveState?()` | Returns the component's authoritative current runtime values (source of truth for the inspector, hierarchy badges, tooltips) |
 | `setLiveField?(fieldName, value)` | Applies an inspector edit to live runtime state immediately; return true if handled, false to fall back to generic assignment |
 
-`ComponentContext` contains `viewer`, `signalStore`, `registry`, `componentEventDispatcher`, and `events` (typed as `EventEmitter<ViewerEvents>`). Everything a component normally needs is reachable.
+### What `ComponentContext` actually carries
+
+**There is no `ctx.viewer`.** A component never gets the viewer pointer — that is the point of the
+context. It receives a fixed set of collaborators, split into always-present and optional
+([rv-component-registry.ts](src/core/engine/rv-component-registry.ts)):
+
+| Always present | Optional (null-check before use) |
+|---|---|
+| `registry` (`NodeRegistry`) | `gizmoManager` — overlay gizmos (`GizmoOverlayManager`) |
+| `signalStore` (`SignalStore`) | `lampManager` — fixed-update lamp flashing |
+| `scene` (`THREE.Scene`) | `outlineManager` — the OutlinePass wrapper |
+| `transportManager` (`RVTransportManager`) | `errorStore` — central error/alarm registry |
+| `root` (`Object3D`, the loaded GLB root) | `instructionStore` — runtime-instruction registry |
+| | `componentEventDispatcher` — hover/click/select routing |
+| | `events` — `EventEmitter<ViewerEvents>` |
+| | `energyChainManager` — energy-chain rigs (plan-362) |
+| | `collisionManager` — `CollisionRole` registrar (plan-394) |
+| | `expectSceneReady` — `true` when `onSceneReady()` will still run on this load path |
+
+Note that `events` and `componentEventDispatcher` are **optional**, so a component that wants to
+emit a `component-event` must guard the call. `expectSceneReady` is the flag that tells a component
+which freeze it may do in `init()`: on the paths that set it, kinematic re-parenting still happens
+between `init()` and `onSceneReady()`, so anything capturing a bind frame must wait for the second
+pass.
 
 ```ts
 class MyComponent implements RVComponent {
@@ -208,6 +233,10 @@ class MyComponent implements RVComponent {
 
   init(ctx: ComponentContext) {
     ctx.signalStore.subscribe('Conveyor1.Start', (v) => { /* … */ });
+    ctx.events?.emit('component-event', {          // optional — guard it
+      componentType: 'my-component', kind: 'ready',
+      path: ctx.registry.getPathForNode(this.node) ?? '',
+    });
   }
   onHover(hovered: boolean) { /* highlight on/off */ }
   dispose() { /* cleanup */ }

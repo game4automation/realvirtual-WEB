@@ -13,6 +13,7 @@
  * WRITE (Claude Code → Vite → browser):
  *   - setSignal / setSignals — write PLC signal values
  *   - jogDrive / stopDrive / moveDrive — control drives
+ *   - setRenderBackend — switch Three/Omniverse for integration diagnostics
  *
  * Endpoints:
  *   GET  /__api/debug              Full snapshot
@@ -52,6 +53,70 @@ function serializeProps(obj: unknown, maxDepth = 2): Record<string, unknown> {
   return result;
 }
 
+// ── Console-argument serialization (crash-safe) ──
+
+/** Max characters kept per serialized console argument. */
+const MAX_ARG_LEN = 2000;
+/** Max characters kept for one buffered console message (all args joined). */
+const MAX_MESSAGE_LEN = 8000;
+
+/**
+ * Serialize ONE console.error/warn argument for the error buffer. MUST NEVER
+ * THROW — this runs inside the console monkey-patch, and an exception here
+ * would swallow the ORIGINAL error and replace it with a serialization error
+ * (seen live: `JSON.stringify` on a Three.js BufferGeometry walked
+ * `BufferAttribute.toJSON` → `Array.from` over a typed array whose
+ * ArrayBuffer was detached (worker transfer / disposed WASM heap) → TypeError
+ * "Cannot perform %TypedArray%.prototype.values on a detached ArrayBuffer").
+ *
+ * Three.js objects (BufferGeometry / BufferAttribute / Object3D / Material)
+ * are therefore NEVER JSON-serialized — they render as a short tag like
+ * `[BufferGeometry name=Belt uuid=…]`. Anything else falls back through
+ * try/catch chains: JSON.stringify → String(arg) → '[unserializable]'.
+ *
+ * Exported for tests.
+ */
+export function serializeConsoleArg(arg: unknown): string {
+  try {
+    if (arg instanceof Error) return `${arg.message}\n${arg.stack ?? ''}`;
+    if (arg === null || typeof arg !== 'object') return String(arg).slice(0, MAX_ARG_LEN);
+
+    // Three.js objects: identify via their `is*` marker flags (stable public
+    // API). Their toJSON walks geometry buffers — potentially megabytes, and
+    // it THROWS on detached ArrayBuffers. Short tag instead.
+    const o = arg as {
+      isBufferGeometry?: boolean; isBufferAttribute?: boolean;
+      isInterleavedBufferAttribute?: boolean; isObject3D?: boolean;
+      isMaterial?: boolean; isTexture?: boolean;
+      type?: unknown; name?: unknown; uuid?: unknown;
+    };
+    if (
+      o.isBufferGeometry || o.isBufferAttribute || o.isInterleavedBufferAttribute ||
+      o.isObject3D || o.isMaterial || o.isTexture
+    ) {
+      const kind =
+        o.isBufferGeometry ? 'BufferGeometry' :
+        (o.isBufferAttribute || o.isInterleavedBufferAttribute) ? 'BufferAttribute' :
+        o.isObject3D ? 'Object3D' :
+        o.isMaterial ? 'Material' : 'Texture';
+      const type = typeof o.type === 'string' && o.type !== kind ? ` type=${o.type}` : '';
+      const name = typeof o.name === 'string' && o.name ? ` name=${o.name}` : '';
+      const uuid = typeof o.uuid === 'string' ? ` uuid=${o.uuid}` : '';
+      return `[${kind}${type}${name}${uuid}]`;
+    }
+
+    // Plain data: JSON — throws on cycles, BigInt, throwing toJSON/getters.
+    const json = JSON.stringify(arg);
+    return (json ?? String(arg)).slice(0, MAX_ARG_LEN);
+  } catch {
+    try {
+      return String(arg).slice(0, MAX_ARG_LEN);
+    } catch {
+      return '[unserializable]';
+    }
+  }
+}
+
 // ── Types ──
 
 interface DebugCommand {
@@ -85,6 +150,9 @@ interface StateHistoryEntry {
 export class DebugEndpointPlugin extends RVBehavior {
   readonly id = 'debug-endpoint';
   readonly order = 999;
+  private readonly _debugSessionId = typeof crypto?.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
   private _lastPush = 0;
   private _lastPoll = 0;
@@ -106,6 +174,7 @@ export class DebugEndpointPlugin extends RVBehavior {
   private static readonly MAX_STATE_HISTORY = 100;
   private _stateTrackingOff?: () => void;
   private _pushInFlight = false;
+  private _tickTimer: ReturnType<typeof setInterval> | null = null;
 
   // Console monkey-patch guard — prevents double-patching on model reload
   private _intercepted = false;
@@ -122,15 +191,26 @@ export class DebugEndpointPlugin extends RVBehavior {
     this._setupErrorCapture();
     this._setupSignalChangelog();
     this._setupStateTracking();
+    // Non-Three backends deliberately pause plugin onRender callbacks. Keep
+    // diagnostics and command polling alive so Omniverse can still be observed
+    // and switched back through the debug endpoint.
+    if (this._tickTimer) clearInterval(this._tickTimer);
+    this._tickTimer = setInterval(() => this._tick(), 250);
   }
 
   protected onDestroy(): void {
+    if (this._tickTimer) clearInterval(this._tickTimer);
+    this._tickTimer = null;
     this._restoreConsole();
     this._stateTrackingOff?.();
     this._stateTrackingOff = undefined;
   }
 
   onRender(_frameDt: number): void {
+    this._tick();
+  }
+
+  private _tick(): void {
     const now = performance.now();
 
     // Push snapshot at 1Hz (skip if previous push still in-flight)
@@ -159,13 +239,16 @@ export class DebugEndpointPlugin extends RVBehavior {
     this._origError = console.error;
     this._origWarn = console.warn;
 
+    // Buffering must NEVER prevent the original console call — a throwing
+    // _bufferError would swallow the actual error (belt and braces on top of
+    // the per-argument try/catch in serializeConsoleArg).
     console.error = (...args: unknown[]) => {
-      this._bufferError('error', args);
+      try { this._bufferError('error', args); } catch { /* never block the original */ }
       this._origError!.apply(console, args);
     };
 
     console.warn = (...args: unknown[]) => {
-      this._bufferError('warning', args);
+      try { this._bufferError('warning', args); } catch { /* never block the original */ }
       this._origWarn!.apply(console, args);
     };
 
@@ -174,10 +257,9 @@ export class DebugEndpointPlugin extends RVBehavior {
   }
 
   private _bufferError(level: 'error' | 'warning', args: unknown[]): void {
-    const message = args.map(a => {
-      if (a instanceof Error) return `${a.message}\n${a.stack ?? ''}`;
-      return typeof a === 'object' ? JSON.stringify(a) : String(a);
-    }).join(' ');
+    // Per-argument crash-safe serialization (see serializeConsoleArg) + a
+    // total length cap so one geometry dump can't bloat every 1 Hz snapshot.
+    const message = args.map(serializeConsoleArg).join(' ').slice(0, MAX_MESSAGE_LEN);
 
     this._errors.push({
       level,
@@ -239,13 +321,13 @@ export class DebugEndpointPlugin extends RVBehavior {
       .then(r => r.json())
       .then((data: { commands: DebugCommand[] }) => {
         for (const cmd of data.commands) {
-          this._executeCommand(cmd);
+          void this._executeCommand(cmd);
         }
       })
       .catch(() => {});
   }
 
-  private _executeCommand(cmd: DebugCommand): void {
+  private async _executeCommand(cmd: DebugCommand): Promise<void> {
     let success = true;
     let error: string | undefined;
 
@@ -254,12 +336,12 @@ export class DebugEndpointPlugin extends RVBehavior {
         case 'setSignal': {
           const name = cmd.name as string;
           const value = cmd.value as boolean | number;
-          this.signals?.set(name, value);
+          this.signalWriter?.set(name, value);
           break;
         }
         case 'setSignals': {
           const signals = cmd.signals as Record<string, boolean | number>;
-          this.signals?.setMany(signals);
+          this.signalWriter?.setMany(signals);
           break;
         }
         case 'jogDrive': {
@@ -284,6 +366,21 @@ export class DebugEndpointPlugin extends RVBehavior {
           drive.startMove(cmd.position as number);
           break;
         }
+        case 'setRenderBackend': {
+          const backend = cmd.backend;
+          if (backend !== 'three' && backend !== 'omniverse') {
+            success = false;
+            error = `Invalid render backend: ${String(backend)}`;
+            break;
+          }
+          if (!this.viewer) {
+            success = false;
+            error = 'Viewer not available';
+            break;
+          }
+          await this.viewer.setRenderBackend(backend);
+          break;
+        }
         default:
           success = false;
           error = `Unknown command: ${cmd.cmd}`;
@@ -305,10 +402,20 @@ export class DebugEndpointPlugin extends RVBehavior {
 
   private _collectState() {
     return {
+      debugSessionId: this._debugSessionId,
       timestamp: Date.now(),
       fps: this.viewer?.currentFps ?? 0,
       elapsed: +this.elapsed.toFixed(2),
       connectionState: this.viewer?.connectionState ?? 'unknown',
+      renderBackend: {
+        id: this.viewer?.renderBackend ?? 'three',
+        status: this.viewer?.renderBackendStatus ?? 'idle',
+        detail: this.viewer?.renderBackendStatusDetail ?? '',
+      },
+      selection: {
+        primaryPath: this.viewer?.selectionManager.primaryPath ?? null,
+        selectedPaths: [...(this.viewer?.selectionManager.selectedPaths ?? [])],
+      },
       scene: {
         model: this.viewer?.currentModelUrl ?? null,
         driveCount: this.drives.length,

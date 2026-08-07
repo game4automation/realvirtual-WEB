@@ -16,12 +16,29 @@ export default defineConfig({
     {
       name: 'chromium',
       use: { ...devices['Desktop Chrome'] },
+      testIgnore: /embed-smoke\.spec\.ts/,
+    },
+    {
+      name: 'embed-chromium',
+      testMatch: /embed-smoke\.spec\.ts/,
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: 'http://localhost:4178',
+      },
     },
   ],
-  webServer: {
-    command: 'npm run dev -- --port 5177',
-    port: 5177,
-    reuseExistingServer: true,
-    timeout: 30_000,
-  },
+  webServer: [
+    {
+      command: 'npm run dev -- --port 5177',
+      port: 5177,
+      reuseExistingServer: true,
+      timeout: 30_000,
+    },
+    {
+      command: 'npm run preview:embed',
+      port: 4178,
+      reuseExistingServer: true,
+      timeout: 30_000,
+    },
+  ],
 });

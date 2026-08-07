@@ -22,6 +22,7 @@
 import type { RVExtrasOverlay } from '../../engine/rv-extras-overlay-store';
 import type { PlacedComponent } from '../../../plugins/layout-planner/rv-layout-store';
 import type { ModelCameraStart } from '../camera-startpos-types';
+import type { RvConnection, ConnectionType } from '../../engine/rv-connection-registry';
 
 // ─── Edit operations ────────────────────────────────────────────────────
 
@@ -88,6 +89,90 @@ export interface TransformPlacementOp extends EditOpBase {
   };
 }
 
+/** Move / rotate an EXISTING scene node (e.g. a dragged IK path waypoint).
+ *  Stores the LOCAL transform relative to the node's parent; scale is
+ *  deliberately untouched (GLB nodes may carry mirror scale that must
+ *  survive). For op-created nodes the transform folds into the addNode spec
+ *  at materialise time — this op only reaches the loader for base-GLB nodes. */
+export interface SetNodeTransformOp extends EditOpBase {
+  kind: 'setNodeTransform';
+  nodePath: string;
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+  prev: {
+    position: [number, number, number];
+    quaternion: [number, number, number, number];
+  };
+}
+
+// ─── WebComponent script code (plan-210 JS-in-GLB authoring) ─────────────
+//
+// The per-node script lives in the scene state as a `WebComponent` component
+// override (`overlay.nodes[path].WebComponent.Code`) — the same shape §7 of
+// plan-210 defines for `rv_extras`, so the future GLB export (plan-187)
+// serialises it without translation. Only `Code` gets a dedicated op kind
+// (keystroke coalescing + code-aware history labels); the remaining
+// `WebComponent` fields (Active / ApiVersion / Language / DesSafe / TypeId)
+// are edited through the existing generic `setField` op.
+//
+// Persistence: setCode ops ride the existing draft autosave / save pipeline
+// (`rv-scene-storage.ts`) unchanged. Quota note: script sources are a few KB
+// per node — well within the localStorage budget, and coalescing keeps a
+// typing run to ONE op (with one code string) in the history, so no special
+// storage mechanism is needed. writeScene/writeDraft already swallow quota
+// errors and surface them to the caller.
+
+/** Component-type key of the script component inside `userData.realvirtual`. */
+export const WEB_COMPONENT_TYPE = 'WebComponent';
+/** Field name of the script source on the WebComponent. */
+export const WEB_COMPONENT_CODE_FIELD = 'Code';
+
+/** Set the WebComponent script code on a node. Coalesces per keystroke run. */
+export interface SetCodeOp extends EditOpBase {
+  kind: 'setCode';
+  nodePath: string;
+  /** New script source. */
+  code: string;
+  /** Previous source; undefined when the node had no `WebComponent.Code` yet. */
+  prev: string | undefined;
+}
+
+// ─── Typed connections (plan-259) ─────────────────────────────────────────
+//
+// Connection edges + user-defined type signatures are top-level rv-ODT data
+// (`Connections` block). In the editor they live in the op log via dedicated
+// op kinds (modelled on `setCode`): materialise() folds them into flat arrays
+// that the ConnectionSystemPlugin applies onto the session registry after the
+// base GLB (with its authored connections) has loaded.
+
+/** Add one connection edge. Inverse: removeConnection. */
+export interface AddConnectionOp extends EditOpBase {
+  kind: 'addConnection';
+  connection: RvConnection;
+}
+
+/** Remove one connection edge (full snapshot carried for undo). */
+export interface RemoveConnectionOp extends EditOpBase {
+  kind: 'removeConnection';
+  connectionId: string;
+  connection: RvConnection;
+}
+
+/** Add or replace a user-defined connection type signature. */
+export interface SetConnectionTypeOp extends EditOpBase {
+  kind: 'setConnectionType';
+  connectionType: ConnectionType;
+  /** Previous signature of the same type name (undefined = newly created). */
+  prev: ConnectionType | undefined;
+}
+
+/** Remove a user-defined connection type signature (edges of the type stay). */
+export interface RemoveConnectionTypeOp extends EditOpBase {
+  kind: 'removeConnectionType';
+  /** Full snapshot for undo. */
+  connectionType: ConnectionType;
+}
+
 /** Set or clear the per-scene camera start preset. */
 export interface SetCameraOp extends EditOpBase {
   kind: 'setCamera';
@@ -140,9 +225,15 @@ export type PrimitiveEditOp =
   | AddPlacementOp
   | RemovePlacementOp
   | TransformPlacementOp
+  | SetNodeTransformOp
   | SetCameraOp
+  | SetCodeOp
   | AddNodeOp
-  | RemoveNodeOp;
+  | RemoveNodeOp
+  | AddConnectionOp
+  | RemoveConnectionOp
+  | SetConnectionTypeOp
+  | RemoveConnectionTypeOp;
 
 /** Top-level op type (anything that may appear in `_ops`). */
 export type EditOp = PrimitiveEditOp | CompositeOp;
@@ -167,28 +258,36 @@ export interface AddedNode {
   spec: NodeSpec;
 }
 
+/** A persisted local transform for a base-GLB node (op-log `setNodeTransform`).
+ *  Op-created nodes never appear here — their transform folds into the spec. */
+export interface NodeTransformEntry {
+  nodePath: string;
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+}
+
 /** The shape `materialise()` produces — fed into `loadGLB` and `applyPlacements`. */
 export interface MaterialisedEdits {
   overlay: RVExtrasOverlay;
   placements: PlacedComponent[];
   cameraStart: ModelCameraStart | null;
   addedNodes: AddedNode[];
+  nodeTransforms: NodeTransformEntry[];
+  /** Edit-op connection edges (plan-259) — applied ADDITIVELY on top of the
+   *  GLB-authored `Connections` block by the ConnectionSystemPlugin. */
+  connections: RvConnection[];
+  /** Edit-op user-defined connection type signatures (plan-259). */
+  connectionTypes: ConnectionType[];
 }
 
-// ─── Constants ──────────────────────────────────────────────────────────
+// ─── Constants + identity (shared with the asset editor's op log) ────────
+//
+// Extracted to `src/core/ops/rv-op-utils.ts` and re-exported here unchanged
+// so existing imports keep working. The asset editor imports them from
+// rv-op-utils directly (it must not depend on scene types).
 
-/** Max number of ops kept in the history. Older ops drop off the front. */
-export const MAX_OP_HISTORY = 500;
-
-/** Coalesce window — adjacent same-target ops within this window merge. */
-export const COALESCE_WINDOW_MS = 500;
-
-// ─── Identity ───────────────────────────────────────────────────────────
-
-/** Generate a fresh op id. Stable across save/load — never regenerate. */
-export function freshOpId(): string {
-  return 'op_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
-}
+export { MAX_OP_HISTORY, COALESCE_WINDOW_MS, freshOpId, deepCloneJSON } from '../../ops/rv-op-utils';
+import { COALESCE_WINDOW_MS, freshOpId, deepCloneJSON } from '../../ops/rv-op-utils';
 
 // ─── Materialise (replay ops onto an empty workspace) ───────────────────
 
@@ -209,10 +308,13 @@ export function materialise(ops: ReadonlyArray<EditOp>): MaterialisedEdits {
   const overlay: RVExtrasOverlay = emptyOverlay();
   const placements = new Map<string, PlacedComponent>();
   const addedNodes = new Map<string, AddedNode>();
+  const nodeTransforms = new Map<string, NodeTransformEntry>();
+  const connections = new Map<string, RvConnection>();
+  const connectionTypes = new Map<string, ConnectionType>();
   let cameraStart: ModelCameraStart | null = null;
 
   for (const op of flattenOps(ops)) {
-    applyForwardPure(op, overlay, placements, addedNodes, (next) => { cameraStart = next; });
+    applyForwardPure(op, overlay, placements, addedNodes, nodeTransforms, connections, connectionTypes, (next) => { cameraStart = next; });
   }
 
   // Fold any field overrides that target an added node INTO its spec, and drop
@@ -233,6 +335,9 @@ export function materialise(ops: ReadonlyArray<EditOp>): MaterialisedEdits {
     placements: [...placements.values()],
     cameraStart,
     addedNodes: [...addedNodes.values()],
+    nodeTransforms: [...nodeTransforms.values()],
+    connections: [...connections.values()],
+    connectionTypes: [...connectionTypes.values()],
   };
 }
 
@@ -251,15 +356,52 @@ function applyForwardPure(
   overlay: RVExtrasOverlay,
   placements: Map<string, PlacedComponent>,
   addedNodes: Map<string, AddedNode>,
+  nodeTransforms: Map<string, NodeTransformEntry>,
+  connections: Map<string, RvConnection>,
+  connectionTypes: Map<string, ConnectionType>,
   setCamera: (next: ModelCameraStart | null) => void,
 ): void {
   switch (op.kind) {
+    case 'addConnection': {
+      connections.set(op.connection.id, deepCloneJSON(op.connection));
+      return;
+    }
+    case 'removeConnection': {
+      connections.delete(op.connectionId);
+      return;
+    }
+    case 'setConnectionType': {
+      connectionTypes.set(op.connectionType.type, deepCloneJSON(op.connectionType));
+      return;
+    }
+    case 'removeConnectionType': {
+      connectionTypes.delete(op.connectionType.type);
+      return;
+    }
     case 'addNode': {
       addedNodes.set(op.nodePath, { nodePath: op.nodePath, spec: deepCloneJSON(op.spec) });
       return;
     }
     case 'removeNode': {
       addedNodes.delete(op.nodePath);
+      nodeTransforms.delete(op.nodePath);
+      return;
+    }
+    case 'setNodeTransform': {
+      // Op-created node: fold the transform straight into its creation spec
+      // (the node doesn't exist during loadGLB, so the loader-side transform
+      // pass could never find it). Base-GLB node: last-write-wins entry.
+      const added = addedNodes.get(op.nodePath);
+      if (added) {
+        added.spec.position = [...op.position];
+        added.spec.quaternion = [...op.quaternion];
+        return;
+      }
+      nodeTransforms.set(op.nodePath, {
+        nodePath: op.nodePath,
+        position: [...op.position],
+        quaternion: [...op.quaternion],
+      });
       return;
     }
     case 'setField': {
@@ -298,6 +440,12 @@ function applyForwardPure(
     }
     case 'setCamera': {
       setCamera(op.preset ? { ...op.preset } : null);
+      return;
+    }
+    case 'setCode': {
+      ensureNode(overlay, op.nodePath);
+      ensureComponent(overlay, op.nodePath, WEB_COMPONENT_TYPE);
+      overlay.nodes[op.nodePath][WEB_COMPONENT_TYPE][WEB_COMPONENT_CODE_FIELD] = op.code;
       return;
     }
   }
@@ -348,14 +496,32 @@ export function canCoalesce(last: EditOp, next: EditOp): boolean {
       const a = last as TransformPlacementOp;
       return a.placementId === next.placementId;
     }
+    case 'setNodeTransform': {
+      const a = last as SetNodeTransformOp;
+      return a.nodePath === next.nodePath;
+    }
     case 'setCamera': {
       // Camera coalesces unconditionally on consecutive saves.
       return true;
+    }
+    case 'setCode': {
+      // Keystroke coalescing — an editor typing run on the same node folds
+      // into one history entry (the first op's `prev` survives the merge).
+      const a = last as SetCodeOp;
+      return a.nodePath === next.nodePath;
+    }
+    case 'setConnectionType': {
+      // Editing one type's parameters folds into a single history entry.
+      const a = last as SetConnectionTypeOp;
+      return a.connectionType.type === next.connectionType.type;
     }
     case 'addPlacement':
     case 'removePlacement':
     case 'addNode':
     case 'removeNode':
+    case 'addConnection':
+    case 'removeConnection':
+    case 'removeConnectionType':
       return false; // never coalesce structural add/remove — discrete user actions
   }
 }
@@ -384,14 +550,30 @@ export function mergeOps(last: EditOp, next: EditOp): EditOp {
       const n = next as TransformPlacementOp;
       return { ...a, position: n.position, rotation: n.rotation, scale: n.scale };
     }
+    case 'setNodeTransform': {
+      const a = last as SetNodeTransformOp;
+      const n = next as SetNodeTransformOp;
+      return { ...a, position: n.position, quaternion: n.quaternion };
+    }
     case 'setCamera': {
       const a = last as SetCameraOp;
       return { ...a, preset: (next as SetCameraOp).preset };
+    }
+    case 'setCode': {
+      const a = last as SetCodeOp;
+      return { ...a, code: (next as SetCodeOp).code };
+    }
+    case 'setConnectionType': {
+      const a = last as SetConnectionTypeOp;
+      return { ...a, connectionType: (next as SetConnectionTypeOp).connectionType };
     }
     case 'addPlacement':
     case 'removePlacement':
     case 'addNode':
     case 'removeNode':
+    case 'addConnection':
+    case 'removeConnection':
+    case 'removeConnectionType':
       throw new Error('mergeOps: should not be called for structural add/remove ops');
   }
 }
@@ -415,12 +597,24 @@ export function describeOp(op: EditOp): string {
       return `Remove ${op.placement.label}`;
     case 'transformPlacement':
       return `Move ${shortPlacementLabel(op)}`;
+    case 'setNodeTransform':
+      return `Move ${nodeLeaf(op.nodePath)}`;
     case 'setCamera':
       return op.preset ? 'Set camera view' : 'Clear camera view';
+    case 'setCode':
+      return `Edit script on ${nodeLeaf(op.nodePath)}`;
     case 'addNode':
       return `Add ${op.spec.name}`;
     case 'removeNode':
       return `Remove ${op.spec.name}`;
+    case 'addConnection':
+      return `Connect ${nodeLeaf(op.connection.source)} → ${nodeLeaf(op.connection.target)} (${op.connection.type})`;
+    case 'removeConnection':
+      return `Disconnect ${nodeLeaf(op.connection.source)} → ${nodeLeaf(op.connection.target)}`;
+    case 'setConnectionType':
+      return `Edit connection type ${op.connectionType.type}`;
+    case 'removeConnectionType':
+      return `Remove connection type ${op.connectionType.type}`;
     case 'composite':
       return op.label;
   }
@@ -511,6 +705,15 @@ export function inverseOp(op: EditOp): EditOp {
         prev: { position: op.position, rotation: op.rotation, scale: op.scale },
       };
     }
+    case 'setNodeTransform': {
+      return {
+        id: freshOpId(), ts: Date.now(), schemaV: 1,
+        kind: 'setNodeTransform',
+        nodePath: op.nodePath,
+        position: op.prev.position, quaternion: op.prev.quaternion,
+        prev: { position: op.position, quaternion: op.quaternion },
+      };
+    }
     case 'setCamera': {
       return {
         id: freshOpId(), ts: Date.now(), schemaV: 1,
@@ -518,11 +721,57 @@ export function inverseOp(op: EditOp): EditOp {
         preset: op.prev, prev: op.preset,
       };
     }
+    case 'setCode': {
+      // Inverse: restore the previous code — or, when the node had no
+      // WebComponent.Code before, unset the field (mirrors setField's inverse).
+      if (op.prev === undefined) {
+        return {
+          id: freshOpId(), ts: Date.now(), schemaV: 1,
+          kind: 'unsetField',
+          nodePath: op.nodePath,
+          componentType: WEB_COMPONENT_TYPE, fieldName: WEB_COMPONENT_CODE_FIELD,
+          prev: op.code,
+        };
+      }
+      return {
+        id: freshOpId(), ts: Date.now(), schemaV: 1,
+        kind: 'setCode',
+        nodePath: op.nodePath, code: op.prev, prev: op.code,
+      };
+    }
     case 'addNode': {
       return { id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'removeNode', nodePath: op.nodePath, spec: op.spec };
     }
     case 'removeNode': {
       return { id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'addNode', nodePath: op.nodePath, spec: op.spec };
+    }
+    case 'addConnection': {
+      return {
+        id: freshOpId(), ts: Date.now(), schemaV: 1,
+        kind: 'removeConnection',
+        connectionId: op.connection.id, connection: op.connection,
+      };
+    }
+    case 'removeConnection': {
+      return { id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'addConnection', connection: op.connection };
+    }
+    case 'setConnectionType': {
+      if (op.prev === undefined) {
+        return {
+          id: freshOpId(), ts: Date.now(), schemaV: 1,
+          kind: 'removeConnectionType', connectionType: op.connectionType,
+        };
+      }
+      return {
+        id: freshOpId(), ts: Date.now(), schemaV: 1,
+        kind: 'setConnectionType', connectionType: op.prev, prev: op.connectionType,
+      };
+    }
+    case 'removeConnectionType': {
+      return {
+        id: freshOpId(), ts: Date.now(), schemaV: 1,
+        kind: 'setConnectionType', connectionType: op.connectionType, prev: undefined,
+      };
     }
     case 'composite': {
       const reversed: PrimitiveEditOp[] = [];
@@ -554,12 +803,3 @@ export function opsEqual(a: ReadonlyArray<EditOp>, b: ReadonlyArray<EditOp>): bo
   return true;
 }
 
-// ─── Misc helpers ───────────────────────────────────────────────────────
-
-/** Cheap deep-clone for JSON-safe values. Used to snapshot `prev` for
- *  object/array overlay values so later mutations of the live data don't
- *  retroactively change the stored inverse. */
-export function deepCloneJSON<T>(value: T): T {
-  if (value === null || typeof value !== 'object') return value;
-  return JSON.parse(JSON.stringify(value)) as T;
-}

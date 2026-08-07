@@ -11,7 +11,6 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   loadOverlay,
   saveOverlay,
-  clearOverlay,
   applyOverlayToNode,
   getOverriddenFields,
   type RVExtrasOverlay,
@@ -100,13 +99,6 @@ describe('rv-extras-overlay-store', () => {
     );
     const loaded = loadOverlay('wrong.glb');
     expect(loaded).toBeNull();
-  });
-
-  it('clearOverlay removes from localStorage', () => {
-    saveOverlay('demo.glb', makeOverlay({}));
-    expect(loadOverlay('demo.glb')).not.toBeNull();
-    clearOverlay('demo.glb');
-    expect(loadOverlay('demo.glb')).toBeNull();
   });
 
   // ─── TestOverlayMissingNode ─────────────────────────────────────────

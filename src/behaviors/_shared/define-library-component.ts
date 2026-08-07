@@ -218,7 +218,10 @@ export function defineLibraryComponent<
         ...(opts.badge ? opts.badge(self) : {}),
       });
 
-      // FixedUpdate only for non-inert components that declare one (F5).
+      // FixedUpdate only for non-inert components that declare one (F5). A wired
+      // component (an interface controls its signals) stays silent via a visible
+      // `if (self.isWired) return;` guard at the top of its own fixedUpdate — the
+      // relay is then authoritative. Kept in the component (transparent), not here.
       const fixed = c.fixedUpdate;
       const late = c.lateFixedUpdate;
       if (!opts.inert && (fixed || late)) {

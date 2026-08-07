@@ -25,6 +25,9 @@ export {
   type StateStyle,
 } from './engine/rv-web-sensor';
 
+export { RVLamp } from './engine/rv-lamp';
+export { LampManager } from './engine/rv-lamp-manager';
+
 // ── Generic Gizmo Overlay System ───────────────────────────────────────
 export {
   GizmoOverlayManager,

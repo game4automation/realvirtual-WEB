@@ -10,7 +10,7 @@
  * (see WebSensorTooltipContent.tsx). Single-instance — a second "Show"
  * on a different sensor replaces the currently shown sensor.
  *
- * Drag/resize follows the ChartPanel blueprint: local React state during
+ * Drag/resize follows the FloatingPanel blueprint: local React state during
  * interaction, store persistence only on pointer-up (prevents React render
  * loops from pointermove-heavy updates).
  */
@@ -44,7 +44,7 @@ import {
   allModeCanvasHeight,
   DEFAULT_CHART_THEME,
 } from './sensor-history-chart-options';
-import { useDrag } from './ChartPanel';
+import { useDrag } from './FloatingPanel';
 
 // ─── Constants ─────────────────────────────────────────────────────────
 

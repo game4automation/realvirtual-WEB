@@ -13,6 +13,8 @@
  *    rows inside the tooltip bubble. Self-registers in tooltipRegistry.
  */
 
+import { resolveAssetsBase } from '../core/project/rv-project-assets-base';
+import { getProjectStore } from '../core/project/project-store';
 import { useState, useEffect, useSyncExternalStore, useCallback } from 'react';
 import { Box, Typography, CircularProgress, IconButton, Button, Tooltip as MuiTooltip } from '@mui/material';
 import { OpenInNew, PictureAsPdf, Description, ShoppingCart, WarningAmber } from '@mui/icons-material';
@@ -27,9 +29,19 @@ import { Box3, Vector3, type Object3D } from 'three';
 import type { ObjectHoverState } from '../hooks/use-hover';
 import { registerCapabilities } from '../core/engine/rv-component-registry';
 import { NodeRegistry } from '../core/engine/rv-node-registry';
-import { ChartPanel } from '../core/hmi/ChartPanel';
+import { FloatingPanel } from '../core/hmi/FloatingPanel';
 import { RV_SCROLL_CLASS } from '../core/hmi/shared-sx';
 import { loadIndex, loadAasxById, getIndexEntry, type AasParsedData, type AasIndexEntry } from './aas-link-parser';
+import {
+  beginAasLoadGeneration,
+  getAasResolution,
+  getAasResolutionVersion,
+  isAasNodeVisible,
+  isAasVisible,
+  resolveAasSubtree,
+  subscribeAasResolution,
+  type AasResolution,
+} from './aas-resolution';
 import type { OrderManagerPluginAPI } from '../core/types/plugin-types';
 import { useCustomBranding } from '../core/hmi/branding-store';
 import { extractOrderData } from './order-manager-plugin';
@@ -62,15 +74,25 @@ export interface AasTooltipData extends TooltipData {
   description: string;
   /** Node path for 3D highlight/focus from order manager. */
   nodePath?: string;
+  /**
+   * Resolution the node carried when the tooltip data was produced. The data
+   * resolver already refuses unresolvable links, so this is a second, local
+   * guard for callers that build tooltip data themselves (doc mode, tests).
+   */
+  resolution?: AasResolution;
 }
 
 // ─── AAS Button (left sidebar) ─────────────────────────────────────────
 
-/** Collect all AASLink nodes in the scene. */
+/**
+ * Collect all AASLink nodes in the scene that can actually be shown. A link
+ * whose AASX was never shipped (CONNECT embed) or whose id is unknown is not a
+ * component the user can look at, so it must neither be counted nor highlighted.
+ */
 function getAasNodes(viewer: RVViewer): import('three').Object3D[] {
   const nodes: import('three').Object3D[] = [];
   viewer.scene.traverse(node => {
-    if (node.userData?._rvAasLink) nodes.push(node);
+    if (node.userData?._rvAasLink && isAasNodeVisible(node)) nodes.push(node);
   });
   return nodes;
 }
@@ -78,6 +100,8 @@ function getAasNodes(viewer: RVViewer): import('three').Object3D[] {
 /** Left sidebar button — highlights all AASLink nodes on click. */
 function AasButton({ viewer }: UISlotProps) {
   const [active, setActive] = useState(false);
+  // Re-render when a resolution pass finishes so the badge count is never stale.
+  useSyncExternalStore(subscribeAasResolution, getAasResolutionVersion, getAasResolutionVersion);
 
   const handleClick = useCallback(() => {
     if (active) {
@@ -124,6 +148,9 @@ export function findGatedAasAtPoint(root: Object3D, point: Vector3): Object3D | 
     if (found) return;
     const aas = n.userData?._rvAasLink as { gated?: boolean } | undefined;
     if (!aas?.gated) return;
+    // An unresolvable datasheet is not a hit target — doc-mode hover and the
+    // doc-mode detail tap both go through here.
+    if (!isAasNodeVisible(n)) return;
     _docHoverBox.setFromObject(n);
     if (!_docHoverBox.isEmpty() && _docHoverBox.containsPoint(point)) found = n;
   });
@@ -164,7 +191,13 @@ export function showDocModeDatasheet(viewer: RVViewer, hover: ObjectHoverState |
     id: tipId,
     lifecycle: 'hover',
     targetPath: nodePath,
-    data: { type: 'aas', aasId: aas.aasId, description: aas.description, nodePath } as AasTooltipData,
+    data: {
+      type: 'aas',
+      aasId: aas.aasId,
+      description: aas.description,
+      nodePath,
+      resolution: getAasResolution(node),
+    } as AasTooltipData,
     mode: 'cursor',
     cursorPos: { x: hover.pointer.x, y: hover.pointer.y },
     priority: 4,
@@ -217,7 +250,21 @@ export class AasLinkPlugin implements RVViewerPlugin {
     // Falls back to viewer.projectAssetsPath (set via settings.json in private deploys).
     const aasConfig = result.modelConfig?.pluginConfig?.['aas-link'] as
       { assetsBasePath?: string; pdfLinks?: Record<string, string> } | undefined;
-    const assetsBasePath = aasConfig?.assetsBasePath ?? viewer.projectAssetsPath;
+    // plan-372 Phase 14: the active project's aasx/ directory wins over the
+    // deployment-wide fallback, so switching project cannot keep serving the
+    // previous project's submodels. An explicit per-model path still wins.
+    const assetsBasePath = resolveAssetsBase({
+      explicit: aasConfig?.assetsBasePath,
+      project: getProjectStore().getProject(),
+      kind: 'aasx',
+      fallbackBase: viewer.projectAssetsPath,
+    });
+
+    // Decide ONCE whether each AAS link can be resolved, and mark the nodes.
+    // Runs on the load result's own root — not `viewer.scene` — so a model switch
+    // during the index fetch cannot classify the new model against the old base
+    // path; the load generation drops the stale completion (plan-373 F1/F2b).
+    void resolveAasSubtree(result.root, assetsBasePath, beginAasLoadGeneration());
 
     // Pre-fetch AASX index and pre-parse all AASX files for nodes with AASLink.
     // Stores searchable text (nameplate + technical data values) on each node's
@@ -268,7 +315,17 @@ export class AasLinkPlugin implements RVViewerPlugin {
 
     // --- Standalone PDF matching ---
     // Read pdfLinks from model config: { "Robot/Arm": "pdf/robot-arm-manual.pdf" }
-    // When assetsBasePath is set, PDF URLs are resolved relative to it.
+    // When a docs base applies, PDF URLs are resolved relative to it.
+    // Datasheets are DOCS, not AAS submodels, so they resolve against the
+    // project's docs/ directory rather than its aasx/ one (plan-372 Phase 14).
+    // An explicit per-model assetsBasePath still wins, which is what keeps the
+    // existing private deploys resolving exactly as before.
+    const docsBasePath = resolveAssetsBase({
+      explicit: aasConfig?.assetsBasePath,
+      project: getProjectStore().getProject(),
+      kind: 'docs',
+      fallbackBase: viewer.projectAssetsPath,
+    });
     const configPdfLinks = aasConfig?.pdfLinks;
     if (configPdfLinks) {
       const entries = Object.entries(configPdfLinks);
@@ -278,9 +335,10 @@ export class AasLinkPlugin implements RVViewerPlugin {
           for (const [pathPattern, pdfUrl] of entries) {
             if (nodePath.endsWith(pathPattern) || nodePath.endsWith('/' + pathPattern)) {
               if (!node.userData._rvPdfLinks) node.userData._rvPdfLinks = [];
-              // Resolve PDF URL: if assetsBasePath is set and URL is relative, prepend it
-              const resolvedUrl = assetsBasePath && !pdfUrl.startsWith('http') && !pdfUrl.startsWith('/')
-                ? `${assetsBasePath}${pdfUrl}`
+              // Resolve PDF URL: if a docs base applies and the URL is
+              // relative, prepend it. Absolute URLs are left untouched.
+              const resolvedUrl = docsBasePath && !pdfUrl.startsWith('http') && !pdfUrl.startsWith('/')
+                ? `${docsBasePath}${pdfUrl}`
                 : pdfUrl;
               (node.userData._rvPdfLinks as PdfLink[]).push({
                 title: pdfUrl.split('/').pop()?.replace(/\.pdf$/i, '') ?? pdfUrl,
@@ -405,8 +463,12 @@ export function AasTooltipContent({ data, isPinned, viewer }: TooltipContentProp
   const [parsed, setParsed] = useState<AasParsedData | null>(null);
   const [indexEntry, setIndexEntry] = useState<AasIndexEntry | null>(null);
   const [error, setError] = useState('');
+  // The data resolver already refuses an unresolvable link; this repeats the gate
+  // for tooltip data built by other callers. Hooks stay above the early return.
+  const hidden = data.resolution !== undefined && !isAasVisible(data.resolution);
 
   useEffect(() => {
+    if (hidden) return;
     if (!data.aasId) {
       setState('error');
       setError('No AAS ID');
@@ -435,13 +497,17 @@ export function AasTooltipContent({ data, isPinned, viewer }: TooltipContentProp
       });
 
     return () => { cancelled = true; };
-  }, [data.aasId]);
+  }, [data.aasId, hidden]);
 
   // Header: use description from rv_extras, or product name from parsed data, or AAS ID
   const headerText = data.description
     || parsed?.nameplate.find(p => p.label === 'Manufacturer Product Designation')?.value
     || parsed?.idShort
     || data.aasId;
+
+  // The whole tile goes — header, error text and "Add to Cart" alike. A tile with
+  // no data behind it and an order button is worse than no tile (plan-373 F2).
+  if (hidden) return null;
 
   return (
     <>
@@ -577,6 +643,11 @@ tooltipRegistry.register({
 tooltipRegistry.registerDataResolver('aas', (node, viewer) => {
   const aas = node.userData?._rvAasLink as { aasId: string; description: string; gated?: boolean } | undefined;
   if (!aas?.aasId) return null;
+  // Single gate for hover tooltip, pinned tooltip and the "Add to Cart" button
+  // inside it: an id the shipped index cannot resolve produces no tooltip at all
+  // rather than a red error over every motor (plan-373 F2/F3).
+  const resolution = getAasResolution(node);
+  if (!isAasVisible(resolution)) return null;
   // Library-attached drive datasheets are gated: hidden while the layout planner
   // is active and documentation mode is off. Authored AAS links (no `gated`
   // flag) and all other viewing modes are always shown.
@@ -584,7 +655,13 @@ tooltipRegistry.registerDataResolver('aas', (node, viewer) => {
     const planner = viewer?.getPlugin?.('layout-planner') as { hideDriveDocs?: boolean } | undefined;
     if (planner?.hideDriveDocs) return null;
   }
-  return { type: 'aas', aasId: aas.aasId, description: aas.description, nodePath: NodeRegistry.computeNodePath(node) };
+  return {
+    type: 'aas',
+    aasId: aas.aasId,
+    description: aas.description,
+    nodePath: NodeRegistry.computeNodePath(node),
+    resolution,
+  };
 });
 
 // ── Search resolver: AAS values are searchable (description, ID, and pre-parsed AASX content) ──
@@ -643,16 +720,31 @@ function useAasDetailState(): AasDetailState {
   );
 }
 
-/** Header action button for the AASLink component section in the PropertyInspector. */
-export function AasDetailHeaderAction({ data }: { data: Record<string, unknown> }) {
+/**
+ * Header action button for the AASLink component section in the PropertyInspector.
+ *
+ * `data` is the raw rv_extras bucket and carries no node identity, so the caller
+ * passes the node it belongs to — without it this surface could not read the
+ * node-local resolution and would keep offering a detail panel for a link the
+ * tooltip already hides (plan-373 F3).
+ */
+export function AasDetailHeaderAction({ viewer, nodePath, data }: {
+  viewer?: RVViewer;
+  nodePath?: string | null;
+  data: Record<string, unknown>;
+}) {
   const aasId = (data.AASId ?? data.aasId ?? '') as string;
   const description = (data.Description ?? data.description ?? '') as string;
+  // Re-render when a resolution pass finishes (the inspector can be open first).
+  useSyncExternalStore(subscribeAasResolution, getAasResolutionVersion, getAasResolutionVersion);
 
   const handleOpen = useCallback(() => {
     if (aasId) openAasDetail(aasId, description, '');
   }, [aasId, description]);
 
   if (!aasId) return null;
+  const node = nodePath ? viewer?.registry?.getNode(nodePath) : null;
+  if (node && !isAasNodeVisible(node)) return null;
 
   return (
     <MuiTooltip title="Open AAS detail panel" placement="top">
@@ -663,7 +755,7 @@ export function AasDetailHeaderAction({ data }: { data: Record<string, unknown> 
   );
 }
 
-/** Floating AAS detail panel — renders nameplate + technical data in a draggable ChartPanel. */
+/** Floating AAS detail panel — renders nameplate + technical data in a draggable FloatingPanel. */
 export function AasDetailPanel() {
   const state = useAasDetailState();
   const [parsed, setParsed] = useState<AasParsedData | null>(null);
@@ -695,7 +787,7 @@ export function AasDetailPanel() {
     || state.aasId;
 
   return (
-    <ChartPanel
+    <FloatingPanel
       open={state.open}
       onClose={closeAasDetail}
       title={`AAS ${headerText}`}
@@ -760,7 +852,7 @@ export function AasDetailPanel() {
           </>
         )}
       </Box>
-    </ChartPanel>
+    </FloatingPanel>
   );
 }
 

@@ -2,10 +2,15 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import type { RVDrive } from './rv-drive';
-import type { SignalStore } from './rv-signal-store';
+import {
+  createSignalWriter,
+  type SignalStore,
+  type SignalWriter,
+} from './rv-signal-store';
 import type { RVSensor } from './rv-sensor';
 import type { RVGrip } from './rv-grip';
 import { debug } from './rv-debug';
+import { isSignalLiveControlled } from './rv-slot-authority';
 
 // ─── Step State ──────────────────────────────────────────────────
 
@@ -20,6 +25,8 @@ export enum StepState {
 
 export abstract class RVLogicStep {
   state: StepState = StepState.Idle;
+  /** Why an otherwise successful step finished without applying its command. */
+  reason?: 'suppressed-live';
   name = '';
   /** Full hierarchy path (set by engine during build) */
   hierarchyPath = '';
@@ -38,9 +45,16 @@ export abstract class RVLogicStep {
     this.state = StepState.Finished;
   }
 
+  /** Finish while documenting that live control suppressed the internal command. */
+  protected finishSuppressedLive(): void {
+    this.reason = 'suppressed-live';
+    this.finish();
+  }
+
   /** Reset step to idle (for container restart) */
   reset(): void {
     this.state = StepState.Idle;
+    this.reason = undefined;
   }
 }
 
@@ -272,12 +286,23 @@ export class RVSetSignalBool extends RVLogicStep {
   signalAddress: string | null;
   value: boolean;
   private signalStore: SignalStore;
+  private signalWriter: SignalWriter;
+  private targetName: string | null;
 
   constructor(signalAddress: string | null, value: boolean, signalStore: SignalStore) {
     super();
     this.signalAddress = signalAddress;
     this.value = value;
     this.signalStore = signalStore;
+    this.signalWriter = createSignalWriter(
+      signalStore,
+      `component:LogicStep:SetSignalBool:${signalAddress ?? 'unbound'}`,
+      'component',
+      signalAddress ? { slotContext: signalAddress } : undefined,
+    );
+    this.targetName = signalAddress
+      ? (signalStore.nameForPath(signalAddress) ?? signalAddress)
+      : null;
   }
 
   get progress(): number {
@@ -290,7 +315,11 @@ export class RVSetSignalBool extends RVLogicStep {
       this.state = StepState.Finished;
       return;
     }
-    this.signalStore.setByPath(this.signalAddress, this.value);
+    if (this.targetName && isSignalLiveControlled(this.targetName)) {
+      this.finishSuppressedLive();
+      return;
+    }
+    this.signalWriter.setByPath(this.signalAddress, this.value);
     debug('logic', `SetSignalBool "${this.name}": ${this.signalAddress} = ${this.value}`);
     this.state = StepState.Finished;
   }
@@ -407,6 +436,10 @@ export class RVDriveTo extends RVLogicStep {
       this.state = StepState.Finished;
       return;
     }
+    if (this.drive.liveControlled) {
+      this.finishSuppressedLive();
+      return;
+    }
 
     this.startPosition = this.drive.currentPosition;
 
@@ -431,6 +464,10 @@ export class RVDriveTo extends RVLogicStep {
 
   fixedUpdate(_dt: number): void {
     if (this.state !== StepState.Active || !this.drive) return;
+    if (this.drive.liveControlled) {
+      this.finishSuppressedLive();
+      return;
+    }
     if (this.drive.isAtTarget) {
       this.finish();
     }
@@ -456,6 +493,10 @@ export class RVSetDriveSpeed extends RVLogicStep {
     if (!this.drive) {
       console.warn(`[LogicStep] SetDriveSpeed "${this.name}": null drive — skipping`);
       this.state = StepState.Finished;
+      return;
+    }
+    if (this.drive.liveControlled) {
+      this.finishSuppressedLive();
       return;
     }
     this.drive.targetSpeed = this.speed;
@@ -513,6 +554,10 @@ export class RVStartDriveTo extends RVLogicStep {
       this.state = StepState.Finished;
       return;
     }
+    if (this.drive.liveControlled) {
+      this.finishSuppressedLive();
+      return;
+    }
 
     let dest = this.relative
       ? this.drive.currentPosition + this.destination
@@ -542,7 +587,7 @@ export class RVWaitForDrivesAtTarget extends RVLogicStep {
   get progress(): number {
     if (this.state === StepState.Finished) return 100;
     if (this.drives.length === 0) return 100;
-    const atTarget = this.drives.filter(d => d.isAtTarget).length;
+    const atTarget = this.drives.filter(d => d.liveControlled || d.isAtTarget).length;
     return (atTarget / this.drives.length) * 100;
   }
 
@@ -552,14 +597,14 @@ export class RVWaitForDrivesAtTarget extends RVLogicStep {
       return;
     }
     this.state = StepState.Waiting;
-    if (this.drives.every(d => d.isAtTarget)) {
+    if (this.drives.every(d => d.liveControlled || d.isAtTarget)) {
       this.finish();
     }
   }
 
   fixedUpdate(_dt: number): void {
     if (this.state !== StepState.Waiting) return;
-    if (this.drives.every(d => d.isAtTarget)) {
+    if (this.drives.every(d => d.liveControlled || d.isAtTarget)) {
       debug('logic', `WaitForDrivesAtTarget "${this.name}": all ${this.drives.length} drives at target`);
       this.finish();
     }
@@ -571,12 +616,23 @@ export class RVSetSignalFloat extends RVLogicStep {
   signalAddress: string | null;
   value: number;
   private signalStore: SignalStore;
+  private signalWriter: SignalWriter;
+  private targetName: string | null;
 
   constructor(signalAddress: string | null, value: number, signalStore: SignalStore) {
     super();
     this.signalAddress = signalAddress;
     this.value = value;
     this.signalStore = signalStore;
+    this.signalWriter = createSignalWriter(
+      signalStore,
+      `component:LogicStep:SetSignalFloat:${signalAddress ?? 'unbound'}`,
+      'component',
+      signalAddress ? { slotContext: signalAddress } : undefined,
+    );
+    this.targetName = signalAddress
+      ? (signalStore.nameForPath(signalAddress) ?? signalAddress)
+      : null;
   }
 
   get progress(): number {
@@ -589,7 +645,11 @@ export class RVSetSignalFloat extends RVLogicStep {
       this.state = StepState.Finished;
       return;
     }
-    this.signalStore.setByPath(this.signalAddress, this.value);
+    if (this.targetName && isSignalLiveControlled(this.targetName)) {
+      this.finishSuppressedLive();
+      return;
+    }
+    this.signalWriter.setByPath(this.signalAddress, this.value);
     debug('logic', `SetSignalFloat "${this.name}": ${this.signalAddress} = ${this.value}`);
     this.state = StepState.Finished;
   }

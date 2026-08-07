@@ -96,7 +96,7 @@ function MediaLegend() {
         borderRadius: 1.5,
         border: '1px solid rgba(255,255,255,0.08)',
         bgcolor: 'rgba(20,20,20,0.85)',
-        backdropFilter: 'blur(8px)',
+        backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
         pointerEvents: 'auto',
         zIndex: 1250,
       }}

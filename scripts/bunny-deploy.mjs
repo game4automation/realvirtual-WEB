@@ -18,19 +18,16 @@
  *   node scripts/bunny-deploy.mjs --path demo              # public, custom remote prefix
  *   node scripts/bunny-deploy.mjs --private --project "Kunde XY"
  *   node scripts/bunny-deploy.mjs --private --list         # list private projects
- *   node scripts/bunny-deploy.mjs --no-build               # deploy existing dist/
  *   node scripts/bunny-deploy.mjs --force                  # skip diff, upload all
  *   node scripts/bunny-deploy.mjs --dry-run                # log only, no build/upload
  */
 
-import { execSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, rmSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   loadConfig,
-  buildEnvForMode,
   BunnyClient,
   collectLocalFiles,
   buildRemoteIndex,
@@ -40,8 +37,28 @@ import {
   loadProject,
   sanitizeDemoName,
   applyPublicModelAllowlist,
+  assertNoDevArtifacts,
   PUBLIC_MODEL_PREFIX,
+  applyPublicScenePruning,
+  PUBLIC_TEST_SCENE_PREFIX,
+  injectSeoTags,
+  injectNoindex,
+  writeSeoArtifacts,
+  PUBLIC_BASE_URL,
+  SEO_CANONICAL_PATH,
+  injectNewsIntoSettings,
 } from './_bunny-lib.mjs';
+import { generateFragmentSecret, bytesToBase64Url, base64UrlToBytes } from './lib/rv-crypto.mjs';
+import { loadSigningConfig, signGlbFile } from './rv-sign-glb.mjs';
+import {
+  assertBuildProvenance,
+  loadDeliveryConfig,
+  runBuild as runFilteredBuild,
+  stageFilteredSourceTree,
+} from './_workspace-lib.mjs';
+import { assertValidProject } from './validate-project.mjs';
+import { isDeniedProjectArtifactPath, isProjectAssetSkipDir } from './_rv-guards.mjs';
+import { recordPublishProvenance } from './_rv-provenance.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
@@ -93,18 +110,57 @@ function humanSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/**
+ * Reject a `--base` that was mangled by MSYS path conversion BEFORE anything is
+ * built or uploaded. Git Bash rewrites a standalone `/demo/` argument into
+ * `C:/Program Files/Git/demo/`; the build then bakes that Windows path into
+ * index.html, build and upload report success, and the live site 404s on every
+ * asset. A valid base is relative (`./`) or a simple absolute URL path like
+ * `/demo/` — never something with a drive letter, backslash or spaces.
+ */
+function assertSaneBase(base) {
+  if (base == null) return;
+  if (/^\.?\/(?:[\w.-]+(?:\/[\w.-]+)*\/?)?$/.test(base)) return;
+  throw new Error(
+    `--base "${base}" is not a valid URL base path. `
+    + 'This is the MSYS/Git-Bash path mangling: a leading "/" argument was rewritten into a '
+    + 'Windows path. Run the deploy from PowerShell, or prefix the Bash command with '
+    + 'MSYS_NO_PATHCONV=1.',
+  );
+}
+
 // ─── Build ───────────────────────────────────────────────────────────────
 
-//! Runs `npm run build` with mode-specific env. Throws on non-zero exit so the
-//! caller aborts before any upload (R8).
-function runBuild(mode, base, dryRun) {
-  const env = buildEnvForMode(mode, { base });
-  log(`${DIM}Building (${mode}${base ? `, base=${base}` : ''})...${RESET}`);
-  if (dryRun) {
-    log(`${DIM}[dry-run] skipping npm run build${RESET}`);
-    return;
-  }
-  execSync('npm run build', { cwd: ROOT, env, shell: true, stdio: 'inherit' });
+function stageAndBuild({ mode, projectDir = null, base = null, dryRun = false }) {
+  const privateRoot = projectDir ? dirname(dirname(projectDir)) : join(ROOT, '..', 'realvirtual-WebViewer-Private~');
+  const projectKey = projectDir ? projectDir.split(/[\\/]/).filter(Boolean).pop() : null;
+  const delivery = projectKey ? loadDeliveryConfig(privateRoot, projectKey) : null;
+  const staged = stageFilteredSourceTree({
+    coreRoot: ROOT,
+    privateRoot,
+    projectKey,
+    delivery,
+    profile: delivery ?? { tier: 'core', restrictedFeatures: [] },
+  });
+  const build = runFilteredBuild(staged.workspaceRoot, { mode, base, dryRun, projectKey });
+  if (!dryRun) assertBuildProvenance(build.distDir, { mode, projectKey });
+  return { ...staged, ...build };
+}
+
+function signGlbsInDirectory(rootDir, signing) {
+  let count = 0;
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else if (entry.isFile() && extname(entry.name).toLowerCase() === '.glb') {
+        signGlbFile(path, signing);
+        count++;
+      }
+    }
+  };
+  walk(rootDir);
+  return count;
 }
 
 // ─── Shared upload routine ───────────────────────────────────────────────
@@ -113,21 +169,23 @@ function runBuild(mode, base, dryRun) {
 //! { uploaded, skipped }. Atomic ordering: every non-index.html file first,
 //! index.html files last (R10), so the CDN never points new HTML at missing
 //! assets.
-async function uploadDirectory(client, localDir, remotePrefix, { force, dryRun }) {
+export async function uploadDirectory(client, localDir, remotePrefix, {
+  force, dryRun, alwaysUploadGlbs, preserveRemotePrefixes = [],
+}) {
   const local = collectLocalFiles(localDir);
   if (local.length === 0) {
     throw new Error(`No files to upload in ${localDir}`);
   }
 
+  log(`${DIM}Fetching remote file list for diff/reconcile...${RESET}`);
+  const entries = await client.listRecursive(remotePrefix);
   let remoteIndex = null;
   if (!force) {
-    log(`${DIM}Fetching remote file list for diff...${RESET}`);
-    const entries = await client.listRecursive(remotePrefix);
     remoteIndex = buildRemoteIndex(entries);
     info('diff', `${remoteIndex.size} remote files indexed`);
   }
 
-  const selected = selectFilesToUpload(local, remoteIndex, { force });
+  const selected = selectFilesToUpload(local, remoteIndex, { force, alwaysUploadGlbs });
   const skipped = local.length - selected.length;
 
   // Atomic ordering: assets first, index.html last.
@@ -152,22 +210,40 @@ async function uploadDirectory(client, localDir, remotePrefix, { force, dryRun }
     }
   }
 
+  const localPaths = new Set(local.map((file) => file.rel.toLowerCase()));
+  const stale = entries.filter((entry) => {
+    const rel = entry.rel.replace(/\\/g, '/');
+    return !localPaths.has(rel.toLowerCase())
+      && !preserveRemotePrefixes.some((prefix) => rel.startsWith(prefix));
+  });
+  for (const entry of stale) {
+    const remotePath = prefix ? `${prefix}/${entry.rel}` : entry.rel;
+    log(`  ${RED}-${RESET} ${entry.rel} ${DIM}(stale)${RESET}`);
+    await client.deleteFile(remotePath);
+  }
+
   if (skipped > 0) log(`  ${DIM}= ${skipped} unchanged (skipped)${RESET}`);
-  return { uploaded, skipped };
+  return { uploaded, skipped, deleted: stale.length };
 }
 
 // ─── Public deploy ───────────────────────────────────────────────────────
 
 async function deployPublic(cfg, opts) {
-  const distDir = opts.dist;
   const remotePrefix = opts.path ?? cfg.remotePath;
+  const filtered = stageAndBuild({ mode: 'public', base: opts.base, dryRun: opts.dryRun });
+  const distDir = filtered.distDir;
+  if (opts.dryRun) {
+    log(`${DIM}[dry-run] filtered public source staged; no build/upload performed${RESET}`);
+    rmSync(filtered.workspaceRoot, { recursive: true, force: true });
+    return;
+  }
+  if (!existsSync(distDir)) throw new Error(`Filtered build output not found: ${distDir}`);
+  assertNoDevArtifacts(distDir);
 
-  if (!opts.noBuild) {
-    runBuild('public', opts.base, opts.dryRun);
-  }
-  if (!existsSync(distDir)) {
-    throw new Error(`dist/ not found: ${distDir} (build first or drop --no-build)`);
-  }
+  // The DemoRealvirtual content is bundled: it lives in `public/` (models/,
+  // scenes/, library/), so Vite has already copied it into dist/ as part of the
+  // build. Nothing to stage here — the allowlist and scene pruning below run
+  // over what the build produced.
 
   // Model allowlist: the public CDN must ship ONLY the official demo models
   // (prefix DemoRealvirtual*) plus the planner library — prune test/helper/stray
@@ -184,8 +260,45 @@ async function deployPublic(cfg, opts) {
     log(`  ${RED}⚠ no model matches prefix "${modelPrefix}*" — the public selector will be empty${RESET}`);
   }
 
+  // Test-scene guard: example scenes named "Test*" are repo/dev-only fixtures —
+  // prune them (file + index.json entry) so they never ship to the public demo.
+  const scenePrefix = (process.env.RV_PUBLIC_TEST_SCENE_PREFIX || PUBLIC_TEST_SCENE_PREFIX).trim() || PUBLIC_TEST_SCENE_PREFIX;
+  const scenes = applyPublicScenePruning(distDir, { prefix: scenePrefix, dryRun: opts.dryRun });
+  if (scenes.dropped.length) {
+    log(`${DIM}Public scene pruning (prefix "${scenePrefix}*"): `
+      + `${scenes.kept.length} kept, ${scenes.dropped.length} pruned${RESET}`);
+    for (const f of scenes.dropped) log(`  ${RED}prune${RESET} scenes/${f}`);
+  }
+
+  // Sign only the final public artifact set, after all allowlist/pruning
+  // mutations. Re-signing is deliberately size-preserving, so signed GLBs
+  // must bypass the CDN's size-only diff.
+  const signing = loadSigningConfig();
+  if (signing) {
+    const signedCount = signGlbsInDirectory(distDir, signing);
+    log(`${DIM}GLB provenance: signed ${signedCount} public GLB file(s)${RESET}`);
+  } else {
+    log(`${DIM}GLB provenance: RV_SIGN_PRIVATE_KEY not configured; models remain unsigned${RESET}`);
+  }
+
   // GA injection (R2): inject only into the deployed settings.json, never commit it.
   injectGaIntoSettings(join(distDir, 'settings.json'), cfg.googleAnalyticsId, opts.dryRun);
+  // News injection: public-hosted artifact only; private/customer paths stay fail-closed.
+  injectNewsIntoSettings(join(distDir, 'settings.json'), cfg.newsApiUrl, opts.dryRun);
+
+  // SEO artifacts: only the canonical public path (default "demo") is indexable —
+  // it gets canonical/OG URL tags + sitemap.xml + robots.txt. Every other
+  // non-root public prefix (e.g. "dev") is noindexed so it never shadows the
+  // canonical demo in search results. RV_SEO=0 disables all of this.
+  const seo = resolveSeo(remotePrefix);
+  if (seo.mode === 'canonical') {
+    injectSeoTags(distDir, { pageUrl: seo.pageUrl, dryRun: opts.dryRun });
+    seo.robots = writeSeoArtifacts(distDir, { pageUrl: seo.pageUrl, dryRun: opts.dryRun }).robots;
+    log(`${DIM}SEO: canonical ${seo.pageUrl} + sitemap.xml + robots.txt${opts.dryRun ? ' [dry-run]' : ''}${RESET}`);
+  } else if (seo.mode === 'noindex') {
+    injectNoindex(join(distDir, 'index.html'), { dryRun: opts.dryRun });
+    log(`${DIM}SEO: noindex injected (non-canonical public path "${seo.prefix}" — canonical is "${seo.canonicalPath}")${RESET}`);
+  }
 
   log('');
   log(`${MAGENTA}realvirtual WebViewer · Bunny Deploy${RESET}`);
@@ -198,10 +311,44 @@ async function deployPublic(cfg, opts) {
     accountKey: cfg.accountKey, pullZoneId: cfg.pullZoneId, dryRun: opts.dryRun, log,
   });
 
-  const { uploaded, skipped } = await uploadDirectory(client, distDir, remotePrefix, opts);
+  const { uploaded, skipped } = await uploadDirectory(client, distDir, remotePrefix, {
+    ...opts,
+    alwaysUploadGlbs: !!signing,
+  });
+
+  // Crawlers only honor /robots.txt at the DOMAIN ROOT — when the canonical
+  // deploy lives under a sub-path (demo/), a root copy referencing the absolute
+  // sitemap URL must exist too. The dist/ copy under the sub-path is harmless.
+  if (seo.mode === 'canonical' && seo.prefix && seo.robots) {
+    log(`  ${GREEN}↑${RESET} robots.txt ${MAGENTA}(zone root)${RESET}`);
+    await client.putFile(Buffer.from(seo.robots, 'utf8'), 'robots.txt');
+  }
 
   await maybePurge(client, uploaded, opts);
   info('done', `${uploaded} uploaded, ${skipped} unchanged`);
+  rmSync(filtered.workspaceRoot, { recursive: true, force: true });
+}
+
+//! Resolves the SEO treatment for a public deploy from env + remote prefix:
+//! { mode: 'canonical' | 'noindex' | 'off', pageUrl?, prefix, canonicalPath }.
+//! Root deploys ('' prefix, e.g. forks publishing at their zone root) are left
+//! untouched unless RV_SEO_CANONICAL_PATH is explicitly set to ''.
+function resolveSeo(remotePrefix) {
+  const prefix = (remotePrefix || '').replace(/^\/+|\/+$/g, '');
+  const canonicalPath = (process.env.RV_SEO_CANONICAL_PATH ?? SEO_CANONICAL_PATH)
+    .replace(/^\/+|\/+$/g, '');
+  if ((process.env.RV_SEO || '').trim() === '0') {
+    return { mode: 'off', prefix, canonicalPath };
+  }
+  if (prefix === canonicalPath) {
+    const host = (process.env.RV_PUBLIC_BASE_URL || PUBLIC_BASE_URL).replace(/\/+$/, '');
+    const pageUrl = prefix ? `${host}/${prefix}/` : `${host}/`;
+    return { mode: 'canonical', pageUrl, prefix, canonicalPath };
+  }
+  if (prefix) {
+    return { mode: 'noindex', prefix, canonicalPath };
+  }
+  return { mode: 'off', prefix, canonicalPath };
 }
 
 // ─── Private deploy ──────────────────────────────────────────────────────
@@ -221,14 +368,17 @@ async function deployPrivate(cfg, opts) {
   }
 
   const projectDir = resolvePrivateProjectDir(projectsDir, opts.project);
+  // Mandatory gate before anything is built or uploaded (F10 / B12). A CDN
+  // upload is not undoable: whatever reaches the pull zone stays there until the
+  // next deploy, so a secret or a broken manifest has to be caught here rather
+  // than noticed afterwards.
+  assertValidProject(projectDir, `project "${opts.project}"`);
   const project = loadProject(projectDir); // validates code + name (R6)
-
-  if (!opts.noBuild) {
-    runBuild('private', opts.base, opts.dryRun); // NOTE: no VITE_PUBLIC_BUILD
-  }
-  if (!existsSync(opts.dist)) {
-    throw new Error(`dist/ not found: ${opts.dist} (build first or drop --no-build)`);
-  }
+  const filtered = stageAndBuild({ mode: 'private', projectDir, base: opts.base, dryRun: opts.dryRun });
+  const filteredProjectDir = join(filtered.workspaceRoot, 'projects', requireFolderName(projectDir));
+  opts.dist = filtered.distDir;
+  if (!opts.dryRun && !existsSync(opts.dist)) throw new Error(`Filtered build output not found: ${opts.dist}`);
+  if (!opts.dryRun) assertNoDevArtifacts(opts.dist);
 
   log('');
   log(`${MAGENTA}realvirtual WebViewer · Bunny Deploy${RESET}`);
@@ -241,6 +391,27 @@ async function deployPrivate(cfg, opts) {
     accountKey: cfg.accountKey, pullZoneId: cfg.pullZoneId, dryRun: opts.dryRun, log,
   });
 
+  // plan-267: optional password protection. Password comes ONLY from env
+  // (never a CLI arg — args land in process lists / shell history / logs).
+  // The 32-byte fragment secret is generated per publish unless RV_DEPLOY_FRAGMENT
+  // is supplied to keep an existing link stable across in-place re-publishes.
+  let encryption = null;
+  let fragmentB64 = null;
+  const password = process.env.RV_DEPLOY_PASSWORD;
+  if (password) {
+    const fragEnv = process.env.RV_DEPLOY_FRAGMENT;
+    const fragmentSecret = fragEnv ? base64UrlToBytes(fragEnv) : generateFragmentSecret();
+    fragmentB64 = bytesToBase64Url(fragmentSecret);
+    encryption = { password, fragmentSecret };
+    info('encrypt', `AES-256-GCM · password protected${fragEnv ? ' · reusing fragment' : ''}`);
+  }
+  const signing = loadSigningConfig();
+  if (signing) {
+    info('sign', signing.customerCert ? `Ed25519 · customer ${signing.customerCert.org}` : 'Ed25519 · realvirtual root');
+  } else {
+    log(`${DIM}GLB provenance: RV_SIGN_PRIVATE_KEY not configured; models remain unsigned${RESET}`);
+  }
+
   let totalUploaded = 0;
   let totalSkipped = 0;
   let stagingDir = null;
@@ -248,24 +419,42 @@ async function deployPrivate(cfg, opts) {
     if (opts.dryRun) {
       log(`${DIM}[dry-run] would stage project + upload to ${project.code}/${RESET}`);
     } else {
-      stagingDir = stagePrivateProject({
+      stagingDir = await stagePrivateProject({
         distDir: opts.dist,
-        projectDir,
-        googleAnalyticsId: cfg.googleAnalyticsId,
+        projectDir: filteredProjectDir,
+        encryption,
+        signing,
       });
       info('staging', stagingDir);
 
+      // Private customer deploys live on unguessable {code}/ URLs and must never
+      // be indexed. A robots.txt below the domain root has no effect — the meta
+      // tag is the mechanism that works at any path. (index.html stays plaintext
+      // even in encrypted deploys; only GLBs are encrypted.)
+      injectNoindex(join(stagingDir, 'index.html'));
+      log(`${DIM}SEO: noindex injected (private deploy)${RESET}`);
+
       // Pass 1: app + models → {code}/
+      // Encrypted GLBs must bypass the size diff: fresh salt/IVs give a new
+      // ciphertext at identical size (see selectFilesToUpload).
       log(`${DIM}Pass 1/2: app + models${RESET}`);
-      const p1 = await uploadDirectory(client, stagingDir, project.code, opts);
+      const p1 = await uploadDirectory(client, stagingDir, project.code, {
+        ...opts,
+        alwaysUploadGlbs: !!encryption || !!signing,
+        preserveRemotePrefixes: ['private-assets/'],
+      });
       totalUploaded += p1.uploaded;
       totalSkipped += p1.skipped;
 
       // Pass 2: project asset subfolders + root *.json → {code}/private-assets/{folder}/
       log(`${DIM}Pass 2/2: private assets${RESET}`);
-      const p2 = await uploadPrivateAssets(client, projectDir, project, opts);
+      const p2 = await uploadPrivateAssets(client, filteredProjectDir, project, opts);
       totalUploaded += p2.uploaded;
       totalSkipped += p2.skipped;
+
+      const expected = expectedPrivateSnapshot(stagingDir, filteredProjectDir, project);
+      const deleted = await reconcileRemoteSnapshot(client, project.code, expected);
+      if (deleted > 0) log(`${DIM}Remote reconcile removed ${deleted} stale private file(s).${RESET}`);
 
       // lastPublished only AFTER pass 2 (R9).
       writeLastPublished(projectDir, project);
@@ -274,31 +463,44 @@ async function deployPrivate(cfg, opts) {
     if (stagingDir && existsSync(stagingDir)) {
       try { rmSync(stagingDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
+    if (filtered.workspaceRoot && existsSync(filtered.workspaceRoot)) {
+      try { rmSync(filtered.workspaceRoot, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
   }
 
   await maybePurge(client, totalUploaded, opts);
   info('done', `${totalUploaded} uploaded, ${totalSkipped} unchanged`);
-  info('url', `https://web.realvirtual.io/${project.code}/`);
+  if (encryption) {
+    // The fragment secret is HALF the key — it must travel in the link. The
+    // password is the other half; send it via a SEPARATE channel (never log it).
+    info('url', `https://web.realvirtual.io/${project.code}/#k=${fragmentB64}`);
+    log(`${DIM}Encrypted deploy: send the link and the password through separate channels.${RESET}`);
+  } else {
+    info('url', `https://web.realvirtual.io/${project.code}/`);
+  }
 }
 
 //! Pass 2: uploads project asset subfolders (excluding build/system dirs) and
 //! root-level *.json (except project.json) into {code}/private-assets/{folder}/.
 // SOURCE: WebViewerToolbar.cs:1346 (skipDirs + private-assets) — keep in sync
 async function uploadPrivateAssets(client, projectDir, project, opts) {
-  const skipDirs = new Set(['models', 'plugins', 'scripts', 'node_modules', '.git']);
+  // What may not be published lives in _rv-guards.mjs and nowhere else
+  // (plan-700 §2.9 / B10). The list used to be duplicated here and in the
+  // CONNECT stager, with a comment asking the two to be "kept in sync" — which
+  // is the failure mode, not the fix. Do not reintroduce a local array.
   const folderName = project.folderName ?? requireFolderName(projectDir);
   let uploaded = 0;
   let skipped = 0;
 
   for (const entry of readdirSync(projectDir, { withFileTypes: true })) {
     if (entry.isDirectory()) {
-      if (skipDirs.has(entry.name.toLowerCase())) continue;
+      if (isProjectAssetSkipDir(entry.name) || isDeniedProjectArtifactPath(entry.name)) continue;
       const remotePath = `${project.code}/private-assets/${folderName}/${entry.name}`;
       const r = await uploadDirectory(client, join(projectDir, entry.name), remotePath, opts);
       uploaded += r.uploaded;
       skipped += r.skipped;
-    } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.json') &&
-               entry.name.toLowerCase() !== 'project.json') {
+    } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.json')
+               && !isDeniedProjectArtifactPath(entry.name)) {
       const remotePath = `${project.code}/private-assets/${folderName}/${entry.name}`;
       log(`  ${GREEN}↑${RESET} ${entry.name} ${DIM}(asset)${RESET}`);
       if (!opts.dryRun) {
@@ -314,11 +516,27 @@ function requireFolderName(projectDir) {
   return join(projectDir).split(/[\\/]/).filter(Boolean).pop();
 }
 
+//! Records this Bunny publish in the project manifest (plan-700 §2.8 / B15).
+//! `lastPublished` used to be ONE field for all three targets, so this write
+//! erased the record of the CONNECT embed every time. It is still written, as
+//! a mirror of the most recent publish; the per-target truth now lives under
+//! `provenance.lastPublishedBy['bunny-private']`.
 function writeLastPublished(projectDir, project) {
-  const jsonPath = join(projectDir, 'project.json');
-  const data = JSON.parse(readFileSync(jsonPath, 'utf8'));
-  data.lastPublished = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-  writeFileSync(jsonPath, JSON.stringify(data, null, 2));
+  recordPublishProvenance(projectDir, 'bunny-private', {
+    version: viewerVersion(),
+    code: project?.code,
+  });
+}
+
+//! The viewer version being published, from the WebViewer's own package.json.
+//! Absent/unreadable is not a deploy failure — the provenance entry simply
+//! carries no version rather than aborting an upload that already happened.
+function viewerVersion() {
+  try {
+    return JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version ?? '';
+  } catch {
+    return '';
+  }
 }
 
 function resolvePrivateProjectDir(projectsDir, projectName) {
@@ -385,6 +603,9 @@ async function maybePurge(client, uploadedCount, opts) {
 
 async function main() {
   loadDotEnv(); // populate process.env from .env.production / .env (CI env still wins)
+  if (hasFlag('no-build')) {
+    throw new Error('--no-build is disabled: deploys must build from filtered staging.');
+  }
   const opts = {
     private: hasFlag('private'),
     project: getArg('project', null),
@@ -392,12 +613,12 @@ async function main() {
     path: getArg('path', null),
     dist: getArg('dist', join(ROOT, 'dist')),
     projectsDir: getArg('projects-dir', process.env.BUNNY_PRIVATE_PROJECTS_DIR || null),
-    noBuild: hasFlag('no-build'),
     base: getArg('base', null),
     force: hasFlag('force'),
     dryRun: hasFlag('dry-run'),
     noPurge: hasFlag('no-purge'),
   };
+  assertSaneBase(opts.base);
 
   // --list does not need full credentials.
   if (opts.private && opts.list) {
@@ -415,7 +636,43 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error(`${RED}Error:${RESET} ${e?.message ?? e}`);
-  process.exit(1);
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((e) => {
+    console.error(`${RED}Error:${RESET} ${e?.message ?? e}`);
+    process.exit(1);
+  });
+}
+
+function expectedPrivateSnapshot(stagingDir, projectDir, project) {
+  const expected = new Set(collectLocalFiles(stagingDir).map((file) => file.rel.replace(/\\/g, '/').toLowerCase()));
+  const folderName = project.folderName ?? requireFolderName(projectDir);
+  const prefix = `private-assets/${folderName}/`;
+  // This set decides what the reconciler DELETES from the CDN, so its selection
+  // rule has to be the same one uploadPrivateAssets applies — a third copy of
+  // the denylist here would delete exactly the files the upload just wrote. Both
+  // read from _rv-guards.mjs for that reason.
+  for (const entry of readdirSync(projectDir, { withFileTypes: true })) {
+    if (entry.isDirectory() && !isProjectAssetSkipDir(entry.name) && !isDeniedProjectArtifactPath(entry.name)) {
+      for (const file of collectLocalFiles(join(projectDir, entry.name))) {
+        expected.add(`${prefix}${entry.name}/${file.rel}`.toLowerCase());
+      }
+    } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.json')
+        && !isDeniedProjectArtifactPath(entry.name)) {
+      expected.add(`${prefix}${entry.name}`.toLowerCase());
+    }
+  }
+  return expected;
+}
+
+//! Deletes every remote file that is absent from the validated local snapshot manifest.
+export async function reconcileRemoteSnapshot(client, remotePrefix, expectedPaths) {
+  const entries = await client.listRecursive(remotePrefix);
+  const prefix = remotePrefix.replace(/^\/+|\/+$/g, '');
+  let deleted = 0;
+  for (const entry of entries) {
+    if (expectedPaths.has(entry.rel.replace(/\\/g, '/').toLowerCase())) continue;
+    await client.deleteFile(prefix ? `${prefix}/${entry.rel}` : entry.rel);
+    deleted++;
+  }
+  return deleted;
+}

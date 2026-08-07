@@ -21,6 +21,7 @@ import { useCallback, useRef } from 'react';
 import type { ReactNode } from 'react';
 import { Box, TextField, Typography } from '@mui/material';
 import type { SxProps, Theme } from '@mui/material/styles';
+import { MathUtils } from 'three';
 
 export interface DragNumberFieldProps {
   /** Drag handle content — usually a small MUI icon. Ignored in `compact` mode,
@@ -71,13 +72,6 @@ export interface DragNumberFieldProps {
   inputWidth?: number;
 }
 
-/**
- * Clamp a number into [min, max].
- */
-function clamp(n: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, n));
-}
-
 export function DragNumberField({
   icon,
   value,
@@ -118,7 +112,7 @@ export function DragNumberField({
     const dx = e.clientX - dragRef.current.startX;
     const sensitivity = step * (e.shiftKey ? 0.1 : 1);
     const raw = dragRef.current.startValue + dx * sensitivity;
-    const next = +clamp(raw, min, max).toFixed(decimals);
+    const next = +MathUtils.clamp(raw, min, max).toFixed(decimals);
     onValueChange(String(next));
     onDragChange?.(next);
   }, [step, min, max, decimals, onValueChange, onDragChange]);
@@ -131,7 +125,23 @@ export function DragNumberField({
   }, [onCommit]);
 
   return (
-    <Box sx={{ display: 'flex', alignItems: 'center', gap: inline ? 1 : compact ? 0.25 : 0.5, ...sx }}>
+    <Box
+      sx={{
+        display: 'flex',
+        alignItems: 'center',
+        // compact: no gap; the grip is absolutely overlaid on the input (below).
+        gap: inline ? 1 : compact ? 0 : 0.5,
+        ...(compact && !inline
+          ? {
+              // positioning anchor for the absolutely-overlaid scrub grip
+              position: 'relative',
+              // compact: the bar is transparent until the field is hovered.
+              '&:hover .rv-drag-bar': disabled ? {} : { bgcolor: 'rgba(255,255,255,0.55)' },
+            }
+          : {}),
+        ...sx,
+      }}
+    >
       <Box
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -150,20 +160,24 @@ export function DragNumberField({
           transition: 'color 120ms ease',
           '&:hover': disabled ? {} : { color: 'text.primary' },
         } : compact ? {
-          // Minimal scrub handle — a thin 1px vertical bar (rendered below) in a
-          // narrow hit area. col-resize cursor signals horizontal drag; the bar
-          // brightens on hover. No box / border / icon.
+          // Minimal scrub handle — a thin 1px vertical bar (rendered below) drawn
+          // OVER the input's left edge. Absolutely positioned (out of flow) so the
+          // field has no left "hangover" and the grip reads as part of the input.
+          // The bar is transparent until the field is hovered (reveal handled on the
+          // outer container). col-resize cursor signals horizontal drag. No box/border.
+          position: 'absolute',
+          left: 0,
+          top: 0,
+          bottom: 0,
+          zIndex: 1,
           display: 'flex',
           alignItems: 'center',
-          justifyContent: 'center',
-          flex: '0 0 auto',
-          width: 10,
-          minHeight: 24,
+          justifyContent: 'flex-start',
+          pl: '2px',
+          width: 8,
           cursor: disabled ? 'default' : 'col-resize',
           userSelect: 'none',
           opacity: disabled ? 0.4 : 1,
-          '& .rv-drag-bar': { bgcolor: 'rgba(255,255,255,0.25)' },
-          '&:hover .rv-drag-bar': disabled ? {} : { bgcolor: 'rgba(255,255,255,0.7)' },
         } : {
           display: 'flex',
           alignItems: 'center',
@@ -186,7 +200,7 @@ export function DragNumberField({
         {compact && !inline ? (
           <Box
             className="rv-drag-bar"
-            sx={{ width: '1px', height: 14, borderRadius: '1px', transition: 'background-color 120ms ease' }}
+            sx={{ width: '1px', height: 16, borderRadius: '1px', bgcolor: 'transparent', transition: 'background-color 120ms ease' }}
           />
         ) : icon}
       </Box>
@@ -225,7 +239,9 @@ export function DragNumberField({
             endAdornment: unit ? (
               <Typography
                 component="span"
-                sx={{ color: 'text.secondary', fontSize: 12, ml: 0.5 }}
+                // Faded + nudged toward the right edge so it reads as a quiet
+                // unit hint rather than part of the value.
+                sx={{ color: 'rgba(255,255,255,0.3)', fontSize: 12, ml: 1 }}
               >
                 {unit}
               </Typography>
@@ -237,11 +253,18 @@ export function DragNumberField({
           '& .MuiInputBase-input': inline
             ? { fontSize: 12, py: 0.4, textAlign: 'right' }
             : compact
-              ? { fontSize: 11, fontFamily: 'monospace', height: 24, py: 0, boxSizing: 'border-box' }
+              // px override: MUI's default 14px horizontal padding looks like an
+              // unwanted leading space in this dense layout — tighten it so the
+              // number sits close to the field's left edge.
+              ? { fontSize: 11, fontFamily: 'monospace', height: 18, py: 0, px: 0.75, boxSizing: 'border-box' }
               : { fontSize: 13, py: 0.75 },
           ...((compact || inline) && {
             '& .MuiOutlinedInput-root': {
               bgcolor: 'rgba(255,255,255,0.04)',
+              // Match the unit's right gap to the value's left gap (input px:0.75
+              // = 6px) so the field reads symmetric. MUI defaults the root's
+              // right padding to ~14px when an endAdornment is present.
+              ...(compact && !inline ? { pr: 0.75 } : {}),
               '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' },
               '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.15)' },
               '&.Mui-focused fieldset': { borderColor: 'primary.main' },

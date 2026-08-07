@@ -26,6 +26,12 @@ import { StepState } from '../engine/rv-logic-step';
 import { extractComponentTypes } from './rv-inspector-helpers';
 import { STEP_STATE_COLORS, STEP_STATE_LABELS } from './rv-logic-step-colors';
 import { componentColor } from './rv-inspector-helpers';
+import {
+  SIGNAL_VALUE_NEUTRAL,
+  signalDirectionFromType,
+  signalValueColor,
+  signalValueColorForValue,
+} from './signal-colors';
 import { readSignalValue, formatValue } from './rv-value-resolver';
 import { getDisplayName } from '../engine/rv-component-registry';
 import { tooltipRegistry } from './tooltip/tooltip-registry';
@@ -42,6 +48,17 @@ export interface TreeNode {
   /** LayoutObjects can hold uninjected Three.js descendants. Set so the row
    *  renders an expand caret even before children are lazily injected. */
   canExpandLazy?: boolean;
+}
+
+export interface VisibleTreeRow {
+  node: TreeNode;
+  depth: number;
+  /** Stable virtualizer key, including for duplicate path-less group rows. */
+  rowKey: string;
+  /** One-based position within this row's sibling group. */
+  posInSet: number;
+  /** Number of rows in this row's sibling group. */
+  setSize: number;
 }
 
 /** Internal tree node augmented with a child lookup map for O(1) insertion. */
@@ -91,26 +108,19 @@ export function sortSignalNodes(nodes: EditableNodeInfo[], sort: SignalSort): Ed
 
 // ─── Tree building ───────────────────────────────────────────────────────
 
+/** Component types whose raw Three.js children are lazily injected into the
+ *  tree: placed catalog items and imported CAD roots (STEP part meshes carry
+ *  no rv_extras of their own, so only lazy injection makes them browsable). */
+const LAZY_EXPAND_TYPES = new Set(['LayoutObject', 'CADLink']);
+
 /**
- * Build a hierarchy tree from a flat list of editable nodes.
- *
- * When `viewer` and `expandedPaths` are provided, Three.js children of
- * LayoutObject nodes that appear in `expandedPaths` are lazily injected
- * into the tree — including mesh-only children that don't carry
- * `userData.realvirtual`. This makes placed catalog items expandable in
- * the hierarchy panel exactly like normal GLB imports.
- *
- * The injection is **lazy**: collapsed LayoutObjects are not traversed,
- * so the cost of placing many catalog items stays flat.
- *
- * Idempotent NodeRegistry registration ensures injection never duplicates
- * existing entries in the suffix map.
+ * Build the expansion-independent hierarchy structure from editable nodes.
+ * LayoutObject/CADLink Three.js descendants are deliberately handled later by
+ * `applyLazyInjection`, allowing this result to be cached across expand toggles.
  */
-export function buildTree(
+export function buildStructureTree(
   nodes: EditableNodeInfo[],
   overlay: RVExtrasOverlay | null,
-  viewer?: RVViewer,
-  expandedPaths?: ReadonlySet<string>,
 ): TreeNode[] {
   const root: BuildTreeNode = { name: '', path: null, types: [], hasOverrides: false, children: [], _childMap: new Map() };
 
@@ -162,31 +172,71 @@ export function buildTree(
     topNodes = topNodes[0].children;
   }
 
-  // LayoutObject discovery: walk the tree and visit every LayoutObject node.
-  // - If it's expanded, eagerly inject its Three.js subtree (mesh-only kids included).
-  // - Otherwise mark `canExpandLazy` so the row renders an expand caret even
-  //   when no children have been injected yet (the caret triggers the lazy
-  //   inject on first toggle).
-  if (viewer) {
-    const visit = (nodes: TreeNode[]): void => {
-      for (const node of nodes) {
-        if (node.path && node.types.includes('LayoutObject')) {
-          const obj = viewer.registry?.getNode(node.path);
-          if (obj) {
-            if (expandedPaths?.has(node.path)) {
-              injectThreeJsChildren(node, obj, viewer, expandedPaths, overlay);
-            } else if (obj.children.length > 0) {
-              node.canExpandLazy = true;
-            }
-          }
-        }
-        if (node.children.length > 0) visit(node.children);
-      }
-    };
-    visit(topNodes);
+  return topNodes;
+}
+
+/**
+ * Apply expanded-state-dependent LayoutObject/CADLink injection to a cached
+ * structural tree. Only changed branches are copied; the structure is never
+ * mutated and unaffected branch identities remain stable.
+ */
+export function applyLazyInjection(
+  nodes: TreeNode[],
+  viewer: RVViewer | undefined,
+  expandedPaths: ReadonlySet<string> = new Set<string>(),
+  overlay: RVExtrasOverlay | null = null,
+): TreeNode[] {
+  if (!viewer) return nodes;
+
+  let changed = false;
+  const next = nodes.map((node) => {
+    const injected = applyLazyInjectionToNode(node, viewer, expandedPaths, overlay);
+    if (injected !== node) changed = true;
+    return injected;
+  });
+  return changed ? next : nodes;
+}
+
+/** Compatibility facade for existing callers and tests. */
+export function buildTree(
+  nodes: EditableNodeInfo[],
+  overlay: RVExtrasOverlay | null,
+  viewer?: RVViewer,
+  expandedPaths?: ReadonlySet<string>,
+): TreeNode[] {
+  return applyLazyInjection(
+    buildStructureTree(nodes, overlay),
+    viewer,
+    expandedPaths ?? new Set<string>(),
+    overlay,
+  );
+}
+
+function applyLazyInjectionToNode(
+  node: TreeNode,
+  viewer: RVViewer,
+  expandedPaths: ReadonlySet<string>,
+  overlay: RVExtrasOverlay | null,
+): TreeNode {
+  let childrenChanged = false;
+  const children = node.children.map((child) => {
+    const next = applyLazyInjectionToNode(child, viewer, expandedPaths, overlay);
+    if (next !== child) childrenChanged = true;
+    return next;
+  });
+
+  const nextNode = childrenChanged ? { ...node, children } : node;
+  if (!node.path || !node.types.some((type) => LAZY_EXPAND_TYPES.has(type))) return nextNode;
+
+  const object = viewer.registry?.getNode(node.path);
+  if (!object) return nextNode;
+  if (expandedPaths.has(node.path)) {
+    return injectThreeJsChildren(nextNode, object, viewer, expandedPaths, overlay);
   }
 
-  return topNodes;
+  const canExpandLazy = hasInjectableThreeJsChildren(object);
+  if (nextNode.canExpandLazy === canExpandLazy) return nextNode;
+  return { ...nextNode, canExpandLazy: canExpandLazy || undefined };
 }
 
 /**
@@ -207,12 +257,19 @@ function injectThreeJsChildren(
   viewer: RVViewer,
   expandedPaths: ReadonlySet<string>,
   overlay: RVExtrasOverlay | null,
-): void {
+): TreeNode {
   // O(1) dedup via Map (avoids quadratic some() scans for large LayoutObjects)
   const existingChildPaths = new Map<string, TreeNode>();
   for (const c of parent.children) {
     if (c.path) existingChildPaths.set(c.path, c);
   }
+
+  let changed = parent.canExpandLazy === true;
+  let children = parent.children;
+  const ensureChildrenCopy = (): TreeNode[] => {
+    if (children === parent.children) children = [...parent.children];
+    return children;
+  };
 
   for (const child of parentObj.children) {
     // Skip highlight/ghost overlays + gizmo sprites (snap markers etc.) — they're
@@ -229,8 +286,20 @@ function injectThreeJsChildren(
     if (existingChildPaths.has(childPath)) {
       // Recurse into existing child if expanded
       const existing = existingChildPaths.get(childPath)!;
+      let nextExisting = existing;
       if (expandedPaths.has(childPath)) {
-        injectThreeJsChildren(existing, child, viewer, expandedPaths, overlay);
+        nextExisting = injectThreeJsChildren(existing, child, viewer, expandedPaths, overlay);
+      } else {
+        const canExpandLazy = hasInjectableThreeJsChildren(child);
+        if (existing.canExpandLazy !== canExpandLazy) {
+          nextExisting = { ...existing, canExpandLazy: canExpandLazy || undefined };
+        }
+      }
+      if (nextExisting !== existing) {
+        const index = parent.children.indexOf(existing);
+        ensureChildrenCopy()[index] = nextExisting;
+        existingChildPaths.set(childPath, nextExisting);
+        changed = true;
       }
       continue;
     }
@@ -248,8 +317,9 @@ function injectThreeJsChildren(
       children: [],
       hasOverrides: overlay ? !!overlay.nodes[childPath] : false,
     };
-    parent.children.push(childNode);
+    ensureChildrenCopy().push(childNode);
     existingChildPaths.set(childPath, childNode);
+    changed = true;
 
     // Idempotent NodeRegistry registration so subsequent lookups by path
     // succeed without polluting the suffix map.
@@ -259,7 +329,11 @@ function injectThreeJsChildren(
 
     // Cascade lazily — only descend when the user has expanded this child
     if (expandedPaths.has(childPath)) {
-      injectThreeJsChildren(childNode, child, viewer, expandedPaths, overlay);
+      const injected = injectThreeJsChildren(childNode, child, viewer, expandedPaths, overlay);
+      if (injected !== childNode) {
+        children[children.length - 1] = injected;
+        existingChildPaths.set(childPath, injected);
+      }
     } else if (hasInjectableThreeJsChildren(child)) {
       // Not yet expanded but real Three.js descendants exist (e.g. Drive-Rot-Y
       // has Transport-Z, Snap-*, …) — show the expand caret so the user can
@@ -268,6 +342,9 @@ function injectThreeJsChildren(
       childNode.canExpandLazy = true;
     }
   }
+
+  if (!changed) return parent;
+  return { ...parent, children, canExpandLazy: undefined };
 }
 
 /** True when `obj` has any child that would inject into the tree (non-overlay). */
@@ -282,8 +359,9 @@ function hasInjectableThreeJsChildren(obj: import('three').Object3D): boolean {
 }
 
 /**
- * Flatten a TreeNode forest into a flat list of nodes (depth-first, parent-first).
- * Useful for virtualization (variable-height rows) or test assertions about order.
+ * Flatten every TreeNode in depth-first, parent-first order, ignoring expansion.
+ * This remains useful for full-tree test assertions; render virtualization uses
+ * `flattenVisibleTree` so collapsed descendants are omitted.
  *
  * Returns each node with its `depth` (0 = root) so the consumer can render indentation
  * without reconstructing the hierarchy.
@@ -296,6 +374,47 @@ export function flattenTree(nodes: TreeNode[]): Array<{ node: TreeNode; depth: n
   }
   for (const node of nodes) walk(node, 0);
   return flat;
+}
+
+/**
+ * Flatten only rows visible under the current expansion state. Unlike
+ * `flattenTree`, collapsed descendants are omitted. ARIA sibling metadata is
+ * computed per branch, and path-less duplicate groups receive unique keys.
+ */
+export function flattenVisibleTree(
+  nodes: TreeNode[],
+  expanded: ReadonlySet<string>,
+): VisibleTreeRow[] {
+  const rows: VisibleTreeRow[] = [];
+
+  const walkSiblings = (siblings: TreeNode[], depth: number, parentKey: string): void => {
+    const setSize = siblings.length;
+    for (let index = 0; index < siblings.length; index++) {
+      const node = siblings[index];
+      const rowKey = node.path ?? `group:${parentKey}/${node.name}#${index}`;
+      rows.push({ node, depth, rowKey, posInSet: index + 1, setSize });
+
+      const hasChildren = node.children.length > 0 || node.canExpandLazy === true;
+      if (hasChildren && expanded.has(node.path ?? node.name)) {
+        walkSiblings(node.children, depth + 1, rowKey);
+      }
+    }
+  };
+
+  walkSiblings(nodes, 0, 'root');
+  return rows;
+}
+
+/**
+ * Paths of the rows CURRENTLY RENDERED by the tree view, in render order —
+ * children are entered only when their parent row is expanded, the exact
+ * mirror of TreeNodeRow's render condition. Used for Shift+click range
+ * selection (a range over rows the user can actually see).
+ */
+export function visibleTreePaths(nodes: TreeNode[], expanded: ReadonlySet<string>): string[] {
+  return flattenVisibleTree(nodes, expanded)
+    .filter((row): row is VisibleTreeRow & { node: TreeNode & { path: string } } => !!row.node.path)
+    .map((row) => row.node.path);
 }
 
 export function filterTree(nodes: TreeNode[], term: string, viewer?: RVViewer): TreeNode[] {
@@ -423,19 +542,22 @@ export function formatSignalValue(type: string, signalStore: SignalStore | null,
   });
 }
 
-/** Get signal badge color based on live value. Bool: green when true, grey when false. */
+/**
+ * Colour of a hierarchy signal badge, driven by the live VALUE (plan-341 §2.3):
+ * hue = direction, intensity = state, neutral when there is no reading at all.
+ *
+ * This is a signal-value surface, not a type badge — it reads the store and
+ * distinguishes TRUE from FALSE. Non-signal types keep {@link componentColor}.
+ */
 export function signalBadgeColor(type: string, signalStore: SignalStore | null, path: string | null): string {
-  if (!signalStore || !path) return componentColor(type);
+  const dir = signalDirectionFromType(type);
+  if (dir === 'unknown') return componentColor(type);
+  if (!signalStore || !path) return SIGNAL_VALUE_NEUTRAL;
   const value = signalStore.getByPath(path);
-  if (value === undefined) return componentColor(type);
-
-  if (isBoolSignal(type)) {
-    if (value === true) {
-      return type.startsWith('PLCInput') ? '#ef5350' : '#66bb6a';
-    }
-    return '#808080';
-  }
-  return componentColor(type);
+  if (value === undefined) return SIGNAL_VALUE_NEUTRAL;
+  // Bool signals report truthiness; numeric signals treat 0 as the weak step.
+  if (isBoolSignal(type)) return signalValueColor(dir, value === true);
+  return signalValueColorForValue(dir, value);
 }
 
 // ─── LogicStep helpers ───────────────────────────────────────────────────

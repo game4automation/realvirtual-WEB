@@ -5,7 +5,7 @@
  * DriveChartOverlay — Floating panel with a real-time ECharts chart
  * showing drive positions and/or speeds.
  *
- * Uses ChartPanel for the reusable drag/resize/title-bar infrastructure.
+ * Uses FloatingPanel for the reusable drag/resize/title-bar infrastructure.
  * Responds to drive filter events — only shows filtered drives.
  */
 
@@ -19,7 +19,7 @@ import { useDrives } from '../../hooks/use-drives';
 import { useDriveFilter } from '../../hooks/use-drive-filter';
 import { useMaintenanceMode } from '../../hooks/use-maintenance-mode';
 import { BOTTOM_BAR_HEIGHT } from '../../core/hmi/layout-constants';
-import { ChartPanel } from '../../core/hmi/ChartPanel';
+import { FloatingPanel } from '../../core/hmi/FloatingPanel';
 import { DriveRecorderPlugin } from '../drive-recorder-plugin';
 import { NodeRegistry } from '../../core/engine/rv-node-registry';
 import {
@@ -51,7 +51,7 @@ function ensureDriveRecorder(viewer: ReturnType<typeof useViewer>) {
   let plugin = viewer.getPlugin<DriveRecorderPlugin>('drive-recorder');
   if (!plugin) {
     plugin = new DriveRecorderPlugin();
-    viewer.use(plugin);
+    viewer.use(plugin, 'core');
   }
   return plugin;
 }
@@ -301,7 +301,7 @@ export function DriveChartOverlay() {
   );
 
   return (
-    <ChartPanel
+    <FloatingPanel
       open={open && !suppressed}
       onClose={() => viewer.toggleDriveChart(false)}
       title="Drive Monitor"
@@ -314,6 +314,6 @@ export function DriveChartOverlay() {
       toolbar={toolbar}
     >
       <Box ref={chartRef} sx={{ flex: 1, minHeight: 0 }} />
-    </ChartPanel>
+    </FloatingPanel>
   );
 }

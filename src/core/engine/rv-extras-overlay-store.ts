@@ -70,15 +70,6 @@ export function saveOverlay(glbName: string, overlay: RVExtrasOverlay): void {
   localStorage.setItem(storageKey(glbName), JSON.stringify(overlay));
 }
 
-/**
- * Clear (remove) the overlay for the given GLB name from localStorage.
- *
- * @deprecated See `loadOverlay`.
- */
-export function clearOverlay(glbName: string): void {
-  localStorage.removeItem(storageKey(glbName));
-}
-
 // ─── Merge / Apply ──────────────────────────────────────────────────────
 
 /**

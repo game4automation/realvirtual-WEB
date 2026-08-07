@@ -5,103 +5,27 @@
  * Model loading, caching, and GLB post-processing helpers for the Layout Planner.
  *
  * - ModelCache: loads + caches GLB models, returns clones
- * - unwrapGltfRoot: strips UnityGLTF `__root__` wrapper nodes
  * - pivotToFloorCenter: recalculates pivot to bottom-center of full AABB
  * - alignToFloor: shifts a group so its bounding box bottom sits at Y=0
+ *
+ * `unwrapGltfRoot` now lives in `core/engine/rv-gltf-unwrap` — the editor's
+ * `parseGlbSubtree` needs the identical definition of "content root". It is
+ * re-exported here (and from the plugin index) for backwards compatibility.
  */
 
 import {
   Group,
-  Mesh,
   Vector3,
   Box3,
   Raycaster,
-  Camera,
-  Light,
 } from 'three';
-import type { Object3D, Scene } from 'three';
+import type { Object3D, Scene, Mesh } from 'three';
 import type { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { disposeSubtree } from './three-utils';
 import { RVAssetBlobCache } from '../../core/engine/rv-asset-blob-cache';
+import { unwrapGltfRoot } from '../../core/engine/rv-gltf-unwrap';
 
-// ─── GLB Wrapper Removal ────────────────────────────────────────────────
-
-/** Names of non-content nodes created by UnityGLTF that should be stripped. */
-const WRAPPER_NAMES = new Set(['__root__']);
-const STRIP_NAMES = new Set(['default camera', 'hdrskybox', 'hdrSkyBox']);
-
-/**
- * Detects names that are scene-container metadata rather than content.
- * Matches UnityGLTF's `__root__` wrapper plus any name that ends in `.glb`
- * (or `glb` after Three.js sanitization) — UnityGLTF sets `scenes[0].name`
- * to the export filename, so the gltf.scene Three.js Group ends up with a
- * filename-based wrapper name like `EuropalletEmpty.glb` / `EuropalletEmptyglb`.
- * Those wrappers exist only because gltf-format requires a scene, but they
- * carry no semantic meaning and should be peeled off before the content
- * node is registered as a library/layout object.
- */
-function isWrapperName(name: string): boolean {
-  if (!name) return true;
-  if (WRAPPER_NAMES.has(name)) return true;
-  return /\.?glb$/i.test(name);
-}
-
-/**
- * Unwrap the `__root__` wrapper node created by UnityGLTF and strip
- * non-content children (default camera, hdrSkyBox, lights, cameras).
- * Returns the actual content node as the new root Group.
- *
- * Also peels off the gltf.scene wrapper that Three.js gives the filename-
- * based name (e.g. `EuropalletEmpty.glb`) when there's exactly one
- * content child — otherwise the library asset would appear inside a
- * filename-shaped LayoutObject instead of being one itself.
- */
-export function unwrapGltfRoot(root: Group): Group {
-  let node: Group = root;
-
-  // Walk through single-child wrappers
-  while (
-    isWrapperName(node.name) ||
-    (node.children.length <= 3 && !hasContentChildren(node))
-  ) {
-    const contentChildren = node.children.filter(c => isContentNode(c));
-    // Descend into a single non-mesh content child. Three.js GLTFLoader
-    // creates plain Object3D (not Group) for empty container nodes, so we
-    // can't gate this on `instanceof Group` — we just need a node that
-    // could carry children (anything that isn't a leaf Mesh).
-    if (contentChildren.length === 1 && !(contentChildren[0] as Mesh).isMesh) {
-      node = contentChildren[0] as Group;
-    } else if (contentChildren.length > 0) {
-      // Multiple content children — keep this node but strip non-content
-      stripNonContent(node);
-      return node;
-    } else {
-      break;
-    }
-  }
-
-  stripNonContent(node);
-  return node;
-}
-
-function isContentNode(obj: Object3D): boolean {
-  const name = obj.name.toLowerCase();
-  if (STRIP_NAMES.has(name) || STRIP_NAMES.has(obj.name)) return false;
-  if ((obj as unknown as Camera).isCamera) return false;
-  if ((obj as unknown as Light).isLight) return false;
-  return true;
-}
-
-function hasContentChildren(group: Group): boolean {
-  return group.children.some(c => isContentNode(c) && ((c as Mesh).isMesh || c.children.length > 0));
-}
-
-function stripNonContent(group: Group): void {
-  const toRemove = group.children.filter(c => !isContentNode(c));
-  for (const child of toRemove) {
-    group.remove(child);
-  }
-}
+export { unwrapGltfRoot };
 
 // ─── Pivot to Floor ─────────────────────────────────────────────────────
 
@@ -417,6 +341,27 @@ function hasAncestorNamed(obj: Object3D, name: string): boolean {
   return false;
 }
 
+/**
+ * Placement roots must be transform-neutral: the planner stamps the placement
+ * position/rotation/scale directly onto the placed root (materialize/restore
+ * paths), which would destroy any intrinsic root transform the asset carries —
+ * e.g. the 0.001 mm→m scale a CAD import bakes onto its content root
+ * ("way too large" bug for editor-saved CAD assets). Wrap such roots in an
+ * identity Group so the intrinsic transform survives inside.
+ */
+export function ensureNeutralPlacementRoot(source: Group): Group {
+  const { position: t, quaternion: q, scale: s } = source;
+  const identity =
+    t.x === 0 && t.y === 0 && t.z === 0 &&
+    q.x === 0 && q.y === 0 && q.z === 0 && q.w === 1 &&
+    s.x === 1 && s.y === 1 && s.z === 1;
+  if (identity) return source;
+  const wrapper = new Group();
+  wrapper.name = source.name || 'Asset';
+  wrapper.add(source);
+  return wrapper;
+}
+
 // ─── Model Cache ────────────────────────────────────────────────────────
 
 /** Cache API bucket for all planner GLBs (catalog, GitHub, AM). */
@@ -425,19 +370,137 @@ const GLB_CACHE_BUCKET = 'rv-planner-glbs';
 /** Shared blob cache singleton — also exposed for tooling that needs to wipe it. */
 const _glbBlobCache = new RVAssetBlobCache({ bucket: GLB_CACHE_BUCKET });
 
+/** The rejection an aborted `getOrLoad` consumer receives. */
+export class AbortError extends Error {
+  readonly name = 'AbortError';
+  constructor(message = 'Aborted') { super(message); }
+}
+
+/** Reject immediately when the caller is already gone. */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new AbortError();
+}
+
+/**
+ * Resolve with `work`, or reject as soon as `signal` aborts — WITHOUT
+ * cancelling `work` itself. The shared load keeps running for every other
+ * consumer (plan-371 H5/R12); this consumer simply stops listening.
+ */
+function detachOnAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return work;
+  // The abandoned promise must still have a handler, or an eventual rejection
+  // would surface as an unhandled rejection.
+  work.catch(() => { /* owned by whoever still awaits it */ });
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new AbortError());
+    if (signal.aborted) { onAbort(); return; }
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (err) => { signal.removeEventListener('abort', onAbort); reject(err); },
+    );
+  });
+}
+
 export class ModelCache {
   /** Decoded Three.js Group cache — clones are returned to callers. */
   private _decoded = new Map<string, Group>();
+  /**
+   * In-flight DECODES, keyed by url (plan-371 §2.10).
+   *
+   * `_decoded` only ever holds finished results, so without this map two
+   * overlapping `getOrLoad` calls for the same url decode the same GLB twice —
+   * exactly the situation the hover prefetch creates (prefetch still running,
+   * drag starts). Three rules keep the map from introducing bugs of its own;
+   * they are spelled out at their enforcement sites in {@link _shared} and
+   * {@link invalidate}.
+   */
+  private _inflight = new Map<string, Promise<Group>>();
+  /**
+   * Invalidation counter per url. A decode records the epoch it started under
+   * and refuses to publish into `_decoded` if `invalidate()` has bumped it
+   * meanwhile — dropping the promise from `_inflight` alone is NOT enough,
+   * because the abandoned decode still runs to completion and would otherwise
+   * re-install the very tree the invalidate was meant to evict.
+   */
+  private _epoch = new Map<string, number>();
   private _loader: GLTFLoader;
 
   constructor(loader: GLTFLoader) {
     this._loader = loader;
   }
 
-  /** Get a clone of the cached model, loading it first if needed. */
-  async getOrLoad(url: string): Promise<Group> {
+  /**
+   * Get a clone of the cached model, loading it first if needed.
+   *
+   * `opts.signal` (plan-371) detaches THIS consumer from the result — it does
+   * NOT cancel the underlying work. That is deliberate: the blob layer beneath
+   * (`RVAssetBlobCache._pending`) de-duplicates in-flight fetches URL-wide, so
+   * a real abort would tear down the download of an unrelated second placement
+   * of the same asset. The load runs to completion, lands in the cache, and
+   * benefits whoever asks next.
+   */
+  async getOrLoad(url: string, opts?: { signal?: AbortSignal }): Promise<Group> {
+    const signal = opts?.signal;
+    throwIfAborted(signal);
+
     const cached = this._decoded.get(url);
     if (cached) return cached.clone();
+
+    const source = await detachOnAbort(this._shared(url), signal);
+    return source.clone();
+  }
+
+  /**
+   * Warm the caches for `url` without producing a clone — fire-and-forget.
+   *
+   * Called from the library panel's hover intent (plan-371 F8): by the time the
+   * user actually starts dragging, fetch and decode are already under way, and
+   * the drag's own `getOrLoad` joins the very same promise instead of starting
+   * a second one.
+   *
+   * Never rejects: a prefetch that fails is simply a prefetch that did not
+   * help, and the real load re-runs (and re-reports) it moments later.
+   */
+  prefetch(url: string): void {
+    if (!url) return;
+    if (this._decoded.has(url)) return;
+    this._shared(url).catch(() => { /* speculative — the real load reports */ });
+  }
+
+  /**
+   * The ONE in-flight decode promise for `url`, created on first ask.
+   *
+   * RULE 1 — cleanup in every case. Without the settle handler a REJECTED
+   * promise would stay in the map forever, and every later caller (including
+   * `PendingGeometryRegistry.retry()`) would be handed the same stale failure:
+   * a retry that can never succeed, silently. Registering the handler also
+   * means the shared promise always has a rejection handler, so a decode whose
+   * consumers all detached never surfaces as an unhandled rejection.
+   *
+   * RULE 2 — no `signal` here on purpose. Aborting is a per-consumer concern
+   * and is applied one level up in `getOrLoad` via `detachOnAbort`; cancelling
+   * the shared work would tear down an unrelated second placement of the same
+   * asset (the same bug class as H5, one layer higher).
+   */
+  private _shared(url: string): Promise<Group> {
+    const existing = this._inflight.get(url);
+    if (existing) return existing;
+
+    const decode = this._decode(url);
+    this._inflight.set(url, decode);
+    // `then(settle, settle)` rather than `finally`: it consumes the rejection
+    // instead of re-raising it on a derived promise nobody awaits.
+    const settle = (): void => {
+      if (this._inflight.get(url) === decode) this._inflight.delete(url);
+    };
+    decode.then(settle, settle);
+    return decode;
+  }
+
+  /** Fetch + decode + normalize one GLB into the decoded cache. */
+  private async _decode(url: string): Promise<Group> {
+    const epoch = this._epoch.get(url) ?? 0;
 
     // Resolve bytes via the generic blob cache (in-memory + Cache API).
     // For blob: URLs the cache pass-throughs so the GLTFLoader can read
@@ -451,14 +514,43 @@ export class ModelCache {
       let source = gltf.scene as Group;
       // Strip UnityGLTF __root__ wrapper and non-content nodes
       source = unwrapGltfRoot(source);
-      this._decoded.set(url, source);
-      return source.clone();
+      source = ensureNeutralPlacementRoot(source);
+      // Publish only if this decode has not been invalidated while it ran. The
+      // caller still gets its result — it asked before the invalidate — but the
+      // CACHE must not be repopulated with a superseded tree.
+      if ((this._epoch.get(url) ?? 0) === epoch) this._decoded.set(url, source);
+      return source;
     } finally {
       if (loadUrl !== url) URL.revokeObjectURL(loadUrl);
     }
   }
 
+  /** Fetch raw GLB bytes for a (blob or object) URL. Test seam. */
+  protected async _fetchBytes(url: string): Promise<ArrayBuffer> {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`GLB fetch failed (${resp.status}) for ${url}`);
+    return resp.arrayBuffer();
+  }
+
   get size(): number { return this._decoded.size; }
+
+  /**
+   * Drop ONE decoded entry (dispose its geometry) — the editor-save
+   * invalidation hook: a re-saved library asset must not be served from the
+   * pre-save decoded tree. No-op on unknown URLs.
+   */
+  invalidate(url: string): void {
+    // RULE 3 (plan-371 §2.10) — TWO steps, and the second is the load-bearing
+    // one. Dropping the promise makes the next ask start a fresh decode; bumping
+    // the epoch stops the abandoned decode (which keeps running regardless)
+    // from publishing the pre-save tree back into `_decoded` when it lands.
+    this._inflight.delete(url);
+    this._epoch.set(url, (this._epoch.get(url) ?? 0) + 1);
+    const entry = this._decoded.get(url);
+    if (!entry) return;
+    disposeSubtree(entry);
+    this._decoded.delete(url);
+  }
 
   /** Clear the persistent browser cache for all planner GLBs. */
   static async clearPersistentCache(): Promise<void> {
@@ -470,5 +562,8 @@ export class ModelCache {
       disposeSubtree(model);
     }
     this._decoded.clear();
+    // In-flight decodes are abandoned, not cancelled — see `_shared`. Their
+    // settle handlers are harmless no-ops once the map is empty.
+    this._inflight.clear();
   }
 }

@@ -33,6 +33,12 @@ export interface RVViewerPlugin {
    * When true: plugin always activates, even in selective mode (rv_plugins declared).
    * Core plugins provide essential infrastructure (drive sorting, physics, etc.)
    * and cannot be skipped. Default: false (plugin is optional/skippable).
+   *
+   * This concerns PARTICIPATION only — whether the plugin runs. It does NOT make
+   * the plugin's UI visible: the visibility of its slot entries is compiled from
+   * `modes` by `UIPluginRegistry.register` (rv-ui-registry.ts), which never looks
+   * at `core`. So `core: true` + `modes: ['hmi']` means "runtime runs in every
+   * mode, UI appears only in hmi". See doc-ui-visibility.md.
    */
   readonly core?: boolean;
 
@@ -98,6 +104,12 @@ export interface RVViewerPlugin {
    * raycast filters, OutlinePass selections) MUST be fully released in
    * {@link onModeDeactivate} — the plugin instance persists across mode
    * switches, so undisposed resources leak.
+   *
+   * NOTE: do NOT create hover/selection highlights from this hook. The mode's
+   * HighlightProfile is applied by RVHighlightPolicy on `mode-changed`, which
+   * fires AFTER activate hooks — a highlight created here would render in the
+   * PREVIOUS mode's profile and is unsupported. React to `mode-changed` (or
+   * user interaction) instead.
    */
   onModeActivate?(mode: ModeId, viewer: RVViewer): void;
 
@@ -108,6 +120,16 @@ export interface RVViewerPlugin {
    * in unusual boot edge cases).
    */
   onModeDeactivate?(mode: ModeId | null, viewer: RVViewer): void;
+
+  /**
+   * Called when the active 3D render backend changes (plan-256), e.g. Three.js
+   * → Omniverse RTX stream. Interactive 3D plugins (raycast/gizmo/camera) have
+   * no meaningful Three interaction under a non-Three backend and should no-op
+   * / tear down open gizmos and drag handlers here. The viewer also neutralises
+   * them centrally (skips per-frame `onRender` dispatch and hides the WebGL
+   * canvas) — this hook is the explicit per-plugin signal on top of that.
+   */
+  onRenderBackendChanged?(backend: 'three' | 'omniverse', viewer: RVViewer): void;
 
   /** Viewer is being destroyed — clean up global listeners, DOM elements, etc. */
   dispose?(): void;

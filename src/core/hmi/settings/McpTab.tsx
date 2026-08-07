@@ -7,21 +7,23 @@ import { useViewer } from '../../../hooks/use-viewer';
 import { useMcpBridge, useMcpBridgeLog } from '../../../hooks/use-mcp-bridge';
 import type { McpBridgePluginAPI } from '../../types/plugin-types';
 import { StatRow, SettingsSection, FieldRow } from './settings-helpers';
+import { ConnectDownloadLinks } from '../ConnectPanel';
+import { RagStatusSection } from './RagStatusSection';
 
-const MCP_JSON_SNIPPET = `"WebViewerMCP": {
+/** The default transport: realvirtual CONNECT hosts the MCP endpoint itself, so any
+ *  MCP client registers ONE http entry and needs neither Node nor Vite (plan-327 AP5). */
+const CONNECT_MCP_SNIPPET = `"realvirtual-CONNECT": {
+  "type": "http",
+  "url": "http://localhost:5100/mcp"
+}`;
+
+/** Emergency fallback only — see doc-ai-integration.md → "Falling back to the Node bridge". */
+const NODE_FALLBACK_SNIPPET = `"WebViewerMCP": {
   "command": "node",
   "args": ["<project>/Assets/realvirtual-WebViewer~/mcp-bridge/dist/index.js"]
 }`;
 
 const BUILD_CMD = 'cd Assets/realvirtual-WebViewer~/mcp-bridge\nnpm run setup';
-
-/** Quick-switch targets: which bridge (which Claude) drives this browser.
- *  Each Claude client runs its own Node bridge on its own port. */
-const BRIDGE_PRESETS: { label: string; port: string }[] = [
-  { label: 'Desktop', port: '18714' },
-  { label: 'Code', port: '18715' },
-  { label: 'Python', port: '18712' },
-];
 
 /** Monospace block with a copy-to-clipboard button. */
 function CodeBlock({ text }: { text: string }) {
@@ -82,8 +84,8 @@ export function McpTab() {
     : 'Disabled';
 
   // Full-chain status: the bridge server pushes who's attached (which Claude)
-  // and when it was last active. Present only for the Node bridge — the legacy
-  // Python bridge sends no status frame, so these rows stay hidden for it.
+  // and when it was last active. Both CONNECT and the Node bridge send this frame;
+  // the legacy Python bridge does not, so these rows stay hidden for it.
   const ss = mcp.serverStatus;
   const aiConnected = !!ss?.clientConnected;
   const aiColor = aiConnected ? '#66bb6a' : '#ef5350';
@@ -136,12 +138,6 @@ export function McpTab() {
     }
   };
 
-  // One-click switch: set the target port + enable + (re)connect.
-  const switchTo = (port: string) => {
-    setPortInput(port);
-    mcpPlugin?.reconnect(port);
-  };
-
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
       <SettingsSection id="mcp-bridge" title="AI Bridge">
@@ -168,20 +164,11 @@ export function McpTab() {
           {mcp.connected && ss && <StatRow label="Bridge" value={bridgeLabel} />}
         </Box>
 
-        {/* Quick target — pick which Claude (or Python) drives this browser. */}
-        <FieldRow label="Connect to">
-          <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
-            {BRIDGE_PRESETS.map(p => (
-              <Button key={p.port} size="small"
-                variant={mcp.port === p.port ? 'contained' : 'outlined'}
-                onClick={() => switchTo(p.port)}
-                title={`port ${p.port}`}
-                sx={{ textTransform: 'none', minWidth: 0, px: 1 }}>
-                {p.label}
-              </Button>
-            ))}
-          </Box>
-        </FieldRow>
+        {/* No transport picker. CONNECT is the MCP server: it hosts the endpoint and owns the web_*
+            tools, so this row asked the operator to choose between the one real answer and two
+            fallbacks nobody reaches for unprompted. The Node bridge stays reachable through the port
+            field below (18714 Desktop / 18715 Code) and its code is untouched — retiring it is
+            plan-348, which has a precondition of its own. */}
 
         {/* Port config */}
         <FieldRow label="Port">
@@ -221,27 +208,47 @@ export function McpTab() {
         )}
       </SettingsSection>
 
+      {/* CONNECT RAG / LLM status — the AI-diagnosis assistant that lives in realvirtual CONNECT,
+          shown here next to the MCP bridge (plan-284). Independent of the MCP connection. */}
+      <RagStatusSection />
+
       {/* Setup helper — shown until the bridge is connected. */}
       {!mcp.connected && (
         <SettingsSection id="mcp-setup" title="Setup — enable the AI Bridge">
           <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.65)' }}>
-            The AI Bridge needs a small local Node server (one-time setup).
+            realvirtual CONNECT hosts the AI Bridge itself — no Node, no extra install.
           </Typography>
+          {/* Dead end without a gateway: mobile reaches this tab directly and never
+              sees the activity-bar download dialog, so the same affordance sits here. */}
+          <ConnectDownloadLinks />
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, mt: 0.5 }}>
-            <SetupStep n={1} title="Build the bridge (double-click setup.cmd, or run)">
-              <CodeBlock text={BUILD_CMD} />
-            </SetupStep>
-            <SetupStep n={2} title="Register with Claude">
+            <SetupStep n={1} title="Run CONNECT with the MCP server enabled">
               <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.65)' }}>
-                Easiest — in Unity: <b>Tools ▸ realvirtual ▸ Settings ▸ Configure Claude Desktop MCP</b>.
-                Or add this to your <code>.mcp.json</code>:
+                Tray icon ▸ <b>MCP server ▸ Enabled</b> (takes effect after a CONNECT restart).
               </Typography>
-              <CodeBlock text={MCP_JSON_SNIPPET} />
+            </SetupStep>
+            <SetupStep n={2} title="Register CONNECT with Claude Code">
+              <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.65)' }}>
+                Add this to your <code>.mcp.json</code>. Claude Desktop (classic) has no native
+                HTTP client — start it through <code>npx -y mcp-remote http://localhost:5100/mcp
+                --allow-http</code> instead.
+              </Typography>
+              <CodeBlock text={CONNECT_MCP_SNIPPET} />
             </SetupStep>
             <SetupStep n={3} title="Restart Claude, then turn the AI Bridge on (toggle above)">
               <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.65)' }}>
-                Restart Claude Desktop / Claude Code so it launches the bridge.
+                Leave the port at <code>5100</code> — that is CONNECT. Running against the Vite dev
+                server works too: open it with <code>?mcpPort=5100</code>, or just leave the
+                default.
               </Typography>
+            </SetupStep>
+            <SetupStep n={4} title="Fallback only — the local Node bridge">
+              <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.65)' }}>
+                Use this if CONNECT is unavailable. Build it once, register it, then set the port
+                above to <code>18714</code> (Claude Desktop) or <code>18715</code> (Claude Code).
+              </Typography>
+              <CodeBlock text={BUILD_CMD} />
+              <CodeBlock text={NODE_FALLBACK_SNIPPET} />
             </SetupStep>
           </Box>
         </SettingsSection>

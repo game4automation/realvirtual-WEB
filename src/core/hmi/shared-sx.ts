@@ -10,6 +10,14 @@
 
 import type { SxProps, Theme } from '@mui/material';
 
+/**
+ * Shared corner radius for all small inline chips (type badges, filter chips,
+ * signal badges). Deliberately squared — MUI's default fully-rounded pill reads
+ * as a consumer tag; the crisp 2px corner matches the instrument aesthetic and
+ * keeps every chip in the HMI visually one family.
+ */
+export const CHIP_RADIUS = '2px';
+
 // ─── Shared scrollbar CSS class ─────────────────────────────────────────
 
 /**
@@ -80,18 +88,19 @@ export function compactToggleGroupSx(
  * Used in hierarchy browser type filters, signal sort chips, etc.
  *
  * @param isActive  Whether the chip is currently selected.
- * @param height    Chip height in px (default 18).
- * @param fontSize  Font size in px (default 9).
+ * @param height    Chip height in px (default 20).
+ * @param fontSize  Font size in px (default 11).
  */
 export function filterChipSx(
   isActive: boolean,
-  height = 18,
-  fontSize = 9,
+  height = 20,
+  fontSize = 11,
 ): SxProps<Theme> {
   return {
     height,
     fontSize,
     fontWeight: isActive ? 700 : 400,
+    borderRadius: CHIP_RADIUS,
     bgcolor: isActive ? 'rgba(79, 195, 247, 0.2)' : 'transparent',
     color: isActive ? 'primary.main' : 'text.secondary',
     border: `1px solid ${isActive ? 'rgba(79, 195, 247, 0.4)' : 'rgba(255, 255, 255, 0.1)'}`,

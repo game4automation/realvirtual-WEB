@@ -20,11 +20,13 @@ import {
 import { AABB } from './rv-aabb';
 import type { RVMovingUnit, InstancedMovingUnit, IMUAccessor } from './rv-mu';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponent } from './rv-component-registry';
+import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import { NodeRegistry } from './rv-node-registry';
 import { unityPositionToGltf } from './rv-coordinate-utils';
-import { instanceScope, scopeSignalName } from './rv-instance-scope';
 import { debug } from './rv-debug';
+import { MM_TO_METERS } from './rv-constants';
+import { RVTransportSurface } from './rv-transport-surface';
+import { createSignalWriter } from './rv-signal-store';
 
 // Shared materials (reused across all sensors to save GPU resources)
 const YELLOW = 0xffcc00;
@@ -53,8 +55,6 @@ const wireRed = new LineBasicMaterial({ color: RED, transparent: true, opacity: 
 // ─── Ray-AABB intersection (slab method) ─────────────────────────────
 
 /** Reusable temporaries to avoid per-frame allocation */
-const _origin = new Vector3();
-const _dir = new Vector3();
 const _forward = new Vector3(0, 0, 1);
 const _quat = new Quaternion();
 
@@ -202,16 +202,8 @@ export function computeBeamFromBounds(node: Object3D, boundsSource?: Object3D | 
  * - Raycast: line from origin to ray end/hit (yellow = idle, red = occupied)
  */
 export class RVSensor implements RVComponent {
-  static readonly schema: ComponentSchema = {
-    UseRaycast: { type: 'boolean', default: false },
-    RayCastDirection: { type: 'vector3', unityCoords: true },
-    RayCastLength: { type: 'number', default: 1000 },
-    SensorOccupied: { type: 'componentRef' },
-    SensorNotOccupied: { type: 'componentRef' },
-    // Set by the naming-convention scan for bare Sensor/Sensor-* nodes: derive a
-    // raycast beam along the longest bounding-box edge (centre face → centre face).
-    AutoRay: { type: 'boolean', default: false },
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('Sensor');
 
   readonly node: Object3D;
   readonly aabb: AABB;
@@ -242,13 +234,32 @@ export class RVSensor implements RVComponent {
   /** InvertSignal — not in C# Sensor.cs, but needed for internal logic */
   invertSignal = false;
 
+  /** Physics mode (plan-276 Phase 5, F6): when true AND the sensor overlaps a
+   *  physics zone (overlap suffices — sensors are thin and may sit on the zone
+   *  edge) AND the physics provider is ready, the sensor is physics-managed:
+   *  collision mode becomes a Rapier sensor collider (enter/leave events),
+   *  raycast mode a per-tick `provider.castRay()`. A physics-managed sensor is
+   *  SKIPPED by the kinematic detection loop; the physics plugin drives
+   *  `occupied` through `applyPhysicsResult()` so `onChanged` keeps firing
+   *  (SensorMonitorPlugin/recorder compatibility). NOTE: a physics-managed
+   *  sensor only sees physics-owned MUs (provider bodies) — sensors that must
+   *  detect kinematic MUs stay on the default AABB path (PhysicsMode false).
+   *  The zone-overlap check runs in the physics plugin's world build. */
+  PhysicsMode = false;
+
   /** Current occupied state */
   occupied = false;
   /** The MU currently occupying this sensor (first one found) */
   occupiedMU: (RVMovingUnit | InstancedMovingUnit) | null = null;
 
+  /** Planner Signal Linking: when live-controlled, the AABB/raycast detection is
+   *  skipped and `occupied` is driven by the CONNECT relay (overrideOccupied
+   *  path). The onChanged writeback is also gated so the live value is not
+   *  overwritten. Set by SignalBindingManager. */
+  liveControlled = false;
   /** Callback for state change (for UI/visualization updates) */
   onChanged?: (occupied: boolean, sensor: RVSensor) => void;
+  private readonly feedbackListeners: (() => void)[] = [];
 
   /** Visual mesh for sensor zone — Collision mode (child of sensor node) */
   private visMesh: Mesh | null = null;
@@ -273,11 +284,33 @@ export class RVSensor implements RVComponent {
     this.aabb = aabb;
   }
 
+  addFeedbackListener(cb: () => void): void {
+    if (!this.feedbackListeners.includes(cb)) this.feedbackListeners.push(cb);
+  }
+
+  removeFeedbackListener(cb: () => void): void {
+    const index = this.feedbackListeners.indexOf(cb);
+    if (index >= 0) this.feedbackListeners.splice(index, 1);
+  }
+
+  readFeedbackSlot(slot: string): boolean | number {
+    if (slot === 'SensorOccupied') return this.occupied;
+    if (slot === 'SensorNotOccupied') return !this.occupied;
+    throw new Error(`[Sensor] Unknown feedback slot "${slot}"`);
+  }
+
   /**
    * Wire sensor into SignalStore and create visualization.
    * Called after applySchema + resolveComponentRefs.
    */
   init(context: ComponentContext): void {
+    const path = NodeRegistry.computeNodePath(this.node);
+    const writer = createSignalWriter(
+      context.signalStore,
+      `component:Sensor:${path}`,
+      'component',
+      { slotContext: path },
+    );
     // Read raw extras from node for legacy Mode conversion and BoxCollider data
     const rv = this.node.userData?.realvirtual as Record<string, unknown> | undefined;
     if (rv) {
@@ -296,27 +329,21 @@ export class RVSensor implements RVComponent {
 
     const sensorPath = NodeRegistry.computeNodePath(this.node);
     this._nodePath = sensorPath;
-    // Per-instance scope: a sensor inside a placed LayoutObject registers under
-    // `<RootName>/<NodeName>` so copies of the same asset don't share one signal.
-    // Standalone (no LayoutObject ancestor) → bare node name. Mirrors the bind
-    // context's scoping so behaviors and the sensor agree on the name.
-    const sensorName = scopeSignalName(instanceScope(this.node), this.node.name);
-
-    // Register sensor signal in SignalStore
-    context.signalStore.register(sensorName, sensorPath, false);
-
     // Resolve SensorOccupied/SensorNotOccupied signal addresses
     const sensorOccupiedAddr = typeof this.SensorOccupied === 'string' ? this.SensorOccupied : null;
     const sensorNotOccupiedAddr = typeof this.SensorNotOccupied === 'string' ? this.SensorNotOccupied : null;
 
     this.onChanged = (occupied) => {
-      context.signalStore.set(sensorName, occupied);
+      // Live override (Planner Signal Linking): when a CONNECT source drives this
+      // sensor's occupied signal, the relay owns the value — do NOT write the
+      // AABB-derived value back over it (two-stage guard: AABB skip + this gate).
+      if (this.liveControlled) return;
       // Mirror C# Sensor.cs: write to connected PLC signals
       if (sensorOccupiedAddr) {
-        context.signalStore.setByPath(sensorOccupiedAddr, occupied);
+        writer.setByPath(sensorOccupiedAddr, occupied);
       }
       if (sensorNotOccupiedAddr) {
-        context.signalStore.setByPath(sensorNotOccupiedAddr, !occupied);
+        writer.setByPath(sensorNotOccupiedAddr, !occupied);
       }
     };
 
@@ -370,6 +397,7 @@ export class RVSensor implements RVComponent {
       this._layoutUnsub();
       this._layoutUnsub = null;
     }
+    this.feedbackListeners.length = 0;
   }
 
   // ─── Collision-mode visualization (box) ────────────────────────────
@@ -421,7 +449,7 @@ export class RVSensor implements RVComponent {
   createRayVisualization(): void {
     if (!this.UseRaycast) return;
 
-    const maxDist = this.RayCastLength / 1000;
+    const maxDist = this.RayCastLength / MM_TO_METERS;
     const radius = 0.002; // 2mm radius — visible but not obtrusive
     const indexedGeo = new CylinderGeometry(radius, radius, maxDist, 6, 1);
     // CylinderGeometry is along Y by default; we orient it along the
@@ -457,17 +485,54 @@ export class RVSensor implements RVComponent {
     this.node.add(this.rayTube);
   }
 
-  /** Compute world-space ray origin and direction. */
+  /**
+   * Fill `out.min`/`out.max` with a world AABB enclosing the FULL raycast
+   * beam segment (origin → origin + dir·maxDist). The transport manager uses
+   * this as the broad-phase (spatial grid) query bounds in UseRaycast mode —
+   * the sensor's own AABB does NOT cover the beam, which extends
+   * `RayCastLength` beyond the node. Conservative by construction: every MU
+   * AABB the ray can hit within `maxDist` overlaps these bounds. Only
+   * min/max are written (all a grid query reads); the exact ray-vs-AABB test
+   * stays in `checkRaycast`.
+   */
+  computeRayQueryBounds(out: AABB): void {
+    // Fresh compute + tick stamp: `checkRaycast` in the SAME transport tick
+    // (the manager calls bounds → grid query → checkOverlap) reuses the ray
+    // instead of re-running updateWorldMatrix + the direction transform.
+    const { origin, dir, maxDist } = this.computeRayFresh();
+    this._rayTickId = RVTransportSurface.currentTickId;
+    const ex = origin.x + dir.x * maxDist;
+    const ey = origin.y + dir.y * maxDist;
+    const ez = origin.z + dir.z * maxDist;
+    out.min.set(Math.min(origin.x, ex), Math.min(origin.y, ey), Math.min(origin.z, ez));
+    out.max.set(Math.max(origin.x, ex), Math.max(origin.y, ey), Math.max(origin.z, ez));
+  }
+
+  /** Tick id of the last `computeRayQueryBounds` — gates the per-tick ray reuse. */
+  private _rayTickId = -1;
+  private readonly _rayOrigin = new Vector3();
+  private readonly _rayDir = new Vector3();
+  private _rayMaxDist = 0;
+
+  /** World-space ray, reusing this tick's `computeRayQueryBounds` result when available. */
   private computeRay(): { origin: Vector3; dir: Vector3; maxDist: number } {
+    if (this._rayTickId === RVTransportSurface.currentTickId) {
+      return { origin: this._rayOrigin, dir: this._rayDir, maxDist: this._rayMaxDist };
+    }
+    return this.computeRayFresh();
+  }
+
+  /** Compute world-space ray origin and direction (always fresh). */
+  private computeRayFresh(): { origin: Vector3; dir: Vector3; maxDist: number } {
     const d = this.RayCastDirection;
-    const maxDist = this.RayCastLength / 1000; // mm → meters
+    this._rayMaxDist = this.RayCastLength / MM_TO_METERS;
 
     this.node.updateWorldMatrix(true, false);
     // Ray start = local origin offset transformed to world (offset (0,0,0) → node origin).
-    _origin.copy(this.rayOriginOffset).applyMatrix4(this.node.matrixWorld);
-    _dir.set(d.x, d.y, d.z).transformDirection(this.node.matrixWorld).normalize();
+    this._rayOrigin.copy(this.rayOriginOffset).applyMatrix4(this.node.matrixWorld);
+    this._rayDir.set(d.x, d.y, d.z).transformDirection(this.node.matrixWorld).normalize();
 
-    return { origin: _origin, dir: _dir, maxDist };
+    return { origin: this._rayOrigin, dir: this._rayDir, maxDist: this._rayMaxDist };
   }
 
   /** Derive the raycast beam from the bounding box (longest edge, face → face).
@@ -510,6 +575,9 @@ export class RVSensor implements RVComponent {
    * Dispatches to collision (AABB) or raycast check based on mode.
    */
   checkOverlap(mus: (RVMovingUnit | InstancedMovingUnit)[]): void {
+    // Live override: a CONNECT-driven sensor ignores local AABB/raycast detection
+    // entirely — `occupied` is set from the relayed signal value (overrideOccupied).
+    if (this.liveControlled) return;
     if (this.UseRaycast) {
       this.checkRaycast(mus);
     } else {
@@ -568,10 +636,44 @@ export class RVSensor implements RVComponent {
       debug('sensor', `Sensor "${this.node.name}" → ${newOccupied ? 'OCCUPIED' : 'CLEARED'}${foundMU ? ` by "${foundMU.getName()}"` : ''}`);
       this.updateVisualization();
       this.onChanged?.(this.occupied, this);
+      for (let i = 0; i < this.feedbackListeners.length; i++) this.feedbackListeners[i]();
     } else if (this.UseRaycast) {
       // Still update ray line even if state didn't change (MU might be moving)
       // updateRayTube is called from checkRaycast already
     }
+  }
+
+  // ─── Physics-managed detection (plan-276 Phase 5, F6) ───────────────
+
+  /**
+   * Apply an EXTERNALLY computed detection result (physics provider path).
+   * Runs the exact same state/callback pipeline as the internal AABB/raycast
+   * checks — invertSignal, occupiedMU, visualization and, on a state change,
+   * `onChanged` (SensorMonitorPlugin + rv-sensor-recorder hang off it, F6).
+   * Live-controlled sensors ignore it (the CONNECT relay owns the value),
+   * mirroring the `checkOverlap` gate.
+   */
+  applyPhysicsResult(foundMU: (RVMovingUnit | InstancedMovingUnit) | null): void {
+    if (this.liveControlled) return;
+    this.applyResult(foundMU);
+    if (this.UseRaycast) this.updateRayTube();
+  }
+
+  /**
+   * Copy this tick's WORLD-space ray into `outOrigin`/`outDir` (unit) and
+   * return the max distance in meters — the physics plugin feeds this into
+   * `provider.castRay()` for raycast sensors in physics mode. Reuses the
+   * per-tick cached ray (same tick id as `computeRayQueryBounds`), so the
+   * matrix work runs at most once per tick per sensor.
+   */
+  getWorldRay(outOrigin: Vector3, outDir: Vector3): number {
+    if (this._rayTickId !== RVTransportSurface.currentTickId) {
+      this.computeRayFresh();
+      this._rayTickId = RVTransportSurface.currentTickId;
+    }
+    outOrigin.copy(this._rayOrigin);
+    outDir.copy(this._rayDir);
+    return this._rayMaxDist;
   }
 
   /** Update AABB world position */
@@ -586,12 +688,12 @@ registerComponent({
   schema: RVSensor.schema,
   needsAABB: true,
   capabilities: {
+    authorable: true,   // addable in the asset editor (schema-complete)
     hoverable: true,
     selectable: true,
     tooltipType: 'sensor',
     badgeColor: '#66bb6a',
     filterLabel: 'Sensors',
-    simulationActive: true,
     hoverEnabledByDefault: true,
     exclusiveHoverGroup: true,
   },

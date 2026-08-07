@@ -6,12 +6,14 @@ import { debug } from './rv-debug';
 import { MM_TO_METERS } from './rv-constants';
 import type { MeshStandardMaterial, Texture } from 'three';
 import { AABB } from './rv-aabb';
+import type { PhysicsAABB } from './rv-physics-registry';
 import type { RVDrive } from './rv-drive';
 import type { RVMovingUnit, InstancedMovingUnit } from './rv-mu';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponent } from './rv-component-registry';
+import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import { traverseMeshes } from './rv-traverse-utils';
 import type { GizmoOverlayManager } from './rv-gizmo-manager';
+import { subscribeOverlayVisibility, isOverlayVisible } from '../overlay-visibility-store';
 
 // Pre-allocated temp vectors (no GC in hot path)
 const _movement = new Vector3();
@@ -34,6 +36,44 @@ const _crossAxis = new Vector3();
 const CENTER_MU_LERP = 0.1;
 // Scratch for snapToCenterLine()'s world-direction read.
 const _centerLineDir = new Vector3();
+
+// ── Accumulation (plan-255): gap-clamp scratch — pre-allocated, no GC in the
+// per-MU transport hot path (single-threaded reuse is safe).
+/** SIGNED world move direction (`direction * sign(speed)`) — reversal-safe. */
+const _accumDir = new Vector3();
+/** Reused candidate buffer for `IAccumulationQuery.queryLeadingMU`. */
+const _accumCandidates: (RVMovingUnit | InstancedMovingUnit)[] = [];
+/** Contact epsilon (~0.1 mm) subtracted in the clamp so `allowed` stays a
+ *  stable 0 at exact contact instead of jittering around the float boundary. */
+const ACCUM_CONTACT_EPS = 1e-4;
+
+/**
+ * IAccumulationQuery — narrow injection seam for the MU-accumulation gap clamp
+ * (plan-255). Implemented by `RVTransportManager`, which injects itself into
+ * every registered surface's `accumulationProvider`. Defined HERE (not in the
+ * manager module) so the surface never imports the manager — the manager
+ * already imports the surface, and a reverse import would be a cycle.
+ *
+ * Without a provider (`accumulationProvider === null`) `transportMU()` behaves
+ * exactly as before the feature existed — standalone call sites (unit tests,
+ * tools) need no manager and no changes.
+ */
+export interface IAccumulationQuery {
+  /**
+   * Collect candidate MUs ahead of `mu` along `moveDir` (world, unit, SIGNED
+   * move direction) within `lookahead` metres beyond the MU's AABB, into the
+   * caller-owned `out` scratch array (reused, never reallocated). Self,
+   * `markedForRemoval` and gripped MUs are already filtered out; all geometric
+   * filtering (in-front projection, lateral lane overlap, gap) is the caller's.
+   * Returns the candidate count.
+   */
+  queryLeadingMU(
+    mu: RVMovingUnit | InstancedMovingUnit,
+    moveDir: Vector3,
+    lookahead: number,
+    out: (RVMovingUnit | InstancedMovingUnit)[],
+  ): number;
+}
 
 /** Identity-matrix element pattern (column-major), used by `matrixIsIdentity`. */
 const _identityElements = new Matrix4().elements;
@@ -62,14 +102,8 @@ const _dropPlaneMaterial = new MeshBasicMaterial({ side: DoubleSide });
  * Speed comes from the associated RVDrive's currentSpeed.
  */
 export class RVTransportSurface implements RVComponent {
-  static readonly schema: ComponentSchema = {
-    TransportDirection: { type: 'vector3', unityCoords: true },
-    Radial: { type: 'boolean', default: false },
-    TextureScale: { type: 'number', default: 1 },
-    HeightOffsetOverride: { type: 'number', default: 0 },
-    AnimateSurface: { type: 'boolean', default: true },
-    DriveReference: { type: 'componentRef' },
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('TransportSurface');
 
   readonly node: Object3D;
   readonly aabb: AABB;
@@ -82,6 +116,60 @@ export class RVTransportSurface implements RVComponent {
   HeightOffsetOverride = 0;
   AnimateSurface = true;
   DriveReference: RVDrive | null = null;
+  /** Accumulation (plan-255): when true, MUs on this surface clamp their advance
+   *  against the next MU in move direction (no penetration, jam builds up and
+   *  releases). Ignored on `Radial` surfaces (v1 exclusion — the radial path
+   *  returns before the clamp hook). */
+  Accumulate = true;
+  /** Minimum front gap in millimetres kept between accumulated MUs. */
+  MinGap = 0;
+
+  /** Physics mode (plan-276 Phase 4, F5): when true AND the surface lies FULLY
+   *  inside a physics zone, the surface is physics-managed — the provider runs
+   *  it as a kinematic conveyor body and MUs on it become dynamic bodies the
+   *  moment they enter (friction take-along; jam/stacking simulated physically).
+   *  Ignored on `Radial` surfaces (documented v1 exclusion, like `Accumulate`)
+   *  and when the deployment kill-switch `physicsDefault` is off. The actual
+   *  zone-containment check runs in the physics plugin's world build. */
+  PhysicsMode = false;
+
+  /**
+   * Global kill-switch for the accumulation clamp (plan-255 §2.8): lets a
+   * deployment disable the feature without re-exporting scenes or reverting
+   * code (settings.json `simulation.accumulateDefault`, applied at boot in
+   * main.ts). The per-surface `Accumulate` flag is ANDed with this — when the
+   * switch is off, no surface clamps regardless of its authored value.
+   */
+  static accumulateDefault = true;
+
+  /**
+   * Global kill-switch for the surface physics mode (plan-276 Phase 4, F5 —
+   * `accumulateDefault` pattern): settings.json `simulation.physicsSurfaceDefault`,
+   * applied at boot in main.ts. The per-surface `PhysicsMode` flag is ANDed
+   * with this — when the switch is off, every surface stays kinematic
+   * regardless of its authored value. Independent of the zone-level
+   * `simulation.physicsEnabled` gate (which turns off ALL physics).
+   */
+  static physicsDefault = true;
+
+  /**
+   * Effective surface physics gate (plan-276 §2.3):
+   * `PhysicsMode && RVTransportSurface.physicsDefault && zone.containsAABB(surface)`.
+   * FULL containment, never overlap — belts are never cut by a zone boundary
+   * (§2.4). Called by the physics plugin during the world build with each
+   * active zone; `Radial` surfaces are excluded there (v1) with a warning.
+   */
+  isPhysicsManaged(zone: { containsAABB(aabb: PhysicsAABB): boolean }): boolean {
+    return this.PhysicsMode && RVTransportSurface.physicsDefault && zone.containsAABB(this.aabb);
+  }
+
+  /**
+   * Injected by `RVTransportManager` when the surface is registered (see the
+   * per-tick surface loop in `update()`). Null for standalone `transportMU()`
+   * call sites (unit tests) — then the gap clamp is skipped entirely and the
+   * legacy behavior is preserved.
+   */
+  accumulationProvider: IAccumulationQuery | null = null;
 
   /** Raw Unity local transport direction for UV animation (before coordinate conversion) */
   rawLocalDir: { x: number; y: number; z: number } = { x: 1, y: 0, z: 0 };
@@ -165,6 +253,11 @@ export class RVTransportSurface implements RVComponent {
   private _selGizmoMgr: GizmoOverlayManager | null = null;
   /** Unsubscribe handle for the direct 'selection-changed' subscription. */
   private _selUnsub: (() => void) | null = null;
+  /** Whether this surface is currently implied by the selection (plan-250: so
+   *  the overlay-visibility toggle can re-show/hide the gizmo without a reselect). */
+  private _selSelected = false;
+  /** Unsubscribe from the overlay-visibility store (plan-250). */
+  private _selCatUnsub: (() => void) | null = null;
   /** Captured registry — maps selection paths back to nodes and lets the gizmo
    *  detect nested transport-surface nodes (to prune them from its bounds). */
   private _selRegistry: {
@@ -185,13 +278,26 @@ export class RVTransportSurface implements RVComponent {
    * Transform transport direction to world space, resolve drive, initialize transport.
    * Called after applySchema + resolveComponentRefs.
    */
-  init(context: ComponentContext): void {
-    // Capture the LOCAL transport axis as the source of truth — never mutated
-    // again. The world direction is derived per tick from this × the node's
-    // CURRENT world quaternion, so MUs keep moving along the belt even when
-    // a parent drive (e.g. a turntable's Drive-Rot-Y) rotates the platform.
+  /** Capture the LOCAL transport axis from the (Unity→Three converted)
+   *  `TransportDirection` config. Source of truth for per-tick world-direction
+   *  derivation; safe to re-run after a live edit. */
+  private _deriveLocalDirection(): void {
     this.localDirection.copy(this.TransportDirection).normalize();
     if (this.localDirection.lengthSq() === 0) this.localDirection.set(1, 0, 0);
+  }
+
+  /** Re-derive runtime state after an inspector edit re-applied the schema.
+   *  IMPLEMENTS RVComponent::reapplyConfig */
+  reapplyConfig(): void {
+    this._deriveLocalDirection();
+    this._refreshWorldDirection();
+  }
+
+  init(context: ComponentContext): void {
+    // Capture the LOCAL transport axis as the source of truth — derived per
+    // tick from this × the node's CURRENT world quaternion, so MUs keep moving
+    // along the belt even when a parent drive rotates the platform.
+    this._deriveLocalDirection();
 
     // Seed `this.direction` (world) immediately so consumers that don't go
     // through `transportMU` (gizmo, debug logs) see a sensible value at init.
@@ -236,26 +342,6 @@ export class RVTransportSurface implements RVComponent {
       this.drive.isTransportSurface = true;
     }
 
-    // Belt drives (conveyor + turntable platform) default to 1000 mm/s (1 m/s).
-    // We only bump when the drive's `TargetSpeed` is still at the generic Drive
-    // default (100 mm/s in `RVDrive` schema), so a GLB that authored a different
-    // value (e.g. 150 or 50) is respected. `applySchema` runs before `init`, so
-    // this check fires after any explicit value has already been written by the
-    // loader.
-    const BELT_DEFAULT_SPEED = 1000;
-    const DRIVE_SCHEMA_DEFAULT = 100;
-    if (this.drive && this.drive.TargetSpeed === DRIVE_SCHEMA_DEFAULT) {
-      this.drive.TargetSpeed = BELT_DEFAULT_SPEED;
-      this.drive.targetSpeed = BELT_DEFAULT_SPEED;
-    }
-
-    // Auto-start: if the drive has a target speed but isn't jogging (Forward signal was false/missing),
-    // default to running. In Unity the PLC/LogicStep sets Forward=true during play, but in the
-    // WebViewer we want conveyor belts to run out of the box.
-    if (this.drive && this.drive.targetSpeed > 0 && !this.drive.jogForward && !this.drive.jogBackward) {
-      this.drive.jogForward = true;
-    }
-
     // Stash a reference to the GizmoOverlayManager + node registry so the
     // selection-gizmo logic can build the visualisation without holding
     // the full context.
@@ -271,15 +357,21 @@ export class RVTransportSurface implements RVComponent {
     // the Drive grabs the slot and our `onSelect` would never fire. The
     // direct subscription side-steps that limitation.
     if (context.events) {
-      const lastState = { selected: false };
       this._selUnsub = context.events.on('selection-changed', (snap) => {
         const nowSelected = this._isSurfaceImpliedBySelection(snap.selectedPaths ?? []);
-        if (nowSelected === lastState.selected) return;
-        lastState.selected = nowSelected;
+        if (nowSelected === this._selSelected) return;
+        this._selSelected = nowSelected;
         if (nowSelected) this._showSelectionGizmo();
         else this._hideSelectionGizmo();
       });
     }
+    // Overlay-visibility gate (plan-250): the selection gizmo belongs to the
+    // 'highlights' category. Re-show/hide it when the user toggles the category.
+    this._selCatUnsub = subscribeOverlayVisibility(() => {
+      if (!this._selSelected) return;
+      if (isOverlayVisible('highlights')) this._showSelectionGizmo();
+      else this._hideSelectionGizmo();
+    });
 
     // Register in transport manager
     context.transportManager.surfaces.push(this);
@@ -349,11 +441,13 @@ export class RVTransportSurface implements RVComponent {
   dispose(): void {
     this._hideSelectionGizmo();
     if (this._selUnsub) { this._selUnsub(); this._selUnsub = null; }
+    if (this._selCatUnsub) { this._selCatUnsub(); this._selCatUnsub = null; }
   }
 
   private _showSelectionGizmo(): void {
     this._hideSelectionGizmo();
     if (!this._selGizmoMgr) return;
+    if (!isOverlayVisible('highlights')) return; // 'highlights' category off (plan-250)
 
     // Blue edge outline around the TOP face of the surface's bounding box.
     // Built in the node's LOCAL frame and parented to `this.node`, so it
@@ -546,7 +640,7 @@ export class RVTransportSurface implements RVComponent {
    *  order-independent (correct whether computed before or after those passes). */
   private _isBakedHelper(node: Object3D): boolean {
     const ud = node.userData;
-    return !!(ud && (ud._rvRaycastBVH || ud._rvKinGroupMerged || ud._rvStaticUberMerged));
+    return !!(ud && (ud._rvRaycastBVH || ud._rvBatchedRender));
   }
 
   /** Accumulate the local-frame AABB of all mesh descendants, PRUNING any
@@ -747,7 +841,73 @@ export class RVTransportSurface implements RVComponent {
     // Speed is in mm/s, Three.js positions are in meters -> divide by MM_TO_METERS
     const speedM = this.speed / MM_TO_METERS;
     if (speedM !== 0 && dt !== 0) {
-      _movement.copy(this.direction).multiplyScalar(speedM * dt);
+      // Signed decomposition: `sgn * moveDist` ≡ `speedM * dt`. The accumulation
+      // clamp below shortens `moveDist` (never flips it), so a clamped MU stops
+      // instead of tunneling — and the SIGNED direction makes a reversed belt
+      // (negative speed) clamp against the MU BEHIND it (F5a, reversal-safe).
+      const sgn = Math.sign(speedM);
+      let moveDist = Math.abs(speedM) * dt;
+
+      // ── Accumulation gap clamp (plan-255) ─────────────────────────────
+      // Clamp the advance to the free distance up to the next MU ahead in the
+      // actual move direction. Position-only (immune to forced drive signals),
+      // computed from candidate AABBs (never `candidate.getPosition()` — the
+      // InstancedMovingUnit pool shares ONE temp vector across all instances).
+      // The query reads last tick's grid/AABB state (manager step 4 runs after
+      // transport) — conservatively safe: the leader only ever moves AWAY.
+      // Radial surfaces never reach this hook (transportMURadial returned above).
+      if (
+        this.Accumulate &&
+        RVTransportSurface.accumulateDefault &&
+        this.accumulationProvider !== null
+      ) {
+        _accumDir.copy(this.direction).multiplyScalar(sgn);
+        const minGapM = this.MinGap / MM_TO_METERS;
+        const muA = mu.aabb;
+        // Projected AABB half-extent of the moving MU along the move direction
+        // (|dir.x|·halfX + |dir.z|·halfZ) — valid for arbitrarily rotated belts.
+        const muHalfAlong =
+          Math.abs(_accumDir.x) * muA.halfSize.x + Math.abs(_accumDir.z) * muA.halfSize.z;
+        // Lateral half-extent perpendicular to the move direction (XZ plane).
+        const muHalfLat =
+          Math.abs(_accumDir.z) * muA.halfSize.x + Math.abs(_accumDir.x) * muA.halfSize.z;
+        // Query window: this tick's travel + own half-extent + gap (covers
+        // tunneling — a leader within reach this substep is always found).
+        const lookahead = moveDist + muHalfAlong + minGapM;
+        const n = this.accumulationProvider.queryLeadingMU(mu, _accumDir, lookahead, _accumCandidates);
+
+        let minFrontGap = Infinity;
+        for (let i = 0; i < n; i++) {
+          const ca = _accumCandidates[i].aabb;
+          const dx = ca.center.x - muA.center.x;
+          const dz = ca.center.z - muA.center.z;
+          // 1D projection along the SIGNED move direction — only MUs in front.
+          const proj = dx * _accumDir.x + dz * _accumDir.z;
+          if (proj <= 0) continue;
+          // Lateral lane test QUER to the move direction (of the MOVING MU):
+          // no cross-track AABB overlap → parallel lane, never blocks.
+          const lat = dx * -_accumDir.z + dz * _accumDir.x;
+          const caHalfLat =
+            Math.abs(_accumDir.z) * ca.halfSize.x + Math.abs(_accumDir.x) * ca.halfSize.z;
+          if (Math.abs(lat) >= muHalfLat + caHalfLat) continue;
+          const caHalfAlong =
+            Math.abs(_accumDir.x) * ca.halfSize.x + Math.abs(_accumDir.z) * ca.halfSize.z;
+          const frontGap = proj - muHalfAlong - caHalfAlong;
+          // Pre-existing overlap (spawn/legacy scene): IGNORE the candidate —
+          // only NEW penetration is prevented; the pair frees itself by driving
+          // apart (F5b, no permanent deadlock, no push-back).
+          if (frontGap < 0) continue;
+          if (frontGap < minFrontGap) minFrontGap = frontGap;
+        }
+
+        if (minFrontGap !== Infinity) {
+          const allowed = Math.max(0, minFrontGap - minGapM - ACCUM_CONTACT_EPS);
+          mu.blocked = allowed < moveDist;
+          if (mu.blocked) moveDist = allowed;
+        }
+      }
+
+      _movement.copy(this.direction).multiplyScalar(sgn * moveDist);
       // Use the explicit get-mutate-set round-trip (matching the carry path above):
       // `getPosition()` returns the live `node.position` reference for clone MUs but
       // a shared TEMP Vector3 for instanced MUs — mutating that temp in place would
@@ -998,9 +1158,9 @@ registerComponent({
   schema: RVTransportSurface.schema,
   needsAABB: true,
   capabilities: {
+    authorable: true,   // addable in the asset editor (schema-complete)
     badgeColor: '#ffa726',
     filterLabel: 'Conveyors',
-    simulationActive: true,
   },
   create: (node, aabb) => new RVTransportSurface(node, aabb!),
   beforeSchema: (inst, extras) => {

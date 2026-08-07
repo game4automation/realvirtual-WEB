@@ -23,6 +23,7 @@
 
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { useSignalTick } from '../../hooks/use-signal-tick';
+import { useChangeGatedTick } from '../../hooks/use-change-gated-tick';
 import { useEditorPlugin } from '../../hooks/use-editor-plugin';
 import { MathUtils } from 'three';
 import type { Object3D } from 'three';
@@ -54,7 +55,7 @@ import { getOverriddenFields } from '../engine/rv-extras-overlay-store';
 import { USER_PAUSE_REASON } from '../engine/rv-constants';
 import { LeftPanel } from './LeftPanel';
 import { AasDetailHeaderAction } from '../../plugins/aas-link-plugin';
-import { ChartPanel } from './ChartPanel';
+import { FloatingPanel } from './FloatingPanel';
 import { INSPECTOR_MIN_WIDTH, INSPECTOR_MAX_WIDTH, ACTIVITY_BAR_WIDTH } from './layout-constants';
 import {
   isHiddenComponentType,
@@ -62,11 +63,15 @@ import {
   extractComponentTypes,
   type ReverseReference,
 } from './rv-inspector-helpers';
-import { getPrimaryDisplayValue, applyLiveEdit } from './rv-value-resolver';
+import { getPrimaryDisplayValue, applyLiveEdit, getLiveStateFor } from './rv-value-resolver';
 import { navigateToRef } from './rv-reference-display';
 import { ComponentSection, runtimeRow } from './rv-component-section';
-import { buildBehaviorVirtualComponent, type BehaviorViewerSnapshot } from './inspector-behavior-section';
+import { AddComponentSection } from './rv-add-component-section';
+import { buildBehaviorVirtualComponent, behaviorDisplayName, collectBehaviorData, type BehaviorViewerSnapshot } from './inspector-behavior-section';
+import { BehaviorSignalSlots } from '../../plugins/signal-bind/InlineSignalSlots';
+import { ConnectionsSection } from './rv-connections-section';
 import { findLayoutRoot } from './layout-root-utils';
+import { findPickOwner } from '../engine/rv-pick-owner';
 import { getCapabilities } from '../engine/rv-component-registry';
 import { Vector3Editor } from './rv-field-editors';
 import { InspectorRow } from './rv-inspector-row';
@@ -83,8 +88,13 @@ const LS_KEY_CONSUMED_ONLY = 'rv-inspector-consumed-only';
 const LS_KEY_DETACHED = 'rv-inspector-detached';
 
 function loadConsumedOnly(): boolean {
-  try { return localStorage.getItem(LS_KEY_CONSUMED_ONLY) === 'true'; }
-  catch { return false; }
+  // Default ON: hide non-consumed ("N more fields") diagnostic fields until the
+  // user opts into the full dump via the toggle. A stored preference wins.
+  try {
+    const v = localStorage.getItem(LS_KEY_CONSUMED_ONLY);
+    return v === null ? true : v === 'true';
+  }
+  catch { return true; }
 }
 
 function loadDetached(): boolean {
@@ -207,6 +217,9 @@ function LogicStepRuntimeSection({ info }: { info: StepStateInfo }) {
       {/* Runtime fields */}
       <Box sx={{ py: 0.5 }}>
         <RuntimeFieldRow label="State" value={info.state} color={stateColor} />
+        {info.reason === 'suppressed-live' && (
+          <RuntimeFieldRow label="Control" value="Live-controlled" color="#ffb74d" />
+        )}
         <RuntimeFieldRow label="Type" value={info.type} />
 
         {/* Progress bar */}
@@ -271,6 +284,79 @@ function LogicStepRuntimeSection({ info }: { info: StepStateInfo }) {
 
 // ── Layout Transform Section ─────────────────────────────────────────────
 
+/** Below this a transform change cannot alter any rendered figure (the section
+ *  prints 4 decimals for millimetres and 2 for degrees), so it must not cost a
+ *  React commit. Compared component-wise on numbers — never by object identity,
+ *  because three.js mutates `position`/`rotation`/`scale` in place. */
+const TRANSFORM_EPSILON = 1e-6;
+
+/**
+ * Flat numeric fingerprint of everything {@link LayoutTransformSection} renders
+ * from the live node: position (x/y/z), Euler rotation (x/y/z), scale (x/y/z)
+ * and the `visible` flag driving the header's eye icon. Missing node → null.
+ *
+ * Scale is included even though the section has no scale editor today: the
+ * fingerprint is the contract "nothing this node shows has changed", and a
+ * future scale row must not silently freeze. `visible` is included because the
+ * header reads `node.visible` directly and an external hide/show carries no
+ * other notification.
+ */
+function readTransformSignature(node: Object3D | undefined | null): readonly number[] | null {
+  if (!node) return null;
+  return [
+    node.position.x, node.position.y, node.position.z,
+    node.rotation.x, node.rotation.y, node.rotation.z,
+    node.scale.x, node.scale.y, node.scale.z,
+    node.visible ? 1 : 0,
+  ];
+}
+
+/** Component-wise comparison of two transform fingerprints within {@link TRANSFORM_EPSILON}. */
+function transformSignaturesEqual(a: readonly number[] | null, b: readonly number[] | null): boolean {
+  if (a === null || b === null) return a === b;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (Math.abs(a[i] - b[i]) > TRANSFORM_EPSILON) return false;
+  }
+  return true;
+}
+
+/**
+ * Fingerprint of every value the inspector shows that changes WITHOUT touching
+ * the SignalStore (plan-344 Phase 3.1) — the gate for the non-signal live tick.
+ *
+ * Two sources, and deliberately only these two, because they are exactly what
+ * gets rendered:
+ *  1. `getLiveState()` of each live component on the selected node. For a Drive
+ *     that is `CurrentPosition`/`CurrentSpeed`/`IsRunning`/`IsAtTarget`/targets/
+ *     jog flags; for a TransportSurface its `Speed`.
+ *  2. When a behavior LayoutObject root is selected, the collected behavior
+ *     read-out — the scoped `Flow.*` states plus EVERY drive and sensor in the
+ *     subtree (speed + direction / occupied). This is the one surface that shows
+ *     CHILD drives, so it is the one that must include them or their read-out
+ *     would freeze.
+ *
+ * Returned as a string so the comparison is a single `===` with no allocation
+ * bookkeeping on the caller's side.
+ */
+function readLiveSignature(
+  viewer: RVViewer,
+  nodePath: string,
+  liveComponentTypes: readonly string[],
+  behaviorRootNode: Object3D | null,
+): string {
+  const parts: string[] = [];
+  for (const type of liveComponentTypes) {
+    const live = getLiveStateFor(viewer, nodePath, type);
+    parts.push(`${type}=${live ? JSON.stringify(live) : ''}`);
+  }
+  if (behaviorRootNode) {
+    const d = collectBehaviorData(viewer as unknown as BehaviorViewerSnapshot, behaviorRootNode);
+    parts.push(`behavior=${JSON.stringify(d)}`);
+  }
+  return parts.join(';');
+}
+
 interface LayoutTransformSectionProps {
   // Re-declared inline so this section is self-contained; viewer + nodePath
   // are required for transform read/write, the rest are inspector-level
@@ -294,13 +380,17 @@ interface LayoutTransformSectionProps {
 function LayoutTransformSection({ viewer, nodePath, locked, onToggleLock, onToggleVisible, onReverseDirection, canReverse }: LayoutTransformSectionProps) {
   const node = viewer.registry?.getNode(nodePath);
 
-  // Poll position/rotation at 200ms for live updates (e.g. during TransformControls drag)
-  const [tick, setTick] = useState(0);
-  const tickRef = useRef(0);
-  useEffect(() => {
-    const id = setInterval(() => { tickRef.current++; setTick(tickRef.current); }, 200);
-    return () => clearInterval(id);
-  }, []);
+  // Poll position/rotation at 200 ms for live updates (e.g. during a
+  // TransformControls drag) — but ONLY commit when something the section
+  // actually renders has moved (plan-344 Phase 3.1). The previous version bumped
+  // state unconditionally, so a completely static scene still re-rendered this
+  // section 5×/s forever. `nodePath` as resetKey re-baselines on selection change
+  // and clears the old interval.
+  const tick = useChangeGatedTick({
+    read: () => readTransformSignature(viewer.registry?.getNode(nodePath)),
+    equal: transformSignaturesEqual,
+    resetKey: nodePath,
+  });
 
   const pos = useMemo(() => {
     if (!node) return { x: 0, y: 0, z: 0 };
@@ -457,12 +547,9 @@ function LayoutTransformSection({ viewer, nodePath, locked, onToggleLock, onTogg
 
 export interface PropertyInspectorProps {
   viewer: RVViewer;
-  /** Mobile selection sheet: render only the inner scroll content (no LeftPanel
-   *  chrome). The host provides its own header / close / positioning. */
-  embedded?: boolean;
 }
 
-export function PropertyInspector({ viewer, embedded = false }: PropertyInspectorProps) {
+export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   const { plugin, state } = useEditorPlugin();
   const selectedPath = state.selectedNodePath;
 
@@ -493,10 +580,14 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
     const layoutObj = rv.LayoutObject as Record<string, unknown> | undefined;
 
     return { components, layoutObj, uuid: node.uuid };
-    // Note: state.overlay intentionally excluded — overlay changes should not re-scan node components.
-    // Overlay-dependent data (overridden fields) is computed separately below.
+    // Depend on `state` so the component objects are re-collected from userData
+    // after every edit (notify() produces a fresh snapshot). An edit replaces
+    // the touched component object with a new identity (applyFieldToScene), so
+    // re-collecting here propagates that new reference to ComponentSection,
+    // whose field rows are memoised on the `data` reference. Unchanged
+    // components keep their identity, so their child memos stay stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPath, viewer.registry]);
+  }, [selectedPath, viewer.registry, state]);
 
   // Check if the selected node has a LayoutObject (for transform section)
   // Re-read Locked from live userData on any state change (state is always a new ref after notify())
@@ -524,6 +615,19 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
     if (!selectedPath || !viewer.registry) return [];
     return viewer.registry.getReferencesTo(selectedPath);
   }, [selectedPath, viewer.registry]);
+
+  // Owning component node for exact-node picks: when a component-less mesh is
+  // selected (editor picking resolves to the exact node), surface the nearest
+  // ancestor carrying components (e.g. the Drive of an axis sub-mesh) as a
+  // clickable breadcrumb chip. Null when the node is its own owner.
+  const pickOwner = useMemo(() => {
+    if (!selectedPath || !viewer.registry) return null;
+    const node = viewer.registry.getNode(selectedPath);
+    if (!node) return null;
+    const owner = findPickOwner(node, viewer.registry);
+    return owner && owner.node !== node ? owner : null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPath, viewer.registry, state]);
 
   // Behavior States+Hardware gate: the stamped behavior marker is
   // inspectorVisible:false, so it no longer appears in nodeData.components.
@@ -608,7 +712,9 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
         if (node) {
           if (fieldName === 'Visible') {
             node.visible = !!value;
-            viewer.markRenderDirty();
+            // markShadowsDirty (not markRenderDirty): syncs BatchedMesh
+            // per-instance visibility and rebuilds the shadow map.
+            viewer.markShadowsDirty();
           }
           // Locked needs no side-effect — gizmo / drag logic reads
           // userData.realvirtual.LayoutObject.Locked directly each frame.
@@ -682,15 +788,34 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
   // component. Sensors write to the SignalStore and refresh via the tick above.
   // Also poll when a behavior root is selected — its virtual component shows
   // child drives' live speed/direction, which change every physics frame.
-  const hasLiveNonSignalComponent = (nodeData?.components.some(
-    c => c.type === 'Drive' || c.type === 'TransportSurface',
-  ) ?? false) || behaviorRoot !== null;
-  const [, setLiveTick] = useState(0);
-  useEffect(() => {
-    if (!hasLiveNonSignalComponent) return;
-    const id = setInterval(() => setLiveTick(t => t + 1), 200);
-    return () => clearInterval(id);
-  }, [hasLiveNonSignalComponent]);
+  //
+  // plan-344 Phase 3.1: the poll no longer commits unconditionally. It compares a
+  // fingerprint of exactly the values these sections DISPLAY (each live
+  // component's `getLiveState()` plus, for a behavior root, the collected
+  // subtree drive/sensor read-out) and bumps state only on a real change — so a
+  // paused or static scene costs zero inspector re-renders.
+  const liveTypes = useMemo(
+    () => (nodeData?.components ?? [])
+      .filter(c => c.type === 'Drive' || c.type === 'TransportSurface')
+      .map(c => c.type),
+    [nodeData],
+  );
+  const hasLiveNonSignalComponent = liveTypes.length > 0 || behaviorRoot !== null;
+  // Stable primitives as effect deps — `nodeData.components` and `behaviorRoot`
+  // get a fresh identity on every editor-state notify, which would otherwise
+  // tear down and rebuild the interval on every edit.
+  const liveTypesKey = liveTypes.join('|');
+  const behaviorRootKey = behaviorRoot ? `${behaviorRoot.root.uuid}:${behaviorRoot.markerType}` : '';
+  useChangeGatedTick({
+    read: () => readLiveSignature(
+      viewer,
+      selectedPath ?? '',
+      liveTypes,
+      behaviorRoot?.root ?? null,
+    ),
+    enabled: hasLiveNonSignalComponent && !!selectedPath,
+    resetKey: `${selectedPath ?? ''}|${liveTypesKey}|${behaviorRootKey}`,
+  });
 
   if (!plugin || !selectedPath || !nodeData) return null;
 
@@ -789,15 +914,28 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
   // userData — they are injected into the section list at render time and
   // rendered through the SAME ComponentSection pipeline (readOnlyLive mode) as
   // a real component. Order: AFTER the real LayoutObject/config sections.
-  const virtualComponents: Array<{ type: string; data: Record<string, unknown> }> = [];
+  const virtualComponents: Array<{ type: string; data: Record<string, unknown>; extraContent?: React.ReactNode }> = [];
   // Behavior live state — only when the LayoutObject root ITSELF is selected.
+  // Since plan-325 the section also carries the behavior's synthetic signal
+  // slots (Conveyor Flow.*, F10) as SignalSlotRow rows: always visible from
+  // the descriptor, bindable once the scoped signal is materialised. The
+  // section therefore renders even when no live data exists yet.
   if (behaviorRoot) {
     const vc = buildBehaviorVirtualComponent(
       viewer as unknown as BehaviorViewerSnapshot,
       behaviorRoot.root,
       behaviorRoot.markerType,
-    );
-    if (vc) virtualComponents.push(vc);
+    ) ?? { type: behaviorDisplayName(behaviorRoot.markerType), data: {} };
+    virtualComponents.push({
+      ...vc,
+      extraContent: (
+        <BehaviorSignalSlots
+          viewer={viewer}
+          root={behaviorRoot.root}
+          markerType={behaviorRoot.markerType}
+        />
+      ),
+    });
   }
   // Snap-point data — when a registered snap Empty is selected (resolved by uuid).
   if (nodeData.uuid) {
@@ -815,6 +953,43 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
         overflow: 'auto',
       }}
     >
+      {/* Owner breadcrumb: exact-node editor picks land on plain geometry —
+          offer one click to jump to the owning component node (e.g. Drive). */}
+      {pickOwner && (
+        <Box sx={{ px: 1, py: 0.75, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+          <Typography sx={{ fontSize: 9, color: 'text.disabled', mb: 0.5, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>
+            Part of
+          </Typography>
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+            {(() => {
+              const ownerName = pickOwner.path.split('/').pop() ?? pickOwner.path;
+              const primaryType = pickOwner.components[0];
+              const color = componentColor(primaryType);
+              return (
+                <Tooltip title={`${pickOwner.path}\nClick to select`} placement="top">
+                  <Chip
+                    label={`${primaryType}: ${ownerName}`}
+                    size="small"
+                    onClick={() => navigateToRef(viewer, pickOwner.path)}
+                    sx={{
+                      height: 16,
+                      fontSize: 9,
+                      fontWeight: 500,
+                      cursor: 'pointer',
+                      bgcolor: color + '18',
+                      color: color,
+                      border: `1px solid ${color}44`,
+                      '& .MuiChip-label': { px: 0.5 },
+                      '&:hover': { bgcolor: color + '28' },
+                    }}
+                  />
+                </Tooltip>
+              );
+            })()}
+          </Box>
+        </Box>
+      )}
+
       {/* LogicStep Runtime Status (above component sections, hidden when Idle) */}
       {showRuntimeSection && <LogicStepRuntimeSection info={stepInfo} />}
 
@@ -831,6 +1006,14 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
           onReverseDirection={() => _doReversePlacement(viewer, selectedPath)}
         />
       )}
+
+      {/* Signal linking is INLINE since plan-325: every componentRef+signal
+          schema field renders as a SignalSlotRow inside its component section
+          (the former "Signals (CONNECT)" SignalBindSection was removed). */}
+
+      {/* Typed connections (plan-259): in/out edges of this node, add/remove,
+          drag handle + connection-type editor. */}
+      {selectedPath && <ConnectionsSection viewer={viewer} nodePath={selectedPath} />}
 
       {!hasContent ? (
         <Typography sx={{ fontSize: 12, color: 'text.disabled', textAlign: 'center', py: 4 }}>
@@ -863,7 +1046,9 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
                 overriddenFields={overriddenFields}
                 consumedOnly={consumedOnly}
                 signalValue={headerValue}
-                headerAction={type === 'AASLink' ? <AasDetailHeaderAction data={data} /> : undefined}
+                headerAction={type === 'AASLink'
+                  ? <AasDetailHeaderAction viewer={viewer} nodePath={selectedPath} data={data} />
+                  : undefined}
                 onFieldEdit={(fieldName, value) => handleFieldEdit(type, fieldName, value)}
                 onFieldReset={(fieldName) => handleFieldReset(type, fieldName)}
                 onResetComponent={() => handleComponentReset(type)}
@@ -876,7 +1061,7 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
           {/* Ephemeral read-only "virtual components" (behavior live state,
               snap data) AFTER the editable sections — same header / collapse /
               color pipeline, but rendered read-only (no editor / overlay). */}
-          {virtualComponents.map(({ type, data }) => (
+          {virtualComponents.map(({ type, data, extraContent }) => (
             <ComponentSection
               key={`virtual:${type}`}
               nodePath={selectedPath}
@@ -885,6 +1070,7 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
               overriddenFields={EMPTY_OVERRIDES}
               consumedOnly={consumedOnly}
               readOnlyLive
+              extraContent={extraContent}
               onFieldEdit={NOOP_FIELD_EDIT}
               onFieldReset={NOOP_FIELD_RESET}
               onResetComponent={NOOP_RESET}
@@ -895,21 +1081,20 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
         </Box>
       )}
 
+      {/* "Add Component" (asset editor only — renders nothing when the active
+          EditTarget doesn't support component authoring). Outside the
+          hasContent branch so the FIRST component can be added to bare nodes. */}
+      {selectedPath && <AddComponentSection viewer={viewer} nodePath={selectedPath} />}
+
       {/* Footer inside scroll area for detached mode */}
       {detached && footerContent}
     </Box>
   );
 
-  // Embedded (mobile selection sheet): inner scroll content only, no panel
-  // chrome — the host sheet supplies its own header/close/positioning.
-  if (embedded) {
-    return scrollContent;
-  }
-
-  // ── Detached: floating ChartPanel ─────────────────────────────────────
+  // ── Detached: floating FloatingPanel ──────────────────────────────────
   if (detached) {
     return (
-      <ChartPanel
+      <FloatingPanel
         open
         onClose={handleClose}
         title={nodeName}
@@ -921,7 +1106,7 @@ export function PropertyInspector({ viewer, embedded = false }: PropertyInspecto
         toolbar={toolbarButtons}
       >
         {scrollContent}
-      </ChartPanel>
+      </FloatingPanel>
     );
   }
 

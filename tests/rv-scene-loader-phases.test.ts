@@ -75,12 +75,6 @@ describe('loadGLB phase functions', () => {
     expect(typeof mod.applyWebGPUFixes).toBe('function');
   });
 
-  it('exports computeBVH as an async function', async () => {
-    const mod = await import('../src/core/engine/rv-scene-loader');
-    expect(mod.computeBVH).toBeDefined();
-    expect(typeof mod.computeBVH).toBe('function');
-  });
-
   it('exports applyKinematicParenting as a function', async () => {
     const mod = await import('../src/core/engine/rv-scene-loader');
     expect(mod.applyKinematicParenting).toBeDefined();
@@ -97,6 +91,44 @@ describe('loadGLB phase functions', () => {
     const mod = await import('../src/core/engine/rv-scene-loader');
     expect(mod.processExtras).toBeDefined();
     expect(typeof mod.processExtras).toBe('function');
+  });
+});
+
+// ── matrixAutoUpdate classification (Drive geometry must stay dynamic) ──
+// Regression: a Drive authored directly ON a mesh node (CAD imports like
+// Toray, where every moving part is a single mesh) was classified static —
+// isUnderDrive() only walks the PARENT chain — so it got matrixAutoUpdate=false
+// and the renderer never rebuilt its matrix from the quaternion applyToNode()
+// sets. The drive reported running/rotating but the geometry never visibly moved.
+describe('processMeshes — Drive geometry stays dynamic', () => {
+  it('keeps matrixAutoUpdate=true on a mesh that IS the Drive node', async () => {
+    const { processMeshes } = await import('../src/core/engine/rv-scene-loader');
+    const { Group, Mesh, BoxGeometry, MeshStandardMaterial } = await import('three');
+
+    const root = new Group();
+
+    // Drive authored directly on a mesh (Toray shape).
+    const driveMesh = new Mesh(new BoxGeometry(), new MeshStandardMaterial());
+    driveMesh.name = 'part_000_1';
+    driveMesh.userData.realvirtual = { Drive: { Direction: 'RotationX' } };
+    root.add(driveMesh);
+
+    // A mesh UNDER a (transform) drive node — the shape that already worked.
+    const driveXform = new Group();
+    driveXform.userData.realvirtual = { Drive: { Direction: 'RotationY' } };
+    const childMesh = new Mesh(new BoxGeometry(), new MeshStandardMaterial());
+    driveXform.add(childMesh);
+    root.add(driveXform);
+
+    // A plain static mesh — must be frozen.
+    const staticMesh = new Mesh(new BoxGeometry(), new MeshStandardMaterial());
+    root.add(staticMesh);
+
+    processMeshes(root);
+
+    expect(driveMesh.matrixAutoUpdate).toBe(true);   // was false before the fix
+    expect(childMesh.matrixAutoUpdate).toBe(true);
+    expect(staticMesh.matrixAutoUpdate).toBe(false); // static stays frozen
   });
 });
 

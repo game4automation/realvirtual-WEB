@@ -1,0 +1,26 @@
+{
+  // Full dev/CI typecheck: everything, INCLUDING the private-dependent test files
+  // that the base tsconfig excludes for community parity, and the private sibling's
+  // own tests (the CAD importers: STEP, JT, USD, Onshape). Requires the private
+  // sibling (`../realvirtual-WebViewer-Private~`). Run via `npm run typecheck`.
+  "extends": "./tsconfig.json",
+  "include": [
+    "src",
+    "tests",
+    "../realvirtual-WebViewer-Private~/src",
+    "../realvirtual-WebViewer-Private~/tests",
+    "../realvirtual-WebViewer-Private~/projects",
+    "../realvirtual-web-pro/src",
+    "../realvirtual-web-pro/projects",
+    "../projects"
+  ],
+  // Pre-existing type errors in three private ops-tooling tests, surfaced the first
+  // time the private tests/ folder entered a typecheck at all (they run under vitest,
+  // which does not typecheck). Unrelated to the CAD-importer tests this include was
+  // added for; excluded so `npm run typecheck` stays a usable gate. Fix and remove.
+  "exclude": [
+    "../realvirtual-WebViewer-Private~/tests/get-connect.node.test.ts",
+    "../realvirtual-WebViewer-Private~/tests/get-dependencies.node.test.ts",
+    "../realvirtual-WebViewer-Private~/tests/jt-artifact-manifest.node.test.ts"
+  ]
+}

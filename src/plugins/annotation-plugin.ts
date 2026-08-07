@@ -339,6 +339,8 @@ export class AnnotationPlugin implements RVViewerPlugin, AnnotationPluginAPI {
           id: 'annotations.add',
           label: 'Annotate',
           order: 50,
+          // Annotations are a viewing/review feature — hidden in editor mode
+          condition: () => viewer.modes.activeMode !== 'editor',
           action: (target) => {
             // Use exact raycast hit point if available, otherwise node center
             const pos: [number, number, number] = target.hitPoint
@@ -480,8 +482,6 @@ export class AnnotationPlugin implements RVViewerPlugin, AnnotationPluginAPI {
       if (!hit.object.visible) continue;
       // Skip the annotation group itself
       if (this._isAnnotationObject(hit.object)) continue;
-      // Skip kinematic merge chunks — annotations should not attach to merged geometry
-      if (hit.object.userData?._rvKinGroupMerged) continue;
       return {
         point: hit.point,
         normal: hit.face?.normal?.clone().transformDirection(hit.object.matrixWorld) ?? null,

@@ -6,8 +6,7 @@
  *
  * `resetSimulation()` calls `drive.reset()` on every drive so a fresh run looks
  * exactly like a reload: position back to StartPosition, no speed, not running,
- * jog cleared (positioning drives). Belt (transport-surface) drives keep their
- * jog so conveyors resume running.
+ * jog cleared for every drive. Drive behaviors may issue a new command afterward.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -54,12 +53,13 @@ describe('RVDrive.reset()', () => {
     expect(drive.jogBackward).toBe(false);
   });
 
-  it('KEEPS jog flags for a transport-surface (belt) drive', () => {
+  it('clears jog flags for a transport-surface drive too', () => {
     const drive = makeLinearDrive(0);
     drive.isTransportSurface = true;
     drive.jogForward = true;
     drive.reset();
-    expect(drive.jogForward).toBe(true); // belt resumes running like a fresh load
+    expect(drive.jogForward).toBe(false);
+    expect(drive.jogBackward).toBe(false);
   });
 
   it('snaps the Three.js node transform back to the start pose', () => {

@@ -155,6 +155,41 @@ describe('RvExtrasEditorPlugin', () => {
     expect(sensor!.types).toEqual(['Sensor']);
   });
 
+  it('lists editor-created empty nodes (__rvAdded) with no rv_extras', () => {
+    // Reproduces the "Empty at Root" hierarchy bug: a freshly created empty
+    // carries only the __rvAdded marker (no userData.realvirtual), so the
+    // component-only scan used to drop it and it never appeared in the tree.
+    const scene: any = { name: 'Scene', parent: null, children: [], userData: {} };
+    const demoCell = makeNode('DemoCell', scene);
+    const conv1 = makeNode('Conveyor1', demoCell, { Drive: { TargetSpeed: 100 } });
+    const empty = makeNode('Empty', demoCell); // no rv extras
+    empty.userData.__rvAdded = true;
+    const plainStructural = makeNode('PlainGroup', demoCell); // neither extras nor __rvAdded
+
+    const allNodes = [scene, demoCell, conv1, empty, plainStructural];
+    scene.traverse = (fn: (n: any) => void) => { for (const n of allNodes) fn(n); };
+
+    const nodePaths = new Map<any, string>([
+      [demoCell, 'DemoCell'],
+      [conv1, 'DemoCell/Conveyor1'],
+      [empty, 'DemoCell/Empty'],
+      [plainStructural, 'DemoCell/PlainGroup'],
+    ]);
+    const registry = { getPathForNode: (n: any) => nodePaths.get(n) ?? null };
+
+    const viewer = makeMockViewer(scene, registry);
+    plugin.onModelLoaded(makeLoadResult(registry) as any, viewer as any);
+
+    const nodes = plugin.getSnapshot().editableNodes;
+    const emptyInfo = nodes.find((n: EditableNodeInfo) => n.path === 'DemoCell/Empty');
+    expect(emptyInfo).toBeDefined();
+    expect(emptyInfo!.types).toEqual([]); // structural node — no component types
+    // The real component node is still listed…
+    expect(nodes.some((n: EditableNodeInfo) => n.path === 'DemoCell/Conveyor1')).toBe(true);
+    // …but a plain structural node without the __rvAdded marker is NOT.
+    expect(nodes.some((n: EditableNodeInfo) => n.path === 'DemoCell/PlainGroup')).toBe(false);
+  });
+
   it('selectNode updates selectedNodePath', () => {
     expect(plugin.getSnapshot().selectedNodePath).toBeNull();
 

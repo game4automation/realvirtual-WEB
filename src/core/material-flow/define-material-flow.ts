@@ -29,6 +29,7 @@ import {
   type MaterialFlowKind,
   type MU,
   type Port,
+  type FrozenDescriptor,
   type SignalShape,
 } from './material-flow-self';
 import { registerMaterialFlow } from './registry';
@@ -43,8 +44,10 @@ export type { MaterialFlowKind } from './material-flow-self';
  *   - `transport` → `findTransport(self.root)` (`Transport-X/Y/Z`)
  *   - `sensor`    → `findSensor(self.root)`    (`Sensor[-id]`)
  *   - `rotary`    → `findRotaryDrive(self.root)` (`Drive-Rot-X/Y/Z`)
+ *   - `path`      → a node carrying `rv_extras.Path` (payload-based, NOT
+ *                   name-based — plan-268 §2.5/§10)
  */
-export type RequiresKind = 'transport' | 'sensor' | 'rotary';
+export type RequiresKind = 'transport' | 'sensor' | 'rotary' | 'path';
 
 /**
  * The shape of a definition's optional `requires` block: a map from an
@@ -85,17 +88,34 @@ export interface ContinuousBlock<S extends MaterialFlowSelf<any> = MaterialFlowS
 
 /** DES adapter — data record of hooks dispatched by the (private) DESRunner. */
 export interface DesBlock<S extends MaterialFlowSelf<any> = MaterialFlowSelf> {
+  /**
+   * Declares that this definition's des hooks sample LIVE scene geometry
+   * (e.g. getWorldPosition on a tweened MU/node) at event dispatch time.
+   * When at least one live instance of such a type exists, the runner keeps
+   * the per-event-time tween settle active; otherwise settle is skipped
+   * entirely in FastForward (pure conveyor/station lines pay zero cost).
+   */
+  samplesLiveGeometry?: boolean;
   canAccept?(self: S, mu: MU, port?: Port): boolean;
   onAccept?(self: S, mu: MU, port?: Port): boolean;
   onArrival?(self: S, mu: MU): void;
-  onProcessComplete?(self: S, mu: MU): void;
+  onProcessComplete?(self: S, mu: MU, data?: unknown): void;
   onRotateComplete?(self: S, mu: MU): void;
   onGenerate?(self: S): void;
   onAutoRelease?(self: S, mu: MU): void;
   onDownstreamReady?(self: S, from: unknown): void;
   onSignalChanged?(self: S, signal: string, value: boolean | number): void;
-  /** Adapter-private helpers (rotateTo/tryRelease/…) authored on the block. */
-  [name: string]: ((self: S, ...args: never[]) => unknown) | undefined;
+  /** Called after scheduled work was converted to JSON-only descriptors. */
+  onFreeze?(self: S, frozen: FrozenDescriptor[]): void;
+  /** Called after frozen work was rebound and scheduled with its remaining time. */
+  onResume?(self: S, frozen: FrozenDescriptor[]): void;
+  /** Called after a full DES snapshot restore has rebuilt component and MU state. */
+  onRestore?(self: S): void;
+  /** Called when FastForward exits after final-only tweens have settled. */
+  onFastForwardExit?(self: S): void;
+  /** Adapter-private helpers (rotateTo/tryRelease/…) authored on the block.
+   *  `boolean` is included only for the `samplesLiveGeometry` capability flag. */
+  [name: string]: ((self: S, ...args: never[]) => unknown) | boolean | undefined;
 }
 
 // ─── Definition ─────────────────────────────────────────────────────────
@@ -132,6 +152,20 @@ export interface MaterialFlowDefinition<
   readonly models?: string[];
   /** Component schema (same shape as rv-component-registry; applySchema reused). */
   readonly schema: ComponentSchema;
+  /** Derive the DES adapter capacity from validated instance configuration. */
+  readonly capacity?: (self: S) => number;
+  /**
+   * Where a central DES Processing attachment applies its hold. Stations default
+   * to `accept`, conveyors default to `transfer`; cycle-based components can
+   * opt into `cycle-dwell` and combine the attachment with their own dwell.
+   */
+  readonly processingAttachmentPoint?: 'accept' | 'transfer' | 'cycle-dwell';
+  /**
+   * Schema string properties that reference MU visual templates. The private
+   * DES binding uses this generic capability to register clone factories without
+   * coupling the binding contract to a private component type name.
+   */
+  readonly muVisualTemplateProperties?: readonly string[];
   /**
    * Optional declarative `signals` block (Plan 197 §2.4b-A). Maps a short key to
    * its PLC signal type; the factory auto-declares each as `${type}.${key}`

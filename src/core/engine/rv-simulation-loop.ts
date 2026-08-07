@@ -40,6 +40,14 @@ export class SimulationLoop {
    */
   private _pauseReasons = new Set<string>();
 
+  /** Time-integration master gate — INDEPENDENT of pause reasons. While false,
+   *  onFixedUpdate is never invoked and the accumulator is drained each frame,
+   *  so no fixed-update backlog can build up. Rendering continues. Owned by the
+   *  SimulationRuntime: detached workspace modes (e.g. the asset editor) switch
+   *  this off so no pause-reason bookkeeping (or `clearPauseReasons()`) can
+   *  resurrect simulation there. */
+  private _integrationEnabled = true;
+
   onFixedUpdate: (dt: number) => void = () => {};
   onRender: (frameTime: number) => void = () => {};
 
@@ -66,6 +74,19 @@ export class SimulationLoop {
     if (paused) this._pauseReasons.add(reason);
     else this._pauseReasons.delete(reason);
     return wasPaused !== this.isPaused;
+  }
+
+  /** Whether fixed-update time integration is enabled (see {@link setIntegrationEnabled}). */
+  get integrationEnabled(): boolean { return this._integrationEnabled; }
+
+  /**
+   * Master gate for fixed-update time integration, orthogonal to pause reasons.
+   * `false` = fully detached: onFixedUpdate is never invoked, the accumulator is
+   * drained each frame, rendering is unaffected. Unlike a pause reason this
+   * cannot be released by `setPaused`/force-clearing — only by re-enabling here.
+   */
+  setIntegrationEnabled(enabled: boolean): void {
+    this._integrationEnabled = enabled;
   }
 
   start() {
@@ -98,7 +119,7 @@ export class SimulationLoop {
     // Clamp frame time to avoid spiral of death
     if (frameTime > 0.1) frameTime = 0.1;
 
-    if (this.isPaused) {
+    if (this.isPaused || !this._integrationEnabled) {
       // Drain accumulator so on resume we don't do a catch-up burst that
       // would fast-forward drives, sensors, and logic steps by seconds.
       this.accumulator = 0;
@@ -138,7 +159,7 @@ export class SimulationLoop {
     // Clamp frame time to avoid spiral of death
     if (frameTime > 0.1) frameTime = 0.1;
 
-    if (this.isPaused) {
+    if (this.isPaused || !this._integrationEnabled) {
       // Drain accumulator so on resume we don't do a catch-up burst that
       // would fast-forward drives, sensors, and logic steps by seconds.
       this.accumulator = 0;

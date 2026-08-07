@@ -4,8 +4,8 @@
 /**
  * build-local-library-catalog.mjs — Generate the bundled-library manifest.
  *
- * Scans `public/models/library/` for `.glb` files and writes a
- * `public/models/library/catalog.json` the planner loads via
+ * Scans `public/library/` for `.glb` files and writes a
+ * `public/library/catalog.json` the planner loads via
  * `loadBundledLibrary` (planner-persistence.ts). This is the STANDARD library
  * shipped with every publish; GitHub is NOT a default source.
  *
@@ -17,18 +17,20 @@
  *                 display; an all-lowercase folder can't be word-split.
  *   - name      = the file stem, humanized (e.g. `RollConveyor-2m`
  *                 -> "Roll Conveyor 2m").
- *   - glbUrl    = path relative to `models/library/` (resolved at load time).
+ *   - glbUrl    = path relative to the library root (resolved at load time).
  * Thumbnails are rendered at runtime by the planner, so none are emitted here.
  *
  * Run: `node scripts/build-local-library-catalog.mjs`
  */
 
 import { readdir, writeFile, stat } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const LIBRARY_DIR = join(ROOT, 'public', 'models', 'library');
+const LIBRARY_DIR = join(ROOT, 'public', 'library');
+const LIBRARY_URL_ROOT = 'public/library';
 const OUTPUT = join(LIBRARY_DIR, 'catalog.json');
 
 /** Insert spaces at camelCase / acronym boundaries and on `-`/`_`, then title-trim. */
@@ -60,6 +62,30 @@ async function collectGlbs(dir) {
   return out;
 }
 
+/**
+ * Git-ignored entries among `relPaths` (relative to LIBRARY_DIR).
+ *
+ * The library tree also holds local scratch assets and customer CAD imports, which are
+ * gitignored individually. `catalog.json` itself is checked in and reaches the public
+ * mirror and every customer delivery, so those file names must never enter it — the
+ * catalog would list them, and the entries would 404 for everyone but the local machine.
+ * Outside a Git checkout (public fork, exported tarball) nothing is filtered.
+ */
+function gitIgnored(relPaths) {
+  if (relPaths.length === 0) return new Set();
+  const toGitPath = (rel) => `${LIBRARY_URL_ROOT}/${rel.split(sep).join('/')}`;
+  try {
+    const output = execFileSync('git', ['check-ignore', '-z', '--stdin'], {
+      cwd: ROOT, input: relPaths.map(toGitPath).join('\0'), encoding: 'utf8',
+    });
+    const ignored = new Set(output.split('\0').filter(Boolean));
+    return new Set(relPaths.filter((rel) => ignored.has(toGitPath(rel))));
+  } catch {
+    // Exit 1 means "nothing ignored"; any other failure (no Git, no repository) filters nothing.
+    return new Set();
+  }
+}
+
 async function main() {
   try {
     await stat(LIBRARY_DIR);
@@ -71,13 +97,18 @@ async function main() {
     process.exit(0);
   }
 
-  const relPaths = (await collectGlbs(LIBRARY_DIR)).sort();
+  const scanned = (await collectGlbs(LIBRARY_DIR)).sort();
+  const ignored = gitIgnored(scanned);
+  if (ignored.size > 0) {
+    console.warn(`[build-local-library-catalog] skipping ${ignored.size} Git-ignored asset(s) — local only, never catalogued.`);
+  }
+  const relPaths = scanned.filter((rel) => !ignored.has(rel));
   const entries = relPaths.map((rel) => {
     const parts = rel.split(sep);
     const file = parts[parts.length - 1];
     const folder = parts.length > 1 ? parts[0] : 'General';
     const stem = file.replace(/\.glb$/i, '');
-    const glbUrl = parts.join('/'); // POSIX-style URL relative to models/library/
+    const glbUrl = parts.join('/'); // POSIX-style URL relative to the library root
     return {
       id: slug(rel.replace(/\.glb$/i, '')),
       name: humanize(stem),

@@ -365,6 +365,16 @@ export function PlannerDocModeButton() {
   );
 }
 
+// ─── Signal-linking mode button ──────────────────────────────────────────
+
+/**
+ * Toolbar button — toggles Planner Signal Linking mode (plan-226). When on,
+ * every placed element with bindable standard-signal slots shows a 3D status
+ * badge; clicking a badge opens the CONNECT signal picker. When off, no badges
+ * and no picker (pure layout). The whole feature is gated by the viewer's
+ * `plannerSignalLinking` flag — when that flag is off there is no
+ * `signalBindingManager`, so the button hides itself entirely.
+ */
 // ─── Delete-selection button ─────────────────────────────────────────────
 
 /**

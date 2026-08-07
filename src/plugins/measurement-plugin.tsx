@@ -23,6 +23,7 @@ import { MeasurementRenderer, formatDistance as _formatDistance } from './rv-mea
 import { MEASUREMENT_LAYER } from '../core/engine/rv-constants';
 import { pointerToNDC } from '../core/engine/rv-pointer-utils';
 import { createStore } from '../core/hmi/create-store';
+import { modeContext } from '../core/rv-mode-manager';
 
 // Re-export formatDistance for tests and external consumers
 export { formatDistance } from './rv-measurement-renderer';
@@ -116,7 +117,15 @@ export class MeasurementPlugin implements RVViewerPlugin, MeasurementPluginAPI {
   readonly id = 'measurements';
   readonly order = 50;
   readonly slots: UISlotEntry[] = [
-    { slot: 'button-group', component: MeasureButton, order: 55 },
+    // Without a rule ButtonPanel hides every entry in a focused workspace mode.
+    // Measuring is useful while authoring CAD assets too, so the Editor is
+    // explicitly allowed; Planner and DES stay focused on their own tools.
+    {
+      slot: 'button-group',
+      component: MeasureButton,
+      order: 55,
+      visibilityRule: { hiddenIn: [modeContext('planner'), modeContext('des')] },
+    },
   ];
 
   // ── State ──
@@ -565,7 +574,6 @@ export class MeasurementPlugin implements RVViewerPlugin, MeasurementPluginAPI {
     for (const hit of intersects) {
       if (!hit.object.visible) continue;
       if (this._isMeasurementObject(hit.object)) continue;
-      if (hit.object.userData?._rvKinGroupMerged) continue;
       return {
         point: hit.point,
         normal: hit.face?.normal?.clone().transformDirection(hit.object.matrixWorld) ?? null,

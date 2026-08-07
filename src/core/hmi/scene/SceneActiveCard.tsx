@@ -40,7 +40,7 @@ import {
   Redo,
   Undo,
 } from '@mui/icons-material';
-import type { SceneStore } from './scene-store';
+import type { SceneStore, SaveSettingsIntoModelOutcome } from './scene-store';
 import { baseLabelOf } from './rv-scene-types';
 
 interface SceneActiveCardProps {
@@ -50,7 +50,44 @@ interface SceneActiveCardProps {
 type NameDialogState =
   | { kind: 'saveAs'; name: string }
   | { kind: 'rename'; id: string; name: string }
+  | { kind: 'saveIntoModel'; name: string }
   | null;
+
+/**
+ * Turn the outcome into something the user can act on.
+ *
+ * Every refusal names its cause — "nothing happened" with no reason is the one
+ * response that leaves someone stuck.
+ */
+function describeSaveOutcome(outcome: SaveSettingsIntoModelOutcome): string {
+  switch (outcome.kind) {
+    case 'saved': {
+      const scope = `${outcome.fields} setting(s) across ${outcome.nodes} object(s)`;
+      const signature = outcome.signatureDropped
+        ? ' The original signature no longer matches the edited file and was removed.'
+        : '';
+      return `Saved ${scope} into ${outcome.fileName}. `
+        + `The scene now uses this model and has no unsaved edits.${signature}`;
+    }
+    case 'nothing-to-save':
+      return 'This scene has no settings to save — the model file would be an exact copy.';
+    case 'structural-ops':
+      return `These edits cannot be stored inside a model file: ${outcome.details.join(', ')}. `
+        + 'Only component properties and signal links can be. Save the scene instead.';
+    case 'no-model-base':
+      return 'This scene is not based on a model file, so there is nothing to save into.';
+    case 'no-writable-project':
+      return outcome.reason;
+    case 'unsupported':
+      return 'Folder projects need the File System Access API, which this browser does not support. '
+        + 'Use a browser project instead.';
+    case 'scene-changed':
+      return `The scene was switched while ${outcome.fileName} was being written. `
+        + 'The file is in the project and is complete, but this scene was left as it was.';
+    case 'error':
+      return outcome.message;
+  }
+}
 
 export function SceneActiveCard({ store }: SceneActiveCardProps) {
   const snap = useSyncExternalStore(store.subscribe, store.getSnapshot);
@@ -61,12 +98,20 @@ export function SceneActiveCard({ store }: SceneActiveCardProps) {
 
   const [nameDialog, setNameDialog] = useState<NameDialogState>(null);
   const closeNameDialog = useCallback(() => setNameDialog(null), []);
+  /** Result or refusal, shown after the name dialog closes. */
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const submitNameDialog = useCallback(async () => {
     if (!nameDialog) return;
     const name = nameDialog.name.trim();
     if (!name) return;
     if (nameDialog.kind === 'saveAs') {
       await store.saveAs(name);
+    } else if (nameDialog.kind === 'saveIntoModel') {
+      // Close first: this reloads the model, and a dialog sitting over a
+      // reloading viewport reads as a hang.
+      setNameDialog(null);
+      setSaveMessage(describeSaveOutcome(await store.saveSettingsIntoModel(name)));
+      return;
     } else {
       store.rename(nameDialog.id, name);
     }
@@ -75,7 +120,9 @@ export function SceneActiveCard({ store }: SceneActiveCardProps) {
 
   const dialogTitle = useMemo(() => {
     if (!nameDialog) return '';
-    return nameDialog.kind === 'saveAs' ? 'Save as new scene' : 'Rename scene';
+    if (nameDialog.kind === 'saveAs') return 'Save as new scene';
+    if (nameDialog.kind === 'saveIntoModel') return 'Save settings into model';
+    return 'Rename scene';
   }, [nameDialog]);
 
   // Hide entirely when no draft is loaded — no UI noise during boot or
@@ -113,6 +160,9 @@ export function SceneActiveCard({ store }: SceneActiveCardProps) {
   const onExportJSON = () => {
     if (!saved) return;
     store.exportSceneJSON(saved.id);
+  };
+  const onSaveIntoModel = () => {
+    setNameDialog({ kind: 'saveIntoModel', name: draft.name });
   };
 
   return (
@@ -260,11 +310,14 @@ export function SceneActiveCard({ store }: SceneActiveCardProps) {
             <ListItemText primaryTypographyProps={{ fontSize: 13 }}>Export JSON</ListItemText>
           </MenuItem>
           <Divider />
-          <MenuItem disabled>
+          <MenuItem
+            disabled={busy}
+            onClick={() => { closeMenu(); onSaveIntoModel(); }}
+          >
             <ListItemIcon sx={{ minWidth: 28 }}><AutoAwesome sx={{ fontSize: 16 }} /></ListItemIcon>
             <ListItemText
-              primary="Export GLB"
-              secondary="Coming soon"
+              primary="Save settings into model…"
+              secondary="Settings travel with the file"
               primaryTypographyProps={{ fontSize: 13 }}
               secondaryTypographyProps={{ fontSize: 10 }}
             />
@@ -298,7 +351,25 @@ export function SceneActiveCard({ store }: SceneActiveCardProps) {
             disabled={!(nameDialog?.name.trim())}
             sx={{ textTransform: 'none' }}
           >
-            {nameDialog?.kind === 'saveAs' ? 'Save' : 'Rename'}
+            {nameDialog?.kind === 'saveAs' ? 'Save' : nameDialog?.kind === 'saveIntoModel' ? 'Save' : 'Rename'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Success and every refusal both land here, with a reason */}
+      <Dialog open={Boolean(saveMessage)} onClose={() => setSaveMessage(null)} maxWidth="xs" fullWidth>
+        <DialogTitle sx={{ fontSize: 14, fontWeight: 600 }}>Save settings into model</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" sx={{ fontSize: 13 }}>{saveMessage}</Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            size="small"
+            variant="contained"
+            onClick={() => setSaveMessage(null)}
+            sx={{ textTransform: 'none' }}
+          >
+            Close
           </Button>
         </DialogActions>
       </Dialog>

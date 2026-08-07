@@ -12,11 +12,13 @@
 
 import type { RVViewerPlugin } from '../rv-plugin';
 import type { LoadResult } from '../engine/rv-scene-loader';
+import { NodeRegistry } from '../engine/rv-node-registry';
 import type { RVViewer } from '../rv-viewer';
 import type { ContextMenuTarget } from './context-menu-store';
 import { loadOverlay, saveOverlay, saveOriginals, loadOriginals, removeOriginals, type RVExtrasOverlay } from '../engine/rv-extras-overlay-store';
-import { materialise as materialiseEdits, freshOpId } from './scene/rv-scene-edits';
+import { materialise as materialiseEdits } from './scene/rv-scene-edits';
 import { getSceneStore } from './scene/scene-store-singleton';
+import { getActiveEditTarget } from './rv-edit-target';
 import { isHiddenComponentType, baseComponentType } from './rv-inspector-helpers';
 import { isEphemeralField } from './rv-value-resolver';
 import { getFieldDescriptor, isFieldDisplayReadonly } from '../engine/rv-component-registry';
@@ -103,6 +105,9 @@ export interface ExtrasEditorState {
   selectedNodePath: string | null;
   /** Set by selectAndReveal(), consumed by HierarchyBrowser to expand ancestors and scroll-to. */
   revealPath: string | null;
+  /** Set by selectAndRevealExclusive(): the hierarchy collapses every branch
+   *  not on the revealed path when consuming the reveal. */
+  revealCollapseOthers: boolean;
   /** Whether the property inspector should be shown (true when selected from hierarchy, false from 3D click). */
   showInspector: boolean;
   /** Whether the settings panel is open (shared so ButtonPanel can shift). */
@@ -123,6 +128,10 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
   private _editableNodes: EditableNodeInfo[] = [];
   private _selectedNodePath: string | null = null;
   private _revealPath: string | null = null;
+  /** While true, selection-changed selects without revealing (see
+   *  {@link RvExtrasEditorPlugin.setRevealSuppressed}). */
+  private _revealSuppressed = false;
+  private _revealCollapseOthers = false;
   private _showInspector = false;
   private _settingsOpen = false;
   private _viewer: RVViewer | null = null;
@@ -147,6 +156,7 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
       editableNodes: [],
       selectedNodePath: this._selectedNodePath,
       revealPath: null,
+      revealCollapseOthers: false,
       showInspector: false,
       settingsOpen: false,
     };
@@ -165,6 +175,7 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
     editableNodes: [],
     selectedNodePath: null,
     revealPath: null,
+    revealCollapseOthers: false,
     showInspector: false,
     settingsOpen: false,
   };
@@ -187,6 +198,7 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
       editableNodes: this._editableNodes,
       selectedNodePath: this._selectedNodePath,
       revealPath: this._revealPath,
+      revealCollapseOthers: this._revealCollapseOthers,
       showInspector: this._showInspector,
       settingsOpen: this._settingsOpen,
     };
@@ -208,6 +220,8 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
         this._viewer.leftPanelManager.close('hierarchy');
       }
     }
+    // Scans skipped while closed land now (notify() below publishes the result).
+    if (this._panelOpen) this._flushStaleEditableNodes();
     this.notify();
   }
 
@@ -290,8 +304,12 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
     return this._selectedNodePath;
   }
 
-  /** Convenience: snapshot of editable nodes (matches `state.editableNodes`). */
+  /** Convenience: snapshot of editable nodes (matches `state.editableNodes`).
+   *  Imperative readers (MCP tools, tests) may ask while the panel is closed, so
+   *  a scan deferred by `_scheduleEditableNodesRefresh` is settled here first.
+   *  React components read `state.editableNodes` instead — never this. */
   getEditableNodes(): EditableNodeInfo[] {
+    this._flushStaleEditableNodes();
     return this._editableNodes;
   }
 
@@ -316,6 +334,9 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
         this._viewer.leftPanelManager.open('hierarchy', this._panelWidth);
       }
     }
+    // The tree is about to render — a scan deferred while the panel was closed
+    // must land first, or the revealed path is not in `editableNodes` yet.
+    this._flushStaleEditableNodes();
     this._selectedNodePath = path;
     this._revealPath = path;
     this._showInspector = showInspector;
@@ -323,10 +344,47 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
     this.notify();
   }
 
+  /**
+   * Like selectAndReveal, but asks the hierarchy browser to collapse every
+   * branch that is not on the revealed path — the revealed node ends up as
+   * the only open line of the tree. Used when a freshly created node should
+   * get full focus (e.g. the auto-created Kinematic node on group assignment).
+   * Preserves the current inspector visibility instead of forcing it open.
+   */
+  selectAndRevealExclusive(path: string): void {
+    this._revealCollapseOthers = true;
+    this.selectAndReveal(path, this._showInspector);
+  }
+
+  /**
+   * Request the hierarchy browser to reveal an already-selected node (expand
+   * ancestors + scroll into view) WITHOUT changing the selection or opening the
+   * inspector. Used to keep the focused node visible across hierarchy view
+   * changes (e.g. toggling a type filter on/off).
+   */
+  requestReveal(path: string): void {
+    this._revealPath = path;
+    this.notify();
+  }
+
+  /**
+   * Suppress/restore hierarchy reveal on scene selection changes. While
+   * suppressed, `selection-changed` still moves the hierarchy's selected node
+   * (so the tree stays in sync) but does NOT expand ancestors or scroll to it.
+   *
+   * Used by the Kinematics window's Auto Assign mode: collecting parts fires a
+   * rapid select → assign → re-select cycle per click, and revealing each one
+   * would keep expanding and scroll-jumping the tree under the user.
+   */
+  setRevealSuppressed(suppressed: boolean): void {
+    this._revealSuppressed = suppressed;
+  }
+
   /** Clear the revealPath after the hierarchy browser has consumed it. */
   clearReveal(): void {
     if (this._revealPath) {
       this._revealPath = null;
+      this._revealCollapseOthers = false;
       this.notify();
     }
   }
@@ -428,11 +486,11 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
     // Snapshot original before first override (for the legacy reset path).
     this.snapshotOriginal(nodePath, componentType, fieldName);
 
-    const sceneStore = getSceneStore();
-    if (sceneStore) {
+    const target = getActiveEditTarget();
+    if (target.available) {
       // Optimistically reflect the override in the cached overlay and notify
       // NOW, so the inspector marks the field as overridden the moment it
-      // changes. `applyOp` runs asynchronously through the SceneStore op queue;
+      // changes. The op runs asynchronously through the target's op queue;
       // without this the override dot only appears after the queue flushes (or,
       // in some scene states, not until a reload re-materialises the ops). The
       // SceneStore subscription later re-materialises the overlay to the same
@@ -441,15 +499,19 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
       if (!ov.nodes[nodePath]) ov.nodes[nodePath] = {};
       if (!ov.nodes[nodePath][componentType]) ov.nodes[nodePath][componentType] = {};
       ov.nodes[nodePath][componentType][fieldName] = value;
+      // Also write userData synchronously NOW (mirrors the legacy fallback
+      // below). The op below is deferred through the target's op queue, so
+      // without this the inspector's optimistic re-render reads the OLD value
+      // from userData; and the store's later subscription no-ops (the overlay
+      // is already equal), so no second re-render ever corrects it. Writing
+      // userData here makes the re-render read the new value immediately.
+      this.applyFieldToScene(nodePath, componentType, fieldName, value);
       this.notify();
 
-      // Op-based path — applyOp pushes a `setField` op, the executor writes
-      // userData + reapplies schema. The store's notify cascades back to
-      // this plugin via _sceneStoreUnsub → _refreshOverlayFromScene.
-      void sceneStore.applyOp({
-        id: freshOpId(), ts: Date.now(), schemaV: 1,
-        kind: 'setField', nodePath, componentType, fieldName, value, prev,
-      });
+      // Op-based path — the target pushes a `setField` op into its document
+      // (SceneStore outside the editor, AssetDocument inside); the executor
+      // writes userData + reapplies schema.
+      target.setField(nodePath, componentType, fieldName, value, prev);
       return true;
     }
 
@@ -470,12 +532,9 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
    */
   resetField(nodePath: string, componentType: string, fieldName: string): void {
     const prev = this.readSceneField(nodePath, componentType, fieldName);
-    const sceneStore = getSceneStore();
-    if (sceneStore) {
-      void sceneStore.applyOp({
-        id: freshOpId(), ts: Date.now(), schemaV: 1,
-        kind: 'unsetField', nodePath, componentType, fieldName, prev,
-      });
+    const target = getActiveEditTarget();
+    if (target.available) {
+      target.unsetField(nodePath, componentType, fieldName, prev);
       return;
     }
 
@@ -503,16 +562,13 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
    * batch is one undo step.
    */
   resetComponent(nodePath: string, componentType: string): void {
-    const sceneStore = getSceneStore();
-    if (sceneStore && this._overlay?.nodes[nodePath]?.[componentType]) {
+    const target = getActiveEditTarget();
+    if (target.available && this._overlay?.nodes[nodePath]?.[componentType]) {
       const fields = Object.keys(this._overlay.nodes[nodePath][componentType]);
-      void sceneStore.withTransaction(`Reset ${componentType}`, async () => {
+      void target.withTransaction(`Reset ${componentType}`, async () => {
         for (const fieldName of fields) {
           const prev = this.readSceneField(nodePath, componentType, fieldName);
-          await sceneStore.applyOp({
-            id: freshOpId(), ts: Date.now(), schemaV: 1,
-            kind: 'unsetField', nodePath, componentType, fieldName, prev,
-          });
+          target.unsetField(nodePath, componentType, fieldName, prev);
         }
       });
       return;
@@ -545,8 +601,8 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
    * unsetField primitives so undo restores the entire node in one step.
    */
   resetNode(nodePath: string): void {
-    const sceneStore = getSceneStore();
-    if (sceneStore && this._overlay?.nodes[nodePath]) {
+    const target = getActiveEditTarget();
+    if (target.available && this._overlay?.nodes[nodePath]) {
       const nodeOv = this._overlay.nodes[nodePath];
       const work: Array<{ componentType: string; fieldName: string; prev: unknown }> = [];
       for (const [componentType, fields] of Object.entries(nodeOv)) {
@@ -555,13 +611,9 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
         }
       }
       if (work.length === 0) return;
-      void sceneStore.withTransaction(`Reset node`, async () => {
+      void target.withTransaction(`Reset node`, async () => {
         for (const w of work) {
-          await sceneStore.applyOp({
-            id: freshOpId(), ts: Date.now(), schemaV: 1,
-            kind: 'unsetField', nodePath, componentType: w.componentType,
-            fieldName: w.fieldName, prev: w.prev,
-          });
+          target.unsetField(nodePath, w.componentType, w.fieldName, w.prev);
         }
       });
       return;
@@ -601,7 +653,12 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
 
     const rv = node.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;
     if (!rv?.[componentType]) return;
-    rv[componentType][fieldName] = value;
+    // Replace the component object with a shallow clone (new identity) rather
+    // than mutating in place. The inspector's ComponentSection memoises its
+    // field rows on the `data` object reference, so an in-place mutation is
+    // invisible until the panel remounts. A fresh object lets React's memos
+    // recompute and the displayed value update immediately.
+    rv[componentType] = { ...rv[componentType], [fieldName]: value };
   }
 
   // ── Layout Context Menu ──
@@ -694,36 +751,10 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
 
   onModelLoaded(result: LoadResult, viewer: RVViewer): void {
     this._viewer = viewer;
-    this._editableNodes = [];
 
-    // Collect all nodes that have userData.realvirtual with component data
-    const registry = result.registry;
-    const scene = viewer.scene;
-
-    scene.traverse((node) => {
-      const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
-      if (!rv) return;
-
-      // Get types: keys that map to objects (component data), excluding metadata and hidden types
-      const types: string[] = [];
-      for (const [key, value] of Object.entries(rv)) {
-        if (isHiddenComponentType(key)) continue;
-        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-          types.push(key);
-        }
-      }
-
-      if (types.length === 0) return;
-
-      // Compute path using registry or fallback
-      const path = registry.getPathForNode(node);
-      if (!path) return;
-
-      this._editableNodes.push({ path, types });
-    });
-
-    // Sort by path for consistent display
-    this._editableNodes.sort((a, b) => a.path.localeCompare(b.path));
+    // Collect all editable nodes (rv_extras components, editor-created empties,
+    // and the raw-geometry fallback). Shared with refreshEditableNodes.
+    this._scanEditableNodes(result.registry);
 
     // Load overlay state. Priority:
     //   1) Materialise the active unified Scene's edit log into an overlay —
@@ -803,7 +834,7 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
         const path = snapshot.primaryPath;
         if (!path) {
           this.clearSelection();
-        } else if (this._panelOpen) {
+        } else if (this._panelOpen && !this._revealSuppressed) {
           this.selectAndReveal(path, this._showInspector);
         } else {
           this.selectNode(path, this._showInspector);
@@ -831,6 +862,13 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
         }
         this.selectAndReveal(path, true);
       }),
+    );
+
+    // Asset-editor structural ops (STEP import, delete, rename, add/remove
+    // component — incl. undo/redo and draft replay) mutate the scene without a
+    // model reload; re-scan the editable-node cache so the hierarchy follows.
+    this._eventUnsubs.push(
+      viewer.on('editor-structure-changed', () => this._scheduleEditableNodesRefresh()),
     );
 
     // Subscribe to LeftPanelManager: close hierarchy when another panel opens
@@ -886,30 +924,172 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
     return toDelete.length;
   }
 
+  /**
+   * Coalesced `refreshEditableNodes` — safe to call once per structural op.
+   *
+   * A refresh is a FULL `scene.traverse` (see {@link _scanEditableNodes}), so on a
+   * bulk edit its cost is `ops × sceneSize`. Two guards keep that off the hot path:
+   *
+   * - **Closed panel = no scan.** Only `HierarchyBrowser` reads `editableNodes`,
+   *   and it is unmounted while the panel is closed (`TopBar.tsx:226`). The scan
+   *   is deferred to whenever the panel opens (`togglePanel`, `selectAndReveal`).
+   *   Measured on a 4493-node assembly with 434 moves: 158 ms of traversing
+   *   nobody was looking at — 73% of the whole operation (plan-359 Phase 2).
+   * - **Macrotask, not microtask.** A transaction `await`s its ops, and a
+   *   microtask fires BETWEEN those awaits — which turned "once per transaction"
+   *   back into "once per op". `setTimeout(0)` collapses the whole transaction
+   *   into one scan, exactly as `RVViewer.rebuildGroupedBvh` already does for the
+   *   BVH (`rv-viewer.ts:4272-4276`).
+   */
+  private _refreshScheduled = false;
+  /** A structural change arrived while the panel was closed — scan on open. */
+  private _editableNodesStale = false;
+  private _scheduleEditableNodesRefresh(): void {
+    // The root override (plan-301 "Runtime view") drives a preview subtree that
+    // is not the hierarchy panel — keep it eager.
+    if (!this._panelOpen && !this._hierarchyRootOverride) {
+      this._editableNodesStale = true;
+      return;
+    }
+    if (this._refreshScheduled) return;
+    this._refreshScheduled = true;
+    setTimeout(() => {
+      this._refreshScheduled = false;
+      this.refreshEditableNodes();
+    }, 0);
+  }
+
+  /** Run the scan that was skipped while the panel was closed. Called from every
+   *  path that opens the panel — the tree must never render a stale scene. */
+  private _flushStaleEditableNodes(): void {
+    if (!this._editableNodesStale) return;
+    this._editableNodesStale = false;
+    this.refreshEditableNodes();
+  }
+
   /** Re-scan the scene for editable nodes. Call after adding/removing nodes with userData.realvirtual. */
   refreshEditableNodes(): void {
     if (!this._viewer) return;
+    this._editableNodesStale = false;
     this._ancestorCache.clear();
-    this._editableNodes = [];
+    if (this._hierarchyRootOverride) {
+      this._scanOverrideNodes(this._hierarchyRootOverride);
+      this.notify();
+      return;
+    }
     const registry = this._viewer.registry;
-    if (!registry) return;
-    this._viewer.scene.traverse((node) => {
-      const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
-      if (!rv) return;
+    if (!registry) { this._editableNodes = []; return; }
+    this._scanEditableNodes(registry);
+    this.notify();
+  }
+
+  // ── Hierarchy root override (plan-301 §2.9 — asset editor "Runtime view") ──
+
+  /** While set, the hierarchy panel lists THIS subtree instead of the
+   *  registry-backed scene scan (see {@link setHierarchyRootOverride}). */
+  private _hierarchyRootOverride: import('three').Object3D | null = null;
+
+  /**
+   * Additive, optional root override for the hierarchy panel. A caller can
+   * point the tree at a preview subtree while every other
+   * `currentModelRoot` consumer keeps pointing at the (hidden, untouched)
+   * editor root. Pass null to restore the normal scan.
+   */
+  setHierarchyRootOverride(root: import('three').Object3D | null): void {
+    this._hierarchyRootOverride = root;
+    this.refreshEditableNodes();
+  }
+
+  /** The active hierarchy root override, or null. */
+  get hierarchyRootOverride(): import('three').Object3D | null {
+    return this._hierarchyRootOverride;
+  }
+
+  /**
+   * Override-scan: list the override subtree WITHOUT registry lookups — the
+   * preview nodes are intentionally never registered (read-only, no ops).
+   * Paths come from `NodeRegistry.computeNodePath` (the preview root lives in
+   * the scene). Nodes with component extras carry their types; bare named
+   * meshes get the synthetic 'Geometry' type so the tree is browsable.
+   */
+  private _scanOverrideNodes(root: import('three').Object3D): void {
+    this._editableNodes = [];
+    root.traverse((node) => {
+      const ud = node.userData as Record<string, unknown> | undefined;
+      const rv = ud?.realvirtual as Record<string, unknown> | undefined;
       const types: string[] = [];
-      for (const [key, value] of Object.entries(rv)) {
-        if (isHiddenComponentType(key)) continue;
-        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-          types.push(key);
+      if (rv) {
+        for (const [key, value] of Object.entries(rv)) {
+          if (isHiddenComponentType(key)) continue;
+          if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+            types.push(key);
+          }
         }
       }
-      if (types.length === 0) return;
+      if (types.length === 0) {
+        if (node.type !== 'Mesh' || !node.name) return;
+        types.push('Geometry');
+      }
+      const path = NodeRegistry.computeNodePath(node);
+      if (!path) return;
+      this._editableNodes.push({ path, types });
+    });
+  }
+
+  /**
+   * Populate `_editableNodes` from the current scene (sorted by path). Shared
+   * by onModelLoaded (initial) and refreshEditableNodes (after edits) so the
+   * two never drift. Lists every node that either carries rv_extras component
+   * data OR is an editor-created empty (tagged `__rvAdded` — a structural node
+   * from the Create section's "Empty at Root" / "Empty Child" that has no
+   * components yet). Without the `__rvAdded` clause a freshly created empty is
+   * invisible in the hierarchy until a component or child is added to it.
+   */
+  private _scanEditableNodes(registry: LoadResult['registry']): void {
+    if (!this._viewer) return;
+    this._editableNodes = [];
+    this._viewer.scene.traverse((node) => {
+      const ud = node.userData as Record<string, unknown> | undefined;
+      const rv = ud?.realvirtual as Record<string, unknown> | undefined;
+      const types: string[] = [];
+      if (rv) {
+        for (const [key, value] of Object.entries(rv)) {
+          if (isHiddenComponentType(key)) continue;
+          if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+            types.push(key);
+          }
+        }
+      }
+      if (types.length === 0 && !ud?.['__rvAdded']) return;
       const path = registry.getPathForNode(node);
       if (!path) return;
       this._editableNodes.push({ path, types });
     });
-    this._editableNodes.sort((a, b) => a.path.localeCompare(b.path));
-    this.notify();
+    this._appendGeometryFallback();
+    // NB: intentionally NOT sorted alphabetically. `scene.traverse` visits
+    // pre-order in real `Object3D.children` order, and `buildStructureTree`
+    // inserts children first-seen — so leaving this list in traversal order
+    // makes the hierarchy panel mirror actual scene order. This is what lets
+    // Unity-style drag-reorder be visible; an alphabetical sort here would hide
+    // any sibling-index change made by a reparent/reorder op.
+  }
+
+  /**
+   * Fallback for raw geometry (e.g. STEP import): when the component scan found
+   * NO editable nodes, list the named mesh nodes so the assembly hierarchy is
+   * still browsable/selectable (buildTree reconstructs the group tree from the
+   * paths). These carry a synthetic 'Geometry' type, visible under the "All"
+   * filter. No-op once any rv_extras component exists.
+   */
+  private _appendGeometryFallback(): void {
+    if (this._editableNodes.length > 0 || !this._viewer) return;
+    const registry = this._viewer.registry;
+    if (!registry) return;
+    this._viewer.scene.traverse((node) => {
+      if (node.type !== 'Mesh' || !node.name) return;
+      const path = registry.getPathForNode(node);
+      if (path) this._editableNodes.push({ path, types: ['Geometry'] });
+    });
   }
 
   onModelCleared(): void {
@@ -932,6 +1112,7 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
     this._editableNodes = [];
     this._overlay = null;
     this._selectedNodePath = null;
+    this._hierarchyRootOverride = null;
     this._viewer = null;
     this._glbName = null;
     this.notify();

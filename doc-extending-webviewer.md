@@ -149,10 +149,21 @@ The Unity scene is exported as a **GLB file** with custom `extras` data on each 
 | `Grip` | `RVGrip` | `rv-grip.ts` |
 | `GripTarget` | `RVGripTarget` | `rv-grip-target.ts` |
 | `ConnectSignal` | `RVConnectSignal` | `rv-connect-signal.ts` |
+| `WebError` | `RVWebError` | `rv-web-error.ts` |
+| `WebVisibility` | `RVWebVisibility` | `rv-web-visibility.ts` |
+| `CustomRuntimeInstruction` | `RVCustomRuntimeInstruction` | `rv-custom-runtime-instruction.ts` |
 | `PLCOutputBool/Float/Int` | Signal entry in `SignalStore` | `rv-signal-store.ts` |
 | `PLCInputBool/Float/Int` | Signal entry in `SignalStore` | `rv-signal-store.ts` |
 | `DrivesRecorder` | `RVDrivesPlayback` | `rv-drives-playback.ts` |
 | `ReplayRecording` | `RVReplayRecording` | `rv-replay-recording.ts` |
+
+### Runtime messages and instructions
+
+Three components feed the right-side message panels instead of animating geometry:
+
+- **`WebError` → `RVWebError`** — a single bool error signal plus a text message; while the signal is high the part flashes in its error color, a text badge appears, and the error registers in the `ErrorStore`.
+- **`WebVisibility` → `RVWebVisibility`** — show/hide on a signal, with an optional second error signal that mirrors `WebError`'s behavior.
+- **`CustomRuntimeInstruction` → `RVCustomRuntimeInstruction`** — the richer instruction component: five types (Info / Maintenance / Warning / Error / Success), an ordered step list (each step carries an instruction text, an optional camera target and an optional document URL), an optional dismiss button, and a bool signal that pushes the card on a rising edge and removes it on a falling edge. It registers entries in the `InstructionRuntimeStore` (singleton on `viewer.instructionStore`) and the `CustomRuntimeInstructionPlugin` renders them as cards in the `'messages'` slot. A type-colored highlight gizmo (color from `ErrorColor` when `UseCustomErrorColor` is set, otherwise the type color; blink rate from `BlinkSpeed`) marks the owning node while the card is active. The View button focuses + highlights a step's `targetObject`; the document button opens its `url` in the embedded document viewer. `steps` and `ErrorColor` are read raw from `node.userData.realvirtual` (a nested object list and a Unity `Color` have no schema field type), and the step parser tolerates both a JSON array and the legacy numeric-keyed object form.
 
 ### Component Registry and Auto-Mapping
 
@@ -218,7 +229,7 @@ export class RVMyComponent implements RVComponent {
 
   init(ctx: ComponentContext): void {
     // Called in Step 2 after ALL components exist and ComponentRefs are resolved
-    ctx.registry.register('MyComponent', ctx.registry.pathFor(this.node) ?? '', this);
+    ctx.registry.register('MyComponent', ctx.registry.getPathForNode(this.node) ?? '', this);
   }
 
   dispose(): void { /* cleanup on model unload */ }
@@ -277,7 +288,39 @@ registerCapabilities('AASLink', {
 | `filterLabel` | string/null | `null` | Label in search/filter dropdown |
 | `hoverEnabledByDefault` | boolean | `false` | Auto-enable hover after scene load |
 | `exclusiveHoverGroup` | boolean | `false` | Part of Drive/Sensor/MU toggle group |
-| `simulationActive` | boolean | `false` | Receives onFixedUpdate calls |
+| `authorable` | boolean | `false` | Can be added to a node in the asset editor's "Add Component" section (needs a complete schema — initial values come from `getSchemaDefaults`) |
+
+> **There is no `simulationActive` capability.** Earlier revisions of this table
+> listed one; it never existed in `ComponentCapabilities` and nothing ever read
+> it. A component that needs a per-frame tick gets a **dedicated viewer-owned
+> manager** instead — see § Per-frame components below.
+
+### Per-frame components (the manager pattern)
+
+Components are not ticked by the engine. A component that has to do something
+every frame is driven by a small **viewer-owned manager**, and registers itself
+with it. The live examples are `LampManager` (blink phase), `EnergyChainManager`
+(bone poses) and `RVCollisionManager` (`rv-collision-manager.ts`, plan-394 —
+per-tick AABB + `bvhcast` check between bodies of different `CollisionRole`s;
+it owns the `'collision'` aux-emphasis set and the `CollisionActive` /
+`CollisionCount` / `ResetCollisions` signals, and observes spawned MUs through
+`RVTransportManager.muLifecycleHook`):
+
+1. Write `rv-<name>-manager.ts` with `register` / `unregister` /
+   `update(dt): boolean` / `clear()`. `update` returns whether anything visible
+   changed.
+2. Create it in `RVViewer`'s constructor, expose it as a `readonly` field, and
+   call `clear()` from `clearModel()` **before** the material/geometry teardown.
+3. Thread it through `ComponentContext` (rv-component-registry.ts) and
+   `RuntimeNodeDeps` + both loader contexts (rv-scene-loader.ts) so components
+   reach it from `init()` / `onSceneReady()`.
+4. Tick it in `CoreSubsystems.visuals(dt)` and mark the viewer dirty on `true`.
+   Mark **shadows** dirty too whenever the manager can move geometry: the drive
+   loop only raises that flag for active positioning drives, so a component
+   driven by a live signal or an external transform would otherwise keep a stale
+   shadow.
+5. The component registers itself in `init()`/`onSceneReady()` and unregisters
+   in `dispose()`.
 
 **Querying capabilities:**
 
@@ -402,7 +445,9 @@ property access.
 // Iterate over every node registered in NodeRegistry (has userData.realvirtual).
 // NOTE: This is NOT equivalent to scene.traverse() — it only visits nodes with
 // rv_extras metadata. It does NOT do a full DFS over every Three.js Object3D.
-viewer.eachNode((path: string, node: Object3D) => {
+// NOTE the argument order: the NODE comes first, the path second
+// (`eachNode(fn: (node: Object3D, path: string) => void)`, rv-viewer.ts).
+viewer.eachNode((node: Object3D, path: string) => {
   console.log(path, node.userData.realvirtual);
 });
 
@@ -456,6 +501,7 @@ After loading a GLB, `loadModel()` returns a `LoadResult` with:
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `root` | `Object3D` | The GLB root added to the scene — track the new model without diffing `scene.children` |
 | `drives` | `RVDrive[]` | All drive components |
 | `transportManager` | `RVTransportManager` | Transport surface + MU management |
 | `signalStore` | `SignalStore` | All PLC signals |
@@ -467,7 +513,10 @@ After loading a GLB, `loadModel()` returns a `LoadResult` with:
 | `boundingBox` | `Box3` | Scene bounding box |
 | `triangleCount` | `number` | Total triangle count |
 
-This result is passed to all plugins via `onModelLoaded(result, viewer)`.
+This result is passed to all plugins via `onModelLoaded(result, viewer)`. The table lists the
+fields plugins commonly read; `LoadResult` carries more (`modelConfig`, `recorderSettings`, the
+batching/dedup results, `raycastGeometrySet`, …) — the full shape is in
+[src/core/engine/rv-scene-loader.ts](src/core/engine/rv-scene-loader.ts).
 
 ### NodeRegistry growth from lazy LayoutObject expansion
 
@@ -483,6 +532,8 @@ The hierarchy editor distinguishes three kinds of selection:
 
 The two-argument legacy form `selectNode(path, true)` still works (treated as `source = 'api'`). New plugin code should pass an explicit source.
 
+**Selection-bound 3D overlays:** the reference implementation for a plugin that reacts to selection with a passive scene overlay is [src/plugins/drive-axis-gizmo-plugin.ts](src/plugins/drive-axis-gizmo-plugin.ts) (drive motion axis: double arrow for linear, axis line + rotation ring for rotary drives). It shows the full pattern: subscribe to `viewer.on('selection-changed', …)`, resolve components via `registry.getByPath` with a bounded subtree fallback (a `'viewport'` selection lands on the LayoutObject root, so the drive may sit below the selected path), build shared-geometry meshes on `HIGHLIGHT_OVERLAY_LAYER` with `depthTest:false` (dispose shared resources only in `dispose()`, per deselect just `removeFromParent()`), sync world position/orientation per `onRender` with pre-allocated temps and a null-parent guard, and clean up in `onModelCleared`.
+
 ---
 
 ## 3. Core Plugins
@@ -496,6 +547,8 @@ interface RVViewerPlugin {
   readonly id: string;                  // Unique ID, e.g. 'my-analytics'
   readonly order?: number;              // Execution order (lower = earlier, default: 100)
   readonly handlesTransport?: boolean;  // true = replaces kinematic transport
+  readonly core?: boolean;              // true = always participates (see doc-ui-visibility.md)
+  readonly modes?: ModeId[];            // Workspace modes this plugin runs in (undefined = all)
   readonly slots?: UISlotEntry[];       // Optional UI components for HMI layout slots
 
   /** Called by viewer.use() — receives the narrower PluginContext facade. */
@@ -503,12 +556,27 @@ interface RVViewerPlugin {
 
   onModelLoaded?(result: LoadResult, viewer: RVViewer): void;
   onModelCleared?(viewer: RVViewer): void;
+  onConnectionStateChanged?(state: 'Connected' | 'Disconnected', viewer: RVViewer): void;
   onFixedUpdatePre?(dt: number): void;   // 60Hz, BEFORE drive physics
   onFixedUpdatePost?(dt: number): void;  // 60Hz, AFTER drive physics + transport
   onRender?(frameDt: number): void;      // Per render frame
+
+  // Workspace mode hooks (plan-198) — everything created in onModeActivate MUST
+  // be released in onModeDeactivate; the plugin instance survives mode switches.
+  onModeActivate?(mode: ModeId, viewer: RVViewer): void;
+  onModeDeactivate?(mode: ModeId | null, viewer: RVViewer): void;
+
+  // Render backend switch (plan-256): 'three' → 'omniverse'. Interactive 3D
+  // plugins (raycast/gizmo/camera drag) should tear down under a non-Three backend.
+  onRenderBackendChanged?(backend: 'three' | 'omniverse', viewer: RVViewer): void;
+
   dispose?(): void;                      // Cleanup on viewer destroy
 }
 ```
+
+`core` and `modes` are the **runtime participation** axis; they are compiled into UI visibility
+only by `UIPluginRegistry.register()`, which never reads `core`. Read
+[doc-ui-visibility.md](doc-ui-visibility.md) before using either.
 
 ### Execution Order in fixedUpdate
 
@@ -552,6 +620,7 @@ export class MyAnalyticsPlugin extends RVBehavior {
 | `PLUGIN_ORDER.INTERFACE_ADAPTER` | 10 | Live PLC signal flush from adapter to SignalStore |
 | `PLUGIN_ORDER.MULTIUSER` | 15 | Multiuser session sync (remote drive states, camera) |
 | `PLUGIN_ORDER.UI_CRITICAL` | 50 | UI-critical overlays and sim-controller HMI |
+| `PLUGIN_ORDER.PLC_RUNTIME` | 60 | Virtual PLC scan cycle — after the signal-binding flush, before drive physics |
 | `PLUGIN_ORDER.SIM_DEFAULT` | 100 | Default order if not specified |
 | `PLUGIN_ORDER.DEMO` | 150 | Demo / process-specific plugins |
 | `PLUGIN_ORDER.UI_OVERLAY` | 250 | UI overlays (drive-gizmo, layout-planner, kiosk) |
@@ -570,10 +639,10 @@ interface PluginContext {
   readonly connectionState: 'Connected' | 'Disconnected';
 
   // Sub-facades — always instantiated eagerly, safe to call from init():
-  readonly scene: SceneFacade;       // eachNode, projectToScreen/Point
-  readonly camera: CameraFacade;     // getState, animateTo, setConfig
-  readonly controls: ControlsFacade; // setConfig (rotateSpeed, panSpeed, …)
-  readonly simLoop: SimLoopFacade;   // onTick(stage, callback, order?)
+  readonly scene: SceneFacade;       // eachNode, projectToScreen/Point, highlightByPath, clearHighlight
+  readonly camera: CameraFacade;     // getCameraState, animateCameraTo, fitToNodes, focusByPath, clearFocus
+  readonly controls: ControlsFacade; // setConfig / setRotateSpeed / setPanSpeed / setZoomSpeed / …
+  readonly simLoop: SimLoopFacade;   // onTick(stage, callback, order?), setPaused, eachDrive, driveCount
   readonly modes: ModeFacade;        // active workspace mode + request a switch
 
   loadModel(url: string, opts?: { signalMap?: string }): Promise<void>;
@@ -581,11 +650,22 @@ interface PluginContext {
   emit: EventEmitter<ViewerEvents>['emit'];
 
   // Live getters — may be null before model load; do NOT cache in init():
-  readonly signals: SignalStore | null;
-  readonly nodes: NodeRegistry | null;
+  readonly signals: PluginSignalFacade | null;
+  readonly nodes: Pick<NodeRegistry, 'getNode' | 'getPathForNode' | 'forEachNode'> | null;
   readonly transport: TransportFacade | null;
 }
 ```
+
+**These are narrowed subsets, not the full classes.** `ctx.signals` is *not* a `SignalStore` and
+`ctx.nodes` is *not* a `NodeRegistry` — each exposes only the members listed below. Anything else
+you remember from those classes is deliberately not reachable through the context; reach for the
+full `viewer` if you truly need it.
+
+| Member | Permitted calls |
+|---|---|
+| `ctx.signals` (`PluginSignalFacade`) | `get(name)`, `subscribe(name, cb)`, `set(name, value)`, `setMany(record)` — and nothing else. Writes go through a per-plugin `SignalWriter` tagged with the plugin id, so provenance stays visible. |
+| `ctx.nodes` | `getNode(path)`, `getPathForNode(node)`, `forEachNode(fn)` |
+| `ctx.camera` (`CameraFacade`) | `getCameraState(out?)`, `animateCameraTo(pos, target, durationMs?)`, `fitToNodes(nodes, offsetFactor?)`, `focusByPath(path, offsetFactor?)`, `clearFocus()`. There is **no** `setState`, `animateTo` or `setConfig` on the camera facade — `setConfig` belongs to `ctx.controls`. |
 
 **Important:** `ctx.signals`, `ctx.nodes`, and `ctx.transport` are **live getters**
 that return `null` before a model is loaded. Do **not** cache these in `init()` —
@@ -594,9 +674,11 @@ read them inside callbacks where the model is guaranteed to be present.
 #### BaseViewerPlugin — Recommended Base Class for Context-Aware Plugins
 
 ```typescript
-import { BaseViewerPlugin } from '../core/rv-plugin';
+import { BaseViewerPlugin } from '../core/rv-base-plugin';
 import { PLUGIN_ORDER } from '../core/rv-plugin-order';
 import { TickStage } from '../core/rv-tick-stages';
+import type { RVViewer } from '../core/rv-viewer';
+import type { PluginContext } from '../core/rv-plugin-context';
 
 export class MyPlugin extends BaseViewerPlugin {
   readonly id = 'my-plugin';
@@ -604,8 +686,14 @@ export class MyPlugin extends BaseViewerPlugin {
 
   // init() is called by viewer.use() — context is stored in this.context automatically.
   // Call super.init(viewer, context) if you override.
-  protected override init(viewer: RVViewer, context: PluginContext): void {
+  //
+  // Keep it PUBLIC and keep `context` optional: the base declares
+  // `init(viewer: RVViewer, context?: PluginContext): void` as a public method
+  // (rv-base-plugin.ts), and TypeScript refuses to narrow a public member to
+  // `protected` or to drop the `?` in an override.
+  override init(viewer: RVViewer, context?: PluginContext): void {
     super.init(viewer, context);   // stores context in this.context
+    if (!context) return;          // pre-Phase-4 viewers pass none
 
     // Register a tick callback at the PRE stage (before drive physics):
     this.context.simLoop.onTick(TickStage.PRE, (dt) => {
@@ -915,9 +1003,54 @@ interface MultiuserSnapshot {
 - **Incoming**: If the server sends more than 100 messages per second, a `console.warn` is emitted. No messages are silently dropped — this is a monitoring signal only.
 - **Unity side**: The `MultiplayerWEB` component enforces a `MaxMessagesPerSecond` limit per client (default: 100). Excess messages are dropped with a `Logger.Warning`. The client is not disconnected.
 
+### Registration Origin and Registry Diagnostics
+
+Registration sites may classify plugins with `viewer.use(plugin, origin)`, where `origin`
+is `core`, `commercial`, `internal`, or `project`. Delegating loaders that do not own the
+individual `use()` calls can wrap synchronous registration in
+`viewer.withDefaultOrigin(origin, () => registerPlugins(viewer))`; an explicit origin still
+wins. Read-only diagnostics can use `viewer.getPlugins()` (a defensive copy),
+`viewer.getPluginOrigin(id)` (`unknown` for untagged IDs), and
+`viewer.isPluginDisabled(id)`. The typed `plugins-changed` event fires after successful
+register/enable/disable/remove mutations with `{ kind, id }`, and does not fire for no-ops.
+Internal builds use these APIs for the private **Features** settings tab; that panel is not
+part of customer bundles.
+
+### User Plugin Overrides
+
+The public viewer API can temporarily suppress a registered plugin's lifecycle participation
+without unloading it:
+
+```typescript
+viewer.setPluginUserEnabled('my-plugin', false);
+
+viewer.isPluginUserDisabled('my-plugin'); // true
+viewer.getPluginUserDisabledIds();        // defensive Set<string> copy
+
+viewer.setPluginUserEnabled('my-plugin', true);
+viewer.clearPluginUserOverrides();
+```
+
+A user-disabled plugin is excluded from fixed-update, render, model-load replay, and workspace-mode
+hooks. Disabling an active mode-scoped plugin runs its deactivation hook once; enabling it in its
+active mode restores the applicable lifecycle callbacks. The override survives workspace-mode
+changes, but it is intentionally session-only and is removed when the plugin is unregistered.
+
+This is a lifecycle override, not an unload operation: registered UI slots remain available,
+subscriptions and allocated resources remain owned by the plugin, and the plugin instance stays in
+the registry. Interfaces should therefore describe the action as enabling or disabling lifecycle
+participation, never as removing or unloading the plugin. `clearPluginUserOverrides()` returns all
+overridden plugins to their normal workspace-mode-driven state; it does not restore a captured
+snapshot.
+
+Successful override changes emit `plugins-changed` with `kind: 'user-disabled'` or
+`kind: 'user-enabled'`. Unknown plugin IDs and repeated requests for the current user-intent state
+are no-ops and emit no event.
+
 ### Retroactive Registration
 
-If a plugin is registered after a model is already loaded, `onModelLoaded` is called immediately:
+If a plugin is registered after a model is already loaded, `onModelLoaded` is normally called
+immediately:
 
 ```typescript
 // Model loaded at t=0
@@ -926,6 +1059,13 @@ await viewer.loadModel('scene.glb');
 // Plugin registered at t=5 — onModelLoaded fires right away
 viewer.use(new LatePlugin());
 ```
+
+**"Immediately" has two exceptions** (`rv-viewer.ts`, `use()`): the call is *skipped* when the
+plugin is currently disabled, or when it declares `modes` and none of them is the active workspace
+mode. In both cases the plugin id is parked in `_missedModelLoad` and the call is **replayed** the
+moment the plugin is enabled — i.e. on the mode transition that activates it. A mode-scoped plugin
+must therefore not assume `onModelLoaded` has already run by the time `init()` returns; do model-
+dependent setup in `onModelLoaded` / `onModeActivate`, never in `init()`.
 
 ### Plugin Order
 
@@ -950,7 +1090,11 @@ The canonical import path for `ViewerEvents` is:
 import type { ViewerEvents } from './core/rv-viewer-events';
 ```
 
-The full `ViewerEvents` interface lives at [src/core/rv-viewer-events.ts](src/core/rv-viewer-events.ts). Snapshot of the categories:
+The full `ViewerEvents` interface lives at [src/core/rv-viewer-events.ts](src/core/rv-viewer-events.ts).
+**The snapshot below is a partial catalog** — roughly two thirds of the declared events, picked to
+show the categories. It is not kept exhaustive on purpose; around two dozen further events (scene
+lifecycle, diagnostics, render-mode, snap/drag, MCP and multiuser channels) exist only in the
+source. Treat `rv-viewer-events.ts` as the list, this table as the map:
 
 ```typescript
 interface ViewerEvents {
@@ -964,8 +1108,10 @@ interface ViewerEvents {
   'object-hover':       ObjectHoverData | null;       // { node, nodeType, nodePath, pointer, hitPoint, mesh }
   'object-unhover':     ObjectUnhoverData;            // { node, nodeType }
   'object-click':       ObjectClickData;              // { node, nodeType, nodePath, pointer }
-  'object-clicked':     { path: string; node: Object3D };
-  'object-focus':       { path: string; node: Object3D };
+  'object-clicked':     { path: string; node: Object3D; hitPoint?: [number, number, number] };
+  // openInspector === false (F shortcut) frames the camera only — listeners must
+  // NOT open or reveal the inspector. Omitted/true (double-click) opens as before.
+  'object-focus':       { path: string; node: Object3D; openInspector?: boolean };
   'object-blur':        void;                          // previous focus was cleared
   'selection-changed':  SelectionSnapshot;
   'exclusive-hover-mode': { mode: HoverableType | null };
@@ -978,7 +1124,8 @@ interface ViewerEvents {
   'groups-overlay-toggle': { open: boolean };
 
   // Generic component lifecycle event — emitted by drives, sensors, MUs and plugin-defined components.
-  // Known: sensor/changed { occupied }, mu/spawned { totalSpawned }, mu/consumed { totalConsumed }.
+  // Known: sensor/changed { occupied }, mu/spawned { totalSpawned },
+  //        mu/consumed { totalConsumed }, drive/at-target { position }.
   'component-event': {
     componentType: string;
     kind: string;
@@ -1008,8 +1155,14 @@ interface ViewerEvents {
   'fpv-enter':              void;
   'fpv-exit':               void;
 
-  // Layout planner
-  'layout-transform-update': { path: string; position: {x,y,z}; rotation: {x,y,z} };
+  // Layout planner — position/rotation/scale are TUPLES, not {x,y,z} objects
+  'layout-transform-update': {
+    path: string;
+    position: [number, number, number];
+    rotation: [number, number, number];
+    scale?: [number, number, number];
+    visible?: boolean;
+  };
 }
 ```
 
@@ -1050,6 +1203,35 @@ useSimulationEvent('component-event', (e) => {
 ## 5. UI Slots (React Components in Plugins)
 
 Plugins can provide UI by declaring a `slots` array on `RVViewerPlugin`. Slot entries are automatically registered into the HMI layout when `viewer.use()` is called.
+
+> **Before you gate a slot by mode, read [doc-ui-visibility.md](doc-ui-visibility.md).**
+> Whether a plugin *runs* and whether its UI is *shown* are two separate axes. `modes`/`core`
+> decide participation; `UIPluginRegistry.register` compiles `modes` (and never `core`) into the
+> slot's `shownOnlyInAny` rule. So `core: true` + `modes: ['hmi']` means "runtime runs in every
+> mode, UI appears only in hmi" — and a `shownOnlyInAny` you write on the entry yourself is
+> replaced, not merged.
+
+> **Your new plugin appears in the Viewer workspace unless you say otherwise.**
+> `modes: undefined` means "every mode", and the `viewer` mode (plan-387) is meant to stay
+> nearly empty — model, kinematics, Settings, view/grouping controls. If your slot is anything
+> an operator or engineer uses, gate it. Two rules of thumb:
+>
+> - **A `button-group` entry with no `visibilityRule` needs NOTHING.** `ButtonPanel` already
+>   hides ruleless buttons in every focused (non-hmi) mode, Viewer mode included. Adding `modes`
+>   to such a plugin is actively harmful: it compiles a rule, the ruleless branch stops
+>   applying, and the button becomes visible in DES/Planner/Editor where it never was.
+> - **Anything else needs an explicit rule.** Prefer `hiddenIn: [modeContext('viewer')]` on the
+>   slot entry over `modes`, because `modes` compiles to `shownOnlyInAny` — a positive list that
+>   fails CLOSED whenever no `mode:*` context is active (before mode boot, and in the CONNECT
+>   embed path which skips it). Reach for `modes` only when you also want the plugin's *runtime*
+>   off in that mode.
+>
+> **The `visibilityId` requirement is `SlotRenderer`-only.** `SlotRenderer` (`HMIShell.tsx`)
+> applies a rule **only when the entry also carries a `visibilityId`** — without one your rule is
+> silently ignored there. `ButtonPanel`, `ActivityBar` and `MessagePanel` evaluate
+> `entry.visibilityRule` directly via `evaluateVisibilityRule()` and need no id. Note that a
+> plugin declaring `modes` gets a `visibilityId` auto-assigned by `UIPluginRegistry.register()`,
+> so this only bites hand-written rules on `overlay` / `views` / `kpi-bar` / `search-bar` entries.
 
 ### Available Layout Slots
 
@@ -1278,10 +1460,14 @@ function SensorTooltipContent({ data }: TooltipContentProps) {
 tooltipRegistry.register({ contentType: 'sensor', component: SensorTooltipContent });
 
 tooltipRegistry.registerDataResolver('sensor', (node, viewer) => {
-  const path = viewer.registry.pathFor(node) ?? node.name;
-  const sensor = viewer.sensors.find(s => s.path === path);
+  // `viewer.registry` is `NodeRegistry | null` (null before a model loads), and the
+  // path lookup is `getPathForNode(node)` — there is no `pathFor()`.
+  const path = viewer.registry?.getPathForNode(node) ?? node.name;
+  // Sensors live on the transport manager, not on the viewer: there is no
+  // `viewer.sensors`. Match by node identity — RVSensor has no `path` field.
+  const sensor = viewer.transportManager?.sensors.find(s => s.node === node);
   if (!sensor) return null;
-  return { type: 'sensor', sensorName: node.name, occupied: sensor.occupied };
+  return { type: 'sensor', sensorName: node.name, path, occupied: sensor.occupied };
 });
 ```
 
@@ -1466,6 +1652,50 @@ const toggle = (id: string) => setOpenChart(prev => prev === id ? null : id);
 
 ---
 
+## 8b. Contributing a Help Topic
+
+> **Internal, not a guaranteed API.** This registry is deliberately unsealed: it may change
+> shape without notice until real plugin use cases have shaped it. Do not depend on it from a
+> customer deliverable yet.
+
+The help button and <kbd>F1</kbd> derive their target from the most recently opened window and
+the active workspace mode (see *Context-Sensitive Help* in `doc-webviewer.md`). A plugin that
+owns a piece of UI which is not a docked window can contribute its own documentation page:
+
+```typescript
+import { registerHelpTopic } from '../core/hmi/help-topic-registry';
+
+private unregisterHelp: (() => void) | null = null;
+
+init(viewer) {
+  // No priority argument — every plugin contribution sits on the fixed top rank (40),
+  // above the open window (30) and the workspace mode (20).
+  this.unregisterHelp = registerHelpTopic(
+    'plugin:my-plugin', { slug: 'planning/des', anchor: 'setup' },
+  );
+}
+
+dispose() {
+  this.unregisterHelp?.();
+  this.unregisterHelp = null;
+}
+```
+
+Rules worth knowing:
+
+- **Always unregister in `dispose()`.** The core context cannot go stale (it is read fresh on
+  every call), but a plugin contribution can — it is the one thing that survives a model switch
+  on its own.
+- **Registration order decides among contributions.** `Map.set()` does not move an existing key,
+  so re-registering the same `sourceId` updates its topic but keeps its position. Unregister and
+  register again to move it.
+- **A stale disposer is harmless.** Each registration carries a generation number; a disposer
+  from a superseded registration is ignored rather than deleting the newer entry.
+- **Notification is content-based.** Re-registering an identical `{slug, anchor}` — even as a
+  freshly allocated object — notifies nobody.
+- **Plugin slugs are not validated.** Core topics are checked against the offline sitemap
+  snapshot in `help-topics.ts`; a plugin may point at its own documentation set instead.
+
 ## 9. Left Panels (Docked Side Panels)
 
 Use the `LeftPanel` component and `LeftPanelManager` to create docked side panels — the same pattern used by the Hierarchy Browser, Property Inspector, Settings, and Machine Control panels.
@@ -1492,9 +1722,16 @@ import { useSyncExternalStore } from 'react';
 
 const lpm = viewer.leftPanelManager;
 const snapshot = useSyncExternalStore(lpm.subscribe, lpm.getSnapshot);
-// snapshot.activePanel  — 'my-panel' | null
-// snapshot.activePanelWidth — number
+// snapshot.activePanel      — 'my-panel' | null   (LEFT slot; backward-compat alias)
+// snapshot.activePanelWidth — number              (LEFT slot)
+// snapshot.left / .right    — per-side slot state
+// snapshot.lastOpenedSide   — 'left' | 'right' | null
 ```
+
+`lastOpenedSide` names the side whose window was opened most recently. Left and right can hold a
+panel at the same time, so consumers that need exactly ONE window (the context-sensitive help
+does) use it to break the tie. It is re-derived when a panel closes and when `restore()` runs,
+and it is deliberately **not** persisted — it is session state, not a setting.
 
 ### LeftPanel Component
 
@@ -1531,7 +1768,10 @@ import { IconButton, Box, Typography } from '@mui/material';
 import { Analytics } from '@mui/icons-material';
 import { useViewer } from '../hooks/use-viewer';
 import { LeftPanel } from '../core/hmi/LeftPanel';
-import type { RVViewerPlugin, UISlotEntry } from '../core/rv-plugin';
+// Two modules: rv-plugin.ts exports ONLY RVViewerPlugin; UISlotEntry lives in rv-ui-plugin.ts.
+import type { RVViewerPlugin } from '../core/rv-plugin';
+import type { UISlotEntry } from '../core/rv-ui-plugin';
+import type { RVViewer } from '../core/rv-viewer';
 
 const PANEL_ID = 'my-status';
 const PANEL_WIDTH = 320;
@@ -1712,7 +1952,11 @@ class MockHost {
 
 ## 12. Existing Plugins Reference
 
-### Core Plugins (`core: true` — always loaded, survive model switches)
+> **These tables are not exhaustive.** `src/plugins/` holds well over fifty entries; the lists
+> below name the ones a plugin author is most likely to read as a reference. The authoritative
+> answer to "is this plugin core?" is the `readonly core = true` line in its own source file.
+
+### Core Plugins (`core: true` — always participate, survive model switches)
 
 | Plugin | ID | File | Purpose |
 |--------|----|------|---------|
@@ -1720,9 +1964,17 @@ class MockHost {
 | `SensorMonitorPlugin` | `sensor-monitor` | [src/plugins/sensor-monitor-plugin.ts](src/plugins/sensor-monitor-plugin.ts) | Event-based sensor change tracking |
 | `TransportStatsPlugin` | `transport-stats` | [src/plugins/transport-stats-plugin.ts](src/plugins/transport-stats-plugin.ts) | 10 Hz spawn/consume RingBuffers |
 | `CameraEventsPlugin` | `camera-events` | [src/plugins/camera-events-plugin.ts](src/plugins/camera-events-plugin.ts) | Emits `camera-animation-done` |
+| `CameraStartposPlugin` | `camera-startpos` | [src/plugins/camera-startpos-plugin.tsx](src/plugins/camera-startpos-plugin.tsx) | Per-model start position presets — the canonical `core: true` + mode-scoped-UI case (see [doc-ui-visibility.md](doc-ui-visibility.md) §4) |
 | `RvExtrasEditorPlugin` | `rv-extras-editor` | [src/core/hmi/rv-extras-editor.tsx](src/core/hmi/rv-extras-editor.tsx) | Hierarchy browser + property inspector |
-| `DebugEndpointPlugin` | `debug-endpoint` | [src/plugins/debug-endpoint-plugin.ts](src/plugins/debug-endpoint-plugin.ts) | `/__api/debug` HTTP bridge (dev) |
-| `McpBridgePlugin` | `mcp-bridge` | [src/plugins/mcp-bridge-plugin.ts](src/plugins/mcp-bridge-plugin.ts) | Claude MCP WebSocket bridge (dev) |
+| `AdaptiveNavPlugin` | `adaptive-nav` | [src/plugins/adaptive-nav-plugin.ts](src/plugins/adaptive-nav-plugin.ts) | Scene-size-aware navigation defaults |
+| `ConnectionSystemPlugin` | `connection-system` | [src/plugins/connection-system-plugin.ts](src/plugins/connection-system-plugin.ts) | Typed connection registry session (see §22) |
+| `KioskPlugin` | `kiosk` | [src/plugins/kiosk-plugin.tsx](src/plugins/kiosk-plugin.tsx) | Kiosk chrome + idle detection / tour |
+| `SignalBindPlugin` | `signal-bind` | [src/plugins/signal-bind/SignalBindPlugin.ts](src/plugins/signal-bind/SignalBindPlugin.ts) | Signal ↔ component binding popover and persistence |
+
+**`SignalBindPlugin`'s click-to-open popover is mode-gated at the click handler**, not by slot
+visibility: `object-clicked` returns early unless `isSignalLinkModeActive()` is true (an explicit
+link-mode toggle or a running signal drag), so an ordinary scene click never surfaces the binding
+popover.
 
 ### Optional Plugins (registered eagerly, opt-in via model config)
 
@@ -1734,7 +1986,9 @@ class MockHost {
 | `AnnotationPlugin` | `annotations` | [src/plugins/annotation-plugin.ts](src/plugins/annotation-plugin.ts) | 3D markers, labels, drawing |
 | `AasLinkPlugin` | `aas-link` | [src/plugins/aas-link-plugin.tsx](src/plugins/aas-link-plugin.tsx) | AAS / AASX linking + tooltip |
 | `DocsBrowserPlugin` | `docs-browser` | [src/plugins/docs-browser-plugin.tsx](src/plugins/docs-browser-plugin.tsx) | PDF / docs browser overlay |
-| `CameraStartposPlugin` | `camera-startpos` | [src/plugins/camera-startpos-plugin.tsx](src/plugins/camera-startpos-plugin.tsx) | Per-model start position presets |
+| `CollisionAlertPlugin` | `collision-alert` | [src/plugins/collision-alert-plugin.tsx](src/plugins/collision-alert-plugin.tsx) | Collision alert tiles in the `messages` slot (order 6), fed by `RVCollisionManager` |
+| `DebugEndpointPlugin` | `debug-endpoint` | [src/plugins/debug-endpoint-plugin.ts](src/plugins/debug-endpoint-plugin.ts) | `/__api/debug` HTTP bridge (dev) — **not** `core` |
+| `McpBridgePlugin` | `mcp-bridge` | [src/plugins/mcp-bridge-plugin.ts](src/plugins/mcp-bridge-plugin.ts) | Claude MCP WebSocket bridge (dev) — **not** `core` |
 | `BlueprintPlugin` | `blueprint` | [src/plugins/blueprint-plugin.ts](src/plugins/blueprint-plugin.ts) | Blueprint / 2D plan view |
 | `DriveRecorderPlugin` | `drive-recorder` | [src/plugins/drive-recorder-plugin.ts](src/plugins/drive-recorder-plugin.ts) | Drive recording at runtime |
 | `SensorRecorderPlugin` | `sensor-recorder` | [src/plugins/sensor-recorder-plugin.ts](src/plugins/sensor-recorder-plugin.ts) | Sensor history recording |
@@ -1766,8 +2020,22 @@ class MockHost {
 Plugins are organized into three tiers:
 
 1. **Core plugins** (`core: true`) — Always loaded, survive model switches. Cannot be removed via `removePlugin()`.
-2. **Global private plugins** — Always loaded when the private folder is present (e.g., LayoutPlanner, DES).
+2. **Global plugins from the private sibling** — Always loaded when the private folder is present.
 3. **Model-specific plugins** — Loaded/unloaded dynamically when a model is loaded or switched.
+
+> **LayoutPlanner and DES are in the PUBLIC tree** (`src/plugins/layout-planner/`,
+> `src/plugins/des/`) — an older revision of this page listed them as private examples; they are
+> not. The actual split inside the private sibling is two entry points, and they are different
+> tiers:
+>
+> | Entry point | Tier | Reaches |
+> |---|---|---|
+> | `private-plugins.ts` | customer | every build that has the private folder. `main.ts` awaits `registerPrivatePlugins(viewer)`; the public build resolves it to the no-op stub in `src/private-stubs/`. |
+> | `internal-plugins.ts` | internal | realvirtual-internal builds only, behind a `__RV_INTERNAL__`-gated dynamic import (Omniverse render backend, physics provider, Features tab). |
+>
+> Both must finish registering before the workspace-mode registration in `main.ts`, because they
+> can contribute modes and component types. See [doc-deploy.md](doc-deploy.md) for which tier ends
+> up in which artifact.
 
 Each model declares which plugins it needs via a `plugins/index.ts` entry point. When switching models, the previous model's plugins are fully unloaded (disposed, UI slots removed) and the new model's plugins are loaded.
 
@@ -2051,14 +2319,31 @@ registerUIElement('my-panel', { hiddenIn: ['fpv', 'planner'] });
 registerUIElement('kiosk-overlay', { shownOnlyIn: ['kiosk'] });
 ```
 
-**From settings.json** — the `uiVisibility` block in settings.json overrides code-declared defaults (see [doc-webviewer.md](doc-webviewer.md) for format).
+**From settings.json** — the key is `ui.visibilityOverrides` (there is no `uiVisibility` block).
+It is a `Record<elementId, UIVisibilityRule>` on `RVAppConfig.ui`
+([rv-app-config.ts](src/core/rv-app-config.ts)), applied once in `main.ts` at startup and
+overriding code-declared defaults:
+
+```json
+{ "ui": { "visibilityOverrides": { "kpi-bar": { "hiddenIn": ["fpv", "xr"] } } } }
+```
+
+Startup order matters in one direction: `registerUIElement` **overwrites unconditionally**, and
+`SlotRenderer` re-registers a slot entry's compiled rule on every render. So for an id owned by a
+slot entry (a plugin declaring `modes`), the compiled `modes` rule wins over
+`ui.visibilityOverrides` — the override sticks only for ids registered by `useUIVisible`/chrome.
+See [doc-ui-visibility.md](doc-ui-visibility.md).
 
 ### Rule Precedence
 
+Evaluated in this order by `evaluateVisibilityRule()` ([ui-context-store.ts](src/core/hmi/ui-context-store.ts)):
+
 1. Unknown element (no rule) → **visible**
-2. `shownOnlyIn` defined and not ALL listed contexts active → **hidden**
-3. `hiddenIn` — if ANY listed context is active → **hidden**
-4. Otherwise → **visible**
+2. `shownOnlyInAny` defined and NO listed context active → **hidden** (OR gate — checked FIRST,
+   before `shownOnlyIn`; this is what `plugin.modes` compiles into)
+3. `shownOnlyIn` defined and not ALL listed contexts active → **hidden**
+4. `hiddenIn` — if ANY listed context is active → **hidden**
+5. Otherwise → **visible**
 
 Rules compose with the existing `H` key HMI toggle via AND logic: `{hmiVisible && useUIVisible('element') && <Element />}`
 
@@ -2151,7 +2436,7 @@ The `GizmoOverlayManager` is the central tool for rendering visual overlays on t
 ### Public API
 
 ```typescript
-import type { GizmoOverlayManager, GizmoShape, GizmoOptions, GizmoHandle } from '@/core';
+import type { GizmoOverlayManager, GizmoShape, GizmoOptions, GizmoHandle } from '@rv/core';
 
 // Available on every viewer:
 viewer.gizmoManager.create(node, opts): GizmoHandle;
@@ -2192,7 +2477,7 @@ interface GizmoOptions {
 
 ### Keeping 3D UI out of SSAO
 
-The viewer runs Screen-Space Ambient Occlusion (`GTAOPass` / `N8AO`) inside the
+realvirtual runs Screen-Space Ambient Occlusion (`GTAOPass` / `N8AO`) inside the
 `EffectComposer`. GTAO builds its **own** depth+normal gbuffer with a
 `scene.overrideMaterial`, so a gizmo's `depthWrite: false` does **not** keep it
 out of SSAO — **only the camera layer mask does**. Any 3D UI left on the default
@@ -2316,7 +2601,7 @@ class MyHoverableComponent implements RVComponent {
 All WebSensor visual parameters (state colors, opacities, blink rates, default shape, default size, default int→state map) are **hardcoded constants** but **overridable** at runtime via a config API. Call this from a model's `index.ts` (per-project styling) or from the app bootstrap (global corporate design):
 
 ```typescript
-import { initWebSensor, resetWebSensorConfig } from '@/core';
+import { initWebSensor, resetWebSensorConfig } from '@rv/core';
 
 // Brand-color override + slower warning blink + custom int mapping
 initWebSensor({
@@ -2395,6 +2680,39 @@ Both expose RingBuffers via the plugin instance — read them through `usePlugin
 
 [src/plugins/order-manager-plugin.tsx](src/plugins/order-manager-plugin.tsx). Production order list / status panel — useful for OEE-style demos and operator HMIs. Reads orders from the plugin's own state; pair with a custom feeder plugin for live data.
 
+## 21. Unified CAD Import (Provider Registry)
+
+One "Import" entry point ([src/plugins/unified-import/](src/plugins/unified-import/)) serves all geometry sources through a provider registry in the core ([src/core/import/rv-import-provider.ts](src/core/import/rv-import-provider.ts)). The dialog renders one tab per registered provider and offers the sink choice explicitly:
+
+- **Add to current scene** (additive, default) — `viewer.importObject(items, options)` places through the layout planner: `AddPlacementOp` in the scene op log, full undo/redo, autosave. It never calls `loadModel`/`clearModel`; the existing scene is untouched. Non-catalog results (raw GLB bytes, parsed CAD trees) are first written into the Local Working Folder (`library/imports/`) as a regular catalog asset so the placement survives reloads; without a working folder the import still places (blob URL) but is flagged as non-persistent with a visible warning.
+- **Open as new scene** (replace) — `openImportAsNewScene(viewer, item)` from [src/core/import/rv-import-object.ts](src/core/import/rv-import-object.ts) loads via `viewer.loadModel()` (clears the scene). STEP results go through `preParsedRoot` — no GLB round-trip.
+
+### Writing a provider
+
+Implement `CadImportProvider` and register it:
+
+```ts
+import { importProviderRegistry, type CadImportProvider } from '.../core/import/rv-import-provider';
+
+const provider: CadImportProvider = {
+  id: 'my-source',
+  label: 'My Source',
+  availability: () => 'ready',            // 'ready' | 'needs-setup' | 'connecting' — reactive, not a sync boolean
+  onAvailabilityChange: (cb) => myStore.subscribe(cb),
+  renderConfigTab: (ctx) => <MyTab ctx={ctx} />,   // call ctx.setInput(...) when the user picked something
+  resolve: async (input) => ({ ok: [/* object3d | glb | catalog items */], failed: [] }),
+};
+importProviderRegistry.register(provider);
+```
+
+Notes:
+
+- `resolve()` supports **partial success** (`{ ok, failed }`); a throwing resolve is normalized by `resolveProviderSafe()` — errors surface in the dialog, never silently.
+- Registering an existing id **replaces** the previous provider (logged warning) — registration is idempotent for HMR.
+- Commercial providers (STEP, Unity Asset Manager, Onshape) register from the private repo; a public build only carries the core GLB-file provider.
+- Additive placement auto-align (`pivotToFloorCenter`/`alignToFloor`) can be skipped per import via `importObject(..., { skipAutoAlign: true })` — required for multi-part CAD assemblies with a functional origin. The dialog exposes this as the "Auto-align to floor" checkbox.
+- The additive STEP provider has a kill switch: set localStorage `rv.import.stepAdditive` to `off` to unregister it without affecting other providers.
+
 ### Blueprint / 2D plan view
 
 [src/plugins/blueprint-plugin.ts](src/plugins/blueprint-plugin.ts). Top-down 2D plan view overlay; useful as a mini-map or layout preview.
@@ -2409,14 +2727,14 @@ Both expose RingBuffers via the plugin instance — read them through `usePlugin
 
 ### Pause-Reason Pattern (Defense-in-Depth)
 
-The viewer's pause state is a **set of named reasons**, not a boolean. Multiple subsystems can hold pause simultaneously (`viewer.setSimulationPaused('my-reason', true)`), and the simulation only resumes when every reason has been released. The same `reason` string can be set/cleared multiple times — only set membership matters.
+The simulation pause state in realvirtual is a **set of named reasons**, not a boolean. Multiple subsystems can hold pause simultaneously (`viewer.setSimulationPaused('my-reason', true)`), and the simulation only resumes when every reason has been released. The same `reason` string can be set/cleared multiple times — only set membership matters.
 
 Existing reasons: `'user'` (SimController), `'layout-edit'` (Layout-Planner), `'ar-placement'` (WebXR), `'shared-view'` (Multiuser).
 
 To safely participate without leaking a frozen simulation, plugins must release their reason on every shutdown path. **Defense-in-Depth, three stages**:
 
 1. **UI close path** — every code path that closes the plugin's panel/mode must call the same release. Audit every `onClick`, `lpm.close()`, `setActive(false)` and confirm they end with `viewer.setSimulationPaused(myReason, false)`.
-2. **`dispose()` safety net** — release the reason unconditionally in `dispose()`. Catches the case where the user closes the viewer / swaps the model while the panel is still open.
+2. **`dispose()` safety net** — release the reason unconditionally in `dispose()`. Catches the case where the user closes realvirtual / swaps the model while the panel is still open.
 3. **Manual escape (dev tools only)** — `viewer.clearPauseReasons(reason?)` exists as a last-resort override. It logs a `[SimControl]` warning so leaks remain observable; never call it from production code paths.
 
 Reference implementations: [src/plugins/sim-controller/index.ts](src/plugins/sim-controller/index.ts) and the `setActive` / `dispose` of [src/plugins/layout-planner/index.ts](src/plugins/layout-planner/index.ts).
@@ -2424,3 +2742,173 @@ Reference implementations: [src/plugins/sim-controller/index.ts](src/plugins/sim
 ### Where the public RVViewer API is documented
 
 There is no separate API reference yet. The authoritative surface is [src/core/rv-viewer.ts](src/core/rv-viewer.ts) (search for `class RVViewer` and `interface ViewerEvents`). Most plugin-relevant calls are described in §3 (RVViewerPlugin / RVBehavior), §4 (Events), §5 (UI Slots), §9 (Left Panels), §13 (Per-Model Plugins) above.
+
+## 21b. Physics Provider Registry (optional physics zones)
+
+The zone-based physics feature (see "Physics Zones (optional)" in [doc-webviewer.md](doc-webviewer.md)) follows the same public-interface / private-provider split as the IK solver: the AGPL core ships only the contract and a registry singleton in [src/core/engine/rv-physics-registry.ts](src/core/engine/rv-physics-registry.ts); the actual engine (Rapier, Rust → WASM) is a private provider. Without a registered provider the feature is a **strict no-op** — kinematic transport runs unchanged and no physics code is loaded.
+
+```ts
+import { physicsRegistry, type PhysicsProvider } from '.../core/engine/rv-physics-registry';
+
+physicsRegistry.register(myProvider);   // private side; pass null to unregister
+```
+
+`PhysicsProvider` is deliberately dependency-free (lean `{x,y,z}` structural types, no Three.js, no engine types). The contract in short:
+
+- **Lifecycle**: `init()` (lazy, re-entrancy-safe — loads the WASM on demand), `dispose()` (must free the WASM world; safe during a pending init), `ready`, and a `failed` fail-off latch: after the first `step()` exception the provider disables itself permanently (one error log, every further call is a no-op).
+- **World building**: `addZone` (application-level AABB + per-zone config; first zone wins on overlap), `addStaticBox`, `addConveyor` / `setConveyorVelocity` (kinematic velocity-based belts), `addSensorBox`, `addDynamicMU` (kinematic → dynamic handover with an explicit initial velocity), `removeBody` (two-phase and idempotent — bodies are freed at the end of the next step, never mid-tick).
+- **Per tick**: `step(dt)` (fixed accumulator dt only), `syncPoses(out)` (zero-GC readback — the callback receives reused pos/quat objects, copy immediately), `getSettledBodies(maxLinVel, uprightToleranceDeg)` (call exactly once per tick), `castRay`, and the `onSensorEvent` enter/leave callback.
+
+**`IPhysicsMUHook`** (same file) is the narrow injection seam between the transport manager and the physics lifecycle owner (pattern: `IAccumulationQuery`): the physics plugin registers itself as `transportManager.physicsMUHook`, and every MU dispose path — swap-and-pop removal, `reset()` (sim stop/reset, model clear, kernel mode switch) and `removeMU()` — calls `onMUDisposed(mu)` **before** `mu.dispose()`, so no physics body is ever orphaned.
+
+**`IMULifecycleHook`** (`rv-transport-manager.ts`, plan-394) is the second seam of that shape and exists for the opposite direction: `onMUSpawned(mu, role)` fires right after a source pushed a new MU, `onMURemoved(mu)` on every dispose path. It is needed because a spawned MU cannot carry its own configuration — the clone paths call `stripComponentMetadata()`, which deletes `userData.realvirtual` so a clone never resurrects as a live component. Anything an MU should inherit is therefore handed over by its source at spawn time; the collision manager uses it for `Source.CollisionRoleForMUs`.
+
+Read-only diagnostics live in the `physicsDiagnostics` singleton (same module): `{ active, zones, bodies, stepMs }`, mutated in place by the provider's plugin and consumed by the Settings → Simulation line and the `web_transport_status` MCP tool.
+
+The private reference implementation is `RapierPhysicsProvider` + `PhysicsZonePlugin` (lifecycle owner: world build per model load, step/sync per tick, settle return, DES/multiuser/reset guards) in the private repo.
+
+## 22. Typed Connections (Script API)
+
+Typed, directed connections ([src/core/engine/rv-connection-registry.ts](src/core/engine/rv-connection-registry.ts)) link two components as a named **bidirectional call**: request parameters out, deferred response parameters back through a reply handle — no Promise/await, deterministic in both kernels. Edges + user-defined type signatures live in the rv-ODT `Connections` block (see `schema/v1/specification.md`, section 7g); the Property Inspector's Connections section and Shift+Drag create them in the editor (op-logged, undoable).
+
+### Station side — the built-in `StopOnExit` type
+
+Connect a **sensor** (source) to a **station script** (target). When an MU reaches the sensor it is already stopped (single-MU hold on accumulating surfaces, belt stop otherwise / for instanced MUs) before the handler fires:
+
+```js
+function setup(self) {
+  return {
+    onArrival(mu) {                      // "sensor: got one" — mu is already held
+      self.setState('processing'); self.statState('Working'); self.statCycleStart();
+      self.in(self.prop.ProcessTime, 'done', mu);
+    },
+    des: { on(hook, mu) {
+      if (hook === 'done') {
+        self.statCycleEnd(); self.statOutput(1);
+        self.setState('idle'); self.statState('Empty');
+        mu.release();                    // "station: done, may pass" — frees the hold
+      }
+    } },
+  };
+}
+```
+
+`mu.release()` frees whatever hold mode was applied; a double release is a no-op. The per-edge `ProcessTime` config is authored in the inspector and arrives via `self.prop`.
+
+### Custom types — `self.connection(type).call` / `onRequest`
+
+User-defined types carry their request/response parameter schemas as DATA in `connectionTypes` — the inspector renders typed fields and the runtime validates parameters (missing → default + warning, type mismatch → default + warning):
+
+```js
+// Target (receiver) — reply now or in a later tick (deferred handle):
+onRequest(topic, params, reply) {
+  if (topic === 'QualityCheck') {
+    self.in(2.0, 'inspected', null, { params: params, reply: reply });
+  }
+},
+des: { on(hook, mu, data) {
+  if (hook === 'inspected') data.reply({ pass: true, defects: 0 });
+} }
+
+// Source (sender) — 1:n fan-out; onReply fires once per replying target:
+var n = self.connection('QualityCheck').call({ partId: 42, imageRef: 'img://x' }, function (resp) {
+  if (!resp.pass) self.raiseError('QC', 'part failed inspection');
+});
+```
+
+Rules: a reply handle answers **exactly once** (duplicates are ignored with a warning); open handles are invalidated on `simulation-reset` and dispose (no ghost replies); cyclic edges (A→B→A) are allowed but dispatch is depth-guarded and edge creation warns. Delivery to the target is scheduled on the target's own event list — never re-entrant into the caller's tick.
+
+### Live geometry in DES hooks (FastForward note)
+
+In DES FastForward the runner normally skips per-frame animation and only "settles" tween positions to the exact simulation time before events dispatch when a component in the model needs it. Script components with DES hooks (`des: { on(...) }`, `des.onAccept`, ...) count as needing it: while at least one active script component with DES hooks exists, the event-time settle stays on, so reading live world transforms (`node.worldPosition()` etc.) inside a hook always sees exact positions — at the cost of the model-wide FastForward fast path. Prefer values carried in event data (`self.in(delay, hook, mu, data)`) over sampling world transforms inside DES hooks when you do not actually need live geometry; the DES lint flags `worldPosition()`/`worldQuaternion()`/`worldDirection()` in DES-hook components with a hint for this reason. (Built-in material-flow definitions declare the same need explicitly via `des: { samplesLiveGeometry: true }`.)
+
+### Host-side extension points
+
+- `registerBuiltinConnectionType({ type, config, configDefaults, description })` — add an engine-semantic type (module-load side effect, like `registerComponent`).
+- `getConnectionSystem()` — the session registry: `addConnection` / `removeConnection` / `outOf(path)` / `into(path)` / `registerEndpoint(path, { onRequest?, onArrival? })` / `call(...)`.
+- Cable layer: [src/plugins/connection-gizmo-plugin.ts](src/plugins/connection-gizmo-plugin.ts) draws one `link-line` gizmo per resolvable edge (color by type via `connectionTypeColor`), toggleable through the `connections` overlay category.
+- Drag-to-link: [src/core/hmi/node-link-drag-store.ts](src/core/hmi/node-link-drag-store.ts) (its own isolated instance of the generic [src/core/hmi/drop-target-registry.ts](src/core/hmi/drop-target-registry.ts) — the signal-linking domain from plan-246 uses another instance and is unaffected).
+
+## 23. Path Simulation — Agv as a Library-Component Example + Routing Hooks
+
+[src/behaviors/Agv.ts](src/behaviors/Agv.ts) and [src/behaviors/OverheadConveyor.ts](src/behaviors/OverheadConveyor.ts) are the reference examples for a library component built on the path substrate: one `defineLibraryComponent(def)` call each (see [doc-behavior-modelling.md](doc-behavior-modelling.md) for the factory), riding `RVPath` / `RVPathNetwork` / `PathTraveler` ([src/core/engine/rv-path.ts](src/core/engine/rv-path.ts), [rv-path-network.ts](src/core/engine/rv-path-network.ts), [rv-path-traveler.ts](src/core/engine/rv-path-traveler.ts)) with raycast-free traffic (`SpacingController` headway + `ZoneRegistry` claims). The Agv shows the full pattern: schema defaults from rv_extras, the shared drive ramp for speed, signals with `self.isWired` live-override, a `continuous` block plus a purely declarative `des` block, and reset/teardown hooks that release every zone claim (a surviving claim would block a crossing permanently).
+
+**The component ships mechanics only — routing and dispatch are project logic.** Three id-based hooks cross to project code (only plain values, never engine objects):
+
+| Hook | Fired | Contract |
+|---|---|---|
+| `selectNextPath(candidateIds, ctx)` | at every junction (and by the traffic look-ahead) | return one of `candidateIds`; anything else → default `candidateIds[0]` |
+| `onArrive(pathId, travelerId)` | a vehicle completed a path (hand-off or dead-end stop) | notification |
+| `requestDispatch(travelerId)` | once when a vehicle goes idle at a dead end | the dispatch trigger for fleet logic |
+
+There are two ways to fill them:
+
+1. **Native TS (tests, custom engine code):** set `traveler.hooks.selectNextPath` / `hooks.onArrive` per traveler, or register a network-wide router via `getDefaultPathNetwork().setRouter(router, owner)` (returns the unregister function). Per-traveler hooks take precedence over the router.
+2. **Project script (JS-in-GLB):** declare `routing.*` handlers in the setup return — the web-component registry registers them as the network's project router and unregisters them on dispose/hot-reload. Dispatch is synchronous host→VM (the same `callHandler` pattern as the DES station handshake); the path graph is queryable by id via `self.paths`. See [doc-scripting.md](doc-scripting.md) for the script-side API and a routing-table example.
+
+```js
+// Project script: route by table, reserve a charging bay, dispatch on idle
+function setup(self) {
+  var routeAt = {};                         // 'travelerId@junctionPathId' → chosen successor id
+  self.paths.claim('ChargingBay');          // zone reservation by id (shared with AGV traffic)
+  return {
+    routing: {
+      selectNextPath: function (ids, ctx) {
+        // Pure table lookup — deterministic and repeatable per junction.
+        var want = routeAt[ctx.travelerId + '@' + ctx.currentPathId];
+        return want && ids.indexOf(want) >= 0 ? want : ids[0];
+      },
+      onArrive: function (pathId, agvId) {
+        self.log(agvId + ' completed ' + pathId);  // progress tracking
+      },
+      requestDispatch: function (agvId) {
+        routeAt[agvId + '@M'] = 'B';               // assign the next mission leg(s)
+      },
+    },
+  };
+}
+```
+
+Keep `selectNextPath` cheap, side-effect-free and deterministic: the headway leader search and the zone claim walk re-ask the same routing decision every tick through the same dispatch, so a random or self-mutating pick would make the look-ahead diverge from the actual hand-off. Mutate routing state in `requestDispatch` (fired once per stop), never inside `selectNextPath` — and note that `onArrive(pathId, …)` fires *before* the routing pick at that same boundary, so do not consume the decision for `pathId` there.
+
+
+## Library source providers (plan-372)
+
+Every supplier of placeable assets registers with one registry, and all three
+consumers — the Layout Planner, the Projects dashboard and the Asset Editor —
+read that single list. None of them imports another.
+
+```ts
+import {
+  registerLibrarySourceProvider,
+  type LibrarySource,
+  type LibrarySourceProvider,
+} from 'core/library/library-source-registry';
+
+const unregister = registerLibrarySourceProvider({
+  id: 'my-provider',                       // unique across providers
+  listSources: (): LibrarySource[] => [...],
+  subscribe: (listener) => store.subscribe(listener),
+});
+```
+
+Three rules are not negotiable:
+
+- **Identity is the pair `(providerId, sourceId)`.** A source id only has to be
+  unique inside its provider. `resolveAsset` takes an `assetId`, never an entry
+  object — otherwise reopening an editor draft is impossible.
+- **`ResolvedAsset.url` is never persisted.** Cloud adapters return `blob:`
+  URLs that are dead after a reload. The caller owns the URL and must call
+  `revokeUrl()` in the success, error *and* cancel paths.
+- **`getSnapshot` fallbacks must be module-level constants.** An inline
+  `() => ({...})` gives `useSyncExternalStore` a new identity on every read,
+  which is an infinite render loop (React minified error #185).
+
+## Project backends
+
+A project's bytes live behind `ProjectBackend`, with three implementations:
+`bundled` (a delivered build, read-only), `browser` (OPFS) and `folder` (File
+System Access). Anything writing project data should go through the backend
+rather than reaching for the filesystem, so it works on all three — that is what
+lets a user on Firefox or Safari, where only the browser backend is writable,
+save their own assets at all.

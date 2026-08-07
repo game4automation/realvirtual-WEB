@@ -1,0 +1,67 @@
+export interface DeliveryProfile {
+  /** DISPLAY name ("Mauser 3D HMI") — never a key. */
+  project?: string;
+  /** Repository-level slug; defaults to the config file name. */
+  customer?: string;
+  /** Every project folder this customer repository carries (§2.10). */
+  projects?: string[];
+  /** The one project a resolving load was asked for. */
+  projectKey?: string;
+  configName?: string;
+  path?: string;
+  tier: 'core' | 'commercial';
+  restrictedFeatures: string[];
+  remote?: string;
+  mirror?: string | null;
+  connectChannel?: 'stable' | 'beta';
+  connectLicenseKey?: string;
+}
+
+export interface MergedSnapshotProject {
+  seeded: boolean;
+  added: string[];
+  updated: string[];
+  removed: string[];
+  addPending: string[];
+  /** Paths the customer kept; carried into the next delivery so it cannot overwrite them. */
+  keptByCustomer: string[];
+  conflicts: Array<{ path: string; reason: string; sidecar: boolean; sidecarPath: string | null }>;
+}
+
+export interface MergedSnapshot {
+  version: string;
+  generatedAt: string;
+  remoteEmpty: boolean;
+  baselineTag: string | null;
+  projects: Record<string, MergedSnapshotProject>;
+  drift: Array<{ status: string; path: string }>;
+}
+export interface TierManifest { defaults: string; rules: Array<Record<string, any>>; registrations: Record<string, any>; path: string }
+export function loadTierManifest(path: string): TierManifest;
+export function resolveTier(manifest: TierManifest, path: string): { tier: string; feature?: string | null };
+export function loadDeliveryConfig(privateRoot: string, projectKey: string, manifest?: TierManifest): DeliveryProfile;
+export function loadDeliveryConfigByCustomer(privateRoot: string, customer: string, manifest?: TierManifest): DeliveryProfile;
+export function listDeliveryConfigs(privateRoot: string, manifest?: TierManifest): DeliveryProfile[];
+export function hasDeliveryConfig(privateRoot: string, projectKey: string): boolean;
+export function generateCustomerPrivatePlugins(manifest: TierManifest, profile: DeliveryProfile): string;
+export function renderFeatureMatrix(manifest: TierManifest, deliveries: DeliveryProfile[], customerProjectKey?: string | null): string;
+export function stageFilteredSourceTree(options: Record<string, any>): { workspaceRoot: string; coreRoot: string; privateRoot: string | null; project: any; projectKey: string | null; projectKeys: string[]; delivery: any; manifest: TierManifest };
+export function assertNoCrossTierLeak(workspaceRoot: string, manifest: TierManifest, profile: DeliveryProfile): void;
+export function assertWorkspaceGuards(workspaceRoot: string, options?: Record<string, any>): void;
+export function assertLfsPointer(repoRoot: string): void;
+export function assertNoSentinelInArtifacts(distRoot: string, sentinels: string[]): void;
+export function gitProvenance(repoRoot: string, options?: { requireTag?: boolean }): { commit: string; tags: string[] };
+export function hashTree(root: string, excludes?: string[]): string;
+export function runBuild(workspaceRoot: string, options?: Record<string, any>): { coreRoot: string; distDir: string; dryRun: boolean };
+export function assertBuildProvenance(distDir: string, expected?: Record<string, any>): Record<string, any>;
+export function applyMergedSnapshot(
+  stagedRoot: string,
+  cloneRoot: string,
+  options: { projects: Array<{ key: string; vendor?: { managed?: string[]; handover?: string[] } | null }>; version: string; seedMissing?: boolean },
+): MergedSnapshot;
+export function renderDeliveryReport(snapshot: MergedSnapshot): string;
+export function formatMergeSummary(snapshot: MergedSnapshot): string;
+export function mergeCommitNote(snapshot: MergedSnapshot): string;
+export function summariseMerge(result: { actions: Record<string, string>; conflicts: unknown[] }): Record<string, number>;
+export function createDeliveryManifest(options: Record<string, any>): Record<string, any>;
+export function deliveryChangelog(coreRoot: string, previousCoreCommit: string | null, options?: { limit?: number }): string;

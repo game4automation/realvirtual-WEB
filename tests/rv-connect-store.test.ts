@@ -10,8 +10,10 @@ import {
   disconnectFromServer,
   toggleSignalSelection,
   selectAllSignals,
+  importS7TagTable,
   _resetConnectStore,
 } from '../src/core/hmi/connect-store';
+import type { S7Tag } from '../src/core/import/s7-tag-table';
 
 describe('connect-store', () => {
   beforeEach(() => {
@@ -26,7 +28,10 @@ describe('connect-store', () => {
   it('should have default state', () => {
     const snap = getConnectSnapshot();
     expect(snap.state).toBe('disconnected');
-    expect(snap.serverUrl).toBe('http://localhost:5100');
+    // plan-363 Phase 7: with CONNECT the only local web server, a loopback page origin IS the
+    // gateway — and the only thing that knows its port. Vitest serves from localhost, so the
+    // derived default is this origin, not the former hard-coded :5100.
+    expect(snap.serverUrl).toBe(window.location.origin);
     expect(snap.interfaces).toEqual([]);
     expect(snap.activeInterfaceId).toBeNull();
     expect(snap.discoveredSignals).toEqual([]);
@@ -168,6 +173,58 @@ describe('connect-store', () => {
     expect(snap.state).toBe('disconnected');
     expect(snap.interfaces).toEqual([]);
     expect(snap.activeInterfaceId).toBeNull();
+  });
+
+  it('importS7TagTable pushes the parsed tags as the S7 interface signals (PUT)', async () => {
+    const s7 = {
+      id: 's7-1',
+      type: 'S7' as const,
+      enabled: true,
+      ipAddress: '192.168.1.50',
+      rack: 0,
+      slot: 1,
+      signals: [],
+    };
+
+    let putBody: { id: string; type: string; signals: Array<Record<string, unknown>> } | null = null;
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('/health')) {
+        return Promise.resolve(new Response(JSON.stringify({ status: 'ok' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+      if (init?.method === 'PUT' && urlStr.includes('/config/interfaces/s7-1')) {
+        putBody = JSON.parse(init.body as string);
+        return Promise.resolve(new Response(JSON.stringify({ success: true }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        }));
+      }
+      // GET /config/interfaces → one S7 interface.
+      return Promise.resolve(new Response(JSON.stringify([s7]), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }));
+    });
+
+    await connectToServer(); // loads the S7 interface into the store
+    expect(getConnectSnapshot().interfaces.find(i => i.id === 's7-1')).toBeTruthy();
+
+    const tags: S7Tag[] = [
+      { name: 'MC01_1', dataType: 'DWord', address: '%QD120', area: 'Q' },
+      { name: 'ATL_CHECK_TOBI', dataType: 'Bool', address: '%M10000.0', area: 'M' },
+      { name: 'Barrier', dataType: 'Bool', address: '%I0.0', area: 'I' },
+    ];
+    await importS7TagTable('s7-1', tags);
+
+    expect(putBody).not.toBeNull();
+    const body = putBody!;
+    expect(body.id).toBe('s7-1');
+    expect(body.type).toBe('S7'); // whole interface preserved, not reset
+    expect(body.signals).toHaveLength(3);
+    // Wire type derived from the area: %Q/%M → PLCOutput, %I → PLCInput.
+    expect(body.signals[0]).toMatchObject({ protocolAddress: '%QD120', name: 'MC01_1', type: 'PLCOutputInt', dataType: 'DWord' });
+    expect(body.signals[1]).toMatchObject({ protocolAddress: '%M10000.0', type: 'PLCOutputBool' });
+    expect(body.signals[2]).toMatchObject({ protocolAddress: '%I0.0', type: 'PLCInputBool' });
   });
 
   it('should toggle signal selection', () => {

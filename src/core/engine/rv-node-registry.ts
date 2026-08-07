@@ -32,6 +32,33 @@ export interface ComponentRef {
 }
 
 /**
+ * A node/component that consumes a signal (points at it by name or owns it as a
+ * child node). Shape-compatible with `ReverseReference` in rv-inspector-helpers,
+ * so the tooltip / property inspector can render both `getReferencesTo()` and
+ * `getComponentsForSignal()` results uniformly.
+ *   - `sourcePath`    — hierarchy path of the CONSUMING node (the component owner).
+ *   - `fieldName`     — the field that names the signal (e.g. `SignalBool`),
+ *                       or `'Signals'` for a parent-walk owner (child-node binding).
+ *   - `componentType` — the consuming component type (e.g. `WebSensor`, `Drive`).
+ */
+export interface SignalConsumerRef {
+  sourcePath: string;
+  fieldName: string;
+  componentType: string;
+}
+
+/**
+ * A component type key is a SIGNAL type (a PLC signal node), not a signal
+ * CONSUMER. Used by the parent-walk to skip past `Signals` container children
+ * and stop at the first owning NON-signal component (Drive/Sensor/…). Kept local
+ * to avoid importing rv-inspector-helpers (which imports from the engine — would
+ * create a cycle).
+ */
+function isSignalComponentTypeKey(type: string): boolean {
+  return type.startsWith('PLCInput') || type.startsWith('PLCOutput');
+}
+
+/**
  * NodeRegistry - Centralized object discovery for the WebViewer.
  *
  * Mirrors Unity's object lookup API:
@@ -56,10 +83,33 @@ export class NodeRegistry {
   private typeIndex = new Map<string, Set<string>>();
   /** last path segment → full paths (for O(1) suffix lookup in getNode fallback) */
   private suffixMap = new Map<string, string[]>();
+  /**
+   * node → alias paths registered for it via {@link registerAlias}.
+   *
+   * Aliases deliberately do NOT appear in `nodePaths` (the canonical reverse
+   * map), which is exactly why `unregisterSubtree` used to leave them behind:
+   * it iterates `nodePaths`. Tracking them per object closes that leak
+   * (plan-381 F11) — without it an alias kept resolving to a node that had been
+   * removed from the scene (delete + re-import, CADLink re-import, planner
+   * remove), handing callers a detached Object3D.
+   */
+  private aliasPaths = new Map<Object3D, string[]>();
   /** targetPath → Set of {sourcePath, fieldName, componentType} (reverse ref index) */
   private reverseRefs = new Map<string, Array<{ sourcePath: string; fieldName: string; componentType: string }>>();
   /** Whether the reverse-ref index has been built (built lazily on first getReferencesTo). */
   private _reverseRefsBuilt = false;
+
+  /**
+   * signalName → consumers that reference the signal by its string name. Distinct
+   * from `reverseRefs` (which indexes ComponentReference OBJECTS by targetPath):
+   * signal bindings are loose STRING names (`WebSensor.SignalBool = "MC07…"`), so
+   * `getReferencesTo(signalName)` never finds them. Built lazily on first
+   * `getComponentsForSignal()` call and invalidated on structural change
+   * (`clear()` / `recomputePathsForSubtrees()`).
+   */
+  private signalNameIndex = new Map<string, SignalConsumerRef[]>();
+  /** Whether the signal-name index has been built (built lazily on first getComponentsForSignal). */
+  private _signalNameIndexBuilt = false;
 
   // ─── Path Computation ───────────────────────────────────────────
 
@@ -114,6 +164,14 @@ export class NodeRegistry {
       this.suffixMap.set(suffix, arr);
     }
     arr.push(aliasPath);
+
+    // Remember the alias so unregisterSubtree can take it down with the node.
+    let aliases = this.aliasPaths.get(node);
+    if (!aliases) {
+      aliases = [];
+      this.aliasPaths.set(node, aliases);
+    }
+    aliases.push(aliasPath);
   }
 
   /**
@@ -137,10 +195,39 @@ export class NodeRegistry {
     typeSet.add(path);
   }
 
+  /**
+   * Unregister a single component instance at a path (asset editor
+   * `removeComponent`). Leaves the node itself registered. No-op when the
+   * path/type is unknown.
+   */
+  unregisterComponent(type: string, path: string): void {
+    const compMap = this.components.get(path);
+    if (compMap) {
+      compMap.delete(type);
+      if (compMap.size === 0) this.components.delete(path);
+    }
+    const typeSet = this.typeIndex.get(type);
+    if (typeSet) {
+      typeSet.delete(path);
+      if (typeSet.size === 0) this.typeIndex.delete(type);
+    }
+  }
+
   // ─── Lookup by Path ─────────────────────────────────────────────
 
   /** Get raw Object3D by full hierarchy path */
   getNode(path: string): Object3D | null {
+    return this._getNode(path, true);
+  }
+
+  /**
+   * @param warnOnAmbiguity Emit the F10 "refusing to guess" warning. Suppressed
+   *   for the internal probe in {@link getByPath}, which does its OWN ambiguity
+   *   check over component instances: an ambiguous node lookup there is not yet
+   *   a failure (only one of the candidates may carry the requested type), so
+   *   warning would put a scary message next to a perfectly good result.
+   */
+  private _getNode(path: string, warnOnAmbiguity: boolean): Object3D | null {
     // Direct lookup (most common case)
     const direct = this.nodes.get(path);
     if (direct) return direct;
@@ -152,21 +239,55 @@ export class NodeRegistry {
       if (normDirect) return normDirect;
     }
 
-    // Suffix match using the suffix map for O(1) lookup
+    // Suffix match using the suffix map for O(1) lookup.
+    //
+    // Every matching candidate is collected instead of returning at the first
+    // hit (plan-381 F10): with two branches carrying the same leaf
+    // (`CellA/PartA/Signal`, `CellB/PartA/Signal`) the old loop returned
+    // whichever happened to be registered first, so the SAME query resolved to
+    // a different object depending on GLB node order. Ambiguity is measured
+    // over distinct NODES, not paths — an alias and its canonical path both
+    // match but denote one node, which must stay resolvable.
     const querySuffix = lastPathSegment(path);
     const candidates = this.suffixMap.get(querySuffix);
     if (candidates) {
+      let found: Object3D | null = null;
+      let matchedPaths: string[] | null = null;
       for (const registeredPath of candidates) {
-        if (registeredPath.endsWith('/' + path) || registeredPath === path) {
-          return this.nodes.get(registeredPath) ?? null;
-        }
-        // Also try with normalized path (spaces → underscores)
-        if (normalized !== path && (registeredPath.endsWith('/' + normalized) || registeredPath === normalized)) {
-          return this.nodes.get(registeredPath) ?? null;
+        if (!this._suffixMatches(registeredPath, path, normalized)) continue;
+        const node = this.nodes.get(registeredPath);
+        if (!node) continue;
+        if (found === null) {
+          found = node;
+          matchedPaths = [registeredPath];
+        } else if (node !== found) {
+          matchedPaths!.push(registeredPath);
         }
       }
+      if (matchedPaths && matchedPaths.length > 1) {
+        if (warnOnAmbiguity) {
+          console.warn(
+            `[NodeRegistry] Ambiguous suffix match for "${path}": ${matchedPaths.length} candidates `
+            + `(${matchedPaths.map((p) => `"${p}"`).join(', ')}) — refusing to guess.`,
+          );
+        }
+        return null;
+      }
+      if (found) return found;
     }
     return null;
+  }
+
+  /**
+   * Does a registered path end on the queried (partial) path? Both the raw and
+   * the space→underscore normalized spelling count as a match; `normalized` is
+   * passed in so callers compute it once.
+   */
+  private _suffixMatches(registeredPath: string, path: string, normalized: string): boolean {
+    if (registeredPath === path || registeredPath.endsWith('/' + path)) return true;
+    if (normalized !== path
+      && (registeredPath === normalized || registeredPath.endsWith('/' + normalized))) return true;
+    return false;
   }
 
   /** Get the registered path for a node */
@@ -191,27 +312,55 @@ export class NodeRegistry {
       }
     }
 
-    // Suffix match using suffixMap for O(1) lookup (instead of O(n) scan)
+    // Alias-aware fallback: registerAlias() adds alias paths (Phase-8c
+    // reparent aliases) to `nodes` but
+    // component instances stay keyed under the node's canonical path only.
+    // Resolve the node via the alias-aware getNode and retry with its
+    // canonical path — this is what lets recorder playback find a Drive by
+    // its authored path after re-parenting.
+    const aliasNode = this._getNode(path, false);
+    if (aliasNode) {
+      const canonical = this.nodePaths.get(aliasNode);
+      if (canonical && canonical !== path) {
+        const cm = this.components.get(canonical);
+        if (cm) {
+          const instance = cm.get(type);
+          if (instance !== undefined) return instance as T;
+        }
+      }
+    }
+
+    // Suffix match using suffixMap for O(1) lookup (instead of O(n) scan).
+    //
+    // Like getNode(), every candidate is collected rather than returning at the
+    // first hit (plan-381 F10). Ambiguity is judged over distinct INSTANCES of
+    // the requested type: candidates that merely share the leaf name but carry
+    // no component of `type` are not competitors, and an alias path resolving
+    // to the same instance is not one either.
     const querySuffix = lastPathSegment(path);
     const candidates = this.suffixMap.get(querySuffix);
     if (candidates) {
+      let found: T | null = null;
+      let matchedPaths: string[] | null = null;
       for (const registeredPath of candidates) {
-        if (registeredPath.endsWith('/' + path) || registeredPath === path) {
-          const cm = this.components.get(registeredPath);
-          if (cm) {
-            const instance = cm.get(type);
-            if (instance !== undefined) return instance as T;
-          }
-        }
-        // Also try with normalized path (spaces → underscores)
-        if (normalized !== path && (registeredPath.endsWith('/' + normalized) || registeredPath === normalized)) {
-          const cm = this.components.get(registeredPath);
-          if (cm) {
-            const instance = cm.get(type);
-            if (instance !== undefined) return instance as T;
-          }
+        if (!this._suffixMatches(registeredPath, path, normalized)) continue;
+        const instance = this.components.get(registeredPath)?.get(type);
+        if (instance === undefined) continue;
+        if (found === null) {
+          found = instance as T;
+          matchedPaths = [registeredPath];
+        } else if (instance !== found) {
+          matchedPaths!.push(registeredPath);
         }
       }
+      if (matchedPaths && matchedPaths.length > 1) {
+        console.warn(
+          `[NodeRegistry] Ambiguous suffix match for "${type}" at "${path}": ${matchedPaths.length} candidates `
+          + `(${matchedPaths.map((p) => `"${p}"`).join(', ')}) — refusing to guess.`,
+        );
+        return null;
+      }
+      if (found !== null) return found;
     }
     return null;
   }
@@ -328,11 +477,20 @@ export class NodeRegistry {
   /**
    * Resolve a ComponentReference from GLB extras to typed instances.
    * Replaces the standalone resolveComponentRef() function.
+   *
+   * @param scope Optional subtree for a last-resort fallback: when the exact /
+   *   alias / suffix path lookups all miss (authored hierarchy no longer exists
+   *   — glTF name-dedup drift, editor re-saves), the ref
+   *   is resolved by NAME to a descendant of `scope` carrying the requested
+   *   component. Callers pass the subtree the ref was authored in (e.g. a
+   *   placed asset root), where axis/signal names are unambiguous.
    */
-  resolve(ref: ComponentRef | undefined | null): {
+  resolve(ref: ComponentRef | undefined | null, scope?: Object3D | null): {
     drive?: RVDrive | null;
     sensor?: RVSensor | null;
     signalAddress?: string | null;
+    /** Plain scene node (Unity `Transform` field). See the generic branch below. */
+    node?: Object3D | null;
   } {
     if (!ref || ref.type !== 'ComponentReference' || !ref.path) {
       return {};
@@ -342,14 +500,16 @@ export class NodeRegistry {
 
     // Drive reference
     if (ct.includes('Drive')) {
-      const drive = this.getByPath<RVDrive>('Drive', ref.path);
+      let drive = this.getByPath<RVDrive>('Drive', ref.path);
+      if (!drive && scope) drive = this.findComponentInScope<RVDrive>('Drive', ref.path, scope);
       if (!drive) console.warn(`[NodeRegistry] Drive not found: "${ref.path}"`);
       return { drive };
     }
 
     // Sensor reference
     if (ct.includes('Sensor')) {
-      const sensor = this.getByPath<RVSensor>('Sensor', ref.path);
+      let sensor = this.getByPath<RVSensor>('Sensor', ref.path);
+      if (!sensor && scope) sensor = this.findComponentInScope<RVSensor>('Sensor', ref.path, scope);
       if (!sensor) console.warn(`[NodeRegistry] Sensor not found: "${ref.path}"`);
       return { sensor };
     }
@@ -363,17 +523,83 @@ export class NodeRegistry {
         const resolvedPath = this.nodePaths.get(node);
         if (resolvedPath) return { signalAddress: resolvedPath };
       }
-      // Fallback: return raw path (may still work if path happens to match)
+      // Scoped fallback: signal node by name inside the authoring subtree.
+      if (scope) {
+        const scopedNode = this.findNodeInScope(ref.path, scope);
+        if (scopedNode) {
+          const resolvedPath = this.nodePaths.get(scopedNode);
+          if (resolvedPath) return { signalAddress: resolvedPath };
+        }
+      }
+      // Fallback: return the raw path. It MAY still work — the SignalStore runs
+      // its own normalization/suffix resolution over `pathToName`, and a
+      // process-image signal legitimately has no scene node at all. But when it
+      // does not, the component silently binds to an address nobody writes and
+      // the drive simply never moves, with nothing in the console to show for
+      // it (plan-381 F6). Hence: say so, without claiming more than we know.
+      console.warn(
+        `[NodeRegistry] Signal node not found: "${ref.path}" — `
+        + 'falling back to the raw path; the signal may not be driven.',
+      );
       return { signalAddress: ref.path };
+    }
+
+    // Generic NODE reference (plan-362). A Unity `public Transform Anchor`
+    // field serializes with componentType `UnityEngine.Transform`; very old
+    // exports wrote no componentType at all. Exactly those two cases resolve
+    // to the plain scene node:
+    //   1. componentType === 'UnityEngine.Transform'  (the wire contract)
+    //   2. componentType missing / null / ''          (legacy tolerance)
+    // Every OTHER non-empty componentType deliberately keeps today's behavior
+    // (unresolved + warning) — treating "unknown" as legacy would silently
+    // bend a future reference type onto a node instead of failing visibly.
+    if (ct === 'UnityEngine.Transform' || ct === '') {
+      let node = this.getNode(ref.path);
+      if (!node && scope) node = this.findNodeInScope(ref.path, scope);
+      if (!node) console.warn(`[NodeRegistry] Node not found: "${ref.path}"`);
+      return { node: node ?? null };
     }
 
     console.warn(`[NodeRegistry] Unknown componentType: "${ref.componentType}" at "${ref.path}"`);
     return {};
   }
 
+  /**
+   * Scope-limited resolution fallback: first descendant of `scope` whose NAME
+   * equals the ref path's last segment and carries a registered component of
+   * `type`. Used by resolve() when every path-based lookup misses.
+   */
+  private findComponentInScope<T>(type: string, refPath: string, scope: Object3D): T | null {
+    const name = lastPathSegment(refPath);
+    if (!name) return null;
+    let found: T | null = null;
+    scope.traverse((n: Object3D) => {
+      if (found !== null || n.name !== name) return;
+      const path = this.nodePaths.get(n);
+      if (!path) return;
+      const instance = this.components.get(path)?.get(type);
+      if (instance !== undefined) found = instance as T;
+    });
+    return found;
+  }
+
+  /** Name-match twin of {@link findComponentInScope} for plain node refs (signals). */
+  private findNodeInScope(refPath: string, scope: Object3D): Object3D | null {
+    const name = lastPathSegment(refPath);
+    if (!name) return null;
+    let found: Object3D | null = null;
+    scope.traverse((n: Object3D) => {
+      if (found !== null || n.name !== name) return;
+      if (this.nodePaths.has(n)) found = n;
+    });
+    return found;
+  }
+
   // ─── Search ────────────────────────────────────────────────────
 
-  /** Search all registered nodes by path substring AND metadata content (case-insensitive). */
+  /** Search all registered nodes by node name, COMPONENT TYPE and metadata
+   *  content (all case-insensitive substring). The component-type match makes
+   *  "Drive"/"Sensor" searches work even when node names carry no hint. */
   search(term: string): NodeSearchResult[] {
     if (!term) return [];
     const lower = term.toLowerCase();
@@ -382,18 +608,22 @@ export class NodeRegistry {
       const name = lastPathSegment(path);
       const nameMatched = name.toLowerCase().includes(lower);
 
-      // Check which component's search resolver matched (if not name match)
-      let matchedBy: string | undefined;
-      if (!nameMatched) {
-        const comp = tooltipRegistry.findMatchingComponent(node, term);
-        if (!comp) continue; // no match
-        matchedBy = comp;
-      }
-
       const compMap = this.components.get(path);
       const types = compMap ? [...compMap.keys()] : [];
       const rvType = node.userData?._rvType as string | undefined;
       if (rvType && !types.includes(rvType)) types.push(rvType);
+
+      // Component-type match ("drive" finds every node with a Drive component),
+      // then the tooltip-registry metadata resolvers as the last resort.
+      let matchedBy: string | undefined;
+      if (!nameMatched) {
+        matchedBy = types.find((t) => t.toLowerCase().includes(lower));
+        if (!matchedBy) {
+          const comp = tooltipRegistry.findMatchingComponent(node, term);
+          if (!comp) continue; // no match
+          matchedBy = comp;
+        }
+      }
       // Ask the matched component for a display label (e.g. product name from AAS)
       const displayText = matchedBy
         ? tooltipRegistry.getSearchDisplayText(node, matchedBy)
@@ -457,6 +687,172 @@ export class NodeRegistry {
     return this.reverseRefs.get(targetPath) ?? [];
   }
 
+  /**
+   * All signal names that a model component references via a ComponentReference
+   * to the signal's node (e.g. `Drive_Cylinder.In` → `.../MC02.09Q00B`). This is
+   * the set of signals actually CONSUMED by the model, as opposed to signals that
+   * merely exist as PLC nodes but drive nothing.
+   *
+   * Coupling is by SYMBOL NAME, not scene path: each referenced target path is
+   * resolved back to its registered signal name via `nameForPath`. Only signal
+   * paths resolve (non-signal reference targets yield undefined and are skipped),
+   * so the result is exactly the referenced *signals*. String-field references
+   * (`WebSensor.SignalBool = "..."`) are covered separately by the caller via
+   * {@link getComponentsForSignal}.
+   *
+   * Built from the cached reverse-ref index; cheap to call once per model load.
+   */
+  getComponentReferencedSignalNames(nameForPath: (path: string) => string | undefined): Set<string> {
+    if (!this._reverseRefsBuilt) this.buildReverseRefIndex();
+    const names = new Set<string>();
+    for (const targetPath of this.reverseRefs.keys()) {
+      const name = nameForPath(targetPath);
+      if (name) names.add(name);
+    }
+    return names;
+  }
+
+  // ─── Signal → Component Binding Index ───────────────────────────
+
+  /**
+   * Build the signal-name → consumers index by scanning every registered node's
+   * `userData.realvirtual` components for STRING fields whose value is the name
+   * of a signal a component binds to.
+   *
+   * Signal-field detection: the component schema (rv-component-registry.ts) has
+   * NO dedicated signal field type — signal references are declared `componentRef`
+   * and, once resolved, become plain signal-address STRINGS on the instance and in
+   * persisted rv_extras. There is therefore no schema flag to key on, so we take
+   * the documented FALLBACK from plan-234 §10-A: index EVERY string field value,
+   * keyed by that value. A `getComponentsForSignal(name)` lookup then hits only
+   * for fields whose value is exactly that signal name. False positives are rare
+   * (a string field that happens to equal a signal name) and tolerable — the
+   * consumer is presented as informational binding, never a hard dependency.
+   *
+   * ComponentReference OBJECT fields (raw `{type:'ComponentReference', path}`) are
+   * intentionally SKIPPED here — those are covered by `getReferencesTo(path)`.
+   */
+  buildSignalNameIndex(): void {
+    this.signalNameIndex.clear();
+    for (const [sourcePath, node] of this.nodes) {
+      const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
+      if (!rv || typeof rv !== 'object') continue;
+      for (const [compType, compData] of Object.entries(rv)) {
+        if (typeof compData !== 'object' || compData === null || Array.isArray(compData)) continue;
+        // Skip the signal's OWN definition component (PLCInput*/PLCOutput*): its
+        // `Name` field equals the signal name but that is the signal declaring
+        // itself, not a consumer binding TO it. Consumers are non-signal
+        // components (WebSensor, ConnectSignal, Drive, …).
+        if (isSignalComponentTypeKey(compType)) continue;
+        for (const [fieldName, value] of Object.entries(compData as Record<string, unknown>)) {
+          // Only bare, non-empty strings are signal-name candidates. Objects
+          // (ComponentReference / vector3 / ScriptableObject) are skipped — a raw
+          // ComponentReference is already covered by getReferencesTo(path).
+          if (typeof value !== 'string' || value.length === 0) continue;
+          let list = this.signalNameIndex.get(value);
+          if (!list) { list = []; this.signalNameIndex.set(value, list); }
+          list.push({ sourcePath, fieldName, componentType: compType });
+        }
+      }
+    }
+    this._signalNameIndexBuilt = true;
+  }
+
+  /**
+   * Resolve which components/nodes a signal is bound to.
+   *
+   * Combines two paths (plan-234 §10-A):
+   *   1. **Primary — signal-name index:** components that reference the signal by
+   *      its string name (`WebSensor.SignalBool`, `ConnectSignal` fields, Drive
+   *      signal slots). Built lazily & cached; O(1) lookup thereafter.
+   *   2. **Secondary — parent-walk (only when `signalPath` is given):** for a
+   *      signal that lives as a child node (`<Owner>/Signals/*`, Drive/Sensor
+   *      auto-signals), walk the node ancestor chain up to the first NON-signal
+   *      component and report it as the owner.
+   *
+   * The caller supplies `signalPath` (via `signalStore.getPath(name)`) so the
+   * store is NOT imported here — keeps the engine registry decoupled.
+   *
+   * Results are deduplicated (by sourcePath + componentType + fieldName) and
+   * sorted with the NEAREST owner first (shortest path distance from the signal
+   * node; index-only hits sort after path-derived owners). Returns `[]` when the
+   * signal is bound to nothing (a pure process-image signal with no node and no
+   * consumer — the expected "orphaned" case, not an error).
+   */
+  getComponentsForSignal(signalName: string, signalPath?: string): SignalConsumerRef[] {
+    if (!this._signalNameIndexBuilt) this.buildSignalNameIndex();
+
+    const results: Array<{ ref: SignalConsumerRef; distance: number }> = [];
+    const seen = new Set<string>();
+    const key = (r: SignalConsumerRef) => `${r.sourcePath} ${r.componentType} ${r.fieldName}`;
+
+    // Primary: string-name index. distance = Infinity so path-derived owners sort first.
+    const named = this.signalNameIndex.get(signalName);
+    if (named) {
+      for (const ref of named) {
+        const k = key(ref);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        results.push({ ref, distance: this._pathDistance(signalPath, ref.sourcePath) });
+      }
+    }
+
+    // Secondary: parent-walk from the signal node up to the first owning
+    // non-signal component. Only possible when a signalPath (→ node) is known.
+    if (signalPath) {
+      const node = this.getNode(signalPath);
+      if (node) {
+        let current: Object3D | null = node;
+        let steps = 0;
+        while (current) {
+          const ancestorPath = this.nodePaths.get(current);
+          if (ancestorPath) {
+            const types = this.getComponentTypes(ancestorPath);
+            const ownerType = types.find((t) => !isSignalComponentTypeKey(t));
+            if (ownerType) {
+              const ref: SignalConsumerRef = { sourcePath: ancestorPath, fieldName: 'Signals', componentType: ownerType };
+              const k = key(ref);
+              if (!seen.has(k)) {
+                seen.add(k);
+                results.push({ ref, distance: steps });
+              }
+              break; // nearest owning component found — stop climbing
+            }
+          }
+          current = current.parent;
+          steps++;
+        }
+      }
+    }
+
+    // Nearest owner first (shortest path distance); stable within equal distance.
+    results.sort((a, b) => a.distance - b.distance);
+    return results.map((r) => r.ref);
+  }
+
+  /**
+   * Hierarchy-distance heuristic between the signal path and a consumer path:
+   * 0 when identical, else the number of trailing path segments that differ
+   * (how far the consumer sits from the signal). Used only for owner ordering,
+   * so an approximate metric is fine; unknown/undefined signalPath → Infinity so
+   * index-only hits sort after path-derived (parent-walk) owners.
+   */
+  private _pathDistance(signalPath: string | undefined, consumerPath: string): number {
+    if (!signalPath) return Number.POSITIVE_INFINITY;
+    if (signalPath === consumerPath) return 0;
+    // If the consumer is an ancestor of the signal (or vice versa), distance is
+    // the segment-count difference — the natural "how many levels apart".
+    const sp = signalPath.split('/');
+    const cp = consumerPath.split('/');
+    if (signalPath.startsWith(consumerPath + '/') || consumerPath.startsWith(signalPath + '/')) {
+      return Math.abs(sp.length - cp.length);
+    }
+    // Unrelated branch: count segments from the signal up to the common prefix.
+    let common = 0;
+    while (common < sp.length && common < cp.length && sp[common] === cp[common]) common++;
+    return (sp.length - common) + (cp.length - common);
+  }
+
   // ─── Iteration ─────────────────────────────────────────────────
 
   /** Iterate all registered nodes with their paths. */
@@ -500,16 +896,39 @@ export class NodeRegistry {
       }
 
       // Remove from suffixMap
-      const suffix = lastPathSegment(path);
-      const arr = this.suffixMap.get(suffix);
-      if (arr) {
-        const idx = arr.indexOf(path);
-        if (idx >= 0) arr.splice(idx, 1);
-        if (arr.length === 0) this.suffixMap.delete(suffix);
+      this._dropFromSuffixMap(path);
+
+      // Alias paths registered for this node (plan-381 F11). They are NOT in
+      // `nodePaths`, so this loop is the only thing that ever removes them —
+      // without it the alias survived in `nodes`/`suffixMap` and kept handing
+      // out a node that is no longer in the scene.
+      const aliases = this.aliasPaths.get(node);
+      if (aliases) {
+        for (const aliasPath of aliases) {
+          // Only drop the entry if it still points at THIS node: a later
+          // registerNode() may have legitimately claimed the same string.
+          if (this.nodes.get(aliasPath) === node) this.nodes.delete(aliasPath);
+          this._dropFromSuffixMap(aliasPath);
+          // NOT added to `removed`: that set is the contract for downstream
+          // purges, which match it against `computeNodePath(component.node)` —
+          // always a CANONICAL path. Listing alias spellings there could only
+          // ever purge a live component that happens to sit at that path.
+        }
+        this.aliasPaths.delete(node);
       }
     });
 
     return removed;
+  }
+
+  /** Remove one path from the suffix index, dropping the bucket when empty. */
+  private _dropFromSuffixMap(path: string): void {
+    const suffix = lastPathSegment(path);
+    const arr = this.suffixMap.get(suffix);
+    if (!arr) return;
+    const idx = arr.indexOf(path);
+    if (idx >= 0) arr.splice(idx, 1);
+    if (arr.length === 0) this.suffixMap.delete(suffix);
   }
 
   /**
@@ -518,6 +937,10 @@ export class NodeRegistry {
    *
    * Updates: nodes, nodePaths, components, typeIndex, suffixMap maps.
    * Does NOT update reverseRefs (built later in Phase 14+).
+   *
+   * Structural node paths change here → the signal-name index (keyed by
+   * consumer sourcePath) is stale. Invalidate its built flag so it is rebuilt
+   * lazily on the next getComponentsForSignal() — never from a hot/60-Hz path.
    */
   recomputePathsForSubtrees(subtreeRoots: Object3D[]): { count: number; remap: Map<string, string> } {
     let updated = 0;
@@ -575,6 +998,10 @@ export class NodeRegistry {
       });
     }
 
+    // Consumer sourcePaths may have moved — invalidate the signal-name index so
+    // it is rebuilt lazily on the next lookup (never eagerly here).
+    if (updated > 0) this._signalNameIndexBuilt = false;
+
     return { count: updated, remap };
   }
 
@@ -585,6 +1012,60 @@ export class NodeRegistry {
     this.components.clear();
     this.typeIndex.clear();
     this.suffixMap.clear();
+    this.aliasPaths.clear();
+    // Reset the reverse-ref index (was previously leaked across reloads — §10-E)
+    // and the signal-name binding index so a reloaded scene never serves stale
+    // bindings. Both rebuild lazily on next access.
+    this.reverseRefs.clear();
+    this._reverseRefsBuilt = false;
+    this.signalNameIndex.clear();
+    this._signalNameIndexBuilt = false;
+    this.gltfNodeIndices.clear();
+    this.gltfNodeNames = [];
+  }
+
+  // ─── glTF source indices ────────────────────────────────────────
+
+  /**
+   * node → index of the glTF `nodes[]` entry it was loaded from.
+   *
+   * Only populated for nodes that came from the model GLB itself. Planner
+   * placements, op-created nodes and anything parsed by `parseGlbSubtree` have
+   * no entry — deliberately, since those are the cases the GLB bake refuses.
+   */
+  private gltfNodeIndices = new Map<Object3D, number>();
+
+  /**
+   * The raw glTF names behind those indices, indexed like the file's `nodes[]`.
+   *
+   * Kept so a writer that re-fetches the model can prove the bytes it got are
+   * the ones these indices describe. Without it an index silently means a
+   * different node whenever the URL served something new.
+   */
+  private gltfNodeNames: readonly (string | undefined)[] = [];
+
+  /** Hand over the load's `associations`-derived index map (see `collectGltfNodeIndices`). */
+  setGltfNodeIndices(indices: Map<Object3D, number>, names: readonly (string | undefined)[] = []): void {
+    this.gltfNodeIndices = indices;
+    this.gltfNodeNames = names;
+  }
+
+  /** The captured glTF node names, for the source-identity check. Empty when unknown. */
+  getGltfNodeNames(): readonly (string | undefined)[] {
+    return this.gltfNodeNames;
+  }
+
+  /**
+   * The glTF `nodes[]` index a path was loaded from, or null when the node is
+   * unknown or did not come from the model GLB.
+   *
+   * Resolution goes through {@link getNode}, so aliases, space-normalisation
+   * and the unambiguous-suffix fallback all apply.
+   */
+  getGltfNodeIndex(path: string): number | null {
+    const node = this.getNode(path);
+    if (!node) return null;
+    return this.gltfNodeIndices.get(node) ?? null;
   }
 
   /** Get registry stats */

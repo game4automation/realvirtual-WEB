@@ -36,7 +36,8 @@ describe('ESLint boundary enforcement (plan-182 Phase 6)', () => {
       m => m.ruleId === 'boundaries/dependencies' || m.ruleId === 'boundaries/element-types'
     );
     expect(hasBoundaryError).toBe(true);
-  }, 30000);  // ESLint startup can be slow
+  }, 120000);  // ESLint startup is slow, and slower still from the cold temp copy the
+  // community precheck stages (scripts/precheck-community.mjs).
 
   it('allows an engine/ file that does NOT import from rv-viewer', async () => {
     const eslint = new ESLint({ cwd: WEBVIEWER_ROOT });
@@ -48,5 +49,5 @@ describe('ESLint boundary enforcement (plan-182 Phase 6)', () => {
       m => m.ruleId === 'boundaries/dependencies' || m.ruleId === 'boundaries/element-types'
     );
     expect(boundaryErrors).toHaveLength(0);
-  }, 30000);
+  }, 120000);
 });

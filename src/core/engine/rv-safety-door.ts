@@ -28,6 +28,7 @@ import {
 } from 'three';
 import {
   registerComponent,
+  loadSchemaFromSpec,
   type RVComponent,
   type ComponentContext,
   type ComponentSchema,
@@ -35,6 +36,7 @@ import {
 import { HIGHLIGHT_OVERLAY_LAYER } from './rv-group-registry';
 import type { GizmoHandle } from './rv-gizmo-manager';
 import { traverseMeshes } from './rv-traverse-utils';
+import { MM_TO_METERS } from './rv-constants';
 
 const AMBER = 0xffa726;
 const LABEL_TEXT = 'SAFETY DOOR - OPEN';
@@ -50,10 +52,8 @@ type ShowAllPayload = { show: boolean };
  * incrementally (see plan-155 §5).
  */
 export class RVSafetyDoor implements RVComponent {
-  static readonly schema: ComponentSchema = {
-    HazardZoneRadius: { type: 'number', default: 1500 }, // mm
-    LabelHeight:      { type: 'number', default: 200 },  // mm above floor
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('WebSafetyDoor');
 
   readonly node: Object3D;
   isOwner = true;
@@ -103,7 +103,8 @@ export class RVSafetyDoor implements RVComponent {
       shape: 'floor-disk',
       color: AMBER,
       opacity: 0.25,
-      radius: Math.max(0.001, this.HazardZoneRadius / 1000), // mm → m
+      radius: Math.max(0.001, this.HazardZoneRadius / MM_TO_METERS),
+      category: 'status',
     });
 
     // Text label — anchored to the bbox bottom, LabelHeight above floor
@@ -113,7 +114,8 @@ export class RVSafetyDoor implements RVComponent {
       color: AMBER,
       opacity: 1.0,
       textAnchor: 'bottom',
-      textOffsetY: this.LabelHeight / 1000, // mm → m
+      textOffsetY: this.LabelHeight / MM_TO_METERS,
+      category: 'status',
     });
 
     // Subscribe to the visibility event. Hidden until UI emits show=true.

@@ -4,18 +4,25 @@
 /**
  * RVHighlightManager — Central highlight system for the WebViewer.
  *
- * Two independent highlight channels:
- *   - **Hover** (orange): Temporary overlays shown on mouse hover.
- *     Managed by RaycastManager. Call highlight()/clear().
- *   - **Selection** (cyan): Persistent overlays for selected objects.
- *     Managed by SelectionManager. Call highlightSelection()/clearSelection().
+ * Channels:
+ *   - **Hover**: temporary highlight under the cursor (RaycastManager).
+ *   - **Selection**: persistent highlight for selected objects (SelectionManager).
+ *   - **Aux emphasis**: named auxiliary sets unioned into the selection visual
+ *     (e.g. the planner's placement-preview ghost) — {@link setAuxEmphasis}.
+ *   - **Flash**: short alarm pulse combining fill + edges + OutlinePass outline
+ *     in one color, independent of hover/selection — {@link flash}.
  *
- * Both channels can be active simultaneously — hovering a different object
- * while a selection is active shows both colors.
+ * WHAT a highlight looks like is decided by the active {@link HighlightProfile}
+ * (mode-driven, installed via {@link setProfile} by RVHighlightPolicy):
+ *   - visual 'overlay' → fill + edges overlay pairs (HMI/DES; batched and
+ *     unbatched content look identical — the OutlinePass is never used).
+ *   - visual 'outline' → OutlinePass silhouette (planner/editor), with a
+ *     per-root capability fallback to the overlay look (WebGPU without TSL,
+ *     fully batched root).
+ * The pure {@link resolveStrategy} function encodes that fallback matrix.
  *
- * Two tracking modes per channel:
- *   - static snapshot (fast, for brief hover)
- *   - tracked: overlays follow moving meshes each frame
+ * Per-call `visual` overrides the profile's desired visual (e.g. the editor's
+ * kinematic-group preview forces 'overlay' so every member mesh reads clearly).
  */
 
 import {
@@ -31,19 +38,23 @@ import {
   Box3,
   Box3Helper,
   BufferGeometry,
-  Float32BufferAttribute,
 } from 'three';
 import type { Scene } from 'three';
 import type { InstancedMovingUnit } from './rv-mu';
 import { HIGHLIGHT_OVERLAY_LAYER } from './rv-group-registry';
 import type { RVOutlineManager } from './rv-outline-manager';
+import { DEFAULT_OUTLINE_STYLE, DEFAULT_HOVER_OUTLINE_STYLE } from './rv-outline-manager';
+import type { GizmoHandle, GizmoOverlayManager } from './rv-gizmo-manager';
+import type { PickMetrics, HighlightStrategy } from './rv-pick-metrics';
+import type { HighlightProfile, HighlightVisual } from './rv-highlight-profiles';
+import { resolveOutlineTargets } from './rv-status-outline';
+import { subscribeOverlayVisibility, isOverlayVisible } from '../overlay-visibility-store';
 
 // ─── Highlight Style ──────────────────────────────────────────────────
 
 /**
- * Per-channel highlight appearance. Used by `setSelectionStyle` and
- * `setHoverStyle` to swap colors/opacity/wireframe for the current mode
- * (e.g. planner mode uses green wireframe instead of cyan fill).
+ * Per-channel highlight appearance for the overlay path (fill + edges).
+ * Bundled per mode inside a {@link HighlightProfile}.
  */
 export interface HighlightStyle {
   /** Overlay fill color (hex). */
@@ -64,42 +75,182 @@ export interface HighlightStyle {
   showEdges: boolean;
 }
 
-/** Default hover style — soft, bright orange (brighter + less saturated than the
- *  old vivid 0xff8800). The edgeColor is what the OutlinePass silhouette uses;
- *  overlayColor is also used by the overlay highlight path. */
+/** True when a mesh is actually rendered by the main camera: `.visible` AND
+ *  not layer-masked out. Batched render sources (BatchedMesh instances) keep
+ *  `visible = true` but carry `layers.mask = 0` — OutlinePass would silhouette
+ *  nothing for them, so they must take the geometry-overlay highlight path. */
+function isRenderedMesh(m: Mesh): boolean {
+  return m.visible && m.layers.mask !== 0;
+}
+
+/** Default hover style — the BLUE family used by HMI and DES modes (the modes
+ *  that keep the app-wide defaults). A lighter, less intense blue than the
+ *  selection style below, so hovering reads as a hint while a selected object
+ *  clearly dominates. Planner (green) and editor (yellow) install their own
+ *  profiles, so the highlight color alone tells the user which mode is active. */
 export const DEFAULT_HOVER_STYLE: HighlightStyle = Object.freeze({
-  overlayColor: 0xffb366,
+  overlayColor: 0x4aa3ff,
   overlayOpacity: 0.10,
   overlayWireframe: false,
-  edgeColor: 0xffb366,
+  edgeColor: 0x4aa3ff,
   edgeOpacity: 0.4,
   edgeLinewidth: 1,
   showOverlay: true,
   showEdges: true,
 });
 
-/** Default selection style — soft, bright blue (brighter + less saturated than
- *  the old vivid 0x00bfff, with slightly gentler opacity). */
+/** Default selection style — the deeper, more intense BLUE used by HMI and DES
+ *  modes. Brighter and more opaque than DEFAULT_HOVER_STYLE so the selected
+ *  object dominates the hovered one. */
 export const DEFAULT_SELECTION_STYLE: HighlightStyle = Object.freeze({
-  overlayColor: 0x66c4ff,
-  overlayOpacity: 0.18,
+  overlayColor: 0x1e88ff,
+  overlayOpacity: 0.20,
   overlayWireframe: false,
-  edgeColor: 0x66c4ff,
-  edgeOpacity: 0.6,
+  edgeColor: 0x1e88ff,
+  edgeOpacity: 0.65,
   edgeLinewidth: 1,
   showOverlay: true,
   showEdges: true,
 });
 
+/** Built-in profile active before RVHighlightPolicy installs a mode profile —
+ *  identical to the HMI profile (overlay visual, blue styles). Defined here
+ *  (not imported from rv-highlight-profiles) to avoid a module cycle. */
+const BUILTIN_PROFILE: HighlightProfile = Object.freeze({
+  visual: 'overlay' as const,
+  hoverStyle: DEFAULT_HOVER_STYLE,
+  selectionStyle: DEFAULT_SELECTION_STYLE,
+  hoverOutline: DEFAULT_HOVER_OUTLINE_STYLE,
+  selectionOutline: DEFAULT_OUTLINE_STYLE,
+});
+
+// ─── Strategy resolver (pure — the single decision point) ─────────────
+
+/** Rendering strategy resolved for one highlight root. */
+export type ResolvedStrategy = 'outline' | 'overlay' | 'fill-proxy' | 'bbox' | 'mu-overlay';
+
+/** Options for {@link RVHighlightManager.highlightSelection}. */
+export interface SelectionHighlightOptions {
+  includeSensorViz?: boolean;
+  includeChildDrives?: boolean;
+  /** Per-call desired visual (overrides the mode profile). */
+  visual?: HighlightVisual;
+  /** Per-call color/opacity override for this selection only. The mode
+   *  profile is left untouched — the next highlight without a style reverts
+   *  to the profile look. */
+  style?: HighlightStyle;
+}
+
+/** Capability context for {@link resolveStrategy} (all per-root). */
+export interface StrategyContext {
+  /** The profile's (or per-call override's) desired visual. */
+  desired: HighlightVisual;
+  /** OutlinePass usable (wired + renderer supports it). */
+  outlineAvailable: boolean;
+  /** Root subtree has ≥1 camera-rendered mesh (OutlinePass precondition). */
+  hasRenderedMesh: boolean;
+  /** A proxy provider covers this root AND its edge arena is ready. */
+  proxyAvailable: boolean;
+  /** Collected mesh count of the root subtree. */
+  meshCount: number;
+  /** Overlay mesh budget — above it, bounding-box wireframe. */
+  maxMeshes: number;
+}
+
+/**
+ * The explicit fallback matrix (replaces the old implicit ladder):
+ *
+ * | desired  | condition                                   | resolved     |
+ * |----------|---------------------------------------------|--------------|
+ * | outline  | outline available AND ≥1 rendered mesh      | outline      |
+ * | outline  | outline unavailable OR root fully batched   | overlay*     |
+ * | overlay  | proxy windows + edge arena ready            | fill-proxy   |
+ * | overlay  | otherwise, meshCount ≤ maxMeshes            | overlay      |
+ * | overlay* | meshCount > maxMeshes                       | bbox         |
+ *
+ * `fallback` is true when the resolved strategy is not the desired visual
+ * (outline→overlay downgrade, or the bbox budget cap).
+ * In 'overlay' mode the outline branch is NEVER taken — batched and unbatched
+ * content look identical in HMI/DES.
+ */
+export function resolveStrategy(ctx: StrategyContext): { strategy: ResolvedStrategy; fallback: boolean } {
+  if (ctx.desired === 'outline') {
+    if (ctx.outlineAvailable && ctx.hasRenderedMesh) return { strategy: 'outline', fallback: false };
+    return resolveOverlayFamily(ctx, true);
+  }
+  return resolveOverlayFamily(ctx, false);
+}
+
+function resolveOverlayFamily(ctx: StrategyContext, fallback: boolean): { strategy: ResolvedStrategy; fallback: boolean } {
+  if (ctx.proxyAvailable) return { strategy: 'fill-proxy', fallback };
+  if (ctx.meshCount <= ctx.maxMeshes) return { strategy: 'overlay', fallback };
+  return { strategy: 'bbox', fallback: true };
+}
+
+/** Map a resolved strategy onto the PickMetrics vocabulary. */
+function toMetricsStrategy(s: ResolvedStrategy): HighlightStrategy {
+  return s === 'overlay' ? 'overlay-legacy' : s;
+}
+
+// ─── Overlay provider seam (§4.2 drawRange proxies plug in here) ──────
+
+/** Channel a provider overlay belongs to (release grouping + style source). */
+export type OverlayChannel = 'hover' | 'selection' | 'aux' | 'flash';
+
+/** Handle to one provider-acquired overlay; release() returns it to the pool. */
+export interface OverlayHandle {
+  release(): void;
+}
+
+/**
+ * Pluggable overlay source. The proxy provider (rv-highlight-proxy.ts)
+ * serves zero-copy drawRange proxies over the merged pick geometry;
+ * when it can't handle a target the manager builds legacy per-mesh pairs.
+ */
+export interface HighlightOverlayProvider {
+  /** True when this provider can fully visualize `target` right now. */
+  canHandle(target: Object3D): boolean;
+  /** Create (or reuse from pool) the overlay visuals for `target`. */
+  acquire(target: Object3D, channel: OverlayChannel, style: HighlightStyle): OverlayHandle;
+}
+
 // ─── Constants ────────────────────────────────────────────────────────
 
+/** Duration of the ping attention pulse in ms. */
+const PING_DURATION_MS = 900;
+/** Number of opacity pulses within one ping. */
+const PING_PULSES = 3;
+
+/** Silhouette-edge crease threshold. NOTE: three's EdgesGeometry takes the
+ *  threshold in DEGREES — the pre-refactor code passed radians (~0.52°), which
+ *  drew practically every tessellation edge on curved parts (full wireframe).
+ *  30° matches the gizmo mesh-edges look and the proxy edge arena. */
 const EDGE_THRESHOLD_DEG = 30;
 
 /** Default max meshes for hover highlight — above this, show bounding-box wireframe instead. */
 const DEFAULT_MAX_HOVER_MESHES = 200;
 
+/** OutlinePass flash-channel pulse period (s). Only the OUTLINE pulses —
+ *  the fill/edges overlays render steady at the opacities below (matching
+ *  the selection overlay look). */
+const FLASH_PULSE_PERIOD_S = 0.6;
+/** Default flash duration (ms). */
+const FLASH_DURATION_MS = 3500;
+const FLASH_FILL_OPACITY = 0.2;
+const FLASH_EDGE_OPACITY = 0.65;
+
 /** WeakMap cache for EdgesGeometry — avoids recomputing edges for the same BufferGeometry */
 const edgeGeometryCache = new WeakMap<BufferGeometry, EdgesGeometry>();
+
+/** Drop the cached EdgesGeometry for a source geometry after an in-place
+ *  mutation (the cache would otherwise serve stale silhouettes). */
+export function invalidateEdgeCache(geometry: BufferGeometry): void {
+  const cached = edgeGeometryCache.get(geometry);
+  if (cached) {
+    cached.dispose();
+    edgeGeometryCache.delete(geometry);
+  }
+}
 
 // ─── Overlay Pair (fill + edge linked to source mesh) ────────────────
 
@@ -109,6 +260,113 @@ interface OverlayPair {
   fill: Mesh | null;
   /** Null when the active style has `showEdges: false`. */
   edge: LineSegments | null;
+  /** True when fill/edge are pooled wrappers owned by the OverlayBuilder. */
+  pooled?: boolean;
+}
+
+/** Shared placeholder geometry parked on pooled wrappers while free — keeps
+ *  the pool from pinning the last-highlighted geometry in memory. */
+const EMPTY_GEOMETRY = new BufferGeometry();
+
+/**
+ * OverlayBuilder — internal builder/pool for the legacy per-mesh overlay pairs
+ * (fill Mesh + cached-EdgesGeometry LineSegments). Wrappers are pooled: on
+ * release they leave the scene and park on a free list; the next acquire
+ * reassigns geometry/material/matrix instead of allocating and re-adding new
+ * objects per hover move.
+ */
+class OverlayBuilder {
+  private readonly _freeFills: Mesh[] = [];
+  private readonly _freeEdges: LineSegments[] = [];
+
+  constructor(private readonly scene: Scene) {}
+
+  acquirePair(
+    geometry: BufferGeometry,
+    matrix: Matrix4,
+    sourceMesh: Mesh,
+    namePrefix: string,
+    thresholdDeg: number,
+    fillMat: MeshBasicMaterial,
+    edgeMaterial: LineBasicMaterial,
+    renderOrderBase: number,
+    showOverlay: boolean,
+    showEdges: boolean,
+  ): OverlayPair {
+    let overlay: Mesh | null = null;
+    if (showOverlay) {
+      overlay = this._freeFills.pop() ?? this._newFill();
+      overlay.geometry = geometry;
+      overlay.material = fillMat;
+      overlay.name = `${namePrefix}_hlOverlay`;
+      overlay.renderOrder = renderOrderBase;
+      overlay.matrix.copy(matrix);
+      overlay.matrixWorld.copy(matrix);
+      this.scene.add(overlay);
+    }
+
+    let edgeLines: LineSegments | null = null;
+    if (showEdges) {
+      let edgeGeo = edgeGeometryCache.get(geometry);
+      if (!edgeGeo) {
+        edgeGeo = new EdgesGeometry(geometry, thresholdDeg);
+        edgeGeometryCache.set(geometry, edgeGeo);
+      }
+      edgeLines = this._freeEdges.pop() ?? this._newEdge();
+      edgeLines.geometry = edgeGeo;
+      edgeLines.material = edgeMaterial;
+      edgeLines.name = `${namePrefix}_hlEdge`;
+      edgeLines.renderOrder = renderOrderBase + 1;
+      edgeLines.matrix.copy(matrix);
+      edgeLines.matrixWorld.copy(matrix);
+      this.scene.add(edgeLines);
+    }
+
+    return { source: sourceMesh, fill: overlay, edge: edgeLines, pooled: true };
+  }
+
+  /** Remove pairs from the scene; pooled wrappers return to the free lists. */
+  releasePairs(pairs: OverlayPair[]): void {
+    for (const pair of pairs) {
+      const { fill, edge, pooled } = pair;
+      if (fill) {
+        this.scene.remove(fill);
+        if (pooled) {
+          fill.geometry = EMPTY_GEOMETRY;
+          this._freeFills.push(fill);
+        }
+      }
+      if (edge && edge !== (fill as unknown as LineSegments)) {
+        this.scene.remove(edge);
+        if (pooled) {
+          edge.geometry = EMPTY_GEOMETRY;
+          this._freeEdges.push(edge);
+        }
+      }
+    }
+    pairs.length = 0;
+  }
+
+  /** Overlay object contract: on-top overlay layer, never picked, never in AO. */
+  private _newFill(): Mesh {
+    const m = new Mesh(EMPTY_GEOMETRY);
+    m.userData._highlightOverlay = true;
+    m.raycast = () => {};
+    m.matrixAutoUpdate = false;
+    m.matrixWorldAutoUpdate = false;
+    m.layers.set(HIGHLIGHT_OVERLAY_LAYER);
+    return m;
+  }
+
+  private _newEdge(): LineSegments {
+    const l = new LineSegments(EMPTY_GEOMETRY as EdgesGeometry);
+    l.userData._highlightOverlay = true;
+    l.raycast = () => {};
+    l.matrixAutoUpdate = false;
+    l.matrixWorldAutoUpdate = false;
+    l.layers.set(HIGHLIGHT_OVERLAY_LAYER);
+    return l;
+  }
 }
 
 // ─── RVHighlightManager ──────────────────────────────────────────────
@@ -118,6 +376,10 @@ export class RVHighlightManager {
   private hoverPairs: OverlayPair[] = [];
   /** Selection overlay pairs (persistent). */
   private selectionPairs: OverlayPair[] = [];
+  /** Aux-emphasis overlay pairs (overlay-mode rendering of aux sets). */
+  private auxPairs: OverlayPair[] = [];
+  /** Flash overlay pairs (pulsing fill+edges). */
+  private flashPairs: OverlayPair[] = [];
   /** When true, update() re-syncs hover overlay matrices from source meshes. */
   private hoverTracked = false;
   /** When true, update() re-syncs selection overlay matrices. */
@@ -126,44 +388,94 @@ export class RVHighlightManager {
   /** Max meshes before falling back to bounding-box wireframe. */
   maxHoverMeshes = DEFAULT_MAX_HOVER_MESHES;
 
-  /** Active hover style (defaults to DEFAULT_HOVER_STYLE). */
+  /** The active mode profile (what a highlight looks like). */
+  private _profile: HighlightProfile = BUILTIN_PROFILE;
+
+  /** Active hover style (from the profile). */
   private _hoverStyle: HighlightStyle = { ...DEFAULT_HOVER_STYLE };
-  /** Active selection style (defaults to DEFAULT_SELECTION_STYLE). */
+  /** Active selection style (from the profile). */
   private _selectionStyle: HighlightStyle = { ...DEFAULT_SELECTION_STYLE };
 
-  /** Materials built from the current styles. Recreated on style change. */
+  /** Materials built from the current styles. Recreated on profile change. */
   private _hoverOverlayMat: MeshBasicMaterial;
   private _hoverEdgeMat: LineBasicMaterial;
   private _selectionOverlayMat: MeshBasicMaterial;
   private _selectionEdgeMat: LineBasicMaterial;
 
-  /**
-   * Optional outline-pass manager. When set and `available`, the standard
-   * hover/selection paths render as a true OutlinePass silhouette (the same
-   * look the layout planner uses for its selection) instead of building
-   * overlay fill + edge meshes per highlighted node. Special cases that the
-   * outline pass can't handle (instanced MU slots, the dense-mesh
-   * bounding-box fallback) keep using the overlay path regardless.
-   */
+  /** Cached materials for the last per-call selection style override
+   *  (`highlightSelection({ style })`) — one slot, rebuilt when the style
+   *  changes. The profile styles above are never touched by an override. */
+  private _overrideKey = '';
+  private _overrideOverlayMat: MeshBasicMaterial | null = null;
+  private _overrideEdgeMat: LineBasicMaterial | null = null;
+
+  /** Optional outline-pass manager (OutlinePass silhouettes for the
+   *  'outline' visual + the flash outline channel). */
   private _outlineManager: RVOutlineManager | null = null;
 
+  /** Optional §4.2 proxy overlay provider (zero-copy drawRange proxies). */
+  private _proxyProvider: HighlightOverlayProvider | null = null;
+
+  /** Provider handles per channel (released together with the channel). */
+  private _hoverProxyHandles: OverlayHandle[] = [];
+  private _selectionProxyHandles: OverlayHandle[] = [];
+  private _auxProxyHandles: OverlayHandle[] = [];
+
+  /** Roots currently on the selection outline channel (unioned with aux). */
+  private _selectionOutlineRoots: Object3D[] = [];
+  /** Aux roots currently rendered through the outline channel. */
+  private _auxOutlineRoots: Object3D[] = [];
+  /** Named aux emphasis sets (e.g. 'planner-ghost'). */
+  private readonly _auxSets = new Map<string, Object3D[]>();
+
+  /** Active flash state, or null. */
+  private _flashState: {
+    until: number;
+    fillMat: MeshBasicMaterial;
+    edgeMat: LineBasicMaterial;
+    disposeProxies: (() => void) | null;
+    proxyHandles: OverlayHandle[];
+  } | null = null;
+
+  /** Overlay builder + pool (legacy per-mesh pairs). */
+  private readonly _builder: OverlayBuilder;
+
+  /** True while the user has hidden the 'highlights' overlay category (plan-250).
+   *  Cached from the store; when set, hover/selection highlights are suppressed. */
+  private _catHidden = !isOverlayVisible('highlights');
+  private _offOverlay: () => void;
+
+  /** Optional highlight-apply timing sink (DevTools "Picking & Highlight"). */
+  private _metrics: PickMetrics | null = null;
+  /** Strategy taken by the currently-running highlight apply (set at branch points). */
+  private _lastStrategy: HighlightStrategy = 'none';
+  /** Whether the last apply downgraded from the desired visual. */
+  private _lastFallback = false;
+
   constructor(private readonly scene: Scene) {
+    this._builder = new OverlayBuilder(scene);
     this._hoverOverlayMat = this._buildOverlayMat(this._hoverStyle, '_hoverOverlay');
     this._hoverEdgeMat = this._buildEdgeMat(this._hoverStyle);
     this._selectionOverlayMat = this._buildOverlayMat(this._selectionStyle, '_selectionOverlay');
     this._selectionEdgeMat = this._buildEdgeMat(this._selectionStyle);
+    // Overlay-visibility gate (plan-250): when 'highlights' is switched off,
+    // suppress new highlights and clear any that are currently shown. A render
+    // is triggered centrally by the Display panel toggle (markRenderDirty).
+    this._offOverlay = subscribeOverlayVisibility(() => {
+      this._catHidden = !isOverlayVisible('highlights');
+      if (this._catHidden) this.clearAll();
+    });
   }
 
   /**
    * Wire up the outline-pass manager. Called once during viewer
-   * construction. After this, hover/selection highlights render as
-   * OutlinePass silhouettes, honoring the current style edge colors.
+   * construction. Pushes the current profile's outline styles.
    */
   setOutlineManager(om: RVOutlineManager | null): void {
     this._outlineManager = om;
     if (om) {
-      om.setStyle(outlineFromHighlightColor(this._selectionStyle.edgeColor));
-      om.setHoverStyle(outlineFromHighlightColor(this._hoverStyle.edgeColor));
+      om.setStyle({ ...this._profile.selectionOutline });
+      om.setHoverStyle({ ...this._profile.hoverOutline });
     }
   }
 
@@ -172,50 +484,86 @@ export class RVHighlightManager {
     return !!this._outlineManager && this._outlineManager.available;
   }
 
-  // ─── Style API ───────────────────────────────────────────────────────
-
-  /**
-   * Replace the selection highlight style. Pass null to revert to default cyan.
-   * Callers should clearSelection() first — existing selection overlays are
-   * not retroactively re-styled (they reference the old materials until cleared).
-   */
-  setSelectionStyle(style: HighlightStyle | null): void {
-    this._selectionOverlayMat.dispose();
-    this._selectionEdgeMat.dispose();
-    this._selectionStyle = style ? { ...style } : { ...DEFAULT_SELECTION_STYLE };
-    this._selectionOverlayMat = this._buildOverlayMat(this._selectionStyle, '_selectionOverlay');
-    this._selectionEdgeMat = this._buildEdgeMat(this._selectionStyle);
-    // Mirror the edge color into the outline pass so the silhouette matches
-    // the new style. Both the visible and the hidden edge color are pushed:
-    // OutlinePass uses hiddenEdgeColor for occluded parts, and the default
-    // is green — which would show as a second green outline through
-    // occluding geometry when the visible color is anything else.
-    // Plugins (e.g. layout planner) may follow up with a more specific
-    // outlineManager.setStyle() — that call wins.
-    this._outlineManager?.setStyle(outlineFromHighlightColor(this._selectionStyle.edgeColor));
+  /** Install the §4.2 proxy overlay provider (null to remove). */
+  setProxyProvider(provider: HighlightOverlayProvider | null): void {
+    this._proxyProvider = provider;
   }
 
-  /**
-   * Replace the hover highlight style. Pass null to revert to default orange.
-   * Existing hover overlays are not retroactively re-styled.
-   */
-  setHoverStyle(style: HighlightStyle | null): void {
-    this._hoverOverlayMat.dispose();
-    this._hoverEdgeMat.dispose();
-    this._hoverStyle = style ? { ...style } : { ...DEFAULT_HOVER_STYLE };
-    this._hoverOverlayMat = this._buildOverlayMat(this._hoverStyle, '_hoverOverlay');
-    this._hoverEdgeMat = this._buildEdgeMat(this._hoverStyle);
-    this._outlineManager?.setHoverStyle(outlineFromHighlightColor(this._hoverStyle.edgeColor));
+  /** Install the highlight-apply timing sink (null to disable). */
+  setMetrics(metrics: PickMetrics | null): void {
+    this._metrics = metrics;
   }
 
-  /** Read the current active selection style (frozen copy). */
+  /** Live overlay objects across all channels (bbox pairs alias fill === edge). */
+  private _overlayObjectCount(): number {
+    let n = 0;
+    for (const list of [this.hoverPairs, this.selectionPairs, this.auxPairs, this.flashPairs]) {
+      for (const p of list) {
+        if (p.fill) n++;
+        if (p.edge && p.edge !== (p.fill as unknown as LineSegments)) n++;
+      }
+    }
+    return n;
+  }
+
+  /** Report one highlight apply to the metrics sink (start time from performance.now()). */
+  private _recordHighlight(startMs: number): void {
+    if (!this._metrics) return;
+    this._metrics.recordHighlight(
+      performance.now() - startMs,
+      this._lastStrategy,
+      this._overlayObjectCount(),
+      this._lastFallback,
+    );
+  }
+
+  // ─── Profile API ─────────────────────────────────────────────────────
+
+  /**
+   * Install a mode highlight profile: atomically swaps the desired visual,
+   * both overlay-channel styles AND both OutlinePass channel styles.
+   * Callers should clear()/refresh the selection afterwards — existing
+   * overlays keep referencing the old materials until re-applied
+   * (RVHighlightPolicy does exactly that on mode-changed).
+   */
+  setProfile(profile: HighlightProfile): void {
+    this._profile = profile;
+    this._setHoverStyle(profile.hoverStyle);
+    this._setSelectionStyle(profile.selectionStyle);
+    this._outlineManager?.setStyle({ ...profile.selectionOutline });
+    this._outlineManager?.setHoverStyle({ ...profile.hoverOutline });
+    this.maxHoverMeshes = profile.maxHoverMeshes ?? DEFAULT_MAX_HOVER_MESHES;
+  }
+
+  /** The active mode profile. */
+  getProfile(): HighlightProfile {
+    return this._profile;
+  }
+
+  /** Read the current active selection style. */
   getSelectionStyle(): Readonly<HighlightStyle> {
     return this._selectionStyle;
   }
 
-  /** Read the current active hover style (frozen copy). */
+  /** Read the current active hover style. */
   getHoverStyle(): Readonly<HighlightStyle> {
     return this._hoverStyle;
+  }
+
+  private _setSelectionStyle(style: HighlightStyle): void {
+    this._selectionOverlayMat.dispose();
+    this._selectionEdgeMat.dispose();
+    this._selectionStyle = { ...style };
+    this._selectionOverlayMat = this._buildOverlayMat(this._selectionStyle, '_selectionOverlay');
+    this._selectionEdgeMat = this._buildEdgeMat(this._selectionStyle);
+  }
+
+  private _setHoverStyle(style: HighlightStyle): void {
+    this._hoverOverlayMat.dispose();
+    this._hoverEdgeMat.dispose();
+    this._hoverStyle = { ...style };
+    this._hoverOverlayMat = this._buildOverlayMat(this._hoverStyle, '_hoverOverlay');
+    this._hoverEdgeMat = this._buildEdgeMat(this._hoverStyle);
   }
 
   // ─── Private helpers ─────────────────────────────────────────────────
@@ -244,68 +592,16 @@ export class RVHighlightManager {
     });
   }
 
-  /**
-   * Create a fill overlay + edge outline pair for a single geometry,
-   * positioned via `matrix`. Accepts materials and show flags so it can serve
-   * both hover and selection channels with their respective styles.
-   */
-  private _createOverlayPair(
-    geometry: BufferGeometry,
-    matrix: Matrix4,
-    sourceMesh: Mesh,
-    namePrefix: string,
-    thresholdRad: number,
-    fillMat: MeshBasicMaterial,
-    edgeMaterial: LineBasicMaterial,
-    renderOrderBase: number,
-    showOverlay: boolean,
-    showEdges: boolean,
-  ): OverlayPair {
-    let overlay: Mesh | null = null;
-    if (showOverlay) {
-      overlay = new Mesh(geometry, fillMat);
-      overlay.name = `${namePrefix}_hlOverlay`;
-      overlay.userData._highlightOverlay = true;
-      overlay.renderOrder = renderOrderBase;
-      overlay.raycast = () => {};
-      overlay.matrixAutoUpdate = false;
-      overlay.matrixWorldAutoUpdate = false;
-      overlay.matrix.copy(matrix);
-      overlay.matrixWorld.copy(matrix);
-      overlay.layers.set(HIGHLIGHT_OVERLAY_LAYER);
-      this.scene.add(overlay);
-    }
-
-    let edgeLines: LineSegments | null = null;
-    if (showEdges) {
-      let edgeGeo = edgeGeometryCache.get(geometry);
-      if (!edgeGeo) {
-        edgeGeo = new EdgesGeometry(geometry, thresholdRad);
-        edgeGeometryCache.set(geometry, edgeGeo);
-      }
-      edgeLines = new LineSegments(edgeGeo, edgeMaterial);
-      edgeLines.name = `${namePrefix}_hlEdge`;
-      edgeLines.userData._highlightOverlay = true;
-      edgeLines.renderOrder = renderOrderBase + 1;
-      edgeLines.raycast = () => {};
-      edgeLines.matrixAutoUpdate = false;
-      edgeLines.matrixWorldAutoUpdate = false;
-      edgeLines.matrix.copy(matrix);
-      edgeLines.matrixWorld.copy(matrix);
-      edgeLines.layers.set(HIGHLIGHT_OVERLAY_LAYER);
-      this.scene.add(edgeLines);
-    }
-
-    return { source: sourceMesh, fill: overlay, edge: edgeLines };
-  }
-
-  /** Remove overlay pairs from the scene. */
-  private _removePairs(pairs: OverlayPair[]): void {
-    for (const { fill, edge } of pairs) {
-      if (fill) this.scene.remove(fill);
-      if (edge) this.scene.remove(edge);
-    }
-    pairs.length = 0;
+  /** Resolve the strategy for one root (shared by all channels). */
+  private _resolve(root: Object3D, meshes: Mesh[], desired: HighlightVisual): { strategy: ResolvedStrategy; fallback: boolean } {
+    return resolveStrategy({
+      desired,
+      outlineAvailable: this._useOutline(),
+      hasRenderedMesh: meshes.some(isRenderedMesh),
+      proxyAvailable: this._proxyProvider?.canHandle(root) ?? false,
+      meshCount: meshes.length,
+      maxMeshes: this.maxHoverMeshes,
+    });
   }
 
   /** Sync tracked overlay positions. */
@@ -323,59 +619,68 @@ export class RVHighlightManager {
     }
   }
 
+  /** Build overlay pairs for a set of meshes into a channel pair list. */
+  private _buildPairs(
+    meshes: Mesh[],
+    into: OverlayPair[],
+    fillMat: MeshBasicMaterial,
+    edgeMat: LineBasicMaterial,
+    style: HighlightStyle,
+    renderOrderBase: number,
+    nameSuffix = '',
+  ): void {
+    for (const mesh of meshes) {
+      mesh.updateWorldMatrix(true, false);
+      into.push(this._builder.acquirePair(
+        mesh.geometry, mesh.matrixWorld, mesh, mesh.name + nameSuffix, EDGE_THRESHOLD_DEG,
+        fillMat, edgeMat, renderOrderBase,
+        style.showOverlay, style.showEdges,
+      ));
+    }
+  }
+
   // ─── Hover API (temporary highlights) ──────────────────────────────
 
   /**
-   * Highlight a subtree with orange hover overlay + edge glow.
+   * Highlight a subtree in the mode's hover visual.
    * Replaces any previous hover highlight. Does NOT affect selection.
    */
-  highlight(root: Object3D, track = false, options?: { includeSensorViz?: boolean; includeChildDrives?: boolean }): void {
+  highlight(root: Object3D, track = false, options?: { includeSensorViz?: boolean; includeChildDrives?: boolean; visual?: HighlightVisual }): void {
+    const t0 = performance.now();
+    this._lastStrategy = 'none';
+    this._lastFallback = false;
+    this._highlightImpl(root, track, options);
+    this._recordHighlight(t0);
+  }
+
+  private _highlightImpl(root: Object3D, track: boolean, options?: { includeSensorViz?: boolean; includeChildDrives?: boolean; visual?: HighlightVisual }): void {
     this.clear();
+    if (this._catHidden) return; // 'highlights' overlay category switched off
     const includeSensorViz = options?.includeSensorViz ?? false;
     const includeChildDrives = options?.includeChildDrives ?? false;
     const meshes = this.collectMeshes(root, includeSensorViz, includeChildDrives);
+    const desired = options?.visual ?? this._profile.visual;
+    const { strategy, fallback } = this._resolve(root, meshes, desired);
+    this._lastStrategy = toMetricsStrategy(strategy);
+    this._lastFallback = fallback;
 
-    // OutlinePass silhouettes only VISIBLE meshes. Use it whenever the subtree
-    // has at least one visible mesh (the common case — Drives, transports,
-    // sensors, library/layout instances). Only fall back to the overlay path
-    // (which builds fill+edge meshes from the geometry, visible or not) when the
-    // subtree is FULLY invisible — e.g. an object whose geometry was pooled into
-    // a shared chunk by the static-merge pass, so its own subtree has no visible
-    // mesh for OutlinePass to draw.
-    const hasVisible = meshes.some(m => m.visible);
-    if (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__rvDiagHighlight) {
-      const pathOf = (n: Object3D): string => { const p: string[] = []; let c: Object3D | null = n; while (c && c.parent) { p.unshift(c.name || '(unnamed)'); c = c.parent; } return p.join('/'); };
-      // eslint-disable-next-line no-console
-      console.log('[rvDiagHighlight]', {
-        root: pathOf(root), rvType: root.userData?._rvType, hasMetadata: !!root.userData?._rvMetadata,
-        useOutline: this._useOutline(), collectedMeshes: meshes.length,
-        visible: meshes.filter(m => m.visible).length, hidden: meshes.filter(m => !m.visible).length,
-        path: (this._useOutline() && hasVisible) ? 'OutlinePass'
-          : meshes.length > this.maxHoverMeshes ? 'boundingBox' : 'overlay',
-      });
-    }
-    if (this._useOutline() && hasVisible) {
-      // OutlinePass renders the silhouette of the live scene mesh, so
-      // tracking is implicit (no per-frame matrix sync needed) and dense
-      // subtrees don't need the bounding-box fallback.
-      this._outlineManager!.setHoverOutlined([root]);
-      return;
-    }
-    this.hoverTracked = track;
-
-    if (meshes.length > this.maxHoverMeshes) {
-      this._highlightBoundingBox(root);
-      return;
-    }
-
-    const thresholdRad = EDGE_THRESHOLD_DEG * (Math.PI / 180);
-    for (const mesh of meshes) {
-      mesh.updateWorldMatrix(true, false);
-      this.hoverPairs.push(this._createOverlayPair(
-        mesh.geometry, mesh.matrixWorld, mesh, mesh.name, thresholdRad,
-        this._hoverOverlayMat, this._hoverEdgeMat, 1000,
-        this._hoverStyle.showOverlay, this._hoverStyle.showEdges,
-      ));
+    switch (strategy) {
+      case 'outline':
+        // OutlinePass renders the silhouette of the live scene mesh, so
+        // tracking is implicit (no per-frame matrix sync needed) and dense
+        // subtrees don't need the bounding-box fallback.
+        this._outlineManager!.setHoverOutlined([root]);
+        return;
+      case 'fill-proxy':
+        this._hoverProxyHandles.push(this._proxyProvider!.acquire(root, 'hover', this._hoverStyle));
+        return;
+      case 'bbox':
+        this.hoverTracked = track;
+        this._highlightBoundingBox(root);
+        return;
+      default:
+        this.hoverTracked = track;
+        this._buildPairs(meshes, this.hoverPairs, this._hoverOverlayMat, this._hoverEdgeMat, this._hoverStyle, 1000);
     }
   }
 
@@ -383,7 +688,16 @@ export class RVHighlightManager {
    * Highlight an instanced MU by creating temporary hover overlay meshes.
    */
   highlightInstancedMU(mu: InstancedMovingUnit): void {
+    const t0 = performance.now();
+    this._lastStrategy = 'none';
+    this._lastFallback = false;
+    this._highlightInstancedMUImpl(mu);
+    this._recordHighlight(t0);
+  }
+
+  private _highlightInstancedMUImpl(mu: InstancedMovingUnit): void {
     this.clear();
+    if (this._catHidden) return; // 'highlights' overlay category switched off
     this.hoverTracked = false;
 
     const pool = mu.node.userData?._muPool;
@@ -395,9 +709,9 @@ export class RVHighlightManager {
     const mat = new Matrix4();
     mu.node.getMatrixAt(mu.slotIndex, mat);
 
-    const thresholdRad = EDGE_THRESHOLD_DEG * (Math.PI / 180);
-    const pair = this._createOverlayPair(
-      geometry, mat, null as unknown as Mesh, '__imu', thresholdRad,
+    this._lastStrategy = 'mu-overlay';
+    const pair = this._builder.acquirePair(
+      geometry, mat, null as unknown as Mesh, '__imu', EDGE_THRESHOLD_DEG,
       this._hoverOverlayMat, this._hoverEdgeMat, 1000,
       this._hoverStyle.showOverlay, this._hoverStyle.showEdges,
     );
@@ -406,52 +720,120 @@ export class RVHighlightManager {
   }
 
   /**
-   * Highlight multiple subtrees at once with orange hover overlay.
-   * Replaces any previous hover highlight.
+   * Highlight multiple subtrees at once on the hover channel.
+   * Replaces any previous hover highlight. `options.visual` overrides the
+   * profile's desired visual per call (e.g. 'overlay' for the editor's group
+   * preview so each grouped mesh reads clearly, not just the outer silhouette).
    */
-  highlightMultiple(roots: Object3D[], options?: { includeSensorViz?: boolean }): void {
-    this.clear();
-    const includeSensorViz = options?.includeSensorViz ?? false;
+  highlightMultiple(roots: Object3D[], options?: { includeSensorViz?: boolean; visual?: HighlightVisual }): void {
+    const t0 = performance.now();
+    this._lastStrategy = 'none';
+    this._lastFallback = false;
+    this._highlightMultipleImpl(roots, options);
+    this._recordHighlight(t0);
+  }
 
-    // Partition roots: those with a visible mesh use OutlinePass; those whose
-    // geometry is fully merged/hidden (e.g. static-merge-pooled objects) fall
-    // back to the overlay path built from their hidden geometry. A mixed set
-    // uses both.
+  private _highlightMultipleImpl(roots: Object3D[], options?: { includeSensorViz?: boolean; visual?: HighlightVisual }): void {
+    this.clear();
+    if (this._catHidden) return; // 'highlights' overlay category switched off
+    const includeSensorViz = options?.includeSensorViz ?? false;
+    const desired = options?.visual ?? this._profile.visual;
+
     const outlineRoots: Object3D[] = [];
     const overlayEntries: { root: Object3D; meshes: Mesh[] }[] = [];
+    let anyOverlay = false;
+    let anyProxy = false;
+    let anyBbox = false;
     for (const root of roots) {
       const meshes = this.collectMeshes(root, includeSensorViz);
-      const hasVisible = meshes.some(m => m.visible);
-      if (this._useOutline() && hasVisible) outlineRoots.push(root);
-      else overlayEntries.push({ root, meshes });
+      const { strategy, fallback } = this._resolve(root, meshes, desired);
+      if (fallback) this._lastFallback = true;
+      switch (strategy) {
+        case 'outline': outlineRoots.push(root); break;
+        case 'fill-proxy':
+          anyProxy = true;
+          this._hoverProxyHandles.push(this._proxyProvider!.acquire(root, 'hover', this._hoverStyle));
+          break;
+        default: overlayEntries.push({ root, meshes }); anyOverlay = true;
+      }
     }
 
-    if (outlineRoots.length > 0) this._outlineManager!.setHoverOutlined(outlineRoots);
+    if (outlineRoots.length > 0) {
+      this._lastStrategy = 'outline';
+      this._outlineManager!.setHoverOutlined(outlineRoots);
+    } else if (anyProxy) {
+      this._lastStrategy = 'fill-proxy';
+    }
     if (overlayEntries.length === 0) return;
 
     this.hoverTracked = true;
     const totalMeshes = overlayEntries.reduce((n, e) => n + e.meshes.length, 0);
     if (totalMeshes > this.maxHoverMeshes) {
+      anyBbox = true;
+      this._lastFallback = true;
       for (const { root } of overlayEntries) this._highlightBoundingBox(root);
-      return;
-    }
-
-    const thresholdRad = EDGE_THRESHOLD_DEG * (Math.PI / 180);
-    for (const { meshes } of overlayEntries) {
-      for (const mesh of meshes) {
-        mesh.updateWorldMatrix(true, false);
-        this.hoverPairs.push(this._createOverlayPair(
-          mesh.geometry, mesh.matrixWorld, mesh, mesh.name, thresholdRad,
-          this._hoverOverlayMat, this._hoverEdgeMat, 1000,
-          this._hoverStyle.showOverlay, this._hoverStyle.showEdges,
-        ));
+    } else {
+      for (const { meshes } of overlayEntries) {
+        this._buildPairs(meshes, this.hoverPairs, this._hoverOverlayMat, this._hoverEdgeMat, this._hoverStyle, 1000);
       }
     }
+    if (anyOverlay) this._lastStrategy = anyBbox ? 'bbox' : 'overlay-legacy';
+  }
+
+  // ─── Ping API (short attention pulse) ───────────────────────────────
+
+  /** Gizmo manager used for the ping glow hull (same visual as the
+   *  CustomRuntimeInstruction highlight). Wired by the viewer after construction. */
+  private _gizmoManager: GizmoOverlayManager | null = null;
+
+  /** Active ping pulse, or null. Only one ping at a time — a new ping replaces it. */
+  private _pingState: { gizmo: GizmoHandle; start: number } | null = null;
+
+  /** Wire up the gizmo overlay manager used for ping pulses. */
+  setGizmoManager(gm: GizmoOverlayManager | null): void {
+    this._gizmoManager = gm;
+  }
+
+  /**
+   * Fire a short attention pulse on a node: a blinking mesh-glow hull (the
+   * same visual the CustomRuntimeInstruction highlight uses), auto-removed
+   * after ~1s. Used by the hierarchy browser so hovered/clicked rows are easy
+   * to spot in the 3D view even when the object is small or occluded.
+   * Independent of the hover and selection channels.
+   */
+  ping(root: Object3D): void {
+    this.clearPing();
+    if (this._catHidden) return; // 'highlights' overlay category switched off
+    if (!this._gizmoManager) return;
+    const gizmo = this._gizmoManager.create(root, {
+      shape: 'mesh-glow-hull',
+      color: this._hoverStyle.edgeColor,
+      opacity: 0.95,
+      blinkHz: PING_PULSES / (PING_DURATION_MS / 1000),
+      outlineScale: 1.06,
+      visible: true,
+      category: 'status',
+    });
+    this._pingState = { gizmo, start: performance.now() };
+  }
+
+  /** Remove an active ping pulse immediately. */
+  clearPing(): void {
+    if (!this._pingState) return;
+    this._pingState.gizmo.dispose();
+    this._pingState = null;
+  }
+
+  /** Whether a ping pulse is currently animating (needs per-frame renders). */
+  get isPingActive(): boolean {
+    return this._pingState !== null;
   }
 
   /** Remove hover highlight overlays only. Selection persists. */
   clear(): void {
-    this._removePairs(this.hoverPairs);
+    this._builder.releasePairs(this.hoverPairs);
+    for (const h of this._hoverProxyHandles) h.release();
+    this._hoverProxyHandles = [];
     this.hoverTracked = false;
     this._outlineManager?.clearHover();
   }
@@ -459,72 +841,275 @@ export class RVHighlightManager {
   /** Whether any hover highlight is currently active. */
   get isActive(): boolean {
     return this.hoverPairs.length > 0
+      || this._hoverProxyHandles.length > 0
       || (this._outlineManager?.hoverPass?.selectedObjects?.length ?? 0) > 0;
   }
 
   // ─── Selection API (persistent highlights) ─────────────────────────
 
   /**
-   * Highlight multiple subtrees with cyan selection overlay + edge glow.
-   * Replaces any previous selection highlight. Does NOT affect hover.
-   * Selection overlays are always tracked (follow moving meshes).
+   * Highlight multiple subtrees on the selection channel in the mode's
+   * selection visual. Replaces any previous selection highlight. Does NOT
+   * affect hover. Overlay-path selection is always tracked (follows moving
+   * meshes). `options.visual` overrides the profile per call; `options.style`
+   * additionally overrides the selection COLOR/opacity for this call only
+   * (used by the editor's kinematic group preview) without disturbing the
+   * mode profile — the profile still owns every other selection.
    */
-  highlightSelection(roots: Object3D[], options?: { includeSensorViz?: boolean; includeChildDrives?: boolean }): void {
+  highlightSelection(roots: Object3D[], options?: SelectionHighlightOptions): void {
+    const t0 = performance.now();
+    this._lastStrategy = 'none';
+    this._lastFallback = false;
+    this._highlightSelectionImpl(roots, options);
+    this._recordHighlight(t0);
+  }
+
+  /** Materials for a per-call style override, cached in a single slot so a
+   *  repeated highlight with the same style does not rebuild them. */
+  private _overrideMats(style: HighlightStyle): { overlay: MeshBasicMaterial; edge: LineBasicMaterial } {
+    const key = `${style.overlayColor}_${style.overlayOpacity}_${style.overlayWireframe ? 1 : 0}`
+      + `_${style.edgeColor}_${style.edgeOpacity}_${style.edgeLinewidth}`;
+    if (key !== this._overrideKey || !this._overrideOverlayMat || !this._overrideEdgeMat) {
+      this._overrideOverlayMat?.dispose();
+      this._overrideEdgeMat?.dispose();
+      this._overrideOverlayMat = this._buildOverlayMat(style, '_selectionOverrideOverlay');
+      this._overrideEdgeMat = this._buildEdgeMat(style);
+      this._overrideKey = key;
+    }
+    return { overlay: this._overrideOverlayMat, edge: this._overrideEdgeMat };
+  }
+
+  private _highlightSelectionImpl(roots: Object3D[], options?: SelectionHighlightOptions): void {
     this.clearSelection();
+    if (this._catHidden) return; // 'highlights' overlay category switched off
     if (roots.length === 0) return;
     const includeSensorViz = options?.includeSensorViz ?? false;
     const includeChildDrives = options?.includeChildDrives ?? false;
+    const desired = options?.visual ?? this._profile.visual;
+    // Per-call color override (kinematic group preview) — falls back to the
+    // profile's selection style and materials when absent.
+    const style = options?.style ?? this._selectionStyle;
+    const mats = options?.style
+      ? this._overrideMats(options.style)
+      : { overlay: this._selectionOverlayMat, edge: this._selectionEdgeMat };
 
-    // Partition roots: visible geometry → OutlinePass; fully merged/hidden
-    // geometry (e.g. static-merge-pooled objects) → overlay built from the
-    // hidden meshes.
     const outlineRoots: Object3D[] = [];
     const overlayEntries: { root: Object3D; meshes: Mesh[] }[] = [];
+    let anyProxy = false;
     for (const root of roots) {
       const meshes = this.collectMeshes(root, includeSensorViz, includeChildDrives);
-      const hasVisible = meshes.some(m => m.visible);
-      if (this._useOutline() && hasVisible) outlineRoots.push(root);
-      else overlayEntries.push({ root, meshes });
+      const { strategy, fallback } = this._resolve(root, meshes, desired);
+      if (fallback) this._lastFallback = true;
+      switch (strategy) {
+        case 'outline': outlineRoots.push(root); break;
+        case 'fill-proxy':
+          anyProxy = true;
+          this._selectionProxyHandles.push(this._proxyProvider!.acquire(root, 'selection', style));
+          break;
+        default: overlayEntries.push({ root, meshes });
+      }
     }
 
-    if (outlineRoots.length > 0) this._outlineManager!.setOutlined(outlineRoots);
+    if (outlineRoots.length > 0) {
+      this._lastStrategy = 'outline';
+      this._selectionOutlineRoots = outlineRoots;
+      this._pushSelectionOutline();
+    } else if (anyProxy) {
+      this._lastStrategy = 'fill-proxy';
+    }
     if (overlayEntries.length === 0) return;
-    // Skip overlay work entirely when the active style suppresses both layers
-    // (e.g. planner mode delegates the selection visual to OutlinePass).
-    if (!this._selectionStyle.showOverlay && !this._selectionStyle.showEdges) return;
+    this._lastStrategy = 'overlay-legacy';
     this.selectionTracked = true;
-    const thresholdRad = EDGE_THRESHOLD_DEG * (Math.PI / 180);
 
     for (const { meshes } of overlayEntries) {
-      for (const mesh of meshes) {
-        mesh.updateWorldMatrix(true, false);
-        this.selectionPairs.push(this._createOverlayPair(
-          mesh.geometry, mesh.matrixWorld, mesh, mesh.name + '_sel', thresholdRad,
-          this._selectionOverlayMat, this._selectionEdgeMat, 900,
-          this._selectionStyle.showOverlay, this._selectionStyle.showEdges,
-        ));
-      }
+      this._buildPairs(meshes, this.selectionPairs, mats.overlay, mats.edge, style, 900, '_sel');
     }
   }
 
-  /** Remove selection highlight overlays only. Hover persists. */
+  /** Remove selection highlight overlays only. Hover and aux persist. */
   clearSelection(): void {
-    this._removePairs(this.selectionPairs);
+    this._builder.releasePairs(this.selectionPairs);
+    for (const h of this._selectionProxyHandles) h.release();
+    this._selectionProxyHandles = [];
     this.selectionTracked = false;
-    this._outlineManager?.clear();
+    this._selectionOutlineRoots = [];
+    this._pushSelectionOutline();
   }
 
   /** Whether any selection highlight is currently active. */
   get isSelectionActive(): boolean {
     return this.selectionPairs.length > 0
-      || (this._outlineManager?.pass?.selectedObjects?.length ?? 0) > 0;
+      || this._selectionProxyHandles.length > 0
+      || this._selectionOutlineRoots.length > 0;
+  }
+
+  // ─── Aux emphasis (named sets unioned into the selection visual) ────
+
+  /**
+   * Show/replace/remove a named auxiliary emphasis set — objects rendered
+   * with the SELECTION visual on top of (independent of) the actual
+   * selection. Used by the planner's placement-preview ghost. Pass null (or
+   * an empty array) to remove the set.
+   *
+   * In outline modes the aux roots join the selection OutlinePass channel;
+   * in overlay modes they get selection-style fill+edges pairs.
+   */
+  setAuxEmphasis(id: string, roots: readonly Object3D[] | null): void {
+    if (!roots || roots.length === 0) this._auxSets.delete(id);
+    else this._auxSets.set(id, [...roots]);
+    this._applyAux();
+  }
+
+  private _applyAux(): void {
+    // Release previous aux visuals.
+    this._builder.releasePairs(this.auxPairs);
+    for (const h of this._auxProxyHandles) h.release();
+    this._auxProxyHandles = [];
+    this._auxOutlineRoots = [];
+
+    if (this._catHidden || this._auxSets.size === 0) {
+      this._pushSelectionOutline();
+      return;
+    }
+
+    const desired = this._profile.visual;
+    for (const roots of this._auxSets.values()) {
+      for (const root of roots) {
+        const meshes = this.collectMeshes(root, false);
+        const { strategy } = this._resolve(root, meshes, desired);
+        switch (strategy) {
+          case 'outline':
+            this._auxOutlineRoots.push(root);
+            break;
+          case 'fill-proxy':
+            this._auxProxyHandles.push(this._proxyProvider!.acquire(root, 'aux', this._selectionStyle));
+            break;
+          case 'bbox':
+            this._highlightBoundingBox(root, this.auxPairs);
+            break;
+          default:
+            this._buildPairs(meshes, this.auxPairs, this._selectionOverlayMat, this._selectionEdgeMat, this._selectionStyle, 900, '_aux');
+        }
+      }
+    }
+    this._pushSelectionOutline();
+  }
+
+  /** Push the union of selection + aux roots to the selection outline channel. */
+  private _pushSelectionOutline(): void {
+    if (!this._outlineManager) return;
+    const union = [...this._selectionOutlineRoots];
+    for (const r of this._auxOutlineRoots) if (!union.includes(r)) union.push(r);
+    this._outlineManager.setOutlined(union);
+  }
+
+  /** Whether any aux emphasis is currently shown (tracked pairs need syncing). */
+  get isAuxActive(): boolean {
+    return this.auxPairs.length > 0
+      || this._auxProxyHandles.length > 0
+      || this._auxOutlineRoots.length > 0;
+  }
+
+  // ─── Flash API (alarm pulse: fill + edges + outline, all modes) ─────
+
+  /**
+   * Flash an alarm on `roots`: STATIC fill + edges (the exact hover/selection
+   * overlay look) plus the PULSING OutlinePass flash channel, all in
+   * `opts.color`, for `durationMs` (default 3500 ms), then auto-cleared.
+   * Only the outline pulses — fill and edges stay steady. Independent of the
+   * hover/selection/aux channels — an alarm never clobbers the user's
+   * selection outline. A new flash replaces the previous one. Batched roots
+   * get invisible outline proxies so the silhouette works everywhere.
+   */
+  flash(roots: readonly Object3D[], opts: { color: number; durationMs?: number }): void {
+    this.clearFlash();
+    if (this._catHidden || roots.length === 0) return;
+
+    const flashStyle: HighlightStyle = {
+      overlayColor: opts.color, overlayOpacity: FLASH_FILL_OPACITY, overlayWireframe: false,
+      edgeColor: opts.color, edgeOpacity: FLASH_EDGE_OPACITY, showOverlay: true, showEdges: true,
+    };
+    const fillMat = this._buildOverlayMat(flashStyle, '_flashOverlay');
+    const edgeMat = this._buildEdgeMat(flashStyle);
+
+    // Fill + edges on every root — the SAME rendering paths as hover: the
+    // drawRange proxy when it covers the root (correct 30° crease edges),
+    // legacy pooled pairs otherwise (budget-capped so a mis-targeted flash on
+    // a huge assembly can't build thousands of pairs).
+    const proxyHandles: OverlayHandle[] = [];
+    let budget = this.maxHoverMeshes;
+    for (const root of roots) {
+      if (this._proxyProvider?.canHandle(root)) {
+        proxyHandles.push(this._proxyProvider.acquire(root, 'flash', flashStyle));
+        continue;
+      }
+      if (budget <= 0) continue;
+      const meshes = this.collectMeshes(root, false).slice(0, budget);
+      budget -= meshes.length;
+      for (const mesh of meshes) {
+        mesh.updateWorldMatrix(true, false);
+        this.flashPairs.push(this._builder.acquirePair(
+          mesh.geometry, mesh.matrixWorld, mesh, mesh.name + '_flash', EDGE_THRESHOLD_DEG,
+          fillMat, edgeMat, 1100, true, true,
+        ));
+      }
+    }
+
+    // Outline on the flash channel — batched roots via invisible proxies.
+    let disposeProxies: (() => void) | null = null;
+    const om = this._outlineManager;
+    if (om && om.available) {
+      const dark = (c: number) => {
+        const f = 0.35;
+        const r = Math.round(((c >> 16) & 0xff) * f);
+        const g = Math.round(((c >> 8) & 0xff) * f);
+        const b = Math.round((c & 0xff) * f);
+        return (r << 16) | (g << 8) | b;
+      };
+      const resolved = resolveOutlineTargets(this.scene, roots as Object3D[]);
+      disposeProxies = resolved.dispose;
+      om.setFlashStyle({
+        visibleEdgeColor: opts.color,
+        hiddenEdgeColor: dark(opts.color),
+        edgeStrength: 20,
+        edgeThickness: 10,
+        edgeGlow: 1.5,
+        pulsePeriod: FLASH_PULSE_PERIOD_S,
+      });
+      om.setFlashOutlined(resolved.targets);
+    }
+
+    this._flashState = {
+      until: performance.now() + (opts.durationMs ?? FLASH_DURATION_MS),
+      fillMat,
+      edgeMat,
+      disposeProxies,
+      proxyHandles,
+    };
+  }
+
+  /** Remove an active flash immediately. */
+  clearFlash(): void {
+    if (!this._flashState) return;
+    this._builder.releasePairs(this.flashPairs);
+    for (const h of this._flashState.proxyHandles) h.release();
+    this._outlineManager?.clearFlash();
+    this._flashState.disposeProxies?.();
+    this._flashState.fillMat.dispose();
+    this._flashState.edgeMat.dispose();
+    this._flashState = null;
+  }
+
+  /** Whether a flash pulse is currently animating (needs per-frame renders). */
+  get isFlashActive(): boolean {
+    return this._flashState !== null;
   }
 
   // ─── Common API ────────────────────────────────────────────────────
 
   /**
-   * Re-sync overlay positions from source meshes (both channels).
-   * Call once per render frame. No-op when nothing is tracked.
+   * Per-frame maintenance: re-sync tracked overlay positions, animate the
+   * flash opacity pulse, expire ping + flash. Call once per render frame.
    */
   update(): void {
     if (this.hoverTracked && this.hoverPairs.length > 0) {
@@ -533,26 +1118,47 @@ export class RVHighlightManager {
     if (this.selectionTracked && this.selectionPairs.length > 0) {
       this._syncPairs(this.selectionPairs);
     }
+    if (this.auxPairs.length > 0) {
+      this._syncPairs(this.auxPairs);
+    }
+    if (this._pingState && performance.now() - this._pingState.start >= PING_DURATION_MS) {
+      this.clearPing();
+    }
+    const flash = this._flashState;
+    if (flash) {
+      if (performance.now() >= flash.until) {
+        this.clearFlash();
+      } else if (this.flashPairs.length > 0) {
+        // Fill/edges stay at constant opacity — only the OutlinePass flash
+        // channel pulses (pulsePeriod). Just track moving alarm roots.
+        this._syncPairs(this.flashPairs);
+      }
+    }
   }
 
-  /** Remove all overlays (both hover and selection). */
+  /** Remove all overlays (hover, selection, aux, ping, flash). */
   clearAll(): void {
     this.clear();
     this.clearSelection();
+    this._auxSets.clear();
+    this._applyAux();
+    this.clearPing();
+    this.clearFlash();
   }
 
   dispose(): void {
+    this._offOverlay();
     this.clearAll();
     this._hoverOverlayMat.dispose();
     this._hoverEdgeMat.dispose();
     this._selectionOverlayMat.dispose();
     this._selectionEdgeMat.dispose();
+    this._overrideOverlayMat?.dispose();
+    this._overrideEdgeMat?.dispose();
   }
 
-  // outlineFromHighlightColor is a free function defined below the class.
-
   /** Cheap bounding-box wireframe highlight for components with too many meshes. */
-  private _highlightBoundingBox(root: Object3D): void {
+  private _highlightBoundingBox(root: Object3D, into: OverlayPair[] = this.hoverPairs): void {
     const box = new Box3().setFromObject(root);
     if (box.isEmpty()) return;
     const helper = new Box3Helper(box, new Color(this._hoverStyle.edgeColor));
@@ -572,7 +1178,7 @@ export class RVHighlightManager {
     helperMat.transparent = true;
     helperMat.opacity = this._hoverStyle.edgeOpacity;
     this.scene.add(helper);
-    this.hoverPairs.push({ source: root as unknown as Mesh, fill: helper as unknown as Mesh, edge: helper as unknown as LineSegments });
+    into.push({ source: root as unknown as Mesh, fill: helper as unknown as Mesh, edge: helper as unknown as LineSegments });
   }
 
   /**
@@ -586,10 +1192,6 @@ export class RVHighlightManager {
         const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
         if (rv?.['Drive']) return; // child drive boundary — don't highlight nested drives
       }
-      // Skip hidden kinematic source meshes (originals hidden by merge).
-      // Merged chunks (_rvKinGroupMerged) are kept — they're visible and
-      // represent the Drive subtree for highlighting.
-      if (node.userData?._rvKinGroupSource) return;
       if (
         (node as Mesh).isMesh &&
         !node.userData?._highlightOverlay &&
@@ -605,23 +1207,4 @@ export class RVHighlightManager {
     visit(root, true);
     return meshes;
   }
-}
-
-/**
- * Map a HighlightStyle.edgeColor to a paired (visible, hidden) outline-edge
- * pair. The hidden edge is the same hue at ~25% lightness so the
- * occlusion-aware OutlinePass renders the same color through walls — a
- * mismatched hidden color (the OutlinePass default is dark green) shows up
- * as a second outline of the wrong hue when the visible color is anything
- * other than green.
- */
-function outlineFromHighlightColor(rgbHex: number): { visibleEdgeColor: number; hiddenEdgeColor: number } {
-  const r = (rgbHex >> 16) & 0xff;
-  const g = (rgbHex >> 8) & 0xff;
-  const b = rgbHex & 0xff;
-  const dark = (c: number) => Math.max(0, Math.min(255, Math.round(c * 0.35)));
-  return {
-    visibleEdgeColor: rgbHex,
-    hiddenEdgeColor: (dark(r) << 16) | (dark(g) << 8) | dark(b),
-  };
 }

@@ -23,11 +23,37 @@ import type { McpBridgeSnapshot, McpServerLogLine } from '../plugins/mcp-bridge-
 import type { ModeId } from './rv-mode-manager';
 import type { RenderMode } from './rv-render-modes';
 import type { Object3D } from 'three';
+import type { SignatureState } from './persistence/rv-sig-verify';
 
 export interface ViewerEvents {
   // ── Existing events (unchanged) ──
   'model-loaded': { result: LoadResult };
+  /** Geometry/HMI lifecycle remains on model-loaded; executable model logic
+   *  binds only when this event fires (immediately for none/valid, or after an
+   *  explicit late activation for invalid/unverifiable signatures). */
+  'model-logic-activated': { result: LoadResult };
+  'signature-state-changed': {
+    signatureState: SignatureState;
+    logicRunState: 'active' | 'gated' | 'activating';
+  };
   'model-cleared': void;
+  /** Fired when the asynchronous BVH build for the current model has completed
+   *  (plan-240): all merged raycast geometries and per-mesh geometries now
+   *  carry their `boundsTree` and hover/click raycasts run BVH-accelerated.
+   *  `model-loaded` intentionally does NOT wait for this — between the two
+   *  events, raycasting works through the native three.js fallback (slower).
+   *  Not fired when the build was aborted by a newer load/clear. */
+  'raycast-ready': void;
+  /** Fired by engine components (e.g. WebVisibility) after mutating a model
+   *  node's `.visible` at runtime. The viewer reacts by re-syncing the
+   *  BatchedMesh per-instance visibility and rebuilding the shadow map. */
+  'node-visibility-changed': void;
+  /** Fired by `RVViewer.setAvailableModels()` when the model catalogue changes
+   *  after boot — a model published to a running CONNECT gateway (plan-365).
+   *  Consumers that keep their OWN copy of the list must re-read it here;
+   *  `SceneStore` is one, because it mirrors `availableModels` into its
+   *  built-ins and would otherwise show a catalogue frozen at boot. */
+  'models-changed': { models: Array<{ url: string; label: string }> };
   /** Fired by RVViewer.loadScene() once the scene record is fully applied
    *  (base GLB + overlay + placements). Camera plugins listen for this to
    *  apply per-scene camera presets. */
@@ -101,6 +127,28 @@ export interface ViewerEvents {
   'panel-opened': { panelId: string };
   'panel-closed': { panelId: string };
 
+  // ── AI error diagnosis events (plan-253) ──
+  /** Emitted by the `WebDiagnostics` engine marker (rv-web-diagnostics.ts) on a
+   *  PLC error-signal edge. The marker NEVER imports a provider (layering/tier);
+   *  the diagnose plugin (private tier) subscribes and performs the backend
+   *  call. `errorActive: false` = falling edge — the plugin aborts the running
+   *  request and removes the card/dialog (F11). */
+  'diagnose-request': {
+    nodePath: string;
+    errorCode?: number;
+    errorActive?: boolean;
+    docFilter?: string;
+    errorId?: string;
+    label?: string;
+    autoOpen?: boolean;
+    /** Documentation paths linked to the node, used as retrieval hints. */
+    docHints?: string[];
+    /** Size-capped live component metadata and signal state. */
+    machineContext?: string;
+    /** Stable identifier of the UI surface that initiated the request. */
+    source?: string;
+  };
+
   // ── Safety door events (engine listens, UI emits) ──
   /** Show or hide all safety-door gizmos at once.
    *  UI plugins emit this to toggle visibility from a warning tile etc. */
@@ -169,6 +217,53 @@ export interface ViewerEvents {
   /** Fired AFTER a workspace-mode switch has fully applied. */
   'mode-changed': { from: ModeId | null; to: ModeId };
 
+  /** Fired after a plugin-registry or enabled-state mutation has completed. */
+  'plugins-changed': {
+    kind: 'registered' | 'enabled' | 'disabled' | 'removed' | 'user-disabled' | 'user-enabled';
+    id: string;
+  };
+
+  // ── Script component events (plan-210) ──
+  /** Fired after a `WebComponent` script instance was hot-reloaded
+   *  (dispose old VM → fresh setup — COLD state). Emitted by the
+   *  web-component plugin's instance registry; the phase-3 editor UI and
+   *  overlays listen to refresh their state. */
+  'component-reloaded': { nodePath: string };
+
+  /** A script component raised (or cleared) an error state via
+   *  `self.raiseError(code, message)` / `self.clearError()` (plan-210 phase
+   *  1b). `cleared: true` marks the clear notification; other components read
+   *  the state via `self.component(path).error` or the conventional
+   *  `<Name>.Error` signal. */
+  'component-error': { nodePath: string; code?: string; message?: string; cleared?: boolean };
+
+  // ── Editor events ──
+  /** Fired after an asset-editor op (forward or inverse — covers undo/redo and
+   *  draft replay) changed the scene STRUCTURE: nodes added/removed/renamed or
+   *  components added/removed. Listeners rebuild caches (hierarchy panel
+   *  editableNodes etc.) and should coalesce — one emit per top-level op. */
+  'editor-structure-changed': { source: 'asset-editor' };
+
+  /** Fired when Group memberships changed through editing (Group component
+   *  added/removed/renamed, grouped node deleted/restored — both op directions,
+   *  undo/redo included). Listeners re-read `viewer.groups`. */
+  'groups-changed': { source: 'editor' };
+
+  /** Fired at the START of every asset save/export flow, BEFORE the scene is
+   *  cloned for GLB export. Listeners must restore any ephemeral live-preview
+   *  state they hold (e.g. the Kinematics window's drive-jog pose) so preview
+   *  poses never bake into the saved GLB. Any future export path MUST emit
+   *  this too. */
+  'asset-editor-pre-export': { source: 'save-flow' };
+
+  // ── Runtime attachment events ──
+  /** Fired when the SimulationRuntime attaches/detaches time integration
+   *  (driven by workspace modes with `runtime: 'detached'`, e.g. the asset
+   *  editor). While detached, fixedUpdate is never scheduled — stronger than a
+   *  pause: no pause reason (or `clearPauseReasons()`) can resume simulation.
+   *  Rendering is unaffected. */
+  'runtime-attach-changed': { attached: boolean };
+
   // ── Simulation pause events ──
   /** Fired when the overall simulation pause state transitions (idle ↔ paused).
    *  Plugins can subscribe to stop/resume external PLC I/O, freeze animations,
@@ -193,7 +288,10 @@ export interface ViewerEvents {
   /** Phase 1 — RESET. Every component restores its internal variables and state
    *  to the start (like a reload): behaviors clear their FSM/counters/timers,
    *  drives snap back to their authored StartPosition, conveyor textures rewind.
-   *  Fired FIRST, before the engine-level MU/sensor clear. */
+   *  Fired first among the reset phases — note that when a DES run is in
+   *  flight, `'simulation-run-ending'` fires DURING this phase (from the DES
+   *  manager's reset hook, which the phase-1 executor reset triggers), so the
+   *  finished run is archived with its pre-reset statistics (plan-260 B1). */
   'simulation-reset': void;
   /** Phase 3 — START. Fired LAST, after the reset + engine clear, so components
    *  (re)start from the clean state (e.g. a conveyor re-asserts `Run = true`). */
@@ -202,4 +300,25 @@ export interface ViewerEvents {
    *  cycle times) — registrations persist. Primarily a DES concern (reset the
    *  numbers without re-running the model); also fired as part of a full reset. */
   'simulation-resetstat': void;
+
+  // ── Simulation run lifecycle events (plan-260) ──
+  //
+  // Emitted by the private DES run-lifecycle controller — the archive hook
+  // sits in the DES manager's `reset()` (NOT only in `resetSimulation()`), so
+  // native DES and the unified DESRunner are both covered (plan-260 B1).
+  /** A new simulation RUN started (fresh run id + master seed). Fired when the
+   *  DES engine (re)starts with active material-flow components — never for
+   *  non-DES scenes. */
+  'simulation-run-started': { runId: string; seed: number };
+  /** The current simulation RUN is ending and has been handed to the archive:
+   *  on reset (`status: 'aborted'`) or when the sim end time was reached
+   *  (`status: 'completed'`). `simTime` is the DES clock actually reached
+   *  (read from the DES manager — NOT the viewer's continuous clock). */
+  'simulation-run-ending': {
+    runId: string;
+    seed: number;
+    simTime: number;
+    status: 'completed' | 'aborted';
+    reason: 'reset' | 'duration-reached' | 'manual';
+  };
 }

@@ -28,11 +28,16 @@ describe('rv-signal-construction', () => {
   });
 
   describe('DRIVE_BEHAVIOR_MAP', () => {
-    it('exposes the three known drive behaviors', () => {
+    it('exposes the known drive behaviors', () => {
       expect(Object.keys(DRIVE_BEHAVIOR_MAP).sort()).toEqual([
         'Drive_Cylinder',
+        'Drive_DestinationMotor',
         'Drive_ErraticPosition',
+        'Drive_FollowPosition',
+        'Drive_Gear',
+        'Drive_PositionSwitch',
         'Drive_Simple',
+        'Drive_Speed',
       ]);
     });
   });
@@ -190,7 +195,7 @@ describe('rv-signal-construction', () => {
       };
       const seen: Array<{ key: string; data: unknown }> = [];
       const result = constructDrive(
-        node, rv, driveData, 'root/DriveNode', registry,
+        node, rv, driveData, 'root/DriveNode', registry, signalStore,
         (key, data) => { seen.push({ key, data }); },
       );
       expect(result).not.toBeNull();

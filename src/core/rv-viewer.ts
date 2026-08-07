@@ -27,8 +27,6 @@ import {
   Vector3,
   Box3,
   Object3D,
-  MOUSE,
-  TOUCH,
   Mesh,
   MeshStandardMaterial,
   NoToneMapping,
@@ -37,15 +35,23 @@ import {
   Texture,
   Matrix4,
   Frustum,
+  Plane,
 } from 'three';
 import type { Renderer } from 'three/webgpu';
+import { preloadTslMaterials, createMaterialContext, type RendererKind } from './engine/materials/material-factory';
+import type { TslPostPipeline } from './engine/materials/rv-post-processing-tsl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import {
+  applyNavigationSettingsToControls,
+  configureOrbitControls,
+} from './engine/rv-orbit-controls-config';
 import type { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import type { Pass } from 'three/addons/postprocessing/Pass.js';
 import type { AOMode } from './hmi/visual-settings-store';
 import { PostProcessingManager, type PostProcessingHost } from './rv-post-processing';
 import { RVToonMaterialManager } from './rv-toon-materials';
+import { ThumbnailService } from './thumbnails/thumbnail-service';
 import { createGroundFade, drawCheckerPattern } from './engine/rv-ground-plane';
 import { createGroundReflector, setReflectorStrength, setReflectorBlur } from './engine/rv-ground-reflector';
 import type { Reflector } from 'three/addons/objects/Reflector.js';
@@ -66,18 +72,34 @@ import { getRenderMode, type RenderMode } from './rv-render-modes';
 import Stats from 'stats-gl';
 
 import { EventEmitter } from './rv-events';
+import { bumpModelCatalog } from './rv-model-catalog';
 import { debug, logInfo } from './engine/rv-debug';
 import { createLoadProfiler } from './engine/rv-load-profiler';
 import { loadModelSettingsConfig } from './hmi/rv-settings-bundle';
 import { DRAG_THRESHOLD_PX, DEFAULT_DPR_CAP, NO_AO_LAYER } from './engine/rv-constants';
-import { loadGLB, createRuntimeNode, removeRuntimeNode, type LoadResult, type RuntimeNodeSpec } from './engine/rv-scene-loader';
+import {
+  loadGLB,
+  computeBVHAsync,
+  createRuntimeNode,
+  removeRuntimeNode,
+  initializeComponents,
+  runOnSceneReady,
+  type DeferredLogic,
+  type LoadResult,
+  type RuntimeNodeSpec,
+} from './engine/rv-scene-loader';
+import { BatchVisibilityService } from './engine/rv-batch-visibility';
+import { createBVHPort, type BVHBuildPort } from './engine/rv-bvh-build-port';
 import type { RVExtrasOverlay } from './engine/rv-extras-overlay-store';
 import type { RvScene } from './hmi/scene/rv-scene-types';
 import type { PublishedSceneEntry } from './hmi/scene/rv-published-scenes';
 import type { PlacementsSnapshot } from './rv-shared-types';
 import type { MultiuserSnapshot } from '../plugins/multiuser-plugin';
 import type { McpBridgeSnapshot } from '../plugins/mcp-bridge-plugin';
-import { buildRaycastGeometries } from './engine/rv-raycast-geometry';
+import { buildRaycastGeometries, collectPendingBVHGeometries, disposeRaycastGeometries, refitRaycastGroupsForSubtrees, type RaycastGeometrySet } from './engine/rv-raycast-geometry';
+import { InstancePickIndex } from './engine/rv-instance-pick-index';
+import { ProxyOverlayProvider } from './engine/rv-highlight-proxy';
+import { PickMetrics, type PickMetricsSnapshot } from './engine/rv-pick-metrics';
 import {
   loadModelJsonConfig,
   extractGlbPluginConfig,
@@ -85,9 +107,31 @@ import {
   type ModelConfig,
 } from './engine/rv-model-config';
 import { loadExternalPlugin } from './engine/rv-plugin-loader';
-import type { ModelPluginManager } from './rv-model-plugin-manager';
+import { importProviderRegistry, type ImportProviderRegistry } from './import/rv-import-provider';
+import { importObject as importObjectSink, type ImportObjectOptions, type ImportObjectOutcome } from './import/rv-import-object';
+import type { ImportResultItem } from './import/rv-import-provider';
+import { resolveModelName, type ModelPluginManager } from './rv-model-plugin-manager';
+import {
+  isSignatureUnlocked,
+  persistSignatureUnlock,
+  resetSignatureUiState,
+  setSignatureUiState,
+} from './rv-sig-store';
+import type { SignatureState } from './persistence/rv-sig-verify';
 import { SimulationLoop } from './engine/rv-simulation-loop';
+import {
+  RenderBackendController,
+  pushRenderBackendDriveValue,
+  readDriveBridgeValue,
+  type RenderBackendId,
+  type RenderBackendStatus,
+  type RenderBackendFactory,
+  type RenderBackendDriveBridgeConfig,
+} from './render-backend/rv-render-backend';
+import { SimulationRuntime } from './engine/rv-simulation-runtime';
+import { CoreSubsystems } from './engine/rv-core-subsystems';
 import { RVHighlightManager } from './engine/rv-highlight-manager';
+import { showStatusOutline, hideStatusOutline } from './engine/rv-status-outline';
 import { RVOutlineManager } from './engine/rv-outline-manager';
 import { RaycastManager, type ObjectHoverData, type ObjectUnhoverData, type ObjectClickData, type HoverableType } from './engine/rv-raycast-manager';
 import type { RVDrive } from './engine/rv-drive';
@@ -101,7 +145,22 @@ import type { NodeRegistry, NodeSearchResult } from './engine/rv-node-registry';
 import { TankFillManager } from './engine/rv-tank-fill';
 import { PipeFlowManager } from './engine/rv-pipe-flow';
 import { GizmoOverlayManager } from './engine/rv-gizmo-manager';
+import { LampManager } from './engine/rv-lamp-manager';
+import { RVCollisionManager } from './engine/rv-collision-manager';
+import { EnergyChainManager } from './engine/rv-energy-chain-manager';
+import {
+  registerOverlayProducer, resetOverlayProducers,
+  isOverlayVisible, subscribeOverlayVisibility,
+} from './overlay-visibility-store';
+import { SignalBindingManager } from './engine/rv-signal-binding-manager';
+import {
+  resetSlotAuthority,
+  setAuthorityRanking,
+  type AuthorityRanking,
+} from './engine/rv-slot-authority';
+import type { SignalWriteGateMode } from './engine/rv-signal-store';
 import { ErrorStore } from './engine/rv-error-store';
+import { InstructionRuntimeStore } from './engine/rv-instruction-runtime-store';
 import { ComponentEventDispatcher } from './engine/rv-component-event-dispatcher';
 import type { GroupRegistry } from './engine/rv-group-registry';
 import { AutoFilterRegistry } from './engine/rv-auto-filter-registry';
@@ -122,15 +181,15 @@ import type { RVViewerPlugin } from './rv-plugin';
 import type { ViewerEvents } from './rv-viewer-events';
 import type { ViewerHost } from './engine/rv-viewer-host';
 import { UIPluginRegistry } from './rv-ui-registry';
-import { isActiveForState } from './engine/rv-active-only';
 import { LeftPanelManager } from './hmi/left-panel-manager';
 import { SelectionManager } from './engine/rv-selection-manager';
+import type { RVHighlightPolicy } from './engine/rv-highlight-policy';
 import { ContextMenuStore } from './hmi/context-menu-store';
 import type { ContextMenuTarget } from './hmi/context-menu-store';
 import type { SelectionSnapshot } from './engine/rv-selection-manager';
 import { isMobileDevice } from '../hooks/use-mobile-layout';
 import { resetDynamicContexts, setContext } from './hmi/ui-context-store';
-import { ModeManager, computeModePluginSets, modeContext } from './rv-mode-manager';
+import { ModeManager, computeModePluginSets, modeContext, pluginParticipatesInMode } from './rv-mode-manager';
 import type { ModeId, ModeHost, ModePluginSets } from './rv-mode-manager';
 import { getAppConfig } from './rv-app-config';
 import { PluginContextImpl } from './rv-plugin-context';
@@ -140,7 +199,6 @@ import { ControlsFacadeImpl } from './facades/controls-facade';
 import { SimLoopFacadeImpl } from './facades/sim-loop-facade';
 import { TickStage } from './rv-tick-stages';
 import { BehaviorManager } from './behaviors';
-import { isUnifiedSimEnabled } from './rv-app-config';
 import { ContinuousRunner } from './material-flow/continuous-runner';
 import { SimulationKernel } from './material-flow/simulation-kernel';
 import { StatisticsManager } from './material-flow/rv-statistics-manager';
@@ -158,6 +216,8 @@ import {
   type RVBindContext,
   type BindContextHost,
 } from './behavior-runtime';
+
+export { applyNavigationSettingsToControls } from './engine/rv-orbit-controls-config';
 
 // Base scene-background grayscale (0x9a9a9a / 255 ≈ 0.604). Multiplied by
 // backgroundBrightness so brightness=1 reproduces the original default color.
@@ -225,8 +285,24 @@ export type { ViewerEvents } from './rv-viewer-events';
 // records — see `src/core/hmi/scene/rv-scene-types.ts`. Translation between
 // any external API shapes and `RvScene` happens in `SceneStore`.
 
+// Re-export so embedders can type `RVViewerOptions.renderer` without reaching
+// into the engine/materials folder (plan-271).
+export type { RendererKind } from './engine/materials/material-factory';
+
+/** Classification of the registration site that contributed a plugin. */
+export type PluginOrigin = 'core' | 'commercial' | 'internal' | 'project' | 'unknown';
+
 export interface RVViewerOptions {
-  /** Use WebGPU renderer (falls back to WebGL if unavailable). Default: false */
+  /**
+   * Renderer selection (plan-271):
+   *  - 'webgl'    — classic WebGLRenderer (default, production path)
+   *  - 'webgpu'   — real WebGPU backend (falls back to WebGL if unavailable)
+   *  - 'webgpu-gl'— WebGPURenderer({ forceWebGL: true }): TSL on a WebGL2
+   *                 context (internal test path, needs NO WebGPU adapter)
+   * Takes precedence over the deprecated `useWebGPU` alias.
+   */
+  renderer?: RendererKind;
+  /** @deprecated Use `renderer: 'webgpu'` instead (`useWebGPU: true` ≙ `renderer: 'webgpu'`). */
   useWebGPU?: boolean;
   /** Show checkerboard ground plane. Default: true */
   ground?: boolean;
@@ -234,32 +310,34 @@ export interface RVViewerOptions {
   autoResize?: boolean;
   /** Enable native MSAA antialiasing (constructor-only, requires page reload to change). Default: false */
   antialias?: boolean;
+  /** Enable Signal Linking (bind component signal slots to live realvirtual
+   *  CONNECT signals or internal model signals → live override). Despite the
+   *  historical name, since plan-325 this flag gates signal linking for ALL
+   *  components (inline inspector rows + badge popover), not just Planner
+   *  elements. When false/unset, no SignalBindingManager is created, no badges,
+   *  no guards active → identical legacy behavior. The structural decoupling of
+   *  the authority service from this flag belongs to plan-320 Phase 2.
+   *  Default: false */
+  plannerSignalLinking?: boolean;
+  /**
+   * Remote-vs-force ranking (plan-320 Phase 3). 'strict' (default) lets an
+   * active remote session owner override operator forces
+   * (`remote > forced > bound > component`); 'legacy' restores the
+   * pre-plan-320 `forced > remote` behavior as a pure rollback lever.
+   */
+  authorityRanking?: AuthorityRanking;
+  /**
+   * Slot write gate (plan-320 Phase 4). Default 'shadow': authority conflicts
+   * are only recorded (`SignalStore.getWriteConflicts()`), nothing is
+   * rejected. 'enforce' is prepared but not part of the plan-320 rollout.
+   */
+  signalWriteGate?: SignalWriteGateMode;
 }
 
-// ─── Navigation Helper ──────────────────────────────────────────────────
-
-/**
- * Apply navigation-sensitivity settings (rotate/pan/zoom speed + damping) to an
- * OrbitControls-compatible object. Extracted as a free function so it can be
- * unit-tested against a plain mock object without WebGL/Three.js setup.
- */
-export function applyNavigationSettingsToControls(
-  controls: {
-    rotateSpeed: number;
-    panSpeed: number;
-    zoomSpeed: number;
-    dampingFactor: number;
-  },
-  s: Pick<VisualSettings, 'orbitRotateSpeed' | 'orbitPanSpeed' | 'orbitZoomSpeed' | 'orbitDampingFactor' | 'distanceAdaptiveNav'>,
-): void {
-  controls.rotateSpeed = s.orbitRotateSpeed;
-  // When adaptive navigation is active, the AdaptiveNavPlugin owns zoomSpeed/panSpeed writes.
-  if (!s.distanceAdaptiveNav) {
-    controls.panSpeed = s.orbitPanSpeed;
-    controls.zoomSpeed = s.orbitZoomSpeed;
-  }
-  controls.dampingFactor = s.orbitDampingFactor;
-}
+/** Success/failure contract for model loaders that surface errors without throwing. */
+export type ModelLoadOutcome =
+  | { ok: true }
+  | { ok: false; error: string };
 
 // ─── RVViewer ───────────────────────────────────────────────────────────
 
@@ -269,6 +347,8 @@ export function applyNavigationSettingsToControls(
 type _RVViewer_satisfies_ViewerHost = RVViewer extends ViewerHost ? true : false;
 const _rvViewerHostCheck: _RVViewer_satisfies_ViewerHost = true;
 void _rvViewerHostCheck;  // suppress unused-warning
+
+export type LogicRunState = 'active' | 'gated' | 'activating';
 
 export class RVViewer extends EventEmitter<ViewerEvents> {
   // --- Three.js context (read-only for custom UIs) ---
@@ -301,9 +381,36 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    */
   readonly controls: OrbitControls;
   readonly loop: SimulationLoop;
+
+  /**
+   * Optional swappable 3D render backend (plan-256). Default `three`; an
+   * internal-tier Omniverse RTX-stream backend can take over the 3D pixels
+   * while HMI/SignalStore/adapters stay identical. Owns the `renderPaused`
+   * flag consulted by `render()` — pausing the Three renderer NEVER touches
+   * the simulation loop or the signal flush (render-pause ≠ sim-pause).
+   */
+  private readonly _renderBackends = new RenderBackendController();
+
+  // Omniverse connection config (opaque bag forwarded to the private backend
+  // factory) + drive-bridge push config (plan-256). Both DEV/internal only.
+  private _omniverseBackendConfig: Record<string, unknown> = {};
+  private _omniverseDriveBridge: RenderBackendDriveBridgeConfig = { enabled: false };
+
   private stats!: Stats;
   private statsReady = false;
+  /** Which renderer create() actually constructed (plan-271): 'webgl'
+   *  (classic WebGLRenderer), 'webgpu-gl' (WebGPURenderer with forceWebGL —
+   *  WebGL2 backend), or 'webgpu' (real WebGPU backend). */
+  readonly rendererKind: RendererKind;
+  /** True for BOTH WebGPURenderer variants ('webgpu-gl' AND 'webgpu'), i.e.
+   *  "not the classic WebGLRenderer". Derived as `rendererKind !== 'webgl'`
+   *  (plan-271 review finding 1) — NOT the real backend! All GLSL /
+   *  onBeforeCompile / composer / XR / reflector code paths must be off when
+   *  this is true. For compute()/diagnostics use `hasCompute`. */
   readonly isWebGPU: boolean;
+  /** True ONLY when the real WebGPU backend is active (former _detectWebGPU()
+   *  semantics) — the gate for TSL compute() and GPU diagnostics. */
+  readonly hasCompute: boolean;
 
   /** Whether native MSAA antialiasing is active (set at renderer creation, cannot change at runtime). */
   private _antialiasActive = false;
@@ -326,6 +433,24 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   // --- Generic gizmo overlay system (always available) ---
   /** Central 3D-overlay/gizmo system. Used by WebSensor and other components. */
   readonly gizmoManager: GizmoOverlayManager;
+  /** Viewer-owned registry for Lamp lifecycle and fixed-update flashing. */
+  readonly lampManager: LampManager;
+  /** Viewer-owned registry for EnergyChain rigs and their per-frame bone update. */
+  readonly energyChainManager: EnergyChainManager;
+  /** Viewer-owned collision registry + per-tick check (plan-394). Survives model
+   *  loads; `clear()` on every model switch drops registry, highlight, signals
+   *  and an open modal. */
+  readonly collisionManager: RVCollisionManager;
+
+  // --- Planner Signal Linking (gated by RVViewerOptions.plannerSignalLinking) ---
+  /** Binding/override engine that links placed Planner elements to live CONNECT
+   *  signals. `null` when the feature flag is off (no manager, no guards).
+   *  (Re)built per model load once signalStore + registry exist. */
+  signalBindingManager: SignalBindingManager | null = null;
+  /** Cached feature-flag from RVViewerOptions. */
+  private readonly _plannerSignalLinking: boolean = false;
+  /** Write-gate mode applied to every per-model SignalStore (plan-320 Phase 4). */
+  private _signalWriteGate: SignalWriteGateMode = 'shadow';
 
   // --- Error/alarm registry (always available) ---
   /** Central error registry — single source of truth for active errors.
@@ -333,25 +458,50 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    *  web-error plugin's onModelCleared hook. Used by WebError + error panel. */
   readonly errorStore: ErrorStore = new ErrorStore();
 
+  // --- Runtime-instruction registry (always available) ---
+  /** Central runtime-instruction registry — single source of truth for active
+   *  CustomRuntimeInstruction cards. Singleton that survives model loads; emptied
+   *  on model switch by the instruction panel plugin's onModelCleared hook. */
+  readonly instructionStore: InstructionRuntimeStore = new InstructionRuntimeStore();
+
   // --- Component event dispatcher (routes viewer events → per-component callbacks) ---
   /** Dispatches object-hover/clicked/selection-changed to RVComponent.onHover/onClick/onSelect. */
   componentEventDispatcher: ComponentEventDispatcher | null = null;
 
-  // --- Connection State ---
-  /** Global connection state — controls which subsystems run based on their ActiveOnly mode. */
-  private _connectionState: 'Connected' | 'Disconnected' = 'Connected';
+  /** Single source of truth for whether model-authored logic may execute. */
+  logicRunState: LogicRunState = 'active';
+  private _signatureState: SignatureState = 'none';
+  private _signatureModelName = '';
+  private _signatureSignerOrganization: string | undefined;
+  private _deferredLogic: DeferredLogic[] = [];
+
+  // --- Simulation Runtime + Connection State ---
+  /**
+   * Unified simulation-runtime facade — the single owner of "is simulation
+   * time integrating at all, and under which execution mode". Fronts the
+   * loop's pause reasons, the kernel's continuous/discrete executor mode, and
+   * the global connection state. Workspace modes registered with
+   * `runtime: 'detached'` (e.g. the asset editor) fully detach time
+   * integration (see `'runtime-attach-changed'`); the viewer wires that
+   * transition on `'mode-changed'` in the constructor.
+   */
+  readonly runtime: SimulationRuntime = new SimulationRuntime({
+    getLoop: () => this.loop,
+    getKernel: () => this._getKernel(),
+    emit: (event, data) => { this.emit(event, data); },
+  });
 
   /** Current connection state ('Connected' or 'Disconnected'). */
-  get connectionState(): 'Connected' | 'Disconnected' { return this._connectionState; }
+  get connectionState(): 'Connected' | 'Disconnected' { return this.runtime.connectionState; }
 
   /**
    * Set the global connection state. Notifies all plugins and emits
    * 'connection-state-changed' event. Subsystems are guarded in fixedUpdate().
+   * State lives on the SimulationRuntime; orchestration stays here.
    */
   setConnectionState(state: 'Connected' | 'Disconnected'): void {
-    if (state === this._connectionState) return;
-    const previous = this._connectionState;
-    this._connectionState = state;
+    const previous = this.runtime.connectionState;
+    if (!this.runtime._setConnectionState(state)) return;
 
     // Notify plugins (skip disabled)
     for (const p of this._plugins) {
@@ -362,6 +512,157 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.emit('connection-state-changed', { state, previous });
   }
 
+  // ─── Render Backend (plan-256) ───────────────────────────────────────
+  //
+  // Optional swappable 3D render backend. `three` (default) uses the Three.js
+  // pipeline below unchanged; a non-Three backend (Omniverse RTX stream,
+  // internal tier) provides the 3D pixels while HMI/SignalStore/adapters stay
+  // identical. CRITICAL: pausing the Three renderer must NOT stop the sim loop
+  // or the WS signal-flush — see rv-render-backend.ts header.
+
+  /** Currently active 3D render backend (`three` | `omniverse`). */
+  get renderBackend(): RenderBackendId { return this._renderBackends.backend; }
+
+  /** Status of the active non-Three backend (`idle` while Three is active). */
+  get renderBackendStatus(): RenderBackendStatus { return this._renderBackends.status; }
+
+  /** Human-readable detail for the current render-backend status (progress/error line). */
+  get renderBackendStatusDetail(): string { return this._renderBackends.statusDetail; }
+
+  /**
+   * Pause ONLY the Three renderer: `render()` skips its `renderer.render(...)`
+   * calls and the WebGL canvas is hidden. The simulation loop, `fixedUpdate`,
+   * SignalStore and all adapters keep running unchanged — this is deliberately
+   * separate from the sim-pause mechanisms (`isSimulationPaused()` etc.).
+   */
+  pauseRendering(): void {
+    this._renderBackends.pauseRendering();
+    this._syncCanvasVisibility();
+  }
+
+  /** Resume the Three renderer previously paused by {@link pauseRendering}. */
+  resumeRendering(): void {
+    this._renderBackends.resumeRendering();
+    this._syncCanvasVisibility();
+    this._renderDirty = true;
+  }
+
+  /**
+   * Register a factory for a non-Three render backend. Called from the private
+   * internal tier (internal-plugins.ts) behind `__RV_INTERNAL__`; the public
+   * build has no factories, so `setRenderBackend('omniverse')` rejects.
+   */
+  registerRenderBackendFactory(id: RenderBackendId, factory: RenderBackendFactory): void {
+    this._renderBackends.registerFactory(id, factory);
+  }
+
+  /** Whether a backend is available (`three` always; others once registered). */
+  hasRenderBackend(id: RenderBackendId): boolean {
+    return this._renderBackends.hasBackend(id);
+  }
+
+  /**
+   * Switch the active 3D render backend. Switching to a non-Three backend
+   * pauses the Three renderer (canvas hidden, GPU render skipped), mounts the
+   * backend overlay into the viewer container, and neutralises the interactive
+   * 3D plugins (central `onRender`-skip + canvas hide, plus the explicit
+   * `onRenderBackendChanged` plugin hook). The simulation keeps running.
+   */
+  async setRenderBackend(id: RenderBackendId): Promise<void> {
+    const domEl = this.renderer.domElement as HTMLElement;
+    const container = (domEl.parentElement ?? domEl) as HTMLElement;
+    await this._renderBackends.setBackend(id, container);
+    this._syncCanvasVisibility();
+    this._renderDirty = true;
+
+    // Explicit per-plugin signal on top of the central neutralisation.
+    for (const p of this._plugins) {
+      if (this._disabledIds.has(p.id)) continue;
+      callPlugin(p, 'onRenderBackendChanged', id, this);
+    }
+
+    // "Weg A" (plan-256): switching to a streamed backend exports the CURRENTLY
+    // loaded scene to it — the GLB stays SSOT, the backend projects it (Kit:
+    // GLB→USD via asset_converter). Fire-and-forget; status is surfaced via the
+    // render-backend status/detail.
+    if (id === 'omniverse') void this._exportCurrentSceneToBackend();
+  }
+
+  /** Send the current model's GLB URL to the active backend's `loadGlb` (if any). */
+  private async _exportCurrentSceneToBackend(): Promise<void> {
+    const backend = this._renderBackends.active;
+    if (!backend?.loadGlb) return;
+    const url = this._currentModelUrl;
+    if (!url) return;
+    // The render side fetches the GLB by URL, so it must be an absolute http(s)
+    // URL — a blob:/data: URL is browser-only and cannot be exported (yet).
+    let abs: string;
+    try { abs = new URL(url, window.location.href).href; } catch { return; }
+    if (abs.startsWith('blob:') || abs.startsWith('data:')) {
+      console.warn('[rv-viewer] current model is a local blob/data URL — cannot export to Omniverse (needs a fetchable http URL)');
+      return;
+    }
+    try {
+      await backend.loadGlb(abs, { addLights: true });
+    } catch (e) {
+      console.warn('[rv-viewer] Omniverse scene export failed:', e);
+    }
+  }
+
+  /** Subscribe to render-backend switches. Returns an unsubscribe function. */
+  onRenderBackendChange(cb: (b: RenderBackendId) => void): () => void {
+    return this._renderBackends.onBackendChange(cb);
+  }
+
+  /** Subscribe to render-backend status changes. Returns an unsubscribe function. */
+  onRenderBackendStatusChange(cb: (s: RenderBackendStatus) => void): () => void {
+    return this._renderBackends.onStatusChange(cb);
+  }
+
+  /** Show/hide the WebGL canvas to match the current render-pause state. */
+  private _syncCanvasVisibility(): void {
+    const canvas = this.renderer.domElement as HTMLElement;
+    canvas.style.display = this._renderBackends.shouldRenderThree() ? 'block' : 'none';
+  }
+
+  /**
+   * Opaque connection config forwarded to the (private) Omniverse backend
+   * factory at construction time (signalingPort, mediaServer, resolution, drive
+   * defaults, …). Edits apply on the NEXT `setRenderBackend('omniverse')`.
+   * Internal tier only; ignored when no omniverse factory is registered.
+   */
+  get omniverseBackendConfig(): Record<string, unknown> { return this._omniverseBackendConfig; }
+
+  /** Merge fields into the Omniverse backend connection config. */
+  setOmniverseBackendConfig(cfg: Record<string, unknown>): void {
+    this._omniverseBackendConfig = { ...this._omniverseBackendConfig, ...cfg };
+  }
+
+  /** Per-tick WEB→backend drive-bridge config (plan-256). */
+  get omniverseDriveBridge(): RenderBackendDriveBridgeConfig { return this._omniverseDriveBridge; }
+
+  /** Merge fields into the drive-bridge config (source signal/drive, payload opts). */
+  setOmniverseDriveBridge(cfg: Partial<RenderBackendDriveBridgeConfig>): void {
+    this._omniverseDriveBridge = { ...this._omniverseDriveBridge, ...cfg };
+  }
+
+  /**
+   * Additive per-tick push (plan-256): while a non-Three backend is active,
+   * mirror one local value (first Drive's `currentPosition`, or a configured
+   * signal) to the streamed 3D prim via the backend's `sendDriveValue`. The
+   * Three path and the signal flush are untouched; the backend dirty-guards.
+   */
+  private _pushRenderBackendDriveValue(): void {
+    // Fast-path: nothing to do while Three is active (avoids per-tick work).
+    if (this._renderBackends.backend === 'three') return;
+    const cfg = this._omniverseDriveBridge;
+    pushRenderBackendDriveValue(
+      this._renderBackends,
+      cfg,
+      () => readDriveBridgeValue(cfg, this.drives, this.signalStore),
+    );
+  }
+
   // --- Simulation state (populated after loadModel) ---
   signalStore: SignalStore | null = null;
   registry: NodeRegistry | null = null;
@@ -370,7 +671,34 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   ikPaths: RVIKPath[] = [];
   /** Unified raycast manager (replaces the old driveHover). */
   raycastManager: RaycastManager | null = null;
+  /** §4.2 zero-copy drawRange highlight proxies over the merged pick geometry.
+   *  Lifetime is coupled to the RaycastGeometrySet it serves — replaced on
+   *  every grouped-BVH (re)build, disposed in clearModel(). */
+  private _highlightProxyProvider: ProxyOverlayProvider | null = null;
+
+  /** Editor-mode two-level pick backend (null when the merged groups are
+   *  active). Membership is maintained by the asset-op executors via
+   *  {@link instancePickIndex}. */
+  private _instancePickIndex: InstancePickIndex | null = null;
+
+  /** The editor instance pick index (null outside authoring loads). */
+  get instancePickIndex(): InstancePickIndex | null {
+    return this._instancePickIndex;
+  }
   transportManager: RVTransportManager | null = null;
+
+  /**
+   * Load-generation guard (plan-240 F9). Incremented at the START of every
+   * `loadModel()` and in `clearModel()`. The asynchronous BVH build captures
+   * the value at kickoff and aborts its WHOLE remaining sequence — discarding
+   * any in-flight result — as soon as the generation moves on, so it never
+   * writes a `boundsTree` onto a disposed/stale geometry.
+   */
+  private _loadGeneration = 0;
+  /** Reused async BVH build port (ONE worker across model loads, plan-240).
+   *  Created lazily on the first build; disposed only in `dispose()` —
+   *  clearModel() keeps it alive for the next load. */
+  private _bvhPort: BVHBuildPort | null = null;
 
   /**
    * Plan 201 — shared per-component statistics registry. Components register
@@ -385,6 +713,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   playback: RVDrivesPlayback | null = null;
   groups: GroupRegistry | null = null;
   autoFilters: AutoFilterRegistry | null = null;
+
+  /** True while a selection-driven isolate (context menu) owns the external isolate channel. */
+  private _selectionIsolateActive = false;
+  /** Prior `.visible` state of the isolated roots, restored on exit. */
+  private _selectionIsolatePriorVis: { node: Object3D; visible: boolean }[] = [];
 
   /**
    * @deprecated Use `viewer.raycastManager` instead. This getter returns
@@ -431,10 +764,18 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
   /** All registered core plugins. */
   private _plugins: RVViewerPlugin[] = [];
+  /** Registration-site metadata, intentionally separate from plugin classes. */
+  private _pluginOrigins = new Map<string, PluginOrigin>();
+  /** Scoped fallback used while delegated plugin modules call use(). */
+  private _defaultPluginOrigin: PluginOrigin | undefined;
   /** Cached: only plugins with onFixedUpdatePre, sorted by order. */
   private _prePlugins: RVViewerPlugin[] = [];
   /** Cached: only plugins with onFixedUpdatePost, sorted by order. */
   private _postPlugins: RVViewerPlugin[] = [];
+  /** Lazily rebuilt defensive snapshots of _pre/_postPlugins — invalidated on
+   *  register/enable/disable/remove so fixedUpdate never allocates per tick. */
+  private _prePluginsSnapshot: readonly RVViewerPlugin[] | null = null;
+  private _postPluginsSnapshot: readonly RVViewerPlugin[] | null = null;
   /** Cached: only plugins with onRender, sorted by order. */
   private _renderPlugins: RVViewerPlugin[] = [];
   /** Flag: a plugin handles transport (kinematic transportManager.update is skipped). */
@@ -442,23 +783,51 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
   /**
    * Plan 194 P1 — unified SimulationKernel. Built lazily on first tick after a
-   * model loads, and ONLY when the `VITE_UNIFIED_SIM` flag is on. When the flag
-   * is OFF (default) this stays null and the legacy fixedUpdate path
-   * (transport.update + behaviors.tick) runs byte-for-byte unchanged.
-   * The kernel reuses the viewer's EXISTING transportManager + behaviors — it
-   * does NOT relocate ownership or re-instantiate them.
+   * model loads; null before that (the viewer then drives the CoreSubsystems
+   * pipeline directly). The kernel reuses the viewer's EXISTING
+   * transportManager + behaviors — it does NOT relocate ownership or
+   * re-instantiate them. The legacy `VITE_UNIFIED_SIM` opt-out was removed in
+   * the runtime unification (Phase B): the kernel path is now the only path.
    */
   private _kernel: SimulationKernel | null = null;
-  /** Cached `isUnifiedSimEnabled()` — read once at construction (flag is build-time static). */
-  private readonly _unifiedSim = isUnifiedSimEnabled();
+
+  /**
+   * Phase B (runtime unification) — the per-tick core subsystem pipeline
+   * (playback/logic/IK/replay, drive loop + dirty flags, texture/tank/gizmo/
+   * pipe visuals) extracted from fixedUpdate. Driven by the SimulationExecutors
+   * via `earlyTick`/`tick`; every host field is read lazily so model-load
+   * reassignments of the underlying managers/arrays are always visible.
+   */
+  private readonly _coreSubsystems: CoreSubsystems = ((viewer: RVViewer) =>
+    new CoreSubsystems({
+      get isConnected() { return viewer.runtime.connectionState === 'Connected'; },
+      get playback() { return viewer.playback; },
+      get logicEngine() { return viewer.logicEngine; },
+      get ikPaths() { return viewer.ikPaths; },
+      get replayRecordings() { return viewer.replayRecordings; },
+      get drives() { return viewer.drives; },
+      get transportManager() { return viewer.transportManager; },
+      get tankFillManager() { return viewer.tankFillManager; },
+      get pipeFlowManager() { return viewer.pipeFlowManager; },
+      get gizmoManager() { return viewer.gizmoManager; },
+      get lampManager() { return viewer.lampManager; },
+      get energyChainManager() { return viewer.energyChainManager; },
+      get collisionManager() { return viewer.collisionManager; },
+      markRenderDirty: () => viewer.markRenderDirty(),
+      markShadowsDirty: () => viewer.markShadowsDirty(),
+    }))(this);
   /** IDs of plugins that have been disabled via disablePlugin(). */
   private _disabledIds = new Set<string>();
+  /** Session-scoped user overrides that mode reconciliation must not undo. */
+  private _userDisabledIds = new Set<string>();
   /**
    * IDs of plugins that were disabled when a model loaded and therefore MISSED
    * their `onModelLoaded` call. `enablePlugin()` replays `_lastLoadResult` to
    * them exactly once, then clears the entry. See plan-198 (mode system).
    */
   private _missedModelLoad = new Set<string>();
+  /** Plugins that actually received onModelLoaded for the current model. */
+  private _modelLoadedIds = new Set<string>();
   /** Last successful load result (for retroactive onModelLoaded). */
   private _lastLoadResult: LoadResult | null = null;
   /** Lazy plugin factories: ID → async import factory (code-split by Vite). */
@@ -481,7 +850,29 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   /** Available model entries for the model selector UI. */
   availableModels: Array<{ url: string; label: string }> = [];
 
-  /** Read-only "Example" scenes shipped under public/scenes/ (Examples section). */
+
+  /**
+   * Replace the model catalogue and tell everything that renders it (plan-365).
+   *
+   * Assigning `availableModels` directly is not enough once the list can change
+   * after boot: `SceneStore` *copies* it and only re-reads on `refreshGlbList()`,
+   * and the login gate's picker memoises on the stable viewer reference, so
+   * neither of them would ever see the new entry. Everything that changes the
+   * catalogue at runtime goes through here.
+   */
+  setAvailableModels(models: Array<{ url: string; label: string }>): void {
+    this.availableModels = models;
+    bumpModelCatalog();
+    // Typed through the declared event rather than as a bare literal: `emit` has
+    // an untyped `(event: string, data?: unknown)` overload that would otherwise
+    // swallow a mistyped payload silently. Annotating it here keeps the check at
+    // the emit site without touching the shared EventEmitter signatures.
+    const payload: ViewerEvents['models-changed'] = { models };
+    this.emit('models-changed', payload);
+  }
+
+  /** Read-only "Example" scenes of the DemoRealvirtual project (Examples section). */
+
   availablePublishedScenes: PublishedSceneEntry[] = [];
 
   /** UI plugin registry for React slot rendering. */
@@ -509,6 +900,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
   /** Central selection state (multi-select, Escape-to-deselect, selection highlights). */
   readonly selectionManager = new SelectionManager();
+
+  /** Mode-driven highlight profile policy (constructed in main.ts after mode
+   *  registration; null in headless/embedded hosts that skip it). */
+  highlightPolicy: RVHighlightPolicy | null = null;
 
   /** Pending async work that must complete before `loadModel` / `loadScene`
    *  resolves to the caller. Drained via {@link whenLoadingIdle}; populated
@@ -568,18 +963,20 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    * If the plugin has `slots`, its UI entries are auto-registered into the HMI.
    * Duplicate IDs are rejected with a warning. Chainable.
    */
-  use(plugin: RVViewerPlugin): this {
+  use(plugin: RVViewerPlugin, origin?: PluginOrigin): this {
     if (this._plugins.some((p) => p.id === plugin.id)) {
       console.warn(`[RVViewer] Plugin '${plugin.id}' already registered`);
       return this;
     }
     this._plugins.push(plugin);
+    const effectiveOrigin = origin ?? this._defaultPluginOrigin;
+    if (effectiveOrigin !== undefined) this._pluginOrigins.set(plugin.id, effectiveOrigin);
 
     // Phase 4a of plan-182: Plugins können init?(viewer, context) implementieren um
     // den schmalen PluginContext statt vollem RVViewer zu erhalten. Optional & try/catch.
     if (typeof plugin.init === 'function') {
       try {
-        plugin.init(this, this._pluginContext);
+        plugin.init(this, this._pluginContext.forPlugin(plugin.id));
       } catch (e) {
         console.error(`[RVViewer] Plugin '${plugin.id}' init error:`, e);
       }
@@ -593,23 +990,103 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     if (plugin.onFixedUpdatePre) insertSorted(this._prePlugins, plugin);
     if (plugin.onFixedUpdatePost) insertSorted(this._postPlugins, plugin);
     if (plugin.onRender) insertSorted(this._renderPlugins, plugin);
+    this._invalidatePluginSnapshots();
 
-    if (plugin.handlesTransport) this._physicsPluginActive = true;
+    this._recomputePhysicsPluginActive();
 
     // Auto-register UI slot entries if the plugin provides them
     if (plugin.slots && plugin.slots.length > 0) {
       this.uiRegistry.register(plugin);
     }
 
-    // Retroactive: if model already loaded, call onModelLoaded immediately (skip disabled)
-    if (this.drives.length > 0 && this._lastLoadResult && plugin.onModelLoaded && !this._disabledIds.has(plugin.id)) {
-      try {
-        plugin.onModelLoaded(this._lastLoadResult, this);
-      } catch (e) {
-        console.error(`[RVViewer] Plugin '${plugin.id}' onModelLoaded error:`, e);
+    // Retroactive: if model already loaded, call onModelLoaded immediately (skip
+    // disabled and mode-scoped plugins outside their mode — the mode transition
+    // replays the missed call via enablePlugin()).
+    if (this._lastLoadResult && plugin.onModelLoaded && this._isPluginEligibleForCurrentModel(plugin)) {
+      if (this._disabledIds.has(plugin.id) || !pluginParticipatesInMode(plugin, this.modes.activeMode)) {
+        this._missedModelLoad.add(plugin.id);
+      } else {
+        this._deliverModelLoaded(plugin, this._lastLoadResult);
       }
     }
+    this.emit('plugins-changed', { kind: 'registered', id: plugin.id });
     return this;
+  }
+
+  /**
+   * Run synchronous delegated registration with a fallback origin. Explicit
+   * origins passed to {@link use} always win; nested scopes restore correctly.
+   */
+  withDefaultOrigin<T>(origin: PluginOrigin, fn: () => T): T {
+    const previous = this._defaultPluginOrigin;
+    this._defaultPluginOrigin = origin;
+    try {
+      return fn();
+    } finally {
+      this._defaultPluginOrigin = previous;
+    }
+  }
+
+  /** Defensive read-only snapshot of the current plugin registry. */
+  getPlugins(): readonly RVViewerPlugin[] {
+    return this._plugins.slice();
+  }
+
+  /** Registration-site origin, or `unknown` for untagged/unknown IDs. */
+  getPluginOrigin(id: string): PluginOrigin {
+    return this._pluginOrigins.get(id) ?? 'unknown';
+  }
+
+  /** Whether a plugin ID is currently disabled. */
+  isPluginDisabled(id: string): boolean {
+    return this._disabledIds.has(id);
+  }
+
+  /** Whether the user explicitly disabled a plugin for this viewer session. */
+  isPluginUserDisabled(id: string): boolean {
+    return this._userDisabledIds.has(id);
+  }
+
+  /** Defensive snapshot of the current session-scoped user overrides. */
+  getPluginUserDisabledIds(): ReadonlySet<string> {
+    return new Set(this._userDisabledIds);
+  }
+
+  /**
+   * Apply a session-scoped user override without unloading plugin resources or
+   * UI slots. Mode hooks only run when the plugin participates in an active
+   * workspace; the callback lists are disabled even during the boot null-mode.
+   */
+  setPluginUserEnabled(id: string, enabled: boolean): void {
+    const plugin = this._plugins.find((candidate) => candidate.id === id);
+    if (!plugin) return;
+
+    if (!enabled) {
+      if (this._userDisabledIds.has(id)) return;
+      this._userDisabledIds.add(id);
+      const activeMode = this.modes.activeMode;
+      if (activeMode !== null && pluginParticipatesInMode(plugin, activeMode)) {
+        callPlugin(plugin, 'onModeDeactivate', activeMode, this);
+      }
+      this.disablePlugin(id);
+      this.emit('plugins-changed', { kind: 'user-disabled', id });
+      return;
+    }
+
+    if (!this._userDisabledIds.delete(id)) return;
+    const activeMode = this.modes.activeMode;
+    if (activeMode !== null && pluginParticipatesInMode(plugin, activeMode)) {
+      this.enablePlugin(id);
+      callPlugin(plugin, 'onModeActivate', activeMode, this);
+    }
+    this.emit('plugins-changed', { kind: 'user-enabled', id });
+  }
+
+  /** Clear all session-scoped user overrides and restore mode-driven state. */
+  clearPluginUserOverrides(): void {
+    for (const id of [...this._userDisabledIds]) {
+      this.setPluginUserEnabled(id, true);
+    }
   }
 
   /** Type-safe plugin lookup by ID. */
@@ -619,14 +1096,19 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
   /**
    * Disable a plugin by ID. The plugin is removed from the cached pre/post/render
-   * arrays and skipped in onModelLoaded, onModelCleared, and onConnectionStateChanged.
+   * arrays and skipped in onModelLoaded and onConnectionStateChanged. A plugin
+   * that received the current model still receives onModelCleared for cleanup.
    * The plugin remains in _plugins so dispose() still runs (prevents memory leaks).
    */
   disablePlugin(id: string): void {
+    if (this._disabledIds.has(id)) return;
     this._prePlugins = this._prePlugins.filter(p => p.id !== id);
     this._postPlugins = this._postPlugins.filter(p => p.id !== id);
     this._renderPlugins = this._renderPlugins.filter(p => p.id !== id);
+    this._invalidatePluginSnapshots();
     this._disabledIds.add(id);
+    this._recomputePhysicsPluginActive();
+    this.emit('plugins-changed', { kind: 'disabled', id });
   }
 
   /**
@@ -655,12 +1137,14 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     if (plugin.onFixedUpdatePre) insertSorted(this._prePlugins, plugin);
     if (plugin.onFixedUpdatePost) insertSorted(this._postPlugins, plugin);
     if (plugin.onRender) insertSorted(this._renderPlugins, plugin);
-    if (plugin.handlesTransport) this._physicsPluginActive = true;
+    this._invalidatePluginSnapshots();
+    this._recomputePhysicsPluginActive();
 
     // Replay a missed onModelLoaded exactly once (mode-driven re-activation).
     if (this._missedModelLoad.delete(id) && this._lastLoadResult) {
-      callPlugin(plugin, 'onModelLoaded', this._lastLoadResult, this);
+      this._deliverModelLoaded(plugin, this._lastLoadResult);
     }
+    this.emit('plugins-changed', { kind: 'enabled', id });
   }
 
   /**
@@ -677,6 +1161,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       (id) => this._disabledIds.has(id),
       from,
       to,
+      (id) => this._userDisabledIds.has(id),
     );
   }
 
@@ -702,12 +1187,80 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._prePlugins = this._prePlugins.filter(p => p.id !== id);
     this._postPlugins = this._postPlugins.filter(p => p.id !== id);
     this._renderPlugins = this._renderPlugins.filter(p => p.id !== id);
+    this._invalidatePluginSnapshots();
     this._disabledIds.delete(id);
+    this._userDisabledIds.delete(id);
+    this._missedModelLoad.delete(id);
+    this._modelLoadedIds.delete(id);
+    this._pluginOrigins.delete(id);
     this.uiRegistry.unregister(id);
     this.contextMenu.unregister(id);
     // Re-evaluate physics plugin state
-    this._physicsPluginActive = this._plugins.some(p => p.handlesTransport);
+    this._recomputePhysicsPluginActive();
+    this.emit('plugins-changed', { kind: 'removed', id });
     return true;
+  }
+
+  private _recomputePhysicsPluginActive(): void {
+    this._physicsPluginActive = this._plugins.some(
+      (plugin) => plugin.handlesTransport && !this._disabledIds.has(plugin.id),
+    );
+  }
+
+  private _isPluginEligibleForCurrentModel(plugin: RVViewerPlugin): boolean {
+    const declared = this._lastLoadResult?.modelConfig?.plugins;
+    return declared === undefined || plugin.core === true || declared.includes(plugin.id);
+  }
+
+  private _deliverModelLoaded(plugin: RVViewerPlugin, result: LoadResult): void {
+    if (!plugin.onModelLoaded || this._modelLoadedIds.has(plugin.id)) return;
+    callPlugin(plugin, 'onModelLoaded', result, this);
+    this._modelLoadedIds.add(plugin.id);
+  }
+
+  private async _notifyPluginsModelLoaded(result: LoadResult): Promise<void> {
+    const declared = result.modelConfig.plugins;
+    const outsideMode = (plugin: RVViewerPlugin): boolean =>
+      !pluginParticipatesInMode(plugin, this.modes.activeMode);
+
+    if (declared === undefined) {
+      for (const plugin of this._plugins) {
+        if (this._disabledIds.has(plugin.id) || outsideMode(plugin)) {
+          this._missedModelLoad.add(plugin.id);
+          continue;
+        }
+        this._deliverModelLoaded(plugin, result);
+      }
+      return;
+    }
+
+    for (const plugin of this._plugins) {
+      const eligible = plugin.core === true || declared.includes(plugin.id);
+      if (!eligible) continue;
+      if (this._disabledIds.has(plugin.id) || outsideMode(plugin)) {
+        this._missedModelLoad.add(plugin.id);
+        continue;
+      }
+      this._deliverModelLoaded(plugin, result);
+    }
+
+    for (const id of declared) {
+      if (this._plugins.some((plugin) => plugin.id === id)) continue;
+      const plugin = await this.resolvePlugin(id);
+      if (plugin && (this._disabledIds.has(plugin.id) || outsideMode(plugin))) {
+        this._missedModelLoad.add(plugin.id);
+        continue;
+      }
+      if (plugin) this._deliverModelLoaded(plugin, result);
+    }
+  }
+
+  private _notifyPluginsModelCleared(): void {
+    for (const plugin of this._plugins) {
+      if (!this._modelLoadedIds.has(plugin.id)) continue;
+      callPlugin(plugin, 'onModelCleared', this);
+    }
+    this._modelLoadedIds.clear();
   }
 
   /** Model plugin manager — handles per-model plugin loading/unloading. */
@@ -757,7 +1310,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
           ? new (PluginOrInstance as new () => RVViewerPlugin)()
           : PluginOrInstance as RVViewerPlugin;
         if (plugin && plugin.id) {
-          this.use(plugin);
+          this.use(plugin, 'core');
           return plugin;
         }
       } catch (e) {
@@ -775,7 +1328,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     const loadedPlugin = await loadExternalPlugin(id, baseUrl);
     if (loadedPlugin) {
       const plugin = loadedPlugin as RVViewerPlugin;
-      this.use(plugin);
+      this.use(plugin, 'project');
       return plugin;
     }
 
@@ -814,48 +1367,52 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.emit('exclusive-hover-mode', { mode });
   }
 
-  // ─── Drive Chart ──────────────────────────────────────────────────
+  // ─── Chart overlays (mutually exclusive) ──────────────────────────
+  //
+  // ONE field encodes which exclusive chart overlay is open — the toggles
+  // below can never leave two "exclusive" overlays open at once, and adding a
+  // third chart means adding a value, not editing every existing toggle.
+
+  /** Which exclusive chart overlay is open (null = none). */
+  private _activeChart: 'drive' | 'sensor' | null = null;
 
   /** Whether the drive chart overlay is open. */
-  private _driveChartOpen = false;
-  get driveChartOpen(): boolean { return this._driveChartOpen; }
+  get driveChartOpen(): boolean { return this._activeChart === 'drive'; }
+
+  /** Whether the sensor chart overlay is open. */
+  get sensorChartOpen(): boolean { return this._activeChart === 'sensor'; }
 
   /** Toggle the drive chart overlay. Exclusive with other chart modes. */
   toggleDriveChart(forceOpen?: boolean): void {
-    this._driveChartOpen = forceOpen ?? !this._driveChartOpen;
-    if (this._driveChartOpen) {
+    const open = forceOpen ?? this._activeChart !== 'drive';
+    if (open) {
       // Close other exclusive modes
-      if (this._sensorChartOpen) {
-        this._sensorChartOpen = false;
+      if (this._activeChart === 'sensor') {
         this.emit('sensor-chart-toggle', { open: false });
       }
+      this._activeChart = 'drive';
       this.setExclusiveHoverMode('Drive');
       // Isolate drives — dims non-drive geometry
       this.autoFilters?.isolate('Drive', { dimOpacity: 0.55, dimDesaturate: true });
       this.markShadowsDirty();
     } else {
+      if (this._activeChart === 'drive') this._activeChart = null;
       this.setExclusiveHoverMode(null);
       this.autoFilters?.showAll();
       this.markShadowsDirty();
     }
-    this.emit('drive-chart-toggle', { open: this._driveChartOpen });
+    this.emit('drive-chart-toggle', { open: this._activeChart === 'drive' });
   }
-
-  // ─── Sensor Chart ─────────────────────────────────────────────────
-
-  /** Whether the sensor chart overlay is open. */
-  private _sensorChartOpen = false;
-  get sensorChartOpen(): boolean { return this._sensorChartOpen; }
 
   /** Toggle the sensor chart overlay. Exclusive with other chart modes. */
   toggleSensorChart(forceOpen?: boolean): void {
-    this._sensorChartOpen = forceOpen ?? !this._sensorChartOpen;
-    if (this._sensorChartOpen) {
+    const open = forceOpen ?? this._activeChart !== 'sensor';
+    if (open) {
       // Close other exclusive modes
-      if (this._driveChartOpen) {
-        this._driveChartOpen = false;
+      if (this._activeChart === 'drive') {
         this.emit('drive-chart-toggle', { open: false });
       }
+      this._activeChart = 'sensor';
       this.setExclusiveHoverMode('Sensor');
       const sensors = this.transportManager?.sensors ?? [];
       const nodes = sensors.map((s) => s.node);
@@ -864,10 +1421,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
         this.fitToNodes(nodes);
       }
     } else {
+      if (this._activeChart === 'sensor') this._activeChart = null;
       this.setExclusiveHoverMode(null);
       this.highlighter.clear();
     }
-    this.emit('sensor-chart-toggle', { open: this._sensorChartOpen });
+    this.emit('sensor-chart-toggle', { open: this._activeChart === 'sensor' });
   }
 
   /** Whether the groups overlay is open. */
@@ -887,6 +1445,16 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   markShadowsDirty(): void {
     this._shadowsDirty = true;
     this._renderDirty = true;
+    // Visibility toggles route through here (Groups window, auto-filters,
+    // display panel) — keep the BatchedMesh per-instance visibility in sync.
+    this._batchVisibility?.markDirty();
+  }
+
+  /** Per-instance visibility sync for the BatchedMesh render path (null when
+   *  the current model has no batches). Mutators of model-node `.visible`
+   *  should call `markShadowsDirty()` or emit 'node-visibility-changed'. */
+  get batchVisibility(): BatchVisibilityService | null {
+    return this._batchVisibility;
   }
 
   /**
@@ -903,7 +1471,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     if (!this.registry || !this.signalStore || !this.transportManager) return false;
     return !!createRuntimeNode({
       registry: this.registry, signalStore: this.signalStore, scene: this.scene,
-      transportManager: this.transportManager, gizmoManager: this.gizmoManager, errorStore: this.errorStore,
+      transportManager: this.transportManager, gizmoManager: this.gizmoManager,
+      lampManager: this.lampManager, energyChainManager: this.energyChainManager,
+      collisionManager: this.collisionManager,
+      errorStore: this.errorStore,
+      instructionStore: this.instructionStore, outlineManager: this.outlineManager,
     }, spec);
   }
 
@@ -1020,6 +1592,19 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     if (!this._groundMesh) return;
     if (this._groundMesh.visible === v) return;
     this._groundMesh.visible = v;
+    this._renderDirty = true;
+  }
+
+  /** Whether the drive axis gizmo overlay is shown on selected Drive nodes
+   *  (plan-249). Read per frame by DriveAxisGizmoPlugin, which rebuilds/clears
+   *  the current selection's gizmos on change. */
+  private _showDriveAxisGizmo = true;
+  get showDriveAxisGizmo(): boolean {
+    return this._showDriveAxisGizmo;
+  }
+  set showDriveAxisGizmo(v: boolean) {
+    if (this._showDriveAxisGizmo === v) return;
+    this._showDriveAxisGizmo = v;
     this._renderDirty = true;
   }
 
@@ -1243,7 +1828,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    * @param paused  `true` to request pause, `false` to release this reason.
    */
   setSimulationPaused(reason: string, paused: boolean): void {
-    const changed = this.loop.setPaused(reason, paused);
+    const changed = this.runtime.setPaused(reason, paused);
     if (changed) {
       this._emitPauseChanged(reason);
     }
@@ -1277,12 +1862,16 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._applySourceMarkersVisible(visible);
   }
 
-  /** Walk every source in the current transport manager and apply the flag. */
+  /** Walk every source in the current transport manager and apply the flag.
+   *  AND-gated with the 'markers' overlay category (plan-250): the user's
+   *  source-marker setting is the fine control, the category is the overriding
+   *  master switch. */
   private _applySourceMarkersVisible(visible: boolean): void {
     const tm = this.transportManager;
     if (!tm) return;
+    const eff = visible && isOverlayVisible('markers');
     for (const source of tm.sources) {
-      source.setMarkerVisible?.(visible);
+      source.setMarkerVisible?.(eff);
     }
   }
 
@@ -1303,6 +1892,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._sourceMarkersUnsub = subscribeSourceMarkersVisible(() => {
       this._applySourceMarkersVisible(getSourceMarkersVisible());
     });
+    // Re-apply when the 'markers' overlay category is toggled (plan-250).
+    const offOverlay = subscribeOverlayVisibility(() => {
+      this._applySourceMarkersVisible(getSourceMarkersVisible());
+    });
+    const prevUnsub = this._sourceMarkersUnsub;
+    this._sourceMarkersUnsub = () => { prevUnsub(); offOverlay(); };
   }
 
   // ─── Vanish MUs at end of line ─────────────────────────────────────
@@ -1348,20 +1943,20 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    *                ALL active pause reasons are cleared.
    */
   clearPauseReasons(reason?: string): void {
-    if (!this.loop.pauseReasons.length) return;
+    if (!this.runtime.pauseReasons.length) return;
     if (reason !== undefined) {
-      if (!this.loop.pauseReasons.includes(reason)) return;
+      if (!this.runtime.pauseReasons.includes(reason)) return;
       console.warn(`[SimControl] Force-clearing pause reason: '${reason}'`);
-      const changed = this.loop.setPaused(reason, false);
+      const changed = this.runtime.setPaused(reason, false);
       if (changed) this._emitPauseChanged(reason);
       return;
     }
-    const snapshot = [...this.loop.pauseReasons];
+    const snapshot = [...this.runtime.pauseReasons];
     console.warn(`[SimControl] Force-clearing pause reasons: ${snapshot.join(', ')}`);
     let lastChanged = false;
     let lastReason = '';
     for (const r of snapshot) {
-      lastChanged = this.loop.setPaused(r, false) || lastChanged;
+      lastChanged = this.runtime.setPaused(r, false) || lastChanged;
       lastReason = r;
     }
     if (lastChanged) this._emitPauseChanged(lastReason);
@@ -1379,8 +1974,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._emittingPauseChanged = true;
     try {
       this.emit('simulation-pause-changed', {
-        paused: this.loop.isPaused,
-        reasons: this.loop.pauseReasons,
+        paused: this.runtime.isPaused,
+        reasons: this.runtime.pauseReasons,
         reason,
       });
     } finally {
@@ -1389,10 +1984,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   }
 
   /** True if any reason is currently holding the simulation paused. */
-  get isSimulationPaused(): boolean { return this.loop.isPaused; }
+  get isSimulationPaused(): boolean { return this.runtime.isPaused; }
 
   /** Snapshot of active pause reasons (for diagnostics / UI badges). */
-  get simulationPauseReasons(): readonly string[] { return this.loop.pauseReasons; }
+  get simulationPauseReasons(): readonly string[] { return this.runtime.pauseReasons; }
 
   /**
    * Reset the running model to its freshly-loaded "start" state — like a reload,
@@ -1437,11 +2032,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // plus per-surface texture/transform accumulators.
     if (this.transportManager) this.transportManager.reset();
     if (this.logicEngine) this.logicEngine.reset();
-    // Plan 194 P1 (K3): when the unified kernel is active, also reset the active
-    // executor so a future DES runner clears its own state. No-op for the
-    // continuous runner beyond the transportManager.reset() above (same target),
-    // and entirely skipped when the flag is OFF.
-    if (this._unifiedSim) this._kernel?.activeExecutor.reset();
+    // Plan 194 P1 (K3): also reset the kernel's active executor so the DES
+    // runner clears its own state. No-op for the continuous runner beyond the
+    // transportManager.reset() above (same target).
+    this._kernel?.activeExecutor.reset();
 
     // ── Phase 2: RESETSTAT ──────────────────────────────────────────────────
     this.statisticsManager.resetAll(); // Plan 201: reset accumulators (registrations persist)
@@ -1454,12 +2048,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   /**
    * Plan 194 P6 — public accessor for the unified SimulationKernel.
    *
-   * Returns the active kernel, building it on demand when the `VITE_UNIFIED_SIM`
-   * flag is on and a model is loaded (so the Sim mode-toggle UI can read mode /
-   * `hasDesRunner()` even before the first fixed tick). Returns `null` when the
-   * flag is OFF (default) or no model is loaded yet — the toggle then renders
-   * nothing. The UI imports only this + the public kernel facade (never the
-   * private `DESRunner`, Plan 194 V7).
+   * Returns the active kernel, building it on demand once a model is loaded
+   * (so the Sim mode-toggle UI can read mode / `hasDesRunner()` even before
+   * the first fixed tick). Returns `null` when no model is loaded yet — the
+   * toggle then renders nothing. The UI imports only this + the public kernel
+   * facade (never the private `DESRunner`, Plan 194 V7).
    */
   get simulationKernel(): SimulationKernel | null {
     return this._getKernel();
@@ -1480,27 +2073,51 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   /**
    * Plan 194 P1 — lazily build (or return) the unified SimulationKernel,
    * reusing the viewer's EXISTING transportManager + behaviors. Returns null
-   * when the flag is OFF or no transportManager is loaded yet. Guarded so the
-   * default (flag-OFF) path never constructs a kernel.
+   * when no transportManager/model is loaded yet.
    */
   private _getKernel(): SimulationKernel | null {
-    if (!this._unifiedSim) return null;
     if (!this.transportManager || !this.currentModel) return null;
     if (this._kernel) return this._kernel;
-    const runner = new ContinuousRunner(this.transportManager, this.behaviors);
+    // Phase B: the runner composes the CoreSubsystems pipeline (drive loop +
+    // visuals) around the transport→behaviours pair, and evaluates the
+    // physics-plugin transport bypass per tick via the gate.
+    const runner = new ContinuousRunner(
+      this.transportManager,
+      this.behaviors,
+      this._coreSubsystems,
+      () => !this._physicsPluginActive,
+    );
     this._kernel = new SimulationKernel({
       continuousRunner: runner,
       // Pass the viewer as the bind-context host so the DESRunner can discover
       // and bind placed material-flow components on start() (Plan 194 P5b).
-      topology: { root: this.currentModel, host: this as unknown as BindContextHost },
+      // Root is the WHOLE scene (not just currentModel): Planner-placed
+      // LayoutObjects live under `_layoutRoot`, a sibling of currentModel, so the
+      // DES scene-binding traversal must cover the full scene to find them. The
+      // bind pass filters on the `LayoutObject` marker, so fixtures (lights,
+      // ground, gizmos) are ignored. `scene` is also a stable reference across
+      // model switches (currentModel is reassigned on load).
+      topology: { root: this.scene, host: this as unknown as BindContextHost },
       // P5 wires the actual material-flow definitions in play; continuous
       // discovery already binds them via the BehaviorManager today.
       defs: [],
       // DES factory defaults to the stub (`null` in the public build) →
       // hasDesRunner() is false → the DES toggle stays hidden (P6).
       desRunnerFactory: createDesRunner,
+      // Phase B: the DES runner composes the same CoreSubsystems pipeline so
+      // drives/logic/visuals keep ticking at 60 Hz while the event queue runs.
+      core: this._coreSubsystems,
       // Plan 194 P6: re-render the Sim mode-toggle UI on a successful switch.
       onModeChanged: (mode) => this.emit('simulation-mode-changed', { mode }),
+    });
+    // Re-bind the DES executor once a scene is fully loaded. The initial DES
+    // bind (on setMode('des')) can run BEFORE the async planner placements
+    // exist (boot-into-DES via ?mode=des): `scene-loaded` fires after Phase 4
+    // (planner.applyPlacements), so a reset here re-discovers the now-placed
+    // LayoutObjects. No-op outside DES mode; harmless on a fresh scene in DES
+    // (clearMUs + re-bind). Registered once — `_kernel` is cached above.
+    this.on('scene-loaded', () => {
+      if (this._kernel?.mode === 'des') this._kernel.reset();
     });
     return this._kernel;
   }
@@ -1540,10 +2157,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this._filteredNodes = [];
       this._filteredDrives = [];
       // Restore chart-specific highlights if chart is open
-      if (this._driveChartOpen) {
+      if (this.driveChartOpen) {
         const nodes = this.drives.map((d) => d.node);
         if (nodes.length > 0) this.highlighter.highlightMultiple(nodes);
-      } else if (this._sensorChartOpen) {
+      } else if (this.sensorChartOpen) {
         const sensors = this.transportManager?.sensors ?? [];
         const nodes = sensors.map((s) => s.node);
         if (nodes.length > 0) this.highlighter.highlightMultiple(nodes, { includeSensorViz: true });
@@ -1597,11 +2214,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   /** Info from the last GLB load. */
   lastLoadInfo: { glbSize: string; loadTime: string } | null = null;
 
+  /** Pick-path timing sink (raycast/resolve/highlight), polled by DevTools. */
+  private readonly _pickMetrics = new PickMetrics();
+
   /** Load model with progress overlay (set by main.ts bootstrap).
    *  The optional `options.overlay` is forwarded to `loadModel` so the
    *  rv-extras overlay is applied during traversal (no race window).
    */
-  loadModelWithProgress: ((url: string, options?: { overlay?: RVExtrasOverlay }) => Promise<void>) | null = null;
+  /** Typed result returned by the host's progress-aware model loader. */
+  loadModelWithProgress: ((url: string, options?: { overlay?: RVExtrasOverlay }) => Promise<ModelLoadOutcome>) | null = null;
 
   /**
    * Optional gate promise that must resolve before model loading begins.
@@ -1649,6 +2270,24 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   /** @internal — exposed to RVOutlineManager so it can insert OutlinePass. */
   get _composer(): EffectComposer | null { return this._postProcessing.composer; }
 
+  /**
+   * Viewer-owned library preview generator (plan-372 §2.7).
+   *
+   * Survives plugin teardown and is available with no plugin loaded. On a
+   * WebGPU viewer the service reports `isAvailable === false` and resolves
+   * every request with `null` — thumbnails need the classic WebGLRenderer.
+   */
+  get thumbnails(): ThumbnailService {
+    if (!this._thumbnails) {
+      this._thumbnails = new ThumbnailService({
+        renderer: this.renderer as unknown as WebGLRenderer,
+        scene: this.scene,
+        isWebGPU: this.isWebGPU,
+      });
+    }
+    return this._thumbnails;
+  }
+
   // --- Toon (cel) render mode ---
   // Owns the Std→Toon material swap and the screen-space Sobel outline. Inert
   // unless the active render mode is 'toon'. See RVToonMaterialManager.
@@ -1659,6 +2298,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    *  probes a tick later (best-effort, see rv-gpu-info.ts). Read via
    *  `getGPUInfo()`; consumers poll. */
   private _gpuInfo: GPUInfo | null = null;
+
+  // --- Library preview thumbnails (plan-372 §2.7) ---
+  // Owned by the viewer, not by the Layout Planner: the Projects dashboard
+  // needs previews while the planner plugin may not be loaded at all. Built
+  // lazily because most sessions never open a library, and on a WebGPU viewer
+  // it is permanently inert (see ThumbnailService).
+  private _thumbnails: ThumbnailService | null = null;
 
   private constructor(
     container: HTMLElement,
@@ -1672,8 +2318,26 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
     // --- Renderer (already configured by create/_configureAndCreate) ---
     this.renderer = renderer;
-    this.isWebGPU = this._detectWebGPU(renderer);
+    // Kind is derived from the renderer instance itself (single source of
+    // truth — also covers the init()-failure fallback path in create()):
+    // classic WebGLRenderer → 'webgl'; WebGPURenderer with a real WebGPU
+    // backend → 'webgpu'; WebGPURenderer with forceWebGL → 'webgpu-gl'.
+    this.hasCompute = this._detectWebGPU(renderer);
+    this.rendererKind = ('isWebGPURenderer' in renderer)
+      ? (this.hasCompute ? 'webgpu' : 'webgpu-gl')
+      : 'webgl';
+    // Semantics change (plan-271 review finding 1): isWebGPU means "any
+    // WebGPURenderer" — under 'webgpu-gl' it MUST be true so all GLSL-only
+    // consumers (composer/outline/AO, XR, splats, reflector, ground fade,
+    // scene-loader fixes) keep skipping their WebGL-only paths.
+    this.isWebGPU = this.rendererKind !== 'webgl';
     this._antialiasActive = options.antialias ?? false;
+    this._plannerSignalLinking = options.plannerSignalLinking ?? false;
+    // plan-320: authority ranking is module-level service config (survives
+    // model switches); the write-gate mode is applied per-model store in
+    // loadModel() (each load creates a fresh SignalStore).
+    setAuthorityRanking(options.authorityRanking ?? 'strict');
+    this._signalWriteGate = options.signalWriteGate ?? 'shadow';
 
     // --- GPU diagnostics ---
     // Sync detection first so `getGPUInfo()` returns a usable object
@@ -1681,9 +2345,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // kick off the optional adapter enumeration in the background;
     // when it resolves, merge non-duplicate entries onto _gpuInfo so
     // the next DevToolsTab poll picks them up.
+    // Diagnostics follow the REAL backend (hasCompute), not the isWebGPU
+    // derivation: under 'webgpu-gl' the pixels come from a WebGL2 context.
     this._gpuInfo = {
-      backend: this.isWebGPU ? 'webgpu' : 'webgl',
-      active: detectActiveGPU(renderer, this.isWebGPU ? 'webgpu' : 'webgl'),
+      backend: this.hasCompute ? 'webgpu' : 'webgl',
+      active: detectActiveGPU(renderer, this.hasCompute ? 'webgpu' : 'webgl'),
     };
     void enumerateOtherAdapters().then((adapters) => {
       if (!this._gpuInfo) return;
@@ -1705,6 +2371,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Default background = 0x9a9a9a gray (scalar 0.604) scaled by backgroundBrightness.
     this.scene.background = new Color().setScalar(BG_BASE_SCALAR * this._backgroundBrightness);
     this.highlighter = new RVHighlightManager(this.scene);
+    this.highlighter.setMetrics(this._pickMetrics);
     this.outlineManager = new RVOutlineManager(this);
     // --- Post-processing manager (constructed early so the OutlineManager,
     // which talks to `_composer` / `_ensureComposer()` via the host, sees a
@@ -1735,6 +2402,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       get antialiasActive() { return ppSelf._antialiasActive; },
       _ensureComposer() { ppSelf._ensureComposer(); },
       get _composer() { return ppSelf._composer; },
+      _ensureTslPost() { return ppSelf._postProcessing.ensureTslPost(); },
       markRenderDirty() { ppSelf._renderDirty = true; },
     });
     // A model loaded while toon mode is already active must be converted (its
@@ -1757,6 +2425,22 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // is needed instead of passing the value directly. Once available, every gizmo
     // automatically participates in raycasting (hover/click resolves to owner node).
     this.gizmoManager = new GizmoOverlayManager(this.scene, () => this.raycastManager);
+    this.lampManager = new LampManager();
+    this.energyChainManager = new EnergyChainManager();
+    // plan-394: collided bodies get the OutlinePass STATUS outline — the same
+    // pulsing severity silhouette the error-message system uses (user decision
+    // 2026-08-07), persistent while the pair is latched and independent of the
+    // user's selection. Color = the warning-severity orange of the collision
+    // cards (SEVERITY_COLORS.warning).
+    this.collisionManager = new RVCollisionManager();
+    this.collisionManager.setHighlightHost({
+      showCollision: (roots) => showStatusOutline(this, roots, 0xffa726,
+        { ownerKey: 'collision', pulsePeriod: 0.6 }),
+      hideCollision: () => hideStatusOutline(this, 'collision'),
+    });
+    // Ping pulses render as mesh-glow-hull gizmos (same visual as the
+    // CustomRuntimeInstruction highlight).
+    this.highlighter.setGizmoManager(this.gizmoManager);
 
     // --- Camera ---
     const w = container.clientWidth || window.innerWidth;
@@ -1813,6 +2497,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._visualSettings = new VisualSettingsManager({
       scene: this.scene,
       renderer: this.renderer,
+      get isWebGPU() { return self.isWebGPU; },
       ambientLight: this.ambientLight,
       dirLight: this.dirLight,
       sceneFixtures: this.sceneFixtures,
@@ -1888,25 +2573,14 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
     // --- Controls ---
     this.controls = new OrbitControls(this._activeCamera, renderer.domElement);
-    this.controls.enableDamping = true;
     // Dolly toward the cursor instead of the static orbit target. Without this,
     // OrbitControls' wheel-dolly scales distance to `target` by a fixed factor
     // per notch — asymptotic to the target, so close-up zoom in large scenes
     // (e.g. Gaussian Splat showrooms) feels frozen.
-    this.controls.zoomToCursor = true;
     this.controls.target.set(0, 0.5, 0);
-    this.controls.mouseButtons = {
-      LEFT: -1 as MOUSE,
-      MIDDLE: MOUSE.PAN,
-      RIGHT: MOUSE.ROTATE,
-    };
-    this.controls.touches = {
-      ONE: TOUCH.ROTATE,
-      TWO: TOUCH.DOLLY_PAN,
-    };
     // Apply navigation-sensitivity settings (rotate/pan/zoom/damping) from store.
     const navSettings = loadVisualSettings();
-    applyNavigationSettingsToControls(this.controls, navSettings);
+    configureOrbitControls(this.controls, navSettings);
     this.controls.update();
 
     // Track orbit/pan/pinch gesture state to suppress selection & hover highlighting
@@ -1936,11 +2610,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // frame during interaction would literally double triangle throughput.
     this.controls.addEventListener('change', () => {
       this._renderDirty = true;
-      const hasStaticUberCaster = (this._lastLoadResult?.uberMergeResult?.mergedCount ?? 0) > 0;
+      const hasStaticUberCaster = (this._lastLoadResult?.uberBatchResult?.instanceCount ?? 0) > 0;
       if (!hasStaticUberCaster) {
         this._shadowsDirty = true;
       }
     });
+
+    // Engine components (WebVisibility, …) announce runtime `.visible`
+    // mutations on model nodes here — sync batch instances + shadow map.
+    this.on('node-visibility-changed', () => this.markShadowsDirty());
 
     // CameraManager — uses proxy state to read/write shared fields on the facade.
     this._cameraManager = new CameraManager({
@@ -1971,6 +2649,18 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.loop.onRender = () => this.render();
     this.loop.start();
 
+    // Runtime attachment follows the workspace mode: modes registered with
+    // `runtime: 'detached'` (e.g. the asset editor) switch time integration
+    // fully off. Subscribed AFTER the ModeManager commit ('mode-changed'), so
+    // plugin onModeDeactivate hooks still ran with a live runtime.
+    this.on('mode-changed', ({ to }) => {
+      this.runtime._setAttached(this.modes.descriptor(to)?.runtime !== 'detached');
+      // A mode switch rebuilds the visuals — re-push the collision status
+      // outline so an active collision keeps its emphasis across the switch
+      // (plan-394 F15).
+      this.collisionManager.reapplyHighlight();
+    });
+
     // --- Resize (ResizeObserver on container — handles soft keyboard, orientation) ---
     if (autoResize) {
       this.resizeHandler = () => {
@@ -1979,14 +2669,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
         const aspect = w / h;
         this.perspCamera.aspect = aspect;
         this.perspCamera.updateProjectionMatrix();
-        // Keep ortho frustum in sync
-        const dist = this.orthoCamera.position.distanceTo(this.controls.target);
-        const halfH = dist * Math.tan((this.perspCamera.fov * Math.PI / 180) / 2);
-        this.orthoCamera.left = -halfH * aspect;
-        this.orthoCamera.right = halfH * aspect;
-        this.orthoCamera.top = halfH;
-        this.orthoCamera.bottom = -halfH;
-        this.orthoCamera.updateProjectionMatrix();
+        // Keep ortho frustum in sync (canonical math lives in the CameraManager;
+        // it reads perspCamera.aspect, which was just updated above).
+        this._cameraManager.syncOrthoFrustum();
         // updateStyle:false — CSS owns the display size (100%/100%), we only
         // resize the drawing buffer. This keeps the canvas covering the viewport
         // during the resize and avoids fighting the CSS with inline px.
@@ -2015,7 +2700,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       window.addEventListener('resize', this.resizeHandler);
     }
 
-    logInfo(`realvirtual WEB — Ready (${this.isWebGPU ? 'WebGPU' : 'WebGL'})`);
+    logInfo(`realvirtual WEB — Ready (${this.hasCompute ? 'WebGPU' : this.isWebGPU ? 'WebGPU (GL backend)' : 'WebGL'})`);
 
     // ─── Sub-Facaden (Phase 4a of plan-182) ────────────────────────────
     // Initialized last: all managers (controls, camera, scene) are ready.
@@ -2025,6 +2710,14 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._controls = new ControlsFacadeImpl(this);
     this._simLoop  = new SimLoopFacadeImpl(this);
     this._pluginContext = new PluginContextImpl(this);
+
+    // Planner Signal Linking: resolve live bindings in TickStage.PRE — AFTER the
+    // interface WS flush (legacy onFixedUpdatePre plugins run before PRE-tick
+    // callbacks) and BEFORE drive physics (TickStage.SIM). order 50 keeps it
+    // early within PRE. No-op when the feature flag is off (manager stays null).
+    if (this._plannerSignalLinking) {
+      this._simLoop.onTick(TickStage.PRE, (dt) => this.signalBindingManager?.tick(dt), 50);
+    }
 
     // ─── Behavior auto-discovery hook ───────────────────────────────────
     // Attach the BehaviorManager so it listens for model-loaded /
@@ -2057,6 +2750,28 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    */
   _ensureComposer(): void {
     this._postProcessing.ensureComposer();
+  }
+
+  /**
+   * Mirrors the Section tool's stable plane array to WebGL post-processing
+   * override materials. The beauty pass receives the planes per model
+   * material; GTAO and outline passes need this explicit companion binding.
+   */
+  setSectionClippingPlanes(planes: Plane[] | null): void {
+    this._postProcessing.setClippingPlanes(planes);
+    this._toon.setClippingPlanes(planes);
+    this.outlineManager.setClippingPlanes(planes);
+  }
+
+  /**
+   * Lazily create the TSL node-post pipeline (WebGPURenderer paths only —
+   * plan-271 Phase 3). Mirrors `_ensureComposer()` for the TSL stack.
+   * @internal — also called by RVOutlineManager / the toon manager via their
+   * host interfaces. Returns null on classic WebGL or when the TSL module
+   * pre-warm has not completed.
+   */
+  _ensureTslPost(): TslPostPipeline | null {
+    return this._postProcessing.ensureTslPost();
   }
 
   /**
@@ -2104,7 +2819,37 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     camera.layers.disable(ISOLATE_FOCUS_LAYER);
     disableOverlayLayers(camera);
 
-    if (desaturate) {
+    if (desaturate && this.isWebGPU) {
+      // TSL desaturation blit (plan-271 Phase 3): the classic path's raw
+      // ShaderMaterial below cannot run under WebGPURenderer — the shared
+      // Rec601 saturation node grades the backdrop instead. Same three-step
+      // dance: render backdrop to RT, blit desaturated, focus group on top.
+      const blit = this._postProcessing.ensureDesatBlitTsl();
+      if (blit) {
+        blit.setSize(gl.domElement.width, gl.domElement.height);
+
+        // Remove environment map during backdrop render (see WebGL branch).
+        const savedEnv = this.scene.environment;
+        this.scene.environment = null;
+
+        // Custom-shim Renderer types setRenderTarget(target: unknown) — no
+        // WebGLRenderTarget cast needed for the WebGPU RenderTarget.
+        this.renderer.setRenderTarget(blit.renderTarget);
+        gl.clear(true, true, false);
+        gl.render(this.scene, camera);
+        this.renderer.setRenderTarget(null);
+
+        this.scene.environment = savedEnv;
+
+        // saturation=0 → full grayscale (parity with the WebGL blit).
+        blit.saturation.value = 0.0;
+        gl.clear(true, true, false);
+        blit.blit(this.renderer);
+      } else {
+        // TSL module pre-warm failed — dim backdrop without desaturation.
+        gl.render(this.scene, camera);
+      }
+    } else if (desaturate) {
       // Render backdrop to offscreen RT, then blit desaturated to screen.
       this._postProcessing.ensureDesatPass();
       const rt = this._postProcessing.desatRT!;
@@ -2209,9 +2954,16 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
   /**
    * Create a viewer instance. Always use this instead of `new RVViewer()`.
-   * Uses WebGPURenderer with forceWebGL as the universal renderer.
-   * When `options.useWebGPU` is true and the browser supports it,
-   * the real WebGPU backend is used instead.
+   * Three renderer paths (plan-271), default is the classic WebGLRenderer:
+   *  - 'webgl' (default): classic WebGLRenderer — the proven production path.
+   *  - 'webgpu': real WebGPU backend; requires `navigator.gpu`, falls back to
+   *    classic WebGL when unavailable or when `init()` fails.
+   *  - 'webgpu-gl': WebGPURenderer({ forceWebGL: true }) — TSL/NodeMaterial on
+   *    a WebGL2 context (internal test path). Deliberately NO `navigator.gpu`
+   *    check here: forceWebGL needs no WebGPU adapter (review finding 4).
+   *    Falls back to the classic WebGLRenderer when `init()` fails.
+   * `options.useWebGPU: true` is kept as a deprecated alias for
+   * `renderer: 'webgpu'`.
    */
   static async create(
     container: HTMLElement,
@@ -2219,43 +2971,57 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   ): Promise<RVViewer> {
     const isTouchDevice = isMobileDevice();
 
-    let useWebGPU = !!options?.useWebGPU;
-    if (useWebGPU && !navigator.gpu) {
+    let kind: RendererKind = options?.renderer ?? (options?.useWebGPU ? 'webgpu' : 'webgl');
+    if (kind === 'webgpu' && !navigator.gpu) {
       console.warn('[RVViewer] WebGPU not available, falling back to WebGL');
-      useWebGPU = false;
+      kind = 'webgl';
     }
 
-    let renderer: Renderer;
+    let renderer: Renderer | undefined;
 
-    if (useWebGPU) {
-      // Real WebGPU: use WebGPURenderer with async init
+    if (kind === 'webgpu' || kind === 'webgpu-gl') {
+      // WebGPURenderer (real backend or forceWebGL) — needs async init()
       const { WebGPURenderer } = await import('three/webgpu');
-      const gpuRenderer = new WebGPURenderer({ antialias: options?.antialias ?? false, alpha: true, stencil: true } as any);
+      const gpuRenderer = new WebGPURenderer({
+        antialias: options?.antialias ?? false,
+        alpha: true,
+        stencil: true,
+        forceWebGL: kind === 'webgpu-gl',
+      } as any);
       try {
         await gpuRenderer.init();
+        renderer = gpuRenderer;
       } catch (err) {
-        console.warn('[RVViewer] WebGPU init() failed, falling back to WebGL:', err);
+        console.warn(`[RVViewer] WebGPURenderer init() failed (${kind}), falling back to classic WebGL:`, err);
         gpuRenderer.dispose();
-        useWebGPU = false;
-        // fall through to WebGL path below
+        kind = 'webgl';
+        // fall through to classic WebGL path below
       }
-      if (useWebGPU) renderer = gpuRenderer;
     }
 
-    if (!useWebGPU) {
+    if (!renderer) {
       // Standard WebGL: use the proven WebGLRenderer (no init needed)
       renderer = new WebGLRenderer({ antialias: options?.antialias ?? false, alpha: true, stencil: true, powerPreference: 'high-performance' }) as unknown as Renderer;
     }
 
-    return RVViewer._configureAndCreate(renderer!, container, isTouchDevice, useWebGPU, options);
+    const viewer = RVViewer._configureAndCreate(renderer, container, isTouchDevice, options);
+
+    // TSL pre-warm (plan-271 review finding 2): the material factory stays
+    // synchronous, so the TSL modules must be cached BEFORE the first
+    // loadModel() traverses the GLB. No-op under classic WebGL; never throws
+    // (a failed preload leaves the F4 guard fallbacks active).
+    if (viewer.isWebGPU) {
+      await preloadTslMaterials(createMaterialContext(viewer.rendererKind, viewer.hasCompute));
+    }
+
+    return viewer;
   }
 
   /** Shared renderer config — called by create() and fallback path. */
   private static _configureAndCreate(
     renderer: Renderer,
     container: HTMLElement,
-    isTouchDevice: boolean,
-    isWebGPU: boolean,
+    _isTouchDevice: boolean,
     options?: RVViewerOptions,
   ): RVViewer {
     renderer.setSize(
@@ -2317,15 +3083,110 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
   // ─── Model Management ─────────────────────────────────────────────────
 
+  /** Current raw rv_sig verification result for the loaded model. */
+  getSignatureState(): SignatureState {
+    return this._signatureState;
+  }
+
+  /** Append components created while a signed model remains gated. */
+  registerDeferredLogic(deferred: DeferredLogic): void {
+    if (this.logicRunState === 'active') {
+      initializeComponents(deferred.pending, deferred.context);
+      runOnSceneReady(deferred.pending, deferred.context);
+      return;
+    }
+    this._deferredLogic.push(deferred);
+  }
+
+  /**
+   * One-shot late Start/onSceneReady transition for invalid or unverifiable
+   * signed models. Parallel callers are rejected by the activating CAS state.
+   */
+  async activateGatedLogic(): Promise<boolean> {
+    if (this.logicRunState !== 'gated') return false;
+    const generation = this._loadGeneration;
+    const result = this._lastLoadResult;
+    if (!result) return false;
+
+    this.logicRunState = 'activating';
+    this._publishSignatureUiState();
+    this.emit('signature-state-changed', {
+      signatureState: this._signatureState,
+      logicRunState: this.logicRunState,
+    });
+
+    const deferred = this._deferredLogic.splice(0);
+    for (const item of deferred) {
+      initializeComponents(item.pending, item.context);
+      if (generation !== this._loadGeneration) return false;
+      runOnSceneReady(item.pending, item.context);
+      if (generation !== this._loadGeneration) return false;
+    }
+
+    this._attachLogicSystems(result);
+    if (generation !== this._loadGeneration) return false;
+    this.logicRunState = 'active';
+    persistSignatureUnlock(this._signatureModelName);
+    this._publishSignatureUiState();
+    this.emit('model-logic-activated', { result });
+    this.emit('signature-state-changed', {
+      signatureState: this._signatureState,
+      logicRunState: this.logicRunState,
+    });
+    return true;
+  }
+
+  private _attachLogicSystems(result: LoadResult): void {
+    this.drives = result.drives;
+    this.transportManager = result.transportManager;
+    this.playback = result.playback;
+    this.replayRecordings = result.replayRecordings;
+    this.logicEngine = result.logicEngine;
+    this.ikPaths = result.registry.getAll<RVIKPath>('IKPath').map((record) => record.instance);
+    this._kernel = null;
+
+    if (this._plannerSignalLinking && !this.signalBindingManager && this.signalStore && this.registry) {
+      this.signalBindingManager = new SignalBindingManager(this.signalStore, this.registry);
+    }
+    if (this.logicEngine) this.logicEngine.start();
+    if (this.playback && (result.recorderSettings?.playOnStart ?? false)) this.playback.play();
+  }
+
+  private _publishSignatureUiState(): void {
+    setSignatureUiState({
+      signatureState: this._signatureState,
+      logicRunState: this.logicRunState,
+      modelName: this._signatureModelName,
+      signerOrganization: this._signatureSignerOrganization,
+      viewer: this,
+    });
+  }
+
   /**
    * Load a GLB model and start all simulation systems.
    *
    * @param url      GLB URL (file, blob:, or empty-glb URL)
    * @param options  Optional load options (e.g. an rv-extras overlay applied during traversal).
    */
-  async loadModel(url: string, options?: { overlay?: RVExtrasOverlay; data?: ArrayBuffer }): Promise<LoadResult> {
+  async loadModel(url: string, options?: {
+    overlay?: RVExtrasOverlay;
+    data?: ArrayBuffer;
+    preserveHierarchy?: boolean;
+    /** Stable local filename or URL-derived identity for signature unlock persistence. */
+    modelName?: string;
+  }): Promise<LoadResult> {
+    // Load-generation guard (plan-240 F9) — any BVH build still running for a
+    // previous model aborts on its next generation check. The async merge
+    // phases of loadGLB (plan-274 B3/F7) capture the same snapshot via
+    // `shouldAbort` below: a newer load/clear makes the stale loadGLB dispose
+    // its constructed chunks + root and reject with LoadAbortedError.
+    this._loadGeneration++;
     this.clearModel();
+    // Snapshot AFTER clearModel() — it bumps the generation once more; the
+    // snapshot must reflect the generation THIS load runs under.
+    const loadGeneration = this._loadGeneration;
     this._currentModelUrl = url;
+    this._signatureModelName = resolveModelName(options?.modelName ?? url);
 
     // --- Pre-load phase: load model plugins BEFORE GLB so they can register capabilities ---
     // Capabilities must be registered before buildRaycastGeometries() in loadGLB().
@@ -2355,11 +3216,21 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
     const result = await loadGLB(url, this.scene, {
       isWebGPU: this.isWebGPU,
+      muComputeRenderer: this._muComputeRenderer(),
       gizmoManager: this.gizmoManager,
+      lampManager: this.lampManager,
+      energyChainManager: this.energyChainManager,
+      collisionManager: this.collisionManager,
+      outlineManager: this.outlineManager,
       errorStore: this.errorStore,
+      instructionStore: this.instructionStore,
       events: this,
       overlay: options?.overlay,
       data: options?.data,
+      preserveHierarchy: options?.preserveHierarchy,
+      allowUntrustedLogic: isSignatureUnlocked(this._signatureModelName),
+      // Async batch phases — stale-load abort (plan-274 pattern).
+      shouldAbort: () => this._loadGeneration !== loadGeneration,
     });
 
     // Profile the expensive post-loadGLB steps separately (gated on ?debug=perf).
@@ -2380,7 +3251,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // historic stray that might still be tagged from prior buggy sessions.
     this.currentModel = result.root;
     this.currentModel.userData._rvModelRoot = true;
-    this.drives = result.drives;
+    this._signatureState = result.signatureState;
+    this._signatureSignerOrganization = result.signerOrganization;
+    this.logicRunState = result.logicGated ? 'gated' : 'active';
+    this._deferredLogic = result.deferredLogic ? [result.deferredLogic] : [];
+    this.drives = [];
+    // Keep the manager available for geometry/HMI inspection. The central tick
+    // gate prevents it from executing until _attachLogicSystems().
     this.transportManager = result.transportManager;
     // Bridge end-of-line vanish to snap connectivity: a connected outgoing snap
     // (e.g. a conveyor → rotated turntable) must never let its MUs vanish even
@@ -2414,17 +3291,31 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._simTime = 0; // Plan 201 (E2): fresh sim clock for the new model
     this.statisticsManager.clear(); // Plan 201: drop prior model's registrations (components re-register on bind)
     // Plan 194 P1: invalidate the unified kernel so it rebuilds against the new
-    // transportManager on the next tick (no-op when the flag is OFF — _kernel
-    // stays null in that case anyway).
+    // transportManager on the next tick.
     this._kernel = null;
     this.signalStore = result.signalStore;
-    this.playback = result.playback;
-    this.replayRecordings = result.replayRecordings;
-    this.logicEngine = result.logicEngine;
+    this.signalStore.signalWriteGate = this._signalWriteGate;
+    // plan-394: (re)wire the collision manager to THIS model — its signals and
+    // its MU spawn/remove stream. Reporting goes through the live card store;
+    // there is no modal round-trip anymore.
+    this.collisionManager.attachSignals(this.signalStore);
+    this.collisionManager.invalidate();
+    if (result.transportManager) result.transportManager.muLifecycleHook = this.collisionManager;
+    this.playback = null;
+    this.replayRecordings = [];
+    this.logicEngine = null;
     this.registry = result.registry;
+    // Planner Signal Linking: (re)build the binding manager against the fresh
+    // signalStore + registry. Gated by the feature flag — null otherwise so no
+    // override path, badge, or guard ever runs.
+    if (this._plannerSignalLinking && this.logicRunState === 'active') {
+      this.signalBindingManager?.dispose();
+      this.signalBindingManager = new SignalBindingManager(this.signalStore, this.registry);
+    }
     // Collect robot IK paths (replay engine) from the registry for per-frame ticking.
-    this.ikPaths = this.registry.getAll<RVIKPath>('IKPath').map((r) => r.instance);
+    this.ikPaths = [];
     this.groups = result.groups;
+    if (this.logicRunState === 'active') this._attachLogicSystems(result);
 
     // Wire the source-floor-marker visibility flag (plan-181) — applies the
     // persisted value to all freshly-loaded Sources AND subscribes to future
@@ -2450,18 +3341,48 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Selection manager — init after registry is available
     this.selectionManager.init(this);
 
-    // Register core "Focus" context menu item (available for all nodes)
+    // Register core "Focus" + "Isolate" context menu items (available for all nodes)
     this.contextMenu.register({
       pluginId: '_core',
-      items: [{
-        id: '_core.focus',
-        label: 'Focus',
-        order: 1,
-        action: (target) => {
-          this.fitToNodes([target.node]);
-          this.selectionManager.select(target.path);
+      items: [
+        {
+          id: '_core.focus',
+          label: 'Focus',
+          order: 1,
+          shortcut: 'F',
+          action: (target) => {
+            this.fitToNodes([target.node]);
+            this.selectionManager.select(target.path);
+          },
         },
-      }],
+        {
+          id: '_core.isolate',
+          label: () => (this._selectionIsolateActive ? 'Exit Isolate' : 'Isolate'),
+          order: 2,
+          // Editor mode has its own selection-centric menu — hide Isolate there
+          condition: () => this.modes.activeMode !== 'editor',
+          action: (target) => {
+            if (this._selectionIsolateActive) {
+              this.exitIsolate();
+              return;
+            }
+            // If the right-clicked node is part of the current selection, isolate
+            // the whole selection; otherwise isolate just that node (and select it).
+            const snap = this.selectionManager.getSnapshot();
+            let roots: Object3D[] = [];
+            if (snap.selectedPaths.includes(target.path) && this.registry) {
+              for (const p of snap.selectedPaths) {
+                const n = this.registry.getNode(p);
+                if (n) roots.push(n);
+              }
+            } else {
+              roots = [target.node];
+              this.selectionManager.select(target.path);
+            }
+            this.isolateNodes(roots);
+          },
+        },
+      ],
     });
 
     // Register filter subscribers from capabilities registry
@@ -2480,6 +3401,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this.renderer, () => this.camera, this.scene,
       result.registry, this.highlighter, this,
     );
+    this._pickMetrics.reset();
+    this.raycastManager.setMetrics(this._pickMetrics);
+    // EnergyChain rigs are excluded from the pick BVH by contract (a SkinnedMesh
+    // never enters it), so their invisible envelope hulls are the ONLY way they
+    // become clickable. The raycast manager only exists from here on.
+    this.energyChainManager.setRaycastHost(this.raycastManager);
 
     // Install central isolation gate — single invariant across all isolate
     // providers (GroupRegistry, AutoFilterRegistry, external/plugin isolates).
@@ -2494,12 +3421,34 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     if (result.raycastGeometrySet) {
       const muMeshes = this._collectInstancedMeshes();
       this.raycastManager.setRaycastGeometry(result.raycastGeometrySet, muMeshes);
+      this._installHighlightProxyProvider(result.raycastGeometrySet);
+      this._instancePickIndex = null;
+    } else {
+      // Authoring load (preserveHierarchy): the loader skipped the merged
+      // groups — install the two-level instance pick backend instead. Real
+      // meshes ARE the pick geometry (per-mesh local BVHs from the async
+      // build below are the narrow phase); membership is maintained
+      // incrementally by the asset-op executors, so NO full rebuild exists
+      // in editor mode. No proxy provider either — editor highlights run on
+      // real meshes (OutlinePass / legacy overlay pairs).
+      const index = new InstancePickIndex(result.registry);
+      index.addSubtree(result.root);
+      this._instancePickIndex = index;
+      this.raycastManager.setBackend(index);
+      debug('loader', `[InstancePickIndex] editor pick backend: ${index.size} meshes`);
     }
 
     // Gizmos created during loadGLB (e.g. WebSensor outlines) were instantiated
     // before raycastManager existed. Register them AFTER setRaycastGeometry so
     // they survive the rebuild that setRaycastGeometry triggers.
     this.gizmoManager.refreshAuxRaycastTargets();
+
+    // Async BVH build (plan-240): loadGLB deferred ALL BVH construction (per-mesh
+    // Phase 13 AND the merged raycast geometries of Phase 13b). Kick off ONE
+    // sequential background build — merged geometries first (few, huge, highest
+    // benefit), then per-mesh. `model-loaded` below does NOT wait for it; until
+    // completion, hover/click raycasts run through the native three.js fallback.
+    this._startAsyncBvhBuild(result);
 
     // Enable hover types based on capabilities registry (hoverEnabledByDefault)
     const hoverDefaults = getTypesWithCapability('hoverEnabledByDefault');
@@ -2518,20 +3467,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
     // Pipe flow visualization (animated rings)
     if (pl.pipes.length > 0) {
-      this.pipeFlowManager = new PipeFlowManager(pl.pipes);
-    }
-
-    // LogicEngine
-    if (this.logicEngine) {
-      this.logicEngine.start();
-    }
-
-    // Recording playback
-    if (this.playback) {
-      const shouldAutoPlay = result.recorderSettings?.playOnStart ?? false;
-      if (shouldAutoPlay) {
-        this.playback.play();
-      }
+      this.pipeFlowManager = new PipeFlowManager(pl.pipes, this.isWebGPU);
     }
 
     // Resize ground plane to fit model bounds + margin
@@ -2565,8 +3501,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // build, not the full 15 m ground extent. Shadow / sun fit below still
     // uses `maxDim` so coverage extends across the whole ground.
     const cameraFitDim = result.boundingBox.isEmpty() ? 5 : maxDim;
-    const fov = this.perspCamera.fov * (Math.PI / 180);
-    const dist = (cameraFitDim / (2 * Math.tan(fov / 2))) * 1.5;
+    const dist = this._cameraManager.fitDistance(cameraFitDim, 1.5);
 
     this.camera.position.set(center.x + dist * 0.7, center.y + dist * 0.5, center.z + dist * 0.7);
     this.controls.target.copy(center);
@@ -2614,34 +3549,21 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Plugin lifecycle: onModelLoaded (before event, with error isolation)
     // Activation mode depends on whether rv_plugins is declared anywhere.
     this._lastLoadResult = result;
-    const declared = result.modelConfig.plugins; // string[] | undefined
 
-    if (declared === undefined) {
-      // ALL-MODE: no rv_plugins declared — activate ALL registered plugins (backward compatible)
-      for (const p of this._plugins) {
-        if (this._disabledIds.has(p.id)) { this._missedModelLoad.add(p.id); continue; }
-        callPlugin(p, 'onModelLoaded', result, this);
-      }
-    } else {
-      // SELECTIVE-MODE: only declared plugins + core plugins activate
-      for (const p of this._plugins) {
-        if (this._disabledIds.has(p.id)) { this._missedModelLoad.add(p.id); continue; }
-        if (p.core || declared.includes(p.id)) {
-          callPlugin(p, 'onModelLoaded', result, this);
-        }
-      }
-      // Resolve any declared plugins not yet registered (lazy built-in or external)
-      for (const id of declared) {
-        if (!this._plugins.find(p => p.id === id)) {
-          const plugin = await this.resolvePlugin(id);
-          if (plugin) callPlugin(plugin, 'onModelLoaded', result, this);
-        }
-      }
-    }
+    // Batched render path: per-instance visibility sync for the model's
+    // BatchedMesh arenas (starts dirty — first rendered frame reconciles).
+    this._batchVisibility = result.batchTable && result.batchTable.instanceCount > 0
+      ? new BatchVisibilityService(result.root, result.batchTable)
+      : null;
+    this._batchVisSafetyCounter = 0;
+    // Mode-scoped plugins outside the active mode (including the null "no mode"
+    // boot window BEFORE main.ts applies the workspace mode) must not receive
+    // onModelLoaded. Selective rv_plugins eligibility is enforced before a
+    // plugin is recorded as having missed the lifecycle callback.
+    await this._notifyPluginsModelLoaded(result);
 
     // Re-evaluate _physicsPluginActive — plugins may have changed handlesTransport in onModelLoaded
-    // Re-evaluate _physicsPluginActive — plugins may have changed handlesTransport in onModelLoaded
-    this._physicsPluginActive = this._plugins.some(p => p.handlesTransport);
+    this._recomputePhysicsPluginActive();
     prof.mark('onModelLoaded-plugins');
 
     // Ensure first frame renders fully (shadows + scene)
@@ -2652,7 +3574,23 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // (NodeRegistry.getReferencesTo), keeping it off the model-load critical path.
 
     logInfo(`Model loaded: ${this.drives.length} drives, ${this.signalStore?.size ?? 0} signals`);
+    // Overlay-visibility (plan-250): mark categories present based on scene
+    // content so the Display panel only lists what actually exists. Cleared
+    // centrally in clearModel via reset. GizmoManager-backed categories
+    // (status/signals/…) register themselves per handle; these are the
+    // own-geometry producers that don't go through the GizmoManager.
+    registerOverlayProducer('highlights'); // hover/selection highlight — any model
+    if (this.drives.length > 0) registerOverlayProducer('gizmos'); // drive-axis gizmo
+    if ((this.transportManager?.sources.length ?? 0) > 0) registerOverlayProducer('markers'); // source markers
     this.emit('model-loaded', { result });
+    this._publishSignatureUiState();
+    this.emit('signature-state-changed', {
+      signatureState: this._signatureState,
+      logicRunState: this.logicRunState,
+    });
+    if (this.logicRunState === 'active') {
+      this.emit('model-logic-activated', { result });
+    }
     // Wait for any deferred async loading work registered by subsystems
     // and plugins (env-map IBL, deferred asset prefetch, …) so the caller's
     // `await viewer.loadModel(...)` only resolves once the scene is fully
@@ -2663,13 +3601,71 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     return result;
   }
 
+  /**
+   * Start the asynchronous BVH build for a freshly loaded model (plan-240).
+   * Fire-and-forget: never throws into the load path. The build
+   *   1. waits two animation frames so the renderer uploads the fresh vertex
+   *      buffers BEFORE the worker path transfers (temporarily detaches) them,
+   *   2. builds the merged raycast geometries (indirect mode) first, then the
+   *      per-mesh BVHs — all sequentially through ONE reused port/worker,
+   *   3. aborts silently when the load generation moves on (new load / clear),
+   *   4. emits 'raycast-ready' + flags a re-render on completion.
+   */
+  private _startAsyncBvhBuild(result: LoadResult): void {
+    const generation = this._loadGeneration;
+    const root = result.root;
+    const indirectGeometries = result.raycastGeometrySet
+      ? collectPendingBVHGeometries(result.raycastGeometrySet)
+      : [];
+    // Merged pick geometries without a BVH raycast via the native O(triangles)
+    // fallback until the async build lands — surface that window in DevTools.
+    // Editor instance-pick loads have NO merged geometries; there the pending
+    // count is the per-mesh builds the backend's narrow phase waits for
+    // (upper bound — shared geometries dedup inside computeBVHAsync).
+    this._pickMetrics.setBvhPending(
+      this._instancePickIndex ? this._instancePickIndex.size : indirectGeometries.length,
+    );
+
+    void (async () => {
+      try {
+        // Two rAFs ≈ one rendered frame with the new model — visible meshes
+        // have their attribute buffers on the GPU before any worker transfer.
+        if (typeof requestAnimationFrame !== 'undefined') {
+          await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+        }
+        if (this._loadGeneration !== generation) return;
+
+        this._bvhPort ??= createBVHPort();
+        const completed = await computeBVHAsync(root, this._bvhPort, {
+          shouldAbort: () => this._loadGeneration !== generation,
+          indirectGeometries,
+        });
+        if (!completed || this._loadGeneration !== generation) return;
+
+        this._pickMetrics.setBvhPending(0);
+        this._renderDirty = true;
+        this.emit('raycast-ready', undefined);
+      } catch (e) {
+        console.warn('[viewer] async BVH build failed:', e);
+      }
+    })();
+  }
+
   /** Remove the current model and reset all simulation state. */
   clearModel(): void {
-    // Plugin lifecycle: onModelCleared (before state reset, skip disabled)
-    for (const p of this._plugins) {
-      if (this._disabledIds.has(p.id)) continue;
-      callPlugin(p, 'onModelCleared', this);
-    }
+    // Load-generation guard (plan-240 F9) — abort any BVH build still running
+    // against the model being torn down (its geometries get disposed below).
+    this._loadGeneration++;
+    this.logicRunState = 'active';
+    this._signatureState = 'none';
+    this._signatureModelName = '';
+    this._signatureSignerOrganization = undefined;
+    this._deferredLogic.length = 0;
+    resetSignatureUiState();
+
+    // Plugin lifecycle: clear exactly the plugins that received this model,
+    // including plugins disabled since their onModelLoaded delivery.
+    this._notifyPluginsModelCleared();
 
     // Close context menu to prevent stale target references
     this.contextMenu.close();
@@ -2683,6 +3679,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     if (this.modes.activeMode) keepCtxs.push(modeContext(this.modes.activeMode));
     resetDynamicContexts(keepCtxs);
 
+    // Batched render path: dispose the arenas (frees arena geometry +
+    // matrices/indirect textures) BEFORE the scene traverse below — the
+    // batches are children of the model root but their geometry is not
+    // per-child, so the generic traverse-dispose would miss the textures.
+    this._lastLoadResult?.batchTable?.dispose();
+    this._batchVisibility = null;
+
     this._lastLoadResult = null;
     this._missedModelLoad.clear();
 
@@ -2690,8 +3693,19 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.selectionManager.dispose();
 
     if (this.raycastManager) {
+      this.energyChainManager.setRaycastHost(null);
       this.raycastManager.dispose();
       this.raycastManager = null;
+    }
+    this._instancePickIndex?.clear();
+    this._instancePickIndex = null;
+
+    // §4.2 proxy provider dies with its RaycastGeometrySet — the shared
+    // position/index VBOs are freed by the model-root geometry disposal below.
+    if (this._highlightProxyProvider) {
+      this.highlighter.setProxyProvider(null);
+      this._highlightProxyProvider.dispose();
+      this._highlightProxyProvider = null;
     }
 
     // Drop the source-markers subscription before nulling out the transport
@@ -2710,8 +3724,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this.transportManager = null;
     }
     this.statisticsManager.clear(); // Plan 201: drop all component stats registrations
-    // Plan 194 P1: drop the unified kernel with the model it was built against
-    // (no-op when the flag is OFF — _kernel is already null).
+    // Plan 194 P1: drop the unified kernel with the model it was built against.
     this._kernel = null;
 
     // Collect every model root currently parented to the scene. Normally this
@@ -2731,6 +3744,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // load re-converts via the `model-loaded` subscription.
     if (this._toon.isActive) this._toon.onModelClearing(modelRootsToClear);
 
+    // plan-394 F12: drop the collision registry, highlight, signals and any
+    // published cards BEFORE the geometry teardown.
+    this.collisionManager.clear();
+    // Restore Lamp-owned material clones before the generic material teardown.
+    this.lampManager.clear();
+    // Same for EnergyChain rigs: dispose restores the original meshes and drops
+    // the skinned sidecars BEFORE their shared geometry/materials are freed.
+    this.energyChainManager.clear();
+
     // After material deduplication, multiple meshes share the same material
     // instance. Use a Set to avoid disposing the same material/texture twice
     // across all roots being torn down in this pass.
@@ -2739,10 +3761,16 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this.scene.remove(root);
       root.traverse((node) => {
         const mesh = node as {
-          geometry?: { dispose(): void };
+          geometry?: { dispose(): void; disposeBoundsTree?: () => void };
           material?: (MeshStandardMaterial & { dispose(): void }) | (MeshStandardMaterial & { dispose(): void })[];
         };
-        if (mesh.geometry) mesh.geometry.dispose();
+        if (mesh.geometry) {
+          // Free the three-mesh-bvh tree explicitly — geometry.dispose() only
+          // releases GPU buffers, the CPU-side BVH would otherwise linger as
+          // long as anything still references the geometry object.
+          mesh.geometry.disposeBoundsTree?.();
+          mesh.geometry.dispose();
+        }
         if (mesh.material) {
           const disposeMat = (m: MeshStandardMaterial & { dispose(): void }) => {
             if (disposedMaterials.has(m)) return;
@@ -2791,8 +3819,23 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this.componentEventDispatcher.dispose();
       this.componentEventDispatcher = null;
     }
+    // Tear down Planner Signal Linking bindings before the store/registry go.
+    if (this.signalBindingManager) {
+      this.signalBindingManager.dispose();
+      this.signalBindingManager = null;
+    }
+    // Slot-authority service reset (plan-320 Phase 2) — UNCONDITIONAL and
+    // independent of the plannerSignalLinking/logicRunState gating above: the
+    // viewer is the state owner and every model switch (clearModel runs at the
+    // head of loadModel too) must drop claims, slot↔channel indexes, the
+    // live-control gate and raised liveControlled instance flags. Do NOT move
+    // this behind a feature flag (review finding: the template registries'
+    // resets were never called from src/ at all).
+    resetSlotAuthority();
     this.signalStore = null;
     this.registry = null;
+    // Clear any active selection isolate before tearing down the group registry.
+    this.exitIsolate();
     if (this.groups) {
       this.groups.clear();
       this.groups = null;
@@ -2804,7 +3847,17 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Reset dirty flags for next model load
     this._shadowsDirty = true;
     this._renderDirty = true;
+    // Overlay-visibility (plan-250): zero all producer refcounts before the
+    // next model's producers register. Safety net so a producer that misses
+    // its unregister cannot leave a "ghost" category in the Display panel.
+    resetOverlayProducers();
     this.emit('model-cleared');
+  }
+
+  /** Root Object3D of the currently loaded model (null if none). The asset
+   *  editor treats this as the asset root it authors into. */
+  get currentModelRoot(): Object3D | null {
+    return this.currentModel;
   }
 
   /** URL of the currently loaded model (null if no model loaded). */
@@ -2815,6 +3868,30 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   /** Override the stored model URL (e.g. to replace blob: URL with original for display). */
   set currentModelUrl(url: string | null) {
     this._currentModelUrl = url;
+  }
+
+  // ─── Unified CAD import facade (plan-238) ─────────────────────────────
+
+  /**
+   * The global import provider registry (GLB file, STEP, Asset Manager,
+   * Onshape …). Providers register themselves from core or `@rv-private`.
+   */
+  get importProviders(): ImportProviderRegistry {
+    return importProviderRegistry;
+  }
+
+  /**
+   * ADDITIVE import sink (plan-238 §2.2): place resolved import items into
+   * the CURRENT scene via the layout planner (op log, undo/redo, autosave).
+   * Never calls `loadModel`/`clearModel`. There is no replace sink — editor mode
+   * imports into its asset document, and "open a GLB as the scene" is the model
+   * picker's job.
+   */
+  importObject(
+    items: ImportResultItem | ImportResultItem[],
+    options?: ImportObjectOptions,
+  ): Promise<ImportObjectOutcome> {
+    return importObjectSink(this, items, options);
   }
 
   // ─── Scene loading (unified RvScene) ──────────────────────────────────
@@ -2934,6 +4011,17 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this.rebuildIKPaths();
     }
 
+    // Phase 4d — persisted node transforms (dragged IK waypoints on base-GLB
+    // nodes; op-created nodes already carry theirs in the spec). Frozen-safe:
+    // applyLocalPose rebuilds the local TRS from the baked matrices first.
+    if (materialised.nodeTransforms.length > 0) {
+      const { applyLocalPose } = await import('./engine/rv-node-transform');
+      for (const t of materialised.nodeTransforms) {
+        const node = this.registry?.getNode(t.nodePath);
+        if (node) applyLocalPose(node, t.position, t.quaternion);
+      }
+    }
+
     // Phase 5 — drain again. loadModel already awaited whenLoadingIdle, but
     // applyPlacements above and any onModelLoaded handlers may have queued
     // additional cascading work after that point. Cheap when the queue is
@@ -3009,10 +4097,26 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       callPlugin(p, 'dispose');
     }
     this.loop.stop();
+    // Tear down any active non-Three render backend (closes the WebRTC
+    // PeerConnection / streaming instance) before the rest of teardown.
+    this._renderBackends.dispose();
     this.clearModel();
+    // Final overlay-visibility teardown (plan-250): drop the GizmoManager's
+    // store subscription (per-model dispose deliberately keeps it alive).
+    this.gizmoManager.destroy();
+    this.collisionManager.dispose();
+    // BVH build port lives across model loads (one reused worker) — only the
+    // final viewer teardown terminates it.
+    this._bvhPort?.dispose();
+    this._bvhPort = null;
+    // Drop any queued preview jobs and free the offscreen render target.
+    this._thumbnails?.dispose();
+    this._thumbnails = null;
     // Free toon gradient / gbuffer RT / normal + Sobel materials. clearModel
     // (above) has already restored originals onto any meshes.
     this._toon.dispose();
+    // Composer RTs + TSL post pipeline / desat blit (plan-271 Phase 3).
+    this._postProcessing.dispose();
     if (this.resizeHandler) {
       window.removeEventListener('resize', this.resizeHandler);
     }
@@ -3090,10 +4194,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     box.getSize(size);
 
     const maxDim = Math.max(size.x, size.y, size.z, 0.1);
-    const fov = this.perspCamera.fov * (Math.PI / 180);
     const effectiveOffset = offset ?? this.getCurrentViewportOffset();
     // Pull back symmetrically to clear panels — never shift the orbit pivot.
-    const dist = (maxDim / (2 * Math.tan(fov / 2))) * 2.5 * this._panelFitScale(effectiveOffset);
+    const dist = this._cameraManager.fitDistance(maxDim, 2.5 * this._panelFitScale(effectiveOffset));
 
     // Keep current viewing direction — just move along it to frame the target.
     // The orbit target is the true bounding-box center, so rotation always
@@ -3104,8 +4207,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   }
 
   /** Smoothly animate camera to frame all given nodes.
-   *  @param offset  Optional pixel offsets for panels obscuring the viewport (shifts orbit target). */
-  fitToNodes(nodes: Object3D[], offset?: ViewportOffset): void {
+   *  @param offset  Optional pixel offsets for panels obscuring the viewport (shifts orbit target).
+   *  @param opts    `minDistance` (scene units) floors the computed fit distance —
+   *                 use it when framing potentially tiny objects so the camera
+   *                 does not dive into the geometry (editor auto-assign focus). */
+  fitToNodes(nodes: Object3D[], offset?: ViewportOffset, opts?: { minDistance?: number; easing?: import('./rv-camera-manager').CameraEasing; duration?: number }): void {
     if (nodes.length === 0) return;
     const box = this._cameraManager.computeNodeBounds(nodes);
     if (box.isEmpty()) return;
@@ -3121,22 +4227,59 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // symmetrically to clear any panels. The orbit pivot stays on the true
     // bounding-box center so rotation always pivots around the selection center.
     const maxDim = Math.max(size.x, size.y, size.z, 0.1);
-    const fovRad = this.perspCamera.fov * (Math.PI / 180);
-    const halfTanFov = Math.tan(fovRad / 2);
     // Breathing room on top of the exact fit. Panels are cleared separately by
     // `_panelFitScale`, so this is purely framing padding — keep it modest so
     // "frame selected" (F / double-click) lands close, not far away.
     const margin = 1.25;
-    const aspect = this.perspCamera.aspect;
-
-    // Distance to fit vertically (full height) and horizontally (full width).
-    const distV = maxDim / (2 * halfTanFov);
-    const distH = maxDim / (2 * halfTanFov * aspect);
-    const dist = Math.max(distV, distH) * margin * this._panelFitScale(effectiveOffset);
+    // Fit vertically AND horizontally (aspect-corrected) — canonical math in
+    // the CameraManager.
+    const fitDist = this._cameraManager.fitDistanceBothAxes(maxDim, margin * this._panelFitScale(effectiveOffset));
+    const dist = Math.max(fitDist, opts?.minDistance ?? 0);
 
     const dir = new Vector3().subVectors(this.camera.position, this.controls.target).normalize();
     const endPos = center.clone().add(dir.multiplyScalar(dist));
-    this.animateCameraTo(endPos, center);
+    this.animateCameraTo(endPos, center, opts?.duration ?? 0.6, opts?.easing ?? 'easeOut');
+  }
+
+  /** True while a selection-driven isolate (context menu) is active. */
+  get isSelectionIsolateActive(): boolean {
+    return this._selectionIsolateActive;
+  }
+
+  /**
+   * Isolate the given roots (and their whole subtree): only these stay bright,
+   * everything else is dimmed and non-interactive. Uses the shared external
+   * isolate channel of the GroupRegistry, so the renderer's 3-pass isolate
+   * composition and the raycast isolation gate apply automatically. Frozen —
+   * exit explicitly via {@link exitIsolate}. Children are covered implicitly
+   * because the isolate tags entire subtrees.
+   */
+  isolateNodes(nodes: Object3D[]): void {
+    if (!this.groups || nodes.length === 0) return;
+    // Take over any prior isolate cleanly (docs browser, group/type isolate, or
+    // a previous selection isolate) before installing the new roots.
+    this.exitIsolate();
+    this._selectionIsolatePriorVis = [];
+    for (const n of nodes) {
+      this._selectionIsolatePriorVis.push({ node: n, visible: n.visible });
+      n.visible = true; // force-visible so a hidden root can still be isolated
+    }
+    this.groups.setExternalIsolated(nodes);
+    this._selectionIsolateActive = true;
+    this.fitToNodes(nodes);
+    this.markShadowsDirty();
+    this.markRenderDirty();
+  }
+
+  /** Exit a selection-driven isolate and restore the roots' prior visibility. */
+  exitIsolate(): void {
+    if (!this._selectionIsolateActive) return;
+    this.groups?.setExternalIsolated(null);
+    for (const { node, visible } of this._selectionIsolatePriorVis) node.visible = visible;
+    this._selectionIsolatePriorVis = [];
+    this._selectionIsolateActive = false;
+    // markShadowsDirty: restored `.visible` must re-sync batch instances.
+    this.markShadowsDirty();
   }
 
   /**
@@ -3159,8 +4302,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     box.getSize(size);
 
     const maxDim = Math.max(size.x, size.y, size.z, 0.1);
-    const fov = this.perspCamera.fov * (Math.PI / 180);
-    const dist = (maxDim / (2 * Math.tan(fov / 2))) * 1.5;
+    const dist = this._cameraManager.fitDistance(maxDim, 1.5);
 
     if (animate) {
       const dir = new Vector3().subVectors(this.camera.position, this.controls.target).normalize();
@@ -3172,6 +4314,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Same iso angle as loadModel's initial fit so the framing feels identical.
     this.camera.position.set(center.x + dist * 0.7, center.y + dist * 0.5, center.z + dist * 0.7);
     this.controls.target.copy(center);
+    // Instant set: keep the ortho view scale in step with the new distance.
+    this._cameraManager.syncOrthoFrustum();
     this.controls.update();
     this.markRenderDirty();
   }
@@ -3187,6 +4331,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.scene.traverse((obj) => {
       const m = obj as Mesh;
       if (!m.isMesh || !m.geometry || !m.visible) return;
+      // BatchedMesh arenas: their geometry bbox ignores instance matrices —
+      // the (still-visible, layer-masked) source meshes provide the correct
+      // per-node bounds instead.
+      if ((m as unknown as { isBatchedMesh?: boolean }).isBatchedMesh) return;
       const ud = m.userData;
       if (ud?._rvGroundPlane || ud?._rvGroundReflector || ud?._layoutFloor) return;
       m.updateWorldMatrix(true, false);
@@ -3218,23 +4366,157 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   }
 
   /**
-   * Coalesce multiple synchronous BVH-rebuild requests into a single
-   * microtask-deferred pass. Used by the planner after placement add/remove
-   * (and after batch operations like applyPlacements).
+   * Coalesce multiple BVH-rebuild requests into a single deferred pass. Used
+   * by the planner after placement add/remove (and after batch operations
+   * like applyPlacements) and by the asset editor for structural ops.
+   *
+   * Coalescing is a MACROTASK (setTimeout 0), not a microtask: an editor
+   * transaction awaits each op sequentially, and a microtask fires BETWEEN
+   * those awaits — a multi-select commit used to pay one full rebuild PER op.
+   * All ops of one transaction resolve within the same macrotask turn, so a
+   * timeout collapses them into exactly one rebuild.
    */
   private _bvhRebuildPending = false;
+  /** Node paths with pending transform-refit (superseded by a full rebuild). */
+  private readonly _bvhRefitPaths = new Set<string>();
+  private _bvhRefitPending = false;
+
   rebuildGroupedBvh(): void {
+    // Editor instance-pick backend active: merged groups don't exist and must
+    // NOT be resurrected (duplicate pick targets). Membership is maintained
+    // incrementally by the asset-op executors instead.
+    if (this._instancePickIndex) return;
     if (this._bvhRebuildPending) return;
     if (!this.currentModel || !this.registry || !this.raycastManager) return;
     this._bvhRebuildPending = true;
-    queueMicrotask(() => {
+    setTimeout(() => {
       this._bvhRebuildPending = false;
+      // The full rebuild re-bakes every position — pending refits are covered.
+      this._bvhRefitPaths.clear();
       if (!this.currentModel || !this.registry || !this.raycastManager) return;
       const driveNodeSet = new Set(this.drives.map(d => d.node));
+      // Intentionally synchronous (no deferBVH): planner increments are small
+      // compared to a full model load, and a sync rebuild keeps the placed
+      // object immediately pickable (plan-240 defers only the load pipeline).
       const geo = buildRaycastGeometries(this.currentModel, this.drives, this.registry, driveNodeSet);
       const muMeshes = this._collectInstancedMeshes();
+      // Retire the superseded set before the new one goes in — otherwise every
+      // rebuild leaves its `__raycastBVH_*` meshes behind in the graph.
+      this._retireRaycastGeometry();
       this.raycastManager.setRaycastGeometry(geo, muMeshes);
+      this._installHighlightProxyProvider(geo);
+    }, 0);
+  }
+
+  /**
+   * Detach + dispose the `RaycastGeometrySet` currently installed on the
+   * RaycastManager, so a rebuild replaces its predecessor instead of stacking
+   * on top of it.
+   *
+   * `buildRaycastGeometries()` parents a FRESH `__raycastBVH_static` mesh under
+   * the model root on every call (and one per Drive under its drive node), and
+   * neither `setRaycastGeometry()` nor this rebuild path used to remove the
+   * previous one: each cycle left an invisible corpse in the scene graph — 6 of
+   * them measured after a PLMXML kinematics import, and the planner rebuilds
+   * from three more call sites (plan-359 §2.2). Nothing ever mis-picked (the
+   * corpses carry `_rvRaycastBVH`, so they are excluded from both re-merging and
+   * the manager's target list), but the graph grew without bound and any
+   * consumer that raycasts `scene.children` itself hits them.
+   *
+   * ORDER IS LOAD-BEARING (doc-render-picking.md §4.2): the highlight proxies
+   * share the merged geometry's position/index attributes zero-copy and
+   * `WebGLGeometries` does not refcount, so the provider must drop its
+   * references BEFORE the geometry is disposed.
+   */
+  private _retireRaycastGeometry(): void {
+    const previous = this.raycastManager?.raycastGeometry ?? null;
+    if (!previous) return;
+    if (this._highlightProxyProvider) {
+      this.highlighter.setProxyProvider(null);
+      this._highlightProxyProvider.dispose();
+      this._highlightProxyProvider = null;
+    }
+    disposeRaycastGeometries(previous);
+  }
+
+  /**
+   * Build local-space BVHs for freshly added editor meshes (CAD import into
+   * the instance pick backend) — async through the shared worker port,
+   * deduped by shared geometry, load-generation guarded. Until a tree lands,
+   * the backend's narrow phase uses the native three.js fallback.
+   *
+   * `isAlive` is the PER-SUBTREE half of the abort condition, and it is not
+   * optional bookkeeping: `_loadGeneration` only changes on a model load, so an
+   * editor undo or a trash flush — which can dispose the very geometries this
+   * build is about to write into — would otherwise go unnoticed and
+   * `computeBVHAsync` would assign a `boundsTree` to a disposed geometry. The
+   * predicate is re-checked before every assignment. Callers that hand out
+   * geometry they do not own (e.g. a CAD import) can omit it.
+   */
+  buildMeshBvhsAsync(root: Object3D, isAlive?: () => boolean): void {
+    const generation = this._loadGeneration;
+    this._bvhPort ??= createBVHPort();
+    void computeBVHAsync(root, this._bvhPort, {
+      shouldAbort: () => this._loadGeneration !== generation || isAlive?.() === false,
+    }).then((completed) => {
+      if (completed && this._loadGeneration === generation) this.markRenderDirty();
+    }).catch((e) => {
+      console.warn('[viewer] async BVH build for imported subtree failed:', e);
     });
+  }
+
+  /**
+   * Transform fast path: coalesce position re-bakes + BVH refits for moved
+   * subtrees (editor `transformNode` ops) instead of a full grouped-BVH
+   * rebuild — a full rebuild re-merges every mesh and rebuilds the highlight
+   * edge arena (~400 ms on a mid-size CAD asset); the refit rewrites only the
+   * moved vertex windows in place. Falls back to `rebuildGroupedBvh()` when a
+   * group cannot be refit.
+   */
+  refitRaycastSubtrees(nodePaths: readonly string[]): void {
+    if (!this.currentModel || !this.registry || !this.raycastManager) return;
+    for (const p of nodePaths) this._bvhRefitPaths.add(p);
+    if (this._bvhRefitPending) return;
+    this._bvhRefitPending = true;
+    setTimeout(() => {
+      this._bvhRefitPending = false;
+      // A pending full rebuild supersedes the refit (it clears the path set
+      // itself when it runs first; guard for scheduling order anyway).
+      if (this._bvhRebuildPending) { this._bvhRefitPaths.clear(); return; }
+      const paths = [...this._bvhRefitPaths];
+      this._bvhRefitPaths.clear();
+      if (paths.length === 0) return;
+      // Model cleared between scheduling and firing → nothing to refit.
+      if (!this.currentModel) return;
+      const set = this.raycastManager?.raycastGeometry;
+      if (!set || !this.registry) return;
+      const nodes: Object3D[] = [];
+      for (const p of paths) {
+        const n = this.registry.getNode(p);
+        if (n) nodes.push(n);
+      }
+      if (nodes.length === 0) return;
+      const ok = refitRaycastGroupsForSubtrees(set, nodes);
+      if (!ok) this.rebuildGroupedBvh();
+    }, 0);
+  }
+
+  /**
+   * Install (or replace) the §4.2 proxy overlay provider for a freshly built
+   * RaycastGeometrySet. The provider serves zero-copy drawRange highlight
+   * proxies over the merged pick geometry; until its edge arenas finish
+   * building (chunked, idle-time) the highlighter transparently keeps using
+   * the legacy overlay path. The previous provider (if any) is disposed —
+   * its proxies referenced the superseded geometry set.
+   */
+  private _installHighlightProxyProvider(set: RaycastGeometrySet): void {
+    this._highlightProxyProvider?.dispose();
+    this._highlightProxyProvider = null;
+    if (!this.registry) return;
+    const provider = new ProxyOverlayProvider(this.registry, set);
+    this._highlightProxyProvider = provider;
+    this.highlighter.setProxyProvider(provider);
+    provider.startEdgeArenaBuild();
   }
 
   /**
@@ -3282,7 +4564,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   private _fitShadowToView(): void {
     if (!this.dirLight.parent || !this.renderer.shadowMap.enabled) return;
 
-    const hasStaticUberCaster = (this._lastLoadResult?.uberMergeResult?.mergedCount ?? 0) > 0;
+    const hasStaticUberCaster = (this._lastLoadResult?.uberBatchResult?.instanceCount ?? 0) > 0;
     if (hasStaticUberCaster) {
       // Full-scene mode: shadow camera was set up once in loadModel and
       // never needs to move. Don't touch `dirLight.target` here — doing so
@@ -3326,17 +4608,6 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
     // Force shadow map re-render
     (this.renderer.shadowMap as unknown as { needsUpdate: boolean }).needsUpdate = true;
-  }
-
-  private syncOrthoFrustum(): void {
-    const dist = this.orthoCamera.position.distanceTo(this.controls.target);
-    const halfH = dist * Math.tan((this.perspCamera.fov * Math.PI / 180) / 2);
-    const aspect = this.perspCamera.aspect;
-    this.orthoCamera.left = -halfH * aspect;
-    this.orthoCamera.right = halfH * aspect;
-    this.orthoCamera.top = halfH;
-    this.orthoCamera.bottom = -halfH;
-    this.orthoCamera.updateProjectionMatrix();
   }
 
   // ─── Visual Settings (pure-delegation proxies) ─────────────────────────
@@ -3642,6 +4913,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     if (this.controls) {
       applyNavigationSettingsToControls(this.controls, settings);
     }
+
+    // 12. Drive axis gizmo overlay (plan-249)
+    this.showDriveAxisGizmo = settings.showDriveAxisGizmo ?? true;
   }
 
   // ─── Individual Rendering Settings (pure-delegation proxies) ───────────
@@ -3743,6 +5017,17 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     return this._gpuInfo ? analyzeGPU(this._gpuInfo) : null;
   }
 
+  /** Pick-path timing snapshot (raycast split, hit resolve, highlight apply).
+   *  Polled by the DevTools "Picking & Highlight" section. */
+  getPickMetrics(): PickMetricsSnapshot {
+    return this._pickMetrics.snapshot();
+  }
+
+  /** Load-time metadata/interaction stats of the current model (or null). */
+  getMetadataLoadStats(): { metadataNodes: number; aabbCount: number; aabbBuildMs: number; hoverableFaceRanges: number } | null {
+    return this._lastLoadResult?.metadataStats ?? null;
+  }
+
   /** Get renderer performance info (triangles, draw calls, etc.). */
   getRendererInfo(): {
     triangles: number;
@@ -3762,22 +5047,38 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     uberClonedGeometryCount: number;
     /** Orphaned source BufferGeometries that Pass 3 disposed (plan-153) */
     uberDisposedSourceGeometries: number;
-    /** Number of uber-baked static meshes that fed into the uber static merge */
+    /** Static uber meshes turned into batch instances (Phase 10c) */
     uberMergeOriginal: number;
-    /** Number of merged meshes created by the uber static batching pass (0 or 1) */
+    /** BatchedMesh arenas created by the uber batching pass (0 or 1) */
     uberMergeCreated: number;
-    /** Kinematic Drive groups that were merged */
+    /** Drive blobs that produced at least one kinematic arena */
     kinGroupsMerged: number;
-    /** Total source meshes collapsed by kinematic merge */
+    /** Meshes turned into kinematic batch instances */
     kinSourceMeshes: number;
-    /** Merged chunks created by kinematic merge */
+    /** Kinematic BatchedMesh arenas created (uber + textured, per drive) */
     kinChunksCreated: number;
+    /** Textured static meshes turned into batch instances (Phase 10d-tex) */
+    texMergeOriginal: number;
+    /** BatchedMesh arenas created by the textured batching pass */
+    texMergeCreated: number;
+    /** Distinct material groups that batched (>= 2 meshes) */
+    texMaterialGroups: number;
+    /** Total BatchedMesh arenas (uber + textured) */
+    batchCount: number;
+    /** Total batch instances across all arenas */
+    batchInstances: number;
+    /** Unique geometries stored in the arenas (instancing dedup) */
+    batchUniqueGeometries: number;
+    /** Total arena vertex capacity */
+    batchArenaVertices: number;
   } {
     const info = this.renderer.info;
     const dedup = this._lastLoadResult?.dedupResult;
     const uber = this._lastLoadResult?.uberResult;
-    const uberMerge = this._lastLoadResult?.uberMergeResult;
-    const kinMerge = this._lastLoadResult?.kinematicMergeResult;
+    const uberBatch = this._lastLoadResult?.uberBatchResult;
+    const texBatch = this._lastLoadResult?.texBatchResult;
+    const kinBatch = this._lastLoadResult?.kinBatchResult;
+    const batchStats = this._lastLoadResult?.batchTable?.stats();
     return {
       // triangles / drawCalls come from the snapshot taken right after
       // renderer.render() — see _lastFrameStats. Reading info.render
@@ -3794,11 +5095,18 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       uberSharedGeometryReuses: uber?.sharedGeometryReuses ?? 0,
       uberClonedGeometryCount: uber?.clonedGeometryCount ?? 0,
       uberDisposedSourceGeometries: uber?.disposedSourceGeometries ?? 0,
-      uberMergeOriginal: uberMerge?.originalCount ?? 0,
-      uberMergeCreated: uberMerge?.mergedCount ?? 0,
-      kinGroupsMerged: kinMerge?.groupsMerged ?? 0,
-      kinSourceMeshes: kinMerge?.sourceMeshCount ?? 0,
-      kinChunksCreated: kinMerge?.chunksCreated ?? 0,
+      uberMergeOriginal: uberBatch?.instanceCount ?? 0,
+      uberMergeCreated: uberBatch?.batchCount ?? 0,
+      kinGroupsMerged: kinBatch?.driveGroups ?? 0,
+      kinSourceMeshes: kinBatch?.instanceCount ?? 0,
+      kinChunksCreated: kinBatch?.batchCount ?? 0,
+      texMergeOriginal: texBatch?.instanceCount ?? 0,
+      texMergeCreated: texBatch?.batchCount ?? 0,
+      texMaterialGroups: texBatch?.batchCount ?? 0,
+      batchCount: batchStats?.batches ?? 0,
+      batchInstances: batchStats?.instances ?? 0,
+      batchUniqueGeometries: batchStats?.uniqueGeometries ?? 0,
+      batchArenaVertices: batchStats?.arenaVertices ?? 0,
     };
   }
 
@@ -3844,9 +5152,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    * @param position  Target camera position.
    * @param target    Target orbit center.
    * @param duration  Animation duration in seconds (default 0.6).
+   * @param easing    'easeOut' (default, snappy click response) or 'easeInOut'
+   *                  (smooth start AND stop — scripted/agent flights).
    */
-  animateCameraTo(position: Vector3, target: Vector3, duration = 0.6): void {
-    this._cameraManager.animateCameraTo(position, target, duration);
+  animateCameraTo(position: Vector3, target: Vector3, duration = 0.6, easing: import('./rv-camera-manager').CameraEasing = 'easeOut'): void {
+    this._cameraManager.animateCameraTo(position, target, duration, easing);
   }
 
   /** Whether a camera animation is currently in progress. */
@@ -3945,6 +5255,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   private lastRenderTime = 0;
   /** Shadow map dirty flag — when false, shadow pass is skipped entirely. */
   private _shadowsDirty = true;
+  /** BatchedMesh per-instance visibility sync (batched render path). */
+  private _batchVisibility: BatchVisibilityService | null = null;
+  /** Animation-frame counter for the periodic batch-visibility safety resync. */
+  private _batchVisSafetyCounter = 0;
   /** Max shadow padding from model load (scene-wide coverage). */
   private _shadowPadMax = 100;
   /** Render dirty flag — when false, renderer.render() is skipped (Phase 4: render-on-demand). */
@@ -3959,8 +5273,6 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   private _lastFrameStats = { drawCalls: 0, triangles: 0 };
   /** Frames remaining for damping after last user input (Phase 4). */
   private _dampingFramesRemaining = 0;
-  /** Previous MU count — used to detect spawn/despawn for shadow dirty flag. */
-  private _prevMuCount = 0;
   /** Reference to the ground plane mesh (if created). */
   private _groundMesh: Mesh | null = null;
   /** Canvas backing the checker CanvasTexture — re-drawn when checkerContrast changes. */
@@ -3986,35 +5298,28 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   // Isolate-overlay and desaturation pass state now live in PostProcessingManager.
 
   private fixedUpdate(dt: number): void {
+    // Signature provenance gate: do not advance simulation time or dispatch
+    // ANY model logic stage until late activation has completed.
+    if (this.logicRunState !== 'active') return;
     this.simTickCount++;
     // Plan 201 (E2): advance the continuous sim clock. In unified DES mode the
     // `simTime` getter overrides this with the executor's event time, so the
     // accumulation is harmless there.
     this._simTime += dt;
-    const isConnected = this._connectionState === 'Connected';
 
-    // Recording playback — guarded by DrivesRecorder.Active
-    if (this.playback && this.playback.isPlaying && isActiveForState(this.playback.activeOnly, isConnected)) {
-      this.playback.update(dt);
-    }
+    // Phase B (runtime unification): the kernel-backed executor owns the core
+    // subsystem pipeline once a model is loaded. Before that (`kernel` null)
+    // the viewer drives the CoreSubsystems stages directly — same order, no
+    // transport (there is none yet).
+    const kernel = this._getKernel();
 
-    // LogicStep engine — guarded by Active
-    if (this.logicEngine && isActiveForState(this.logicEngine.activeOnly, isConnected)) {
-      this.logicEngine.fixedUpdate(dt);
-    }
-
-    // Robot IK path replay engine — runs after LogicStep (so LogicStep-started
-    // paths advance the same frame) and BEFORE the drive loop (so target/overwrite
-    // writes apply this frame).
-    for (const ik of this.ikPaths) {
-      ik.fixedUpdate(dt);
-    }
-
-    // ReplayRecording signal-triggered sequences — each has its own Active
-    for (const rr of this.replayRecordings) {
-      if (isActiveForState(rr.activeOnly, isConnected)) {
-        rr.fixedUpdate(dt);
-      }
+    // ── Early (pre-PRE): playback → LogicSteps → IK paths → replay ────────
+    // Runs BEFORE interfaces flush incoming PLC signals (TickStage.PRE), so
+    // these subsystems see last tick's signals — the historical order.
+    if (kernel) {
+      kernel.earlyTick(dt);
+    } else {
+      this._coreSubsystems.early(dt);
     }
 
     // ── TickStage.PRE ──────────────────────────────────────────────────────
@@ -4027,81 +5332,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._runTickCallbacks(TickStage.PRE, dt);
 
     // ── TickStage.SIM (Core) ───────────────────────────────────────────────
-
-    // ── Core Drive Physics (behaviors + motion, drives[] may be topologically sorted) ──
-    for (const drive of this.drives) {
-      drive.update(dt);
-      if (drive.isRunning || drive.positionOverwrite) {
-        this._renderDirty = true;
-        // Conveyor drives (jogForward/jogBackward) don't move geometry — only belt speed
-        // changes. No shadow recompute needed for them.
-        if (!drive.jogForward && !drive.jogBackward) {
-          this._shadowsDirty = true;
-        }
-      }
-    }
-
-    // Mark shadows + render dirty when the MU count changes (spawn/despawn).
-    // Shadows for MUs that *move* (riding an active belt) are handled in the
-    // transport block below — conveyor drives are jogForward/jogBackward, so
-    // the drive loop above intentionally skips _shadowsDirty for them.
-    const muCount = this.transportManager ? this.transportManager.mus.length : 0;
-    if (muCount !== this._prevMuCount) {
-      this._shadowsDirty = true;
-      this._renderDirty = true;
-    }
-    this._prevMuCount = muCount;
-
-    // ── Core Transport (kinematic — skipped when physics plugin is active) ──
-    // Plan 194 P1: when the unified-sim flag is ON, route transport + the
-    // behaviour/material-flow fixedUpdate through the SimulationKernel's active
-    // executor (ContinuousRunner.tick = transport.update → behaviors.tick, exact
-    // R1 order). The legacy `behaviors.tick(dt)` further down is then skipped
-    // (kernel.lateTick fills that slot). When OFF (default) this whole branch is
-    // bypassed and the legacy split path below runs byte-for-byte unchanged.
-    const kernel = this._unifiedSim ? this._getKernel() : null;
+    // Executor tick: drive loop (+ dirty flags + MU diff) → transport →
+    // behaviour/material-flow fixedUpdate → visual managers (texture anims,
+    // tank, gizmo, pipe). The physics-plugin transport bypass is evaluated per
+    // tick inside the ContinuousRunner's gate (drives + visuals keep running).
     if (kernel) {
-      if (!this._physicsPluginActive) kernel.tick(dt);
-    } else if (this.transportManager && !this._physicsPluginActive) {
-      this.transportManager.update(dt);
-    }
-
-    // ── Texture animation (always runs, even when physics plugin handles transport) ──
-    if (this.transportManager) {
-      this.transportManager.updateTextureAnimations(dt);
-      // Mark render dirty when any surface is actively animating its belt texture.
-      for (const surface of this.transportManager.surfaces) {
-        if (surface.isActive) {
-          this._renderDirty = true;
-          // MUs riding an active belt move every frame. Conveyor drives are
-          // jogForward/jogBackward, so the drive loop above intentionally skips
-          // _shadowsDirty for them — meaning the shadow map would otherwise stay
-          // frozen at the MU's spawn position. Regenerate it each frame while a
-          // belt carries MUs so MU shadows track the parts dynamically.
-          if (muCount > 0) this._shadowsDirty = true;
-          break;
-        }
-      }
-      // Keep the renderer awake while an MU plays its end-of-line burn dissolve
-      // / spawn grow-out (the MU is parked, so nothing else would mark the frame
-      // dirty). The MU footprint changes during these effects, so refresh shadows too.
-      if (this.transportManager.hasVanishingMU) {
-        this._renderDirty = true;
-        this._shadowsDirty = true;
-      }
-    }
-
-    // ── Tank fill visualization (clip plane updates) ──
-    if (this.tankFillManager && this.tankFillManager.update()) {
-      this._renderDirty = true;
-    }
-
-    // ── Gizmo overlay blink loop (early-returns when no entries) ──
-    this.gizmoManager.tick(dt * 1000);
-
-    // ── Pipe flow visualization (animated rings) ──
-    if (this.pipeFlowManager && this.pipeFlowManager.update(dt)) {
-      this._renderDirty = true;
+      kernel.tick(dt);
+    } else {
+      this._coreSubsystems.drives(dt);
+      this._coreSubsystems.visuals(dt);
     }
 
     // 3. SimLoopFacade.onTick(SIM) callbacks — run AFTER all core SIM subsystems
@@ -4109,10 +5348,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     //    so plugins reading drive positions or MU counts see the current-tick values.
     this._runTickCallbacks(TickStage.SIM, dt);
 
-    // 3b. Behavior onFixedUpdate fan-out (auto-disposed on model-cleared).
-    // Plan 194 P1: when the kernel is active, the behaviour fixedUpdate already
-    // ran inside `kernel.tick(dt)` (transport → behaviours, exact R1 order)
-    // above; here we only run the kernel's late pass. OFF path is unchanged.
+    // 3b. Late pass: DES tween render / consumed-visual sweep (continuous:
+    // no-op). Pre-kernel (no model) the BehaviorManager fan-out keeps its
+    // historical post-SIM slot — with no model there are no binds, so this is
+    // a harmless no-op iteration.
     if (kernel) {
       kernel.lateTick(dt);
     } else {
@@ -4127,23 +5366,37 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // 5. SimLoopFacade.onTick(POST) callbacks — recorders, stats, adapter readback.
     this._runTickCallbacks(TickStage.POST, dt);
 
+    // 6. Render-backend drive bridge (plan-256) — additive, gated. Only when a
+    //    non-Three backend is active: mirror the source value to the Omniverse
+    //    prim. No effect on the Three path or the signal flush above.
+    this._pushRenderBackendDriveValue();
   }
 
   // ─── Defensive Plugin Iteration (Phase 5 of plan-182) ────────────────────
   //
   // Snapshots protect against iterator-invalidation: a plugin that removes
   // itself during fixedUpdate() (via disablePlugin/removePlugin) would otherwise
-  // mutate the array while we are iterating it. slice() returns a shallow copy
-  // so that plugins registered in the same tick are deferred to the next one.
+  // mutate the array while we are iterating it. The snapshot is cached and only
+  // rebuilt after a register/enable/disable/remove (which also invalidates it,
+  // so the running iteration keeps its old copy) — no per-tick allocation.
+  // Plugins registered mid-tick are still deferred to the next tick.
 
   /** @internal */
   _snapshotPrePlugins(): readonly RVViewerPlugin[] {
-    return this._prePlugins.slice();
+    if (!this._prePluginsSnapshot) this._prePluginsSnapshot = this._prePlugins.slice();
+    return this._prePluginsSnapshot;
   }
 
   /** @internal */
   _snapshotPostPlugins(): readonly RVViewerPlugin[] {
-    return this._postPlugins.slice();
+    if (!this._postPluginsSnapshot) this._postPluginsSnapshot = this._postPlugins.slice();
+    return this._postPluginsSnapshot;
+  }
+
+  /** Drop cached plugin snapshots after any pre/post list mutation. */
+  private _invalidatePluginSnapshots(): void {
+    this._prePluginsSnapshot = null;
+    this._postPluginsSnapshot = null;
   }
 
   // ─── _runTickCallbacks — per-stage SimLoopFacade tick (Phase 5 of plan-182) ─
@@ -4152,10 +5405,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    *  Each callback is wrapped in try/catch — one failing callback does not stop the others.
    *  @internal */
   private _runTickCallbacks(stage: TickStage, dt: number): void {
-    const list = this._simLoop._ticks.get(stage);
-    if (!list || list.length === 0) return;
-    // Defensive snapshot: a callback may register/unregister callbacks during execution.
-    const snapshot = list.slice();
+    // Defensive snapshot (cached in the facade, invalidated on (un)subscribe):
+    // a callback may register/unregister callbacks during execution.
+    const snapshot = this._simLoop._snapshotTicks(stage);
+    if (snapshot.length === 0) return;
     for (const entry of snapshot) {
       try {
         entry.callback(dt);
@@ -4210,7 +5463,32 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     }
   }
 
+  /**
+   * Render one full frame synchronously through the SAME path as the live
+   * render loop — isolate 3-pass composite, EffectComposer/TSL post, plugin
+   * onRender and the overlay pass all included.
+   *
+   * Used by the MCP screenshot capture (rv-frame-capture.ts): a raw
+   * `renderer.render(scene, camera)` bypasses the isolate composition and
+   * post-processing, so captures would not match what the user sees in the
+   * viewport (e.g. an active isolate showed no dimming in screenshots).
+   * The renderer has no preserveDrawingBuffer, so callers must read the
+   * drawing buffer in the same tick after this returns.
+   */
+  renderFrameForCapture(): void {
+    this._renderDirty = true;
+    this.render();
+  }
+
   private render(): void {
+    // Render-pause / non-Three backend (plan-256): skip ALL Three GPU work and
+    // the per-frame plugin `onRender` dispatch below. This is the render-loop
+    // side of the backend switch — `fixedUpdate` (drives, sensors, logic) and
+    // the WS signal-flush run in the SEPARATE `onFixedUpdate` loop callback and
+    // are unaffected, so live HMI values keep updating over the Omniverse
+    // stream. Also centrally neutralises the interactive 3D plugins.
+    if (!this._renderBackends.shouldRenderThree()) return;
+
     if (this.statsReady) this.stats.begin();
     const now = performance.now() / 1000;
     const frameDt = this.lastRenderTime > 0 ? Math.min(now - this.lastRenderTime, 0.1) : 0.016;
@@ -4243,9 +5521,38 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this._renderDirty = true;
     }
     if (this.controls.enabled) this.controls.update();
-    // Highlight tracked mode needs rendering when overlays move
-    if (this.highlighter.isActive || this.highlighter.isSelectionActive) this._renderDirty = true;
+    // Highlight tracked mode needs rendering when overlays move; a running
+    // ping/flash pulse animates opacities and needs per-frame renders too.
+    // Aux emphasis pairs are always tracked (planner ghost follows cursor).
+    if (
+      this.highlighter.isActive
+      || this.highlighter.isSelectionActive
+      || this.highlighter.isPingActive
+      || this.highlighter.isAuxActive
+      || this.highlighter.isFlashActive
+    ) this._renderDirty = true;
+    // A pulsing OutlinePass outline (severity pulse / instruction status
+    // outline) animates from the wall clock — it only advances when frames
+    // render, so keep rendering while one is active.
+    if (this.outlineManager.hasPulsingOutlines) this._renderDirty = true;
     this.highlighter.update();
+
+    // Batched render path: mirror node `.visible` into the arena instances
+    // BEFORE any pass renders. Cheap when clean; an actual flip forces a
+    // redraw + shadow rebuild. A periodic safety resync (every 60 animation
+    // frames) catches mutators that bypassed markShadowsDirty /
+    // 'node-visibility-changed' — setVisibleAt no-ops on unchanged values.
+    if (this._batchVisibility) {
+      const force = ++this._batchVisSafetyCounter >= 60;
+      if (force) this._batchVisSafetyCounter = 0;
+      const changed = force
+        ? this._batchVisibility.forceReconcile()
+        : this._batchVisibility.reconcile();
+      if (changed > 0) {
+        this._renderDirty = true;
+        this._shadowsDirty = true;
+      }
+    }
 
     // A pending shadow-dirty flag MUST trigger a render, otherwise the
     // flag would be consumed below without the shadow map ever being
@@ -4337,6 +5644,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
           // (gizmos, ghosts, grid) are excluded from the outline.
           if (this._toon.outlineActive) this._toon.renderPrepass(aoCam);
           composer.render();
+        } else if (this._postProcessing.useTslPost) {
+          // TSL node post-processing (plan-271 Phase 3) — WebGPURenderer
+          // paths. RenderPipeline.render() REPLACES renderer.render(): the
+          // scene pass + effect graph (AO / outlines / saturation) render
+          // internally and the final quad lands in the default framebuffer.
+          // Overlay layers stay excluded here and render in the post-plugin
+          // overlay pass below — same contract as the composer branch.
+          disableOverlayLayers(this.camera);
+          this._postProcessing.renderTslPost(this.scene, this.camera);
         } else {
           // Non-composer path — render scene without overlay layers so the
           // post-plugin overlay pass below can draw them on top of the
@@ -4455,6 +5771,23 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     return !!backend?.isWebGPUBackend;
   }
 
+  /** plan-271 Phase 4 SPIKE opt-in: GPU compute for MU instance transforms.
+   *  Hard AND — requires the REAL WebGPU backend (`hasCompute`) AND an
+   *  explicit flag (`?mucompute=1` or localStorage 'rv-mu-compute' = '1').
+   *  The compute path is NEVER on by default. Returns the renderer to route
+   *  into `LoadGLBOptions.muComputeRenderer`, or undefined for the CPU path. */
+  private _muComputeRenderer(): unknown {
+    if (!this.hasCompute) return undefined;
+    try {
+      if (typeof window === 'undefined') return undefined;
+      const byQuery = new URLSearchParams(window.location.search).get('mucompute') === '1';
+      const byStorage = window.localStorage?.getItem('rv-mu-compute') === '1';
+      return byQuery || byStorage ? this.renderer : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Bind all canvas event listeners. Called ONCE in the constructor. */
   private _bindCanvasEvents(canvas: HTMLCanvasElement): void {
     // Trackpad: two-finger drag rotates when no modifier, pinch (ctrl+wheel) zooms.
@@ -4526,13 +5859,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
         : null;
 
       // Drive chart special mode: filter drives on click
-      if (hoveredDrive && this._driveChartOpen) {
+      if (hoveredDrive && this.driveChartOpen) {
         this.filterDrives(hoveredDrive.name);
         return;
       }
 
       // Sensor chart special mode: filter sensors on click
-      if (hoveredNode && hoveredType === 'Sensor' && this._sensorChartOpen) {
+      if (hoveredNode && hoveredType === 'Sensor' && this.sensorChartOpen) {
         const path = this.registry?.getPathForNode(hoveredNode);
         if (path) {
           this.filterNodes(hoveredNode.name);
@@ -4588,6 +5921,20 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       }
     });
 
+    // Escape: exit a selection isolate first (before the SelectionManager's
+    // bubble-phase Escape handler on `document` would clear the selection).
+    // Registered in the capture phase and stops propagation only while isolate
+    // is active, so a plain Escape without isolate still clears the selection.
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      if (!this._selectionIsolateActive) return;
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      this.exitIsolate();
+      e.preventDefault();
+      e.stopPropagation();
+    }, true);
+
     // F key: Frame Selected — fit camera to current selection.
     // Industry-standard 3D-tool shortcut (Blender, Unity, Maya all use F).
     // Skipped while typing in form fields. Mirrors a dblclick `object-focus`
@@ -4603,7 +5950,21 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       const nodes: Object3D[] = [];
       for (const p of snap.selectedPaths) {
         const n = this.registry.getNode(p);
-        if (n) nodes.push(n);
+        if (!n) continue;
+        nodes.push(n);
+        // A kinematic axis node is an empty (no geometry of its own) — frame
+        // its whole collected group so F focuses the entire kinematic.
+        const rv = (n.userData as Record<string, unknown> | undefined)?.['realvirtual'] as
+          Record<string, unknown> | undefined;
+        if (rv && this.groups) {
+          for (const key of Object.keys(rv)) {
+            if (!/^Kinematic(_\d+)?$/.test(key)) continue;
+            const groupName = (rv[key] as Record<string, unknown> | undefined)?.['GroupName'];
+            if (typeof groupName === 'string' && groupName) {
+              nodes.push(...(this.groups.get(groupName)?.nodes ?? []));
+            }
+          }
+        }
       }
       if (nodes.length === 0) return;
       e.preventDefault();

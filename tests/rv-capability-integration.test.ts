@@ -169,7 +169,20 @@ describe('Component self-registration', () => {
     expect(getCapabilities('renderer').inspectorVisible).toBe(false);
     expect(getCapabilities('colliders').inspectorVisible).toBe(false);
     expect(getCapabilities('BoxCollider').inspectorVisible).toBe(false);
-    expect(getCapabilities('Group').inspectorVisible).toBe(false);
-    expect(getCapabilities('Kinematic').inspectorVisible).toBe(false);
+  });
+
+  it('Kinematic is inspector-visible (authored in the asset editor) after scene-loader import', async () => {
+    await import('../src/core/engine/rv-scene-loader');
+    const caps = getCapabilities('Kinematic');
+    expect(caps.inspectorVisible).toBe(true);
+    expect(caps.badgeColor).toBe('#ce93d8');
+  });
+
+  it('Group is inspector-visible and authorable after scene-loader import', async () => {
+    await import('../src/core/engine/rv-scene-loader');
+    const caps = getCapabilities('Group');
+    expect(caps.inspectorVisible).toBe(true);
+    expect(caps.authorable).toBe(true);
+    expect(caps.badgeColor).toBe('#66bb6a');
   });
 });

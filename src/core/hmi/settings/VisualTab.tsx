@@ -23,6 +23,7 @@ import {
 import { markEnvironmentUserModified } from '../environment-presets';
 import { showInfoOverlay } from '../info-overlay-store';
 import { RENDER_MODES, getRenderMode, type RenderMode } from '../../rv-render-modes';
+import { STATIC_MERGE_LS_KEY, isStaticMeshMergingEnabled } from '../../engine/rv-static-merge-flag';
 import { SettingsSection, FieldRow, SliderRow } from './settings-helpers';
 
 /** Outer wrapper: remounts the body (via `key`) after a preset is applied so all
@@ -98,6 +99,7 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
   const sourceMarkersVisible = useSourceMarkersVisible();
   const toolbarShowLabels = useToolbarShowLabels();
   const settingsLocked = isSettingsLocked();
+  const [driveAxisGizmoOn, setDriveAxisGizmoOn] = useState<boolean>(settingsRef.current.showDriveAxisGizmo);
 
   const updateSourceMarkersVisible = (_: unknown, v: boolean): void => {
     viewer.setSourceMarkersVisible(v);
@@ -106,6 +108,10 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
   const persist = (patch: Partial<VisualSettings>) => {
     Object.assign(settingsRef.current, patch);
     saveVisualSettings(settingsRef.current);
+  };
+
+  const updateDriveAxisGizmo = (_: unknown, v: boolean): void => {
+    viewer.showDriveAxisGizmo = v; setDriveAxisGizmoOn(v); persist({ showDriveAxisGizmo: v });
   };
   const persistMode = () => persist({ modeSettings: { ...settingsRef.current.modeSettings } });
 
@@ -683,6 +689,15 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
           />
         </FieldRow>
 
+        {/* Drive axis gizmo (plan-249) — motion axis overlay on selected drives */}
+        <FieldRow label="Drive axis gizmo" hint="Show the motion axis (double arrow / rotation ring) on selected drives.">
+          <Switch
+            size="small"
+            checked={driveAxisGizmoOn}
+            onChange={updateDriveAxisGizmo}
+          />
+        </FieldRow>
+
         {/* Toolbar button labels — show text next to icons in top-left toolbar */}
         <FieldRow label="Toolbar labels" hint="Show text labels next to icons in the top-left toolbar. Always collapsed on mobile.">
           <Switch
@@ -724,7 +739,7 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
           <Select
             size="small"
             fullWidth
-            value={viewer.isWebGPU ? 'webgpu' : 'webgl'}
+            value={viewer.rendererKind}
             onChange={(e) => { localStorage.setItem('rv-webviewer-renderer', e.target.value); window.location.reload(); }}
           >
             <MenuItem value="webgl" sx={{ fontSize: 13 }}>WebGL</MenuItem>
@@ -734,7 +749,24 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
                 <Typography component="span" sx={{ ml: 1, fontSize: 10, color: 'text.disabled' }}>not available</Typography>
               )}
             </MenuItem>
+            {/* Internal-only TSL test path (plan-271): WebGPURenderer({forceWebGL:true}).
+                Deliberately NEVER disabled on !navigator.gpu — this path exists exactly
+                for devices WITHOUT a WebGPU adapter (review finding 4). */}
+            {__RV_INTERNAL__ && (
+              <MenuItem value="webgpu-gl" sx={{ fontSize: 13 }}>WebGPU (GL backend)</MenuItem>
+            )}
           </Select>
+        </FieldRow>
+        {/* Static mesh batching (BatchedMesh arenas, per-instance visibility):
+            group/auto-filter hide and isolate work per instance. The switch
+            remains as a kill-switch for render problems — off renders every
+            static mesh individually (see rv-static-merge-flag.ts). */}
+        <FieldRow label="Static mesh batching" hint="Collapses static geometry into a few multi-draw batches. Disable only as a kill-switch for render problems. Reloads the viewer.">
+          <Switch
+            size="small"
+            checked={isStaticMeshMergingEnabled()}
+            onChange={(_, v) => { localStorage.setItem(STATIC_MERGE_LS_KEY, v ? '1' : '0'); window.location.reload(); }}
+          />
         </FieldRow>
       </SettingsSection>
 

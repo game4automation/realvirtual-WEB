@@ -18,6 +18,25 @@ import { Close, PushPin, Add, History } from '@mui/icons-material';
 import type { AlarmScenario, AlarmNote } from './alarm-seed-data';
 import { loadNotes, addNote, notesArePersistable } from './alarm-notes-store';
 
+/** localStorage key remembering the operator name across sessions (plan-253). */
+export const OPERATOR_NAME_KEY = 'rv-operator-name';
+
+/** Read the remembered operator name. Never throws (private mode etc.). */
+export function loadOperatorName(): string {
+  try {
+    return localStorage.getItem(OPERATOR_NAME_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/** Remember the operator name for the next note. Never throws. */
+export function saveOperatorName(name: string): void {
+  try {
+    localStorage.setItem(OPERATOR_NAME_KEY, name);
+  } catch { /* storage unavailable — name simply not remembered */ }
+}
+
 export interface AlarmHistoryDialogProps {
   alarm: AlarmScenario;
   open: boolean;
@@ -45,6 +64,7 @@ function NoteRow({ note }: { note: AlarmNote }) {
 export function AlarmHistoryDialog({ alarm, open, onClose, onNotesChanged }: AlarmHistoryDialogProps) {
   const [notes, setNotes] = useState<AlarmNote[]>([]);
   const [draft, setDraft] = useState('');
+  const [author, setAuthor] = useState(() => loadOperatorName());
   const [saving, setSaving] = useState(false);
   const persistable = notesArePersistable();
 
@@ -60,8 +80,10 @@ export function AlarmHistoryDialog({ alarm, open, onClose, onNotesChanged }: Ala
     const text = draft.trim();
     if (!text || saving) return;
     setSaving(true);
+    const authorName = author.trim() || 'You';
+    saveOperatorName(author.trim());
     const note: AlarmNote = {
-      author: 'You',
+      author: authorName,
       dateLabel: new Date().toLocaleDateString('en-US', { day: 'numeric', month: 'short' }),
       shift: 'This shift',
       text,
@@ -73,7 +95,7 @@ export function AlarmHistoryDialog({ alarm, open, onClose, onNotesChanged }: Ala
     setDraft('');
     setSaving(false);
     onNotesChanged?.();
-  }, [draft, saving, alarm.id, onNotesChanged]);
+  }, [draft, author, saving, alarm.id, onNotesChanged]);
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
@@ -89,6 +111,14 @@ export function AlarmHistoryDialog({ alarm, open, onClose, onNotesChanged }: Ala
           {notes.map((n, i) => <NoteRow key={`${n.author}-${i}`} note={n} />)}
         </Stack>
         <Divider sx={{ my: 2 }} />
+        <TextField
+          value={author}
+          onChange={(e) => setAuthor(e.target.value)}
+          placeholder="Your name"
+          size="small"
+          disabled={!persistable || saving}
+          sx={{ mb: 1, maxWidth: 220 }}
+        />
         <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
           <TextField
             value={draft}

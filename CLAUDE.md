@@ -18,7 +18,7 @@ This file provides guidance to Claude Code when working with the realvirtual WEB
 npm install
 npm run dev          # Vite dev server with HMR (localhost:5173)
 npm run build        # Production build -> dist/
-npm test             # Run all tests (headless Chromium)
+npm test             # Run all tests (headless Chromium; see Testing below)
 npx tsc --noEmit     # Type-check without emitting
 ```
 
@@ -79,7 +79,15 @@ src/
       rv-sensor.ts               # AABB overlap sensor
       rv-source.ts / rv-sink.ts  # MU spawning/destruction
       rv-mu.ts                   # Movable Unit
-      rv-simulation-loop.ts      # Fixed 60 Hz timestep accumulator
+      rv-simulation-loop.ts      # Fixed 60 Hz timestep accumulator (+ integration gate)
+      rv-simulation-runtime.ts   # SimulationRuntime facade: attach/detach (editor mode),
+                                 #   pause reasons, continuous|discrete mode, connection state
+      rv-core-subsystems.ts      # Per-tick core pipeline (playback/logic/IK, drives, visuals)
+                                 #   driven by the SimulationExecutors (kernel path)
+    editor/                      # Asset editor document (Editor mode = GLB authoring):
+                                 #   rv-asset-document/ops/executors (undo/redo op log),
+                                 #   rv-asset-glb-export (GLTFExporter save), CADLink + re-import,
+                                 #   rv-cad-provider (private OCCT injection seam)
     hmi/                         # React HMI components (MUI-based)
       HMIShell.tsx               # Main HMI layout shell
       TopBar.tsx / BottomBar.tsx  # Navigation bars
@@ -119,6 +127,7 @@ public/models/                   # GLB model files
 ### Running Tests
 ```bash
 npm test              # Run all tests once (CI mode)
+npm run test:node     # Node-environment tests only (*.node.test.ts) — seconds, no browser
 npm run test:watch    # Watch mode for development
 ```
 
@@ -138,12 +147,32 @@ describe('MyComponent', () => {
 - **Test files:** `tests/*.test.ts`
 - All tests run in headless Chromium via Playwright provider
 
+### Headless is the default (and the opt-out)
+
+`browser.headless: true` is pinned in `vite.config.ts`. Do not remove it: vitest's own
+default follows `process.env.CI`, which is unset on a developer machine, so before plan-375
+every local `npm test` opened a real Chromium window — extra compositor work per test file,
+and frame-timing tests that depended on whether that window was focused or occluded.
+
+To watch a run for visual debugging, opt out per invocation instead of editing the config:
+
+```bash
+npx vitest --browser.headless=false                       # watch mode, visible browser
+npx vitest run --browser.headless=false tests/foo.test.ts # one file, visible browser
+```
+
 ### Before Committing
 Always run both checks:
 ```bash
-npx tsc --noEmit     # Must pass with zero errors
+npm run typecheck    # Full typecheck incl. private-dependent tests — must pass with zero errors
 npm test             # All tests must pass
 ```
+
+Note: plain `npx tsc --noEmit` shows the COMMUNITY view — it excludes the generated list of
+private-dependent test files (`tests/private-dependent-tests.json`, maintained by
+`npm run gen:private-excludes`, guarded by `tests/private-test-excludes.node.test.ts`). The
+community edition (public mirror, no private sibling) must stay green on that view; the full
+dev check is `npm run typecheck` (tsconfig.full.json).
 
 ## Debug API
 
@@ -162,7 +191,11 @@ When the dev server is running (`npm run dev`), debug endpoints are available:
 
 realvirtual WEB includes a built-in MCP bridge (`src/plugins/mcp-bridge-plugin.ts`) that exposes the running Three.js scene to AI assistants. The MCP tools documentation is in `webviewer.mcp.md`.
 
-The MCP server is the local **Node bridge** in `mcp-bridge/` — a stdio MCP server that hosts a WebSocket server on `:18712` and connects AI assistants (Claude Desktop, Claude Code) to the running browser. Build it once with `npm run setup` inside `mcp-bridge/`, then register it in `.mcp.json` (the Unity menu *Tools ▸ realvirtual ▸ Settings ▸ Configure Claude Desktop MCP* does this automatically and points the Unity Python server at `--no-webviewer` so the Node bridge owns the port). When also used with the Unity Editor, 80+ additional tools for scene authoring and simulation control become available.
+**The default MCP server is realvirtual CONNECT** (`http://localhost:5100/mcp`). It hosts the MCP endpoint itself, so nothing extra is installed: register it as `"realvirtual-CONNECT": { "type": "http", "url": "http://localhost:5100/mcp" }` in `.mcp.json`, enable it via the CONNECT tray icon (*MCP server ▸ Enabled*) and restart CONNECT. The browser reaches it over the same WebSocket contract at `:5100/webviewer` — that is the AI Bridge panel's default port, including under the Vite dev server on 5173 (`?mcpPort=5100` pins it explicitly). Claude Code and Claude Code Desktop speak HTTP natively; classic Claude Desktop needs the `npx -y mcp-remote http://localhost:5100/mcp --allow-http` stdio shim.
+
+The local **Node bridge** in `mcp-bridge/` (a stdio MCP server hosting its own WebSocket server on `:18714`/`:18715`) is **not deprecated** — it remains the documented emergency fallback. In `.mcp.json` it is parked under the top-level `_disabledMcpServers` key, which Claude Code never launches; move that block into `mcpServers`, run `npm run setup` inside `mcp-bridge/` once, and point the browser at its port to fall back. Moving it back is the way home.
+
+Tool ownership is strict: CONNECT owns the `web_*` browser tools, the Unity Python MCP server owns the 80+ Unity Editor tools. The Python server's historic `web_*` proxy on `:18712` still exists (arming `--no-webviewer` everywhere is follow-up plan 348) — ignore it and call `web_*` through CONNECT. Full reference: `doc-ai-integration.md`.
 
 ## Documentation Files
 
@@ -171,6 +204,9 @@ The MCP server is the local **Node bridge** in `mcp-bridge/` — a stdio MCP ser
 | `doc-webviewer.md` | Full architecture, component reference, configuration |
 | `doc-deploy.md` | Local test build vs. publishing to public; `npm run deploy`/`deploy:private`, credentials, CI |
 | `doc-lifecycle.md` | Runtime lifecycle: model load, fixed-step loop, pause, reset, dispose, events |
+| `../realvirtual-WebViewer-Private~/doc-render-picking.md` | **Batched render pipeline (motion blobs) + picking/highlight system — architecture AND hard do-not-touch contracts. Read BEFORE changing rv-batched-render/rv-batch-*/rv-raycast-*/rv-highlight-* files.** Lives in the private sibling (not published on the public mirror). |
+| `doc-node-paths.md` | **Node paths: how component/signal references are written by the exporter and resolved by NodeRegistry. The three naming layers (Unity / glTF / Three.js after sanitization + file-global dedup), alias mechanics, resolution order, known pitfalls. Read BEFORE changing anything that stores or resolves a path.** |
+| `doc-ui-visibility.md` | **UI visibility: the two independent axes — plugin runtime participation (`modes`/`core` → `pluginParticipatesInMode`) vs. element presentation (`visibilityRule`/`useUIVisible`), the bridge in `UIPluginRegistry.register`, the `shownOnlyInAny` overwrite, deploy overrides. Read BEFORE changing plugin `modes`/`core`, UI slots or anything gated by `useUIVisible`.** |
 | `doc-extending-webviewer.md` | Plugin system, custom components, UI slots, hooks |
 | `doc-multiuser-system.md` | Multiuser sessions, relay server, shared views |
 | `doc-web-debugging.md` | Debugging tools and workflow |
@@ -179,11 +215,17 @@ The MCP server is the local **Node bridge** in `mcp-bridge/` — a stdio MCP ser
 | `doc-ai-integration.md` | AI integration + MCP bridge: architecture, setup, the AI Bridge status panel, activity indicator, `web_screenshot` cropping, troubleshooting |
 | `webviewer.mcp.md` | MCP tools reference (imported at runtime) |
 
-## Git Repository
+## Git Repository — git only, no Plastic
 
-This directory has its **own git repository** (separate from the parent realvirtual Plastic SCM repo):
+This directory has its **own git repository**, and since plan-360 (2026-08-01) git is its
+**sole owner**: Plastic SCM no longer tracks these files, so `cm update`, a branch switch or a
+Plastic merge cannot change or delete anything here. Nothing in this folder belongs in a
+Plastic checkin.
 
-- **Remote:** `https://github.com/game4automation/realvirtual-WEB-DEV.git`
+- **`origin`** — `https://git.realvirtual.io/rv-internal/realvirtual-WEB.git` (Forgejo, the
+  integration remote; every commit goes here)
+- **`public`** — `https://github.com/game4automation/realvirtual-WEB.git` (public mirror,
+  pushed deliberately and only via `/gitweb`)
 - **Branch:** `main`
 
 Commit here, not in the parent repo:
@@ -193,8 +235,28 @@ git commit -m "feat(webviewer): description"
 git push origin main
 ```
 
+Work canonically on `main` or in a worktree (`/worktree-web <plan>`) — the worktree is a tool
+against parallel sessions, not an obligation. A handful of paths that git ignores (for example
+`.env.production` and the NDA models under `public/models/library/Custom/`) stay under Plastic
+control; they are listed file by file in `<WS>\ignore.conf`.
+
 ## Private/Commercial Extensions
 
 Private extensions live in the sibling folder `../realvirtual-WebViewer-Private~/`. They are wired in via Vite path aliases (`@rv-private`). When absent, stub files in `src/private-stubs/` provide no-op fallbacks.
 
 Private content is NOT AGPL — do not add AGPL headers to private files.
+
+**Two private tiers** (see `doc-deploy.md` → "Build tiers & feature gating"): `private-plugins.ts` = customer tier (ships in customer deploys), `internal-plugins.ts` = internal/dev-only tier, loaded ONLY behind the `__RV_INTERNAL__` build flag (dev server/vitest always on; production builds only with `RV_INTERNAL=1`; customer deploys never set it — Rollup drops the gated dynamic import and its chunks). NEVER import internal feature modules statically — their side-effect registrations would leak back into every private build. Guard: `tests/private-internal-gate.node.test.ts`. New in-development features register in `internal-plugins.ts`, not `private-plugins.ts`.
+
+## Design Context
+
+Before designing or changing UI, read the two design-context files. They live in the **private
+sibling** `../realvirtual-WebViewer-Private~/` — strategy and brand are not published on the
+public mirror:
+
+- **`../realvirtual-WebViewer-Private~/PRODUCT.md`** — strategic context: register (product), users, positioning ("the open standard for browser-based 3D-HMIs"), brand personality (precise, industrial, calm), anti-references (no SCADA/WinCC look, no gamer/sci-fi HUD, no generic SaaS dashboard, no consumer playfulness), WCAG AA target.
+- **`../realvirtual-WebViewer-Private~/DESIGN.md`** — the visual system ("The Glass Control Room"): three glass surface tiers over the 3D viewport, no shadows, Instrument Blue `#4fc3f7` as the only working accent, monospace for all measurement values, 13px Inter density.
+
+New UI must follow these files; they are the source of truth for design decisions. Without the
+private sibling (community edition) they are simply absent — the code itself remains the
+fallback authority (`src/core/hmi/theme.ts`, `signal-colors.ts`).

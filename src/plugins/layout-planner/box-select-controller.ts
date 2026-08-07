@@ -28,11 +28,44 @@ import { computeBoxSelectPaths, combineSelection } from './box-select-hit';
 
 const MIN_RECT_SIDE_PX = 4;
 
+/** Marquee overlay colors (CSS color strings). */
+export interface MarqueeColors {
+  /** Dashed border color, e.g. `rgba(79, 195, 79, 0.95)`. */
+  border: string;
+  /** Translucent fill color, e.g. `rgba(79, 195, 79, 0.12)`. */
+  fill: string;
+}
+
+/** Planner-green marquee (the historical default). */
+const DEFAULT_MARQUEE_COLORS: MarqueeColors = {
+  border: 'rgba(79, 195, 79, 0.95)',
+  fill: 'rgba(79, 195, 79, 0.12)',
+};
+
 export interface BoxSelectControllerDeps {
   viewer: RVViewer;
   canvas: HTMLCanvasElement;
-  /** Live reference — the planner mutates this Map; we re-read on commit. */
-  objectMap: ReadonlyMap<string, Object3D>;
+  /** Live reference — the planner mutates this Map; we re-read on commit.
+   *  Ignored when `getObjectMap` is supplied. Optional so callers whose set of
+   *  selectable roots is recomputed per-commit (e.g. the asset editor, whose
+   *  model root is swapped on every asset load) can pass `getObjectMap` instead. */
+  objectMap?: ReadonlyMap<string, Object3D>;
+  /** Optional getter that returns the selectable-roots map fresh on every
+   *  commit. Takes precedence over `objectMap`. Use this when the map cannot be
+   *  a stable live reference (the editor rebuilds it from `viewer.currentModelRoot`,
+   *  which changes on each asset load). */
+  getObjectMap?: () => ReadonlyMap<string, Object3D>;
+  /** Marquee overlay colors. Defaults to planner green. */
+  marqueeColors?: MarqueeColors;
+  /** Optional getter re-read at the START of every drag, so the marquee can
+   *  change color with a mode (the editor's Auto Assign turns it pink).
+   *  Takes precedence over `marqueeColors` when it returns non-null. */
+  getMarqueeColors?: () => MarqueeColors | null;
+  /** Optional commit interceptor. Called instead of the default
+   *  `selectionManager.selectPaths(...)` when it returns true — lets a caller
+   *  consume the marquee result for something other than selection (the
+   *  editor's Auto Assign adds the boxed paths to a kinematic's group). */
+  onCommit?: (paths: string[], mods: { shift: boolean; ctrl: boolean }) => boolean;
   /** Getter — `viewer.registry` is REPLACED on each model load (rv-viewer
    *  assigns `this.registry = result.registry` in `loadModel`), so we must
    *  read it fresh on every commit. Caching the reference at construction
@@ -68,12 +101,13 @@ export class BoxSelectController {
     if (this._div) return;
     const parent = this.deps.canvas.parentElement;
     if (!parent) return;
+    const colors = this.deps.marqueeColors ?? DEFAULT_MARQUEE_COLORS;
     const div = document.createElement('div');
     div.setAttribute('data-rv-box-select', '');
     div.style.position = 'absolute';
     div.style.pointerEvents = 'none';
-    div.style.border = '1px dashed rgba(79, 195, 79, 0.95)';
-    div.style.background = 'rgba(79, 195, 79, 0.12)';
+    div.style.border = `1px dashed ${colors.border}`;
+    div.style.background = colors.fill;
     div.style.zIndex = '10';
     div.style.display = 'none';
     div.style.left = '0';
@@ -107,6 +141,17 @@ export class BoxSelectController {
     // marquee there disables the controls and captures the pointer, which is
     // why touch interaction in the 3D scene appeared "dead" — so skip it.
     if (e.pointerType !== 'mouse') return;
+    // Re-read the marquee color per drag so a mode change (editor Auto Assign)
+    // is reflected without re-attaching the overlay.
+    const dynamic = this.deps.getMarqueeColors?.();
+    if (dynamic) {
+      this._div.style.border = `1px dashed ${dynamic.border}`;
+      this._div.style.background = dynamic.fill;
+    } else {
+      const base = this.deps.marqueeColors ?? DEFAULT_MARQUEE_COLORS;
+      this._div.style.border = `1px dashed ${base.border}`;
+      this._div.style.background = base.fill;
+    }
     this._active = true;
     this._startX = e.clientX;
     this._startY = e.clientY;
@@ -181,9 +226,12 @@ export class BoxSelectController {
         h,
       };
       const registry = this.deps.getRegistry();
-      if (!registry) {
-        // No registry yet (e.g. between scene-clear and the next loadGLB) —
-        // skip silently and let the user retry.
+      const objectMap = this.deps.getObjectMap
+        ? this.deps.getObjectMap()
+        : this.deps.objectMap;
+      if (!registry || !objectMap) {
+        // No registry / selectable set yet (e.g. between scene-clear and the
+        // next loadGLB) — skip silently and let the user retry.
         this._finish();
         return;
       }
@@ -191,16 +239,17 @@ export class BoxSelectController {
         this.deps.viewer.camera,
         this.deps.canvas,
         rect,
-        this.deps.objectMap,
+        objectMap,
         registry,
         this.deps.getMuMap(),
       );
-      const current = this.deps.viewer.selectionManager.getSnapshot().selectedPaths;
-      const next = combineSelection(current, marquee, {
-        shift: e.shiftKey,
-        ctrl: e.ctrlKey || e.metaKey,
-      });
-      this.deps.viewer.selectionManager.selectPaths(next);
+      const mods = { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey };
+      // A consumer may claim the boxed paths (editor Auto Assign adds them to
+      // a kinematic's group); only fall through to selection when it doesn't.
+      if (!this.deps.onCommit?.(marquee, mods)) {
+        const current = this.deps.viewer.selectionManager.getSnapshot().selectedPaths;
+        this.deps.viewer.selectionManager.selectPaths(combineSelection(current, marquee, mods));
+      }
     }
     // sufficientDrag === false: a tiny click on empty canvas. Leave selection
     // untouched here — let the canvas's existing empty-space-click handler

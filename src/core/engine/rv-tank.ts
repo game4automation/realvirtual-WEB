@@ -16,7 +16,7 @@
 
 import type { Object3D } from 'three';
 import type { ComponentSchema } from './rv-component-registry';
-import { applySchema, setComponentInstance } from './rv-component-registry';
+import { applySchema, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import { validateExtras } from './rv-extras-validator';
 import { NodeRegistry } from './rv-node-registry';
 import { registerTooltipComponent } from './rv-tooltip-component';
@@ -26,21 +26,8 @@ export class RVTank {
   static readonly tooltipType = 'tank';
   static readonly displayName = 'Tank';
 
-  static readonly schema: ComponentSchema = {
-    resourceName: { type: 'string', default: '' },
-    capacity: { type: 'number', default: 0 },
-    amount: { type: 'number', default: 0 },
-    pressure: { type: 'number', default: 0 },
-    temperature: { type: 'number', default: 0 },
-    // Industry-typical instrumentation (all optional — 0 means "not shown" in tooltip)
-    density: { type: 'number', default: 0 },         // kg/m³
-    ph: { type: 'number', default: 0 },              // pH (0 = not measured)
-    agitatorOn: { type: 'boolean', default: false }, // mixer/agitator running
-    heatingOn: { type: 'boolean', default: false },  // jacket heater on
-    tempHighLimit: { type: 'number', default: 0 },   // °C — 0 = no alarm
-    tempLowLimit: { type: 'number', default: 0 },    // °C — 0 = no alarm
-    pressureHighLimit: { type: 'number', default: 0 }, // bar — 0 = no alarm
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('ResourceTank');
 
   readonly node: Object3D;
 

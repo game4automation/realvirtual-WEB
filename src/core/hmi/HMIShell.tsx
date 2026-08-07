@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useEffect, useRef, useSyncExternalStore } from 'react';
+import { Suspense, lazy, useEffect, useRef, useSyncExternalStore } from 'react';
 import { Box } from '@mui/material';
 import { useViewer } from '../../hooks/use-viewer';
 import type { UISlot } from '../rv-ui-plugin';
-import { useActiveContexts, isUIElementVisible, registerUIElement } from './ui-context-store';
+import { useActiveContexts, isUIElementVisible, registerUIElement, useUIVisible } from './ui-context-store';
 import { subscribeUIZoom, getUIZoom } from './visual-settings-store';
 import { getSceneStore } from './scene/scene-store-singleton';
+import { ForceConfirmDialog } from './ForceConfirmDialog';
+import { ProjectDialogHost } from '../project/rv-project-conflict-dialog';
+import { mountDragAnnouncer } from './drag-announcer';
+
+/** Lazy: most sessions never open the Projects dashboard (plan-372 Phase 7). */
+const ProjectsDashboardHost = lazy(() =>
+  import('./projects/ProjectsDashboardHost').then(m => ({ default: m.ProjectsDashboardHost })));
 
 interface HMIShellProps {
   children: React.ReactNode;
@@ -53,6 +60,12 @@ export function SlotRenderer({ slot }: { slot: UISlot }) {
 export function HMIShell({ children }: HMIShellProps) {
   const boxRef = useRef<HTMLDivElement>(null);
 
+  // plan-387: the shell's own dialog hosts are not slot entries, so no plugin
+  // `modes` declaration reaches them — they get their rules here (Schicht B).
+  const showForceConfirm = useUIVisible('force-confirm-dialog', { hiddenIn: ['mode:viewer'] });
+  const showProjectDialogs = useUIVisible('project-dialog-host', { hiddenIn: ['mode:viewer'] });
+  const showProjectsDashboard = useUIVisible('projects-dashboard', { hiddenIn: ['mode:viewer'] });
+
   // Apply zoom directly to DOM — avoids re-rendering the entire child tree on every slider tick.
   useEffect(() => {
     function applyZoom() {
@@ -64,6 +77,12 @@ export function HMIShell({ children }: HMIShellProps) {
     applyZoom();
     return subscribeUIZoom(applyZoom);
   }, []);
+
+  // ── Screen-reader live region for signal drags (plan-341 F12) ──────
+  // One region for the whole shell, mounted for the shell's whole life: a live
+  // region must already be in the DOM when its text changes, so it cannot be
+  // created at drag start.
+  useEffect(() => mountDragAnnouncer(), []);
 
   // ── Global undo/redo keyboard shortcuts ────────────────────────────
   // Ctrl/Cmd+Z      → undo
@@ -111,7 +130,7 @@ export function HMIShell({ children }: HMIShellProps) {
       }}
     >
       {/*
-        Portal target for floating panels (ChartPanel, DESStatsPanel, …).
+        Portal target for floating panels (FloatingPanel, DESStatsPanel, …).
         Direct child of HMIShell so panels inherit the CSS `zoom` but
         bypass the deeper Paper hierarchy. Ancestor Papers carry
         `backdrop-filter: blur(...)` from the theme (theme.ts) which per
@@ -127,6 +146,22 @@ export function HMIShell({ children }: HMIShellProps) {
       */}
       <div id="rv-floating-panel-root" style={{ pointerEvents: 'none' }} />
       {children}
+      {/* Signal forcing is an engineering action — no force dialog in the Viewer. */}
+      {showForceConfirm && <ForceConfirmDialog />}
+      {/* Collision notices (plan-394) live as cards in the right-side messages
+          slot (CollisionAlertPlugin) — no modal here anymore. */}
+      {/* Project folder ↔ cache conflict prompt + the switch dirty guard (§4c/§4e).
+          Renders nothing until a project raises one of the two. */}
+      {showProjectDialogs && <ProjectDialogHost />}
+      {/* Projects dashboard (plan-372). Lazy: most sessions never open it, and
+          it pulls in the rail, the card grid and the detail pane. The Suspense
+          fallback is deliberately null — the overlay simply appears a tick
+          later rather than flashing a spinner over the viewport. */}
+      {showProjectsDashboard && (
+        <Suspense fallback={null}>
+          <ProjectsDashboardHost />
+        </Suspense>
+      )}
     </Box>
   );
 }

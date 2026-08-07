@@ -40,10 +40,39 @@
 import { defineLibraryComponent, type RV } from './_shared/behavior-kit';
 
 /** Seconds between generations, derived from the mode-agnostic schema. */
-function generationInterval(self: RV.Self): number {
+function generationInterval(self: RV.Self<SourceLocal>): number {
   const interval = Number(self.prop['Interval'] ?? 0);
   // Default cadence mirrors the engine RVSource (3 s) when no interval is set.
   return interval > 0 ? interval : 3;
+}
+
+/** Per-instance DES state. `pending` is the at-most-one MU generated but held
+ *  because the downstream is full (ZPA pull, plan-225 B2) — null when idle. */
+interface SourceLocal {
+  pending: RV.MU | null;
+}
+
+/**
+ * Emit ONE part downstream IFF the successor can take it right now: flush a held MU
+ * (ZPA) or mint a fresh one, and transfer; if the successor is still full, hold it
+ * (at most one) and wait. Shared by `onGenerate` (heartbeat safety net) and
+ * `onDownstreamReady` (the ASAP demand pull) so both follow identical, no-flood
+ * semantics — the source only ever spawns when nothing is pending.
+ *
+ * With `AutomaticGeneration` (the default) the DES source has NO production rate: it
+ * is purely demand-driven and emits the instant the successor frees, throttled only
+ * by the line itself. `AutomaticGeneration=false` disables automatic spawning.
+ */
+function emitIfDownstreamFree(self: RV.Self<SourceLocal>): void {
+  if (self.prop['AutomaticGeneration'] === false) return;
+  const out = self.outputs()[0];
+  const mu: RV.MU = self.local.pending ?? self.spawn();
+  if (self.downstreamCanAccept(mu, out)) {
+    self.local.pending = null;
+    self.transfer(mu, out);
+  } else {
+    self.local.pending = mu;
+  }
 }
 
 const def = {
@@ -70,30 +99,45 @@ const def = {
     ThisObjectAsMU:      { type: 'string' as const,  default: '', scope: 'des' as const },
   },
 
+  // Per-instance DES state slot (pending MU for ZPA back-pressure).
+  state: (): SourceLocal => ({ pending: null }),
+
+  // Mode-agnostic init: clear the held MU so a Reset-on-Switch / DESRunner.start
+  // begins fresh (self.local persists across start, only setup re-runs).
+  setup(self: RV.Self<SourceLocal>): void {
+    self.local.pending = null;
+  },
+
   // ── Continuous adapter — INERT. The engine RVSource owns continuous spawning. ──
   // No fixedUpdate (no double-spawn on the default path) — guaranteed by
   // `inert:true`. See the file header "double-spawn guard".
   continuous: {},
 
-  // ── DES adapter — event-driven generation (private DESRunner, P5) ──
+  // ── DES adapter — event-driven generation with ZPA back-pressure (DESRunner) ──
   des: {
     /**
-     * Generate one MU and transfer it to the first free output, then schedule
-     * the next generation. This is the DES analogue of the engine RVSource's
-     * interval/distance spawn — it runs only under the DESRunner, never on the
-     * continuous path.
+     * Emit ONE MU when the line can take it (ZPA pull), then re-arm a heartbeat.
+     * Together with `onDownstreamReady` this makes the DES source demand-driven
+     * (AutomaticGeneration → no production rate, see `emitIfDownstreamFree`). The
+     * heartbeat is ONLY a deadlock-safety net for a missed one-shot wake — NOT the
+     * cadence; `onDownstreamReady` drives normal generation. The source sits in the
+     * band's `previousComponents`, so the band's `releaseMU` reaches it here.
      */
-    onGenerate(self: RV.Self): void {
-      // Mint a real runner-backed MU (manager-tracked) — `self.spawn()` returns a
-      // plain structural MU in continuous/mock mode, a registered DESMU under the
-      // DESRunner.
-      const mu: RV.MU = self.spawn();
-      // Hand the new MU to the first output port (the start of the line). The
-      // DESRunner replaces self.transfer with the real canAccept→accept handshake
-      // (P5); in continuous/mock mode it is a no-op (no double-effect).
-      self.transfer(mu, self.outputs()[0]);
-      // Re-arm: schedule the next generation from the spawn schedule.
-      self.in(generationInterval(self), 'Generate', null);
+    onGenerate(self: RV.Self<SourceLocal>): void {
+      emitIfDownstreamFree(self);
+      self.in(generationInterval(self), 'Generate', null); // heartbeat safety net
+    },
+
+    /**
+     * ASAP pull (the PRIMARY driver of automatic generation): the successor reported
+     * free space → emit the next part IMMEDIATELY (flush a held one, or mint+transfer
+     * a fresh one), not on the next heartbeat tick. This is what makes the DES source
+     * demand-driven with no production rate — a new part appears the instant the line
+     * can take it. The line's own capacity (1 part per conveyor) is the only
+     * throttle. No-op while the successor is still full.
+     */
+    onDownstreamReady(self: RV.Self<SourceLocal>): void {
+      emitIfDownstreamFree(self);
     },
   },
 };

@@ -3,6 +3,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { ModelOptionPlugin, optionIdFromUrl, remapAasLink, setComponentField } from '../src/plugins/models/model-option-plugin';
+import * as demoOptions from '../src/plugins/models/DemoRealvirtualWeb/model-options';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { LoadResult } from '../src/core/engine/rv-scene-loader';
 
@@ -54,6 +55,40 @@ describe('setComponentField', () => {
   });
 });
 
+/**
+ * plan-373 F5 — the supplier variants leave every model selection, but stay
+ * reachable by deep link. The expansion in main.ts is driven purely by a module's
+ * `modelOptions`, so emptying that array is the whole change; the generic
+ * mechanism itself must stay intact for future model modules.
+ */
+describe('DemoRealvirtualWeb supplier variants', () => {
+  /** The exact predicate main.ts uses to decide whether to expand a module. */
+  function expandsInSelector(mod: { baseModel?: string; modelOptions?: unknown[] }): boolean {
+    return Boolean(mod.baseModel) && Array.isArray(mod.modelOptions) && mod.modelOptions.length > 0;
+  }
+
+  it('does not expand supplier variants into availableModels', () => {
+    expect(demoOptions.modelOptions).toHaveLength(0);
+    expect(expandsInSelector(demoOptions)).toBe(false);
+  });
+
+  it('still expands options for a module that declares them', () => {
+    expect(expandsInSelector({ baseModel: 'Other', modelOptions: [{ id: 'a', label: 'A' }] })).toBe(true);
+  });
+
+  it('keeps bosch and sew reachable as deep-link-only options', () => {
+    expect(demoOptions.deepLinkOptions.map(o => o.id)).toEqual(['bosch', 'sew']);
+    expect(demoOptions.baseModel).toBe('DemoRealvirtualWeb');
+  });
+
+  it('still applies ?option=bosch via the deep link', () => {
+    const apply = vi.fn();
+    const viewer = { pendingModelUrl: 'DemoRealvirtualWeb.glb?option=bosch' } as unknown as RVViewer;
+    new ModelOptionPlugin(apply).onModelLoaded({} as LoadResult, viewer);
+    expect(apply).toHaveBeenCalledWith(viewer, 'bosch');
+  });
+});
+
 describe('ModelOptionPlugin', () => {
   it('runs apply with the option id from the loaded model url', () => {
     const apply = vi.fn();
@@ -61,10 +96,12 @@ describe('ModelOptionPlugin', () => {
     new ModelOptionPlugin(apply).onModelLoaded({} as LoadResult, viewer);
     expect(apply).toHaveBeenCalledWith(viewer, 'sew');
   });
-  it('does not run apply when no option marker is present', () => {
+  it('runs apply with null when no option marker is present (default normalization)', () => {
+    // `null` = "no option active": the model callback may use it to normalize GLB
+    // state to its default variant (e.g. DemoRealvirtualWeb → Festo standard).
     const apply = vi.fn();
     const viewer = { pendingModelUrl: 'm.glb' } as unknown as RVViewer;
     new ModelOptionPlugin(apply).onModelLoaded({} as LoadResult, viewer);
-    expect(apply).not.toHaveBeenCalled();
+    expect(apply).toHaveBeenCalledWith(viewer, null);
   });
 });

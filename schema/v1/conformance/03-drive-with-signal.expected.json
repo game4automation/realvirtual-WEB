@@ -1,0 +1,29 @@
+{
+  "description": "Drive_Simple with a ComponentReference signal slot. The raw reference is preserved for later resolution; unset fields take their defaults; Drive.Direction maps through the identity enumMap.",
+  "nodes": {
+    "Conveyor": {
+      "Drive": {
+        "Direction": "LinearX",
+        "ReverseDirection": false,
+        "Offset": 0,
+        "StartPosition": 0,
+        "TargetSpeed": 100,
+        "Acceleration": 100,
+        "UseAcceleration": false,
+        "UseLimits": false,
+        "LowerLimit": -180,
+        "UpperLimit": 180,
+        "JogForward": false,
+        "JogBackward": false,
+        "TargetPosition": 0
+      },
+      "Drive_Simple": {
+        "Forward": { "type": "ComponentReference", "path": "PLC/ConveyorStart", "componentType": "PLCOutputBool" },
+        "ScaleSpeed": 2,
+        "CurrentPositionScale": 1,
+        "CurrentPositionOffset": 0,
+        "ScaleFeedbackPosition": true
+      }
+    }
+  }
+}

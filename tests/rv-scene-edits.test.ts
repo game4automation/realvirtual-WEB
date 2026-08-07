@@ -423,3 +423,99 @@ describe('deepCloneJSON', () => {
     expect(b.x).not.toBe(a.x);
   });
 });
+
+// ─── setNodeTransform ───────────────────────────────────────────────────
+
+describe('setNodeTransform', () => {
+  const P0: [number, number, number] = [0, 0, 0];
+  const Q0: [number, number, number, number] = [0, 0, 0, 1];
+
+  function transformN(
+    nodePath: string,
+    pos: [number, number, number],
+    quat: [number, number, number, number] = Q0,
+    prev: { position: [number, number, number]; quaternion: [number, number, number, number] } = { position: P0, quaternion: Q0 },
+    ts = 1000,
+  ) {
+    return {
+      id: freshOpId(), ts, schemaV: 1 as const,
+      kind: 'setNodeTransform' as const, nodePath, position: pos, quaternion: quat, prev,
+    };
+  }
+
+  function addNodeOp(nodePath: string, ts = 1000) {
+    return {
+      id: freshOpId(), ts, schemaV: 1 as const, kind: 'addNode' as const, nodePath,
+      spec: {
+        parentPath: nodePath.slice(0, nodePath.lastIndexOf('/')),
+        name: nodePath.slice(nodePath.lastIndexOf('/') + 1),
+        position: P0, quaternion: Q0, scale: [1, 1, 1] as [number, number, number],
+        components: { IKTarget: {} },
+      },
+    };
+  }
+
+  it('materialises a base-GLB node transform (last write wins)', () => {
+    const m = materialise([
+      transformN('Robot/Path/T1', [1, 2, 3]),
+      transformN('Robot/Path/T1', [4, 5, 6], [0, 0.707, 0, 0.707]),
+    ]);
+    expect(m.nodeTransforms).toHaveLength(1);
+    expect(m.nodeTransforms[0]).toEqual({
+      nodePath: 'Robot/Path/T1',
+      position: [4, 5, 6],
+      quaternion: [0, 0.707, 0, 0.707],
+    });
+  });
+
+  it('folds a transform for an op-created node into its addNode spec', () => {
+    const m = materialise([
+      addNodeOp('Robot/Path/New1'),
+      transformN('Robot/Path/New1', [7, 8, 9]),
+    ]);
+    expect(m.nodeTransforms).toHaveLength(0); // NOT in the loader-side pass
+    expect(m.addedNodes).toHaveLength(1);
+    expect(m.addedNodes[0].spec.position).toEqual([7, 8, 9]);
+  });
+
+  it('drops a pending transform when the node is removed', () => {
+    const add = addNodeOp('Robot/Path/New1');
+    const m = materialise([
+      transformN('Robot/Path/Orig', [1, 1, 1]),
+      add,
+      { id: freshOpId(), ts: 1001, schemaV: 1 as const, kind: 'removeNode' as const, nodePath: 'Robot/Path/Orig', spec: add.spec },
+    ]);
+    expect(m.nodeTransforms).toHaveLength(0);
+  });
+
+  it('inverseOp swaps transform and prev', () => {
+    const op = transformN('Robot/Path/T1', [1, 2, 3], [0, 1, 0, 0], { position: [9, 9, 9], quaternion: Q0 });
+    const inv = inverseOp(op);
+    expect(inv.kind).toBe('setNodeTransform');
+    if (inv.kind === 'setNodeTransform') {
+      expect(inv.position).toEqual([9, 9, 9]);
+      expect(inv.quaternion).toEqual(Q0);
+      expect(inv.prev.position).toEqual([1, 2, 3]);
+      expect(inv.prev.quaternion).toEqual([0, 1, 0, 0]);
+    }
+  });
+
+  it('coalesces consecutive transforms of the same node only', () => {
+    const a = transformN('Robot/Path/T1', [1, 0, 0], Q0, { position: P0, quaternion: Q0 }, 1000);
+    const b = transformN('Robot/Path/T1', [2, 0, 0], Q0, { position: [1, 0, 0], quaternion: Q0 }, 1100);
+    const c = transformN('Robot/Path/T2', [3, 0, 0], Q0, { position: P0, quaternion: Q0 }, 1150);
+    expect(canCoalesce(a, b)).toBe(true);
+    expect(canCoalesce(a, c)).toBe(false);
+    const merged = mergeOps(a, b);
+    expect(merged.kind).toBe('setNodeTransform');
+    if (merged.kind === 'setNodeTransform') {
+      expect(merged.position).toEqual([2, 0, 0]); // next payload
+      expect(merged.prev.position).toEqual(P0);   // first prev survives
+      expect(merged.id).toBe(a.id);
+    }
+  });
+
+  it('describes the op with the node leaf name', () => {
+    expect(describeOp(transformN('Robot/Path/T1', [1, 2, 3]))).toBe('Move T1');
+  });
+});

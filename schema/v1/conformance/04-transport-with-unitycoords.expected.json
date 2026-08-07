@@ -1,0 +1,18 @@
+{
+  "description": "TransportSurface with a unityCoords Vector3: the reader MUST negate X when applying the value in glTF space ({x:1} -> {x:-1}).",
+  "nodes": {
+    "Belt": {
+      "TransportSurface": {
+        "TransportDirection": { "x": -1, "y": 0, "z": 0 },
+        "Radial": false,
+        "Accumulate": true,
+        "MinGap": 0,
+        "PhysicsMode": false,
+        "TextureScale": 2.5,
+        "HeightOffsetOverride": 0,
+        "AnimateSurface": true,
+        "DriveReference": { "type": "ComponentReference", "path": "Cell/BeltDrive", "componentType": "Drive" }
+      }
+    }
+  }
+}

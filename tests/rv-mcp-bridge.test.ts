@@ -13,7 +13,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { McpBridgePlugin } from '../src/plugins/mcp-bridge-plugin';
-import { buildToolDispatcher } from '../src/core/engine/rv-mcp-tools';
+import { buildMultiDispatcher } from '../src/core/engine/rv-mcp-tools';
 
 // ── Minimal mock viewer ──
 
@@ -84,16 +84,24 @@ function createMockViewer() {
     stats: { totalSteps: 0, activeSteps: 0 },
   };
 
+  const errorStore = {
+    getActive: vi.fn((): Array<{ path: string; text: string; active: boolean; since: number }> => []),
+  };
+
   return {
     drives,
     signalStore,
     transportManager,
     logicEngine,
+    errorStore,
     currentFps: 60,
     connectionState: 'Connected',
     currentModelUrl: '/models/test.glb',
     lastLoadInfo: { glbSize: '1.2 MB', loadTime: '0.5s' },
-    scene: {},
+    // web_status walks the scene for its mesh/arena inventory. This viewer holds
+    // no geometry, so traversal visits nothing and every count stays 0 — the
+    // fields these tests assert on (fps, drive/signal counts) are unaffected.
+    scene: { traverse: () => {} },
     emit: vi.fn(),
     on: vi.fn(() => () => {}),
   };
@@ -112,8 +120,22 @@ function setupPlugin() {
   // Access private viewer field via prototype chain.
   (plugin as unknown as { viewer: MockViewer }).viewer = viewer as unknown as MockViewer;
 
-  // Build dispatcher manually (normally done in _sendDiscover)
-  (plugin as unknown as { _dispatcher: ReturnType<typeof buildToolDispatcher> })._dispatcher = buildToolDispatcher(plugin);
+  // Build the dispatcher manually — normally done in _sendDiscover(). Decorator
+  // metadata lives per-prototype, so the tools are spread over five decorated
+  // instances (the plugin plus the four delegate-object tool classes it owns).
+  // Dispatching over the plugin alone would silently lose every delegated tool.
+  // Mirrors mcp-bridge-plugin.ts::_sendDiscover — keep the list in step with it.
+  const delegates = plugin as unknown as {
+    _viewTools: object; _observeTools: object; _editorTools: object; _helpTool: object;
+  };
+  (plugin as unknown as { _dispatcher: ReturnType<typeof buildMultiDispatcher> })._dispatcher =
+    buildMultiDispatcher([
+      plugin,
+      delegates._viewTools,
+      delegates._observeTools,
+      delegates._editorTools,
+      delegates._helpTool,
+    ]);
 
   return { plugin, viewer };
 }
@@ -241,6 +263,39 @@ describe('McpBridgePlugin - Message Dispatch', () => {
     expect(sensors).toHaveLength(1);
     expect(sensors[0].name).toBe('TestSensor1');
     expect(sensors[0].occupied).toBe(true);
+  });
+
+  it('dispatches web_errors and returns active errors with rounded age', async () => {
+    const { plugin, viewer } = setupPlugin();
+    vi.spyOn(performance, 'now').mockReturnValue(10_000);
+    viewer.errorStore.getActive.mockReturnValue([
+      { path: 'Line/Module7', text: 'Motor overload', active: true, since: 6_400 },
+      { path: 'Line/Sensor2', text: 'Part missing', active: true, since: 8_700 },
+    ]);
+    const { handleMessage, sent } = createMessageHandler(plugin);
+
+    await handleMessage(JSON.stringify({
+      type: 'call',
+      id: 51,
+      tool: 'web_errors',
+      arguments: {},
+    }));
+
+    const result = JSON.parse(sent[0]);
+    expect(result.error).toBeUndefined();
+    expect(JSON.parse(result.result)).toEqual({
+      errors: [
+        { path: 'Line/Module7', text: 'Motor overload', sinceSeconds: 4 },
+        { path: 'Line/Sensor2', text: 'Part missing', sinceSeconds: 1 },
+      ],
+      count: 2,
+    });
+  });
+
+  it('web_errors returns an empty schema when no alarm is active', async () => {
+    const { plugin } = setupPlugin();
+
+    expect(JSON.parse(await plugin.webErrors())).toEqual({ errors: [], count: 0 });
   });
 
   it('dispatches web_drive_jog and sets jog flags', async () => {
@@ -429,6 +484,9 @@ describe('McpBridgePlugin - Transport and Logic tools', () => {
     expect(payload.totalSpawned).toBe(5);
     expect(payload.totalConsumed).toBe(3);
     expect(payload.activeMUs).toBe(0);
+    // Physics diagnostics (plan-276 Phase 6): zero while physics is off.
+    expect(payload.physicsOwnedCount).toBe(0);
+    expect(payload.physicsBodies).toBe(0);
   });
 
   it('web_logic_flow returns logic data (empty roots)', async () => {

@@ -2,7 +2,11 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import type { RVDrivesPlayback } from './rv-drives-playback';
-import type { SignalStore } from './rv-signal-store';
+import {
+  createSignalWriter,
+  type SignalStore,
+  type SignalWriter,
+} from './rv-signal-store';
 import type { ActiveOnly } from './rv-active-only';
 
 /**
@@ -22,6 +26,7 @@ export class RVReplayRecording {
 
   private playback: RVDrivesPlayback;
   private signalStore: SignalStore;
+  private signalWriter: SignalWriter;
   private isReplaying = false;
   private oldStartOnSignal = false;
 
@@ -37,6 +42,7 @@ export class RVReplayRecording {
     this.isReplayingSignalAddr = isReplayingSignalAddr;
     this.playback = playback;
     this.signalStore = signalStore;
+    this.signalWriter = createSignalWriter(signalStore, `replay:${sequenceName}`, 'replay');
   }
 
   fixedUpdate(_dt: number): void {
@@ -44,8 +50,7 @@ export class RVReplayRecording {
     if (!this.isReplaying && this.startOnSignalAddr) {
       const currentVal = this.signalStore.getBoolByPath(this.startOnSignalAddr);
       if (currentVal && !this.oldStartOnSignal) {
-        this.playback.playSequence(this.sequenceName);
-        this.isReplaying = true;
+        this.isReplaying = this.playback.playSequence(this.sequenceName);
       }
     }
 
@@ -56,7 +61,7 @@ export class RVReplayRecording {
 
     // Write status to IsReplayingSignal
     if (this.isReplayingSignalAddr) {
-      this.signalStore.setByPath(this.isReplayingSignalAddr, this.isReplaying);
+      this.signalWriter.setByPath(this.isReplayingSignalAddr, this.isReplaying);
     }
 
     // Store for next frame flank detection

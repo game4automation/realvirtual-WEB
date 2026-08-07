@@ -25,13 +25,23 @@ import type { Object3D } from 'three';
  * layout planner's `addPlacedToScene`).
  */
 export function instanceScope(node: Object3D): string {
+  return instanceScopeNode(node)?.name ?? '';
+}
+
+/**
+ * Nearest enclosing LayoutObject root NODE (self included), or null if the node
+ * is not inside a placed LayoutObject. Same walk as {@link instanceScope}, but
+ * returns the node itself — used to host the per-component `Signals` container
+ * (ONE folder per component, all component signals inside).
+ */
+export function instanceScopeNode(node: Object3D): Object3D | null {
   let cur: Object3D | null = node;
   while (cur) {
     const rv = cur.userData?.realvirtual as Record<string, unknown> | undefined;
-    if (rv && rv.LayoutObject) return cur.name;
+    if (rv && rv.LayoutObject) return cur;
     cur = cur.parent;
   }
-  return '';
+  return null;
 }
 
 /**

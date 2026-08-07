@@ -28,11 +28,13 @@ import type { GizmoHandle } from '../core/engine/rv-gizmo-manager';
 import type { RVRobotIK } from '../core/engine/rv-robot-ik';
 import type { RVIKPath } from '../core/engine/rv-ik-path';
 import type { RVIKTarget } from '../core/engine/rv-ik-target';
-import { ikSolverRegistry, targetPoseInBase, type OpwParams } from '../core/engine/rv-ik-solver';
+import { ikSolverRegistry, targetPoseInBase, type OpwParams, type CobotSolveOpts } from '../core/engine/rv-ik-solver';
+import { ikEditStore } from '../core/hmi/ik-edit-store';
 
 const MARKER_COLOR = 0xce93d8;      // IKTarget badge lavender (reachable)
 const UNREACHABLE_COLOR = 0xff4d4d; // red — pose has no IK solution
 const MARKER_SIZE = 0.28;
+const MARKER_OPACITY = 0.95;
 const LABEL_SIZE = 0.6;
 const SHOW_LABELS = true;
 
@@ -62,14 +64,23 @@ export class IKPathVisualizerPlugin implements RVViewerPlugin {
 
   private viewer: RVViewer | null = null;
   private unsub: (() => void) | null = null;
+  private unsubEdit: (() => void) | null = null;
+  /** Node path of the marker currently hidden behind the edit gizmo (or null). */
+  private hiddenMarkerPath: string | null = null;
   private readonly shown = new Map<RVIKPath, PathVisual>();
   private readonly _tmp = new Vector3();
   private readonly _p3: [number, number, number] = [0, 0, 0];
   private readonly _q4: [number, number, number, number] = [0, 0, 0, 1];
+  // Reusable Cobot opts (plan-233 Phase 2): opw is set per call; no warm start
+  // for reachability checks (cold, deterministic). Never allocated per frame.
+  private readonly _cobotOpts: CobotSolveOpts = {};
 
   init(viewer: RVViewer): void {
     this.viewer = viewer;
     this.unsub = viewer.on('selection-changed', (snap) => this.onSelectionChanged(snap));
+    // Hide the marker of the pathpoint being edited — the edit gizmo sits exactly
+    // on it and the fat sphere would bury the gizmo's centre handle.
+    this.unsubEdit = ikEditStore.subscribe(() => this.syncActiveMarker());
   }
 
   onModelCleared(): void {
@@ -80,7 +91,29 @@ export class IKPathVisualizerPlugin implements RVViewerPlugin {
     this.clearAll();
     this.unsub?.();
     this.unsub = null;
+    this.unsubEdit?.();
+    this.unsubEdit = null;
     this.viewer = null;
+  }
+
+  /** Fade out the marker under the active edit gizmo; restore the previous one. */
+  private syncActiveMarker(): void {
+    const activePath = ikEditStore.getSnapshot()?.path ?? null;
+    if (activePath === this.hiddenMarkerPath) return;
+    this.hiddenMarkerPath = activePath;
+    this.applyActiveMarker();
+  }
+
+  private applyActiveMarker(): void {
+    const registry = this.viewer?.registry;
+    if (!registry) return;
+    const activePath = this.hiddenMarkerPath;
+    for (const visual of this.shown.values()) {
+      for (let i = 0; i < visual.targetNodes.length; i++) {
+        const isActive = !!activePath && registry.getPathForNode(visual.targetNodes[i]) === activePath;
+        visual.markers[i]?.update({ opacity: isActive ? 0 : MARKER_OPACITY });
+      }
+    }
   }
 
   /** Keep polylines, segment colors and reachability glued to the targets — but only
@@ -148,6 +181,8 @@ export class IKPathVisualizerPlugin implements RVViewerPlugin {
         if (visual) this.shown.set(path, visual);
       }
     }
+    // Rebuilt visuals start fully visible — re-hide the actively edited marker.
+    this.applyActiveMarker();
   }
 
   // ── Build / update / dispose visuals ──────────────────────────
@@ -168,12 +203,13 @@ export class IKPathVisualizerPlugin implements RVViewerPlugin {
       markers.push(viewer.gizmoManager.create(t.node, {
         shape: 'sphere',
         color: MARKER_COLOR,
-        opacity: 0.95,
+        opacity: MARKER_OPACITY,
         size: MARKER_SIZE,
         attachToNode: true,
         excludeFromRaycast: true, // visual only — grabbing is handled by IKTargetEditPlugin proximity
         depthTest: false,
         renderOrder: 9998,
+        category: 'gizmos',
       }));
       if (SHOW_LABELS) {
         labels.push(viewer.gizmoManager.create(t.node, {
@@ -184,6 +220,7 @@ export class IKPathVisualizerPlugin implements RVViewerPlugin {
           size: LABEL_SIZE,
           attachToNode: true,
           excludeFromRaycast: true,
+          category: 'gizmos',
         }));
       }
     });
@@ -248,10 +285,25 @@ export class IKPathVisualizerPlugin implements RVViewerPlugin {
     }
   }
 
-  /** True if the target pose (relative to the robot base) has any IK solution. */
+  /** True if the target pose (relative to the robot base) has any IK solution.
+   *  Wrist-type routing (plan-233 Phase 2): NonSpherical robots check via the
+   *  numerical Cobot solver (no warm start — cold, deterministic); spherical
+   *  wrists — and any fallback (no chain / no pro solver) — via Pieper. */
   private isReachable(robot: RVRobotIK, params: OpwParams, targetNode: Object3D): boolean {
     targetPoseInBase(robot.node.matrixWorld, targetNode.matrixWorld, this._p3, this._q4);
-    return !!ikSolverRegistry.solvePieper(params, this._p3, this._q4);
+    if (robot.WristType === 'NonSpherical' && ikSolverRegistry.canSolveCobot) {
+      const chain = robot.getJointChain();
+      if (chain) {
+        this._cobotOpts.opw = params;
+        this._cobotOpts.warmStart = undefined;
+        const sols = ikSolverRegistry.solveCobot(chain, this._p3, this._q4, this._cobotOpts);
+        if (sols) return sols.some((s) => s.reachable);
+      }
+    }
+    // NOTE: solvePieper returns the full 8-branch set with per-branch reachable
+    // flags — a bare truthiness check would ALWAYS pass once a solver is loaded.
+    const sols = ikSolverRegistry.solvePieper(params, this._p3, this._q4);
+    return !!sols && sols.some((s) => s.reachable);
   }
 
   private disposeVisual(visual: PathVisual): void {

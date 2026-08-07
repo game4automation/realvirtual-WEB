@@ -1,0 +1,4 @@
+{
+  "description": "Empty scene: one node without rv-ODT data. A conforming reader constructs no components.",
+  "nodes": {}
+}

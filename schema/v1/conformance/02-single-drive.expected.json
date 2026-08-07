@@ -1,0 +1,22 @@
+{
+  "description": "Drive with every field set explicitly. Values pass through unchanged; the enum wire string maps to itself.",
+  "nodes": {
+    "Axis": {
+      "Drive": {
+        "Direction": "RotationZ",
+        "ReverseDirection": true,
+        "Offset": 10,
+        "StartPosition": 5,
+        "TargetSpeed": 250,
+        "Acceleration": 500,
+        "UseAcceleration": true,
+        "UseLimits": true,
+        "LowerLimit": -90,
+        "UpperLimit": 90,
+        "JogForward": false,
+        "JogBackward": false,
+        "TargetPosition": 0
+      }
+    }
+  }
+}

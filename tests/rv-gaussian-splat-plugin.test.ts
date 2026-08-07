@@ -98,6 +98,34 @@ async function flush() {
   }
 }
 
+/** Wait until the plugin has actually issued `count` splat loads.
+ *
+ *  `flush()` above grants a CONSTANT budget (6 rAF + 10 macrotasks). That is
+ *  fine for the negative tests — they assert nothing happens — but it raced
+ *  the positive ones: `loadSplat()` awaits two nested rAFs and THEN
+ *  `await import('@mkkellogg/gaussian-splats-3d')`, and under full-suite load
+ *  that dynamic module fetch outlives any fixed number of frames, so
+ *  `addSplatScene` had simply not been called yet. Poll against a deadline
+ *  instead of guessing a frame count. */
+async function flushLoaded(count = 1, timeoutMs = 20_000) {
+  const deadline = performance.now() + timeoutMs;
+  while (mockAddSplatScene.mock.calls.length < count) {
+    if (performance.now() > deadline) {
+      throw new Error(
+        `flushLoaded: expected ${count} addSplatScene call(s) within ${timeoutMs} ms, `
+        + `got ${mockAddSplatScene.mock.calls.length}`,
+      );
+    }
+    await new Promise(r => requestAnimationFrame(() => r(undefined)));
+    await new Promise(r => setTimeout(r, 0));
+  }
+  // Let the continuation after the awaited addSplatScene() settle (the plugin
+  // adds the container and marks the frame dirty after that await resolves).
+  for (let i = 0; i < 10; i++) {
+    await new Promise(r => setTimeout(r, 0));
+  }
+}
+
 describe('GaussianSplatPlugin', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -159,7 +187,7 @@ describe('GaussianSplatPlugin', () => {
     const viewer = makeViewer();
     const result = makeLoadResult({ 'gaussian-splat': { enabled: true, url: 'factory.splat' } });
     plugin.onModelLoaded(result as any, viewer as any);
-    await flush();
+    await flushLoaded();
 
     expect(viewer.scene.add).toHaveBeenCalled();
     expect(mockAddSplatScene).toHaveBeenCalledWith('factory.splat', expect.any(Object));
@@ -172,7 +200,7 @@ describe('GaussianSplatPlugin', () => {
     const viewer = makeViewer();
     const result = makeLoadResult({ 'gaussian-splat': { enabled: true, url: 'test.splat' } });
     plugin.onModelLoaded(result as any, viewer as any);
-    await flush();
+    await flushLoaded();
 
     expect(plugin.instanceCount).toBe(1);
     plugin.onModelCleared();
@@ -187,7 +215,7 @@ describe('GaussianSplatPlugin', () => {
     const viewer = makeViewer();
     const result = makeLoadResult({ 'gaussian-splat': { enabled: true, url: 'test.splat' } });
     plugin.onModelLoaded(result as any, viewer as any);
-    await flush();
+    await flushLoaded();
 
     const firstAddCall = viewer.scene.add.mock.calls[0]?.[0];
     expect(firstAddCall?.userData?._rvExcludeFromRaycast).toBe(true);

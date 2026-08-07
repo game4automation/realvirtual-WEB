@@ -16,9 +16,9 @@ what is otherwise spread across `rv-viewer.ts`, `rv-plugin.ts`,
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  new RVViewer(...)            Viewer constructed (Three.js scene,    │
-│                               renderer, controls, loop, plugins,     │
-│                               UI registry — but NO model yet)        │
+│  await RVViewer.create(       Viewer constructed (Three.js scene,    │
+│      container, options)      renderer, controls, RUNNING loop,      │
+│                               plugins, UI registry — but NO model)   │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
@@ -29,7 +29,7 @@ what is otherwise spread across `rv-viewer.ts`, `rv-plugin.ts`,
                                   │
                                   ▼
    ┌──────────────────────────────────────────────────────────────┐
-   │                  RUNNING (loop.start())                      │
+   │                  RUNNING (loop already started)              │
    │   per fixed step (60 Hz):  onFixedUpdatePre → drives →       │
    │                            transport → onFixedUpdatePost     │
    │   per animation frame:     onRender                          │
@@ -60,10 +60,22 @@ what is otherwise spread across `rv-viewer.ts`, `rv-plugin.ts`,
 
 ## 2. Viewer Construction
 
-`new RVViewer(canvas, options)` builds the static infrastructure:
+```typescript
+const viewer = await RVViewer.create(container, options);
+```
+
+`static async create(container: HTMLElement, options?: RVViewerOptions)` is the **only**
+entry point. The constructor is `private` — the renderer (`webgl` / `webgpu` /
+`webgpu-gl`, with fallbacks) must be created and `init()`-ed asynchronously before the
+instance exists, which a constructor cannot do. Note the argument is the **container
+element**, not a canvas: the viewer creates and appends its own canvas and observes the
+container for resizes.
+
+`create()` builds the static infrastructure:
 
 - Three.js `Scene`, `WebGLRenderer` (or WebGPU), camera, `OrbitControls`
-- `SimulationLoop` (not yet started)
+- `SimulationLoop` — constructed **and started** right there (`loop.start()`, see §4).
+  It runs from construction until `dispose()`; there is no separate start call.
 - `GizmoManager`, `SelectionManager`, `HighlightManager`
 - Plugin registry (no plugins active yet — use `viewer.use(plugin)`)
 - UI slot registry (HMI mounts can read this)
@@ -99,6 +111,7 @@ loaded GLB. `viewer.loadScene(scene)` wraps it for the Scene/Op-Log workflow.
 | 7 | **Shader pre-compile** | `renderer.compileAsync()` (when available) | — |
 | 8 | **State assignment** | `currentModel`, `drives`, `transportManager`, `signalStore`, `playback`, `replayRecordings`, `logicEngine`, `registry`, `groups` are set | — |
 | 9 | **Wire subsystems** | Source-markers binding, `ComponentEventDispatcher`, `AutoFilterRegistry`, `SelectionManager.init()`, `RaycastManager`, isolation gate, core context-menu items | — |
+| 9b | **Async BVH kickoff** | The BVH build for all raycast geometry starts in the background (one reused worker across loads; time-sliced inline fallback when no `Worker` is available). The load does NOT wait for it | — |
 | 10 | **Plugin notification** | Every enabled plugin gets `onModelLoaded(result, viewer)` | `onModelLoaded` |
 | 11 | **Re-evaluate physics** | `_physicsPluginActive` updated (plugins may have flipped `handlesTransport` in step 10) | — |
 | 12 | **Emit event** | `'model-loaded'` event fires | `'model-loaded'` |
@@ -109,6 +122,18 @@ loaded GLB. `viewer.loadScene(scene)` wraps it for the Scene/Op-Log workflow.
 > `Awake()`/`Start()` lifecycle: all node registry entries are created first
 > (Awake), then typed component instances are built and can resolve
 > cross-references (Start). See [doc-signal-architecture.md](doc-signal-architecture.md) §2.
+
+> **`model-loaded` timing and `raycast-ready`:** `loadModel()` does not wait
+> for BVH construction. The GLB parse builds the merged raycast geometries
+> without their BVH trees; the trees are then built asynchronously — merged
+> groups first (indirect mode, preserving the face-range tables), then
+> per-mesh geometries — through one sequential background worker. Until the
+> build completes, hover and click raycasts run through the native three.js
+> fallback: fully functional, just slower on large models. Once every
+> eligible geometry carries its tree, the viewer emits `'raycast-ready'` and
+> flags a re-render. A new `loadModel()` or a `clearModel()` during a running
+> build aborts the whole remaining sequence and discards in-flight results;
+> `'raycast-ready'` is not emitted for an aborted load.
 
 ### 3.2 `loadScene()` extension
 
@@ -148,6 +173,85 @@ for plugins to observe load failures.
 > If your plugin needs to gate UI on "load is in progress", subscribe to
 > `'model-cleared'` and treat the first `'model-loaded'` after it as the
 > load-complete signal. A dedicated pair of events is on the roadmap.
+
+### 3.4 Placement lifecycle — placeholder → swap
+
+A Layout-Planner placement has a **second, per-object load pipeline** that runs
+long after `'model-loaded'`. It is asynchronous by design: dragging a library
+asset registers a placeholder synchronously and swaps the decoded geometry in
+underneath the same root later, so the drag gesture and the drop never wait for
+the GLB.
+
+```
+dragstart  → buildPlaceholderNode(entry)        wireframe box, < 1 ms
+             addPlacedToScene(node, id, { mode: 'light' })
+                 · unique name, objectMap, root in NodeRegistry,
+                   raycast aux targets, markShadowsDirty
+                 · NO processExtras, NO drives/signals, NO snap ports
+             pending.begin(id, entry) → generation token
+             void modelCache.getOrLoad(url, { signal })     ── async ──┐
+                                                                      │
+drop       → _commitDraft()   store entry + `addPlacement` undo op     │
+             (commits immediately — the load is NOT awaited)           │
+                                                                      │
+decode lands ─────────────────────────────────────────────────────────┘
+           → pending.isCurrent(id, gen)?   no → discard the result
+           → swapPlacedGeometry(deps, id, realSource):
+                1. root = objectMap.get(id)          (false if gone)
+                2. keepY = root.position.y
+                3. unregister the placeholder subtree
+                4. detach children + disposePlaceholderNode(root)
+                5. adopt realSource's children,
+                   prepPlacedVisual({ skipAutoAlign: true }) + pivotToFloorCenter
+                6. root.position.y = keepY
+                7. registerPlaced(…, 'full')
+                     · processExtras → signals, drives, components
+                     · behaviors, LogicSteps, snap ports
+                     · raycast aux targets, grouped-BVH rebuild
+                     · markShadowsDirty, 'layout-content-added'
+```
+
+**The root object is never replaced — only its children are.** That is what lets
+`objectMap`, the FloorGizmo's target, MultiSelectPivot members, the path-based
+selection and the armed bbox-snap state survive the swap untouched. `alignToFloor`
+is deliberately not re-run (it would rewrite `position.y` to 0 and drop every
+placement parked on an elevated surface), which is why step 5 re-applies the
+pivot by hand and step 6 re-asserts the height.
+
+**The generation token is the guard against a resurrected node.** Every load
+carries a monotonically increasing generation per placement id
+(`pending-geometry.ts`), and `isCurrent(id, gen)` validates **both** the token
+**and** that the placement still exists in the planner's object map — the second
+half covers removal paths that never learned about the registry at all. A result
+that fails either check is dropped without touching the scene.
+
+Cancellation is centralised rather than wired per call site:
+
+| Trigger | Where | Effect |
+|---|---|---|
+| Delete, undo, drag cancel, scene reload, <kbd>Del</kbd> key, hierarchy context menu | `LayoutPlannerPlugin._removePlacedFromScene` — the single choke point every removal path funnels through | `pending.cancel(id)` + pulse released; the resource dispose sits one level down in `scene-mutations.removePlacedFromScene` |
+| `onModelCleared` (§6.1) | Plugin hook | `pending.cancelAll()` + `pulse.stopAll()` — placements are parented under `viewer.currentModel`, so a late swap would land under a parent that is being disposed |
+| `dispose()` (§9) | Plugin teardown | `pending.cancelAll()` + `pulse.dispose()` before the object map is emptied |
+
+> ⛔ A placeholder must **never** be torn down with `disposeSubtree`: that helper
+> duck-types on `.geometry`/`.material` without an `isMesh` check, and the
+> billboard is a `Sprite` whose geometry is a three.js **module singleton**.
+> Use `disposePlaceholderNode` — the teardown loop in the planner's `dispose()`
+> branches on `isPlaceholderNode` for exactly this reason.
+
+Two further lifecycle notes:
+
+- **The swap takes no pause reason.** `'layout-edit'` (§5.1) is held by the drag
+  gesture, not by the load; a swap that landed after the user moved on would
+  otherwise keep the simulation frozen.
+- **Aborting is consumer-side only.** `getOrLoad(url, { signal })` detaches the
+  cancelled consumer and lets the shared fetch/decode run to completion — both
+  cache layers de-duplicate URL-wide, so a real abort would tear down an
+  unrelated second placement of the same asset.
+
+Nothing about this state is persisted; see [doc-persistence.md](doc-persistence.md)
+§7.3. Feature overview: [doc-webviewer.md](doc-webviewer.md) → *Pending
+placements (Planner)*.
 
 ---
 
@@ -191,10 +295,20 @@ requestAnimationFrame / renderer.setAnimationLoop tick
        │  7. transportManager.update(dt)     (kinematic transport; skipped when
        │                                      a physics plugin handles transport)
        │
-       │  8. transportManager.updateTextureAnimations(dt)   (always)
-       │     tankFillManager.update()
+       │  8. CoreSubsystems.visuals(dt)      ← always runs, even when a physics
+       │     transportManager.updateTextureAnimations(dt)   plugin or the DES
+       │     tankFillManager.update()                       queue owns transport
        │     gizmoManager.tick(dt * 1000)
+       │     lampManager.update(dt)
+       │     energyChainManager.update(dt)   (after the drive stage, so the
+       │                                      follower pose of this frame is set)
        │     pipeFlowManager.update(dt)
+       │     collisionManager.update(dt)     ← deliberately LAST: drives,
+       │                                      kinematics, transport and the
+       │                                      energy-chain rig of THIS tick are
+       │                                      all applied. A hit highlights and
+       │                                      raises the modal in the same tick;
+       │                                      the simulation is never stopped.
        │     + onTick(SIM) callbacks
        │
        │  9. behaviors.tick(dt)              (discrete material-flow / DES
@@ -270,14 +384,15 @@ the loop resumes only after **every** reason has been released.
 
 Conventions for `reason` strings:
 
-| Reason | Owner |
-|--------|-------|
-| `'user'` | UI pause button |
-| `'ar-placement'` | WebXR placement mode |
-| `'layout-edit'` | Layout Planner edit mode |
-| `'shared-view'` | Shared-view follower (multiuser) |
-| `'kiosk-tour'` | Kiosk-tour transitions |
-| `'maintenance-step'` | Maintenance overlay |
+| Reason | Constant | Owner |
+|--------|----------|-------|
+| `'user'` | `USER_PAUSE_REASON` (`core/engine/rv-constants.ts`) | UI pause button, Property Inspector edits, Set-Position dialog |
+| `'layout-edit'` | `LAYOUT_EDIT_PAUSE_REASON` (same file) | Layout Planner edit mode — deliberately DISTINCT from `'user'` so the planner can auto-resume without clobbering a user pause |
+| `'ar-placement'` | — (literal) | WebXR placement mode |
+| `'layout-drag'`, `'layout-placement'` | — (literals) | Legacy Layout-Planner reasons; the planner only *releases* them today (defensive cleanup) |
+
+Always use the constants for `'user'` and `'layout-edit'` rather than the string
+literals — a typo there produces a pause reason nobody can release.
 
 > **Best practice:** one plugin = one stable reason string. Same reason
 > set/cleared multiple times is idempotent — only the set state matters.
@@ -323,21 +438,32 @@ The two operations are **not interchangeable**.
 
 Steps in order:
 
-1. `onModelCleared(viewer)` on every enabled plugin
-2. Close context menu
-3. Reset dynamic UI contexts (preserving config-initial ones)
-4. `selectionManager.clear()` + `dispose()`
-5. `raycastManager.dispose()`
-6. Drop source-markers subscription
-7. `transportManager.reset()` then null it **before** scene traverse
-   (MUs share geometry with templates by reference)
-8. Sweep all `_rvModelRoot`-tagged children from the scene; dispose
-   geometries and materials (skipping `_rvShared` material singletons)
-9. Null out `currentModel`, `drives`, `playback`, `replayRecordings`,
-   `logicEngine`, `tankFillManager`, `pipeFlowManager`, `signalStore`,
-   `registry`, `groups`, `autoFilters`, `componentEventDispatcher`
-10. Dispose `gizmoManager`
-11. Emit `'model-cleared'`
+1. Bump the load generation (aborts a running BVH build), reset the signature /
+   logic-run state
+2. `onModelCleared(viewer)` on every plugin that received this model
+3. Close context menu
+4. Reset dynamic UI contexts (preserving config-initial ones **and** the active
+   workspace-mode context — a mode must survive a model switch)
+5. `batchTable.dispose()` — the batched arenas hold geometry and indirect
+   textures the generic traverse-dispose below would miss
+6. `selectionManager.clear()` + `dispose()`
+7. `raycastManager.dispose()`, drop the instance pick index and the highlight
+   proxy provider
+8. Drop source-markers / vanishing-MU subscriptions
+9. `transportManager.reset()` then null it **before** scene traverse
+   (MUs share geometry with templates by reference); `statisticsManager.clear()`;
+   drop the simulation kernel
+10. `collisionManager.clear()`, `lampManager.clear()`, `energyChainManager.clear()`
+    — these restore material clones / original meshes **before** the geometry teardown
+11. Sweep all `_rvModelRoot`-tagged children from the scene; dispose
+    geometries and materials (skipping `_rvShared` material singletons)
+12. Null out `currentModel`, `drives`, `ikPaths`, `playback`, `replayRecordings`,
+    `logicEngine`, `tankFillManager`, `pipeFlowManager`, `signalStore`,
+    `registry`, `groups`, `autoFilters`, `componentEventDispatcher`,
+    `signalBindingManager`
+13. Dispose `gizmoManager`; `resetSlotAuthority()` (unconditional — drops slot
+    claims, slot↔channel indexes and the live-control gate); reset overlay producers
+14. Emit `'model-cleared'`
 
 The `SimulationLoop` keeps running. `onFixedUpdate` is still called but has
 no drives/transport to advance.
@@ -372,6 +498,16 @@ Components subscribe via the bind-context hooks `onReset` / `onStart` /
 `onResetStat` (a material-flow definition adds top-level `reset` / `start` /
 `resetStat` blocks), or directly via `viewer.on('simulation-reset', …)`.
 
+**Simulation runs.** When a DES run is in flight, the reset also ends the
+run: the DES manager's reset hook archives it (seed, reached sim time,
+statistics aggregate) into the experiment store and emits
+`'simulation-run-ending'` — this happens DURING phase 1 (the executor reset
+triggers the manager reset), so the archived statistics are the pre-reset
+values. A subsequent engine start emits `'simulation-run-started'` with a
+fresh run id. The archive hook lives in the DES manager itself (not only in
+`resetSimulation()`), so native-DES resets that bypass the viewer are covered
+too. Non-DES scenes never produce run events.
+
 ### 6.3 Side-by-side
 
 | | drives | signals | MUs | LogicSteps | pause | camera | listeners |
@@ -385,9 +521,9 @@ Components subscribe via the bind-context hooks `onReset` / `onStart` /
 
 ## 7. Connection State
 
-`viewer._connectionState` tracks the overall Live/Direct connection. When
-it flips, `'connection-state-changed'` fires and every enabled plugin
-receives `onConnectionStateChanged(state, viewer)`.
+`viewer.connectionState` (a getter over the `SimulationRuntime`) reports the overall
+Live/Direct connection. When it flips, `'connection-state-changed'` fires and every
+enabled plugin receives `onConnectionStateChanged(state, viewer)`.
 
 ```typescript
 viewer.on('connection-state-changed', ({ state, previous }) => {
@@ -416,10 +552,17 @@ The full plugin interface lives in [src/core/rv-plugin.ts](src/core/rv-plugin.ts
 | `onModelLoaded(result, viewer)` | After step 8 of §3.1 (state assigned), **before** `'model-loaded'` emits. Also called retroactively for plugins registered after a model is already loaded. |
 | `onModelCleared(viewer)` | First step of `clearModel()`, **before** state is reset. |
 | `onConnectionStateChanged(state, viewer)` | When viewer-wide connection flips. |
+| `onModeActivate(mode, viewer)` | The plugin's workspace mode becomes active. Build mode-scoped resources here. The plugin instance itself persists across mode switches. |
+| `onModeDeactivate(from, viewer)` | The plugin's mode is left (`from` is `null` only for the initial boot). Tear down whatever `onModeActivate` created. |
+| `onRenderBackendChanged(backend, viewer)` | The render backend flips between `'three'` and `'omniverse'`. |
 | `onFixedUpdatePre(dt)` | 60 Hz, before drive physics (TickStage.PRE). Use to set drive targets. |
 | `onFixedUpdatePost(dt)` | 60 Hz, after drive physics + transport (TickStage.POST). Use to read results / sample data / emit events. |
 | `onRender(frameDt)` | Per animation frame, after `renderer.render()`. |
 | `dispose()` | Viewer teardown. **Must release any held pause reasons here.** |
+
+A plugin declares its mode membership with the optional `modes?: ModeId[]` field
+(omitted = active in every mode). `core: true` is orthogonal to it: the runtime hooks
+of a core plugin run everywhere, while `modes` still gates its UI slots.
 
 For stage-based tick registration without subclassing, use `this.context.simLoop.onTick(stage, callback)` from inside `init()`. See §4.1b above.
 
@@ -465,12 +608,19 @@ For the complete list (hover, selection, charts, XR, FPV, layout, etc.) see
 | Event | Payload | Fires when | Typical subscriber |
 |-------|---------|-----------|--------------------|
 | `'model-loaded'` | `{ result: LoadResult }` | After `loadModel()` step 12 | HMI tiles, KPI cards, MCP bridge, chart subscribers |
+| `'model-logic-activated'` | `{ result: LoadResult }` | Executable model logic is bound — immediately for `none`/`valid` signatures, or after an explicit late activation for `invalid`/unverifiable ones. Geometry/HMI lifecycle stays on `'model-loaded'` | Anything that must not run untrusted model logic before it is cleared |
+| `'signature-state-changed'` | `{ signatureState, logicRunState }` | Model-signature verification result or the `active`/`gated`/`activating` run gate changes | Signature banner, logic activation UX |
+| `'raycast-ready'` | `void` | Background BVH build completed for every eligible geometry (not emitted for aborted loads) | Plugins wanting BVH-accelerated raycasts from the first query |
 | `'model-cleared'` | `void` | First step of `clearModel()` | HMI reset, listener cleanup |
 | `'scene-loaded'` | `{ scene: RvScene }` | After `loadScene()` Phase 5 | camera-startpos plugin, scene-aware overlays |
 | `'simulation-pause-changed'` | `{ paused, reasons, reason }` | On `idle ↔ paused` transition only | External PLC I/O, animations, recorders |
 | `'simulation-reset'` | `void` | `resetSimulation()` phase 1 | Behaviors / drives restoring start state (bind-context `onReset`) |
 | `'simulation-resetstat'` | `void` | `resetSimulation()` phase 2 (or DES stat-only reset) | Statistics accumulators (bind-context `onResetStat`) |
 | `'simulation-start'` | `void` | `resetSimulation()` phase 3 | Behaviors (re)starting from the clean state (bind-context `onStart`) |
+| `'simulation-run-started'` | `{ runId, seed }` | DES engine (re)start with live material-flow components | Run-history panel, external run trackers |
+| `'simulation-run-ending'` | `{ runId, seed, simTime, status, reason }` | DES run archived — on reset (`aborted`) or sim end reached (`completed`), during reset phase 1 | Run-history panel, KPI exporters |
+| `'mode-changing'` | `{ from, to }` | BEFORE a workspace-mode switch begins (plugins deactivate/activate, UI swaps). Distinct from the kernel's `'simulation-mode-changed'` | Anything that must save state before the UI swaps |
+| `'mode-changed'` | `{ from, to }` | AFTER a workspace-mode switch has fully applied. The viewer itself listens to re-attach/detach the runtime and re-apply the collision highlight | Highlight policy, mode-gated overlays |
 | `'connection-state-changed'` | `{ state, previous }` | Viewer-wide Live/Direct flip | Status badges, reconnection UX |
 | `'interface-connected'` | `{ interfaceId, type }` | Industrial interface attaches | Connection status per interface |
 | `'interface-disconnected'` | `{ interfaceId, reason? }` | Industrial interface drops | Reconnect UX, alarm raising |

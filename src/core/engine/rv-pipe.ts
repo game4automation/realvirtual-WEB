@@ -14,7 +14,7 @@
 
 import type { Object3D } from 'three';
 import type { ComponentSchema } from './rv-component-registry';
-import { applySchema, setComponentInstance } from './rv-component-registry';
+import { applySchema, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import { validateExtras } from './rv-extras-validator';
 import { NodeRegistry } from './rv-node-registry';
 import { registerTooltipComponent } from './rv-tooltip-component';
@@ -30,19 +30,8 @@ export class RVPipe {
   static readonly tooltipType = 'pipe';
   static readonly displayName = 'Pipe';
 
-  static readonly schema: ComponentSchema = {
-    resourceName: { type: 'string', default: '' },
-    flowRate: { type: 'number', default: 0 },
-    source: { type: 'componentRef' },
-    destination: { type: 'componentRef' },
-    uvDirection: { type: 'number', default: 1 },
-    circuitId: { type: 'number', default: -1 },
-    // Industry-typical instrumentation (all optional — 0 means "not shown" in tooltip)
-    pressure: { type: 'number', default: 0 },        // bar gauge
-    temperatureC: { type: 'number', default: 0 },    // °C
-    velocityMs: { type: 'number', default: 0 },      // m/s — flow velocity (erosion check)
-    dnSize: { type: 'number', default: 0 },          // nominal diameter DN, e.g. 50, 100, 200
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('Pipe');
 
   readonly node: Object3D;
 

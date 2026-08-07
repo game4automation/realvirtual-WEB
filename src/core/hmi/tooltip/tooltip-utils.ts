@@ -9,6 +9,7 @@
  */
 
 import { Vector3, Box3, type Mesh, type Object3D, type Camera } from 'three';
+import { ndcToScreen } from '../../engine/rv-ndc';
 
 /** Minimal renderer interface — only what tooltip projection needs. */
 interface HasDomElement { readonly domElement: HTMLCanvasElement; }
@@ -16,6 +17,14 @@ interface HasDomElement { readonly domElement: HTMLCanvasElement; }
 // Pre-allocated temp vectors for GC-free projection
 const _tempVec = new Vector3();
 const _tempBox = new Box3();
+
+/** Map the projected `_tempVec` NDC to a visible ScreenProjection. */
+function screenFromTempVec(renderer: HasDomElement): ScreenProjection {
+  const rect = renderer.domElement.getBoundingClientRect();
+  const out: ScreenProjection = { x: 0, y: 0, visible: true };
+  ndcToScreen(_tempVec.x, _tempVec.y, rect, out);
+  return out;
+}
 
 /** Result of projecting a 3D object to screen coordinates. */
 export interface ScreenProjection {
@@ -59,12 +68,7 @@ export function projectToScreen(
       _tempBox.getCenter(_tempVec);
       _tempVec.project(camera);
       if (_tempVec.z > 1) return { x: 0, y: 0, visible: false };
-      const rect = renderer.domElement.getBoundingClientRect();
-      return {
-        x: (_tempVec.x * 0.5 + 0.5) * rect.width + rect.left,
-        y: (-_tempVec.y * 0.5 + 0.5) * rect.height + rect.top,
-        visible: true,
-      };
+      return screenFromTempVec(renderer);
     }
   }
 
@@ -76,12 +80,7 @@ export function projectToScreen(
     return { x: 0, y: 0, visible: false };
   }
 
-  const rect = renderer.domElement.getBoundingClientRect();
-  return {
-    x: (_tempVec.x * 0.5 + 0.5) * rect.width + rect.left,
-    y: (-_tempVec.y * 0.5 + 0.5) * rect.height + rect.top,
-    visible: true,
-  };
+  return screenFromTempVec(renderer);
 }
 
 /**
@@ -123,12 +122,7 @@ export function projectPointToScreen(
     return { x: 0, y: 0, visible: false };
   }
 
-  const rect = renderer.domElement.getBoundingClientRect();
-  return {
-    x: (_tempVec.x * 0.5 + 0.5) * rect.width + rect.left,
-    y: (-_tempVec.y * 0.5 + 0.5) * rect.height + rect.top,
-    visible: true,
-  };
+  return screenFromTempVec(renderer);
 }
 
 /**

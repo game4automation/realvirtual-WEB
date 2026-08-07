@@ -12,8 +12,7 @@
  * start (only the store/undo commit is deferred to drop).
  */
 
-import { Group, BoxGeometry, EdgesGeometry, LineSegments, LineBasicMaterial } from 'three';
-import type { Object3D } from 'three';
+import { Group, Object3D, BoxGeometry, EdgesGeometry, LineSegments, LineBasicMaterial } from 'three';
 
 import type { ModelCache } from './model-cache';
 import type { LibraryCatalogEntry } from './rv-layout-store';
@@ -201,7 +200,41 @@ export async function buildVirtualNode(entry: LibraryCatalogEntry): Promise<Obje
   if (entry.desType) {
     node.userData.realvirtual = { [entry.desType]: entry.desConfig ?? {} };
   }
+  addVirtualConventionNodes(node, entry);
   return node;
+}
+
+/** Add catalog-declared snap, carrier, and path convention nodes to a virtual root. */
+function addVirtualConventionNodes(root: Object3D, entry: LibraryCatalogEntry): void {
+  const MM_TO_M = 0.001;
+  for (const port of entry.virtualPorts ?? []) {
+    const node = new Object3D();
+    node.name = `Snap-${port.name}`;
+    node.position.fromArray(port.position).multiplyScalar(MM_TO_M);
+    root.add(node);
+  }
+
+  for (const child of entry.virtualChildren ?? []) {
+    const node = new Object3D();
+    node.name = child.name;
+    node.position.fromArray(child.position).multiplyScalar(MM_TO_M);
+    if (child.kind === 'path') {
+      const endpoint = child.size ?? [1000, 0, 0];
+      node.userData.realvirtual = {
+        Path: {
+          type: 'Path',
+          version: 1,
+          segments: [{
+            kind: 'line',
+            from: [0, 0, 0],
+            to: endpoint.map(value => value * MM_TO_M),
+          }],
+          closed: false,
+        },
+      };
+    }
+    root.add(node);
+  }
 }
 
 /**

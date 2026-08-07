@@ -31,6 +31,7 @@
 
 import type { RVTransportManager } from '../engine/rv-transport-manager';
 import type { BehaviorManager } from '../behaviors';
+import type { CoreSubsystems } from '../engine/rv-core-subsystems';
 import type { MaterialFlowDefinition } from './define-material-flow';
 import type {
   SimulationExecutor,
@@ -68,17 +69,31 @@ export class ContinuousRunner implements SimulationExecutor {
   private readonly transport: TransportManagerLike;
   /** The viewer's behaviour manager (shared — NOT owned anew). */
   private readonly behaviors: BehaviorManagerLike;
+  /** Optional core subsystem pipeline (drives/visuals/early — Phase B unification).
+   *  Absent in minimal/unit-test setups: tick() then degrades to the historical
+   *  transport → behaviors pair. */
+  private readonly core: CoreSubsystems | null;
+  /** Optional transport gate — `false` skips transport+behaviors this tick (the
+   *  old `_physicsPluginActive` bypass, now evaluated per tick inside the runner
+   *  so the drive loop + visuals keep running while a physics plugin owns transport). */
+  private readonly transportGate: (() => boolean) | null;
 
   /**
-   * @param transport The RVViewer's existing `RVTransportManager`.
-   * @param behaviors The RVViewer's existing `BehaviorManager`.
+   * @param transport     The RVViewer's existing `RVTransportManager`.
+   * @param behaviors     The RVViewer's existing `BehaviorManager`.
+   * @param core          The viewer's CoreSubsystems pipeline (optional for tests).
+   * @param transportGate Per-tick gate; `false` = a physics plugin owns transport.
    */
   constructor(
     transport: RVTransportManager | TransportManagerLike,
     behaviors: BehaviorManager | BehaviorManagerLike,
+    core?: CoreSubsystems,
+    transportGate?: () => boolean,
   ) {
     this.transport = transport;
     this.behaviors = behaviors;
+    this.core = core ?? null;
+    this.transportGate = transportGate ?? null;
   }
 
   /** Live MU count — reads through to the shared transport manager. */
@@ -106,13 +121,30 @@ export class ContinuousRunner implements SimulationExecutor {
   }
 
   /**
-   * Advance one fixed tick — EXACT current order: `transport.update(dt)` first,
-   * then the behaviour/material-flow `fixedUpdate` fan-out (`behaviors.tick`).
-   * R1 regression guard: this pair-order must never be swapped.
+   * Pre-PRE pass — the CoreSubsystems early stage (playback → logic → IK →
+   * replay). No-op in minimal setups without a core pipeline.
+   */
+  earlyTick(dt: number): void {
+    this.core?.early(dt);
+  }
+
+  /**
+   * Advance one fixed tick — EXACT legacy fixedUpdate order:
+   * drive loop (+ dirty flags + MU diff) → `transport.update(dt)` →
+   * behaviour/material-flow `fixedUpdate` fan-out (`behaviors.tick`) →
+   * visual managers (texture anims, tank, gizmo, pipe).
+   * R1 regression guard: the transport → behaviors pair-order must never be
+   * swapped. When the transport gate reports `false` (physics plugin owns
+   * transport) that pair is skipped but drives + visuals still run — matching
+   * the old viewer-level `_physicsPluginActive` bypass.
    */
   tick(dt: number): void {
-    this.transport.update(dt);
-    this.behaviors.tick(dt);
+    this.core?.drives(dt);
+    if (this.transportGate?.() !== false) {
+      this.transport.update(dt);
+      this.behaviors.tick(dt);
+    }
+    this.core?.visuals(dt);
   }
 
   /**

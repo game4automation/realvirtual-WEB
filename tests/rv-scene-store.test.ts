@@ -251,6 +251,31 @@ describe('SceneStore', () => {
     });
   });
 
+  // The dashboard catalogues rather than switches: creating a scene must add a
+  // row WITHOUT replacing the open workspace, and must persist so a reload
+  // keeps it. (newEmpty() is the other half of the pair and does switch.)
+  describe('createEmpty', () => {
+    it('adds a saved scene without touching the workspace', async () => {
+      await store.openBuiltin(builtinDemo.url, builtinDemo.label);
+      const before = store.getSnapshot().draft;
+
+      const id = store.createEmpty();
+
+      const created = readScene(id)!;
+      expect(created.base.kind).toBe('empty');
+      expect(store.listScenes().some(m => m.id === id)).toBe(true);
+      // The open workspace is untouched — no switch, so no dirty prompt owed.
+      expect(store.getSnapshot().draft?.id).toBe(before?.id);
+    });
+
+    it('does not collide when called twice', () => {
+      const a = store.createEmpty();
+      const b = store.createEmpty();
+      expect(a).not.toBe(b);
+      expect(readScene(a)!.name).not.toBe(readScene(b)!.name);
+    });
+  });
+
   describe('delete', () => {
     it('removes a non-active scene from index and storage', async () => {
       const a = writeScene({ ...makeDraftScene(builtinDemo, 'A'), id: newSceneId() });
@@ -291,23 +316,24 @@ describe('SceneStore', () => {
     });
   });
 
-  // ─── Legacy compat shims ──────────────────────────────────────────────
+  // ─── Open / save / export flows ───────────────────────────────────────
 
-  describe('legacy compat shims', () => {
-    it('loadScene({kind:"glb",...}) routes to openBuiltin', async () => {
-      await store.loadScene({ kind: 'glb', url: '/models/Demo.glb', label: 'Demo' });
+  describe('open / save / export flows', () => {
+    it('openBuiltin loads the GLB base into the draft', async () => {
+      await store.openBuiltin('/models/Demo.glb', 'Demo');
       const snap = store.getSnapshot();
       expect(snap.draft?.base).toEqual(builtinDemo);
     });
 
-    it('createNewLayout(name) routes to newEmpty + saveAs', async () => {
-      const id = await store.createNewLayout('Empty A');
+    it('newEmpty + saveAs creates a named empty scene', async () => {
+      await store.newEmpty();
+      const id = await store.saveAs('Empty A');
       expect(id).toMatch(/^scn_/);
       expect(readScene(id)?.base.kind).toBe('empty');
       expect(readScene(id)?.name).toBe('Empty A');
     });
 
-    it('exportLayoutJSON triggers a download', () => {
+    it('exportSceneJSON triggers a download', () => {
       const seeded = writeScene({ ...makeDraftScene(builtinDemo, 'A'), id: newSceneId() });
       const orig = URL.createObjectURL;
       const created: string[] = [];
@@ -317,7 +343,7 @@ describe('SceneStore', () => {
         return u;
       };
       try {
-        store.exportLayoutJSON(seeded.id);
+        store.exportSceneJSON(seeded.id);
         expect(created.length).toBeGreaterThan(0);
       } finally {
         URL.createObjectURL = orig;

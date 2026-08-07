@@ -64,7 +64,7 @@ describe('RVViewer public API surface', () => {
   });
 
   it('has use() for plugin registration', () => {
-    expect(viewerSrc).toContain('use(plugin: RVViewerPlugin)');
+    expect(viewerSrc).toContain('use(plugin: RVViewerPlugin, origin?: PluginOrigin)');
   });
 
   it('has getPlugin()', () => {

@@ -45,6 +45,10 @@ export interface ComponentActionContext {
   readonly viewer: RVViewer;
   /** The component's `userData.realvirtual[componentType]` data snapshot. */
   readonly componentData: Record<string, unknown>;
+  /** The CONCRETE component key of the section, including any `_N` dedup
+   *  suffix (e.g. `Drive_1`) — actions registered against the base type use
+   *  this to address the exact instance (asset editor Remove). */
+  readonly componentType: string;
 }
 
 /**
@@ -57,8 +61,10 @@ export interface ComponentActionContext {
 export interface ComponentAction {
   /** Unique within its component type. Used as React key + analytics tag. */
   readonly id: string;
-  /** Short button label (1–3 words). Falls back to id when omitted. */
-  readonly label?: string;
+  /** Short button label (1–3 words). Falls back to id when omitted. A function
+   *  form receives the ctx per render — used by two-click confirm actions
+   *  ("Unbind all" → "Confirm unbind all", plan-325). */
+  readonly label?: string | ((ctx: ComponentActionContext) => string);
   /** Optional MUI icon component rendered before the label. */
   readonly icon?: ComponentType<{ sx?: object }>;
   /** Optional tooltip — explains the effect of clicking. */

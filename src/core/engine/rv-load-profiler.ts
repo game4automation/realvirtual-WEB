@@ -14,10 +14,13 @@
 import { isDebugEnabled, debug } from './rv-debug';
 
 /** A single measured phase. */
-interface PhaseTiming {
+export interface PhaseTiming {
   phase: string;
   ms: number;
 }
+
+/** Synchronous CPU self-time accumulated for one nested load operation. */
+export type LoadSelfTimings = Readonly<Record<string, Readonly<Record<string, number>>>>;
 
 /** Profiler instance returned by createLoadProfiler(). */
 export interface LoadProfiler {
@@ -25,6 +28,17 @@ export interface LoadProfiler {
   mark(phase: string): void;
   /** Emit a duration-sorted table when 'perf' is enabled; no-op otherwise. */
   report(): void;
+  /**
+   * Structured access to the recorded phase timings (plan-274 Phase 0).
+   * Unlike report() this is NOT gated on the 'perf' debug category — callers
+   * (e.g. loadGLB filling LoadResult.mergeMs) read it programmatically.
+   * Returns the live array in mark() order; treat as read-only.
+   */
+  getTimings(): readonly PhaseTiming[];
+  /** Add synchronous CPU self-time for a nested operation/substep pair. */
+  addSelfTime(operation: string, substep: string, ms: number): void;
+  /** Structured snapshot of all accumulated synchronous CPU self-times. */
+  getSelfTimings(): LoadSelfTimings;
 }
 
 /**
@@ -33,6 +47,7 @@ export interface LoadProfiler {
  */
 export function createLoadProfiler(label: string): LoadProfiler {
   const timings: PhaseTiming[] = [];
+  const selfTimings: Record<string, Record<string, number>> = {};
   let last = performance.now();
 
   return {
@@ -40,6 +55,27 @@ export function createLoadProfiler(label: string): LoadProfiler {
       const now = performance.now();
       timings.push({ phase, ms: now - last });
       last = now;
+    },
+
+    getTimings(): readonly PhaseTiming[] {
+      return timings;
+    },
+
+    addSelfTime(operation: string, substep: string, ms: number): void {
+      let group = selfTimings[operation];
+      if (!group) {
+        group = {};
+        selfTimings[operation] = group;
+      }
+      group[substep] = (group[substep] ?? 0) + ms;
+    },
+
+    getSelfTimings(): LoadSelfTimings {
+      const snapshot: Record<string, Readonly<Record<string, number>>> = {};
+      for (const [operation, values] of Object.entries(selfTimings)) {
+        snapshot[operation] = { ...values };
+      }
+      return snapshot;
     },
 
     report(): void {
@@ -57,6 +93,10 @@ export function createLoadProfiler(label: string): LoadProfiler {
       // console.table renders the sorted rows nicely in DevTools.
       if (typeof console !== 'undefined' && typeof console.table === 'function') {
         console.table(rows);
+      }
+      for (const [operation, values] of Object.entries(selfTimings)) {
+        const selfTotal = Object.values(values).reduce((sum, ms) => sum + ms, 0);
+        debug('perf', `${label}/${operation}: self ${selfTotal.toFixed(2)} ms`, values);
       }
     },
   };

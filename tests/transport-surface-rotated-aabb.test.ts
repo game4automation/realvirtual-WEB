@@ -142,11 +142,11 @@ describe('RVTransportSurface — child-sensor geometry excluded from footprint',
     expect(surface.aabb.halfSize.y).toBeCloseTo(0.05, 3);
   });
 
-  it('excludes a merged kinematic-group chunk', () => {
-    const merged = new Mesh(new BoxGeometry(3.0, 0.5, 0.2), new MeshBasicMaterial());
-    merged.name = '__kinGroupMerge_Transport-Z_0';
-    merged.userData._rvKinGroupMerged = true;
-    const surface = makeSurfaceWithChild(merged);
+  it('excludes a BatchedMesh render arena', () => {
+    const arena = new Mesh(new BoxGeometry(3.0, 0.5, 0.2), new MeshBasicMaterial());
+    arena.name = '__driveUberBatch_Transport-Z';
+    arena.userData._rvBatchedRender = true;
+    const surface = makeSurfaceWithChild(arena);
     surface.updateAABB();
     expect(surface.aabb.halfSize.x).toBeCloseTo(0.1, 3);
   });

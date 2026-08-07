@@ -129,7 +129,7 @@ HMI button press / LogicStep / Drive feedback
     ▼
 SignalStore.subscribe() callback
     │
-    │  Only for 'output' direction signals
+    │  Only for 'input' direction signals (PLC inputs — realvirtual writes them)
     │  Writes to: dirtyOutgoing Map<string, bool|number>
     ▼
 onFixedUpdatePost(dt)             ← called at 60 Hz, AFTER drive physics
@@ -243,14 +243,54 @@ Signal type strings from C# map to:
 | C# Type | SignalType | SignalDirection | Example |
 |---------|-----------|-----------------|---------|
 | `PLCInputBool` | `bool` | `input` | Sensor occupied |
-| `PLCOutputBool` | `bool` | `output` | Start button |
+| `PLCOutputBool` | `bool` | `output` | Motor running feedback |
 | `PLCInputFloat` | `float` | `input` | Drive speed |
 | `PLCOutputFloat` | `float` | `output` | Speed setpoint |
 | `PLCInputInt` | `int` | `input` | Counter value |
 | `PLCOutputInt` | `int` | `output` | Program number |
 
-- **Input** = PLC writes, realvirtual WEB reads (the PLC provides this value)
-- **Output** = realvirtual WEB writes, PLC reads (realvirtual WEB provides this value)
+Direction is named from the **PLC's** point of view, exactly as in Unity:
+
+- **Input** = the PLC reads it, realvirtual writes it (an HMI start button, a setpoint)
+- **Output** = the PLC writes it, realvirtual reads it (an encoder position, a program number)
+
+Source of truth: `plcTypeForSignalDescriptor()` in `src/interfaces/base-industrial-interface.ts`
+(`direction === 'input' ? 'PLCInput' : 'PLCOutput'`).
+
+### MQTT: direction is user configuration
+
+MQTT carries no direction. A topic is just a name, so nothing in the protocol says whether a
+value is produced by the machine or written to it — and realvirtual deliberately does **not**
+guess one from the topic text.
+
+- **Via CONNECT** (MQTT interface in the Connect window): the direction is chosen by hand per
+  signal — *Edit signal → Direction* — and persisted into the CONNECT interface config, so it
+  survives a reconnect. A signal switched to *Write to PLC* (`PLCInput…`) publishes to its own
+  concrete topic. Publishing additionally requires **Allow Web → PLC writes**, which is an
+  **interface-wide** switch, not a per-signal one.
+- Changing only the direction never changes the data type: the dialog keeps the signal's
+  `dataType`, and derives it from the wire type (`…Float` → `Float`, `…Text` → `String`) when the
+  stored value is missing or blank, before falling back to the schema default.
+- The **browser-direct** `MqttInterface` (`src/interfaces/mqtt-interface.ts`) is a different code
+  path with a different rule: it derives the direction from an `in/` / `out/` segment in the topic.
+  That convention applies only to that plugin's own topic prefix and is intentionally not shared
+  with the CONNECT path.
+
+### MQTT signal list: derived topic tree
+
+Single-topic MQTT signals (one topic per signal, as opposed to the ProcessImage byte arrays) live
+in the interface's flat `signals[]` list. The Connect signal list derives a **topic tree** from
+their addresses — `rv/demo/out/OpenDoor` renders as `rv` > `demo` > `out` > signal.
+
+- The tree is derived only, never configured: no wildcard groups enter the interface config, so
+  receive path, publish path and address validation are unchanged.
+- Every level is its own collapsible node and shows the number of signals in its subtree; the
+  collapse state is persisted per interface.
+- Filtering keeps matching leaves, opens all their ancestor levels, and hides branches that hold
+  no match.
+- Applies to MQTT interfaces and to addresses that contain `/`. Configured topic entries
+  (`ProcessImage` **and** `Single` mode) stay single-level groups, and other protocols (S7,
+  Modbus, …) render flat as before.
 
 ## Integration with Drives
 
@@ -421,6 +461,108 @@ The `CtrlXInterface` extends `WebSocketRealtimeInterface` — same protocol, dif
 | Direct (bridge snap) | `ws://address:8080/` | None |
 
 The wire protocol (init, import, subscribe, data) is identical to WebSocket Realtime v2.
+
+## CONNECT gateway endpoints
+
+Besides the signal protocols above, the viewer talks to a local realvirtual CONNECT gateway over
+plain HTTP. Three of those endpoints describe the gateway itself and drive the CONNECT options
+window.
+
+### `GET /health`
+
+Always reachable, never behind the API key. Two fields were added for the self-update and both are
+**additive** — `version`, `build`, `buildDate` and `appVersion` are unchanged, so an older viewer
+against a newer gateway and a newer viewer against an older gateway both keep working.
+
+```json
+{
+  "status": "ok",
+  "version": "0.2.0", "build": 26, "buildDate": "2026-07-30",
+  "release": { "semver": "0.4.0-beta2", "channel": "beta", "build": 26 },
+  "updateSupported": true,
+  "stepImport": true, "jtImport": true
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `release.semver` | Full SemVer **including a prerelease suffix**. `version` cannot express one, which is why this field exists: a beta could otherwise not be confirmed after a restart. |
+| `release.channel` | `stable` or `beta`. Any prerelease means `beta`. |
+| `release.build` | Build number, same value as `build`. |
+| `updateSupported` | Whether this installation offers a self-update at all. |
+
+`updateSupported` is the feature flag: a viewer that does not find it shows no update surface,
+which is how older gateways stay silent instead of showing a control that cannot work. It is
+`false` for a build carrying its customer project inside the executable, without a configured API
+key, when the program directory cannot be renamed within, when the update is switched off in the
+configuration, and on Linux.
+
+### `GET /update/status`
+
+Requires the API key. Reports what is on offer and what an operation in flight is doing.
+
+```json
+{
+  "updateSupported": true,
+  "reason": null,
+  "current": { "semver": "0.2.0", "channel": "stable", "build": 26 },
+  "selectedChannel": "stable",
+  "channels": {
+    "stable": {
+      "candidate": { "channel": "stable", "semver": "0.3.0", "build": 31,
+                     "sha256": "…", "url": "https://…/download/versions/…exe" },
+      "sizeBytes": 248261120,
+      "isDowngrade": false,
+      "isChannelSwitch": false
+    }
+  },
+  "state": "idle",
+  "progress": null,
+  "jobReason": null,
+  "pinWillChange": false,
+  "pinPath": null
+}
+```
+
+- A channel is present only when its manifest resolves. A missing beta manifest is a normal state,
+  not an error, and produces no entry and no message.
+- `sizeBytes` is `null` when the server does not report a content length; the dialog then says the
+  size is unknown.
+- `pinWillChange` is true only inside a developer workspace whose `connect.lock.json` would be
+  rewritten, so the confirmation dialog can say a project file is about to change.
+- `state` runs `idle → checking → available → downloading → verifying → staging → restarting →
+  verifying-health` and ends in `succeeded`, `failed` or `rolled-back`.
+- When `updateSupported` is false, `reason` says why. The viewer shows a sentence only for
+  `no-api-key` and `no-write-permission`, which the operator can act on, and stays silent otherwise.
+
+### `POST /update/apply`
+
+Requires the API key and, from a browser, an allowed origin. The body is the **complete candidate**
+taken from `/update/status`, not just a version number:
+
+```json
+{ "candidate": { "channel": "stable", "semver": "0.3.0", "build": 31,
+                 "sha256": "…", "url": "https://…" } }
+```
+
+The gateway re-reads the manifest and compares the whole candidate against it. Any difference —
+including the same version with a different build or hash — is rejected with `manifest-changed`
+rather than installing something other than what was confirmed. A second call while an operation is
+running answers `409` with `update-in-progress`; a non-terminal operation keeps blocking across a
+restart.
+
+Both update endpoints check the API key **themselves** and refuse when none is configured, rather
+than relying on the global middleware, which passes everything through when no key is set.
+
+### Reading the result
+
+A reachable `/health` after the restart means the connection is back and nothing more. The
+operation is successful only when `/update/status` reports `succeeded`, because pin and job are
+committed after health is confirmed. A viewer that celebrates on `/health` would report success for
+an operation that is still able to roll back.
+
+If `/health` comes back with a release other than the confirmed one, that is a failure, not a
+success — the gateway is not the build the operator agreed to.
 
 ## Unity-Side Setup
 

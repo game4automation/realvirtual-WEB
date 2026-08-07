@@ -13,7 +13,8 @@ import { useMobileLayout } from '../../hooks/use-mobile-layout';
 import { WelcomeModal } from './WelcomeModal';
 import { useCustomBranding } from './branding-store';
 import { useKioskHasTour, startKioskFromWelcome } from '../../plugins/kiosk-plugin';
-import { useActiveContexts, evaluateVisibilityRule } from './ui-context-store';
+import { useActiveContexts, evaluateVisibilityRule, useUIVisible } from './ui-context-store';
+import { WELCOME_AUTO_OPEN_UI_ELEMENT_ID, WELCOME_AUTO_OPEN_VISIBILITY_RULE } from './welcome-modal-store';
 import { useMode } from '../../hooks/use-mode';
 
 /* Logo URL: use BASE_URL so it resolves correctly under sub-folder deploys (e.g. Bunny CDN /demo/) */
@@ -49,7 +50,23 @@ function BrandingContent() {
 const WELCOME_DISMISSED_KEY = 'rv-welcome-dismissed';
 
 export function LogoBadge() {
-  const [aboutOpen, setAboutOpen] = useState(() => !localStorage.getItem(WELCOME_DISMISSED_KEY));
+  // Two openings, kept in separate state on purpose:
+  //  - `manualOpen`  — the user clicked the logo. Honoured in every workspace.
+  //  - `autoPending` — first visit in this browser; the dialog shows itself.
+  const [manualOpen, setManualOpen] = useState(false);
+  const [autoPending, setAutoPending] = useState(() => !localStorage.getItem(WELCOME_DISMISSED_KEY));
+
+  // plan-387 (F4): in the Viewer workspace the dialog must not open ITSELF —
+  // it is a product pitch whose "Planner Demo" button is an authoring entry
+  // point, and a spectator following a shared link should see the machine.
+  // Gated through the rule system (id + `hiddenIn`) rather than by asking for
+  // the active mode, so a deployment can override it like any other chrome
+  // element. The logo stays visible and clickable; About remains reachable.
+  const autoOpenAllowed = useUIVisible(
+    WELCOME_AUTO_OPEN_UI_ELEMENT_ID,
+    WELCOME_AUTO_OPEN_VISIBILITY_RULE,
+  );
+  const aboutOpen = manualOpen || (autoPending && autoOpenAllowed);
 
   return (
     <>
@@ -64,7 +81,7 @@ export function LogoBadge() {
           borderRadius: 1,
           '&:hover': { backgroundColor: 'rgba(255,255,255,0.06)' },
         }}
-        onClick={() => setAboutOpen(true)}
+        onClick={() => setManualOpen(true)}
         title="About"
       >
         <BrandingContent />
@@ -72,7 +89,11 @@ export function LogoBadge() {
 
       <WelcomeModalHost
         open={aboutOpen}
-        onClose={() => { setAboutOpen(false); localStorage.setItem(WELCOME_DISMISSED_KEY, '1'); }}
+        onClose={() => {
+          setManualOpen(false);
+          setAutoPending(false);
+          localStorage.setItem(WELCOME_DISMISSED_KEY, '1');
+        }}
       />
     </>
   );

@@ -55,11 +55,13 @@ function setup(opts?: { inputs?: number; downstreams?: number; missingBelt?: boo
 
   const signalSubs = new Map<string, Set<(v: boolean | number) => void>>();
   const values = new Map<string, boolean | number>();
+  let setSensorState: ((occupied: boolean) => void) | null = null;
   const signalStore = {
     get: (n: string) => values.get(n),
     set: (n: string, v: boolean | number) => {
       values.set(n, v);
       signalSubs.get(n)?.forEach((cb) => cb(v));
+      if (n === 'Sensor') setSensorState?.(v === true);
     },
     subscribe: (n: string, cb: (v: boolean | number) => void) => {
       let s = signalSubs.get(n); if (!s) { s = new Set(); signalSubs.set(n, s); }
@@ -146,6 +148,23 @@ function setup(opts?: { inputs?: number; downstreams?: number; missingBelt?: boo
     drives: opts?.missingBelt ? [rotary] : [rotary, belt],
     registry: null,                                // no component registry → flow fallback
     getPlugin: (id: string) => (id === 'snap-point' ? snapPlugin : undefined),
+  };
+  const sensorListeners = new Set<() => void>();
+  const sensor = {
+    node: sensorNode,
+    occupied: false,
+    addFeedbackListener(cb: () => void) { sensorListeners.add(cb); },
+    removeFeedbackListener(cb: () => void) { sensorListeners.delete(cb); },
+  };
+  setSensorState = (occupied) => {
+    if (sensor.occupied === occupied) return;
+    sensor.occupied = occupied;
+    for (const listener of sensorListeners) listener();
+  };
+  (host as unknown as { transportManager: { sensors: typeof sensor[]; surfaces: unknown[]; mus: unknown[] } }).transportManager = {
+    sensors: [sensor],
+    surfaces: [],
+    mus: [],
   };
 
   const accum: KinematicsSpec = {};
@@ -311,40 +330,43 @@ describe('Turntable behavior — multi-input cycle', () => {
   });
 });
 
-describe('Turntable behavior — fair input selection', () => {
-  afterEach(() => { vi.restoreAllMocks(); });
+describe('Turntable behavior — round-robin input selection', () => {
+  /** Drive idle → ALIGNING_IN → RECEIVING (a refresh window then the align finishes). */
+  function receive(s: ReturnType<typeof setup>): void {
+    pump(s.handle, 0.6);                                       // refresh → tryReceive → ALIGNING_IN
+    s.rotary.isAtTarget = true; iterateFixedUpdate(s.handle, DT); // → RECEIVING the picked input
+  }
+  /** Discharge the good on the platform back out, returning the disc to IDLE. */
+  function dischargeToIdle(s: ReturnType<typeof setup>): void {
+    s.signalStore.set('Sensor', true);                        // captured → dispatch (output is free)
+    s.rotary.isAtTarget = true; iterateFixedUpdate(s.handle, DT); // → DISCHARGING
+    s.signalStore.set('Sensor', false);                       // → DISCHARGE_CLEARING
+    pump(s.handle, 0.66);                                      // dwell elapses → IDLE
+  }
 
-  /** Drive idle → ALIGNING_IN → RECEIVING with both inputs already waiting. */
-  function receiveWithBothWaiting(s: ReturnType<typeof setup>): void {
+  it('alternates between two waiting inputs across cycles (deterministic, no random)', () => {
+    const s = setup({ inputs: 2, downstreams: 1 });
     s.signalStore.set('Conv0.Flow.Occupied', false);
     s.signalStore.set('Flow.Run', true);
     s.setInputWaiting(0, true);
     s.setInputWaiting(1, true);
-    iterateFixedUpdate(s.handle, DT);                          // tryReceive → ALIGNING_IN
-    s.rotary.isAtTarget = true; iterateFixedUpdate(s.handle, DT); // → RECEIVING the picked input
-  }
 
-  it('honours the random pick: input1 is served when random points to it', () => {
-    // floor(0.99 * 2 inputs) = 1 → ready[1] = input1 (NOT the deterministic-first input0).
-    vi.spyOn(Math, 'random').mockReturnValue(0.99);
-    const s = setup({ inputs: 2, downstreams: 1 });
-    receiveWithBothWaiting(s);
-    expect(s.portOcc('tt-in1')).toBe(false);                   // input1 port OPEN — it was chosen
-    expect(s.portOcc('tt-in0')).toBe(true);                    // input0 still blocked
+    receive(s);
+    expect(s.portOcc('tt-in0')).toBe(false);                  // cycle 1: fresh cursor → first input
+    dischargeToIdle(s);
+
+    receive(s);
+    expect(s.portOcc('tt-in1')).toBe(false);                  // cycle 2: cursor rotates on → the other input
   });
 
-  it('does not starve: over many cycles both inputs get selected (real random)', () => {
-    // With deterministic .find() this would always pick input0. With a fair random pick,
-    // both inputs must appear as chosen across many independent idle→receive cycles.
-    const chosen = new Set<string>();
-    for (let trial = 0; trial < 40; trial++) {
-      const s = setup({ inputs: 2, downstreams: 1 });
-      receiveWithBothWaiting(s);
-      if (s.portOcc('tt-in0') === false) chosen.add('in0');
-      if (s.portOcc('tt-in1') === false) chosen.add('in1');
-    }
-    expect(chosen.has('in0')).toBe(true);
-    expect(chosen.has('in1')).toBe(true);                      // would fail with first-match selection
+  it('serves the only waiting input even when the round-robin next one is empty', () => {
+    const s = setup({ inputs: 2, downstreams: 1 });
+    s.signalStore.set('Conv0.Flow.Occupied', false);
+    s.signalStore.set('Flow.Run', true);
+    s.setInputWaiting(1, true);                                // only in1 waits; in0 is empty
+    receive(s);
+    expect(s.portOcc('tt-in1')).toBe(false);                  // round-robin skips the empty in0
+    expect(s.portOcc('tt-in0')).toBe(true);
   });
 });
 

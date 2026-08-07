@@ -20,10 +20,13 @@ import type {
   SimulationTopology,
 } from '../core/material-flow/simulation-executor';
 import type { MaterialFlowDefinition } from '../core/material-flow/define-material-flow';
+import type { CoreSubsystems } from '../core/engine/rv-core-subsystems';
 
-/** Factory the private DES side provides; `null` in the public build. */
+/** Factory the private DES side provides; `null` in the public build. The
+ *  optional `core` is the viewer's CoreSubsystems pipeline the DES runner
+ *  composes into its tick (drives/visuals keep running at 60 Hz). */
 export type CreateDesRunner =
-  | ((defs: MaterialFlowDefinition[], topology: SimulationTopology) => SimulationExecutor)
+  | ((defs: MaterialFlowDefinition[], topology: SimulationTopology, core?: CoreSubsystems) => SimulationExecutor)
   | null;
 
 /** Public build: no DES runner available. */

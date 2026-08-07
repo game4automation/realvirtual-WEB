@@ -8,7 +8,7 @@
  * consumedOnly filter support, and per-component reset.
  */
 
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, type KeyboardEvent } from 'react';
 import {
   Box,
   Typography,
@@ -19,12 +19,15 @@ import { ExpandMore, ChevronRight } from '@mui/icons-material';
 import type { RVViewer } from '../rv-viewer';
 import type { SignalStore } from '../engine/rv-signal-store';
 import { getConsumedFields } from '../engine/rv-extras-validator';
-import { getFieldDescriptor, isFieldDisplayReadonly } from '../engine/rv-component-registry';
+import { getFieldDescriptor, getSignalSlotFields, isFieldDisplayReadonly, isSignalSlotField } from '../engine/rv-component-registry';
+import { ComponentSignalSlots } from '../../plugins/signal-bind/InlineSignalSlots';
+import { signalTypeBadgeColor } from './signal-colors';
 import {
   baseComponentType,
   classifyField,
   componentColor,
   formatDisplayValue,
+  getFieldUnit,
   getSignalHeaderColor,
   inferFieldType,
   isComponentRef,
@@ -43,6 +46,10 @@ import { componentActionRegistry, type ComponentActionContext } from './rv-compo
 
 const LS_KEY_COLLAPSED = 'rv-inspector-collapsed';
 const LS_KEY_SECTION_COLLAPSED = 'rv-inspector-section-collapsed';
+const INK_HIGH = 'rgba(255,255,255,0.92)';
+const INK_MED = 'rgba(255,255,255,0.7)';
+const INK_LOW = 'rgba(255,255,255,0.5)';
+const HIT_MIN = 24;
 
 /** Module-level caches to avoid re-parsing localStorage on every toggle. */
 let _collapsedCache: Set<string> | null = null;
@@ -118,6 +125,15 @@ export function isRuntimeRow(value: unknown): value is RuntimeRowSpec {
   return typeof value === 'object' && value !== null && (value as RuntimeRowSpec).__runtimeRow === true;
 }
 
+function activateOnKey(handler: () => void) {
+  return (event: KeyboardEvent<HTMLElement>): void => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      handler();
+    }
+  };
+}
+
 /** A single read-only label/value row for the `readOnlyLive` mode — same
  *  visual language as the editable field rows, but never an editor. Resolves
  *  a {@link RuntimeRowSpec} (color + clickable navigation) or a raw value. */
@@ -129,20 +145,32 @@ function ReadOnlyLiveRow({ fieldName, value }: { fieldName: string; value: unkno
     <InspectorRow
       label={fieldName}
       labelTitle={fieldName}
-      labelColor="text.disabled"
-      minHeight={22}
+      labelColor={INK_LOW}
+      minHeight={HIT_MIN}
       py={0.15}
     >
       <Typography
         onClick={spec?.onClick}
+        role={clickable ? 'button' : undefined}
+        tabIndex={clickable ? 0 : undefined}
+        onKeyDown={clickable ? activateOnKey(() => spec?.onClick?.()) : undefined}
         sx={{
           fontSize: 11,
+          fontFamily: 'monospace',
           color: spec?.color ?? 'text.primary',
           fontWeight: spec?.color ? 600 : 500,
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
-          ...(clickable ? { cursor: 'pointer', '&:hover': { textDecoration: 'underline' } } : {}),
+          ...(clickable ? {
+            display: 'flex',
+            alignItems: 'center',
+            minWidth: HIT_MIN,
+            minHeight: HIT_MIN,
+            cursor: 'pointer',
+            '&:hover': { textDecoration: 'underline' },
+            '&:focus-visible': { outline: '1px solid #4fc3f7', outlineOffset: 1, borderRadius: 0.5 },
+          } : {}),
         }}
       >
         {text}
@@ -180,7 +208,12 @@ export interface ComponentSectionProps {
 }
 
 export function ComponentSection({ nodePath, componentType, data, overriddenFields, consumedOnly, signalValue, headerAction, extraContent, readOnlyLive, onFieldEdit, onFieldReset, onResetComponent, viewer, signalStore }: ComponentSectionProps) {
-  const color = componentColor(componentType);
+  // A PLCInput/PLCOutput section header is a pure TYPE badge — it names the
+  // direction while no value is in play, so the hue stays but the intensity is
+  // always `weak` (plan-341 §2.8 b). Every other component keeps its type colour.
+  const color = isSignalComponentType(componentType)
+    ? signalTypeBadgeColor(componentType)
+    : componentColor(componentType);
   const base = baseComponentType(componentType);
   const expandKey = `${nodePath}:${componentType}`;
   const [showOther, setShowOther] = useState(() => !loadCollapsedSet().has(expandKey));
@@ -231,6 +264,11 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
     for (const [key, value] of Object.entries(data)) {
       if (key.startsWith('_')) continue;
       if (isFieldHidden(base, key)) continue;
+      // Rendering-precedence contract (plan-325 S3/S4): signal-slot keys are
+      // removed from the generic FieldRow pipeline ENTIRELY — SignalSlotRow is
+      // their only render path (also for value === null/undefined, where
+      // inferFieldType would misclassify them as 'string' and open an editor).
+      if (isSignalSlotField(base, key)) continue;
       // A read-only schema field (readonly:true OR scope:'des') renders its value
       // but never an editor → route it into the read-only ("other") branch rather
       // than the consumed/editable one. The "(DES)" tag is added by FieldRow.
@@ -271,7 +309,7 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
     if (!viewer || actions.length === 0) return null;
     const node = viewer.registry?.getNode(nodePath);
     if (!node) return null;
-    return { node, nodePath, viewer, componentData: data };
+    return { node, nodePath, viewer, componentData: data, componentType };
     // actionTick is intentionally in deps so the ctx identity changes on
     // click — drives the actions.map() loop to re-evaluate isActive().
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -300,13 +338,19 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
         >
           <Box
             onClick={toggleSection}
+            role="button"
+            tabIndex={0}
+            aria-expanded={sectionExpanded}
+            onKeyDown={activateOnKey(toggleSection)}
             sx={{
               display: 'flex',
               alignItems: 'center',
               gap: 0.25,
+              minHeight: HIT_MIN,
               cursor: 'pointer',
               userSelect: 'none',
               '&:hover .rv-comp-title': { textDecoration: 'underline' },
+              '&:focus-visible': { outline: '1px solid #4fc3f7', outlineOffset: 1, borderRadius: 0.5 },
             }}
           >
             {sectionExpanded
@@ -314,13 +358,13 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
               : <ChevronRight sx={{ fontSize: 14, color: color }} />}
             <Typography
               className="rv-comp-title"
-              sx={{ fontSize: 10, fontWeight: 700, color: color, letterSpacing: 0.5, textTransform: 'uppercase' }}
+              sx={{ fontSize: 11, fontWeight: 700, color: color, letterSpacing: 0.5, textTransform: 'uppercase' }}
             >
               {componentType}
             </Typography>
           </Box>
           {signalValue != null && (
-            <Typography sx={{ fontSize: 10, fontWeight: 600, fontFamily: 'monospace', ml: 'auto', color: getSignalHeaderColor(componentType, String(signalValue)) }}>
+            <Typography sx={{ fontSize: 11, fontWeight: 600, fontFamily: 'monospace', ml: 'auto', color: getSignalHeaderColor(componentType, String(signalValue)) }}>
               {signalValue}
             </Typography>
           )}
@@ -345,23 +389,23 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
     return (
       <Box>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, px: 1, py: 0.375, bgcolor: color + '11', borderBottom: `1px solid ${color}22`, borderTop: `1px solid ${color}22` }}>
-          <Typography sx={{ fontSize: 10, fontWeight: 700, color, letterSpacing: 0.5, textTransform: 'uppercase' }}>
+          <Typography sx={{ fontSize: 11, fontWeight: 700, color, letterSpacing: 0.5, textTransform: 'uppercase' }}>
             {`Signal (${signalTypeLabel(componentType)})`}
           </Typography>
-          <Typography sx={{ fontSize: 10, fontWeight: 600, fontFamily: 'monospace', ml: 'auto', color: valueColor }}>
+          <Typography sx={{ fontSize: 11, fontWeight: 600, fontFamily: 'monospace', ml: 'auto', color: valueColor }}>
             {valueText}
           </Typography>
           {headerAction}
         </Box>
         <Box sx={{ display: 'flex', alignItems: 'center', px: 1, py: 0.15 }}>
-          <Typography sx={{ fontSize: 10, color: 'text.disabled', width: 64, flexShrink: 0 }}>Symbol</Typography>
+          <Typography sx={{ fontSize: 11, color: INK_LOW, width: 64, flexShrink: 0 }}>Symbol</Typography>
           <Tooltip title={symbol} placement="top">
-            <Typography sx={{ fontSize: 10, color: 'text.secondary', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{symbol}</Typography>
+            <Typography sx={{ fontSize: 11, fontFamily: 'monospace', color: INK_MED, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{symbol}</Typography>
           </Tooltip>
         </Box>
         <Box sx={{ display: 'flex', alignItems: 'center', px: 1, py: 0.15 }}>
-          <Typography sx={{ fontSize: 10, color: 'text.disabled', width: 64, flexShrink: 0 }}>Value</Typography>
-          <Typography sx={{ fontSize: 10, color: valueColor, fontWeight: 500 }}>{valueText}</Typography>
+          <Typography sx={{ fontSize: 11, color: INK_LOW, width: 64, flexShrink: 0 }}>Value</Typography>
+          <Typography sx={{ fontSize: 11, fontFamily: 'monospace', color: valueColor, fontWeight: 500 }}>{valueText}</Typography>
         </Box>
         {extraContent}
       </Box>
@@ -385,13 +429,19 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
       >
         <Box
           onClick={toggleSection}
+          role="button"
+          tabIndex={0}
+          aria-expanded={sectionExpanded}
+          onKeyDown={activateOnKey(toggleSection)}
           sx={{
             display: 'flex',
             alignItems: 'center',
             gap: 0.25,
+            minHeight: HIT_MIN,
             cursor: 'pointer',
             userSelect: 'none',
             '&:hover .rv-comp-title': { textDecoration: 'underline' },
+            '&:focus-visible': { outline: '1px solid #4fc3f7', outlineOffset: 1, borderRadius: 0.5 },
           }}
         >
           {sectionExpanded
@@ -400,7 +450,7 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
           <Typography
             className="rv-comp-title"
             sx={{
-              fontSize: 10,
+              fontSize: 11,
               fontWeight: 700,
               color: color,
               letterSpacing: 0.5,
@@ -413,7 +463,7 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
         {signalValue != null && (
           <Typography
             sx={{
-              fontSize: 10,
+              fontSize: 11,
               fontWeight: 600,
               fontFamily: 'monospace',
               ml: 'auto',
@@ -428,12 +478,20 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
           <Tooltip title="Click to reset all overrides for this component" placement="top">
             <Typography
               onClick={(e) => { e.stopPropagation(); onResetComponent(); }}
+              role="button"
+              tabIndex={0}
+              aria-label={`Reset ${overriddenFields.size} override${overriddenFields.size !== 1 ? 's' : ''} for ${componentType}`}
+              onKeyDown={activateOnKey(onResetComponent)}
               sx={{
-                fontSize: 9,
+                display: 'flex',
+                alignItems: 'center',
+                minHeight: HIT_MIN,
+                fontSize: 11,
                 color: '#4fc3f7',
                 ml: 'auto',
                 cursor: 'pointer',
-                '&:hover': { color: '#ffa726', textDecoration: 'underline' },
+                '&:hover': { color: INK_HIGH, textDecoration: 'underline' },
+                '&:focus-visible': { outline: '1px solid #4fc3f7', outlineOffset: 1, borderRadius: 0.5 },
               }}
             >
               {overriddenFields.size} override{overriddenFields.size !== 1 ? 's' : ''}
@@ -442,11 +500,17 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
         )}
       </Box>
 
+      {sectionExpanded && (
+      // Padded body — adds breathing room before the first field (after the
+      // header) and after the last field (before the next component section).
+      <Box sx={{ py: 1 }}>
       {/* Consumed (editable) fields */}
-      {sectionExpanded && consumedEntries.map(([fieldName, value]) => {
+      {consumedEntries.map(([fieldName, value]) => {
         // Check for a custom field renderer plugin
         const CustomRenderer = fieldRendererRegistry.getRenderer(componentType, fieldName);
         if (CustomRenderer) {
+          // The custom renderer spans the full section-body width and aligns its
+          // own title/rows to the inspector's label/value columns internally.
           return (
             <CustomRenderer
               key={fieldName}
@@ -471,9 +535,24 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
             viewer={viewer}
             signalStore={signalStore}
             descriptor={getFieldDescriptor(base, fieldName)}
+            unit={getFieldUnit(base, fieldName)}
           />
         );
       })}
+
+      {/* Inline signal-slot rows (plan-325): EVERY componentRef+signal schema
+          field renders as a SignalSlotRow — also when the GLB has no value.
+          The keys were removed from the FieldRow pipeline above; binding runs
+          through SignalBindingManager + persistence, never onFieldEdit. */}
+      {getSignalSlotFields(base).length > 0 && (
+        <ComponentSignalSlots
+          viewer={viewer}
+          signalStore={signalStore}
+          nodePath={nodePath}
+          componentType={componentType}
+          data={data}
+        />
+      )}
 
       {/* Action buttons contributed by plugins (e.g. Splat Invert X/Y/Z,
           Drive Jog, Sensor Reset). Rendered between consumed fields and the
@@ -482,7 +561,7 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
           Styling: theme primary accent — intentionally NOT the component's
           own color, so the buttons read consistently across all sections and
           stand out from the section's text/header tint. */}
-      {sectionExpanded && actions.length > 0 && actionCtx && (
+      {actions.length > 0 && actionCtx && (
         <Box sx={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: 0.5, px: 1, py: 0.5 }}>
           {actions.map((action) => {
             // Per-render visibility check — lets plugins hide actions based
@@ -513,7 +592,7 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
                   height: 24,
                   px: 0.75,
                   py: 0,
-                  fontSize: 10,
+                  fontSize: 11,
                   fontWeight: 600,
                   textTransform: 'none',
                   // Custom color path — overrides MUI's color prop. Active
@@ -530,7 +609,7 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
                   } : {}),
                 }}
               >
-                {action.label ?? action.id}
+                {typeof action.label === 'function' ? action.label(actionCtx) : action.label ?? action.id}
               </Button>
             );
             return action.tooltip
@@ -540,27 +619,37 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
         </Box>
       )}
 
-      {/* Collapsible other (read-only) fields — hidden when consumedOnly is active */}
-      {sectionExpanded && !consumedOnly && otherEntries.length > 0 && (
+      {/* Collapsible other (read-only) fields — hidden when consumedOnly is active.
+          Exception: a component with NO consumed fields at all is pure metadata (JTData,
+          CADLink). For those the filter would leave an empty section behind, so their values
+          stay visible — the filter exists to hide diagnostic noise next to real fields, not to
+          blank out a component that has nothing else to show. */}
+      {(!consumedOnly || consumedEntries.length === 0) && otherEntries.length > 0 && (
         <>
           <Box
             onClick={toggleOther}
+            role="button"
+            tabIndex={0}
+            aria-expanded={showOther}
+            onKeyDown={activateOnKey(toggleOther)}
             sx={{
               display: 'flex',
               alignItems: 'center',
+              minHeight: HIT_MIN,
               px: 1,
               py: 0.125,
               cursor: 'pointer',
               '&:hover': { bgcolor: 'rgba(255,255,255,0.02)' },
+              '&:focus-visible': { outline: '1px solid #4fc3f7', outlineOffset: -1 },
             }}
           >
             <ExpandMore sx={{
               fontSize: 12,
-              color: 'text.disabled',
+              color: INK_LOW,
               transform: showOther ? 'rotate(0deg)' : 'rotate(-90deg)',
               transition: 'transform 0.15s',
             }} />
-            <Typography sx={{ fontSize: 9, color: 'text.disabled', ml: 0.25 }}>
+            <Typography sx={{ fontSize: 11, color: INK_LOW, ml: 0.25 }}>
               {otherEntries.length} more field{otherEntries.length !== 1 ? 's' : ''}
             </Typography>
           </Box>
@@ -576,12 +665,15 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
               viewer={viewer}
               signalStore={signalStore}
               descriptor={getFieldDescriptor(base, fieldName)}
+              unit={getFieldUnit(base, fieldName)}
             />
           ))}
         </>
       )}
 
-      {sectionExpanded && extraContent}
+      {extraContent}
+      </Box>
+      )}
     </Box>
   );
 }

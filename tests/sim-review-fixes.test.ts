@@ -193,7 +193,7 @@ describe('FIX #4 — grip auto-place rotation aligns in world space', () => {
     const muNode = new Object3D(); scene.add(muNode);
     const mu = new RVMovingUnit(muNode, 'src', new Vector3(0.05, 0.05, 0.05));
     mu.parentBeforeGrip = interim;
-    mu.isGripped = true;
+    mu.heldBy = 'grip';
 
     const grip = new RVGrip(new Object3D());
     scene.add(grip.node);

@@ -47,7 +47,7 @@ export function AiActivityOverlay() {
         bgcolor: alpha(accent, 0.95),
         border: `1px solid ${accent}`,
         boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
-        backdropFilter: 'blur(6px)',
+        backdropFilter: 'blur(calc(6px * var(--rv-ui-blur-scale, 1)))',
         maxWidth: 'min(40vw, 320px)',
       }}
     >

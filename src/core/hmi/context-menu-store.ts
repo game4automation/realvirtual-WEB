@@ -30,22 +30,42 @@ export interface ContextMenuTarget {
   hitNormal?: [number, number, number];
 }
 
+/** Inline text-input row (e.g. "New group…"). Mutually exclusive with action. */
+export interface ContextMenuInputSpec {
+  placeholder?: string;
+  initialValue?: string;
+  onSubmit: (value: string, target: ContextMenuTarget) => void;
+}
+
 export interface ContextMenuItem {
   id: string;
   label: string | ((target: ContextMenuTarget) => string);
   icon?: string;
-  action: (target: ContextMenuTarget) => void;
+  action?: (target: ContextMenuTarget) => void;
+  /** Cascading submenu — static list or resolver evaluated at open() time. */
+  children?: ContextMenuItem[] | ((target: ContextMenuTarget) => ContextMenuItem[]);
+  /** Inline text-input row. When set, the item renders as a text field. */
+  input?: ContextMenuInputSpec;
+  /** Keyboard-shortcut hint rendered right-aligned (Blender style, e.g. 'F').
+   *  While the menu is CLOSED the key binding lives with the item's owner;
+   *  while it is OPEN, ContextMenuLayer chord-activates the matching item of
+   *  the visible level (action items run, submenu items descend) — so S › I
+   *  works without the mouse. Single characters only take part in chords. */
+  shortcut?: string;
   condition?: (target: ContextMenuTarget) => boolean;
   order?: number;
   danger?: boolean;
   dividerBefore?: boolean;
 }
 
-/** Resolved item in snapshot — labels pre-resolved to strings. */
+/** Resolved item in snapshot — labels pre-resolved to strings, submenus resolved. */
 export interface ResolvedContextMenuItem {
   id: string;
   resolvedLabel: string;
-  action: (target: ContextMenuTarget) => void;
+  action?: (target: ContextMenuTarget) => void;
+  children?: ResolvedContextMenuItem[];
+  input?: ContextMenuInputSpec;
+  shortcut?: string;
   order: number;
   danger?: boolean;
   dividerBefore?: boolean;
@@ -111,41 +131,20 @@ export class ContextMenuStore {
    * sorts by order. If zero items pass, menu stays closed.
    */
   open(pos: { x: number; y: number }, target: ContextMenuTarget): void {
-    const resolved: ResolvedContextMenuItem[] = [];
-
-    for (const items of this._registrations.values()) {
-      for (const item of items) {
-        // Evaluate condition with error isolation
-        if (item.condition) {
-          try {
-            if (!item.condition(target)) continue;
-          } catch {
-            continue; // Errors treated as false
-          }
-        }
-
-        // Resolve label eagerly
-        let resolvedLabel: string;
-        if (typeof item.label === 'function') {
-          try {
-            resolvedLabel = item.label(target);
-          } catch {
-            resolvedLabel = '(error)';
-          }
-        } else {
-          resolvedLabel = item.label;
-        }
-
-        resolved.push({
-          id: item.id,
-          resolvedLabel,
-          action: item.action,
-          order: item.order ?? 100,
-          danger: item.danger,
-          dividerBefore: item.dividerBefore,
-        });
-      }
+    const items: ContextMenuItem[] = [];
+    for (const regItems of this._registrations.values()) {
+      items.push(...regItems);
     }
+    this.openItems(pos, target, items);
+  }
+
+  /**
+   * Open the menu with an explicit item list, bypassing plugin registrations.
+   * Used by keyboard shortcuts that surface one submenu's content directly at
+   * the cursor (e.g. G → the Group picker). Same resolution rules as open().
+   */
+  openItems(pos: { x: number; y: number }, target: ContextMenuTarget, items: ContextMenuItem[]): void {
+    const resolved = this._resolveItems(items, target);
 
     // Don't open if no items matched
     if (resolved.length === 0) return;
@@ -160,6 +159,107 @@ export class ContextMenuStore {
       items: resolved,
     };
     this._notify();
+  }
+
+  /**
+   * Resolve items recursively: filter by condition (errors → false), resolve
+   * function labels, resolve submenu children (resolver errors → empty), sort
+   * children by order. Items whose resolved children are empty AND that have
+   * neither an action nor an input are dropped — this auto-hides submenu
+   * parents when nothing inside them is applicable.
+   */
+  private _resolveItems(items: ContextMenuItem[], target: ContextMenuTarget): ResolvedContextMenuItem[] {
+    const resolved: ResolvedContextMenuItem[] = [];
+    for (const item of items) {
+      // Evaluate condition with error isolation
+      if (item.condition) {
+        try {
+          if (!item.condition(target)) continue;
+        } catch {
+          continue; // Errors treated as false
+        }
+      }
+
+      // Resolve label eagerly
+      let resolvedLabel: string;
+      if (typeof item.label === 'function') {
+        try {
+          resolvedLabel = item.label(target);
+        } catch {
+          resolvedLabel = '(error)';
+        }
+      } else {
+        resolvedLabel = item.label;
+      }
+
+      // Resolve submenu children (resolver errors → empty list)
+      let children: ResolvedContextMenuItem[] | undefined;
+      if (item.children) {
+        let childItems: ContextMenuItem[];
+        if (typeof item.children === 'function') {
+          try {
+            childItems = item.children(target);
+          } catch {
+            childItems = [];
+          }
+        } else {
+          childItems = item.children;
+        }
+        children = this._resolveItems(childItems, target);
+        children.sort((a, b) => a.order - b.order);
+      }
+
+      // Drop submenu parents that resolved empty and have no own behavior
+      if (item.children && (!children || children.length === 0) && !item.action && !item.input) {
+        continue;
+      }
+
+      resolved.push({
+        id: item.id,
+        resolvedLabel,
+        action: item.action,
+        children,
+        input: item.input,
+        shortcut: item.shortcut,
+        order: item.order ?? 100,
+        danger: item.danger,
+        dividerBefore: item.dividerBefore,
+      });
+    }
+    return resolved;
+  }
+
+  // ─── Keyboard chords ───────────────────────────────────────────────
+
+  /**
+   * Item of the currently VISIBLE menu level whose `shortcut` matches the
+   * pressed key (case-insensitive, single characters only). First match in
+   * display order wins. Returns null while the menu is closed.
+   */
+  findByShortcut(key: string): ResolvedContextMenuItem | null {
+    if (!this._snapshot.open || key.length !== 1) return null;
+    const wanted = key.toLowerCase();
+    for (const item of this._snapshot.items) {
+      if (item.shortcut && item.shortcut.length === 1 && item.shortcut.toLowerCase() === wanted) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Replace the visible items with a submenu item's (already resolved)
+   * children — the chord equivalent of hovering into the submenu, Blender
+   * style: the menu narrows to that level in place. Returns false when the
+   * item is not in the current level or has no children.
+   */
+  descendInto(id: string): boolean {
+    if (!this._snapshot.open) return false;
+    const item = this._snapshot.items.find((i) => i.id === id);
+    if (!item?.children?.length) return false;
+    this._snapshot = { ...this._snapshot, items: item.children };
+    this._notify();
+    return true;
   }
 
   /** Close the context menu. Idempotent — double close does not notify twice. */

@@ -42,7 +42,7 @@ export function SharedViewBanner() {
         bgcolor: 'rgba(21,101,192,0.95)',
         borderRadius: 2,
         boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
-        backdropFilter: 'blur(8px)',
+        backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
       }}>
         <Visibility sx={{ fontSize: 16, color: '#fff' }} />
         <Typography sx={{ fontSize: 12, fontWeight: 500, color: '#fff' }}>

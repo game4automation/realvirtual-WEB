@@ -37,10 +37,19 @@ export class UIPluginRegistry {
    *
    * If the plugin declares `modes` (plan-198), each of its slot entries is
    * auto-gated to those modes' UI contexts: a `shownOnlyInAny: ['mode:<id>', …]`
-   * rule is merged into the entry's `visibilityRule` (AND-combined with any
-   * existing `shownOnlyIn`/`hiddenIn`), and a `visibilityId` is assigned if
-   * absent (HMIShell only applies a rule when `visibilityId` is set). Plugins
-   * with no `modes` (shared) are untouched — backward compatible.
+   * rule is written into the entry's `visibilityRule`, and a `visibilityId` is
+   * assigned if absent (HMIShell only applies a rule when `visibilityId` is
+   * set). Plugins with no `modes` (shared) are untouched — backward compatible.
+   *
+   * Exactly what survives (the assignment below is a spread, not a merge):
+   * - OTHER rule keys are PRESERVED — a pre-existing `shownOnlyIn`/`hiddenIn`
+   *   on the entry survives and is AND-combined at evaluation time by
+   *   `evaluateVisibilityRule`.
+   * - A pre-existing `shownOnlyInAny` on the entry is REPLACED, not combined.
+   *   The plugin's `modes` win outright; the entry's own OR-list is lost.
+   *
+   * This is the ONLY place where `modes` becomes UI visibility, and it never
+   * reads `core` — see rv-plugin.ts `core?` and doc-ui-visibility.md.
    */
   register(plugin: { id?: string; slots?: UISlotEntry[]; modes?: string[] }): void {
     if (!plugin.slots || plugin.slots.length === 0) return;

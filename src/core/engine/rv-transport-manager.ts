@@ -1,18 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { Vector3 } from 'three';
+import { Vector3, Quaternion } from 'three';
 import type { Scene, Object3D } from 'three';
 import { RVTransportSurface } from './rv-transport-surface';
+import type { IAccumulationQuery } from './rv-transport-surface';
 import type { RVSensor } from './rv-sensor';
 import type { RVSource } from './rv-source';
 import type { RVSink } from './rv-sink';
 import type { RVGrip } from './rv-grip';
 import type { RVGripTarget } from './rv-grip-target';
 import type { RVMovingUnit, InstancedMovingUnit } from './rv-mu';
-import type { AABB } from './rv-aabb';
+import { AABB } from './rv-aabb';
+import { SpatialGridXZ } from './rv-spatial-grid';
 import { createMUDissolve, createMUGrow } from './rv-mu-dissolve';
 import { debug } from './rv-debug';
+import { physicsRegistry, physicsSettings } from './rv-physics-registry';
+import type { IPhysicsMUHook, PhysicsPose, PhysicsProvider } from './rv-physics-registry';
+import { RVPhysicsZone } from './rv-physics-zone';
+import { MM_TO_METERS } from './rv-constants';
 
 // Pre-allocated scratch for the driver-selection direction gate (no GC in the
 // per-tick transport hot path; single-threaded reuse is safe).
@@ -23,20 +29,85 @@ const _deadEndDir = new Vector3();
 // Scratch for the spawn grow-out effect setup/update (single-threaded reuse, no GC).
 const _growDir = new Vector3();
 
+// Pre-allocated scratch for the physics handover (plan-276 F4). The provider
+// copies all values synchronously inside `addDynamicMU`, so single-threaded
+// reuse is safe — zero GC in the per-tick no-driver branch.
+const _handoverPos = new Vector3();
+const _handoverQuat = new Quaternion();
+const _handoverVel = new Vector3();
+const _handoverPose: PhysicsPose = {
+  pos: { x: 0, y: 0, z: 0 },
+  quat: { x: 0, y: 0, z: 0, w: 1 },
+};
+
 /** True when `surface` belongs to a planner-placed layout object — its node (or
  *  any ancestor) carries the `_layoutObject` tag the layout planner propagates to
  *  every descendant of a placed asset. End-of-line vanish is scoped to these, so
- *  MUs reaching a dead end on the authored GLB scene are never deleted. */
+ *  MUs reaching a dead end on the authored GLB scene are never deleted.
+ *
+ *  The parent-chain walk is constant between topology changes, so the result is
+ *  cached per surface (cleared in `notifyTopologyChanged()`); the uncached walk
+ *  would run per driven MU per tick. */
+const _layoutObjectFlag = new Map<RVTransportSurface, boolean>();
 function surfaceIsLayoutObject(surface: RVTransportSurface): boolean {
-  let cur: Object3D | null = surface.node;
-  while (cur) {
-    if (cur.userData?._layoutObject === true) return true;
-    cur = cur.parent;
+  let flag = _layoutObjectFlag.get(surface);
+  if (flag === undefined) {
+    flag = false;
+    let cur: Object3D | null = surface.node;
+    while (cur) {
+      if (cur.userData?._layoutObject === true) { flag = true; break; }
+      cur = cur.parent;
+    }
+    _layoutObjectFlag.set(surface, flag);
   }
-  return false;
+  return flag;
 }
 const _growOrigin = new Vector3();
 const _growPlane = new Vector3();
+
+/**
+ * Cached per-surface dead-end topology (plan-240 Baustein 2). Built lazily on
+ * the first `_isAtDeadEnd` after an invalidation (`_adjacencyCache === null`).
+ */
+interface SurfaceAdjacency {
+  /** STATIC stacked junction siblings (`_overlapFractionXZ >= 0.5` at cache
+   *  build time), excluding the surface itself. Dynamic surfaces are never
+   *  cached as members — they are live-checked per query, because a rotating
+   *  footprint can enter/leave the stacking band between cache builds. */
+  group: RVTransportSurface[];
+  /** True for surfaces whose AABB neighborhood changes during simulation:
+   *  `Radial === true` (turntables — rotation is exactly how they "dock" to a
+   *  conveyor) or observed moving (see `_observedMoving`). Dynamic surfaces
+   *  always take the LIVE dead-end path (correctness over caching). */
+  isDynamic: boolean;
+  /** XZ AABB signature at build time. A mismatch on any STATIC surface in the
+   *  per-tick surface loop invalidates the whole cache — this self-healing
+   *  guard subsumes the planner's `layout-transform-update` event (a move
+   *  without add/remove), which the manager cannot subscribe to (it has no
+   *  event-bus access; see `notifyTopologyChanged`). */
+  sigMinX: number;
+  sigMinZ: number;
+  sigMaxX: number;
+  sigMaxZ: number;
+}
+
+/**
+ * Narrow injection seam for observers of the MU lifecycle (plan-394), same
+ * pattern as {@link IPhysicsMUHook}: the observer is assigned to
+ * `transportManager.muLifecycleHook`, and every spawn and every dispose path
+ * (swap-and-pop removal, `removeMU()`, `reset()`) reports through it.
+ *
+ * It exists because a spawned MU cannot carry its own configuration: the clone
+ * paths call `stripComponentMetadata()`, which deletes `userData.realvirtual`
+ * so a clone never resurrects as a live component. Anything an MU should
+ * inherit therefore has to be handed over at spawn time by its source.
+ */
+export interface IMULifecycleHook {
+  /** A source just spawned `mu`. `role` is the source's `CollisionRoleForMUs`. */
+  onMUSpawned(mu: RVMovingUnit | InstancedMovingUnit, role: string | undefined): void;
+  /** `mu` is about to be disposed (any path). Idempotent for unknown MUs. */
+  onMURemoved(mu: RVMovingUnit | InstancedMovingUnit): void;
+}
 
 /**
  * RVTransportManager - Central coordinator for transport simulation.
@@ -44,7 +115,7 @@ const _growPlane = new Vector3();
  * Manages the update order: Sources -> Transport -> Sensors -> Sinks.
  * Called from SimulationLoop.onFixedUpdate.
  */
-export class RVTransportManager {
+export class RVTransportManager implements IAccumulationQuery {
   surfaces: RVTransportSurface[] = [];
   sensors: RVSensor[] = [];
   sources: RVSource[] = [];
@@ -54,8 +125,92 @@ export class RVTransportManager {
   mus: (RVMovingUnit | InstancedMovingUnit)[] = [];
   scene: Scene | null = null;
 
+  /** True when the renderer is a WebGPURenderer — passed through to the
+   *  GLSL-only MU dissolve/grow effects so they skip their onBeforeCompile
+   *  patches (plan-271 PR#0). Set by the scene loader from LoadGLBOptions. */
+  isWebGPU = false;
+
+  /** plan-271 Phase 4 SPIKE: when set (real WebGPU backend AND explicit
+   *  opt-in — see `LoadGLBOptions.muComputeRenderer`), the MU instance pools
+   *  compose their instance matrices in a GPU compute kernel instead of the
+   *  CPU loop. null = CPU path (unchanged default). Set by the scene loader
+   *  from LoadGLBOptions, same route as `isWebGPU` above. */
+  muComputeRenderer: unknown = null;
+
   /** Monotonic tick counter shared with RVTransportSurface for per-tick world-direction refresh. */
   private _tickId = 0;
+
+  // ── Spatial broad-phase (plan-240) ────────────────────────────────
+  /** Below this live-MU count the sensor/sink checks stay on the plain array
+   *  scan (grid overhead > gain for small scenes); at/above it, candidates
+   *  come from `_muGrid`. `_pickDrivingSurface` applies the same threshold to
+   *  the SURFACE count. Public so tests can force either path (0 = always
+   *  grid, Infinity = always brute force). */
+  bruteForceThreshold = 64;
+
+  /** XZ uniform grid over live MUs (~1 m cells ≈ 1-2× a typical MU footprint).
+   *  Maintained unconditionally (cheap no-op updates) so switching across the
+   *  brute-force threshold is seamless; entries are LAZY-inserted in the
+   *  per-tick MU-AABB loop, which self-heals against every external
+   *  `mus.push(...)` (sources, multiuser followers, tests) — plan-240 §2.6. */
+  private readonly _muGrid = new SpatialGridXZ<RVMovingUnit | InstancedMovingUnit>(1.0);
+
+  /** XZ uniform grid over transport surfaces. Larger cells (4 m) because
+   *  belts are long — keeps a 20 m line at ~6 cells (long-AABB mitigation,
+   *  plan-240 §5.2). Rebuilt via the reference/length guard below; moved
+   *  surfaces (turntable arms under a rotating drive, planner drags) are
+   *  re-indexed right after the per-tick surface-AABB update — a no-op while
+   *  the cell span is unchanged, so static surfaces cost O(1) per tick. */
+  private readonly _surfaceGrid = new SpatialGridXZ<RVTransportSurface>(4.0);
+
+  /** Reference/length guard for the surface grid (plan-240 §2.6): the
+   *  surfaces array is mutated externally (component constructors push during
+   *  load AND placement; scene-mutations REASSIGNS it via filter on removal).
+   *  Any reference or length change → full grid rebuild at the next tick.
+   *  Sensors/sinks need no such guard — they are iterated directly and never
+   *  indexed. */
+  private _lastSurfacesRef: RVTransportSurface[] | null = null;
+  private _lastSurfacesLen = -1;
+  /** Set by `notifyTopologyChanged()` to force a surface-grid rebuild even
+   *  without an array reference/length change (e.g. a planner move). */
+  private _surfaceGridDirty = true;
+
+  /** Reused scratch for MU candidates from `_muGrid` (sensor/sink queries). */
+  private readonly _muCandidates: (RVMovingUnit | InstancedMovingUnit)[] = [];
+  /** Reused scratch for surface candidates from `_surfaceGrid`. */
+  private readonly _surfaceCandidates: RVTransportSurface[] = [];
+  /** Reused query bounds for UseRaycast sensors — encloses the full beam
+   *  segment (the sensor's own AABB does NOT cover the ray). Only min/max are
+   *  ever written/read on this instance. */
+  private readonly _rayQueryAABB = new AABB();
+
+  // ── Dead-end adjacency cache (plan-240 Baustein 2) ────────────────
+  /** Per-surface junction topology for `_isAtDeadEnd`. `null` = invalidated
+   *  (lazy rebuild on next use — same null-sentinel pattern as the viewer's
+   *  `_prePluginsSnapshot`). Only ever built while the end-of-line vanish is
+   *  active (planner mode), so the per-tick signature check below is free
+   *  otherwise. */
+  private _adjacencyCache: Map<RVTransportSurface, SurfaceAdjacency> | null = null;
+  /** Surfaces classified dynamic by the CURRENT cache build (Radial +
+   *  observed-moving) — live-checked for junction membership on every static
+   *  query. Rebuilt together with the cache; typically very short. */
+  private readonly _dynamicSurfaces: RVTransportSurface[] = [];
+  /** Non-Radial surfaces whose AABB was observed changing while cached as
+   *  static (e.g. a belt under a moving Drive). They are reclassified as
+   *  dynamic on the next cache build so they stop invalidating the cache
+   *  every tick (adaptive fallback from plan-240 §5.2: "dynamische Surfaces
+   *  als immer-Kandidat fuehren"). Cleared on explicit topology changes. */
+  private readonly _observedMoving = new Set<RVTransportSurface>();
+  /** Reused degenerate point-AABB for the dead-end forward-probe grid query. */
+  private readonly _probeAABB = new AABB();
+
+  // ── Accumulation (plan-255) ───────────────────────────────────────
+  /** Reused query-bounds AABB for `queryLeadingMU` / `isAreaOccupiedByMU` —
+   *  only min/max are ever written/read (same pattern as `_probeAABB`). */
+  private readonly _accumQueryAABB = new AABB();
+  /** Reused raw grid-candidate scratch for `queryLeadingMU` (kept separate from
+   *  `_muCandidates` so a caller-owned `out` array can never alias it). */
+  private readonly _accumGridScratch: (RVMovingUnit | InstancedMovingUnit)[] = [];
 
   /** Reused scratch for the per-MU overlapping-surface scan (no per-tick alloc). */
   private readonly _overlapScratch: RVTransportSurface[] = [];
@@ -63,6 +218,39 @@ export class RVTransportManager {
   /** Reused scratch for the dead-end junction group (current surface + stacked
    *  transfer siblings). No per-tick allocation. */
   private readonly _deadEndGroup: RVTransportSurface[] = [];
+
+  // ── Physics zones (plan-276) ──────────────────────────────────────
+  /** Reset-chokepoint injection seam (F14, pattern `IAccumulationQuery`):
+   *  the physics plugin registers itself here; `reset()`, the swap-and-pop
+   *  removal loop AND `removeMU()` call `onMUDisposed(mu)` BEFORE
+   *  `mu.dispose()` so no physics body is ever orphaned on any dispose path. */
+  physicsMUHook: IPhysicsMUHook | null = null;
+
+  /** MU lifecycle observer (plan-394, pattern: `physicsMUHook`). Set by the
+   *  viewer to the collision manager so spawned MUs join the collision check
+   *  with the role configured on their source, and leave it on every dispose
+   *  path. Null (default) = nobody observes. */
+  muLifecycleHook: IMULifecycleHook | null = null;
+
+  /** Physics-managed surfaces (plan-276 Phase 4, F5 — narrow seam like
+   *  `physicsMUHook`, NO plugin import): maintained by the physics plugin's
+   *  world build (surfaces with `PhysicsMode` fully contained in a zone).
+   *  An MU whose driving surface is in this set is handed to the provider
+   *  IMMEDIATELY on entering the surface (not only at the belt end) — the
+   *  provider's kinematic conveyor body carries it via friction from then on.
+   *  Null (default) = no surface is physics-managed. */
+  physicsManagedSurfaces: Set<RVTransportSurface> | null = null;
+
+  /** Physics-managed sensors (plan-276 Phase 5, F6 — same narrow-seam pattern
+   *  as `physicsManagedSurfaces`): maintained by the physics plugin's world
+   *  build (sensors with `PhysicsMode` overlapping a zone). A sensor in this
+   *  set is SKIPPED by the kinematic detection loop (step 5) — the plugin
+   *  drives its `occupied` state from provider sensor events / raycasts and
+   *  fires `sensor.onChanged` through `applyPhysicsResult()`. Non-managed
+   *  sensors keep detecting ALL MUs — including physics-owned ones — via
+   *  their AABB path (the pose sync writes node positions; 1 tick stale).
+   *  Null (default) = no sensor is physics-managed. */
+  physicsManagedSensors: Set<RVSensor> | null = null;
 
   /** When false, sources do NOT spawn new MUs (the rest of the simulation —
    *  transport, sensors, sinks — keeps running). The Layout-Planner sets this
@@ -183,6 +371,9 @@ export class RVTransportManager {
         this.mus.push(mu);
         this.totalSpawned++;
         debug('transport', `Source "${source.node.name}" spawned MU #${this.totalSpawned}: "${mu.getName()}"`);
+        // plan-394: the role travels from the source, not on the clone —
+        // stripComponentMetadata() wiped the clone's rv_extras.
+        this.muLifecycleHook?.onMUSpawned(mu, source.CollisionRoleForMUs);
         this._startGrow(mu, source);
       }
     }
@@ -192,8 +383,53 @@ export class RVTransportManager {
     //    each fixed step — their AABB centre tracks the parent rotation only
     //    if `updateAABB` is called per tick. The cost is one getWorldPosition
     //    + one quaternion multiply per surface per tick — negligible.
+    //
+    //    Surface-grid self-healing guard first (plan-240 §2.6): rebuild on any
+    //    array reference/length change (constructor pushes, scene-mutations
+    //    filter reassignment) or explicit notifyTopologyChanged().
+    if (
+      this._surfaceGridDirty ||
+      this.surfaces !== this._lastSurfacesRef ||
+      this.surfaces.length !== this._lastSurfacesLen
+    ) {
+      this._surfaceGrid.rebuild(this.surfaces);
+      this._lastSurfacesRef = this.surfaces;
+      this._lastSurfacesLen = this.surfaces.length;
+      this._surfaceGridDirty = false;
+      this._adjacencyCache = null; // surfaces added/removed → junction topology stale
+    }
     for (const surface of this.surfaces) {
+      // Accumulation (plan-255): inject the manager as the surface's leading-MU
+      // query provider. Done per tick (cheap guarded assignment) so it self-heals
+      // against any registration path (component init pushes, tests, planner) —
+      // surfaces driven WITHOUT a manager keep provider null (legacy behavior).
+      if (surface.accumulationProvider !== this) surface.accumulationProvider = this;
       surface.updateAABB();
+      // Re-index moved surfaces BEFORE the MU loop (step 3) queries the grid —
+      // otherwise `_pickDrivingSurface` would see a current AABB in a stale
+      // cell. `update()` is a no-op while the cell span is unchanged, so this
+      // covers Radial/drive-moved surfaces AND planner drags at O(1) per
+      // static surface (superset of the plan's dynamic-only re-index — simpler
+      // and self-healing against ANY movement source).
+      this._surfaceGrid.update(surface);
+      // Dead-end cache self-healing: a surface cached as STATIC whose AABB
+      // changed (planner move, belt under a moving Drive) invalidates the
+      // whole cache and is reclassified dynamic on the next build. Subsumes
+      // the `layout-transform-update` event, which this manager cannot
+      // subscribe to. Only runs while a cache exists (vanish/planner mode).
+      if (this._adjacencyCache) {
+        const adj = this._adjacencyCache.get(surface);
+        if (adj && !adj.isDynamic) {
+          const a = surface.aabb;
+          if (
+            a.min.x !== adj.sigMinX || a.min.z !== adj.sigMinZ ||
+            a.max.x !== adj.sigMaxX || a.max.z !== adj.sigMaxZ
+          ) {
+            this._observedMoving.add(surface);
+            this._adjacencyCache = null;
+          }
+        }
+      }
     }
 
     // 3. Transport: each MU is moved by exactly one surface (currentSurface)
@@ -204,6 +440,12 @@ export class RVTransportManager {
     for (const mu of this.mus) {
       if (mu.markedForRemoval) continue;
 
+      // Accumulation hygiene (plan-255): the gap clamp only runs for MOVING MUs
+      // (inside transportMU's speed guard), so `blocked` is reset here every tick
+      // — a stopped belt or a runtime `Accumulate=false` toggle never leaves a
+      // stale blocked=true behind.
+      mu.blocked = false;
+
       // Spawn grow-out: a freshly-spawned clone MU plays a short clip effect that
       // grows it out of the source along its move direction. Purely visual — it
       // runs independent of transport/grip/vanish below (a gripped MU keeps
@@ -212,6 +454,13 @@ export class RVTransportManager {
 
       if (!mu.isInstanced && (mu as RVMovingUnit).isGripped) continue;
 
+      // Physics ownership (plan-276 F4): the provider drives this MU — skip
+      // the whole kinematic pipeline. MUST come AFTER the `mu.blocked = false`
+      // reset above (a stale blocked flag would corrupt the accumulation
+      // diagnostics) and AFTER the isGripped skip (gripped MUs are never
+      // physics-owned — structural exclusion, see plan-276 §5.2/F15).
+      if (mu.physicsOwned) continue;
+
       // Pick the single surface that drives this MU this tick. When a good
       // straddles two belts (a hand-off), an ACTIVE (running) overlapping surface
       // wins so a stopped upstream belt never freezes a good the downstream belt
@@ -219,6 +468,16 @@ export class RVTransportManager {
       const prev = mu.currentSurface;
       const driver = this._pickDrivingSurface(mu);
       if (driver) {
+        // Physics-mode surface (plan-276 Phase 4, F5): the MU is handed to the
+        // provider the MOMENT it enters a physics-managed surface (not only at
+        // the belt end) — the provider's conveyor body carries it via friction
+        // from here; the gap clamp never runs for it (physicsOwned is filtered
+        // everywhere). While the provider is still loading, the MU keeps
+        // moving kinematically and the check retries next tick (F4 pattern).
+        if (this.physicsManagedSurfaces !== null && this.physicsManagedSurfaces.has(driver)) {
+          this._tryPhysicsSurfaceHandover(mu, driver);
+          if (mu.physicsOwned) continue; // provider owns it — skip transport + vanish
+        }
         if (driver !== prev) {
           // Ownership changed — clear the carry marker so `transportMU` doesn't
           // apply a phantom parent-rotation delta on the entry tick (its carry
@@ -245,6 +504,14 @@ export class RVTransportManager {
       } else {
         mu.currentSurface = null;
         mu.lastSurfaceTickId = undefined;
+        // Physics handover at the conveyor end (plan-276 F4): no driving
+        // surface AND the MU's AABB overlaps a physics zone → the provider
+        // takes over with an explicit belt-velocity handover. Runs EVERY tick
+        // in this no-driver branch (self-healing retry while the provider is
+        // still loading; deliberately independent of the dead-end cache below,
+        // which only serves the vanish feature).
+        this._tryPhysicsHandover(mu);
+        if (mu.physicsOwned) continue; // handed over — skip vanish bookkeeping
       }
 
       // End-of-line vanish: an MU that has been transported and now sits at a
@@ -282,25 +549,70 @@ export class RVTransportManager {
     for (const mu of this.mus) {
       if (!mu.markedForRemoval) {
         mu.updateAABB();
+        // Keep the MU grid current BEFORE the sensor/sink checks (steps 5/6):
+        // `update()` lazy-inserts unknown MUs, so every MU that shows up in
+        // `this.mus` — source spawn, multiuser follower push, direct test
+        // push — is indexed the same tick (self-healing, plan-240 §2.6).
+        // Marked MUs keep their (stale) entry until step 7 removes it; grid
+        // queries may therefore return them — callers filter, as with
+        // `this.mus` today.
+        this._muGrid.update(mu);
       }
     }
 
-    // 5. Sensors: check overlap
+    // 5. Sensors: check overlap. Small scenes stay on the plain array scan;
+    //    larger ones query the MU grid. Candidate order is the stable spawn
+    //    ordinal (seq) — deterministic first-hit even under multi-occupancy
+    //    (stricter than the swap-and-pop-mutated `this.mus` order, F1).
+    const useGrid = this.mus.length >= this.bruteForceThreshold;
     for (const sensor of this.sensors) {
       sensor.updateAABB();
-      sensor.checkOverlap(this.mus);
+      // Physics-managed sensor (plan-276 Phase 5, F6): the provider owns its
+      // detection — enter/leave events / raycasts drive `occupied` in the
+      // physics plugin's onFixedUpdatePost. Skip the kinematic check entirely
+      // (it would fight the event-driven state every tick).
+      if (this.physicsManagedSensors !== null && this.physicsManagedSensors.has(sensor)) continue;
+      if (!useGrid || sensor.liveControlled) {
+        // liveControlled sensors skip local detection inside checkOverlap —
+        // don't spend a grid query on them.
+        sensor.checkOverlap(this.mus);
+      } else if (sensor.UseRaycast) {
+        // Raycast mode: the query bounds must cover the BEAM segment — the
+        // sensor's own AABB does not (the ray extends RayCastLength beyond
+        // the node). checkRaycast keeps the exact ray-vs-AABB test.
+        sensor.computeRayQueryBounds(this._rayQueryAABB);
+        this._muGrid.queryXZ(this._rayQueryAABB, this._muCandidates);
+        sensor.checkOverlap(this._muCandidates);
+      } else {
+        this._muGrid.queryXZ(sensor.aabb, this._muCandidates);
+        sensor.checkOverlap(this._muCandidates);
+      }
     }
 
-    // 6. Sinks: mark overlapping MUs (skip gripped MUs)
+    // 6. Sinks: mark overlapping MUs (skip gripped MUs). Same candidate
+    //    sourcing as the sensors; markOverlapping keeps its own exact
+    //    overlap + markedForRemoval/isGripped filtering.
     for (const sink of this.sinks) {
       sink.updateAABB();
-      sink.markOverlapping(this.mus);
+      if (!useGrid) {
+        sink.markOverlapping(this.mus);
+      } else {
+        this._muGrid.queryXZ(sink.aabb, this._muCandidates);
+        sink.markOverlapping(this._muCandidates);
+      }
     }
 
     // 7. Remove marked MUs (reverse iteration, swap-and-pop — no splice!)
     for (let i = this.mus.length - 1; i >= 0; i--) {
       if (this.mus[i].markedForRemoval) {
         const removedMU = this.mus[i];
+        // Drop the grid entry first (remove() uses the STORED cell span, so
+        // this is exact even though the marked MU skipped its AABB update).
+        this._muGrid.remove(removedMU);
+        // Physics chokepoint (plan-276 F14): free the provider body BEFORE
+        // mu.dispose() — the hook is idempotent for non-owned MUs.
+        this.physicsMUHook?.onMUDisposed(removedMU);
+        this.muLifecycleHook?.onMURemoved(removedMU);
         // Notify grips of MU disposal
         if (!removedMU.isInstanced) {
           for (const grip of this.grips) {
@@ -360,10 +672,22 @@ export class RVTransportManager {
     const overlapping = this._overlapScratch;
     overlapping.length = 0;
     let topY = -Infinity;
-    for (const s of this.surfaces) {
-      if (!s.aabb.overlapsXZ(mu.aabb)) continue;
-      overlapping.push(s);
-      if (s.aabb.max.y > topY) topY = s.aabb.max.y;
+    if (this.surfaces.length >= this.bruteForceThreshold) {
+      // Grid path (F2): exact XZ-overlap candidates in seq order. seq is the
+      // surfaces-array order at rebuild time, so the priority tie-breaks
+      // below ("first band surface") match the brute-force path.
+      const count = this._surfaceGrid.queryXZ(mu.aabb, this._surfaceCandidates);
+      for (let i = 0; i < count; i++) {
+        const s = this._surfaceCandidates[i];
+        overlapping.push(s);
+        if (s.aabb.max.y > topY) topY = s.aabb.max.y;
+      }
+    } else {
+      for (const s of this.surfaces) {
+        if (!s.aabb.overlapsXZ(mu.aabb)) continue;
+        overlapping.push(s);
+        if (s.aabb.max.y > topY) topY = s.aabb.max.y;
+      }
     }
     if (overlapping.length === 0) return null;                          // (4)
     const minTop = topY - TOP_EPS;
@@ -379,6 +703,92 @@ export class RVTransportManager {
       if (!stoppedFallback) stoppedFallback = s;                       // (3)
     }
     return stoppedFallback;
+  }
+
+  /**
+   * Kinematic → physics handover at a conveyor end (plan-276 F4). Called every
+   * tick from the no-driver branch of the MU loop. Containment criterion is
+   * AABB OVERLAP with a zone (NOT full containment — an MU that lost its
+   * driver but only partially reached the zone box must not freeze mid-air).
+   * The initial velocity is direction × speed of the LAST driving surface
+   * (sticky driver, survives running off the belt); v = 0 is allowed (stopped
+   * belt / free spawn) — the MU then falls straight down. While the provider
+   * is absent, not ready or failed the MU simply stays kinematic and the
+   * check repeats next tick (self-healing retry).
+   */
+  private _tryPhysicsHandover(mu: RVMovingUnit | InstancedMovingUnit): void {
+    if (mu.physicsOwned || !physicsSettings.enabled) return;
+    if (RVPhysicsZone.zones.length === 0) return;
+    const provider = physicsRegistry.provider;
+    if (!provider || !provider.ready || provider.failed) return;
+
+    const zone = RVPhysicsZone.findZoneOverlapping(mu.aabb);
+    if (!zone || !zone.active) return;
+
+    // Belt velocity comes from the LAST driving surface (sticky driver —
+    // survives running off the belt); null → v = 0 (F4).
+    this._handoverToPhysics(mu, mu.lastSurface ?? null, provider, `zone "${zone.node.name}"`);
+  }
+
+  /**
+   * Immediate kinematic → physics handover the moment an MU ENTERS a
+   * physics-managed surface (plan-276 Phase 4, F5). Unlike the conveyor-end
+   * handover (F4) there is NO zone-overlap check on the MU: the plugin only
+   * marks surfaces FULLY contained in a zone, so the MU is inside the zone by
+   * construction. Same self-healing as F4 — while the provider is absent, not
+   * ready or failed, the MU keeps moving kinematically and retries next tick.
+   */
+  private _tryPhysicsSurfaceHandover(
+    mu: RVMovingUnit | InstancedMovingUnit,
+    surface: RVTransportSurface,
+  ): void {
+    if (mu.physicsOwned || !physicsSettings.enabled) return;
+    const provider = physicsRegistry.provider;
+    if (!provider || !provider.ready || provider.failed) return;
+    this._handoverToPhysics(mu, surface, provider, `physics surface "${surface.node.name}"`);
+  }
+
+  /**
+   * Shared handover tail (F4 + F5): initial velocity = `surface` direction ×
+   * speed in m/s (speed is mm/s and SIGNED — a reversed belt hands over with a
+   * negative-direction velocity automatically; null surface / no drive → v=0),
+   * then the MU's WORLD pose → `provider.addDynamicMU` + ownership flags.
+   * Zero-GC: all scratch is module-level and copied synchronously by the
+   * provider inside `addDynamicMU`.
+   */
+  private _handoverToPhysics(
+    mu: RVMovingUnit | InstancedMovingUnit,
+    surface: RVTransportSurface | null,
+    provider: PhysicsProvider,
+    debugContext: string,
+  ): void {
+    if (surface && surface.drive) {
+      surface.getWorldDirection(_handoverVel).multiplyScalar(surface.speed / MM_TO_METERS);
+    } else {
+      _handoverVel.set(0, 0, 0);
+    }
+
+    // World pose. Clone MUs store a PARENT-local quaternion on the node —
+    // hand over the WORLD rotation; instanced pool quaternions are world-space.
+    mu.getWorldPosition(_handoverPos);
+    if (mu.isInstanced) {
+      _handoverQuat.copy(mu.getQuaternion());
+    } else {
+      (mu as RVMovingUnit).node.getWorldQuaternion(_handoverQuat);
+    }
+    _handoverPose.pos.x = _handoverPos.x;
+    _handoverPose.pos.y = _handoverPos.y;
+    _handoverPose.pos.z = _handoverPos.z;
+    _handoverPose.quat.x = _handoverQuat.x;
+    _handoverPose.quat.y = _handoverQuat.y;
+    _handoverPose.quat.z = _handoverQuat.z;
+    _handoverPose.quat.w = _handoverQuat.w;
+
+    const bodyId = String(mu.id);
+    provider.addDynamicMU(bodyId, _handoverPose, mu.aabb.halfSize, _handoverVel);
+    mu.physicsOwned = true;
+    mu.physicsBodyId = bodyId;
+    debug('transport', `MU "${mu.getName()}" handed over to physics (${debugContext})`);
   }
 
   /**
@@ -429,7 +839,7 @@ export class RVTransportManager {
     // the axis) → the whole MU starts behind the plane (fully clipped). The
     // trailing edge sits at (cOff - r) relative to the node origin.
     _growPlane.copy(_growOrigin).addScaledVector(_growDir, cOff + r);
-    m.grow = createMUGrow(m.node, _growDir, _growPlane, cOff - r);
+    m.grow = createMUGrow(m.node, _growDir, _growPlane, cOff - r, this.isWebGPU);
     this._hasGrowing = true;
   }
 
@@ -460,7 +870,7 @@ export class RVTransportManager {
     const m = mu as RVMovingUnit;
     if (!m.dissolve) {
       // Sweep the burn edge across the MU's current world-Y bounds.
-      m.dissolve = createMUDissolve(m.node, m.aabb.min.y, m.aabb.max.y);
+      m.dissolve = createMUDissolve(m.node, m.aabb.min.y, m.aabb.max.y, this.isWebGPU);
       m.vanishElapsed = 0;
     } else {
       m.vanishElapsed = (m.vanishElapsed ?? 0) + dt;
@@ -516,17 +926,40 @@ export class RVTransportManager {
     // Junction group: the current surface + any surface STACKED on it (a
     // transfer junction whose sibling shares the same footprint). Plain seams
     // overlap only slightly and are NOT grouped — they remain external outputs.
+    //
+    // Hybrid sourcing (plan-240 Baustein 2): STATIC surfaces read their
+    // stacked siblings from the adjacency cache (plus a live check of the few
+    // DYNAMIC surfaces, whose overlap can change between cache builds);
+    // dynamic surfaces run the live scan — over grid candidates instead of
+    // ALL surfaces. `_overlapFractionXZ` stays the single grouping predicate.
     const group = this._deadEndGroup;
     group.length = 0;
     group.push(s);
-    for (const surf of this.surfaces) {
-      if (surf !== s && this._overlapFractionXZ(surf.aabb, s.aabb) >= 0.5) group.push(surf);
+    const adj = this._ensureAdjacency().get(s);
+    if (adj && !adj.isDynamic) {
+      for (const g of adj.group) group.push(g);
+      for (const d of this._dynamicSurfaces) {
+        if (d !== s && this._overlapFractionXZ(d.aabb, s.aabb) >= 0.5) group.push(d);
+      }
+    } else {
+      // Dynamic (Radial/observed-moving) — live scan, grid-narrowed. A ≥0.5
+      // overlap fraction requires XZ overlap, so grid candidates suffice.
+      const count = this._surfaceGrid.queryXZ(s.aabb, this._surfaceCandidates);
+      for (let i = 0; i < count; i++) {
+        const surf = this._surfaceCandidates[i];
+        if (surf !== s && this._overlapFractionXZ(surf.aabb, s.aabb) >= 0.5) group.push(surf);
+      }
     }
 
     // Turntable: a radial surface discharges to whatever conveyor it touches.
     // Any overlap with a surface OUTSIDE the junction → an output exists.
+    // ALWAYS live (Radial is classified dynamic — rotation is exactly how a
+    // turntable's AABB neighborhood changes per tick); the grid query returns
+    // precisely the XZ-overlapping surfaces.
     if (s.Radial) {
-      for (const surf of this.surfaces) {
+      const count = this._surfaceGrid.queryXZ(s.aabb, this._surfaceCandidates);
+      for (let i = 0; i < count; i++) {
+        const surf = this._surfaceCandidates[i];
         if (group.includes(surf)) continue;
         if (surf.aabb.overlapsXZ(s.aabb)) return false;
       }
@@ -536,6 +969,12 @@ export class RVTransportManager {
     // Probe forward along EVERY junction member's direction. A hit on a group
     // member = the MU still has room to travel within this asset (not at the
     // edge yet); a hit on a surface OUTSIDE the group = a real successor.
+    //
+    // Probe TARGETS are resolved through the surface grid at the probe point
+    // (deviation from the plan's precomputed "Sonden-Ziele": the probe reach
+    // depends on the querying MU's half-extents and cannot be bounded at
+    // cache-build time without risking false vanishes for large MUs — the
+    // grid is always current and MU-size-independent; correctness first).
     const c = mu.aabb.center;
     let roomAhead = false;
     for (const js of group) {
@@ -544,7 +983,11 @@ export class RVTransportManager {
       const reach = muHalf + this.vanishProbeAheadM;
       const px = c.x + d.x * reach;
       const pz = c.z + d.z * reach;
-      for (const surf of this.surfaces) {
+      this._probeAABB.min.set(px, 0, pz);
+      this._probeAABB.max.set(px, 0, pz);
+      const count = this._surfaceGrid.queryXZ(this._probeAABB, this._surfaceCandidates);
+      for (let i = 0; i < count; i++) {
+        const surf = this._surfaceCandidates[i];
         const a = surf.aabb;
         if (px < a.min.x || px > a.max.x || pz < a.min.z || pz > a.max.z) continue;
         if (group.includes(surf)) roomAhead = true;       // still within this asset
@@ -552,6 +995,52 @@ export class RVTransportManager {
       }
     }
     return !roomAhead;
+  }
+
+  /**
+   * Lazily (re)build the dead-end adjacency cache (plan-240 Baustein 2).
+   * Cold path — invalidation is rare (placement/removal/planner move), so the
+   * per-build allocations here are acceptable; the per-tick hot path only
+   * reads. Must run with a CURRENT surface grid (guaranteed: callers sit in
+   * step 3, after the step-2 guard/updates).
+   *
+   * Classification: `Radial === true` OR observed-moving → dynamic (never
+   * cached, always live-scanned). "Under an active Drive" is not cheaply
+   * detectable up front, so non-Radial moved surfaces are LEARNED via the
+   * per-tick AABB-signature check instead (see `_observedMoving`).
+   */
+  private _ensureAdjacency(): Map<RVTransportSurface, SurfaceAdjacency> {
+    let cache = this._adjacencyCache;
+    if (cache) return cache;
+    cache = new Map();
+    this._dynamicSurfaces.length = 0;
+    for (const s of this.surfaces) {
+      if (s.Radial || this._observedMoving.has(s)) this._dynamicSurfaces.push(s);
+    }
+    const candidates: RVTransportSurface[] = [];
+    for (const s of this.surfaces) {
+      const isDynamic = s.Radial || this._observedMoving.has(s);
+      const group: RVTransportSurface[] = [];
+      if (!isDynamic) {
+        const count = this._surfaceGrid.queryXZ(s.aabb, candidates);
+        for (let i = 0; i < count; i++) {
+          const other = candidates[i];
+          if (other === s) continue;
+          if (other.Radial || this._observedMoving.has(other)) continue; // dynamic sibs live-checked per query
+          if (this._overlapFractionXZ(other.aabb, s.aabb) >= 0.5) group.push(other);
+        }
+      }
+      cache.set(s, {
+        group,
+        isDynamic,
+        sigMinX: s.aabb.min.x,
+        sigMinZ: s.aabb.min.z,
+        sigMaxX: s.aabb.max.x,
+        sigMaxZ: s.aabb.max.z,
+      });
+    }
+    this._adjacencyCache = cache;
+    return cache;
   }
 
   /**
@@ -572,6 +1061,93 @@ export class RVTransportManager {
     return Math.max(fa, fb);
   }
 
+  // ── Accumulation queries (plan-255) ─────────────────────────────────
+
+  /**
+   * Collect candidate MUs ahead of `mu` along `moveDir` within `lookahead`
+   * metres beyond its AABB (forward probe — same pattern as `_isAtDeadEnd`).
+   * IMPLEMENTS IAccumulationQuery::queryLeadingMU.
+   *
+   * Query bounds = the MU's AABB extruded by `lookahead` along the SIGNED
+   * `moveDir` (XZ). Below `bruteForceThreshold` live MUs the plain array scan
+   * is used (grid overhead > gain), above it the `_muGrid`. Self,
+   * `markedForRemoval`, gripped AND `physicsOwned` candidates are filtered
+   * here (gripped MUs stay indexed in the grid but hang from a gripper;
+   * physics-owned MUs are the provider's — plan-276, no gap-clamp double
+   * logic at the handover point); geometric front/lane/gap filtering stays
+   * with the caller. GC-free: reused scratch AABB + caller-owned `out`.
+   */
+  queryLeadingMU(
+    mu: RVMovingUnit | InstancedMovingUnit,
+    moveDir: Vector3,
+    lookahead: number,
+    out: (RVMovingUnit | InstancedMovingUnit)[],
+  ): number {
+    out.length = 0;
+    const qa = this._accumQueryAABB;
+    qa.min.copy(mu.aabb.min);
+    qa.max.copy(mu.aabb.max);
+    const ex = moveDir.x * lookahead;
+    const ez = moveDir.z * lookahead;
+    if (ex > 0) qa.max.x += ex; else qa.min.x += ex;
+    if (ez > 0) qa.max.z += ez; else qa.min.z += ez;
+
+    if (this.mus.length < this.bruteForceThreshold) {
+      for (const other of this.mus) {
+        if (other === mu || other.markedForRemoval || other.physicsOwned) continue;
+        if (!other.isInstanced && (other as RVMovingUnit).isGripped) continue;
+        const a = other.aabb;
+        if (a.min.x > qa.max.x || a.max.x < qa.min.x || a.min.z > qa.max.z || a.max.z < qa.min.z) continue;
+        out.push(other);
+      }
+      return out.length;
+    }
+
+    const count = this._muGrid.queryXZ(qa, this._accumGridScratch);
+    for (let i = 0; i < count; i++) {
+      const other = this._accumGridScratch[i];
+      if (other === mu || other.markedForRemoval || other.physicsOwned) continue;
+      if (!other.isInstanced && (other as RVMovingUnit).isGripped) continue;
+      out.push(other);
+    }
+    return out.length;
+  }
+
+  /**
+   * True when any live MU's AABB overlaps `area` (full 3D test — a belt on
+   * another level never counts). Same candidate filters as `queryLeadingMU`.
+   * Used by the Source spawn gate (plan-255 F6a) so a jam that backs up to the
+   * source delays the next spawn instead of stacking MUs into each other.
+   */
+  isAreaOccupiedByMU(area: AABB): boolean {
+    if (this.mus.length < this.bruteForceThreshold) {
+      for (const other of this.mus) {
+        if (other.markedForRemoval || other.physicsOwned) continue;
+        if (!other.isInstanced && (other as RVMovingUnit).isGripped) continue;
+        if (other.aabb.overlaps(area)) return true;
+      }
+      return false;
+    }
+    const count = this._muGrid.queryXZ(area, this._muCandidates);
+    for (let i = 0; i < count; i++) {
+      const other = this._muCandidates[i];
+      if (other.markedForRemoval || other.physicsOwned) continue;
+      if (!other.isInstanced && (other as RVMovingUnit).isGripped) continue;
+      if (other.aabb.overlaps(area)) return true;
+    }
+    return false;
+  }
+
+  /** Number of live MUs currently jam-blocked by the accumulation clamp
+   *  (diagnostic — surfaces in `web_transport_status.blockedMuCount`). */
+  get blockedMuCount(): number {
+    let n = 0;
+    for (const mu of this.mus) {
+      if (!mu.markedForRemoval && mu.blocked) n++;
+    }
+    return n;
+  }
+
   /**
    * Immediately remove a single MU from the simulation (full cleanup: grip
    * notification, gripTarget release, dispose, list removal). Unlike setting
@@ -584,6 +1160,10 @@ export class RVTransportManager {
     const idx = this.mus.indexOf(mu);
     if (idx < 0) return;
 
+    this._muGrid.remove(mu);
+    // Physics chokepoint (plan-276 F14): this is a dispose path too.
+    this.physicsMUHook?.onMUDisposed(mu);
+    this.muLifecycleHook?.onMURemoved(mu);
     if (!mu.isInstanced) {
       for (const grip of this.grips) {
         grip.onMUDisposed(mu as RVMovingUnit);
@@ -602,6 +1182,19 @@ export class RVTransportManager {
     // Refresh instanced pool matrices so a released slot stops rendering at
     // its stale position right away (clone removal already detached the node).
     if (mu.isInstanced) this.updatePoolMatrices();
+  }
+
+  /**
+   * Resolve a live MU by its engine-wide numeric id (plan-259 Phase 2 —
+   * the id↔MU lookup behind the script SDK's `ScriptMuRef.id`). Linear scan:
+   * calls are event-scoped (sensor enter / mu.release), never per-tick.
+   * Returns null for unknown or already-removed ids.
+   */
+  muById(id: number): (RVMovingUnit | InstancedMovingUnit) | null {
+    for (const mu of this.mus) {
+      if (mu.id === id && !mu.markedForRemoval) return mu;
+    }
+    return null;
   }
 
   /** Get counts for stats display */
@@ -639,13 +1232,46 @@ export class RVTransportManager {
   updatePoolMatrices(): void {
     for (const source of this.sources) {
       if (source.pool) {
-        source.pool.updateInstanceMatrix();
+        source.pool.updateInstanceMatrix(this.muComputeRenderer ?? undefined);
       }
     }
   }
 
+  /**
+   * Notify the manager that the transport TOPOLOGY changed outside its own
+   * arrays' reference/length guard — a planner placement/removal or a layout
+   * move (transform change without array mutation). Forces a surface-grid
+   * rebuild on the next tick and invalidates the dead-end adjacency cache.
+   * Cheap and idempotent — safe to call defensively after any layout mutation.
+   */
+  notifyTopologyChanged(): void {
+    this._surfaceGridDirty = true;
+    this._adjacencyCache = null;
+    // Fresh topology → drop the learned moving-surface classification so a
+    // surface that stopped moving can be cached as static again.
+    this._observedMoving.clear();
+    // Re-parenting may change which surfaces sit under a layout object.
+    _layoutObjectFlag.clear();
+  }
+
   /** Reset all state */
   reset(disposeSources = false): void {
+    // Spatial index (plan-240 §2.6): the MU grid always empties with `mus`;
+    // the surface grid survives a plain sim reset (surfaces are untouched)
+    // and is only dropped on model unload (disposeSources=true), avoiding a
+    // needless full rebuild on every restart.
+    this._muGrid.clear();
+    if (disposeSources) {
+      this._surfaceGrid.clear();
+      this._lastSurfacesRef = null;
+      this._lastSurfacesLen = -1;
+      this._surfaceGridDirty = true;
+      // Model unload — the surfaces are torn down with the scene.
+      this._adjacencyCache = null;
+      this._observedMoving.clear();
+      this._dynamicSurfaces.length = 0;
+      _layoutObjectFlag.clear();
+    }
     // Reset grips before disposing MUs (so they release references cleanly)
     for (const grip of this.grips) {
       grip.reset();
@@ -654,6 +1280,12 @@ export class RVTransportManager {
       target.clearOccupied();
     }
     for (const mu of this.mus) {
+      // Reset chokepoint (plan-276 F14): `reset()` is "the single reset
+      // chokepoint" — it serves resetSimulation(), clearModel() AND
+      // SimulationKernel.setMode()→clearMUs(). Free the physics body BEFORE
+      // mu.dispose() so no Rapier body is ever orphaned on a bulk dispose.
+      this.physicsMUHook?.onMUDisposed(mu);
+      this.muLifecycleHook?.onMURemoved(mu);
       mu.dispose();
     }
     this.mus.length = 0;

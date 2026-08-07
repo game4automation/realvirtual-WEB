@@ -1,0 +1,19 @@
+{
+  "description": "Grip with a canonical enum wire string (Physics) and WebError with a LEGACY integer-index enum wire value ('1' -> 'FlashObject' via the enumMap).",
+  "nodes": {
+    "Gripper": {
+      "Grip": {
+        "GripRange": 80,
+        "OneBitControl": true,
+        "PlaceMode": "Physics",
+        "GripTargetSearchRadius": 500
+      }
+    },
+    "FaultLamp": {
+      "WebError": {
+        "ErrorText": "Overtemp",
+        "HighlightStyle": "FlashObject"
+      }
+    }
+  }
+}

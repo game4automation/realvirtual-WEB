@@ -28,6 +28,7 @@ import { useMetadataTooltipConfig, getMetadataTooltipConfig, normalizeLabel } fr
 import type { TooltipContentProps } from './tooltip-registry';
 import { tooltipRegistry } from './tooltip-registry';
 import type { TooltipData } from './tooltip-store';
+import type { OrderManagerConfig, OrderManagerPluginAPI } from '../../types/plugin-types';
 const DOC_BASE_URL = 'https://doc.realvirtual.io/';
 
 /** Data shape for metadata tooltips. */
@@ -81,6 +82,40 @@ export function extractAttr(attributes: string, name: string): string | null {
     if (match[1] === name) return match[2];
   }
   return null;
+}
+
+// ── Order-data label matching (shared with OrderManagerPlugin) ──
+
+/** Default `<value label="...">` candidates for the article number. Includes
+ *  German BOM column names as exported from ERP parts lists. Overridable via
+ *  `OrderManagerConfig.metadataArticleLabels`. */
+export const DEFAULT_ARTICLE_LABELS = ['Article', 'ArticleNumber', 'OrderCode', 'PartNumber', 'Artikel', 'Artikelnummer'];
+/** Default label candidates for the item description (see above). */
+export const DEFAULT_DESCRIPTION_LABELS = ['English', 'Description', 'Designation', 'Beschreibung', 'Bezeichnung'];
+/** Default label candidates for the manufacturer (see above). */
+export const DEFAULT_MANUFACTURER_LABELS = ['Manufacturer', 'ManufacturerName', 'Hersteller'];
+
+const normalizeOrderLabel = (s: string): string => s.replace(/[\s_-]/g, '').toLowerCase();
+
+/**
+ * Find the first `<value>` tag whose label matches one of the candidates and
+ * return its trimmed text ('' when nothing matches). Exact (normalized)
+ * matches win over substring matches, so a candidate like "Artikel" is not
+ * captured by "Artikeltyp" / "Artikelhauptgruppe" rows. Candidate order sets
+ * the priority within each pass.
+ */
+export function findValueByLabels(tags: readonly ParsedTag[], candidates: readonly string[]): string {
+  for (const exact of [true, false]) {
+    for (const candidate of candidates) {
+      const nc = normalizeOrderLabel(candidate);
+      for (const t of tags) {
+        if (t.tag !== 'value') continue;
+        const label = normalizeOrderLabel(extractAttr(t.attributes, 'label') ?? '');
+        if (exact ? label === nc : label.includes(nc)) return t.text.trim();
+      }
+    }
+  }
+  return '';
 }
 
 /**
@@ -205,48 +240,32 @@ export function MetadataTooltipContent({ data, viewer, isPinned }: TooltipConten
   }, [tags]);
   const signalValues = useSignalValues(viewer, signalNames);
 
-  // Check if this metadata has an article number (orderable via OrderManagerPlugin)
+  // Check if this metadata has an article number (orderable via OrderManagerPlugin).
+  // Label candidates come from the plugin config (metadataArticleLabels etc.)
+  // so customer projects with non-default column names stay orderable.
+  const orderPlugin = viewer.getPlugin('order-manager') as
+    | (OrderManagerPluginAPI & { config?: OrderManagerConfig })
+    | undefined;
+  const orderConfig = orderPlugin?.config;
   const articleInfo = useMemo(() => {
-    for (const t of tags) {
-      if (t.tag !== 'value') continue;
-      const label = (extractAttr(t.attributes, 'label') ?? '').toLowerCase().replace(/[\s_-]/g, '');
-      if (['article', 'articlenumber', 'ordercode', 'partnumber'].some(c => label.includes(c))) {
-        return t.text;
-      }
-    }
-    return null;
-  }, [tags]);
+    return findValueByLabels(tags, orderConfig?.metadataArticleLabels ?? DEFAULT_ARTICLE_LABELS) || null;
+  }, [tags, orderConfig]);
 
   const handleAddToCart = useCallback(() => {
-    const plugin = viewer.getPlugin('order-manager') as
-      | import('../../types/plugin-types').OrderManagerPluginAPI
-      | undefined;
-    if (!plugin) return;
-
-    // Extract order data from parsed tags
-    const normalize = (s: string) => s.replace(/[\s_-]/g, '').toLowerCase();
-    const getByLabels = (candidates: string[]) => {
-      for (const c of candidates) {
-        const nc = normalize(c);
-        for (const t of tags) {
-          if (t.tag !== 'value') continue;
-          const lbl = normalize(extractAttr(t.attributes, 'label') ?? '');
-          if (lbl.includes(nc)) return t.text;
-        }
-      }
-      return '';
-    };
+    if (!orderPlugin) return;
 
     const nodeName = data.nodePath.split('/').pop() || 'Component';
     const nameTag = tags.find(t => t.tag === 'name');
-    const article = getByLabels(['Article', 'ArticleNumber', 'OrderCode', 'PartNumber']);
-    const description = getByLabels(['English', 'Description', 'Designation']) || nameTag?.text || nodeName;
-    const manufacturer = getByLabels(['Manufacturer', 'ManufacturerName']);
+    const article = findValueByLabels(tags, orderConfig?.metadataArticleLabels ?? DEFAULT_ARTICLE_LABELS);
+    const description =
+      findValueByLabels(tags, orderConfig?.metadataDescriptionLabels ?? DEFAULT_DESCRIPTION_LABELS) ||
+      nameTag?.text || nodeName;
+    const manufacturer = findValueByLabels(tags, orderConfig?.metadataManufacturerLabels ?? DEFAULT_MANUFACTURER_LABELS);
 
     if (article) {
-      plugin.addItem(article, description, manufacturer, article, data.nodePath);
+      orderPlugin.addItem(article, description, manufacturer, article, data.nodePath);
     }
-  }, [viewer, tags, data.nodePath]);
+  }, [orderPlugin, orderConfig, tags, data.nodePath]);
 
   if (tags.length === 0) return null;
 
@@ -328,14 +347,14 @@ export function MetadataTooltipContent({ data, viewer, isPinned }: TooltipConten
             if (nestedSignalMatch) {
               const sigName = nestedSignalMatch[1];
               const info = signalValues.get(sigName);
-              return <SignalRow key={i} label={label} direction={info?.direction ?? 'unknown'} plcType={info?.plcType} raw={info?.raw} />;
+              return <SignalRow key={i} label={label} direction={info?.direction ?? 'unknown'} plcType={info?.plcType} raw={info?.raw} viewer={viewer} signalName={sigName} />;
             }
             return <Row key={i} label={label} value={t.text} />;
           }
 
           case 'signal': {
             const info = signalValues.get(t.text);
-            return <SignalRow key={i} label={t.text} direction={info?.direction ?? 'unknown'} raw={info?.raw} />;
+            return <SignalRow key={i} label={t.text} direction={info?.direction ?? 'unknown'} raw={info?.raw} viewer={viewer} signalName={t.text} />;
           }
 
           case 'link': {
@@ -353,7 +372,7 @@ export function MetadataTooltipContent({ data, viewer, isPinned }: TooltipConten
       })}
 
       {/* Add to Cart button — only in pinned mode (same style as AAS tooltips) */}
-      {isPinned && articleInfo && viewer.getPlugin('order-manager') && (
+      {isPinned && articleInfo && orderPlugin && (
         <Button
           variant="outlined"
           size="small"

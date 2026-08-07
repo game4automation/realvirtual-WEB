@@ -30,7 +30,7 @@ function isRef(v: unknown): v is ComponentRef {
     && typeof (v as Record<string, unknown>).path === 'string';
 }
 
-function IKPathTargetsRenderer({ value, nodePath, viewer }: FieldRendererProps) {
+function IKPathTargetsRenderer({ value, fieldName, nodePath, viewer }: FieldRendererProps) {
   const initial = Array.isArray(value) ? (value as unknown[]).filter(isRef) : [];
   const [order, setOrder] = useState<ComponentRef[]>(initial);
 
@@ -73,11 +73,22 @@ function IKPathTargetsRenderer({ value, nodePath, viewer }: FieldRendererProps) 
     persistFieldOp(nodePath, 'IKPath', 'Path', next, order);
   };
 
+  const handleRemove = (i: number) => {
+    const next = [...order];
+    next.splice(i, 1);
+    setOrder(next);
+    registry?.getByPath<RVIKPath>('IKPath', nodePath)?.removeTarget(i);
+    // Persist the shortened path to the GLB.
+    persistFieldOp(nodePath, 'IKPath', 'Path', next, order);
+  };
+
   return (
     <ReorderableList
+      title={fieldName}
       items={items}
       onReorder={handleReorder}
       onSelect={handleSelect}
+      onRemove={(i) => handleRemove(i)}
       selectedId={primaryPath}
       emptyText="No targets"
     />

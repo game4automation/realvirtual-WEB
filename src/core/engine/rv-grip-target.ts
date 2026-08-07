@@ -4,7 +4,7 @@
 import type { Object3D } from 'three';
 import type { RVMovingUnit } from './rv-mu';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponent } from './rv-component-registry';
+import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import { debug } from './rv-debug';
 
 /**
@@ -14,10 +14,8 @@ import { debug } from './rv-debug';
  * the nearest free target during auto-place.
  */
 export class RVGripTarget implements RVComponent {
-  static readonly schema: ComponentSchema = {
-    AlignPosition: { type: 'boolean', default: true },
-    AlignRotation: { type: 'boolean', default: true },
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('GripTarget');
 
   readonly node: Object3D;
   isOwner = true;
@@ -54,6 +52,6 @@ export class RVGripTarget implements RVComponent {
 registerComponent({
   type: 'GripTarget',
   schema: RVGripTarget.schema,
-  capabilities: {},
+  capabilities: { authorable: true },   // addable in the asset editor (schema-complete)
   create: (node) => new RVGripTarget(node),
 });

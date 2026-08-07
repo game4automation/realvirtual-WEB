@@ -9,40 +9,80 @@
  * and localStorage persistence.
  */
 
+import {
+  getSignalLinkModeSnapshot,
+  setSignalLinkModeExplicit,
+  subscribeSignalLinkMode,
+} from '../signal-bind/signal-link-mode-store';
+
+// ─── Re-exports: the library layer moved to core/library (plan-372 §2.6.1) ──
+//
+// `rv-layout-store` has ~60 importers across core, plugins, tests and the
+// private repo. Every name the library extraction took away is re-exported
+// from here, so the move stayed invisible to all of them.
+
+export type {
+  LibraryCatalog,
+  LibraryCatalogEntry,
+  LibraryOrigin,
+  LibrarySnapshot,
+} from '../../core/library/library-types';
+export { LOCAL_NEEDS_PERMISSION } from '../../core/library/library-types';
+export {
+  LibraryStore,
+  resolveUrl,
+  normalizeCatalogEntry,
+  parseGitHubRepoUrl,
+  isGitHubRepoScanUrl,
+  isGitHubCatalogUrl,
+  buildCatalogFromGitHub,
+} from '../../core/library/library-store';
+
 // ─── Types ──────────────────────────────────────────────────────────────
 
-export interface LibraryCatalog {
-  version: '1.0';
-  name: string;
-  entries: LibraryCatalogEntry[];
-  baseUrl?: string;
+/** Direction semantics of a signal mapping (PLC convention). */
+export type SignalLinkDirection = 'plcOutput' | 'plcInput';
+
+/**
+ * A single link between a Planner-component standard-signal SLOT and a live
+ * realvirtual CONNECT signal. Persisted per {@link PlacedComponent} so it
+ * survives reload. Optional on PlacedComponent → legacy scenes load unchanged.
+ */
+export interface SignalMapping {
+  /** Binding sink. Missing on legacy mappings and interpreted as mapped-signal. */
+  kind?: 'mapped-signal' | 'direct-property' | 'direct-feedback';
+  /** Root-relative component-node path. Missing only on legacy mappings. */
+  componentPath?: string;
+  /** Component standard-signal slot, e.g. "Forward", "Flow.Run", "IsOccupied". */
+  slot: string;
+  /**
+   * Source of the assignment (plan-325). Missing on legacy mappings and
+   * interpreted as 'connect' at EVERY read site (use {@link mappingSourceKind}).
+   *  - 'connect'  — `signal` is a CONNECT signal name at the provider.
+   *  - 'internal' — `signal` is the SignalStore NAME of a model signal.
+   */
+  sourceKind?: 'connect' | 'internal';
+  /** connect: CONNECT signal name (WITHOUT `__iface__/` prefix), e.g.
+   *  "ConveyorMotor.Run". internal: SignalStore NAME of the model signal. */
+  signal: string;
+  /** Stable supplying interface id. Missing only on legacy mappings pending migration. */
+  interfaceId?: string;
+  /** MQTT topic when the provider exposes the signal through a topic. */
+  topic?: string;
+  /** PLC direction — read-only (plcOutput) vs. writable (plcInput). */
+  direction: SignalLinkDirection;
+  /** Binding temporarily disable-able without deleting it. */
+  enabled: boolean;
 }
 
-export interface LibraryCatalogEntry {
-  id: string;
-  name: string;
-  category: 'conveyor' | 'robot' | 'machine' | 'fixture' | 'custom' | 'des' | 'splat';
-  glbUrl?: string;
-  splatUrl?: string;
-  thumbnailUrl?: string;
-  footprintMm?: [number, number];
-  tags?: string[];
-  pivotToFloor?: boolean;
-  plugin?: string;
-  // Virtual DES components (no GLB — rendered as gizmos)
-  virtual?: boolean;
-  desType?: string;                        // 'DESConveyor', 'DESStation', etc.
-  desConfig?: Record<string, unknown>;     // default rv_extras values
-  gizmoSize?: [number, number, number];    // visual box size in mm [x, y, z]
-  /** For Local-Folder entries: path of the source GLB relative to the
-   *  scanned `library/` subfolder (e.g. "conveyor/belt.glb"). Used to
-   *  persist generated thumbnails alongside the asset. */
-  localPath?: string;
-  /** Free-form group names this entry belongs to. Mirrors the Asset
-   *  Manager "Collections" concept and is rendered as filter chips in
-   *  the Local-Folder tab. For local libraries, derived from the
-   *  immediate parent subfolder under `library/` (case preserved). */
-  collections?: string[];
+/**
+ * Effective source kind of a mapping — THE legacy default (`?? 'connect'`).
+ * Every read site (bind, liveness, picker, popover, persistence read) goes
+ * through this helper so mappings persisted before plan-325 keep loading as
+ * CONNECT mappings unchanged.
+ */
+export function mappingSourceKind(mapping: Pick<SignalMapping, 'sourceKind'>): 'connect' | 'internal' {
+  return mapping.sourceKind ?? 'connect';
 }
 
 export interface PlacedComponent {
@@ -57,6 +97,9 @@ export interface PlacedComponent {
   splatUrl?: string;
   /** Visibility toggle. Missing/undefined = visible (legacy default). */
   visible?: boolean;
+  /** Live-signal links to realvirtual CONNECT. Optional → legacy scenes load
+   *  unchanged. Serialized as-is by {@link serializeLayout}. */
+  signalMappings?: SignalMapping[];
 }
 
 export interface LayoutFile {
@@ -115,15 +158,36 @@ export interface LayoutSnapshot {
    *  Only gates docs while the planner is active — other viewing modes always
    *  show them. */
   docMode: boolean;
+  /** Signal-linking mode (plan-226): when on, every placed element with bindable
+   *  standard-signal slots shows a 3D status badge, and clicking it opens the
+   *  CONNECT signal picker. When off, no badges and no picker — pure layout. Only
+   *  meaningful while `plannerSignalLinking` is enabled on the viewer. */
+  signalLinkMode: boolean;
   placementMode: string | null; // catalogEntry id for tap-to-place
   /** Entry ids whose preview thumbnail is currently being auto-generated.
    *  Cards render a spinner while their id is present. */
   thumbnailPending: ReadonlySet<string>;
+  /** Placements whose geometry is still loading or has failed (plan-371).
+   *  Drives the HMI status line. RUNTIME ONLY — never serialized: a pending
+   *  placement's `PlacedComponent` already carries its `glbUrl` and is
+   *  byte-identical to a finished one. */
+  pendingPlacements: readonly PendingPlacementInfo[];
+}
+
+/** One row of the pending-load status line. */
+export interface PendingPlacementInfo {
+  /** Placement id — the same id the store and the object map use. */
+  id: string;
+  /** Catalog entry name, shown to the user. */
+  name: string;
+  status: 'loading' | 'error';
+  /** Failure detail; only meaningful with `status: 'error'`. */
+  error?: string;
 }
 
 // ─── localStorage keys ──────────────────────────────────────────────────
 
-const LS_KEY_URLS = 'rv-layout-library-urls';
+// LS_KEY_URLS / LS_KEY_ACTIVE_TAB moved to core/library/library-types.
 const LS_KEY_AUTOSAVE = 'rv-layout-autosave';
 const LS_KEY_GRID_ENABLED = 'rv-layout-grid-enabled';
 const LS_KEY_GRID_SIZE = 'rv-layout-grid-size';
@@ -138,7 +202,6 @@ const LS_KEY_NEIGHBOR_DIST_MAX = 'rv-layout-neighbor-distance-max';
 const LS_KEY_SNAPPOINT_MAGNET = 'rv-layout-snappoint-magnet-enabled';
 const LS_KEY_CHAIN_MODE = 'rv-layout-chain-mode-enabled';
 const LS_KEY_DOC_MODE = 'rv-layout-doc-mode';
-const LS_KEY_ACTIVE_TAB = 'rv-layout-active-tab';
 
 /** Default magnetic-snap tolerance in millimetres (world space). */
 const DEFAULT_BBOX_SNAP_TOLERANCE_MM = 30;
@@ -166,6 +229,22 @@ export function serializeLayout(
   };
 }
 
+/** Field-wise comparison of two pending-placement lists (order-sensitive —
+ *  the registry preserves insertion order, so a reorder IS a change). */
+export function samePendingPlacements(
+  a: readonly PendingPlacementInfo[],
+  b: readonly PendingPlacementInfo[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].id !== b[i].id) return false;
+    if (a[i].name !== b[i].name) return false;
+    if (a[i].status !== b[i].status) return false;
+    if (a[i].error !== b[i].error) return false;
+  }
+  return true;
+}
+
 export function deserializeLayout(json: string): LayoutFile {
   const data = JSON.parse(json);
   return data as LayoutFile;
@@ -187,258 +266,41 @@ export function snapToGrid(
 
 // alignToFloor() moved to model-cache.ts — single source of truth.
 
-import { type Object3D } from 'three';
-import {
-  isSupported as isFsApiSupported,
-  selectWorkFolder,
-  getWorkFolder,
-  getWorkFolderMeta,
-  removeWorkFolder,
-  getSubfolder,
-  listFiles,
-  readFileAsUrl,
-  type LocalFileEntry,
-} from '../../core/engine/rv-local-filesystem';
-
-const THUMBNAILS_SUBFOLDER = '.thumbnails';
-
-/**
- * Sentinel catalogError value used for a local-folder tab whose handle is
- * still saved but whose browser permission has lapsed (the default state
- * after closing the browser). The Planner UI treats this as a "click to
- * re-grant" prompt instead of a real error.
- */
-export const LOCAL_NEEDS_PERMISSION = '__needs_permission__';
-
-// ─── URL / entry normalization ───────────────────────────────────────────
-
-/** Resolve a potentially relative URL against a base URL. */
-export function resolveUrl(base: string, relative: string): string {
-  // Already absolute
-  if (/^https?:\/\//i.test(relative) || relative.startsWith('blob:')) return relative;
-  // Starts with ./ or ../ — resolve against base
-  try {
-    return new URL(relative, base).href;
-  } catch {
-    // Fallback: simple concatenation
-    const b = base.endsWith('/') ? base : base + '/';
-    return b + relative.replace(/^\.\//, '');
-  }
-}
-
-/** File extensions recognized as Gaussian Splat formats. */
-const SPLAT_EXTENSIONS = new Set(['.splat', '.ksplat', '.ply']);
-
-/** Auto-fill missing fields on a catalog entry. */
-export function normalizeCatalogEntry(
-  raw: Partial<LibraryCatalogEntry> & { glbUrl?: string; splatUrl?: string },
-  baseUrl: string,
-): LibraryCatalogEntry {
-  // Virtual DES entries have no GLB — pass through with defaults
-  if (raw.virtual) {
-    return {
-      id: raw.id ?? raw.desType?.toLowerCase() ?? 'virtual',
-      name: raw.name ?? raw.desType ?? 'Virtual Component',
-      category: raw.category ?? 'des',
-      glbUrl: '',
-      thumbnailUrl: '',
-      footprintMm: raw.footprintMm,
-      tags: raw.tags,
-      pivotToFloor: raw.pivotToFloor,
-      plugin: raw.plugin,
-      virtual: true,
-      desType: raw.desType,
-      desConfig: raw.desConfig,
-      gizmoSize: raw.gizmoSize,
-    };
-  }
-
-  // Splat entries — splatUrl instead of glbUrl
-  if (raw.splatUrl) {
-    const splatUrlRaw = raw.splatUrl;
-    const filename = splatUrlRaw.split('/').pop() ?? splatUrlRaw;
-    const stem = filename.replace(/\.(splat|ksplat|ply)$/i, '');
-    const id = raw.id ?? stem.toLowerCase().replace(/\s+/g, '-');
-    const name = raw.name ?? stem.replace(/[_-]/g, ' ');
-    const splatUrl = resolveUrl(baseUrl, splatUrlRaw);
-    const thumbnailUrl = raw.thumbnailUrl
-      ? resolveUrl(baseUrl, raw.thumbnailUrl)
-      : '';
-    return {
-      id,
-      name,
-      category: raw.category ?? 'splat',
-      splatUrl,
-      thumbnailUrl,
-      footprintMm: raw.footprintMm,
-      tags: raw.tags,
-      pivotToFloor: raw.pivotToFloor,
-      plugin: raw.plugin,
-      collections: raw.collections,
-    };
-  }
-
-  const glbUrlRaw = raw.glbUrl ?? '';
-  const filename = glbUrlRaw.split('/').pop() ?? glbUrlRaw;
-  const stem = filename.replace(/\.glb$/i, '');
-  const id = raw.id ?? stem.toLowerCase().replace(/\s+/g, '-');
-  const name = raw.name ?? stem.replace(/[_-]/g, ' ');
-  const category = raw.category ?? 'custom';
-  const glbUrl = resolveUrl(baseUrl, glbUrlRaw);
-  const thumbnailUrl = raw.thumbnailUrl
-    ? resolveUrl(baseUrl, raw.thumbnailUrl)
-    : '';
-  return {
-    id,
-    name,
-    category,
-    glbUrl,
-    thumbnailUrl,
-    footprintMm: raw.footprintMm,
-    tags: raw.tags,
-    pivotToFloor: raw.pivotToFloor,
-    plugin: raw.plugin,
-    collections: raw.collections,
-  };
-}
-
-// ─── GitHub repository scanning ──────────────────────────────────────────
-
-interface GitHubRepoRef {
-  owner: string;
-  repo: string;
-  branch?: string;
-  subpath: string;
-}
-
-/**
- * Parse a GitHub repo / folder URL into its parts. Returns null for anything
- * that is not a github.com repo URL. Handles:
- *   https://github.com/owner/repo
- *   https://github.com/owner/repo/tree/branch
- *   https://github.com/owner/repo/tree/branch/sub/folder
- */
-export function parseGitHubRepoUrl(url: string): GitHubRepoRef | null {
-  const m = url.match(
-    /^https?:\/\/github\.com\/([^/]+)\/([^/?#]+?)(?:\.git)?(?:\/tree\/([^/?#]+)(?:\/([^?#]*))?)?\/?(?:[?#].*)?$/i,
-  );
-  if (!m) return null;
-  return {
-    owner: m[1],
-    repo: m[2],
-    branch: m[3],
-    subpath: (m[4] ?? '').replace(/\/+$/, ''),
-  };
-}
-
-/**
- * True when `url` should be treated as a GitHub repository to SCAN for `.glb`
- * files (rather than a `catalog.json` to fetch). A github.com URL that does not
- * point at a `.json` file qualifies; a `.../blob/.../catalog.json` URL does not
- * (it is handled by the regular catalog-fetch path).
- */
-export function isGitHubRepoScanUrl(url: string): boolean {
-  if (/\.json(\?|#|$)/i.test(url)) return false;
-  if (/\/blob\//i.test(url)) return false; // a blob points at a single file, not a folder
-  return parseGitHubRepoUrl(url) !== null;
-}
-
-/**
- * True for any github.com / raw.githubusercontent.com catalog URL.
- *
- * GitHub libraries are strictly OPT-IN: they may only be loaded by an explicit
- * manual add this session (the GitHub tab, a constructor `catalogUrls` option,
- * or a `?library=<url>` parameter). They are NEVER auto-restored from persisted
- * storage or a restored scene's `catalogUrls`, and are NEVER written back to
- * storage — otherwise a former-default GitHub library that leaked into a user's
- * storage would re-scan GitHub (and 404) on every boot without the user ever
- * adding it.
- */
-export function isGitHubCatalogUrl(url: string): boolean {
-  return /^https?:\/\/(raw\.githubusercontent\.com|github\.com)\//i.test(url.trim());
-}
-
-/**
- * Scan a GitHub repository (optionally a subfolder) for `.glb` files via the
- * public GitHub API and build a `LibraryCatalog` from them — no `catalog.json`
- * required. Each `.glb` becomes an entry whose `glbUrl` is its raw URL; the
- * immediate parent folder becomes a collection chip. Throws on failure so the
- * caller can record a catalog error.
- */
-export async function buildCatalogFromGitHub(url: string): Promise<LibraryCatalog> {
-  const ref = parseGitHubRepoUrl(url);
-  if (!ref) throw new Error('Not a GitHub repository URL');
-  const { owner, repo } = ref;
-
-  // Resolve the default branch when the URL did not specify one.
-  let branch = ref.branch;
-  if (!branch) {
-    const repoResp = await fetch(`https://api.github.com/repos/${owner}/${repo}`);
-    if (!repoResp.ok) {
-      throw new Error(repoResp.status === 403
-        ? 'GitHub API rate limit reached — try again later'
-        : `GitHub repo lookup failed: HTTP ${repoResp.status}`);
-    }
-    branch = ((await repoResp.json()) as { default_branch?: string }).default_branch ?? 'main';
-  }
-
-  // One recursive tree listing returns every path in the repo.
-  const treeResp = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`,
-  );
-  if (!treeResp.ok) {
-    throw new Error(treeResp.status === 403
-      ? 'GitHub API rate limit reached — try again later'
-      : `GitHub tree fetch failed: HTTP ${treeResp.status}`);
-  }
-  const treeData = (await treeResp.json()) as {
-    tree?: Array<{ path: string; type: string }>;
-    truncated?: boolean;
-  };
-
-  const prefix = ref.subpath ? ref.subpath.toLowerCase() + '/' : '';
-  const glbNodes = (treeData.tree ?? []).filter(
-    n => n.type === 'blob'
-      && /\.glb$/i.test(n.path)
-      && n.path.toLowerCase().startsWith(prefix),
-  );
-  if (glbNodes.length === 0) {
-    throw new Error(treeData.truncated
-      ? 'No .glb files found (repository tree was truncated — narrow the folder)'
-      : 'No .glb files found in this repository / folder');
-  }
-
-  const entries: LibraryCatalogEntry[] = glbNodes.map((n) => {
-    const rel = n.path.slice(prefix.length);
-    const filename = n.path.split('/').pop() ?? n.path;
-    const stem = filename.replace(/\.glb$/i, '');
-    const parent = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')).split('/').pop() ?? '' : '';
-    const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/`
-      + n.path.split('/').map(encodeURIComponent).join('/');
-    return {
-      id: `${repo}/${n.path}`.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-      name: stem.replace(/[_-]+/g, ' ').trim(),
-      category: 'custom',
-      glbUrl: rawUrl,
-      thumbnailUrl: '',
-      collections: parent ? [parent] : undefined,
-    };
-  });
-
-  return {
-    version: '1.0',
-    name: `${repo}${ref.subpath ? '/' + ref.subpath : ''}`,
-    entries,
-  };
-}
+import { LibraryStore as LibraryStoreImpl } from '../../core/library/library-store';
+import type { LibraryStore as LibraryStoreClass } from '../../core/library/library-store';
+import type {
+  LibraryCatalog,
+  LibraryCatalogEntry,
+  LibraryOrigin,
+} from '../../core/library/library-types';
 
 // ─── Store ──────────────────────────────────────────────────────────────
 
+/**
+ * Planner state — and, since plan-372 Phase 4, an ADAPTER over the shared
+ * {@link LibraryStoreClass} (§2.6.2).
+ *
+ * The catalog fields left this class; what stayed is the full public surface.
+ * Four things make the split invisible to the ~60 modules that read this store:
+ *
+ *  1. **Getters and mutators both delegate.** A partial adapter would have left
+ *     the 11 mutating call sites in `layout-planner/index.ts` writing into a
+ *     dead copy.
+ *  2. **A notification bridge.** The constructor subscribes to the library
+ *     store and rebuilds the COMBINED snapshot on every library mutation —
+ *     without it no React consumer would ever see a library change, because
+ *     they all read `LayoutSnapshot`, not `LibrarySnapshot`.
+ *  3. **Exactly one notification per mutation.** Delegating mutators must not
+ *     call `_notify()` themselves; the bridge already does it.
+ *  4. **{@link dispose}** unsubscribes both the bridge and the signal-link-mode
+ *     subscription — the plugin can be torn down and rebuilt.
+ */
 export class LayoutStore {
-  private _catalogs = new Map<string, LibraryCatalog>();
-  private _catalogUrls: string[] = [];
-  private _catalogErrors = new Map<string, string>();
-  private _activeTabUrl: string | null = null;
+  /** Shared catalog state. Injected so tests can isolate; the planner passes
+   *  the process-wide singleton (`getLibraryStore()`). */
+  private readonly _library: LibraryStoreClass;
+  private _unsubLibrary: (() => void) | null = null;
+  private _unsubSignalLinkMode: (() => void) | null = null;
   private _placed: PlacedComponent[] = [];
   private _selectedId: string | null = null;
   private _mode: TransformMode = 'select';
@@ -458,15 +320,14 @@ export class LayoutStore {
   private _placementMode: string | null = null;
   private _listeners = new Set<() => void>();
   private _snapshot: LayoutSnapshot;
-  /** Map of URL -> pending Promise to serialize concurrent fetches. */
-  private _pendingFetches = new Map<string, Promise<void>>();
-  /** URLs added via addCatalogDirect (bundled) — excluded from localStorage. */
-  private _bundledUrls = new Set<string>();
+  /** plan-371 pending placements. Runtime only — see `setPendingPlacements`. */
+  private _pendingPlacements: PendingPlacementInfo[] = [];
 
-  /** Entry ids currently being auto-thumbnailed (drives per-card spinner). */
-  private _thumbnailPending = new Set<string>();
+  constructor(library?: LibraryStoreClass) {
+    // Lazily required so `rv-layout-store` stays importable in tests that never
+    // touch the library layer; a caller that wants the shared state passes it.
+    this._library = library ?? new LibraryStoreImpl();
 
-  constructor() {
     // Restore grid settings from localStorage
     try {
       const ge = localStorage.getItem(LS_KEY_GRID_ENABLED);
@@ -511,12 +372,26 @@ export class LayoutStore {
       if (cm !== null) this._chainModeEnabled = cm === 'true';
       const dm = localStorage.getItem(LS_KEY_DOC_MODE);
       if (dm !== null) this._docMode = dm === 'true';
-      const at = localStorage.getItem(LS_KEY_ACTIVE_TAB);
-      if (at) this._activeTabUrl = at;
     } catch { /* ignore */ }
 
     this._snapshot = this._createSnapshot();
+    // Notification bridge (§2.6.2 point 2) — a DIRECT library mutation must
+    // reach every LayoutSnapshot consumer, and must do so exactly once.
+    this._unsubLibrary = this._library.subscribe(() => this._notify());
+    this._unsubSignalLinkMode = subscribeSignalLinkMode(() => this._notify());
   }
+
+  /** Detach both subscriptions. Called from the plugin's `dispose()`. */
+  dispose(): void {
+    this._unsubLibrary?.();
+    this._unsubLibrary = null;
+    this._unsubSignalLinkMode?.();
+    this._unsubSignalLinkMode = null;
+    this._listeners.clear();
+  }
+
+  /** The shared library state behind this adapter. */
+  get library(): LibraryStoreClass { return this._library; }
 
   // ─── useSyncExternalStore API ─────────────────────────────────────
 
@@ -529,395 +404,68 @@ export class LayoutStore {
     return this._snapshot;
   };
 
-  // ─── Catalog management (multi-tab) ───────────────────────────────
+  // ─── Catalog management — DELEGATED to the LibraryStore (§2.6.2) ──
+  //
+  // Every method below forwards and does NOT call `_notify()`: the library
+  // store notifies, the bridge in the constructor turns that into exactly one
+  // LayoutStore notification with a freshly combined snapshot.
 
-  async addCatalog(url: string): Promise<void> {
-    // If already loading this URL, wait for the existing fetch
-    const existing = this._pendingFetches.get(url);
-    if (existing) {
-      await existing;
-      return;
-    }
-
-    // Avoid duplicate tabs
-    if (this._catalogUrls.includes(url)) {
-      this._activeTabUrl = url;
-      this._notify();
-      return;
-    }
-
-    // Add URL to tab list immediately (shows loading state)
-    this._catalogUrls.push(url);
-    if (!this._activeTabUrl) this._activeTabUrl = url;
-    this._notify();
-
-    const fetchPromise = (async () => {
-      try {
-        // A GitHub repo / folder URL is scanned for .glb files (no catalog.json
-        // needed); any other URL is fetched as a catalog.json manifest.
-        if (isGitHubRepoScanUrl(url)) {
-          const data = await buildCatalogFromGitHub(url);
-          this._catalogs.set(url, data);
-          this._catalogErrors.delete(url);
-          this._notify();
-          return;
-        }
-
-        // Auto-convert GitHub blob URLs to raw URLs
-        // https://github.com/user/repo/blob/main/path → https://raw.githubusercontent.com/user/repo/main/path
-        let fetchUrl = url;
-        const ghMatch = url.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/(.+)$/);
-        if (ghMatch) {
-          fetchUrl = `https://raw.githubusercontent.com/${ghMatch[1]}/${ghMatch[2]}/${ghMatch[3]}`;
-        }
-        const resp = await fetch(fetchUrl);
-        if (!resp.ok) {
-          this._catalogErrors.set(url, `HTTP ${resp.status}`);
-          this._notify();
-          return;
-        }
-        const data = await resp.json() as LibraryCatalog;
-        if (!data.entries || !Array.isArray(data.entries)) {
-          this._catalogErrors.set(url, 'Invalid catalog format');
-          this._notify();
-          return;
-        }
-        // Derive baseUrl from catalog URL directory
-        const baseUrl = data.baseUrl ?? fetchUrl.substring(0, fetchUrl.lastIndexOf('/') + 1);
-        // Normalize entries: auto-fill missing fields, resolve relative URLs
-        data.entries = data.entries.map(e => normalizeCatalogEntry(e, baseUrl));
-        this._catalogs.set(url, data);
-        this._catalogErrors.delete(url);
-        this._notify();
-      } catch (e) {
-        this._catalogErrors.set(url, e instanceof Error ? e.message : String(e));
-        this._notify();
-      } finally {
-        this._pendingFetches.delete(url);
-      }
-    })();
-
-    this._pendingFetches.set(url, fetchPromise);
-    await fetchPromise;
-
-    this._persistUrls();
+  /** Add a library subscription. `origin` drives the persistence policy (§2.6.3). */
+  async addCatalog(url: string, origin: LibraryOrigin = 'user'): Promise<void> {
+    return this._library.addCatalog(url, origin);
   }
 
   /** Inject a pre-built catalog without fetching (e.g. bundled library). */
   addCatalogDirect(key: string, catalog: LibraryCatalog): void {
-    this._bundledUrls.add(key);
-    if (this._catalogUrls.includes(key)) {
-      // Update existing
-      this._catalogs.set(key, catalog);
-      this._catalogErrors.delete(key);
-      this._notify();
-      return;
-    }
-    this._catalogUrls.push(key);
-    this._catalogs.set(key, catalog);
-    this._catalogErrors.delete(key);
-    if (!this._activeTabUrl) this._activeTabUrl = key;
-    this._notify();
+    this._library.addCatalogDirect(key, catalog);
   }
 
-  /** Update the thumbnail URL for a specific catalog entry.
-   *
-   *  Immutable update: replaces the entry, its `entries` array, and the catalog
-   *  object so a new reference flows through the snapshot. The ThumbnailCard is
-   *  `React.memo`'d on the `entry` prop — mutating in place would leave the
-   *  reference unchanged and the card would only repaint if its spinner state
-   *  happened to toggle (which is why freshly-generated previews appeared only
-   *  after a reload). */
+  /** Update the thumbnail URL for a specific catalog entry. */
   setEntryThumbnail(entryId: string, thumbnailUrl: string): void {
-    for (const [key, catalog] of this._catalogs) {
-      const idx = catalog.entries.findIndex(e => e.id === entryId);
-      if (idx !== -1) {
-        const entries = catalog.entries.slice();
-        entries[idx] = { ...entries[idx], thumbnailUrl };
-        this._catalogs.set(key, { ...catalog, entries });
-        this._notify();
-        return;
-      }
-    }
+    this._library.setEntryThumbnail(entryId, thumbnailUrl);
   }
 
-  /** Mark/unmark an entry as having its preview auto-generated (drives the
-   *  per-card spinner). */
+  /** Mark/unmark an entry as having its preview auto-generated. */
   setThumbnailPending(entryId: string, pending: boolean): void {
-    const has = this._thumbnailPending.has(entryId);
-    if (pending === has) return;
-    if (pending) this._thumbnailPending.add(entryId);
-    else this._thumbnailPending.delete(entryId);
-    this._notify();
+    this._library.setThumbnailPending(entryId, pending);
   }
 
   removeCatalog(url: string): void {
-    const idx = this._catalogUrls.indexOf(url);
-    if (idx === -1) return;
-    this._catalogUrls.splice(idx, 1);
-    this._catalogs.delete(url);
-    this._catalogErrors.delete(url);
-
-    // Switch active tab
-    if (this._activeTabUrl === url) {
-      this._activeTabUrl = this._catalogUrls[0] ?? null;
-    }
-    this._persistUrls();
-    this._notify();
+    this._library.removeCatalog(url);
   }
 
   setActiveTab(url: string): void {
-    if (!this._catalogUrls.includes(url)) return;
-    this._activeTabUrl = url;
-    try { localStorage.setItem(LS_KEY_ACTIVE_TAB, url); } catch { /* ignore */ }
+    this._library.setActiveTab(url);
+  }
+
+  async restoreFromStorage(): Promise<void> {
+    return this._library.restoreFromStorage();
+  }
+
+  /**
+   * Replace the pending-placement list (plan-371). Pure in-memory state — it
+   * never reaches `serializeLayout` and has no localStorage key.
+   *
+   * The equality guard matters: the registry notifies on every generation bump
+   * and every cancel, and a `_notify()` per event would rerender the whole
+   * planner UI for a list that did not actually change.
+   */
+  setPendingPlacements(list: readonly PendingPlacementInfo[]): void {
+    if (samePendingPlacements(this._pendingPlacements, list)) return;
+    this._pendingPlacements = list.map((p) => ({ ...p }));
     this._notify();
   }
 
-  // ─── Local Working Folder support (File System Access API) ─────────
+  // ─── Local Working Folder — DELEGATED (§2.6.2) ────────────────────
 
   /** True if the browser supports the File System Access API. */
-  get isLocalFolderSupported(): boolean { return isFsApiSupported(); }
+  get isLocalFolderSupported(): boolean { return this._library.isLocalFolderSupported; }
 
-  /**
-   * Add the working folder as a library catalog.
-   *
-   * If a working folder is already configured (handle in IndexedDB), reuse it —
-   * Chrome may show a brief re-grant prompt because this runs in a user-gesture
-   * context (button click). If no handle is stored, fall back to the native
-   * directory picker.
-   */
-  async addLocalFolder(): Promise<void> {
-    // Try to reuse an existing handle first (user-gesture context — safe to prompt).
-    let root = await getWorkFolder(true);
-    if (!root) {
-      // No stored handle, or user denied the re-grant — show the native picker.
-      root = await selectWorkFolder();
-    }
-    if (!root) return; // user cancelled or denied
-    await this._loadLibrarySubfolder(root);
-  }
-
-  /**
-   * Restore the library from a previously configured working folder.
-   *
-   * Called automatically at boot (no user gesture available) — must NOT call
-   * `requestPermission()`. Reads the handle from IndexedDB and proceeds in
-   * one of three ways:
-   *   - permission still granted     → load the library subfolder normally.
-   *   - handle stored, no permission → add a placeholder tab carrying the
-   *     `LOCAL_NEEDS_PERMISSION` sentinel so the UI can prompt the user to
-   *     re-grant access on the next click (a user-gesture context).
-   *   - no handle stored             → no-op.
-   */
-  async restoreLocalFolder(): Promise<void> {
-    const root = await getWorkFolder(false);
-    if (root) {
-      await this._loadLibrarySubfolder(root);
-      return;
-    }
-    // Permission has lapsed (or was never granted in this session). If a
-    // folder handle is still remembered, surface a placeholder tab so the
-    // user sees the previous selection and can re-grant access by clicking
-    // the tab — that click runs in a user-gesture context, which is the
-    // only place `requestPermission()` is allowed.
-    const meta = getWorkFolderMeta();
-    if (!meta) return;
-    this._addPendingLocalFolderTab(meta.displayName);
-  }
-
-  /** Insert a placeholder local-folder tab tagged with the
-   *  `LOCAL_NEEDS_PERMISSION` sentinel. No-op if already present. */
-  private _addPendingLocalFolderTab(folderName: string): void {
-    const key = `local:${folderName}/library`;
-    if (this._catalogUrls.includes(key)) return;
-    this._catalogUrls.push(key);
-    this._catalogs.set(key, {
-      version: '1.0',
-      name: `Local: ${folderName}/library`,
-      entries: [],
-    });
-    this._catalogErrors.set(key, LOCAL_NEEDS_PERMISSION);
-    this._bundledUrls.add(key); // never persist `local:` URLs into LS_KEY_URLS
-    if (!this._activeTabUrl) this._activeTabUrl = key;
-    this._notify();
-  }
-
-  /**
-   * User-gesture entry point: prompt for read permission on the stored
-   * working-folder handle and load the library subfolder. Call from a
-   * click handler — the browser blocks `requestPermission()` outside of
-   * user gestures. No-op if the user denies the prompt.
-   */
-  async activateLocalFolder(): Promise<void> {
-    const root = await getWorkFolder(true);
-    if (!root) return;
-    // Clear the placeholder sentinel before loading so the UI flips out of
-    // the "needs permission" state even if `_loadLibrarySubfolder` ends up
-    // setting a different error (e.g. missing `library/` subfolder). If the
-    // folder was renamed on disk since the placeholder was created, also
-    // drop the now-mismatched tab — the loader will add a fresh one.
-    const placeholderKey = this._catalogUrls.find(u => u.startsWith('local:'));
-    const newKey = `local:${root.name}/library`;
-    if (placeholderKey && placeholderKey !== newKey) {
-      this.removeCatalog(placeholderKey);
-    } else if (placeholderKey) {
-      this._catalogErrors.delete(placeholderKey);
-    }
-    await this._loadLibrarySubfolder(root);
-  }
-
-  /** Refresh the local library catalog (re-scan files).
-   *
-   * Always called from a user gesture (the panel's Refresh button), so it uses
-   * the prompting `getWorkFolder(true)` variant: if the persisted handle's read
-   * permission has lapsed back to `prompt` (Chrome does this across reloads /
-   * tab-backgrounding), this re-grants instead of silently no-opping — which
-   * would otherwise leave the stale catalog on screen and hide newly added
-   * files. When permission is already `granted`, no prompt is shown. */
-  async refreshLocalFolder(): Promise<void> {
-    const root = await getWorkFolder(true);
-    if (!root) return;
-    await this._loadLibrarySubfolder(root);
-  }
-
-  /** Remove working folder access and its catalog tab. */
-  async removeLocalFolder(): Promise<void> {
-    await removeWorkFolder();
-    const localUrl = this._catalogUrls.find(u => u.startsWith('local:'));
-    if (localUrl) this.removeCatalog(localUrl);
-  }
-
-  private async _loadLibrarySubfolder(root: FileSystemDirectoryHandle): Promise<void> {
-    const key = `local:${root.name}/library`;
-    try {
-      // Sources merged into the single local catalog:
-      //   - `library/` → all assets (GLB + Splats)
-      //   - `splats/`  → splats-only (the working folder's documented home
-      //                  for reality-capture point clouds). Files here are
-      //                  treated identically to splats under `library/` so
-      //                  the user can drop them into either location.
-      const libDir = await getSubfolder(root, 'library');
-      const splatsDir = await getSubfolder(root, 'splats');
-      if (!libDir && !splatsDir) {
-        this._catalogErrors.set(key, 'No "library/" or "splats/" subfolder found in working folder');
-        this._notify();
-        return;
-      }
-
-      type LibrarySource = {
-        dir: FileSystemDirectoryHandle;
-        files: LocalFileEntry[];
-        source: 'library' | 'splats';
-      };
-      const sources: LibrarySource[] = [];
-      if (libDir) {
-        sources.push({
-          dir: libDir,
-          files: await listFiles(libDir, ['.glb', '.splat', '.ksplat', '.ply']),
-          source: 'library',
-        });
-      }
-      if (splatsDir) {
-        sources.push({
-          dir: splatsDir,
-          files: await listFiles(splatsDir, ['.splat', '.ksplat', '.ply']),
-          source: 'splats',
-        });
-      }
-
-      // Persisted thumbnail map across both source `.thumbnails/` trees.
-      // Keys are namespaced by source so `splats/.thumbnails/scan.png`
-      // never collides with a hypothetical `library/.thumbnails/scan.png`.
-      const thumbsByKey = new Map<string, FileSystemFileHandle>();
-      for (const src of sources) {
-        try {
-          const thumbsDir = await src.dir.getDirectoryHandle(THUMBNAILS_SUBFOLDER);
-          const thumbFiles = await listFiles(thumbsDir, ['.png']);
-          for (const tf of thumbFiles) {
-            thumbsByKey.set(`${src.source}/${tf.path.toLowerCase()}`, tf.handle);
-          }
-        } catch { /* no thumbnails folder yet — fine */ }
-      }
-
-      const entryArrays = await Promise.all(
-        sources.map((src) => Promise.all(
-          src.files.map(async (f: LocalFileEntry) => {
-            const blobUrl = await readFileAsUrl(f.handle);
-            const ext = '.' + (f.name.split('.').pop()?.toLowerCase() ?? '');
-            const isSplat = SPLAT_EXTENSIONS.has(ext);
-            const stem = f.name.replace(/\.(glb|splat|ksplat|ply)$/i, '');
-            // Derive category from first subfolder, or 'custom' / 'splat'.
-            // `category` stays in the predefined enum so existing UIs and
-            // filters keep working; arbitrary subfolder names are exposed
-            // separately via `collections` (Asset-Manager-style chips).
-            const parts = f.path.split('/');
-            const folder = parts.length > 1 ? parts[0].toLowerCase() : '';
-            const category = isSplat
-              ? 'splat' as LibraryCatalogEntry['category']
-              : (['conveyor', 'robot', 'machine', 'fixture', 'des'].includes(folder)
-                ? folder
-                : 'custom') as LibraryCatalogEntry['category'];
-
-            // Collections: every parent directory inside the source becomes
-            // a chip. For `library/PalletHandling/RollConveyor2m.glb` →
-            // ["PalletHandling"]. For nested `splats/Hall1/Scan.splat` →
-            // ["Hall1"]. The source folder itself is not added as a chip —
-            // splat-category already groups `splats/` entries together.
-            const dirSegments = parts.slice(0, -1).filter(Boolean);
-            const collections: string[] = [];
-            for (let i = 0; i < dirSegments.length; i++) {
-              collections.push(dirSegments.slice(0, i + 1).join('/'));
-            }
-
-            // Look up persisted thumbnail by mirroring the source path
-            // (same subfolder structure, .png extension).
-            const thumbRelPath = f.path.replace(/\.(glb|splat|ksplat|ply)$/i, '.png').toLowerCase();
-            const thumbHandle = thumbsByKey.get(`${src.source}/${thumbRelPath}`);
-            const thumbnailUrl = thumbHandle ? await readFileAsUrl(thumbHandle) : '';
-
-            // Files from `splats/` use the source as a path prefix in
-            // `localPath` and `id` so they round-trip cleanly on layout
-            // restore and never collide with a same-name file under
-            // `library/`. Files from `library/` keep their unprefixed
-            // path → backwards-compatible with layouts saved before the
-            // splats/ source existed.
-            const prefixedPath = src.source === 'splats' ? `splats/${f.path}` : f.path;
-
-            const base: LibraryCatalogEntry = {
-              id: `local-${prefixedPath.replace(/[^a-z0-9]/gi, '-').toLowerCase()}`,
-              name: stem.replace(/[_-]/g, ' '),
-              category,
-              thumbnailUrl,
-              pivotToFloor: !isSplat,
-              localPath: prefixedPath,
-              collections: collections.length > 0 ? collections : undefined,
-            };
-            if (isSplat) {
-              base.splatUrl = blobUrl;
-            } else {
-              base.glbUrl = blobUrl;
-            }
-            return base;
-          }),
-        )),
-      );
-
-      const entries: LibraryCatalogEntry[] = entryArrays.flat();
-
-      const catalog: LibraryCatalog = {
-        version: '1.0',
-        name: `Local: ${root.name}/library`,
-        entries,
-      };
-
-      this.addCatalogDirect(key, catalog);
-      this._activeTabUrl = key;
-      this._notify();
-    } catch (e) {
-      this._catalogErrors.set(key, String(e));
-      this._notify();
-    }
-  }
+  async addLocalFolder(): Promise<void> { return this._library.addLocalFolder(); }
+  async restoreLocalFolder(): Promise<void> { return this._library.restoreLocalFolder(); }
+  async activateLocalFolder(): Promise<void> { return this._library.activateLocalFolder(); }
+  async refreshLocalFolder(): Promise<void> { return this._library.refreshLocalFolder(); }
+  async removeLocalFolder(): Promise<void> { return this._library.removeLocalFolder(); }
 
   // ─── Component management ─────────────────────────────────────────
 
@@ -960,6 +508,15 @@ export class LayoutStore {
   updateVisibility(id: string, visible: boolean): void {
     this._placed = this._placed.map(c =>
       c.id === id ? { ...c, visible } : c,
+    );
+    this._notify();
+  }
+
+  /** Replace the signal mappings of a placed component. An empty array is kept
+   *  (not dropped) so an explicit "all unbound" state round-trips. */
+  updateSignalMappings(id: string, signalMappings: SignalMapping[]): void {
+    this._placed = this._placed.map(c =>
+      c.id === id ? { ...c, signalMappings } : c,
     );
     this._notify();
   }
@@ -1061,6 +618,12 @@ export class LayoutStore {
     this._notify();
   }
 
+  /** Toggle signal-linking mode (plan-226): when on, placed elements with
+   *  bindable slots show a 3D status badge and clicking opens the signal picker. */
+  setSignalLinkMode(enabled: boolean): void {
+    setSignalLinkModeExplicit(enabled);
+  }
+
   setGridSize(mm: number): void {
     this._gridSizeMm = Math.max(0, mm); // 0 = translation snap off (grid not drawn)
     try { localStorage.setItem(LS_KEY_GRID_SIZE, String(this._gridSizeMm)); } catch { /* ignore */ }
@@ -1086,7 +649,8 @@ export class LayoutStore {
       const layout = serializeLayout(
         'autosave',
         this._placed,
-        this._catalogUrls,
+        // §2.6.2 point 4 — read through the delegated getter, not a local copy.
+        this._library.catalogUrls,
         this._gridSizeMm,
       );
       localStorage.setItem(LS_KEY_AUTOSAVE, JSON.stringify(layout));
@@ -1104,21 +668,6 @@ export class LayoutStore {
       this._gridSizeMm = layout.gridSizeMm;
       this._notify();
     } catch { /* ignore corrupt data */ }
-  }
-
-  async restoreFromStorage(): Promise<void> {
-    try {
-      const urlsJson = localStorage.getItem(LS_KEY_URLS);
-      if (!urlsJson) return;
-      const urls = (JSON.parse(urlsJson) as string[]).filter(u => u.trim() !== '');
-      for (const url of urls) {
-        // GitHub libraries are opt-in only — never auto-restore a persisted
-        // GitHub catalog (it would re-scan GitHub on every boot without the
-        // user adding it this session). Only an explicit manual add loads it.
-        if (isGitHubCatalogUrl(url)) continue;
-        await this.addCatalog(url);
-      }
-    } catch { /* ignore */ }
   }
 
   /** Replace all placed components (used when loading a layout file). */
@@ -1149,28 +698,25 @@ export class LayoutStore {
   get snapPointMagnetEnabled(): boolean { return this._snapPointMagnetEnabled; }
   get chainModeEnabled(): boolean { return this._chainModeEnabled; }
   get docMode(): boolean { return this._docMode; }
+  get signalLinkMode(): boolean { return getSignalLinkModeSnapshot().explicit; }
 
   // ─── Internal ─────────────────────────────────────────────────────
 
-  private _persistUrls(): void {
-    try {
-      // Only persist user-added URLs, not bundled ones. GitHub catalogs are
-      // never persisted (opt-in per session only) — this also self-heals any
-      // former-default GitHub URL that leaked into storage: the next persist
-      // rewrites the list without it.
-      const userUrls = this._catalogUrls.filter(
-        u => u.trim() !== '' && !this._bundledUrls.has(u) && !isGitHubCatalogUrl(u),
-      );
-      localStorage.setItem(LS_KEY_URLS, JSON.stringify(userUrls));
-    } catch { /* ignore */ }
-  }
-
+  /**
+   * The COMBINED snapshot (§2.6.2 point 2).
+   *
+   * The library half is spread in from the library store's own snapshot rather
+   * than copied field by field, so a future library field reaches every planner
+   * consumer without another edit here. Everything below it is planner-only.
+   */
   private _createSnapshot(): LayoutSnapshot {
+    const lib = this._library.getSnapshot();
     return {
-      catalogs: new Map(this._catalogs),
-      catalogUrls: [...this._catalogUrls],
-      catalogErrors: new Map(this._catalogErrors),
-      activeTabUrl: this._activeTabUrl,
+      catalogs: lib.catalogs,
+      catalogUrls: lib.catalogUrls,
+      catalogErrors: lib.catalogErrors,
+      activeTabUrl: lib.activeTabUrl,
+      thumbnailPending: lib.thumbnailPending,
       placed: this._placed,
       selectedId: this._selectedId,
       mode: this._mode,
@@ -1187,8 +733,9 @@ export class LayoutStore {
       snapPointMagnetEnabled: this._snapPointMagnetEnabled,
       chainModeEnabled: this._chainModeEnabled,
       docMode: this._docMode,
+      signalLinkMode: getSignalLinkModeSnapshot().explicit,
       placementMode: this._placementMode,
-      thumbnailPending: new Set(this._thumbnailPending),
+      pendingPlacements: this._pendingPlacements,
     };
   }
 

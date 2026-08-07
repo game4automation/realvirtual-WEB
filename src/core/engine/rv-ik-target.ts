@@ -20,40 +20,24 @@
 
 import type { Object3D } from 'three';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponent } from './rv-component-registry';
+import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import type { ComponentRef } from './rv-node-registry';
-import type { SignalStore } from './rv-signal-store';
+import {
+  createSignalWriter,
+  type SignalStore,
+  type SignalWriter,
+} from './rv-signal-store';
 import type { RVGrip } from './rv-grip';
 import { debug } from './rv-debug';
 
 export type IKInterpolation = 'PointToPoint' | 'PointToPointUnsynced' | 'Linear';
 
 export class RVIKTarget implements RVComponent {
-  static readonly schema: ComponentSchema = {
-    FollowInEditMode:     { type: 'boolean', default: true },
-    SpeedToTarget:        { type: 'number',  default: 1 },
-    LinearAcceleration:   { type: 'number',  default: 100 },
-    InterpolationToTarget: { type: 'enum', enumMap: {
-      PointToPoint: 'PointToPoint',
-      PointToPointUnsynced: 'PointToPointUnsynced',
-      Linear: 'Linear',
-    }, default: 'PointToPoint' },
-    LinearSpeedToTarget:  { type: 'number',  default: 500 },
-    TurnCorrection:       { type: 'boolean', default: false },
-    SetSignalDuration:    { type: 'number',  default: 0.5 },
-    WaitForSeconds:       { type: 'number',  default: 0 },
-    PickAndPlace:         { type: 'boolean', default: false },
-    Pick:                 { type: 'boolean', default: false },
-    Place:                { type: 'boolean', default: false },
-    EnableBlending:       { type: 'boolean', default: false },
-    BlendRadius:          { type: 'number',  default: 25 },
-    // Signal refs → resolved to address strings by resolveComponentRefs()
-    SetSignal:            { type: 'componentRef' },
-    WaitForSignal:        { type: 'componentRef' },
-    // NOTE: AxisPos (number[6]), gripTarget/fixer (object refs) are NOT schema
-    //       fields — they are captured raw in beforeSchema() (see below), because
-    //       the schema mapper has no numberArray type and drops object refs.
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  // NOTE: AxisPos (number[6]), gripTarget/fixer (object refs) are NOT schema
+  //       fields — they are captured raw in beforeSchema() (see below), because
+  //       the schema mapper has no numberArray type and drops object refs.
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('IKTarget');
 
   readonly node: Object3D;
   isOwner = true;
@@ -86,6 +70,7 @@ export class RVIKTarget implements RVComponent {
   waitForSignalAddr: string | null = null;
   gripTarget: RVGrip | null = null;
   private _store: SignalStore | null = null;
+  private _writer: SignalWriter | null = null;
 
   constructor(node: Object3D) {
     this.node = node;
@@ -93,6 +78,11 @@ export class RVIKTarget implements RVComponent {
 
   init(context: ComponentContext): void {
     this._store = context.signalStore;
+    this._writer = createSignalWriter(
+      context.signalStore,
+      `component:IKTarget:${this.node.name}`,
+      'component',
+    );
     // SetSignal / WaitForSignal are address strings after resolveComponentRefs.
     this.setSignalAddr = typeof this.SetSignal === 'string' ? this.SetSignal : null;
     this.waitForSignalAddr = typeof this.WaitForSignal === 'string' ? this.WaitForSignal : null;
@@ -127,8 +117,8 @@ export class RVIKTarget implements RVComponent {
 
   /** Called when the robot reaches this target: raise SetSignal + pick/place. */
   onAtTarget(): void {
-    if (this.setSignalAddr && this._store) {
-      this._store.setByPath(this.setSignalAddr, true);
+    if (this.setSignalAddr && this._writer) {
+      this._writer.setByPath(this.setSignalAddr, true);
     }
     if (this.PickAndPlace && this.gripTarget) {
       if (this.Pick) this.gripTarget.pick();
@@ -147,6 +137,6 @@ function isRef(v: unknown): v is ComponentRef {
 registerComponent({
   type: 'IKTarget',
   schema: RVIKTarget.schema,
-  capabilities: { simulationActive: false, selectable: true, badgeColor: '#ce93d8', filterLabel: 'IK Targets' },
+  capabilities: { selectable: true, badgeColor: '#ce93d8', filterLabel: 'IK Targets' },
   create: (node: Object3D) => new RVIKTarget(node),
 });

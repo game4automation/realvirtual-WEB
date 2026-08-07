@@ -39,10 +39,25 @@ const TONE_MAP_LOOKUP: Record<ToneMappingType, ThreeToneMapping> = {
 
 const SHADOW_RES: Record<ShadowQuality, number> = { low: 512, medium: 1024, high: 2048 };
 
+// Module-local warn-once flag (repo convention — no external warnOnce util).
+let _warnedWebGPU = false;
+function warnEnvMapWebGPUOnce(): void {
+  if (_warnedWebGPU) return;
+  _warnedWebGPU = true;
+  console.warn(
+    '[VisualSettings] WebGPU env-map generation failed — the classic ' +
+    'PMREMGenerator is WebGL-only and the three/webgpu variant threw. ' +
+    'Environment lighting and unlit reflections are unavailable.',
+  );
+}
+
 /** Shared state that VisualSettingsManager reads/writes on the facade. */
 export interface ViewerVisualState {
   scene: Scene;
   renderer: Renderer;
+  /** True when the renderer is a WebGPURenderer — gates WebGL-only paths
+   *  (PMREM env-map generation). Optional so tests can omit it. */
+  isWebGPU?: boolean;
   ambientLight: AmbientLight;
   dirLight: DirectionalLight;
   sceneFixtures: Set<import('three').Object3D>;
@@ -316,6 +331,31 @@ export class VisualSettingsManager {
     if (this._envMapTexture) return;
     const loader = new RGBELoader();
     const hdrTexture = await loader.loadAsync(`${import.meta.env.BASE_URL}envmaps/empty_warehouse_01_1k.hdr`);
+
+    // WebGPU path (plan-271): the classic PMREMGenerator is WebGL-only, but
+    // three/webgpu ships its own — use the async variant (waits for backend
+    // init). Dynamic import keeps three/webgpu in the async chunk (NFR 9.8).
+    // Without an env map, PBR metals render nearly black under WebGPU.
+    if (this.state.isWebGPU) {
+      try {
+        const { PMREMGenerator: PMREMGeneratorGPU } = await import('three/webgpu');
+        // @types/three 0.185 lags the runtime: fromEquirectangularAsync exists
+        // on the three/webgpu PMREMGenerator but is not declared yet.
+        const pmrem = new PMREMGeneratorGPU(this.state.renderer as never) as unknown as {
+          fromEquirectangularAsync(t: Texture): Promise<{ texture: Texture }>;
+          dispose(): void;
+        };
+        const envMap = await pmrem.fromEquirectangularAsync(hdrTexture);
+        this._envMapTexture = envMap.texture;
+        pmrem.dispose();
+      } catch {
+        warnEnvMapWebGPUOnce();
+      } finally {
+        hdrTexture.dispose();
+      }
+      return;
+    }
+
     const pmrem = new PMREMGenerator(this.state.renderer as unknown as WebGLRenderer);
     const envMap = pmrem.fromEquirectangular(hdrTexture);
     this._envMapTexture = envMap.texture;

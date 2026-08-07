@@ -57,8 +57,8 @@ describe('filterChipSx', () => {
 
   it('uses default height and fontSize', () => {
     const sx = filterChipSx(true) as Record<string, unknown>;
-    expect(sx.height).toBe(18);
-    expect(sx.fontSize).toBe(9);
+    expect(sx.height).toBe(20);
+    expect(sx.fontSize).toBe(11);
   });
 
   it('accepts custom height and fontSize', () => {

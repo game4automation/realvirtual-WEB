@@ -23,6 +23,8 @@ import {
 } from 'three';
 import { ISOLATE_FOCUS_LAYER } from './rv-group-registry';
 import { traverseMeshes } from './rv-traverse-utils';
+import { getTslMaterials } from './materials/material-factory';
+import type { PipeFlowTslHandles } from './materials/rv-pipe-flow-tsl';
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -44,6 +46,9 @@ interface PipeFlowEntry {
   node: Object3D;
   overlay: Mesh;
   shader: WebGLProgramParametersWithUniforms | null;
+  /** TSL uniform handles (WebGPURenderer path, plan-271 Phase 2). The uTime
+   *  uniform is fed EXCLUSIVELY from update(dt) — never wall-clock. */
+  tsl: PipeFlowTslHandles | null;
   lastFlowRate: number;
 }
 
@@ -73,11 +78,30 @@ function findPipeMesh(pipeNode: Object3D): Mesh | null {
 
 // ─── PipeFlowManager ────────────────────────────────────────────────────
 
+// Module-local warn-once flag (repo convention — no external warnOnce util).
+// Since plan-271 Phase 2 this only fires as a FALLBACK: when the renderer is
+// a WebGPURenderer but the TSL material module was not pre-warmed (see
+// preloadTslMaterials in material-factory.ts) — the TSL variant in
+// materials/rv-pipe-flow-tsl.ts otherwise carries the animated rings.
+let _warnedWebGPU = false;
+function warnPipeFlowWebGPUOnce(): void {
+  if (_warnedWebGPU) return;
+  _warnedWebGPU = true;
+  console.warn(
+    '[PipeFlow] WebGPU renderer active but the TSL material module is not ' +
+    'preloaded — the GLSL onBeforeCompile ring patch is disabled because ' +
+    'onBeforeCompile is silently ignored under WebGPURenderer. Pipes keep a ' +
+    'static semi-transparent overlay without animated flow rings.',
+  );
+}
+
 export class PipeFlowManager {
   readonly entries: PipeFlowEntry[] = [];
   private _time = 0;
+  private readonly _isWebGPU: boolean;
 
-  constructor(pipeNodes: Object3D[]) {
+  constructor(pipeNodes: Object3D[], isWebGPU = false) {
+    this._isWebGPU = isWebGPU;
     for (const node of pipeNodes) {
       this._createFlow(node);
     }
@@ -118,10 +142,16 @@ export class PipeFlowManager {
       // uFlowSpeed makes rings drift toward lower uv.x. To match the Unity
       // convention for rings flowing from destination→source, we negate the
       // direction before assigning.
+      const direction = Math.sign(flowRate) * uvDirection;
+      const flowSpeed = active ? -direction * FLOW_SCROLL_SPEED : 0;
       if (entry.shader) {
         entry.shader.uniforms.uTime.value = this._time;
-        const direction = Math.sign(flowRate) * uvDirection;
-        entry.shader.uniforms.uFlowSpeed.value = active ? -direction * FLOW_SCROLL_SPEED : 0;
+        entry.shader.uniforms.uFlowSpeed.value = flowSpeed;
+      } else if (entry.tsl) {
+        // TSL path (plan-271 Phase 2): the SAME dt-accumulated time base —
+        // NEVER the wall-clock `time` node (pause behaviour / determinism).
+        entry.tsl.uTime.value = this._time;
+        entry.tsl.uFlowSpeed.value = flowSpeed;
       }
 
       entry.overlay.visible = true; // always visible — zero flow shows static rings
@@ -174,22 +204,53 @@ export class PipeFlowManager {
       node: pipeNode,
       overlay: null!,
       shader: null,
+      tsl: null,
       lastFlowRate: 0,
     };
 
-    const mat = new MeshBasicMaterial({
-      color: RING_COLOR,
-      transparent: true,
-      opacity: RING_OPACITY,
-      side: FrontSide,
-      depthTest: true,
-      depthWrite: false,
-      polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -4,
-    });
-
-    mat.onBeforeCompile = (shader) => {
+    let mat: MeshBasicMaterial;
+    // WebGPURenderer (both backends): onBeforeCompile GLSL patches are
+    // silently ignored — the pre-warmed TSL variant carries the animated
+    // rings instead (plan-271 Phase 2). Without pre-warm → F4 guard fallback
+    // (warn once, static semi-transparent overlay, `entry.shader`/`entry.tsl`
+    // stay null so update() writes nothing).
+    if (this._isWebGPU) {
+      const tslMod = getTslMaterials();
+      if (tslMod) {
+        const handles = tslMod.createPipeFlowMaterialTsl(
+          RING_COLOR, RING_OPACITY, RING_DENSITY, RING_WIDTH,
+        );
+        // MeshBasicNodeMaterial shares the MeshBasicMaterial property surface
+        // (color, opacity, …) — setRingColor()/dispose() keep working.
+        mat = handles.material as MeshBasicMaterial;
+        entry.tsl = handles;
+      } else {
+        warnPipeFlowWebGPUOnce();
+        mat = new MeshBasicMaterial({
+          color: RING_COLOR,
+          transparent: true,
+          opacity: RING_OPACITY,
+          side: FrontSide,
+          depthTest: true,
+          depthWrite: false,
+          polygonOffset: true,
+          polygonOffsetFactor: -1,
+          polygonOffsetUnits: -4,
+        });
+      }
+    } else {
+      mat = new MeshBasicMaterial({
+        color: RING_COLOR,
+        transparent: true,
+        opacity: RING_OPACITY,
+        side: FrontSide,
+        depthTest: true,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -4,
+      });
+      mat.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = { value: 0 };
       shader.uniforms.uFlowSpeed = { value: 0 };
       shader.uniforms.uRingDensity = { value: RING_DENSITY };
@@ -231,10 +292,13 @@ varying vec2 vPipeUv;`,
 }`,
       );
 
-      entry.shader = shader;
-    };
+        entry.shader = shader;
+      };
 
-    mat.customProgramCacheKey = () => `pipeFlow_${pipeMesh.uuid}`;
+      // WebGL program cache key (GLSL path only — the WebGPU node pipeline
+      // caches by node-graph state, a shared key would be wrong there).
+      mat.customProgramCacheKey = () => `pipeFlow_${pipeMesh.uuid}`;
+    }
 
     const overlay = new Mesh(pipeMesh.geometry, mat);
     overlay.name = `${pipeMesh.name}_flowOverlay`;

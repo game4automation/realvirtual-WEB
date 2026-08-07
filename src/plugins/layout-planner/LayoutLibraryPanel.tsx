@@ -10,13 +10,12 @@
  * Relies on LayoutStore (useSyncExternalStore) for reactive state.
  */
 
-import { useState, useCallback, useSyncExternalStore, memo, useRef, type ReactNode } from 'react';
+import { useState, useCallback, useEffect, useSyncExternalStore, memo, useRef, type ReactNode } from 'react';
 import {
   Box,
   Paper,
   Typography,
   IconButton,
-  TextField,
   Button,
   Tooltip,
   Switch,
@@ -24,22 +23,12 @@ import {
   ListItemIcon,
   Divider,
   CircularProgress,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  Tabs,
-  Tab,
   Menu,
 } from '@mui/material';
 import {
-  Add,
+  Tune,
   CameraAlt,
-  TimerOutlined,
-  Cloud,
-  GitHub,
   FolderOpen,
-  Landscape,
   ErrorOutline,
   Close,
   ViewSidebar,
@@ -47,8 +36,8 @@ import {
   MoreVert,
   Check,
   Refresh,
-  Delete,
   Link as LinkIcon,
+  Edit as EditIcon,
 } from '@mui/icons-material';
 import { useViewer } from '../../hooks/use-viewer';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
@@ -57,6 +46,7 @@ import { LeftPanel, WINDOW_DARK_BG } from '../../core/hmi/LeftPanel';
 import { RV_SCROLL_CLASS } from '../../core/hmi/shared-sx';
 import { LAYOUT_PANEL_WIDTH, LEFT_PANEL_ZINDEX } from '../../core/hmi/layout-constants';
 import { showInfoOverlay } from '../../core/hmi/info-overlay-store';
+import { setPendingAssetOpen } from '../asset-editor/pending-open-store';
 import type { LayoutPlannerPlugin } from './index';
 import type { LibraryCatalogEntry, LayoutSnapshot } from './rv-layout-store';
 import { LOCAL_NEEDS_PERMISSION, isGitHubRepoScanUrl } from './rv-layout-store';
@@ -75,7 +65,15 @@ function behaviorDescription(entry: LibraryCatalogEntry): string | null {
 }
 import { CatalogBrowser } from './CatalogBrowser';
 import { LibrarySelector, type LibraryItem } from './LibrarySelector';
-import { deriveChips, filterByChip } from './library-chips';
+import { deriveChips, filterByChip } from '../../core/library/library-chips';
+import { AssetCard } from '../../core/library/AssetCard';
+import { openProjectsDashboard } from '../../core/hmi/projects/projects-dashboard-store';
+import { buildThumbnailKey } from '../../core/thumbnails/thumbnail-key';
+import { useThumbnailVisibility } from '../../core/thumbnails/use-thumbnail-visibility';
+import { getProjectStore } from '../../core/project/project-store';
+// Lives in its own module so the lazy-loading host (LayoutLibraryPanelHost) can
+// show it WITHOUT pulling this panel's chunk (plan-344 Phase 4).
+import { MobileLibraryTab } from './MobileLibraryTab';
 
 
 // ─── Constants ──────────────────────────────────────────────────────────
@@ -88,6 +86,25 @@ const MOBILE_CARD_WIDTH = 84;
  *  strip/tab sits flush on top of — no gap below it. The bars add the safe-area
  *  inset as bottom padding, so the strip adds the same inset on top of this. */
 const MOBILE_NAV_CLEARANCE = 48;
+
+/**
+ * Hover-intent delay (ms) before a card starts prefetching its GLB (plan-371 F8).
+ *
+ * Prefetching on the very first `mouseenter` would fire for every card the
+ * pointer merely crosses on its way somewhere else — "align prefetching with
+ * intent, not hope". 65–100 ms is the established window; 80 ms is short enough
+ * to be invisible to a user who is actually reaching for the card and long
+ * enough to reject a scrub across the grid.
+ */
+export const PREFETCH_INTENT_MS = 80;
+
+/** Whether an entry has a GLB worth prefetching (virtual/DES and splat entries
+ *  never take the placeholder path, so warming them buys nothing). */
+function prefetchableUrl(entry: LibraryCatalogEntry): string | null {
+  if (entry.virtual === true || entry.splatUrl) return null;
+  const url = entry.glbUrl?.trim();
+  return url ? url : null;
+}
 
 // ─── Panel Component ────────────────────────────────────────────────────
 
@@ -127,26 +144,14 @@ export function LayoutLibraryPanel() {
   // Active tab: either a catalog URL or "am:<connectionId>"
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
 
-  // Dialog states
-  const [addUrlOpen, setAddUrlOpen] = useState(false);
-  const [addUrl, setAddUrl] = useState('');
-  const [addLoading, setAddLoading] = useState(false);
-  const [addDialogTab, setAddDialogTab] = useState(0); // 0 = URL, 1 = GitHub, 2 = Asset Manager
-  const [ghUrl, setGhUrl] = useState('');
-  const [amLabel, setAmLabel] = useState('');
-  const [amProjId, setAmProjId] = useState('');
-  const [amKeyId, setAmKeyId] = useState('');
-  const [amSecret, setAmSecret] = useState('');
   const [searchText, setSearchText] = useState('');
   // Save / Load / Clear dialogs were removed when those actions migrated
   // to the unified Scene window — see footer note in this file's render.
-
-  // Edit AM connection dialog
-  const [editAmId, setEditAmId] = useState<string | null>(null);
-  const [editAmLabel, setEditAmLabel] = useState('');
-  const [editAmProjId, setEditAmProjId] = useState('');
-  const [editAmKeyId, setEditAmKeyId] = useState('');
-  const [editAmSecret, setEditAmSecret] = useState('');
+  //
+  // The Add-Library and Edit-Connection dialogs and their fourteen state
+  // variables went the same way in plan-702: library MANAGEMENT now lives
+  // exclusively in the Projects dashboard's Assets tab, and this panel keeps
+  // only what browsing needs (pick, search, filter, drag, refresh, re-grant).
 
   // Selected filter chip (null = "All"). Shared across every tab type:
   // collections when the catalog defines them, otherwise the category enum
@@ -170,81 +175,22 @@ export function LayoutLibraryPanel() {
     if (!id.startsWith('am:')) store?.setActiveTab(id);
   }, [store]);
 
-  const handleAddCatalog = useCallback(async () => {
-    if (!store || !addUrl.trim()) return;
-    const url = addUrl.trim();
-    setAddLoading(true);
-    await store.addCatalog(url);
-    setAddLoading(false);
-    setAddUrl('');
-    setAddUrlOpen(false);
-    switchToLibrary(url);
-  }, [store, addUrl, switchToLibrary]);
-
-  const handleAddGitHub = useCallback(async () => {
-    if (!store || !ghUrl.trim()) return;
-    const url = ghUrl.trim();
-    setAddLoading(true);
-    // store.addCatalog() auto-detects a GitHub repo/folder URL and scans it for
-    // .glb files; a direct catalog.json URL (blob→raw) is also supported.
-    await store.addCatalog(url);
-    setAddLoading(false);
-    setGhUrl('');
-    setAddUrlOpen(false);
-    switchToLibrary(url);
-  }, [store, ghUrl, switchToLibrary]);
-
-  const handleAddAssetManager = useCallback(() => {
-    if (!cloudStore || !amProjId.trim() || !amKeyId.trim() || !amSecret.trim()) return;
-    const label = amLabel.trim() || `Asset Manager (${amProjId.trim().slice(0, 8)}...)`;
-    const id = cloudStore.addConnection(label, {
-      projectId: amProjId.trim(),
-      keyId: amKeyId.trim(),
-      secretKey: amSecret.trim(),
-    });
-    // Reset form & switch to new connection tab
-    setAmLabel(''); setAmProjId(''); setAmKeyId(''); setAmSecret('');
-    setAddUrlOpen(false);
-    setActiveTabId(`am:${id}`);
-  }, [cloudStore, amLabel, amProjId, amKeyId, amSecret]);
-
-  const handleAddLocalFolder = useCallback(async () => {
-    if (!store) return;
-    setAddLoading(true);
-    await store.addLocalFolder();
-    setAddLoading(false);
-    setAddUrlOpen(false);
-    // The local key depends on the chosen folder name, so resolve it from the
-    // store after adding, then switch to it.
-    const localUrl = store.getSnapshot().catalogUrls.find(u => u.startsWith('local:'));
-    if (localUrl) switchToLibrary(localUrl);
-  }, [store, switchToLibrary]);
-
   const handleRefreshLocalFolder = useCallback(async () => {
     if (!store) return;
     await store.refreshLocalFolder();
   }, [store]);
 
-  const handleEditAmConnection = useCallback((connId: string) => {
-    const cs = cloudSnapshot.connections.find(c => c.conn.id === connId);
-    if (!cs) return;
-    setEditAmId(connId);
-    setEditAmLabel(cs.conn.label);
-    setEditAmProjId(cs.conn.config.projectId);
-    setEditAmKeyId(cs.conn.config.keyId);
-    setEditAmSecret(cs.conn.config.secretKey);
-  }, [cloudSnapshot]);
-
-  const handleSaveAmEdit = useCallback(() => {
-    if (!cloudStore || !editAmId || !editAmProjId.trim() || !editAmKeyId.trim() || !editAmSecret.trim()) return;
-    const label = editAmLabel.trim() || `Asset Manager (${editAmProjId.trim().slice(0, 8)}...)`;
-    cloudStore.updateConnection(editAmId, label, {
-      projectId: editAmProjId.trim(),
-      keyId: editAmKeyId.trim(),
-      secretKey: editAmSecret.trim(),
-    });
-    setEditAmId(null);
-  }, [cloudStore, editAmId, editAmLabel, editAmProjId, editAmKeyId, editAmSecret]);
+  /**
+   * The panel's single management route (plan-702 F8).
+   *
+   * Everything that used to live here — add URL / GitHub / Asset Manager /
+   * local folder, remove, edit connection — is now one door into the Projects
+   * dashboard's Assets tab, which groups the same libraries by source and can
+   * attach new ones.
+   */
+  const handleManageLibraries = useCallback(() => {
+    openProjectsDashboard({ kind: 'globalLibraries' });
+  }, []);
 
   if (!plugin || !store || !snapshot) return null;
 
@@ -276,7 +222,6 @@ export function LayoutLibraryPanel() {
       ? snapshot.activeTabUrl
       : allTabIds[0] ?? null;
   const isAmTab = resolvedActiveTabId?.startsWith('am:') ?? false;
-  const activeAmId = isAmTab ? resolvedActiveTabId!.slice(3) : null;
   const isLocalTab = resolvedActiveTabId?.startsWith('local:') ?? false;
 
   // Active (non-AM) catalog + the shared chip/filter pipeline. Every public
@@ -339,12 +284,6 @@ export function LayoutLibraryPanel() {
     }
   };
 
-  const handleRemoveLibrary = (id: string): void => {
-    if (id.startsWith('am:')) cloudStore?.removeConnection(id.slice(3));
-    else if (id.startsWith('local:')) void store.removeLocalFolder();
-    else store.removeCatalog(id);
-  };
-
   // Chip row is redundant when a single facet already covers every entry
   // (e.g. one category == all items). Show it only when it adds filtering value.
   const showChips = chips.length > 1 || (chips.length === 1 && chips[0].count < fullEntries.length);
@@ -358,7 +297,7 @@ export function LayoutLibraryPanel() {
     emptyContent = (
       <Box sx={{ p: 2, textAlign: 'center' }}>
         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-          No libraries loaded. Click [+] to add a library.
+          No libraries loaded. Attach one via “Manage libraries…” in the library dropdown.
         </Typography>
       </Box>
     );
@@ -420,9 +359,8 @@ export function LayoutLibraryPanel() {
           libraryItems={libraryItems}
           activeId={resolvedActiveTabId}
           onSelect={handleSelectLibrary}
-          onRemove={handleRemoveLibrary}
           onRefreshLocal={handleRefreshLocalFolder}
-          onAdd={() => setAddUrlOpen(true)}
+          onManage={handleManageLibraries}
           onClose={handleClose}
         />
       ) : (
@@ -449,223 +387,45 @@ export function LayoutLibraryPanel() {
           ) : null
         }
       >
-        {/* Library switcher — full-width dropdown with per-library remove. */}
+        {/* Library switcher — full-width dropdown, plus the one management
+            route into the Projects dashboard (plan-702 F8). */}
         <LibrarySelector
           items={libraryItems}
           activeId={resolvedActiveTabId}
           onSelect={handleSelectLibrary}
-          onRemove={handleRemoveLibrary}
           onRefresh={(id) => { if (id.startsWith('local:')) void handleRefreshLocalFolder(); }}
-          onAdd={() => setAddUrlOpen(true)}
+          onManage={handleManageLibraries}
         />
 
-        {/* Content area — the Asset Manager tab delegates to the private cloud
-            component (its own data model + download flow); every other catalog
-            source shares the CatalogBrowser shell. */}
-        {isAmTab && activeAmId && plugin?.extension?.cloudTabComponent && cloudStore ? (
-          <Box className={RV_SCROLL_CLASS} sx={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
-            {(() => {
-              const CloudTab = plugin.extension.cloudTabComponent;
-              return <CloudTab plugin={plugin} cloudStore={cloudStore} connectionId={activeAmId} onEdit={handleEditAmConnection} />;
-            })()}
-          </Box>
-        ) : (
-          <CatalogBrowser
-            headerText={countLabel}
-            searchText={searchText}
-            onSearchChange={setSearchText}
-            searchPlaceholder={isLocalTab ? 'Search assets...' : 'Search...'}
-            chips={showChips ? chips : []}
-            totalCount={fullEntries.length}
-            selectedChip={selectedChip}
-            onSelectChip={setSelectedChip}
-            empty={emptyContent !== null}
-            emptyContent={emptyContent}
-          >
-            {displayedEntries.map((entry) => (
-              <ThumbnailCard
-                key={entry.id}
-                entry={entry}
-                isPlacing={snapshot.placementMode === entry.id}
-                isPending={snapshot.thumbnailPending.has(entry.id)}
-                plugin={plugin}
-              />
-            ))}
-          </CatalogBrowser>
-        )}
+        {/* Every catalog source shares the CatalogBrowser shell. (The private
+            Asset-Manager `cloudTabComponent` escape hatch was removed in
+            plan-372 Phase 13; the branch that rendered it had been dead in
+            every build since, and went with it in plan-702.) */}
+        <CatalogBrowser
+          headerText={countLabel}
+          searchText={searchText}
+          onSearchChange={setSearchText}
+          searchPlaceholder={isLocalTab ? 'Search assets...' : 'Search...'}
+          chips={showChips ? chips : []}
+          totalCount={fullEntries.length}
+          selectedChip={selectedChip}
+          onSelectChip={setSelectedChip}
+          empty={emptyContent !== null}
+          emptyContent={emptyContent}
+        >
+          {displayedEntries.map((entry) => (
+            <ThumbnailCard
+              key={entry.id}
+              entry={entry}
+              isPlacing={snapshot.placementMode === entry.id}
+              isPending={snapshot.thumbnailPending.has(entry.id)}
+              plugin={plugin}
+            />
+          ))}
+        </CatalogBrowser>
       </LeftPanel>
       )}
-
-      {/* Add Library Dialog (URL or Asset Manager) */}
-      <Dialog open={addUrlOpen} onClose={() => setAddUrlOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle sx={{ fontSize: 14, pb: 0 }}>Add Library</DialogTitle>
-        <DialogContent sx={{ pt: 0 }}>
-          <Tabs value={addDialogTab} onChange={(_, v) => setAddDialogTab(v)} sx={{ mb: 1, minHeight: 32, '& .MuiTab-root': { minHeight: 32, textTransform: 'none', fontSize: 12 } }}>
-            <Tab label="URL" />
-            <Tab label="GitHub" icon={<GitHub sx={{ fontSize: 12 }} />} iconPosition="start" sx={{ gap: 0.5 }} />
-            <Tab label="Asset Manager" icon={<Cloud sx={{ fontSize: 12 }} />} iconPosition="start" sx={{ gap: 0.5 }} />
-            {store?.isLocalFolderSupported && (
-              <Tab label="Local Folder" icon={<FolderOpen sx={{ fontSize: 12 }} />} iconPosition="start" sx={{ gap: 0.5 }} />
-            )}
-          </Tabs>
-
-          {addDialogTab === 0 && (
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, mt: 1 }}>
-              <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                Load a component library from a public <Box component="code" sx={{ fontFamily: 'monospace', px: 0.5, py: 0.125, bgcolor: 'rgba(255,255,255,0.06)', borderRadius: 0.5 }}>catalog.json</Box> URL.
-              </Typography>
-              <TextField
-                autoFocus
-                fullWidth
-                size="small"
-                label="Catalog URL"
-                placeholder="https://library.example.com/catalog.json"
-                value={addUrl}
-                onChange={(e) => setAddUrl(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleAddCatalog(); }}
-              />
-            </Box>
-          )}
-
-          {addDialogTab === 1 && (
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, mt: 1 }}>
-              <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                Paste a GitHub repository or folder URL — it is scanned for <Box component="code" sx={{ fontFamily: 'monospace', px: 0.5, py: 0.125, bgcolor: 'rgba(255,255,255,0.06)', borderRadius: 0.5 }}>.glb</Box> files automatically (no <Box component="code" sx={{ fontFamily: 'monospace', px: 0.5, py: 0.125, bgcolor: 'rgba(255,255,255,0.06)', borderRadius: 0.5 }}>catalog.json</Box> needed). A direct catalog.json URL also works.
-              </Typography>
-              <TextField
-                autoFocus
-                fullWidth
-                size="small"
-                label="GitHub URL"
-                placeholder="https://github.com/user/repo/tree/main/library"
-                value={ghUrl}
-                onChange={(e) => setGhUrl(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleAddGitHub(); }}
-              />
-            </Box>
-          )}
-
-          {addDialogTab === 2 && (
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, mt: 1 }}>
-              <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                Connect to a Unity Cloud Asset Manager project. Credentials are stored in this browser only.
-              </Typography>
-              <TextField size="small" fullWidth label="Name (optional)" placeholder="My Asset Library"
-                value={amLabel} onChange={(e) => setAmLabel(e.target.value)} />
-              <TextField size="small" fullWidth label="Project ID" required
-                value={amProjId} onChange={(e) => setAmProjId(e.target.value)} />
-              <TextField size="small" fullWidth label="Service Account Key ID" required
-                value={amKeyId} onChange={(e) => setAmKeyId(e.target.value)} />
-              <TextField size="small" fullWidth label="Secret Key" type="password" required
-                value={amSecret} onChange={(e) => setAmSecret(e.target.value)} />
-            </Box>
-          )}
-
-          {addDialogTab === 3 && (
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, mt: 1 }}>
-              <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                Pick your working folder. The planner reads <Box component="code" sx={{ fontFamily: 'monospace', px: 0.5, py: 0.125, bgcolor: 'rgba(255,255,255,0.06)', borderRadius: 0.5 }}>library/</Box> inside it. Subfolder names become category headers.
-              </Typography>
-              <Box sx={{ px: 1.5, py: 1, bgcolor: 'rgba(255,255,255,0.03)', borderRadius: 1, fontFamily: 'monospace', fontSize: 10, color: 'text.secondary', lineHeight: 1.6 }}>
-                <Box component="span" sx={{ color: 'text.primary' }}>{'<working-folder>/'}</Box><br />
-                {'└── library/'}<br />
-                {'    ├── conveyor/   *.glb'}<br />
-                {'    ├── robot/      *.glb'}<br />
-                {'    └── machine/    *.glb'}
-              </Box>
-              <Typography variant="caption" sx={{ color: 'text.disabled' }}>
-                If a working folder is already set in Settings → Local Folder, it is reused. The handle is remembered across sessions (you may need to re-grant read access after a reload).
-              </Typography>
-              <Button
-                variant="contained"
-                startIcon={<FolderOpen />}
-                onClick={handleAddLocalFolder}
-                disabled={addLoading}
-                fullWidth
-                sx={{ textTransform: 'none' }}
-              >
-                {addLoading ? 'Scanning...' : 'Choose Folder'}
-              </Button>
-            </Box>
-          )}
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setAddUrlOpen(false)} sx={{ textTransform: 'none' }}>Cancel</Button>
-          {addDialogTab === 0 && (
-            <Button onClick={handleAddCatalog} disabled={!addUrl.trim() || addLoading} variant="contained" sx={{ textTransform: 'none' }}>
-              {addLoading ? 'Loading...' : 'Add'}
-            </Button>
-          )}
-          {addDialogTab === 1 && (
-            <Button onClick={handleAddGitHub} disabled={!ghUrl.trim() || addLoading} variant="contained" sx={{ textTransform: 'none' }}>
-              {addLoading ? 'Loading...' : 'Add'}
-            </Button>
-          )}
-          {addDialogTab === 2 && (
-            <Button onClick={handleAddAssetManager} disabled={!amProjId.trim() || !amKeyId.trim() || !amSecret.trim()} variant="contained" sx={{ textTransform: 'none' }}>
-              Connect
-            </Button>
-          )}
-        </DialogActions>
-      </Dialog>
-
-      {/* Edit AM Connection Dialog */}
-      <Dialog open={editAmId !== null} onClose={() => setEditAmId(null)} maxWidth="sm" fullWidth>
-        <DialogTitle sx={{ fontSize: 14, pb: 0 }}>Edit Connection</DialogTitle>
-        <DialogContent>
-          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, mt: 1 }}>
-            <TextField size="small" fullWidth label="Name (optional)" placeholder="My Asset Library"
-              value={editAmLabel} onChange={(e) => setEditAmLabel(e.target.value)} />
-            <TextField size="small" fullWidth label="Project ID" required
-              value={editAmProjId} onChange={(e) => setEditAmProjId(e.target.value)} />
-            <TextField size="small" fullWidth label="Service Account Key ID" required
-              value={editAmKeyId} onChange={(e) => setEditAmKeyId(e.target.value)} />
-            <TextField size="small" fullWidth label="Secret Key" type="password" required
-              value={editAmSecret} onChange={(e) => setEditAmSecret(e.target.value)} />
-          </Box>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setEditAmId(null)} sx={{ textTransform: 'none' }}>Cancel</Button>
-          <Button onClick={handleSaveAmEdit} disabled={!editAmProjId.trim() || !editAmKeyId.trim() || !editAmSecret.trim()} variant="contained" sx={{ textTransform: 'none' }}>
-            Save & Reconnect
-          </Button>
-        </DialogActions>
-      </Dialog>
     </>
-  );
-}
-
-// ─── Mobile: collapsed tab ──────────────────────────────────────────────
-
-/** Small bottom tab shown on the compact layout while the planner is active
- *  and the library is closed. Tapping it opens the horizontal strip. Sits above
- *  the bottom nav strips (ActivityBar / ButtonPanel). */
-function MobileLibraryTab({ onOpen }: { onOpen: () => void }) {
-  return (
-    <Box
-      sx={{
-        position: 'fixed', left: 0, right: 0,
-        bottom: `calc(${MOBILE_NAV_CLEARANCE}px + env(safe-area-inset-bottom, 0px))`,
-        zIndex: LEFT_PANEL_ZINDEX,
-        display: 'flex', justifyContent: 'center', pointerEvents: 'none',
-      }}
-    >
-      <Paper
-        elevation={6}
-        data-ui-panel
-        onClick={onOpen}
-        sx={{
-          pointerEvents: 'auto', cursor: 'pointer',
-          display: 'flex', alignItems: 'center', gap: 0.75,
-          px: 1.5, py: 0.75, borderRadius: 1,
-          backgroundColor: `${WINDOW_DARK_BG} !important`,
-        }}
-      >
-        <ViewSidebar sx={{ fontSize: 18, color: 'primary.main' }} />
-        <Typography variant="caption" sx={{ fontWeight: 600, fontSize: 12 }}>Library</Typography>
-        <KeyboardArrowUp sx={{ fontSize: 16, color: 'text.secondary' }} />
-      </Paper>
-    </Box>
   );
 }
 
@@ -679,9 +439,9 @@ interface MobileLibraryStripProps {
   libraryItems: LibraryItem[];
   activeId: string | null;
   onSelect: (id: string) => void;
-  onRemove: (id: string) => void;
   onRefreshLocal: () => void | Promise<void>;
-  onAdd: () => void;
+  /** Open the Projects dashboard's Assets tab — the one management route. */
+  onManage: () => void;
   onClose: () => void;
 }
 
@@ -690,7 +450,7 @@ interface MobileLibraryStripProps {
  *  fullscreen panel) — tap a card to enter placement mode, then tap the scene. */
 function MobileLibraryStrip({
   entries, plugin, snapshot, isAmTab, libraryItems, activeId,
-  onSelect, onRemove, onRefreshLocal, onAdd, onClose,
+  onSelect, onRefreshLocal, onManage, onClose,
 }: MobileLibraryStripProps) {
   // Single combined menu (library switch + manage) opened from the floating ⋮.
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
@@ -804,13 +564,16 @@ function MobileLibraryStrip({
               Refresh folder
             </MenuItem>
           )}
-          <MenuItem disabled={!activeItem} onClick={() => { if (activeItem) onRemove(activeItem.id); closeMenu(); }} sx={{ fontSize: 12 }}>
-            <ListItemIcon sx={{ minWidth: 26 }}><Delete sx={{ fontSize: 16 }} /></ListItemIcon>
-            Remove library
-          </MenuItem>
-          <MenuItem onClick={() => { onAdd(); closeMenu(); }} sx={{ fontSize: 12 }}>
-            <ListItemIcon sx={{ minWidth: 26 }}><Add sx={{ fontSize: 16 }} /></ListItemIcon>
-            Add library…
+          {/* Full library management lives in the Projects dashboard
+              (plan-372 Phase 8, sole route since plan-702). This panel keeps
+              the fast path — pick a library, search, filter, drag — and hands
+              off everything else. */}
+          <MenuItem
+            onClick={() => { closeMenu(); onManage(); }}
+            sx={{ fontSize: 12 }}
+          >
+            <ListItemIcon sx={{ minWidth: 26 }}><Tune sx={{ fontSize: 16 }} /></ListItemIcon>
+            Manage libraries…
           </MenuItem>
         </Menu>
       </Paper>
@@ -828,7 +591,82 @@ interface ThumbnailCardProps {
   plugin: LayoutPlannerPlugin;
 }
 
-const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isPending, plugin }: ThumbnailCardProps) {
+export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isPending, plugin }: ThumbnailCardProps) {
+  const viewer = useViewer();
+  // Hover-intent prefetch (plan-371 F8). The timer is the whole mechanism:
+  // start on enter, drop on leave, so only a deliberate rest over the card
+  // warms its GLB. Touch has no hover at all — `pointerdown` stands in and
+  // fires immediately, which on a tap-then-drag still wins the decode race.
+  const prefetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelPrefetchIntent = useCallback(() => {
+    if (prefetchTimer.current === null) return;
+    clearTimeout(prefetchTimer.current);
+    prefetchTimer.current = null;
+  }, []);
+
+  const startPrefetchIntent = useCallback(() => {
+    const url = prefetchableUrl(entry);
+    if (!url) return;
+    cancelPrefetchIntent();
+    prefetchTimer.current = setTimeout(() => {
+      prefetchTimer.current = null;
+      plugin.modelCache.prefetch(url);
+    }, PREFETCH_INTENT_MS);
+  }, [entry, plugin, cancelPrefetchIntent]);
+
+  const prefetchNow = useCallback(() => {
+    const url = prefetchableUrl(entry);
+    if (!url) return;
+    cancelPrefetchIntent();
+    plugin.modelCache.prefetch(url);
+  }, [entry, plugin, cancelPrefetchIntent]);
+
+  useEffect(() => cancelPrefetchIntent, [cancelPrefetchIntent]);
+
+  // ── Visibility-scheduled preview (plan-372 §2.7/§2.8) ────────────────
+  // Previews are pulled, not pushed: the card asks for its picture once it
+  // enters the prefetch band and withdraws the request when it leaves. The
+  // service de-duplicates by key, so re-entering the viewport is free.
+  const { ref: cardRef, visible } = useThumbnailVisibility<HTMLDivElement>();
+  const needsPreview = !entry.thumbnailUrl && !entry.virtual && !!entry.glbUrl;
+
+  useEffect(() => {
+    if (!needsPreview || !viewer) return;
+    // Optional chaining is deliberate: a missing preview service must never
+    // throw out of a card render. Constrained shells and test doubles hand back
+    // viewers that do not carry it, and a card without a picture is a far
+    // better outcome than a broken library panel.
+    const service = viewer.thumbnails;
+    if (!service?.isAvailable) return;  // WebGPU / unavailable — manual button remains
+    const glbUrl = entry.glbUrl!;
+    const key = buildThumbnailKey({
+      projectId: getProjectStore().getProject()?.id ?? '',
+      providerId: 'layout-planner',
+      // Entry ids are unique across the planner's catalogs, which is what the
+      // previous glbUrl-wide lookup already relied on. Phase 10 replaces this
+      // with the real (providerId, sourceId) pair from the source registry.
+      sourceId: 'catalogs',
+      assetId: entry.id,
+    });
+
+    let cancelled = false;
+    if (!visible) { service.cancel(key); return; }
+
+    plugin.store.setThumbnailPending(entry.id, true);
+    void service
+      .enqueue(key, () => plugin.modelCache.getOrLoad(glbUrl), 1)
+      .then((blob) => {
+        if (cancelled || !blob) return;
+        plugin.store.setEntryThumbnail(entry.id, URL.createObjectURL(blob));
+      })
+      .finally(() => {
+        if (!cancelled) plugin.store.setThumbnailPending(entry.id, false);
+      });
+
+    return () => { cancelled = true; };
+  }, [visible, needsPreview, viewer, plugin, entry.id, entry.glbUrl]);
+
   // Preview generation state — kept local because it only matters for the
   // single card showing the camera button. Multiple cards can generate in
   // parallel; each tracks its own progress.
@@ -930,171 +768,53 @@ const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isPending,
 
   return (
     <>
-    <Tooltip
-      title={description ?? ''}
-      open={!!description && hovered && !dragging}
-      placement="right"
-      arrow
-      disableInteractive
-    >
-    <Box
+    <AssetCard
+      ref={cardRef}
+      entry={entry}
+      variant="compact"
       draggable={!isSplat}
+      cursor={isSplat ? 'pointer' : (isPlacing ? 'crosshair' : 'grab')}
+      selected={isPlacing}
+      tooltip={description ?? ''}
+      tooltipOpen={!!description && hovered && !dragging}
       onDragStart={isSplat ? undefined : handleDragStart}
       onDragEnd={isSplat ? undefined : handleDragEnd}
       onClick={handleClick}
       onContextMenu={handleContextMenu}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      sx={{
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        gap: 0.25,
-        p: 0.5,
-        borderRadius: 1,
-        cursor: isSplat ? 'pointer' : (isPlacing ? 'crosshair' : 'grab'),
-        bgcolor: isPlacing ? 'rgba(79, 195, 247, 0.15)' : 'rgba(255,255,255,0.03)',
-        border: isPlacing ? '1px solid rgba(79, 195, 247, 0.5)' : '1px solid rgba(255,255,255,0.06)',
-        '&:hover': { bgcolor: 'rgba(79, 195, 247, 0.08)', borderColor: 'rgba(79, 195, 247, 0.2)' },
-        transition: 'all 0.15s',
-        userSelect: 'none',
-      }}
-    >
-      {entry.thumbnailUrl ? (
-        <Box
-          component="img"
-          src={entry.thumbnailUrl}
-          alt={entry.name}
-          sx={{
-            width: '100%',
-            aspectRatio: '1',
-            objectFit: 'cover',
-            borderRadius: 0.5,
-            bgcolor: 'rgba(255,255,255,0.05)',
-          }}
-          draggable={false}
-        />
-      ) : entry.virtual ? (
-        <Box
-          sx={{
-            width: '100%',
-            aspectRatio: '1',
-            borderRadius: 0.5,
-            bgcolor: 'rgba(79,195,247,0.08)',
-            border: '1px dashed rgba(79,195,247,0.3)',
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            gap: 0.5,
-          }}
+      onMouseEnter={() => { setHovered(true); startPrefetchIntent(); }}
+      onMouseLeave={() => { setHovered(false); cancelPrefetchIntent(); }}
+      onPointerDown={prefetchNow}
+      placeholderAction={
+        <Tooltip
+          title={
+            (generating || isPending) ? 'Generating preview…'
+              : genError ? genError
+              : 'Generate preview'
+          }
+          placement="top"
         >
-          <TimerOutlined sx={{ fontSize: 28, color: 'rgba(79,195,247,0.6)' }} />
-          <Typography sx={{ fontSize: 8, color: 'rgba(79,195,247,0.5)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
-            {entry.desType?.replace('DES', '') ?? 'Virtual'}
-          </Typography>
-        </Box>
-      ) : entry.splatUrl ? (
-        <Box
-          sx={{
-            width: '100%',
-            aspectRatio: '1',
-            borderRadius: 0.5,
-            bgcolor: 'rgba(139,195,74,0.08)',
-            border: '1px dashed rgba(139,195,74,0.3)',
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            gap: 0.5,
-          }}
-        >
-          <Landscape sx={{ fontSize: 28, color: 'rgba(139,195,74,0.6)' }} />
-          <Typography sx={{ fontSize: 8, color: 'rgba(139,195,74,0.5)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
-            Splat
-          </Typography>
-        </Box>
-      ) : (
-        <Box
-          sx={{
-            width: '100%',
-            aspectRatio: '1',
-            borderRadius: 0.5,
-            bgcolor: 'rgba(255,255,255,0.05)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            position: 'relative',
-          }}
-        >
-          <Tooltip
-            title={
-              (generating || isPending) ? 'Generating preview…'
-                : genError ? genError
-                : 'Generate preview'
-            }
-            placement="top"
-          >
-            <Box component="span" sx={{ display: 'inline-flex' }}>
-              <IconButton
-                size="small"
-                disabled={generating || isPending}
-                sx={{
-                  color: genError ? '#ef5350' : 'rgba(255,255,255,0.25)',
-                  '&:hover': { color: genError ? '#ef5350' : 'rgba(79,195,247,0.8)' },
-                  '&.Mui-disabled': { color: 'rgba(79,195,247,0.6)' },
-                }}
-                onClick={handleGeneratePreview}
-              >
-                {(generating || isPending)
-                  ? <CircularProgress size={18} sx={{ color: 'rgba(79,195,247,0.8)' }} />
-                  : genError
-                    ? <ErrorOutline sx={{ fontSize: 20 }} />
-                    : <CameraAlt sx={{ fontSize: 20 }} />
-                }
-              </IconButton>
-            </Box>
-          </Tooltip>
-        </Box>
-      )}
-      <Typography
-        sx={{
-          fontSize: 9,
-          color: 'text.secondary',
-          textAlign: 'center',
-          lineHeight: 1.2,
-          maxWidth: '100%',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        {entry.name}
-      </Typography>
-      {entry.tags && entry.tags.length > 0 && (
-        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.25, justifyContent: 'center', mt: 0.125 }}>
-          {entry.tags.map(tag => (
-            <Typography
-              key={tag}
-              component="span"
+          <Box component="span" sx={{ display: 'inline-flex' }}>
+            <IconButton
+              size="small"
+              disabled={generating || isPending}
               sx={{
-                fontSize: 7,
-                lineHeight: 1.2,
-                px: 0.5,
-                py: 0.125,
-                borderRadius: 0.5,
-                bgcolor: 'rgba(79, 195, 247, 0.1)',
-                color: 'rgba(79, 195, 247, 0.7)',
-                whiteSpace: 'nowrap',
+                color: genError ? '#ef5350' : 'rgba(255,255,255,0.25)',
+                '&:hover': { color: genError ? '#ef5350' : 'rgba(79,195,247,0.8)' },
+                '&.Mui-disabled': { color: 'rgba(79,195,247,0.6)' },
               }}
+              onClick={handleGeneratePreview}
             >
-              {tag}
-            </Typography>
-          ))}
-        </Box>
-      )}
-    </Box>
-    </Tooltip>
+              {(generating || isPending)
+                ? <CircularProgress size={18} sx={{ color: 'rgba(79,195,247,0.8)' }} />
+                : genError
+                  ? <ErrorOutline sx={{ fontSize: 20 }} />
+                  : <CameraAlt sx={{ fontSize: 20 }} />
+              }
+            </IconButton>
+          </Box>
+        </Tooltip>
+      }
+    />
     <Menu
       open={ctxPos !== null}
       onClose={() => setCtxPos(null)}
@@ -1109,6 +829,23 @@ const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isPending,
         <CameraAlt sx={{ fontSize: 14, mr: 1 }} />
         {entry.thumbnailUrl ? 'Update Preview' : 'Generate Preview'}
       </MenuItem>
+      {/* Local work-folder GLBs can be opened in the asset editor. Saving
+          always lands in library/Custom/, regardless of where the source
+          asset lives. */}
+      {entry.localPath && entry.glbUrl && !entry.splatUrl && !entry.localPath.startsWith('splats/') && (
+        <MenuItem
+          onClick={() => {
+            setCtxPos(null);
+            const fileName = entry.localPath!.split('/').pop() ?? entry.localPath!;
+            setPendingAssetOpen({ kind: 'libraryGlb', fileName, relPath: entry.localPath! });
+            void viewer.modes.requestMode('editor');
+          }}
+          sx={{ fontSize: 12 }}
+        >
+          <EditIcon sx={{ fontSize: 14, mr: 1 }} />
+          Edit asset
+        </MenuItem>
+      )}
     </Menu>
     </>
   );

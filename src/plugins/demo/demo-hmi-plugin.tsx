@@ -16,6 +16,7 @@ import type { UISlotEntry, UISlotProps } from '../../core/rv-ui-plugin';
 // Core reusable components
 import { KpiCard } from '../../core/hmi/KpiCard';
 import { TileCard } from '../../core/hmi/TileCard';
+import { pulseSeverityOutline } from '../../core/hmi/severity-pulse';
 import { NavButton } from '../../core/hmi/NavButton';
 
 // Demo charts (co-located in plugins/demo/)
@@ -220,37 +221,15 @@ function DriveInfoMessage({ viewer }: UISlotProps) {
 }
 
 const DRIVE1_MOTOR_PATH = 'DemoCell/Conveyors/ConveyorEntry1/Motor';
-const ALARM_PULSE_DURATION_MS = 3500;
 
 /**
- * Frame the Drive 1 motor in 3D and pulse a red alarm outline for a few seconds
- * (visual cue matching the error severity). The outline reverts to the default
- * selection style afterwards so it doesn't bleed into the next regular selection.
- *
- * Uses `fitToNodes` (camera-only) instead of `focusByPath` so the click does NOT
- * emit `object-focus` — that event opens the property inspector / hierarchy, which
- * an operator clicking an alarm message should not get. Outlines directly on the
- * selection pass, bypassing the selectionManager (no pinned tooltip). Pure visual cue.
+ * Frame the Drive 1 motor in 3D and flash it red for a few seconds (visual cue
+ * matching the error severity). Delegates to the shared severity flash — the
+ * highlighter's flash channel is independent of the selection, so the user's
+ * selection outline survives the alarm. Camera-only fit, no focus event.
  */
 function pulseMotorAlarm(viewer: UISlotProps['viewer'], path: string): void {
-  const motorNode = viewer.registry?.getNode(path);
-  if (!motorNode) return;
-  const outline = viewer.outlineManager;
-  const prevStyle = outline.getStyle();
-  outline.setStyle({
-    visibleEdgeColor: 0xff3030,
-    hiddenEdgeColor: 0x8a1a1a,
-    edgeStrength: 20,
-    edgeThickness: 10,
-    edgeGlow: 1.5,
-    pulsePeriod: 0.6,
-  });
-  outline.setOutlined([motorNode]);
-  viewer.fitToNodes([motorNode]);
-  window.setTimeout(() => {
-    outline.setStyle({ ...prevStyle });
-    outline.clear();
-  }, ALARM_PULSE_DURATION_MS);
+  pulseSeverityOutline(viewer, path, 'error');
 }
 
 /**

@@ -35,6 +35,17 @@ export interface ModelPluginModule {
   unregisterModelPlugins(viewer: RVViewer): void;
 }
 
+/**
+ * Stable model identity used by model plugins and signature-unlock storage.
+ * Query strings and the final .glb suffix are ignored.
+ */
+export function resolveModelName(url: string): string {
+  const withoutQuery = url.split('?')[0];
+  const lastSlash = withoutQuery.lastIndexOf('/');
+  const fileName = lastSlash >= 0 ? withoutQuery.substring(lastSlash + 1) : withoutQuery;
+  return fileName.replace(/\.glb$/i, '');
+}
+
 // ─── Plugin Module Discovery ───────────────────────────────────────────
 
 // Vite resolves these globs at build time and code-splits each match.
@@ -46,11 +57,22 @@ const pluginModuleImporters = import.meta.glob<ModelPluginModule>([
 
 // Private project plugin modules
 // Glob paths in Vite are relative to the importing file's location (src/core/).
-// In public builds without the private folder, this glob returns {}.
-const privatePluginModuleImporters = import.meta.glob<ModelPluginModule>([
-  '../../../realvirtual-WebViewer-Private~/projects/*/plugins/index.ts',
-  '../../../realvirtual-WebViewer-Private~/projects/*/plugins/index.tsx',
-], { eager: false });
+// MUST be gated behind __RV_HAS_PRIVATE__: import.meta.glob matches whatever is
+// on disk, so on a machine WITH the private folder a forced-public build
+// (VITE_PUBLIC_BUILD=1) would otherwise bundle customer project plugins into
+// the public bundle — and break on @rv-private imports that have no stub. The
+// dead branch (and every chunk behind it) is eliminated by Rollup.
+const privatePluginModuleImporters: Record<string, () => Promise<ModelPluginModule>> =
+  __RV_HAS_PRIVATE__
+    ? import.meta.glob<ModelPluginModule>([
+        '../../../realvirtual-WebViewer-Private~/projects/*/plugins/index.ts',
+        '../../../realvirtual-WebViewer-Private~/projects/*/plugins/index.tsx',
+        '../../../realvirtual-web-pro/projects/*/plugins/index.ts',
+        '../../../realvirtual-web-pro/projects/*/plugins/index.tsx',
+        '../../../projects/*/plugins/index.ts',
+        '../../../projects/*/plugins/index.tsx',
+      ], { eager: false })
+    : {};
 
 // Merge both sets
 const allImporters: Record<string, () => Promise<ModelPluginModule>> = {
@@ -90,22 +112,11 @@ export class ModelPluginManager {
   /** Unsub for the UI-context store subscription. */
   private _ctxUnsub: (() => void) | null = null;
 
-  /**
-   * Extract the model base name (without .glb) from a URL.
-   * Works for both local paths and full URLs.
-   */
-  private resolveModelName(url: string): string {
-    const withoutQuery = url.split('?')[0];
-    const lastSlash = withoutQuery.lastIndexOf('/');
-    const fileName = lastSlash >= 0 ? withoutQuery.substring(lastSlash + 1) : withoutQuery;
-    return fileName.replace(/\.glb$/i, '');
-  }
-
   /** Extract the project folder name from a private plugin path, or null for public plugins. */
   private extractProjectFolder(path: string): string | null {
     const segments = path.replace(/\\/g, '/').split('/');
     const pluginsIdx = segments.indexOf('plugins');
-    if (pluginsIdx > 0 && path.includes('Private~')) {
+    if (pluginsIdx > 0 && segments.includes('projects')) {
       return segments[pluginsIdx - 1];
     }
     return null;
@@ -179,7 +190,7 @@ export class ModelPluginManager {
   async onModelLoading(modelUrl: string, viewer: RVViewer): Promise<void> {
     // Prefer pendingModelUrl (original URL set before loadModel) over the passed URL which may be a blob:
     const resolveUrl = viewer.pendingModelUrl || modelUrl;
-    const modelName = this.resolveModelName(resolveUrl);
+    const modelName = resolveModelName(resolveUrl);
 
     // Cache viewer + subscribe to planner-context changes (idempotent).
     this._lastViewer = viewer;
@@ -249,7 +260,7 @@ export class ModelPluginManager {
           debug('plugins', `Skipped model plugins for '${modelName}' (planner active — will register on exit)`);
         } else {
           debug('plugins', `Loading model plugins for '${modelName}'${projectFolder ? ` (project: ${projectFolder})` : ''}`);
-          mod.registerModelPlugins(viewer);
+          viewer.withDefaultOrigin('project', () => mod.registerModelPlugins(viewer));
           this._registered = true;
           logInfo(`Model plugins loaded for '${modelName}'`);
         }
@@ -304,7 +315,7 @@ export class ModelPluginManager {
       // RVViewer.use → retroactive call when _lastLoadResult is set).
       debug('plugins', `Planner inactive — registering model plugins for '${this.activeModelName}'`);
       try {
-        mod.registerModelPlugins(viewer);
+        viewer.withDefaultOrigin('project', () => mod.registerModelPlugins(viewer));
         this._registered = true;
         logInfo(`Model plugins loaded for '${this.activeModelName}' (deferred from planner mode)`);
       } catch (e) {

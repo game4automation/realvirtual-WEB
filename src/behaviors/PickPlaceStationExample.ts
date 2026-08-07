@@ -60,18 +60,31 @@ export default defineBehavior({
 
     // ─── 60-Hz logic (auto-disposed on model-cleared) ───────────────
     let cycleTime = 0;
+    let photoeyeOccupied = false;
     rv.onFixedUpdate((dt) => {
       cycleTime += dt;
-      if (rv.signals.get<boolean>('Photoeye_42.Occupied') && cycleTime > 0.5) {
+      if (photoeyeOccupied && cycleTime > 0.5) {
         rv.drives.get('Axis1_LinearSled')?.moveTo(250);
         cycleTime = 0;
       }
     });
 
     // ─── Event reactions (auto-disposed on model-cleared) ───────────
-    rv.on('sensor:Photoeye_42:enter', (...args: unknown[]) => {
-      // eslint-disable-next-line no-console
-      console.log('[PickPlaceStation] workpiece entered:', args[0]);
+    rv.on('component-event', (...args: unknown[]) => {
+      const event = args[0] as {
+        componentType?: string;
+        kind?: string;
+        path?: string;
+        payload?: { occupied?: boolean; mu?: unknown };
+      } | undefined;
+      if (event?.componentType !== 'sensor' || event.kind !== 'changed') return;
+      if (event.path !== 'Photoeye_42' && !event.path?.endsWith('/Photoeye_42')) return;
+      const wasOccupied = photoeyeOccupied;
+      photoeyeOccupied = event.payload?.occupied === true;
+      if (photoeyeOccupied && !wasOccupied) {
+        // eslint-disable-next-line no-console
+        console.log('[PickPlaceStation] workpiece entered:', event.payload?.mu);
+      }
     });
     rv.signals.on('Axis1.AtTarget', (v) => {
       if (v) rv.drives.get('Tool_GripperHead')?.jog(true);

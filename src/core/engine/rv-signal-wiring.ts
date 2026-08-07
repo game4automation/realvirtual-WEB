@@ -56,6 +56,24 @@ export function wireBoolSignal(
 }
 
 /**
+ * Scale a drive feedback position for the PLC.
+ *
+ * Shared by the Drive_* behaviors (Drive_Simple, Drive_Speed,
+ * Drive_DestinationMotor): `(pos - offset) / scale` when scaling is enabled
+ * (with a Scale=0 guard so a zero divisor never produces ±Infinity), the raw
+ * position otherwise.
+ */
+export function scaleFeedbackPosition(
+  pos: number,
+  enabled: boolean,
+  scale: number,
+  offset: number,
+): number {
+  if (!enabled) return pos;
+  return (pos - offset) / (scale || 1);
+}
+
+/**
  * Resolve a raw ComponentRef to a signal address, then wire as boolean.
  * No-op if ref is null/undefined or does not resolve to a signal address.
  *

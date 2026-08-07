@@ -25,6 +25,7 @@
 
 import { Color, Vector3 } from 'three';
 import type { Object3D, Mesh, Material, IUniform } from 'three';
+import { getTslMaterials } from './materials/material-factory';
 
 /** Tunables — single-line tweaks for the look of the burn. */
 const BURN_COLOR = new Color(0.25, 0.6, 1.0); //!< sci-fi blue
@@ -36,6 +37,23 @@ const NOISE_AMP_M = 0.05;                      //!< jitter (m) of the edge
 const VERTEX_VARYING = 'varying vec3 vDissolveWorld;';
 const VERTEX_ASSIGN = 'vDissolveWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;';
 const DHASH = 'float dHash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }';
+
+// Module-local warn-once flag (repo convention — no external warnOnce util).
+// Since plan-271 Phase 2 this only fires as a FALLBACK: when the renderer is
+// a WebGPURenderer but the TSL material module was not pre-warmed (see
+// preloadTslMaterials in material-factory.ts) — the TSL variant in
+// materials/rv-mu-dissolve-tsl.ts otherwise carries the effect.
+let _warnedWebGPU = false;
+function warnDissolveWebGPUOnce(): void {
+  if (_warnedWebGPU) return;
+  _warnedWebGPU = true;
+  console.warn(
+    '[MUDissolve] WebGPU renderer active but the TSL material module is not ' +
+    'preloaded — the GLSL onBeforeCompile clip/burn effect is disabled ' +
+    'because onBeforeCompile is silently ignored under WebGPURenderer. ' +
+    'MUs appear/disappear without the dissolve effect.',
+  );
+}
 
 /**
  * Splice a clip shader (given header + body GLSL) into every `Mesh` under `node`
@@ -49,7 +67,16 @@ function installClip(
   cacheKey: string,
   fragHeader: string,
   fragBody: string,
+  isWebGPU = false,
 ): () => void {
+  // WebGPU guard (plan-271 PR#0): onBeforeCompile GLSL patches are silently
+  // ignored under WebGPURenderer — skip the material clone/patch entirely.
+  // The MU simply appears/vanishes without the burn effect (accepted).
+  if (isWebGPU) {
+    warnDissolveWebGPUOnce();
+    return (): void => { /* nothing installed — nothing to restore */ };
+  }
+
   const restore: Array<{ mesh: Mesh; original: Material | Material[] }> = [];
   const clones: Material[] = [];
 
@@ -135,7 +162,22 @@ export interface MUDissolve {
  * burn edge sweeps from just below `minY` to just above `maxY` as progress goes
  * 0 → 1 (bottom-to-top). The MU is stationary, so the clip is absolute world-Y.
  */
-export function createMUDissolve(node: Object3D, minY: number, maxY: number): MUDissolve {
+export function createMUDissolve(
+  node: Object3D,
+  minY: number,
+  maxY: number,
+  isWebGPU = false,
+): MUDissolve {
+  // WebGPURenderer (both backends): the pre-warmed TSL variant carries the
+  // effect (plan-271 Phase 2). Without pre-warm → F4 guard fallback (warn
+  // once, MU vanishes without the burn effect).
+  if (isWebGPU) {
+    const tsl = getTslMaterials();
+    if (tsl) return tsl.createMUDissolveTsl(node, minY, maxY);
+    warnDissolveWebGPUOnce();
+    return { setProgress(): void { /* effect off */ }, dispose(): void { /* nothing installed */ } };
+  }
+
   const uniforms = {
     uProgress: { value: 0 },
     uMinY: { value: minY },
@@ -146,7 +188,7 @@ export function createMUDissolve(node: Object3D, minY: number, maxY: number): MU
     uNoiseScale: { value: NOISE_SCALE },
     uNoiseAmp: { value: NOISE_AMP_M },
   };
-  const dispose = installClip(node, uniforms, 'muDissolve', DISSOLVE_HEADER, DISSOLVE_BODY);
+  const dispose = installClip(node, uniforms, 'muDissolve', DISSOLVE_HEADER, DISSOLVE_BODY, isWebGPU);
   return {
     setProgress(p: number): void {
       uniforms.uProgress.value = p < 0 ? 0 : p > 1 ? 1 : p;
@@ -207,20 +249,36 @@ export function createMUGrow(
   axis: Vector3,
   planePoint: Vector3,
   trailingRel: number,
+  isWebGPU = false,
 ): MUGrow {
-  const uniforms = {
-    uAxis: { value: axis.clone() },
-    uPlane: { value: planePoint.clone() },
-    uBand: { value: GLOW_BAND_M },
-    uColor: { value: BURN_COLOR.clone() },
-    uGlow: { value: GLOW_STRENGTH },
-    uNoiseScale: { value: NOISE_SCALE },
-    uNoiseAmp: { value: NOISE_AMP_M },
-  };
-  const dispose = installClip(node, uniforms, 'muGrow', GROW_HEADER, GROW_BODY);
+  // Material install: TSL variant under WebGPURenderer (plan-271 Phase 2),
+  // GLSL onBeforeCompile patch on the classic WebGLRenderer. The CPU-side
+  // completion tracking below is renderer-independent (the clip plane is
+  // fixed in world space — no per-frame shader update either way).
+  let dispose: () => void;
+  if (isWebGPU) {
+    const tsl = getTslMaterials();
+    if (tsl) {
+      dispose = tsl.createMUGrowTsl(node, axis, planePoint);
+    } else {
+      warnDissolveWebGPUOnce();
+      dispose = (): void => { /* nothing installed — nothing to restore */ };
+    }
+  } else {
+    const uniforms = {
+      uAxis: { value: axis.clone() },
+      uPlane: { value: planePoint.clone() },
+      uBand: { value: GLOW_BAND_M },
+      uColor: { value: BURN_COLOR.clone() },
+      uGlow: { value: GLOW_STRENGTH },
+      uNoiseScale: { value: NOISE_SCALE },
+      uNoiseAmp: { value: NOISE_AMP_M },
+    };
+    dispose = installClip(node, uniforms, 'muGrow', GROW_HEADER, GROW_BODY, false);
+  }
 
-  const planeRef = uniforms.uPlane.value;
-  const axisRef = uniforms.uAxis.value;
+  const planeRef = planePoint.clone();
+  const axisRef = axis.clone();
   const _prev = new Vector3();
   let havePrev = false;
 

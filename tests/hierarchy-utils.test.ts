@@ -4,13 +4,17 @@
 import { describe, it, expect } from 'vitest';
 import { Object3D } from 'three';
 import {
+  applyLazyInjection,
   buildTree,
+  buildStructureTree,
   computeAncestors,
   countNodes,
   filterTree,
   flattenTree,
+  flattenVisibleTree,
   matchesTypeFilter,
   sortSignalNodes,
+  visibleTreePaths,
   splitTypes,
   isSignalType,
   isBoolSignal,
@@ -25,6 +29,7 @@ import {
   signalOwnerLabel,
   type TreeNode,
 } from '../src/core/hmi/hierarchy-utils';
+import { SIGNAL_VALUE_COLOR, SIGNAL_VALUE_NEUTRAL } from '../src/core/hmi/signal-colors';
 import { StepState } from '../src/core/engine/rv-logic-step';
 import { STEP_STATE_COLORS } from '../src/core/hmi/rv-logic-step-colors';
 import type { EditableNodeInfo } from '../src/core/hmi/rv-extras-editor';
@@ -253,6 +258,166 @@ describe('flattenTree', () => {
     const flat = flattenTree(t);
     expect(flat.map(x => x.node.name)).toEqual(['A', 'A1', 'A1a', 'A2', 'B']);
     expect(flat.map(x => x.depth)).toEqual([0, 1, 2, 1, 0]);
+  });
+});
+
+describe('flattenVisibleTree', () => {
+  const tree: TreeNode[] = [
+    {
+      name: 'A', path: 'A', types: [], hasOverrides: false,
+      children: [
+        {
+          name: 'A1', path: 'A/A1', types: [], hasOverrides: false,
+          children: [
+            { name: 'A1a', path: 'A/A1/A1a', types: [], hasOverrides: false, children: [] },
+          ],
+        },
+        { name: 'A2', path: 'A/A2', types: [], hasOverrides: false, children: [] },
+      ],
+    },
+    { name: 'B', path: 'B', types: [], hasOverrides: false, children: [] },
+  ];
+
+  it('returns only rows whose ancestors are all expanded', () => {
+    expect(flattenVisibleTree(tree, new Set(['A'])).map((row) => row.node.name))
+      .toEqual(['A', 'A1', 'A2', 'B']);
+  });
+
+  it('reports depth relative to the visible root', () => {
+    expect(flattenVisibleTree(tree, new Set(['A', 'A/A1'])).map((row) => row.depth))
+      .toEqual([0, 1, 2, 1, 0]);
+  });
+
+  it('includes canExpandLazy nodes as single rows when not expanded', () => {
+    const lazy: TreeNode[] = [
+      { name: 'CAD', path: 'CAD', types: ['CADLink'], hasOverrides: false, children: [], canExpandLazy: true },
+    ];
+    expect(flattenVisibleTree(lazy, new Set()).map((row) => row.node.path)).toEqual(['CAD']);
+  });
+
+  it('renders path-less group rows and derives unique rowKeys for duplicate names', () => {
+    const groups: TreeNode[] = [
+      { name: 'Group', path: null, types: [], hasOverrides: false, children: [] },
+      { name: 'Group', path: null, types: [], hasOverrides: false, children: [] },
+    ];
+    const rows = flattenVisibleTree(groups, new Set());
+    expect(rows.map((row) => row.node.name)).toEqual(['Group', 'Group']);
+    expect(new Set(rows.map((row) => row.rowKey)).size).toBe(2);
+  });
+
+  it('computes posInSet/setSize per sibling group', () => {
+    const rows = flattenVisibleTree(tree, new Set(['A']));
+    expect(rows.map(({ node, posInSet, setSize }) => [node.name, posInSet, setSize]))
+      .toEqual([
+        ['A', 1, 2],
+        ['A1', 1, 2],
+        ['A2', 2, 2],
+        ['B', 2, 2],
+      ]);
+  });
+
+  it('matches visibleTreePaths order for path-bearing rows', () => {
+    const expanded = new Set(['A', 'A/A1']);
+    const rowPaths = flattenVisibleTree(tree, expanded)
+      .filter((row) => row.node.path)
+      .map((row) => row.node.path);
+    expect(rowPaths).toEqual(visibleTreePaths(tree, expanded));
+  });
+});
+
+describe('structure cache', () => {
+  function lazyFixture() {
+    const layout = new Object3D();
+    layout.name = 'Layout';
+    const rawChild = new Object3D();
+    rawChild.name = 'RawChild';
+    layout.add(rawChild);
+    const viewer = {
+      registry: {
+        getNode: (path: string) => path === 'Layout' ? layout : null,
+        registerNode: () => {},
+      },
+    } as unknown as Parameters<typeof applyLazyInjection>[1];
+    const nodes = [info('Layout', ['LayoutObject']), info('Other', ['Drive'])];
+    return { layout, viewer, nodes };
+  }
+
+  it('expand toggle does not rebuild the structural tree and preserves unaffected branch identity', () => {
+    const { viewer, nodes } = lazyFixture();
+    const structure = buildStructureTree(nodes, null);
+    const collapsed = applyLazyInjection(structure, viewer, new Set(), null);
+    const expanded = applyLazyInjection(structure, viewer, new Set(['Layout']), null);
+    expect(collapsed[1]).toBe(structure[1]);
+    expect(expanded[1]).toBe(structure[1]);
+    expect(structure[0].children).toEqual([]);
+  });
+
+  it('lazy injection under expanded LayoutObject matches the buildTree facade', () => {
+    const { viewer, nodes } = lazyFixture();
+    const structure = buildStructureTree(nodes, null);
+    expect(applyLazyInjection(structure, viewer, new Set(['Layout']), null))
+      .toEqual(buildTree(nodes, null, viewer, new Set(['Layout'])));
+  });
+
+  it('search cannot see raw children of collapsed LayoutObject', () => {
+    const { viewer, nodes } = lazyFixture();
+    const structure = buildStructureTree(nodes, null);
+    const collapsed = applyLazyInjection(structure, viewer, new Set(), null);
+    expect(filterTree(collapsed, 'RawChild')).toEqual([]);
+  });
+
+  it('search finds raw children of expanded LayoutObject', () => {
+    const { viewer, nodes } = lazyFixture();
+    const structure = buildStructureTree(nodes, null);
+    const expanded = applyLazyInjection(structure, viewer, new Set(['Layout']), null);
+    expect(flattenTree(filterTree(expanded, 'RawChild')).some((row) => row.node.name === 'RawChild')).toBe(true);
+  });
+});
+
+// ── visibleTreePaths (Shift-range selection order) ─────────────────────────
+
+describe('visibleTreePaths', () => {
+  const t: TreeNode[] = [
+    {
+      name: 'A', path: 'A', types: [], hasOverrides: false,
+      children: [
+        { name: 'A1', path: 'A/A1', types: [], hasOverrides: false, children: [
+          { name: 'A1a', path: 'A/A1/A1a', types: [], hasOverrides: false, children: [] },
+        ] },
+        { name: 'A2', path: 'A/A2', types: [], hasOverrides: false, children: [] },
+      ],
+    },
+    { name: 'B', path: 'B', types: [], hasOverrides: false, children: [] },
+  ];
+
+  it('collapsed parents hide their descendants', () => {
+    expect(visibleTreePaths(t, new Set())).toEqual(['A', 'B']);
+  });
+
+  it('expanded chain is included in DFS render order', () => {
+    expect(visibleTreePaths(t, new Set(['A', 'A/A1']))).toEqual(
+      ['A', 'A/A1', 'A/A1/A1a', 'A/A2', 'B'],
+    );
+    // Expanding only the parent leaves grandchildren hidden.
+    expect(visibleTreePaths(t, new Set(['A']))).toEqual(['A', 'A/A1', 'A/A2', 'B']);
+  });
+
+  it('canExpandLazy node without expansion contributes just itself', () => {
+    const lazy: TreeNode[] = [
+      { name: 'Cad', path: 'Cad', types: ['CADLink'], hasOverrides: false, children: [], canExpandLazy: true },
+    ];
+    expect(visibleTreePaths(lazy, new Set())).toEqual(['Cad']);
+  });
+
+  it('path-less group rows use their name as expand key and are not listed', () => {
+    const grouped: TreeNode[] = [
+      {
+        name: 'Group', path: null, types: [], hasOverrides: false,
+        children: [{ name: 'C', path: 'Group/C', types: [], hasOverrides: false, children: [] }],
+      },
+    ];
+    expect(visibleTreePaths(grouped, new Set())).toEqual([]);
+    expect(visibleTreePaths(grouped, new Set(['Group']))).toEqual(['Group/C']);
   });
 });
 
@@ -585,21 +750,31 @@ describe('signalBadgeColor', () => {
     return { getByPath: (p: string) => values[p] } as unknown as SignalStore;
   }
 
-  it('green for true PLCOutput bool, red for true PLCInput bool', () => {
-    expect(signalBadgeColor('PLCOutputBool', mockStore({ 'X': true }), 'X')).toBe('#66bb6a');
-    expect(signalBadgeColor('PLCInputBool', mockStore({ 'X': true }), 'X')).toBe('#ef5350');
+  // plan-341 Phase 0: hue carries the direction, intensity the state. A TRUE
+  // bool is the `strong` step of its direction, a FALSE bool the `weak` step
+  // of the SAME direction (it used to collapse to one grey for both), and a
+  // missing reading is the neutral step (it used to show the direction hue at
+  // full strength, claiming a state nobody had measured).
+
+  it('strong step of the direction for a true bool', () => {
+    expect(signalBadgeColor('PLCOutputBool', mockStore({ 'X': true }), 'X'))
+      .toBe(SIGNAL_VALUE_COLOR.output.strong);
+    expect(signalBadgeColor('PLCInputBool', mockStore({ 'X': true }), 'X'))
+      .toBe(SIGNAL_VALUE_COLOR.input.strong);
   });
 
-  it('grey for false bool', () => {
-    expect(signalBadgeColor('PLCOutputBool', mockStore({ 'X': false }), 'X')).toBe('#808080');
-    expect(signalBadgeColor('PLCInputBool', mockStore({ 'X': false }), 'X')).toBe('#808080');
+  it('weak step of the SAME direction for a false bool', () => {
+    expect(signalBadgeColor('PLCOutputBool', mockStore({ 'X': false }), 'X'))
+      .toBe(SIGNAL_VALUE_COLOR.output.weak);
+    expect(signalBadgeColor('PLCInputBool', mockStore({ 'X': false }), 'X'))
+      .toBe(SIGNAL_VALUE_COLOR.input.weak);
   });
 
-  it('falls back to componentColor when value undefined', () => {
+  it('neutral step when there is no reading at all', () => {
     const c1 = signalBadgeColor('PLCInputBool', mockStore({}), 'X');
     const c2 = signalBadgeColor('PLCInputBool', null, 'X');
-    // Both fall back to componentColor() of the same type — should be equal
     expect(c1).toBe(c2);
+    expect(c1).toBe(SIGNAL_VALUE_NEUTRAL);
   });
 });
 

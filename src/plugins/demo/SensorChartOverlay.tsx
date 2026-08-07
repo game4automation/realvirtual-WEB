@@ -5,7 +5,7 @@
  * SensorChartOverlay — Floating panel with a real-time ECharts step chart
  * showing sensor occupied/vacant states as high/low timelines.
  *
- * Uses ChartPanel for the reusable drag/resize/title-bar infrastructure.
+ * Uses FloatingPanel for the reusable drag/resize/title-bar infrastructure.
  * Each sensor is displayed as a separate step-line series (0 = vacant, 1 = occupied).
  * Sensors are stacked vertically with offsets so they don't overlap.
  */
@@ -17,7 +17,7 @@ import { useEChart } from '../../hooks/use-echart';
 import { useSensorChartOpen } from '../../hooks/use-sensor-chart';
 import { useMaintenanceMode } from '../../hooks/use-maintenance-mode';
 import { BOTTOM_BAR_HEIGHT } from '../../core/hmi/layout-constants';
-import { ChartPanel } from '../../core/hmi/ChartPanel';
+import { FloatingPanel } from '../../core/hmi/FloatingPanel';
 import { SensorRecorderPlugin } from '../sensor-recorder-plugin';
 import { NodeRegistry } from '../../core/engine/rv-node-registry';
 import {
@@ -49,7 +49,7 @@ function ensureSensorRecorder(viewer: ReturnType<typeof useViewer>) {
   let plugin = viewer.getPlugin<SensorRecorderPlugin>('sensor-recorder');
   if (!plugin) {
     plugin = new SensorRecorderPlugin();
-    viewer.use(plugin);
+    viewer.use(plugin, 'core');
   }
   return plugin;
 }
@@ -244,7 +244,7 @@ export function SensorChartOverlay() {
   );
 
   return (
-    <ChartPanel
+    <FloatingPanel
       open={open && !suppressed}
       onClose={() => viewer.toggleSensorChart(false)}
       title="Sensor Monitor"
@@ -257,6 +257,6 @@ export function SensorChartOverlay() {
       toolbar={toolbar}
     >
       <Box ref={chartRef} sx={{ flex: 1, minHeight: 0 }} />
-    </ChartPanel>
+    </FloatingPanel>
   );
 }

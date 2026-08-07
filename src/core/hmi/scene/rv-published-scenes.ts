@@ -2,20 +2,25 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-published-scenes — catalogue of read-only "Example" scenes shipped with
- * the build under `public/scenes/*.scene.json`.
+ * rv-published-scenes — catalogue of read-only "Example" scenes.
  *
  * Examples are curated demos (e.g. a planner layout). Unlike "My Scenes" they
  * are NOT stored in localStorage — opening one loads it transiently via
  * `SceneStore.openPublishedExample`, and "Add to My Scenes"
  * (`SceneStore.addPublishedToMyScenes`) materialises an editable copy the user
- * owns. Discovery prefers a curated `public/scenes/index.json`
- * (`[{ file, name, mode }]`) and falls back to a build-time glob of the folder.
+ * owns. The catalogue is a curated `scenes/index.json` (`[{ file, name, mode }]`).
+ *
+ * ## Where the bytes live
+ *
+ * They belong to the **DemoRealvirtual project**, which is BUNDLED: its scenes
+ * are `public/scenes/`, so Vite serves them at `<BASE_URL>scenes/` in dev and
+ * copies them to exactly that path in a build. One location, dev and deployed
+ * alike — no dev-only mount and no base to record.
  */
 
 /** A single example scene available in the "Examples" section. */
 export interface PublishedSceneEntry {
-  /** Filename under `public/scenes/`, e.g. "DemoPlanner.scene.json". */
+  /** Filename inside the project's `scenes/` folder, e.g. "DemoPlanner.scene.json". */
   file: string;
   /** Token used in `?scene=published:<urlName>` — `file` without ".scene.json". */
   urlName: string;
@@ -23,6 +28,29 @@ export interface PublishedSceneEntry {
   label: string;
   /** Preferred workspace mode to switch to on open (e.g. "planner"). Optional. */
   mode?: string;
+}
+
+/** Fetchable URL of one example scene file. */
+export function publishedSceneUrl(file: string): string {
+  return `${deployBase()}scenes/${file}`;
+}
+
+/**
+ * Manifest `path` for one example scene.
+ *
+ * Always deploy-relative (`scenes/<file>`), because `BundledBackend` resolves
+ * it against the deploy root itself.
+ */
+export function publishedScenePath(file: string): string {
+  return `scenes/${file}`;
+}
+
+function deployBase(): string {
+  try {
+    return (import.meta as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? '/';
+  } catch {
+    return '/';
+  }
 }
 
 /** Strip the `.scene.json` suffix to get the `?scene=published:<name>` token. */
@@ -40,7 +68,7 @@ export function publishedEntryFromFile(file: string): PublishedSceneEntry {
 }
 
 /**
- * Parse a curated `public/scenes/index.json` payload into catalogue entries.
+ * Parse a curated `scenes/index.json` payload into catalogue entries.
  * Defensive: ignores non-array input and any item without a valid `file`
  * ending in `.scene.json`. `name` becomes the label (falls back to the url
  * name); `mode` is carried through only when it is a non-empty string.

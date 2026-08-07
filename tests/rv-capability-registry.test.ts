@@ -38,7 +38,6 @@ describe('ComponentCapabilities', () => {
     expect(caps.badgeColor).toBe('#90a4ae');
     expect(caps.tooltipType).toBeNull();
     expect(caps.filterLabel).toBeNull();
-    expect(caps.simulationActive).toBe(false);
     expect(caps.hoverEnabledByDefault).toBe(false);
     expect(caps.exclusiveHoverGroup).toBe(false);
   });

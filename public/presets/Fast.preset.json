@@ -79,6 +79,7 @@
     "reflectionStrength": 0.8,
     "reflectionBlur": 1,
     "envReflectionsEnabled": true,
-    "envReflectionsIntensity": 1
+    "envReflectionsIntensity": 1,
+    "uiBlurScale": 0.25
   }
 }

@@ -39,6 +39,16 @@ export const DARK_TOOLTIP_BASE = {
   textStyle: { color: '#fff', fontSize: 11 },
 };
 
+/** Shared categorical palette for multi-series engineering charts. */
+export const CHART_SERIES_PALETTE = [
+  '#4fc3f7',
+  '#e94078',
+  '#9575cd',
+  '#4db6ac',
+  '#7986cb',
+  '#f48fb1',
+] as const;
+
 interface BaseChartOptions {
   title?: string;
   legendData?: string[];

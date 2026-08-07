@@ -29,6 +29,7 @@ import {
   getAnnotationSnapshot,
 } from '../../plugins/annotation-plugin';
 import {
+  ANNOTATION_PANEL_WIDTH,
   LEFT_PANEL_TOP,
   LEFT_PANEL_LEFT,
   LEFT_PANEL_BOTTOM,
@@ -36,11 +37,11 @@ import {
 } from './layout-constants';
 import { WINDOW_DARK_BG } from './LeftPanel';
 import { useViewportInsets } from '../../hooks/use-viewport-insets';
+import { useDropOrphanedPanelSlot } from '../../hooks/use-drop-orphaned-panel-slot';
 import { ISA_RED } from './isa-colors';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
-const PANEL_WIDTH = 280;
 const BORDER = 'rgba(255,255,255,0.07)';
 
 // ── Panel Component ────────────────────────────────────────────────────
@@ -70,6 +71,11 @@ export function AnnotationPanel() {
     plugin?.focusAnnotation(id);
   }, [plugin]);
 
+  // The per-model annotation plugin backs this slot; drop it if the slot was
+  // restored for a model that doesn't load the plugin (else its inset reserves
+  // an empty strip — see useDropOrphanedPanelSlot).
+  useDropOrphanedPanelSlot('annotations', isOpen, !!plugin);
+
   if (!isOpen || !plugin) return null;
 
   return (
@@ -81,7 +87,7 @@ export function AnnotationPanel() {
         left: LEFT_PANEL_LEFT,
         top: LEFT_PANEL_TOP + topOffset,
         bottom: LEFT_PANEL_BOTTOM,
-        width: PANEL_WIDTH,
+        width: ANNOTATION_PANEL_WIDTH,
         backgroundColor: `${WINDOW_DARK_BG} !important`,
         borderRight: `1px solid ${BORDER}`,
         borderRadius: 0,

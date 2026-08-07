@@ -42,7 +42,7 @@ export default defineBehavior({
 - glob: `'MyMachine_*'`, `'Belt_v?'`
 - wildcard: `'*'` matches every loaded model
 
-**Lifecycle.** The bind callback runs on every `model-loaded` event when `models[]` matches. All hooks and subscriptions registered through `rv.*` are tracked per bind and automatically disposed on the next `model-cleared` event — no manual cleanup.
+**Lifecycle.** The bind callback runs on every `model-logic-activated` event when `models[]` matches. For unsigned and validly signed models this follows `model-loaded` immediately. If a signed model is invalid or cannot be verified, geometry and HMI still load, but behaviors remain stopped until the user explicitly activates model logic. All hooks and subscriptions registered through `rv.*` are tracked per bind and automatically disposed on the next `model-cleared` event — no manual cleanup.
 
 ## 2. Naming convention
 
@@ -65,9 +65,23 @@ The scan deep-merges into existing `rv_extras`, so manually-authored fields (e.g
 
 An optional Unity-side marker component `WebLibraryComponent { TypeId, Version }` can be placed on a library asset root for diagnostics and future catalog metadata. It is **not required** for the naming-convention scan — the loader treats it as documentation only.
 
+### Bindable follow-position drives
+
+`Drive_FollowPosition` exposes `Position` as a float control slot and
+`CurrentPosition` as a float feedback slot in Signal Link mode. When several
+axes have no `LayoutObject` scope, give each signal an axis-qualified name such
+as `A1.Position` and `A1.CurrentPosition`; unqualified names would share one
+global store entry.
+
+A live `Position` binding moves the drive to the supplied value and publishes
+the resulting position through `CurrentPosition`. If the provider disconnects,
+the drive holds its last live position instead of following the neutralized
+zero. Reconnecting the provider or forcing the target signal releases this
+latch, including when the forced value is zero.
+
 ## 3. Sidecar JSON
 
-If `mymachine.glb` ships with `mymachine.kin.json` next to it, the loader fetches it automatically and applies the spec. Silent on 404, warning on parse error.
+If an unsigned `mymachine.glb` ships with `mymachine.kin.json` next to it, the loader fetches it automatically and applies the spec. Silent on 404, warning on parse error. A GLB carrying `scenes[scene ?? 0].extras.rv_sig` is self-contained, so its sidecar is never applied, regardless of the verification result.
 
 ```json
 {
@@ -87,7 +101,7 @@ Spec shape = `KinematicsSpec` interface. No code deployment needed — ideal for
 
 ## RVBindContext reference
 
-The single argument to `bind(rv)`. All methods are chainable (return `this`); subscriptions are auto-disposed on `model-cleared`.
+The single argument to `bind(rv)`. All methods are chainable (return `this`). In a **behavior file** subscriptions are auto-disposed on `model-cleared` (the BehaviorManager tracks them per bind); through the low-level `viewer.bind()` entry they are **not** — see [Low-level API](#low-level-api).
 
 ### Kinematics
 
@@ -111,7 +125,7 @@ The single argument to `bind(rv)`. All methods are chainable (return `this`); su
 
 ### AAS links
 
-- `rv.aas(target, aasxFile, { tab?, idShort?, description?, serverUrl? })` — registers an Asset Administration Shell link; consumed by the AAS-link plugin.
+- `rv.aas(target, aasxFile, { tab?, idShort?, description?, serverUrl?, overwrite? })` — registers an Asset Administration Shell link; consumed by the AAS-link plugin. `overwrite` follows the same merge semantics as every other entry (see [Merge semantics](#merge-semantics)).
 
 ### Context menus
 
@@ -142,6 +156,8 @@ viewer.bind(root, {
   drives: [{ target: 'Axis1', direction: 'LinearY', speed: 500 }],
 });
 ```
+
+**No auto-dispose here.** The "auto-disposed on `model-cleared`" promise belongs to behavior **files**, where the BehaviorManager tracks every `rv.*` registration per bind. The low-level entry does not: subscriptions made through the callback form — `rv.onFixedUpdate`, `rv.signals.on`, `rv.contextMenu` — survive a model clear, and the caller must dispose them itself (e.g. by listening to `model-cleared`). If you want the disposal, use a behavior file.
 
 ## Merge semantics
 

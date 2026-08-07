@@ -149,6 +149,33 @@ describe('WebBridge', () => {
     expect(bridge.connected).toBe(false);
   });
 
+  it('drifts to the next free port when the canonical port is held by a live bridge', async () => {
+    // Bridge A grabs an ephemeral port; that becomes the "canonical" port B wants.
+    const a = makeBridge();
+    await a.start();
+    const canonical = a.port;
+    expect(a.bindFailed).toBe(false);
+
+    // Bridge B requests the SAME port. A is alive, so retries never free it →
+    // B must drift upward to the next free port instead of degrading to 0 tools.
+    const logger = new Logger();
+    const b = new WebBridge({ port: canonical, logger, bindRetries: 1, bindRetryDelayMs: 1, maxPortDrift: 20 });
+    logger.setSink((lines) => b.sendLog(lines));
+    open.push(b);
+    await b.start();
+
+    expect(b.bindFailed).toBe(false);
+    expect(b.port).not.toBe(canonical);
+    expect(b.port).toBeGreaterThan(canonical);
+    expect(b.port).toBeLessThanOrEqual(canonical + 20);
+
+    // The drifted bridge is fully functional — a browser can connect to its port.
+    const browser = await MockBrowserClient.connect(b.port);
+    clients.push(browser);
+    await waitFor(() => b.connected);
+    expect(b.connected).toBe(true);
+  });
+
   it('mirrors server log lines to the browser', async () => {
     const logger = new Logger();
     const bridge = new WebBridge({ port: 0, logger });

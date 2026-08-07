@@ -40,6 +40,16 @@ export interface LeftPanelSnapshot {
   left: PanelSlotState;
   /** Right-side slot state. */
   right: PanelSlotState;
+  /**
+   * Side whose panel was opened most recently, or null when nothing is open.
+   * Both sides can hold a panel at once, so "the active panel" is ambiguous —
+   * consumers that need ONE window (context-sensitive help, plan-370) read this
+   * to break the tie.
+   *
+   * Session state, deliberately NOT persisted: after a reload the restore order
+   * determines it (left first, right last).
+   */
+  lastOpenedSide: AnchorSide | null;
 }
 
 const LS_KEY_ACTIVE_PANEL = 'rv-left-panel-active';
@@ -78,6 +88,8 @@ const EMPTY_SLOT: PanelSlotState = { activePanel: null, activePanelWidth: 0 };
 export class LeftPanelManager {
   private _left: PanelSlotState = { ...EMPTY_SLOT };
   private _right: PanelSlotState = { ...EMPTY_SLOT };
+  /** Side of the most recent `open()` — see LeftPanelSnapshot.lastOpenedSide. */
+  private _lastOpenedSide: AnchorSide | null = null;
   private _listeners = new Set<() => void>();
   private _snapshot: LeftPanelSnapshot = this._buildSnapshot();
   /** Panel widths registered via open() — used to restore width on reload. */
@@ -110,7 +122,17 @@ export class LeftPanelManager {
   open(id: PanelId, width: number, anchor: AnchorSide = 'left'): void {
     this._panelWidths.set(id, width);
     const slot = anchor === 'right' ? this._right : this._left;
-    if (slot.activePanel === id && slot.activePanelWidth === width) return;
+    const slotUnchanged = slot.activePanel === id && slot.activePanelWidth === width;
+    // Re-opening the SAME window is only a full no-op when it also does not
+    // move the focus to the other side. Bailing out before `_lastOpenedSide`
+    // was updated would leave "which window is the user working in" wrong.
+    if (slotUnchanged && this._lastOpenedSide === anchor) return;
+    this._lastOpenedSide = anchor;
+    if (slotUnchanged) {
+      // Nothing persistable changed — only the session-local focus side did.
+      this._notify();
+      return;
+    }
     slot.activePanel = id;
     slot.activePanelWidth = width;
     this._persist();
@@ -129,6 +151,10 @@ export class LeftPanelManager {
       changed = true;
     }
     if (!changed) return;
+    // Focus falls back to whatever is still open; null when nothing is.
+    this._lastOpenedSide = this._left.activePanel ? 'left'
+      : this._right.activePanel ? 'right'
+        : null;
     this._persist();
     this._notify();
   }
@@ -199,6 +225,7 @@ export class LeftPanelManager {
       activePanelWidth: this._left.activePanelWidth,
       left: { ...this._left },
       right: { ...this._right },
+      lastOpenedSide: this._lastOpenedSide,
     };
   }
 

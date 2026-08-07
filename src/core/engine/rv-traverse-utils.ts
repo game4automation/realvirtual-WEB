@@ -9,8 +9,66 @@
  * eliminates the `as Mesh` cast boilerplate at every call site.
  */
 
-import { Box3, Vector3, type Object3D } from 'three';
+import { Box3, Vector3, type Material, type Object3D } from 'three';
 import { Mesh } from 'three';
+
+// ─── Runtime-rig markers (plan-362, EnergyChain) ─────────────────
+//
+// An EnergyChain rig replaces a static CAD subtree with runtime sidecars:
+// one SkinnedMesh per source mesh, the deactivated originals, and one
+// invisible picking-proxy hull. Several scene-wide pipelines walk EVERY mesh
+// (material dedup, uber-material bake, layout-planner aux raycast targets) and
+// must not treat those sidecars as ordinary geometry. The markers live here —
+// next to the traversal helpers those pipelines already import — so no
+// pipeline needs to depend on the EnergyChain module itself.
+
+/** `userData` flag on the invisible EnergyChain picking-proxy hull. */
+export const RV_CHAIN_PROXY = '_rvEnergyChainProxy';
+/** `userData` flag on a runtime `SkinnedMesh` sidecar created by an EnergyChain rig. */
+export const RV_CHAIN_SKIN = '_rvEnergyChainSkin';
+/** `userData` flag on an original CAD mesh that a rig deactivated and shadowed. */
+export const RV_CHAIN_SOURCE = '_rvEnergyChainSource';
+/**
+ * `userData` copy of an original mesh's AUTHORED `visible` flag, kept next to
+ * {@link RV_CHAIN_SOURCE}. The export clone has no access to the live component,
+ * so this is how it knows whether restoring the mesh means showing it — an
+ * author who deliberately hid a part must not have it reappear in the file.
+ */
+export const RV_CHAIN_SOURCE_VISIBLE = '_rvEnergyChainSourceVisible';
+
+/**
+ * True when a mesh belongs to a runtime deformation rig and must be kept out
+ * of the material-collapsing pipelines (`deduplicateMaterials`,
+ * `applyUberMaterial`).
+ *
+ * Two independent reasons:
+ *   - a `SkinnedMesh` carries per-vertex skin attributes; the uber bake writes
+ *     shared per-vertex color/rmPacked attributes and may swap the geometry
+ *     for a cached clone, which would silently drop the skin binding;
+ *   - the picking proxy is invisible bookkeeping geometry that should never
+ *     contribute a material at all;
+ *   - the deactivated original shares its geometry with the SkinnedMesh, so
+ *     baking it in place would write into the skinned geometry as a side
+ *     effect, and `dispose()` must be able to hand back exactly what it took.
+ */
+export function isRuntimeRigMesh(node: Object3D): boolean {
+  const ud = node.userData as Record<string, unknown> | undefined;
+  if (ud?.[RV_CHAIN_PROXY] === true || ud?.[RV_CHAIN_SOURCE] === true) return true;
+  return (node as unknown as { isSkinnedMesh?: boolean }).isSkinnedMesh === true;
+}
+
+/**
+ * True when a mesh is a rig sidecar that must NOT become a raycast target:
+ * the SkinnedMesh (CPU skin raycast is slow and the proxy already covers the
+ * chain) and the deactivated original (it sits frozen in the rest pose). The
+ * picking proxy itself deliberately does NOT match — it is the one target the
+ * planner drop path should register.
+ */
+export function isRigRaycastExcluded(node: Object3D): boolean {
+  const ud = node.userData as Record<string, unknown> | undefined;
+  if (ud?.[RV_CHAIN_SKIN] === true || ud?.[RV_CHAIN_SOURCE] === true) return true;
+  return (node as unknown as { isSkinnedMesh?: boolean }).isSkinnedMesh === true;
+}
 
 /**
  * Traverse `root` and invoke `cb` for every descendant (and `root` itself,
@@ -31,6 +89,32 @@ export function traverseMeshes(root: Object3D, cb: (mesh: Mesh) => void): void {
       cb(child as Mesh);
     }
   });
+}
+
+/**
+ * Precise geometric center of a subtree: the average of every world-space
+ * mesh vertex under `node` (including `node` itself). Unlike the AABB center
+ * this is not inflated by rotated bounding boxes and reflects the actual
+ * vertex distribution of the geometry. Returns null when the subtree carries
+ * no vertices.
+ */
+export function computeSubtreeVertexCenter(node: Object3D, target?: Vector3): Vector3 | null {
+  const sum = target ?? new Vector3();
+  sum.set(0, 0, 0);
+  let count = 0;
+  const v = new Vector3();
+  node.updateMatrixWorld(true);
+  traverseMeshes(node, (mesh) => {
+    const pos = mesh.geometry?.getAttribute('position');
+    if (!pos) return;
+    for (let i = 0; i < pos.count; i++) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld);
+      sum.add(v);
+      count++;
+    }
+  });
+  if (count === 0) return null;
+  return sum.divideScalar(count);
 }
 
 /**
@@ -138,4 +222,29 @@ export function computeSubtreeAABB(
   const center = new Vector3();
   box.getCenter(center);
   return { box, size, center };
+}
+
+/**
+ * Dispose geometry and materials on all Mesh nodes in a subtree.
+ * Uses a Set to prevent double-dispose of shared resources.
+ * Does NOT remove root from scene — caller is responsible.
+ */
+export function disposeSubtree(root: Object3D): void {
+  const disposed = new Set<unknown>();
+  root.traverse((node) => {
+    const m = node as Mesh;
+    if (m.geometry && !disposed.has(m.geometry)) {
+      disposed.add(m.geometry);
+      m.geometry.dispose();
+    }
+    if (m.material) {
+      const mats = Array.isArray(m.material) ? m.material : [m.material];
+      for (const mat of mats) {
+        if (mat && !disposed.has(mat)) {
+          disposed.add(mat);
+          (mat as Material).dispose();
+        }
+      }
+    }
+  });
 }

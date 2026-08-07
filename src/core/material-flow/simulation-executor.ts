@@ -57,7 +57,14 @@ export interface SimulationExecutor {
   /** Begin simulating the given definitions over `topology` (fresh, empty). */
   start(defs: MaterialFlowDefinition[], topology: SimulationTopology): void;
 
-  /** Advance one fixed tick (continuous: transport.update → fixedUpdate). */
+  /**
+   * Optional pre-PRE pass — the CoreSubsystems early stage (playback → logic →
+   * IK → replay). Runs BEFORE the TickStage.PRE plugin hooks so these
+   * subsystems see last tick's signals, exactly as the legacy fixedUpdate did.
+   */
+  earlyTick?(dt: number): void;
+
+  /** Advance one fixed tick (continuous: drives → transport.update → fixedUpdate → visuals). */
   tick(dt: number): void;
 
   /** Optional post-tick pass (mirrors lateFixedUpdate / late-phase transport). */

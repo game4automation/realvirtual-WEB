@@ -64,7 +64,7 @@ function ConsentGate({ onAccept }: { onAccept: () => void }) {
     <Box sx={{
       position: 'fixed', inset: 0,
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-      bgcolor: 'rgba(0,0,0,0.88)', backdropFilter: 'blur(12px)', p: 2,
+      bgcolor: 'rgba(0,0,0,0.88)', backdropFilter: 'blur(calc(12px * var(--rv-ui-blur-scale, 1)))', p: 2,
     }}>
       <Paper elevation={12} sx={{
         width: 420, maxWidth: '100%', p: 4, borderRadius: 3,

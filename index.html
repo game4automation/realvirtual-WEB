@@ -9,7 +9,30 @@
   <link rel="icon" type="image/png" href="/favicon.png" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="manifest" href="/manifest.json" />
-  <title>realvirtual WEB</title>
+  <title>realvirtual WEB — Browser-based 3D HMI & Digital Twin Viewer</title>
+  <meta name="description" content="realvirtual WEB is the open, browser-based 3D HMI and digital twin viewer for industrial automation. Explore live demos of conveyor simulation, robotics and PLC-connected 3D visualization — no installation, right in the browser." />
+  <!-- URL-bound SEO tags (canonical, og:url, og:image, twitter:card) are injected
+       per deploy by scripts/bunny-deploy.mjs — the committed file stays deployment-neutral. -->
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="realvirtual WEB" />
+  <meta property="og:title" content="realvirtual WEB — Browser-based 3D HMI & Digital Twin Viewer" />
+  <meta property="og:description" content="Open, browser-based 3D HMI and digital twin viewer for industrial automation. Live demos: conveyor simulation, robotics, PLC-connected 3D visualization." />
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "realvirtual WEB",
+    "alternateName": "realvirtual WebViewer",
+    "description": "Open, browser-based 3D HMI and digital twin viewer for industrial automation: conveyor simulation, robotics, sensors and live PLC signals rendered in real time in the browser.",
+    "applicationCategory": "BusinessApplication",
+    "operatingSystem": "Any (web browser)",
+    "browserRequirements": "Requires JavaScript and WebGL2",
+    "license": "https://www.gnu.org/licenses/agpl-3.0.html",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "EUR" },
+    "publisher": { "@type": "Organization", "name": "realvirtual GmbH", "url": "https://realvirtual.io" },
+    "sameAs": ["https://github.com/game4automation/realvirtual-WEB"]
+  }
+  </script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { width: 100%; height: 100dvh; height: 100vh; overflow: hidden; background: #9a9a9a; }
@@ -36,6 +59,17 @@
     }
     #app { width: 100%; height: 100dvh; height: 100vh; touch-action: none; }
     #react-root { position: fixed; inset: 0; z-index: 1000; pointer-events: none; }
+
+    /* Signal / node-link drag in progress. The body class was set but had NO
+       rule anywhere in the repo, so it promised something it never did. It now
+       does exactly one thing: stop the pointer from selecting label text while
+       it is dragged across panels. It deliberately does NOT dim non-candidate
+       rows — compatible rows announce themselves, the rest stays calm
+       (Entscheidungs-Log 29.07.). */
+    body.rv-signal-dragging, body.rv-node-link-dragging {
+      user-select: none;
+      -webkit-user-select: none;
+    }
 
     /* --- Loading Overlay --- */
     #loading-overlay {
@@ -177,6 +211,18 @@
       letter-spacing: 0.5px;
       min-height: 14px;
     }
+    /* Secondary line: what is happening + how long it should still take.
+       Reserved height so the overlay never reflows as the text changes. */
+    .loader-detail {
+      color: #777;
+      font-family: 'Segoe UI', sans-serif;
+      font-size: 11px;
+      letter-spacing: 0.3px;
+      margin-top: 4px;
+      min-height: 14px;
+      text-align: center;
+    }
+    .loader-detail.warn { color: #b8860b; }
 
     /* --- Error state --- */
     .loader-error {
@@ -251,6 +297,19 @@
 <body>
   <div id="app"></div>
 
+  <noscript>
+    <div style="max-width: 640px; margin: 10vh auto 0; padding: 0 24px; color: #222; font-family: 'Segoe UI', sans-serif; line-height: 1.6;">
+      <h2>realvirtual WEB — Browser-based 3D HMI &amp; Digital Twin Viewer</h2>
+      <p>realvirtual WEB loads industrial 3D models (GLB) and runs interactive simulation of
+         conveyors, drives, sensors and robots directly in the browser — as a 3D HMI connected
+         to live PLC signals or as a standalone digital twin demo. JavaScript and WebGL are
+         required to run the viewer.</p>
+      <p><a href="https://realvirtual.io">realvirtual.io</a> ·
+         <a href="https://github.com/game4automation/realvirtual-WEB">Source on GitHub (AGPL-3.0)</a> ·
+         <a href="https://doc.realvirtual.io">Documentation</a></p>
+    </div>
+  </noscript>
+
   <!-- Loading Overlay -->
   <div id="loading-overlay">
     <div class="loader-logo-wrap">
@@ -258,12 +317,13 @@
       <div class="orbit-dot"></div>
       <img class="loader-logo" src="/logo.png" alt="realvirtual" />
     </div>
-    <div class="loader-brand">realvirtual WEB</div>
+    <h1 class="loader-brand">realvirtual WEB</h1>
     <div class="loader-slogan">Open. Light. Industrial. Anywhere.</div>
     <div class="loader-status" id="loading-status"><span id="loading-label">Loading </span><span class="model-name" id="loading-model-name"></span></div>
     <div class="loader-progress-wrap">
       <div class="loader-progress-track"><div class="loader-progress-bar indeterminate" id="loading-progress-bar"></div></div>
       <div class="loader-progress-pct" id="loading-progress-pct"></div>
+      <div class="loader-detail" id="loading-detail"></div>
     </div>
     <!-- Error state (hidden until a load fails after all retries) -->
     <div class="loader-error hidden" id="loading-error">

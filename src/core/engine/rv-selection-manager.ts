@@ -194,28 +194,43 @@ export class SelectionManager {
     return paths;
   }
 
+  /**
+   * Re-apply the selection highlight for the CURRENT selection without
+   * changing the selection or emitting events. Called by RVHighlightPolicy
+   * after a mode profile swap so the surviving selection re-renders in the
+   * new mode's visual.
+   */
+  refreshHighlight(): void {
+    this._applyHighlight();
+  }
+
+  private _applyHighlight(): void {
+    const viewer = this._viewer;
+    if (!viewer) return;
+    if (this._selected.length === 0) {
+      viewer.highlighter.clearSelection();
+      return;
+    }
+    const nodes = this._selected
+      .map(p => viewer.registry?.getNode(p))
+      .filter((n): n is NonNullable<typeof n> => n != null);
+    if (nodes.length > 0) {
+      // Include child drives in highlight when any selected node has LayoutObject
+      const hasLayout = nodes.some(n => {
+        const rv = n.userData?.realvirtual as Record<string, unknown> | undefined;
+        return !!rv?.LayoutObject;
+      });
+      viewer.highlighter.highlightSelection(nodes, { includeChildDrives: hasLayout });
+    } else {
+      viewer.highlighter.clearSelection();
+    }
+  }
+
   private _apply(): void {
     const viewer = this._viewer;
     if (!viewer) return;
 
-    // Update highlights
-    if (this._selected.length === 0) {
-      viewer.highlighter.clearSelection();
-    } else {
-      const nodes = this._selected
-        .map(p => viewer.registry?.getNode(p))
-        .filter((n): n is NonNullable<typeof n> => n != null);
-      if (nodes.length > 0) {
-        // Include child drives in highlight when any selected node has LayoutObject
-        const hasLayout = nodes.some(n => {
-          const rv = n.userData?.realvirtual as Record<string, unknown> | undefined;
-          return !!rv?.LayoutObject;
-        });
-        viewer.highlighter.highlightSelection(nodes, { includeChildDrives: hasLayout });
-      } else {
-        viewer.highlighter.clearSelection();
-      }
-    }
+    this._applyHighlight();
 
     // Create new snapshot
     const paths = Object.freeze([...this._selected]) as ReadonlyArray<string>;

@@ -24,7 +24,7 @@ export interface UIContextConfig {
 }
 
 /** Settings tab identifiers used for selective locking. */
-export type SettingsTabId = 'model' | 'mouse' | 'visual' | 'environment' | 'interfaces' | 'devtools' | 'tests' | 'mcp' | 'multiuser' | 'groups';
+export type SettingsTabId = 'model' | 'mouse' | 'visual' | 'simulation' | 'environment' | 'interfaces' | 'devtools' | 'tests' | 'mcp' | 'multiuser' | 'groups';
 
 /** Top-level app configuration loaded from `public/settings.json`. */
 export interface RVAppConfig {
@@ -36,11 +36,30 @@ export interface RVAppConfig {
   defaultModel?: string;
   /** Base path for project-specific assets (docs, AASX, logos). Relative to BASE_URL. Ends with '/'. */
   projectAssetsPath?: string;
+  /** Public corresponding-source URL for the exact embedded AGPL WebViewer build. */
+  sourceUrl?: string;
+
+  /**
+   * Zero-knowledge encryption for password-protected deploys (plan-267). When
+   * `enabled`, model GLBs on the CDN are AES-256-GCM RVE1 envelopes (self-
+   * describing via magic) under their normal `.glb` names — the runtime shows a
+   * password gate and decrypts before parsing. Salt/iterations live in each
+   * envelope header, so this flag is just a boolean signal set at publish time.
+   */
+  encryption?: { enabled?: boolean };
 
   /** Global plugin IDs — lowest priority, overridden by modelname.json and GLB extras. */
   plugins?: string[];
   /** Global per-plugin config — lowest priority, deep-merged with model-specific config. */
   pluginConfig?: Record<string, Record<string, unknown>>;
+
+  /**
+   * Suppress per-model opener/welcome dialogs (OpenerMessagePlugin)
+   * deployment-wide — e.g. for kiosk installations or host pages with their
+   * own onboarding. Default `false`. Custom loaders can instead toggle at
+   * runtime via `setOpenerMessagesEnabled()` from opener-message-plugin.
+   */
+  disableOpenerMessages?: boolean;
 
   /**
    * Opt-in: load external plugin bundles at runtime via HEAD-then-import.
@@ -74,24 +93,105 @@ export interface RVAppConfig {
     /** Privacy-policy URL linked from the consent gate. Omit to hide the link. */
     privacyPolicyUrl?: string;
   };
+
+  /**
+   * Public-hosted news feed opt-in. Omitted in private, customer, and
+   * self-hosted settings so those deployments make no external request.
+   */
+  news?: {
+    /** Must be exactly true to enable the public news request. */
+    enabled?: boolean;
+    /** Absolute HTTP(S) URL of the versioned news endpoint, without a query. */
+    apiUrl?: string;
+  };
+
+  /**
+   * Startup behaviour of the Projects dashboard (plan-372 §2.12).
+   *
+   * By default it opens only when the session has nothing else to show: no
+   * `?project=` / `?scene=` / `?model=`, no `defaultModel`, and not
+   * mode-locked. Every delivered customer build either sets `defaultModel` or
+   * runs kiosk-locked, so those boot into their model **unchanged**.
+   *
+   * The two flags exist for the deployments that fall outside that rule:
+   * `suppress` for a shell that owns its own entry point, `force` for an
+   * authoring install that wants the dashboard even with a default model.
+   * `suppress` wins when both are set — refusing to show a window is always
+   * the safer half of a contradictory configuration.
+   */
+  projects?: {
+    /** Never auto-open the dashboard, whatever the other conditions say. */
+    suppress?: boolean;
+    /** Always auto-open it, unless `suppress` is also set or the mode is locked. */
+    force?: boolean;
+  };
+
+  /** Simulation behavior toggles (deploy-config, never editable via UI). */
+  simulation?: {
+    /**
+     * Global kill-switch for the MU accumulation gap clamp (plan-255 §2.8).
+     * Default `true`. Set `false` to disable accumulation deployment-wide
+     * WITHOUT re-exporting scenes (rollback path — applied to
+     * `RVTransportSurface.accumulateDefault` at boot in main.ts).
+     */
+    accumulateDefault?: boolean;
+    /**
+     * Global kill-switch for zone-based physics simulation (plan-276 F10).
+     * Default `true` (= ALLOWED). Set `false` to disable physics zones
+     * deployment-wide WITHOUT re-exporting scenes (applied to
+     * `physicsSettings.enabled` at boot in main.ts, AND-ed with the
+     * localStorage `rv.physics` ACTIVATION toggle — Settings → Simulation →
+     * "Physics (whole scene)", default OFF/opt-in). Load-time-only — takes
+     * effect on the next model load.
+     */
+    physicsEnabled?: boolean;
+    /**
+     * Global kill-switch for the TransportSurface physics mode (plan-276
+     * Phase 4, F5). Default `true` (= surfaces with `PhysicsMode: true` may be
+     * physics-managed). Set `false` to keep ALL surfaces kinematic
+     * deployment-wide WITHOUT re-exporting scenes (applied to
+     * `RVTransportSurface.physicsDefault` at boot in main.ts —
+     * `accumulateDefault` pattern). Narrower than `physicsEnabled`, which
+     * turns off the whole physics-zone feature.
+     */
+    physicsSurfaceDefault?: boolean;
+  };
+
+  /**
+   * AI error diagnosis + operator comment backend (plan-253). Deploy-config
+   * only (like `analytics.googleAnalyticsId`) — never editable via UI.
+   * Both URLs absent (the default) keeps the demo/fake path fully offline.
+   */
+  diagnostics?: {
+    /** Base URL of the CONNECT diagnosis backend (`{diagnoseUrl}/diagnose`). Omit to disable. */
+    diagnoseUrl?: string;
+    /** Base URL of the CONNECT comment store (`{notesUrl}/comments`). Omit for localStorage notes. */
+    notesUrl?: string;
+  };
+
+  /**
+   * Product documentation the context-sensitive help opens (plan-370). Deploy
+   * config only — never editable through the UI. A customer who mirrors or
+   * replaces the documentation points `baseUrl` at their own site; the topic
+   * paths below it stay the same.
+   *
+   * Whether the help entry is offered at all is a separate, orthogonal switch:
+   * `ui.visibilityOverrides['help']`.
+   */
+  docs?: {
+    /**
+     * Base URL of the documentation. Default: `https://realvirtual.io/doc/web/`.
+     * Ignored (default used) when it is not an absolute `http:`/`https:` URL.
+     */
+    baseUrl?: string;
+  };
 }
 
 // ─── Build-time feature flags ──────────────────────────────────
-
-/**
- * Is the unified SimulationKernel / ContinuousRunner path enabled? Default ON:
- * the kernel owns the fixed-update orchestration (continuous via ContinuousRunner,
- * DES via the DESRunner). Opt out back to the legacy fixedUpdate path with
- * `VITE_UNIFIED_SIM=0` (or `false`) — a rollback kept available during the soak
- * period before the legacy path + `_physicsPluginActive` are removed.
- *
- * Read via `import.meta.env` so Vite statically replaces it (the value is the
- * raw string '0'/'false'/'1'/'true' or undefined).
- */
-export function isUnifiedSimEnabled(): boolean {
-  const v = import.meta.env.VITE_UNIFIED_SIM;
-  return v !== '0' && v !== 'false';
-}
+//
+// NOTE: the `VITE_UNIFIED_SIM` opt-out (legacy fixedUpdate path) was removed
+// in the runtime unification (Phase B) after its soak period — the
+// SimulationKernel / executor path is now the only fixed-update orchestration.
 
 // ─── Singleton State ───────────────────────────────────────────
 

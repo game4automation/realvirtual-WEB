@@ -22,6 +22,8 @@
  * soft warnings (`overlaps`) that do NOT block the push.
  */
 
+import { matchesAny } from '../glob-match';
+
 // ── Public Types ───────────────────────────────────────────────────────────
 
 export interface S7Tag {
@@ -41,6 +43,48 @@ export interface ParsedTagTable {
   warnings: string[];
   /** Soft range-overlap warnings — these do NOT block the push. */
   overlaps: string[];
+}
+
+// ── Multi-Tab (Excel → MQTT Topic) Types ─────────────────────────────────────
+
+/** A single parsed signal with its derived rv wire type (Multi-Tab import). */
+export interface ParsedTag extends S7Tag {
+  /** Derived rv PLC wire type (direction + value kind), e.g. "PLCOutputBool". */
+  wireType: string;
+}
+
+/** Options for the Multi-Tab Excel → MQTT Topic import (one tab = one topic). */
+export interface MqttExcelImportOptions {
+  /** Glob pattern matched against sheet/tab names, e.g. "Data_Q*". Empty = all tabs (F12). */
+  sheetPattern: string;
+  /** F6: force every signal (even %I inputs) to a PLCOutput wire type. */
+  forceAllAsOutput: boolean;
+  /** Optional prefix prepended to the topic name. Default "". */
+  topicPrefix?: string;
+}
+
+/** One imported tab mapped to one MQTT topic. */
+export interface ParsedTopic {
+  /** Final MQTT topic name (sanitized, prefixed). */
+  topic: string;
+  /** Original sheet/tab name. */
+  sheetName: string;
+  /** Signals parsed from the tab, with derived wire types. */
+  signals: ParsedTag[];
+  /** Per-topic warnings (dropped addresses, overlaps, sanitizing). */
+  warnings: string[];
+}
+
+/** Result of a Multi-Tab Excel import. */
+export interface ParsedMultiTabTable {
+  /** Only the tabs matching the pattern, one topic each. */
+  topics: ParsedTopic[];
+  /** Tab names filtered out by the pattern. */
+  ignoredSheets: string[];
+  /** Total signal count across all imported topics. */
+  totalSignals: number;
+  /** Cross-tab warnings (duplicate signal names, topic-name collisions). */
+  warnings: string[];
 }
 
 // ── Address Parsing ─────────────────────────────────────────────────────────
@@ -135,19 +179,44 @@ export function parseAddress(
 // ── Wire-type derivation ────────────────────────────────────────────────────
 
 /**
- * Derive the rv PLC wire type from a Siemens data type. An imported process-image
- * signal is always a PLC output (the PLC writes the process image, the viewer only
- * reads/displays it — read-only, never sent back), matching the Unity nomenclature.
- *   Bool                         → PLCOutputBool
- *   Byte/Word/Int/DWord/DInt     → PLCOutputInt
- *   Real/LReal                   → PLCOutputFloat
+ * Derive the rv PLC wire type (direction + value kind) from a Siemens data type
+ * and memory area, matching the Unity nomenclature and the Siemens address
+ * convention:
+ *
+ *   Direction (from area):
+ *     I / E (PLC input)  → PLCInput*   — written by the viewer/operator
+ *     Q / A (PLC output) → PLCOutput*  — read by the viewer
+ *     M / '' / anything  → PLCOutput*  — DEFAULT when the area is unknown
+ *
+ *   Value kind (from data type):
+ *     Bool                       → ...Bool
+ *     Real / LReal               → ...Float
+ *     Byte/Word/Int/DWord/DInt   → ...Int
+ *
+ * The derived direction is only a DEFAULT — it can be overridden per signal
+ * downstream (see {@link S7Tag} → CONNECT `SignalConfig.Type`), because CONNECT
+ * accepts an explicit `Type` via `PUT /config/interfaces/{id}` and never writes
+ * back to the PLC regardless of direction.
+ *
+ * When `opts.forceOutput` is set, the direction is forced to `PLCOutput`
+ * regardless of the area letter (F6: "Treat all signals as PLC Output"). The
+ * value kind (Bool/Int/Float) is always derived from the data type.
+ *
+ * @param dataType Siemens data type (Bool/Byte/Word/Int/DWord/DInt/Real/LReal).
+ * @param area     Memory area letter (I/E/Q/A/M) or '' for a bare process-image address.
+ * @param opts     Optional flags; `forceOutput` pins the direction to PLCOutput.
  */
-export function deriveWireType(dataType: string): string {
+export function deriveWireType(dataType: string, area = '', opts?: { forceOutput?: boolean }): string {
   const dt = dataType.trim().toLowerCase();
-  if (dt === 'bool') return 'PLCOutputBool';
-  if (dt === 'real' || dt === 'lreal') return 'PLCOutputFloat';
-  // Byte, Word, Int, DWord, DInt and any other integral type.
-  return 'PLCOutputInt';
+  const kind = dt === 'bool' ? 'Bool' : dt === 'real' || dt === 'lreal' ? 'Float' : 'Int';
+  // I/E = PLC input (viewer writes); everything else (Q/A/M/unknown) defaults to PLC output.
+  const a = area.trim().toUpperCase();
+  const direction = opts?.forceOutput || a === 'Q' || a === 'A' || a === 'M'
+    ? 'PLCOutput'
+    : a === 'I' || a === 'E'
+      ? 'PLCInput'
+      : 'PLCOutput';
+  return `${direction}${kind}`;
 }
 
 // ── Overlap check ───────────────────────────────────────────────────────────
@@ -203,18 +272,40 @@ function cellToString(cell: Cell): string {
 const ADDRESS_LIKE_RE = /^%?[IQMEA]?[BWDX]?\d+(\.[0-7])?$/;
 
 /**
- * Build tags from a matrix of rows (header auto-detected). Each row is expected
- * to follow the fixed column order Name, Type, Adress, Comment.
+ * Zero-based column indices for a tag-table layout. Different Siemens exports use
+ * different column orders — a plain xlsx/csv tag table is Name/Type/Address/Comment,
+ * whereas a TIA `.sdf` symbol-table export is Name/Address/Type/…/Comment(6).
  */
-function rowsToTable(rows: Cell[][]): ParsedTagTable {
+export interface TagColumnMap {
+  name: number;
+  dataType: number;
+  address: number;
+  comment: number;
+}
+
+/** Column layout of a plain xlsx/csv tag table: Name, Type, Address, Comment. */
+export const CSV_COLUMNS: TagColumnMap = { name: 0, dataType: 1, address: 2, comment: 3 };
+
+/**
+ * Column layout of a TIA Portal `.sdf` symbol-table export (quoted, comma-separated,
+ * no header): `"Name","Address","DataType",<HMI flags 3..5>,"Comment"(6),…`. Mirrors the
+ * Unity `S7Interface.ReadSignalFile()` column mapping (0=symbol, 1=address, 2=type, 6=comment).
+ */
+export const SDF_COLUMNS: TagColumnMap = { name: 0, address: 1, dataType: 2, comment: 6 };
+
+/**
+ * Build tags from a matrix of rows (header auto-detected). Column order is taken
+ * from {@link TagColumnMap}, defaulting to the Name/Type/Address/Comment layout.
+ */
+function rowsToTable(rows: Cell[][], columns: TagColumnMap = CSV_COLUMNS): ParsedTagTable {
   const tags: S7Tag[] = [];
   const warnings: string[] = [];
 
-  // Header auto-detect (F7): skip the first row when its 3rd column (the address)
-  // is NOT a Siemens address; otherwise the first row is already data.
+  // Header auto-detect (F7): skip the first row when its address column is NOT a
+  // Siemens address; otherwise the first row is already data (a `.sdf` has no header).
   let startRow = 0;
   if (rows.length > 0) {
-    const firstAddr = cellToString(rows[0][2]);
+    const firstAddr = cellToString(rows[0][columns.address]);
     if (!ADDRESS_LIKE_RE.test(firstAddr)) {
       startRow = 1;
     }
@@ -224,10 +315,10 @@ function rowsToTable(rows: Cell[][]): ParsedTagTable {
     const row = rows[r];
     if (!row || row.length === 0) continue;
 
-    const name = cellToString(row[0]);
-    const dataType = cellToString(row[1]);
-    const address = cellToString(row[2]);
-    const comment = cellToString(row[3]);
+    const name = cellToString(row[columns.name]);
+    const dataType = cellToString(row[columns.dataType]);
+    const address = cellToString(row[columns.address]);
+    const comment = cellToString(row[columns.comment]);
 
     // Skip fully empty rows.
     if (!name && !dataType && !address) continue;
@@ -311,6 +402,24 @@ function parseCsv(text: string): ParsedTagTable {
   return rowsToTable(rows);
 }
 
+// ── SDF parsing (TIA symbol-table export) ────────────────────────────────────
+
+/**
+ * Parse a TIA Portal `.sdf` symbol-table export. The format is a header-less,
+ * fully double-quoted, comma-separated table whose columns are
+ * `Name, Address, DataType, <HMI flags>, Comment(6), …` (see {@link SDF_COLUMNS}).
+ * The address keeps its `%` and area letter (e.g. `%QD120`, `%M10000.0`), which the
+ * shared {@link parseAddress}/{@link deriveWireType} handle unchanged.
+ *
+ * Example line: `"MC01_1","%QD120","DWord","True","True","False","","","True"`.
+ */
+export function parseSdf(text: string): ParsedTagTable {
+  const delimiter = detectDelimiter(text);
+  const lines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
+  const rows: Cell[][] = lines.map(l => splitCsvLine(l, delimiter));
+  return rowsToTable(rows, SDF_COLUMNS);
+}
+
 // ── Public entry point ──────────────────────────────────────────────────────
 
 /**
@@ -320,6 +429,7 @@ function parseCsv(text: string): ParsedTagTable {
 export async function parseTagTable(file: File): Promise<ParsedTagTable> {
   const name = (file.name ?? '').toLowerCase();
   const isXlsx = name.endsWith('.xlsx') || name.endsWith('.xls');
+  const isSdf = name.endsWith('.sdf');
 
   if (isXlsx) {
     // Lazy-load the spreadsheet parser only when an xlsx is actually imported.
@@ -330,5 +440,139 @@ export async function parseTagTable(file: File): Promise<ParsedTagTable> {
   }
 
   const text = await file.text();
-  return parseCsv(text);
+  return isSdf ? parseSdf(text) : parseCsv(text);
+}
+
+// ── Multi-Tab (Excel → MQTT Topic) Mapping ───────────────────────────────────
+
+/**
+ * Sanitize a tab name into a valid MQTT topic level: the MQTT wildcard
+ * characters (`#`, `+`), the level separator `/` and whitespace are not allowed
+ * inside a topic segment derived from a single tab, so they are replaced with
+ * `_`. Leading/trailing `_` are trimmed; a fully-empty result falls back to
+ * `topic`.
+ */
+function sanitizeTopicName(raw: string): string {
+  const cleaned = raw.replace(/[#+/\s]+/g, '_').replace(/^_+|_+$/g, '');
+  return cleaned.length > 0 ? cleaned : 'topic';
+}
+
+/**
+ * Build one topic per sheet from already-read row matrices — the pure mapping
+ * core of the Multi-Tab import (no xlsx IO), so it is unit-testable inline.
+ *
+ * `sheets` maps a tab name to its raw `Cell[][]` (first row = header
+ * Name|Type|Address|Comment, auto-detected). Sheets whose name does not match
+ * `options.sheetPattern` go to `ignoredSheets`. Each accepted sheet becomes a
+ * {@link ParsedTopic} whose `topic` is the (prefixed, sanitized) tab name.
+ *
+ * Implements: F12 (empty pattern = all tabs), F13 (topic sanitizing + collision
+ * check), F14 (cross-tab duplicate signal-name warnings), F15 (unparsable
+ * addresses surfaced as per-topic drop warnings, never silently lost).
+ */
+export function buildTopicsFromRows(
+  sheets: Record<string, Cell[][]>,
+  options: MqttExcelImportOptions,
+): ParsedMultiTabTable {
+  const prefix = options.topicPrefix ?? '';
+  const pattern = options.sheetPattern ?? '';
+  const matchAll = pattern.trim().length === 0; // F12: empty pattern = ALL tabs.
+
+  const topics: ParsedTopic[] = [];
+  const ignoredSheets: string[] = [];
+  const warnings: string[] = [];
+  let totalSignals = 0;
+
+  // F14: track signal names across all imported tabs.
+  const nameToSheets = new Map<string, string[]>();
+  // F13: track sanitized topic → originating sheet to detect collisions.
+  const topicToSheet = new Map<string, string>();
+
+  for (const sheetName of Object.keys(sheets)) {
+    // F3 / F12: pattern filter (case-sensitive, no /i flag).
+    if (!matchAll && !matchesAny([pattern], sheetName)) {
+      ignoredSheets.push(sheetName);
+      continue;
+    }
+
+    const table = rowsToTable(sheets[sheetName]);
+    const topicWarnings: string[] = [];
+
+    // F15: report dropped (unparsable) rows per topic — never silent loss.
+    if (table.warnings.length > 0) {
+      topicWarnings.push(
+        `${table.warnings.length} row(s) dropped (unparsable address/type): ${table.warnings.join('; ')}`,
+      );
+    }
+    // Carry over soft overlap warnings (F11).
+    for (const o of table.overlaps) topicWarnings.push(o);
+
+    const signals: ParsedTag[] = table.tags.map(t => ({
+      ...t,
+      wireType: deriveWireType(t.dataType, t.area, { forceOutput: options.forceAllAsOutput }),
+    }));
+
+    // F13: sanitize the topic name and apply the optional prefix.
+    const sanitized = sanitizeTopicName(sheetName);
+    const topic = `${prefix}${sanitized}`;
+    const prevSheet = topicToSheet.get(topic);
+    if (prevSheet !== undefined) {
+      warnings.push(`Topic collision: "${sheetName}" and "${prevSheet}" both map to topic "${topic}"`);
+    } else {
+      topicToSheet.set(topic, sheetName);
+    }
+
+    // F14: record signal names for the cross-tab duplicate check.
+    for (const s of signals) {
+      const arr = nameToSheets.get(s.name) ?? [];
+      arr.push(sheetName);
+      nameToSheets.set(s.name, arr);
+    }
+
+    totalSignals += signals.length;
+    topics.push({ topic, sheetName, signals, warnings: topicWarnings });
+  }
+
+  // F14: emit one warning per signal name seen in more than one tab.
+  for (const [name, sheetList] of nameToSheets) {
+    if (sheetList.length > 1) {
+      warnings.push(`Duplicate signal name "${name}" in tabs: ${[...new Set(sheetList)].join(', ')}`);
+    }
+  }
+
+  return { topics, ignoredSheets, totalSignals, warnings };
+}
+
+/**
+ * Parse a multi-tab Excel workbook (xlsx) into one MQTT topic per matching tab.
+ *
+ * Reads the sheet names lazily via `read-excel-file`'s `readSheetNames`, reads
+ * each matching sheet's rows via `readXlsxFile(file, { sheet })`, then delegates
+ * all mapping to the pure {@link buildTopicsFromRows}. Keeping the xlsx IO out
+ * of the mapping core lets the latter be unit-tested without a fixture file.
+ */
+export async function parseMqttExcelMultiTab(
+  file: File,
+  options: MqttExcelImportOptions,
+): Promise<ParsedMultiTabTable> {
+  return buildTopicsFromRows(await readWorkbookSheets(file), options);
+}
+
+/**
+ * Read every sheet of an xlsx workbook into a `tab name → Cell[][]` map, once.
+ *
+ * The per-sheet reads are independent, so they run in parallel. Exposed separately
+ * from {@link parseMqttExcelMultiTab} so a UI can read the workbook a single time and
+ * then re-run the pure {@link buildTopicsFromRows} on every filter/prefix change,
+ * instead of re-reading the file on each keystroke.
+ */
+export async function readWorkbookSheets(file: File): Promise<Record<string, Cell[][]>> {
+  const { default: readXlsxFile, readSheetNames } = await import('read-excel-file');
+  const sheetNames = await readSheetNames(file);
+  const rowsPerSheet = await Promise.all(
+    sheetNames.map(name => readXlsxFile(file, { sheet: name }) as Promise<Cell[][]>),
+  );
+  const sheets: Record<string, Cell[][]> = {};
+  sheetNames.forEach((name, i) => { sheets[name] = rowsPerSheet[i]; });
+  return sheets;
 }

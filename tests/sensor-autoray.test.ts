@@ -107,7 +107,7 @@ describe('computeBeamFromBounds — Ray child override', () => {
   });
 });
 
-describe('RVSensor — per-instance signal scoping', () => {
+describe('RVSensor — signal-free loading (plan-317)', () => {
   function makeCtx() {
     const registered: { name: string; path: string }[] = [];
     const ctx = {
@@ -121,23 +121,28 @@ describe('RVSensor — per-instance signal scoping', () => {
     return { ctx, registered };
   }
 
-  it('scopes the occupied signal under the LayoutObject root', () => {
+  it('registers no signal when inside a LayoutObject root', () => {
     const root = new Object3D(); root.name = 'RollConveyor2m_2';
     root.userData.realvirtual = { LayoutObject: { Label: 'x', CatalogId: 'c', Locked: false } };
     const sensorNode = new Object3D(); sensorNode.name = 'Sensor'; root.add(sensorNode);
     const sensor = new RVSensor(sensorNode, new AABB());
     const { ctx, registered } = makeCtx();
     sensor.init(ctx);
-    expect(registered[0].name).toBe('RollConveyor2m_2.Sensor');
+    // plan-317 §2.1: loading registers NO sensor signal; the occupancy is
+    // exposed as a bindable direct-feedback slot instead.
+    expect(registered).toEqual([]);
+    expect(sensor.readFeedbackSlot('SensorOccupied')).toBe(false);
+    expect(sensor.readFeedbackSlot('SensorNotOccupied')).toBe(true);
   });
 
-  it('keeps the bare sensor name when standalone (no LayoutObject)', () => {
+  it('registers no signal when standalone (no LayoutObject)', () => {
     const root = new Object3D(); root.name = 'Scene';
     const sensorNode = new Object3D(); sensorNode.name = 'Sensor'; root.add(sensorNode);
     const sensor = new RVSensor(sensorNode, new AABB());
     const { ctx, registered } = makeCtx();
     sensor.init(ctx);
-    expect(registered[0].name).toBe('Sensor');
+    expect(registered).toEqual([]);
+    expect(sensor.readFeedbackSlot('SensorOccupied')).toBe(false);
   });
 
   it('AutoRay derives the beam from a Ray child and hides the marker', () => {

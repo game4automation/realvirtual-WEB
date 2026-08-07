@@ -8,6 +8,8 @@
  * 3-shift manufacturing with handovers, breaks, tool wear, etc.
  */
 
+import { MathUtils } from 'three';
+
 import type { RVViewerPlugin } from '../../core/rv-plugin';
 
 // ─── OEE Types ──────────────────────────────────────────────────────────
@@ -40,10 +42,6 @@ function seededRandom(seed: number): () => number {
     s = (s * 16807 + 0) % 2147483647;
     return (s - 1) / 2147483646;
   };
-}
-
-function clamp(v: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, v));
 }
 
 /** Normalize an object's numeric values so they sum to 100. */
@@ -129,7 +127,7 @@ function generatePartsDummyData(): PartsHourBucket[] {
 
   return baseParts.map((base, i) => ({
     hour: `${String(i).padStart(2, '0')}:00`,
-    parts: Math.round(clamp(base + (rand() - 0.5) * 4, 0, 50)),
+    parts: Math.round(MathUtils.clamp(base + (rand() - 0.5) * 4, 0, 50)),
   }));
 }
 
@@ -158,7 +156,7 @@ function generateCycleTimeDummyData(): number[] {
     // Random variation ±4s
     ct += (rand() - 0.5) * 8000;
 
-    cycles.push(Math.round(clamp(ct, 80000, 300000)));
+    cycles.push(Math.round(MathUtils.clamp(ct, 80000, 300000)));
   }
 
   return cycles;

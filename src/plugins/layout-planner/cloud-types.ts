@@ -58,7 +58,6 @@ export interface LayoutPlannerCloudTabProps {
   plugin: LayoutPlannerPlugin;
   cloudStore: LayoutPlannerCloudStore;
   connectionId: string | null;
-  onEdit: (connId: string) => void;
 }
 
 export interface LayoutPlannerExtension {

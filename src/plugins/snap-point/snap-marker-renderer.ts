@@ -192,6 +192,7 @@ export class SnapMarkerRenderer {
       depthTest: false,
       renderOrder: RENDER_ORDER_ACTIVE,
       visible: true,
+      category: 'markers',
     });
     this.activeSnapId = snap.id;
     this.viewer.markRenderDirty?.();
@@ -240,6 +241,7 @@ export class SnapMarkerRenderer {
       depthTest: false,
       renderOrder: RENDER_ORDER_HIGHLIGHT,
       visible: true,
+      category: 'markers',
     });
     this.viewer.markRenderDirty?.();
   }

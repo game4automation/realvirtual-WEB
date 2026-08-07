@@ -17,6 +17,7 @@
 import type { Object3D } from 'three';
 import type { RVBindContext, SignalOpts } from '../../core/behavior-runtime';
 import { findOutputPairings, listOwnSnaps, type OutputPairing, type PortConnection } from './snap-graph-helpers';
+import { RVTransportSurface } from '../../core/engine/rv-transport-surface';
 
 /**
  * SSOT for the type-neutral downstream-occupancy interlock signal. This is the
@@ -128,20 +129,37 @@ export interface InterlockHost {
 }
 
 /**
- * Allocation-free downstream interlock for the hot path (Conveyor).
- * Build once in setup(); occupied() scans the snap registry INLINE (no .map,
- * no link objects) and only reads signals → no per-tick allocation.
+ * Downstream interlock for the hot path (Conveyor). Build once in setup().
+ *
+ * The snap-pairing resolution + interlock signal NAMES are memoized per
+ * transport tick (`RVTransportSurface.currentTickId`): Conveyor evaluates the
+ * interlock twice per tick (`shouldFlow` + `conveyorStat`), and pairings only
+ * change on snap connect/disconnect. The signal VALUES are read fresh on every
+ * call — occupancy can flip between two reads of the same tick (and tests tick
+ * behaviors without a transport manager advancing the tick id).
  */
 export function createDownstreamInterlock(rv: InterlockHost): { occupied(): boolean } {
+  let memoTickId = Number.NEGATIVE_INFINITY;
+  let memoHasPairing = false;
+  let memoRootSig = '';
+  let memoPerPort = '';
   return {
     occupied(): boolean {
-      // Inline scan instead of findOutputPairings().map(): take the first out
-      // pairing, read per-port-then-root; no successor → blocked.
-      const pairing = findOutputPairings(rv.viewer as { getPlugin?(id: string): unknown }, rv.root)[0];   // small/no alloc; 1-4 snaps
-      if (!pairing) return true;
-      const rootSig = flowOccupiedRootSignal(pairing.ownerRoot.name);
-      const perPort = `${rootSig}@${pairing.pairedSnap.id}`;
-      const name = rv.signals.get(perPort) !== undefined ? perPort : rootSig;
+      const tickId = RVTransportSurface.currentTickId;
+      if (tickId !== memoTickId) {
+        memoTickId = tickId;
+        // Inline scan instead of findOutputPairings().map(): take the first out
+        // pairing; no successor → blocked.
+        const pairing = findOutputPairings(rv.viewer as { getPlugin?(id: string): unknown }, rv.root)[0];   // small/no alloc; 1-4 snaps
+        memoHasPairing = !!pairing;
+        if (pairing) {
+          memoRootSig = flowOccupiedRootSignal(pairing.ownerRoot.name);
+          memoPerPort = `${memoRootSig}@${pairing.pairedSnap.id}`;
+        }
+      }
+      if (!memoHasPairing) return true;
+      // Per-port-then-root, always freshly read.
+      const name = rv.signals.get(memoPerPort) !== undefined ? memoPerPort : memoRootSig;
       return rv.signals.get<boolean>(name) === true;
     },
   };

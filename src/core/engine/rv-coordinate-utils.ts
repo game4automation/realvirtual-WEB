@@ -37,14 +37,6 @@ export function unityPositionToGltf(x: number, y: number, z: number): Vector3 {
   return new Vector3(-x, y, z);
 }
 
-/**
- * Convert a Unity local-space position in-place (mutates the vector).
- */
-export function convertPositionInPlace(v: Vector3): Vector3 {
-  v.x = -v.x;
-  return v;
-}
-
 // ─── Direction Conversion ────────────────────────────────────────────
 
 /** Unity DIRECTION enum values (serialized as strings in GLB extras) */
@@ -104,25 +96,3 @@ export function isRotation(dir: DriveDirection): boolean {
          dir === DriveDirection.RotationZ;
 }
 
-// ─── Raw Vector3 Conversion ──────────────────────────────────────────
-
-/**
- * Convert a raw Unity Vector3 direction (from extras) to glTF space.
- * This applies the same X-negation as UnityGLTF does for positions.
- *
- * Use for: TransportDirection, any raw direction vectors from extras
- * that will be used in the glTF/Three.js scene.
- *
- * Note: The resulting vector is NOT normalized — call .normalize() if needed.
- */
-export function unityDirectionToGltf(x: number, y: number, z: number): Vector3 {
-  return new Vector3(-x, y, z);
-}
-
-/**
- * Convert a raw Unity Vector3 direction in-place (mutates the vector).
- */
-export function convertDirectionInPlace(v: Vector3): Vector3 {
-  v.x = -v.x;
-  return v;
-}

@@ -40,12 +40,88 @@ function sceneKey(id: string): string {
   return LS_KEY_SCENE_PREFIX + id;
 }
 
+// ─── Draft scope (project isolation) ────────────────────────────────────
+//
+// `baseKeyOf()` derives the per-base draft slot purely from the base GLB
+// (`builtin:<url>` / `empty`) and knows nothing about projects. With more
+// than one project that is a cross-project leak: an unsaved draft made on
+// `conveyor.glb` inside project A resurrects when the same built-in is
+// opened inside project B — or in "no project" — because both compute the
+// identical key.
+//
+// The scope prefixes the slot with the open project's id. It is deliberately
+// module state rather than a parameter on every call: `readDraft`/
+// `writeDraft`/`clearDraft` have many callers, and threading a project id
+// through all of them would push project awareness into code that has no
+// business holding it. "No project" keeps the historic unscoped key, so
+// existing drafts stay exactly where they are.
+
+let _draftScope: string | null = null;
+
+/** Scope subsequent per-base draft reads/writes to a project. Null = global. */
+export function setDraftScope(projectId: string | null): void {
+  _draftScope = projectId && projectId.trim() !== '' ? projectId : null;
+}
+
+/** Current per-base draft scope, or null when no project is open. */
+export function getDraftScope(): string | null {
+  return _draftScope;
+}
+
 function draftKey(base: SceneBase): string {
-  return LS_KEY_DRAFT_PREFIX + baseKeyOf(base);
+  const key = baseKeyOf(base);
+  return LS_KEY_DRAFT_PREFIX + (_draftScope ? `${_draftScope}:${key}` : key);
 }
 
 function sceneDraftKey(id: string): string {
   return LS_KEY_SCENE_DRAFT_PREFIX + id;
+}
+
+// ─── Write failures (plan-372 §5.1) ─────────────────────────────────────
+//
+// `writeScene()` and `writeIndex()` swallow their `setItem` failure and the
+// comment claims "caller surfaces toast" — but the return value carries no
+// failure signal, so no caller ever could. The scene simply is not saved and
+// the UI says it was. With the Sample project now bundling every formerly
+// loose scene into one keyspace, the pressure on that quota only goes up.
+//
+// The fix is additive: the return contract is unchanged (changing it would
+// ripple through every save path), and a failure is announced on this channel
+// instead of vanishing. A build with no subscriber behaves exactly as before.
+
+export interface SceneStorageError {
+  op: 'write-scene' | 'write-index' | 'write-draft';
+  /** Scene id, where one is known. */
+  id?: string;
+  cause: unknown;
+}
+
+type SceneStorageErrorListener = (error: SceneStorageError) => void;
+
+const storageErrorListeners = new Set<SceneStorageErrorListener>();
+
+/** Subscribe to persistence failures (quota, private mode). */
+export function onSceneStorageError(listener: SceneStorageErrorListener): () => void {
+  storageErrorListeners.add(listener);
+  return () => { storageErrorListeners.delete(listener); };
+}
+
+/** Last failure seen, for a caller that polls rather than subscribes. */
+let _lastStorageError: SceneStorageError | null = null;
+
+export function getLastSceneStorageError(): SceneStorageError | null {
+  return _lastStorageError;
+}
+
+export function clearLastSceneStorageError(): void {
+  _lastStorageError = null;
+}
+
+function reportStorageError(error: SceneStorageError): void {
+  _lastStorageError = error;
+  for (const l of [...storageErrorListeners]) {
+    try { l(error); } catch { /* a bad listener must not break a save */ }
+  }
 }
 
 // ─── Index ──────────────────────────────────────────────────────────────
@@ -67,8 +143,8 @@ function writeIndex(metas: RvSceneMeta[]): void {
   const sorted = [...metas].sort((a, b) => (b.modifiedAt ?? '').localeCompare(a.modifiedAt ?? ''));
   try {
     localStorage.setItem(LS_KEY_INDEX, JSON.stringify(sorted));
-  } catch {
-    // Quota — caller surfaces toast.
+  } catch (e) {
+    reportStorageError({ op: 'write-index', cause: e });
   }
 }
 
@@ -108,8 +184,10 @@ export function writeScene(scene: RvScene): RvScene {
   try {
     localStorage.setItem(sceneKey(updated.id), JSON.stringify(updated));
     upsertMeta(metaOf(updated));
-  } catch {
-    // Quota — caller surfaces toast. Index left alone.
+  } catch (e) {
+    // The index is deliberately left alone: an index row pointing at a body
+    // that was never written is worse than no row at all.
+    reportStorageError({ op: 'write-scene', id: updated.id, cause: e });
   }
   return updated;
 }
@@ -175,6 +253,27 @@ export function clearDraft(base: SceneBase): void {
     localStorage.removeItem(draftKey(base));
   } catch {
     /* ignore */
+  }
+}
+
+/**
+ * Drop every per-base draft belonging to `projectId`.
+ *
+ * Called when a project is closed or switched. Scoping the key already
+ * stops project A's draft from surfacing inside project B; clearing on the
+ * way out stops them accumulating and makes the isolation observable rather
+ * than merely structural.
+ */
+export function clearDraftsForScope(projectId: string): void {
+  if (!projectId) return;
+  const prefix = LS_KEY_DRAFT_PREFIX + projectId + ':';
+  const doomed: string[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith(prefix)) doomed.push(k);
+  }
+  for (const k of doomed) {
+    try { localStorage.removeItem(k); } catch { /* ignore */ }
   }
 }
 

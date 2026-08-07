@@ -28,7 +28,7 @@ function createMockViewer() {
     leftPanelManager: { open: vi.fn(), close: vi.fn() },
     markRenderDirty: vi.fn(),
     fitToNodes: vi.fn(),
-    highlighter: { highlight: vi.fn(), clear: vi.fn() },
+    highlighter: { highlight: vi.fn(), clear: vi.fn(), setAuxEmphasis: vi.fn() },
     outlineManager: {
       available: false,
       hasOutlines: false,

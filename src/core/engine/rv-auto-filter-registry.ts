@@ -19,6 +19,7 @@ import type { Object3D } from 'three';
 import type { NodeRegistry } from './rv-node-registry';
 import { tagIsolateSubtree, untagIsolateSubtree } from './rv-group-registry';
 import { getRegisteredCapabilities } from './rv-component-registry';
+import { getAutoFilterNodesByType } from './rv-visibility-owners';
 
 /** Information about a single auto-filter group. */
 export interface AutoFilterGroup {
@@ -65,19 +66,15 @@ export class AutoFilterRegistry {
   build(nodeRegistry: NodeRegistry): void {
     this._filters.clear();
 
-    for (const [type, caps] of getRegisteredCapabilities()) {
-      if (!caps.filterLabel) continue;
-
-      const instances = nodeRegistry.getAll(type);
-      if (instances.length === 0) continue;
-
-      const nodes: Object3D[] = [];
-      for (const inst of instances) {
-        const node = nodeRegistry.getNode(inst.path);
-        if (node) nodes.push(node);
-      }
-      if (nodes.length === 0) continue;
-
+    // Node collection is shared with the static-merge owner resolver
+    // (rv-visibility-owners.ts, plan-294) — the merge passes parent their
+    // chunks under EXACTLY the nodes this registry toggles, so the two
+    // sources must never drift apart.
+    const nodesByType = getAutoFilterNodesByType(nodeRegistry);
+    const capabilities = getRegisteredCapabilities();
+    for (const [type, nodes] of nodesByType) {
+      const caps = capabilities.get(type);
+      if (!caps?.filterLabel) continue;
       this._filters.set(type, {
         type,
         label: caps.filterLabel,

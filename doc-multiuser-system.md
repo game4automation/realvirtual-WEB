@@ -317,6 +317,20 @@ A relay server is a Node.js WebSocket multiplexer that enables multiuser session
 
 > **The relay server source code lives in a separate repository.** It is no longer bundled with realvirtual WEB. The settings store ships with a default hosted relay URL (`wss://download.realvirtual.io/relay`) and the realvirtual WEB plugin handles both `local` and `relay` connection modes (see `connectionMode` in [multiuser-settings-store.ts](src/core/hmi/multiuser-settings-store.ts)).
 
+> **Two relay URLs appear in the sources and they do not agree.** The browser
+> default is `wss://download.realvirtual.io/relay` (`relayUrl` in
+> `src/core/hmi/multiuser-settings-store.ts`); the Unity `RelayServerUrl`
+> inspector tooltip gives `wss://portal.realvirtual.io/relay` as its example.
+> Only one of them can be the relay a given deployment actually runs — set
+> `RelayServerUrl` on the Unity host and `relayUrl` in the browser settings to
+> the *same* endpoint explicitly rather than trusting either default.
+
+> **Everything in this section describes code that is not in this repository.**
+> The **relay repo's own README is the authoritative source** for the relay's
+> endpoints, rate limits, CLI flags and deployment. The tables below are a
+> convenience summary that cannot be verified from here and may drift — check
+> the relay README before relying on any specific number.
+
 ### Architecture
 - Express.js HTTP + `ws` WebSocket on a single port (default 7000)
 - Room-based session management with alphanumeric join codes
@@ -325,12 +339,16 @@ A relay server is a Node.js WebSocket multiplexer that enables multiuser session
 
 ### Endpoints
 
+*(Summary — authoritative source: relay repo README.)*
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | `{ status: "ok", rooms: N, clients: N }` |
 | `/model.glb` | GET | Serves GLB file if `--model` CLI arg provided |
 
 ### Rate Limiting
+
+*(Summary — authoritative source: relay repo README.)*
 
 | Role | Limit |
 |------|-------|
@@ -375,25 +393,38 @@ The Unity-side component that acts as the multiuser host.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| ConnectionMode | enum | LocalServer | `LocalServer` or `RelayClient` |
-| RelayServerUrl | string | (empty) | Relay endpoint for RelayClient mode |
+| **Connection** | | | |
+| ConnectionMode | enum | LocalServer | `LocalServer` (host a WS server on `Port`) or `RelayClient` (connect outbound to a relay) |
+| RelayServerUrl | string | (empty) | Relay endpoint — RelayClient mode only |
+| **Server Settings** | | | |
 | Port | int | 7000 | WebSocket listen port (LocalServer mode) |
-| AvatarPrefab | GameObject | Avatar.prefab | Remote player avatar template |
-| AvatarUpdateRate | int | 20 | Hz for avatar broadcast |
-| DrivesSyncRate | int | 60 | Hz for drive position broadcast |
-| MUSyncRate | int | 50 | Hz for MU position broadcast |
-| HandshakeTimeoutSeconds | float | 5 | Disconnect clients that don't send room_join |
-| MaxMessagesPerSecond | int | 200 | Per-client rate limit |
-| UseDrivePathTable | bool | false | Enable indexed drive_sync (Opt 7) |
+| PlayerName | string | (empty) | Display name shown to other participants. Empty falls back to the `rv_player_name` PlayerPref. |
+| PlayerColor | string | `#2196F3` | Hex colour of the local player's avatar |
+| **Session** (read-only, runtime status) | | | |
+| JoinCode | string | (empty) | 6-character alphanumeric room code — generated when hosting (LocalServer) or assigned by the relay (RelayClient) |
+| ConnectedPlayers | int | 0 | Number of clients currently in the room |
+| IsHosting | bool | false | True while actively hosting (server listening, or connected to the relay as host) |
+| **Avatar / Sync rates** | | | |
+| AvatarPrefab | GameObject | (none) | Remote player avatar template; must contain a Renderer. Falls back to a plain sphere when null. |
+| AvatarUpdateRate | **float** | 20 | Hz for avatar broadcast |
+| DrivesSyncRate | **float** | 60 | Hz for drive position broadcast |
+| MUSyncRate | **float** | 50 | Hz for MU position broadcast |
+| **Timeout / limits** | | | |
+| HandshakeTimeoutSeconds | float | 5 | Disconnect clients that don't send `room_join` in time |
+| MaxMessagesPerSecond | int | 200 | Per-client rate limit; excess messages are dropped with a warning |
+| UseDrivePathTable | bool | false | Enable indexed `drive_sync_idx` (Opt 7) |
+
+The three **Session** fields are `[ReadOnly]` status readouts, not settings — they
+report the live session back into the inspector.
 
 ### Delta Detection Thresholds
 
 | Component | Threshold | Description |
 |-----------|-----------|-------------|
-| Avatar position | 10 mm (sqr 0.0001) | Skip broadcast if camera barely moved |
-| Avatar rotation | dot > 0.9999 | Skip broadcast if rotation barely changed |
-| Drive position | 0.001 (1 mm) | Skip drive if position change < 1mm |
-| MU position | 1 mm (sqr 0.000001) | Skip MU if position change < 0.001mm |
+| Avatar position | 10 mm (`SqrMagnitude < 0.0001f`) | Skip broadcast if the camera barely moved |
+| Avatar rotation | `Quaternion.Dot > 0.9999f` | Skip broadcast if the rotation barely changed |
+| Drive position | `Mathf.Abs(delta) < 0.001f` | Skip the drive when its position changed by less than 0.001 drive units |
+| MU position | 1 mm (`SqrMagnitude > 0.000001f`) | Skip the MU when it moved less than **1 mm** |
 
 ### Coordinate Conversion (Unity -> glTF/Three.js)
 

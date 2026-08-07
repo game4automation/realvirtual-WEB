@@ -9,6 +9,7 @@ import ViewQuiltOutlinedIcon from '@mui/icons-material/ViewQuiltOutlined';
 import GridViewOutlinedIcon from '@mui/icons-material/GridViewOutlined';
 import { setWelcomeModalOpen } from './welcome-modal-store';
 import { useCustomBranding } from './branding-store';
+import { formatVersionFull } from '../rv-version';
 
 /** Primary use cases, shown as a compact list. */
 const USE_CASES: Array<[string, string]> = [
@@ -22,6 +23,41 @@ const USE_CASES: Array<[string, string]> = [
 /** Deep links to the two built-in demos (resolved against the deploy base path). */
 const HMI_DEMO_HREF = `${import.meta.env.BASE_URL}?model=DemoRealvirtualWeb.glb`;
 const PLANNER_DEMO_HREF = `${import.meta.env.BASE_URL}?scene=published:DemoPlanner&mode=planner`;
+
+// ─── License / beta acceptance ────────────────────────────────────────────
+//
+// The first time the dialog is shown it acts as an acceptance gate: the
+// backdrop does not dismiss it and the confirm button reads "Accept &
+// continue". Acceptance covers the beta status and the license terms and is
+// recorded once per browser. Where the dialog never auto-opens (Viewer
+// workspaces, plan-387 F4) no acceptance is asked — spectators following a
+// shared link only run the software, which the AGPL permits without
+// accepting anything.
+
+const TERMS_ACCEPTED_KEY = 'rv-terms-accepted';
+
+// Session fallback so a throwing storage (Safari private mode) still holds
+// the answer until the page is reloaded.
+let sessionAccepted = false;
+
+/** True once the user accepted the beta note + license terms in this browser. */
+export function hasAcceptedTerms(): boolean {
+  if (sessionAccepted) return true;
+  try {
+    return localStorage.getItem(TERMS_ACCEPTED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function recordTermsAccepted(): void {
+  sessionAccepted = true;
+  try {
+    localStorage.setItem(TERMS_ACCEPTED_KEY, '1');
+  } catch {
+    // Storage unavailable — sessionAccepted carries the answer.
+  }
+}
 
 interface WelcomeModalProps {
   open: boolean;
@@ -42,6 +78,15 @@ export function WelcomeModal({ open, onClose, onStartDemo }: WelcomeModalProps) 
   // sets custom branding, so we hide the demo shortcuts there.
   const custom = useCustomBranding();
 
+  // First visit in this browser: the dialog is an acceptance gate. Reading
+  // storage at render is fine — the component renders only while visible.
+  const mustAccept = open && !hasAcceptedTerms();
+
+  const acceptAndClose = () => {
+    recordTermsAccepted();
+    onClose();
+  };
+
   if (!open) return null;
 
   return createPortal(
@@ -56,13 +101,13 @@ export function WelcomeModal({ open, onClose, onStartDemo }: WelcomeModalProps) 
         bgcolor: 'rgba(0,0,0,0.6)',
         pointerEvents: 'auto',
       }}
-      onClick={onClose}
+      onClick={mustAccept ? undefined : onClose}
     >
       <Paper
         elevation={12}
         sx={{
           borderRadius: 2,
-          width: 520,
+          width: 680,
           maxWidth: '95vw',
           p: { xs: 2.5, sm: 4 },
           display: 'flex',
@@ -73,9 +118,27 @@ export function WelcomeModal({ open, onClose, onStartDemo }: WelcomeModalProps) 
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        <Typography variant="h6" sx={{ fontWeight: 700, color: '#4fc3f7' }}>
-          realvirtual WEB
-        </Typography>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25 }}>
+          <Typography variant="h6" sx={{ fontWeight: 700, color: '#4fc3f7' }}>
+            realvirtual WEB
+          </Typography>
+          <Box
+            component="span"
+            data-testid="welcome-beta-badge"
+            sx={{
+              px: 0.75,
+              borderRadius: 1,
+              border: '1px solid rgba(79,195,247,0.5)',
+              color: '#4fc3f7',
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: 1.5,
+              lineHeight: '18px',
+            }}
+          >
+            BETA
+          </Box>
+        </Box>
         <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.45)', letterSpacing: 2, textTransform: 'uppercase', fontSize: 10, mt: -1 }}>
           Open. Light. Industrial. Anywhere.
         </Typography>
@@ -147,7 +210,14 @@ export function WelcomeModal({ open, onClose, onStartDemo }: WelcomeModalProps) 
         )}
 
         <Typography variant="body2" sx={{ color: 'text.secondary', lineHeight: 1.7 }}>
+          <strong style={{ color: '#fff' }}>Beta software</strong> — realvirtual WEB is under
+          active development. Features, file formats, and APIs may still change, and it is
+          not intended for production use yet.
           Open source under the <strong style={{ color: '#fff' }}>AGPL-3.0 license</strong>.
+          Provided as is, without warranty of any kind — see the{' '}
+          <a href="https://realvirtual.io/en/terms/" target="_blank" rel="noopener noreferrer" style={{ color: '#4fc3f7', textDecoration: 'none' }}>
+            license terms
+          </a>.
           Part of the{' '}
           <a href="https://realvirtual.io" target="_blank" rel="noopener noreferrer" style={{ color: '#4fc3f7', textDecoration: 'none' }}>
             realvirtual.io
@@ -161,9 +231,21 @@ export function WelcomeModal({ open, onClose, onStartDemo }: WelcomeModalProps) 
           </a>
         </Typography>
 
-        <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.35)' }}>
-          &copy; 2025 realvirtual GmbH
-        </Typography>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>
+          <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.4)', fontFamily: 'monospace', fontSize: 10 }}>
+            realvirtual WEB {formatVersionFull()}
+          </Typography>
+          <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.35)' }}>
+            &copy; 2025 realvirtual GmbH
+          </Typography>
+        </Box>
+
+        {mustAccept && (
+          <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.45)', lineHeight: 1.6 }}>
+            By continuing you acknowledge the beta status of this software and accept the
+            license terms.
+          </Typography>
+        )}
 
         <Box sx={{ display: 'flex', justifyContent: onStartDemo ? 'space-between' : 'flex-end', mt: 1, gap: 1 }}>
           {onStartDemo && (
@@ -172,15 +254,21 @@ export function WelcomeModal({ open, onClose, onStartDemo }: WelcomeModalProps) 
               color="primary"
               size="small"
               startIcon={<SlideshowOutlinedIcon />}
-              onClick={() => { onClose(); onStartDemo(); }}
+              onClick={() => { acceptAndClose(); onStartDemo(); }}
               data-testid="welcome-start-demo"
               sx={{ textTransform: 'none', fontWeight: 600 }}
             >
               Start Demo
             </Button>
           )}
-          <Button variant="contained" size="small" onClick={onClose} sx={{ textTransform: 'none', fontWeight: 600 }}>
-            Got it
+          <Button
+            variant="contained"
+            size="small"
+            onClick={acceptAndClose}
+            data-testid="welcome-dismiss"
+            sx={{ textTransform: 'none', fontWeight: 600 }}
+          >
+            {mustAccept ? 'Accept & continue' : 'Got it'}
           </Button>
         </Box>
       </Paper>

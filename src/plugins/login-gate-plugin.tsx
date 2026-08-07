@@ -20,7 +20,9 @@
  *   })
  */
 
-import { useState, useCallback, useEffect, useMemo, type KeyboardEvent } from 'react';
+import {
+  useState, useCallback, useEffect, useMemo, useSyncExternalStore, type KeyboardEvent,
+} from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { Box, Typography, TextField, Button, Paper, Menu, MenuItem } from '@mui/material';
 import { Lock, SwapHoriz } from '@mui/icons-material';
@@ -28,6 +30,7 @@ import { RVViewerProvider } from '../hooks/use-viewer';
 import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { RVViewer } from '../core/rv-viewer';
 import type { UISlotEntry, UISlotProps } from '../core/rv-ui-plugin';
+import { subscribeModelCatalog, getModelCatalogVersion } from '../core/rv-model-catalog';
 
 export interface LoginGateConfig {
   /** Display title on the login dialog. */
@@ -118,11 +121,18 @@ function LoginGateOverlay({ viewer }: UISlotProps) {
   // gate is the most likely current model. `availableModels` is populated
   // during main.ts model discovery before plugins register, so it should
   // already be ready by the time this overlay renders.
+  //
+  // The catalogue version is a real dependency, not decoration: since plan-365 a
+  // model can be published while this gate is on screen, and memoising on the
+  // viewer alone would never see it — the reference is stable and the list is
+  // replaced behind it.
+  const catalogVersion = useSyncExternalStore(subscribeModelCatalog, getModelCatalogVersion);
   const otherModels = useMemo(() => {
     const all = viewer?.availableModels ?? [];
     const current = viewer?.currentModelUrl ?? viewer?.pendingModelUrl ?? null;
     return current ? all.filter((m) => m.url !== current) : [...all];
-  }, [viewer]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewer, catalogVersion]);
 
   const handleLogin = useCallback(() => {
     try {
@@ -163,7 +173,7 @@ function LoginGateOverlay({ viewer }: UISlotProps) {
       position: 'fixed', inset: 0, zIndex: 20000,
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       bgcolor: 'rgba(0,0,0,0.85)',
-      backdropFilter: 'blur(12px)',
+      backdropFilter: 'blur(calc(12px * var(--rv-ui-blur-scale, 1)))',
     }}>
       <Paper elevation={12} sx={{
         width: 340, p: 4, borderRadius: 3,

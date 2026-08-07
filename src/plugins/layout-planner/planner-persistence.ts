@@ -25,16 +25,19 @@ import {
 import type { LayoutPlannerCloudStore } from './cloud-types';
 
 /**
- * Auto-load the bundled library at `public/models/library/catalog.json`.
- * Falls back to `import.meta.glob` discovery if `catalog.json` is missing.
+ * Auto-load the realvirtual component library.
+ *
+ * The library belongs to the DemoRealvirtual project and is BUNDLED: it lives
+ * in `public/library/`, so `<BASE_URL>library/` reaches it in dev and in a
+ * build alike. That base is also what the catalog's relative `glbUrl`s resolve
+ * against.
  *
  * Mutates the provided `store` via `addCatalogDirect`. Returns silently on
  * any fetch / parse error so the planner can still boot offline.
  */
 export async function loadBundledLibrary(store: LayoutStore): Promise<string | null> {
-  const baseUrl = (import.meta.env.BASE_URL ?? '/') + 'models/library/';
+  const baseUrl = (import.meta.env.BASE_URL ?? '/') + 'library/';
   const catalogUrl = baseUrl + 'catalog.json';
-
   try {
     const resp = await fetch(catalogUrl);
     if (resp.ok) {
@@ -52,11 +55,13 @@ export async function loadBundledLibrary(store: LayoutStore): Promise<string | n
         return catalogUrl;
       }
     }
-  } catch { /* catalog.json not available — try glob fallback */ }
+  } catch { /* no catalog — fall through to the legacy glob below */ }
 
-  // Fallback: enumerate the bundled GLBs via import.meta.glob. These assets
-  // live in `public/`, so Vite serves them at the ROOT path (WITHOUT the
-  // `/public` prefix) and the `?url` import VALUE is unreliable for them
+  // Legacy fallback: enumerate GLBs still sitting under `public/models/library/`
+  // via import.meta.glob. The shipped library moved into the DemoRealvirtual
+  // project, so this now only catches local scratch (`Custom/`, `imports/`).
+  // These assets live in `public/`, so Vite serves them at the ROOT path
+  // (WITHOUT the `/public` prefix) and the `?url` import VALUE is unreliable
   // (Vite warns: "Assets in the public directory are served at the root
   // path"). We therefore read the glob KEYS and derive the served path
   // ourselves: strip the `/public/models/library/` prefix to get each asset's
@@ -137,11 +142,15 @@ export function findCatalogEntryById(
 /**
  * Re-root a bundled (local) standard-library path onto the current deploy's
  * BASE_URL. A scene authored on one deploy (e.g. root `/`) stores each placement
- * glbUrl as the fully-resolved path of THAT deploy (`/models/library/...`); under
+ * glbUrl as the fully-resolved path of THAT deploy (`/library/...`); under
  * a sub-path deploy (`/demo/`) that root-absolute path resolves against the origin
- * root and 404s. Stripping to the `models/library/...` suffix and re-prepending
+ * root and 404s. Stripping to the `library/...` suffix and re-prepending
  * BASE_URL makes published scenes portable across root / sub-path / customer
  * deploys (and keeps local dev == build).
+ *
+ * The optional `models/` prefix is what scenes saved before the library moved
+ * out of `models/` carry. Dropping it re-roots them onto the current location,
+ * so an old published layout keeps resolving.
  *
  * Full public web URLs (http/https — e.g. a GitHub-hosted library) and blob/data
  * URLs are left untouched: those are NOT deploy-relative and resolve the same
@@ -149,7 +158,7 @@ export function findCatalogEntryById(
  */
 function rebaseLocalLibraryUrl(url: string): string | null {
   if (!url || /^(https?:|blob:|data:)/i.test(url)) return null;
-  const m = url.match(/(?:^|\/)(models\/library\/.+)$/);
+  const m = url.match(/(?:^|\/)(?:models\/)?(library\/.+)$/);
   if (!m) return null;
   const base = import.meta.env.BASE_URL ?? '/';
   return (base.endsWith('/') ? base : base + '/') + m[1];

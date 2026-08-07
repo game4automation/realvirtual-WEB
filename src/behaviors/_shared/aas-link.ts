@@ -29,6 +29,7 @@
  */
 
 import type { Object3D } from 'three';
+import { markAasPending } from '../../plugins/aas-resolution';
 
 /**
  * The standard gearmotor used by the transport library (conveyor / turntable /
@@ -59,6 +60,9 @@ export function attachAasLink(node: Object3D | null, aasId: string, description:
   rv.AASLink = { AASId: aasId, Description: description };
 
   ud._rvAasLink = { aasId, description, serverUrl: '', gated: true };
+  // Synchronous, so an AAS node without a resolution marking never exists — an
+  // unmarked node would be indistinguishable from a resolved one.
+  markAasPending(node);
 }
 
 /**

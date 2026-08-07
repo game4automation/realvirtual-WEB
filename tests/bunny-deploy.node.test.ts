@@ -35,7 +35,15 @@ import {
   ALWAYS_UPLOAD_FILES,
   applyPublicModelAllowlist,
   PUBLIC_MODEL_PREFIX,
+  applyPublicScenePruning,
+  PUBLIC_TEST_SCENE_PREFIX,
+  injectSeoTags,
+  injectNoindex,
+  writeSeoArtifacts,
+  SEO_CANONICAL_PATH,
 } from '../scripts/_bunny-lib.mjs';
+// @ts-expect-error — plain JS Node module, no type declarations by design.
+import { generateFragmentSecret, isEncryptedEnvelope, decryptGlb } from '../scripts/lib/rv-crypto.mjs';
 
 // ─── 9.1 buildUploadUrl ──────────────────────────────────────────────────
 
@@ -71,6 +79,21 @@ describe('diff selection', () => {
     expect(ALWAYS_UPLOAD_FILES.has('settings.json')).toBe(true);
     expect(ALWAYS_UPLOAD_FILES.has('models.json')).toBe(true);
     expect(ALWAYS_UPLOAD_FILES.has('manifest.json')).toBe(true);
+  });
+
+  it('alwaysUploadGlbs=true selects same-size GLBs (encrypted deploys)', () => {
+    // Encrypted RVE1 envelopes change bytes but not size on a password change —
+    // the size diff must never skip them.
+    const local = [
+      { rel: 'assets/index-abc.js', size: 100 },
+      { rel: 'models/machine.glb', size: 999 },
+    ];
+    const remote = new Map([
+      ['assets/index-abc.js', 100],
+      ['models/machine.glb', 999],
+    ]);
+    const sel = selectFilesToUpload(local, remote, { force: false, alwaysUploadGlbs: true });
+    expect(sel.map((f: { rel: string }) => f.rel)).toEqual(['models/machine.glb']);
   });
 
   it('force=true selects everything (diff skipped)', () => {
@@ -115,7 +138,7 @@ describe('stagePrivateProject', () => {
   beforeEach(() => { work = mkdtempSync(join(tmpdir(), 'rvdep-')); });
   afterEach(() => { rmSync(work, { recursive: true, force: true }); });
 
-  it('produces correct staging contents', () => {
+  it('produces correct staging contents', async () => {
     const dist = join(work, 'dist');
     mkdirSync(join(dist, 'assets'), { recursive: true });
     writeFileSync(join(dist, 'index.html'), '<html></html>');
@@ -127,7 +150,7 @@ describe('stagePrivateProject', () => {
     writeFileSync(join(proj, 'project.json'),
       JSON.stringify({ name: 'Kunde XY', code: 'deadbeef', settings: { defaultModel: 'machine.glb' } }));
 
-    const staging = stagePrivateProject({ distDir: dist, projectDir: proj });
+    const staging = await stagePrivateProject({ distDir: dist, projectDir: proj });
     try {
       expect(existsSync(join(staging, 'index.html'))).toBe(true);
       expect(existsSync(join(staging, 'assets', 'demo.glb'))).toBe(false);   // public glb removed
@@ -137,14 +160,14 @@ describe('stagePrivateProject', () => {
       const settings = JSON.parse(readFileSync(join(staging, 'settings.json'), 'utf8'));
       expect(settings.defaultModel).toBe('models/machine.glb');
       expect(settings.projectAssetsPath).toBe('private-assets/kunde-xy/');
-      // R2: GA id empty unless explicitly provided
+      // Customer deploys never carry analytics
       expect(settings.analytics.googleAnalyticsId).toBe('');
     } finally {
       rmSync(staging, { recursive: true, force: true });
     }
   });
 
-  it('injects GA id only when provided (R2)', () => {
+  it('never carries a GA id in private customer deploys', async () => {
     const dist = join(work, 'dist');
     mkdirSync(dist, { recursive: true });
     writeFileSync(join(dist, 'index.html'), '<html></html>');
@@ -153,10 +176,46 @@ describe('stagePrivateProject', () => {
     writeFileSync(join(proj, 'project.json'),
       JSON.stringify({ name: 'Kunde Z', code: 'cafebabe', settings: {} }));
 
-    const staging = stagePrivateProject({ distDir: dist, projectDir: proj, googleAnalyticsId: 'G-TEST123' });
+    // Even a (stale) caller passing a GA id must not leak it into the staging.
+    const staging = await stagePrivateProject({
+      distDir: dist, projectDir: proj, googleAnalyticsId: 'G-TEST123',
+    } as never);
     try {
       const settings = JSON.parse(readFileSync(join(staging, 'settings.json'), 'utf8'));
-      expect(settings.analytics.googleAnalyticsId).toBe('G-TEST123');
+      expect(settings.analytics.googleAnalyticsId).toBe('');
+    } finally {
+      rmSync(staging, { recursive: true, force: true });
+    }
+  });
+
+  it('encrypts GLBs in place and flags settings when a password is given (plan-267)', async () => {
+    const dist = join(work, 'dist');
+    mkdirSync(dist, { recursive: true });
+    writeFileSync(join(dist, 'index.html'), '<html></html>');
+    const proj = join(work, 'projects', 'kunde-enc');
+    mkdirSync(join(proj, 'models'), { recursive: true });
+    const plainGlb = 'glTF-CUSTOMER-GEOMETRY-BYTES';
+    writeFileSync(join(proj, 'models', 'machine.glb'), plainGlb);
+    writeFileSync(join(proj, 'project.json'),
+      JSON.stringify({ name: 'Kunde Enc', code: 'facefeed', settings: { defaultModel: 'machine.glb' } }));
+
+    const fragmentSecret = generateFragmentSecret();
+    const staging = await stagePrivateProject({
+      distDir: dist, projectDir: proj,
+      encryption: { password: 'geheim-2027', fragmentSecret, iterations: 1000 },
+    });
+    try {
+      // Same .glb name, but the body is now an RVE1 envelope (not the plaintext).
+      const staged = readFileSync(join(staging, 'models', 'machine.glb'));
+      expect(isEncryptedEnvelope(staged)).toBe(true);
+      expect(staged.toString('utf8')).not.toContain('CUSTOMER');
+      // settings.json advertises encryption; manifest keeps the .glb name.
+      const settings = JSON.parse(readFileSync(join(staging, 'settings.json'), 'utf8'));
+      expect(settings.encryption).toEqual({ enabled: true });
+      expect(JSON.parse(readFileSync(join(staging, 'models.json'), 'utf8'))).toEqual(['machine.glb']);
+      // Round-trips with the same password + fragment.
+      const back = await decryptGlb(new Uint8Array(staged), 'geheim-2027', fragmentSecret);
+      expect(new TextDecoder().decode(back)).toBe(plainGlb);
     } finally {
       rmSync(staging, { recursive: true, force: true });
     }
@@ -257,6 +316,74 @@ describe('applyPublicModelAllowlist', () => {
 
   it('default prefix is DemoRealvirtual', () => {
     expect(PUBLIC_MODEL_PREFIX).toBe('DemoRealvirtual');
+  });
+});
+
+// ─── 9.4c applyPublicScenePruning ────────────────────────────────────────
+
+describe('applyPublicScenePruning', () => {
+  let work: string;
+  beforeEach(() => { work = mkdtempSync(join(tmpdir(), 'rvscene-')); });
+  afterEach(() => { rmSync(work, { recursive: true, force: true }); });
+
+  /** dist/scenes/ with a curated demo, two Test fixtures, and an index.json
+   *  listing all three (mirroring a real public build of public/scenes/). */
+  function makeDist(): string {
+    const dist = join(work, 'dist');
+    mkdirSync(join(dist, 'scenes'), { recursive: true });
+    writeFileSync(join(dist, 'scenes', 'DemoPlanner.scene.json'), '{}');
+    writeFileSync(join(dist, 'scenes', 'Test-DES-Turntable-Loop.scene.json'), '{}');
+    writeFileSync(join(dist, 'scenes', 'test-lowercase.scene.json'), '{}'); // case-insensitive
+    writeFileSync(join(dist, 'scenes', 'index.json'), JSON.stringify([
+      { file: 'DemoPlanner.scene.json', name: 'Planner Demo', mode: 'planner' },
+      { file: 'Test-DES-Turntable-Loop.scene.json', name: 'Test DES Turntable Loop', mode: 'des' },
+      { file: 'test-lowercase.scene.json', name: 'lc', mode: 'des' },
+    ], null, 2));
+    return dist;
+  }
+
+  it('deletes Test* scene files and keeps the curated demo', () => {
+    const dist = makeDist();
+    const res = applyPublicScenePruning(dist, { prefix: 'Test' });
+
+    expect(res.kept).toEqual(['DemoPlanner.scene.json']);
+    expect(res.dropped).toEqual(['Test-DES-Turntable-Loop.scene.json', 'test-lowercase.scene.json']);
+
+    expect(existsSync(join(dist, 'scenes', 'DemoPlanner.scene.json'))).toBe(true);
+    expect(existsSync(join(dist, 'scenes', 'Test-DES-Turntable-Loop.scene.json'))).toBe(false);
+    expect(existsSync(join(dist, 'scenes', 'test-lowercase.scene.json'))).toBe(false);
+  });
+
+  it('rewrites index.json to drop the Test* entries', () => {
+    const dist = makeDist();
+    applyPublicScenePruning(dist, { prefix: 'Test' });
+    const idx = JSON.parse(readFileSync(join(dist, 'scenes', 'index.json'), 'utf8'));
+    expect(idx).toEqual([{ file: 'DemoPlanner.scene.json', name: 'Planner Demo', mode: 'planner' }]);
+  });
+
+  it('dry-run reports without deleting or rewriting', () => {
+    const dist = makeDist();
+    const res = applyPublicScenePruning(dist, { prefix: 'Test', dryRun: true });
+    expect(res.dropped).toEqual(['Test-DES-Turntable-Loop.scene.json', 'test-lowercase.scene.json']);
+    expect(existsSync(join(dist, 'scenes', 'Test-DES-Turntable-Loop.scene.json'))).toBe(true); // not deleted
+    const idx = JSON.parse(readFileSync(join(dist, 'scenes', 'index.json'), 'utf8'));
+    expect(idx).toHaveLength(3);                                                                // not rewritten
+  });
+
+  it('is idempotent and a no-op when there is no scenes/ dir', () => {
+    const dist = makeDist();
+    applyPublicScenePruning(dist, { prefix: 'Test' });
+    const res = applyPublicScenePruning(dist, { prefix: 'Test' });
+    expect(res.dropped).toEqual([]);
+    expect(res.kept).toEqual(['DemoPlanner.scene.json']);
+
+    const empty = join(work, 'empty-dist');
+    mkdirSync(empty, { recursive: true });
+    expect(applyPublicScenePruning(empty).dropped).toEqual([]);
+  });
+
+  it('default prefix is Test', () => {
+    expect(PUBLIC_TEST_SCENE_PREFIX).toBe('Test');
   });
 });
 
@@ -428,5 +555,92 @@ describe('BunnyClient.purge', () => {
     const ok = await client.purge();
     expect(ok).toBe(true);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+// ─── SEO artifacts (public deploy) ───────────────────────────────────────
+
+describe('SEO artifacts', () => {
+  const PAGE_URL = 'https://web.realvirtual.io/demo/';
+  let dist: string;
+
+  function makeDist(withOgImage = false): string {
+    const dir = mkdtempSync(join(tmpdir(), 'rv-seo-test-'));
+    writeFileSync(
+      join(dir, 'index.html'),
+      '<!DOCTYPE html>\n<html><head>\n  <title>realvirtual WEB</title>\n</head>\n<body></body></html>\n',
+    );
+    writeFileSync(join(dir, 'pwa-512x512.png'), 'png');
+    if (withOgImage) writeFileSync(join(dir, 'og-image.png'), 'png');
+    return dir;
+  }
+
+  afterEach(() => {
+    if (dist && existsSync(dist)) rmSync(dist, { recursive: true, force: true });
+  });
+
+  it('default canonical path is demo', () => {
+    expect(SEO_CANONICAL_PATH).toBe('demo');
+  });
+
+  it('injects canonical + og:url + fallback og:image with summary card', () => {
+    dist = makeDist(false);
+    expect(injectSeoTags(dist, { pageUrl: PAGE_URL })).toBe(true);
+    const html = readFileSync(join(dist, 'index.html'), 'utf8');
+    expect(html).toContain(`<link rel="canonical" href="${PAGE_URL}" />`);
+    expect(html).toContain(`<meta property="og:url" content="${PAGE_URL}" />`);
+    expect(html).toContain(`<meta property="og:image" content="${PAGE_URL}pwa-512x512.png" />`);
+    expect(html).toContain('<meta name="twitter:card" content="summary" />');
+    expect(html).toContain('</head>'); // head still closed exactly once
+    expect(html.match(/<\/head>/g)?.length).toBe(1);
+  });
+
+  it('prefers og-image.png with summary_large_image card when present', () => {
+    dist = makeDist(true);
+    injectSeoTags(dist, { pageUrl: PAGE_URL });
+    const html = readFileSync(join(dist, 'index.html'), 'utf8');
+    expect(html).toContain(`<meta property="og:image" content="${PAGE_URL}og-image.png" />`);
+    expect(html).toContain('<meta name="twitter:card" content="summary_large_image" />');
+  });
+
+  it('is idempotent — second injection is a no-op', () => {
+    dist = makeDist(false);
+    injectSeoTags(dist, { pageUrl: PAGE_URL });
+    const once = readFileSync(join(dist, 'index.html'), 'utf8');
+    expect(injectSeoTags(dist, { pageUrl: PAGE_URL })).toBe(false);
+    expect(readFileSync(join(dist, 'index.html'), 'utf8')).toBe(once);
+  });
+
+  it('dry-run reports true but writes nothing', () => {
+    dist = makeDist(false);
+    const before = readFileSync(join(dist, 'index.html'), 'utf8');
+    expect(injectSeoTags(dist, { pageUrl: PAGE_URL, dryRun: true })).toBe(true);
+    expect(readFileSync(join(dist, 'index.html'), 'utf8')).toBe(before);
+  });
+
+  it('injectNoindex adds the robots meta exactly once', () => {
+    dist = makeDist(false);
+    const indexPath = join(dist, 'index.html');
+    expect(injectNoindex(indexPath)).toBe(true);
+    const html = readFileSync(indexPath, 'utf8');
+    expect(html).toContain('<meta name="robots" content="noindex, nofollow" />');
+    expect(injectNoindex(indexPath)).toBe(false); // idempotent
+  });
+
+  it('writeSeoArtifacts writes sitemap.xml + robots.txt with absolute URLs', () => {
+    dist = makeDist(false);
+    const { robots, sitemap } = writeSeoArtifacts(dist, { pageUrl: PAGE_URL });
+    expect(readFileSync(join(dist, 'sitemap.xml'), 'utf8')).toBe(sitemap);
+    expect(readFileSync(join(dist, 'robots.txt'), 'utf8')).toBe(robots);
+    expect(sitemap).toContain(`<loc>${PAGE_URL}</loc>`);
+    expect(robots).toContain(`Sitemap: ${PAGE_URL}sitemap.xml`);
+    expect(robots).toContain('User-agent: *');
+  });
+
+  it('writeSeoArtifacts dry-run writes no files', () => {
+    dist = makeDist(false);
+    writeSeoArtifacts(dist, { pageUrl: PAGE_URL, dryRun: true });
+    expect(existsSync(join(dist, 'sitemap.xml'))).toBe(false);
+    expect(existsSync(join(dist, 'robots.txt'))).toBe(false);
   });
 });

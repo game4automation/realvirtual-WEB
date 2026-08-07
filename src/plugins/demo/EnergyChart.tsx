@@ -10,7 +10,7 @@
 
 import { useEffect } from 'react';
 import { Box } from '@mui/material';
-import { ChartPanel } from '../../core/hmi/ChartPanel';
+import { FloatingPanel } from '../../core/hmi/FloatingPanel';
 import { useKpiData } from '../../hooks/use-kpi-data';
 import { useEChart } from '../../hooks/use-echart';
 import { createBaseChartOption, DARK_TOOLTIP_BASE } from '../../core/hmi/chart-theme';
@@ -32,11 +32,11 @@ interface EnergyChartProps {
 
 export function EnergyChart({ open, onClose }: EnergyChartProps) {
   const kpi = useKpiData();
-  const { containerRef: chartRef, chartInstance } = useEChart({ open });
+  const { containerRef: chartRef, chartInstance, isReady } = useEChart({ open });
 
   // Set chart data
   useEffect(() => {
-    if (!open || !kpi) return;
+    if (!open || !kpi || !isReady) return;
     const timer = setTimeout(() => {
       const chart = chartInstance.current;
       if (!chart) return;
@@ -107,10 +107,10 @@ export function EnergyChart({ open, onClose }: EnergyChartProps) {
       );
     }, 100);
     return () => clearTimeout(timer);
-  }, [open, kpi]);
+  }, [open, kpi, isReady]);
 
   return (
-    <ChartPanel
+    <FloatingPanel
       open={open}
       onClose={onClose}
       title="Power Consumption"
@@ -121,6 +121,6 @@ export function EnergyChart({ open, onClose }: EnergyChartProps) {
       zIndex={1400}
     >
       <Box ref={chartRef} sx={{ flex: 1, minHeight: 0 }} />
-    </ChartPanel>
+    </FloatingPanel>
   );
 }

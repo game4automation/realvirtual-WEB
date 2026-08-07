@@ -257,6 +257,7 @@ export class SnapFlipIconOverlay implements RVViewerPlugin {
       // skips our sprite and 'object-clicked' fires for the geometry behind
       // it — and the flip never triggers.
       auxOwner: root,
+      category: 'markers',
     });
     // The click event will report `node === root`, so use that for
     // identity matching instead of the snap-empty.

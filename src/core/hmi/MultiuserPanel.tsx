@@ -197,7 +197,7 @@ export function MultiuserPanel({ onClose }: MultiuserPanelProps) {
       p: 1.25,
       zIndex: 9000,
       boxShadow: '0 8px 24px rgba(0,0,0,0.6)',
-      backdropFilter: 'blur(8px)',
+      backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
       pointerEvents: 'auto',
     }}>
       {/* Header */}

@@ -11,7 +11,12 @@
  * - McpBridgeSnapshot shape correctness
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { McpBridgePlugin, type McpBridgeSnapshot } from '../src/plugins/mcp-bridge-plugin';
+import {
+  McpBridgePlugin,
+  DEFAULT_BRIDGE_PORT,
+  NODE_FALLBACK_PORT,
+  type McpBridgeSnapshot,
+} from '../src/plugins/mcp-bridge-plugin';
 import { buildToolDispatcher } from '../src/core/engine/rv-mcp-tools';
 
 // ── Minimal mock viewer ──
@@ -115,7 +120,7 @@ describe('McpBridgePlugin - State Extension', () => {
 
     const s = snapshot as McpBridgeSnapshot;
     expect(s.connected).toBe(true);
-    expect(s.port).toBe('18714');
+    expect(s.port).toBe(DEFAULT_BRIDGE_PORT);
     expect(s.toolCount).toBeGreaterThan(0);
     expect(s.enabled).toBe(true);
     expect(typeof s.reconnectAttempt).toBe('number');
@@ -342,5 +347,41 @@ describe('McpBridgePlugin - Persistence (reload)', () => {
     const snap = plugin.getSnapshot();
     expect(snap.port).toBe('15555');
     expect(snap.enabled).toBe(false);
+  });
+});
+
+// plan-327 AP5: CONNECT becomes the default transport WITHOUT taking the Node bridge away.
+describe('McpBridgePlugin - CONNECT is the default, Node stays reachable', () => {
+  beforeEach(() => { localStorage.clear(); });
+
+  it('a fresh profile targets CONNECT and does not pin the port', () => {
+    const { plugin, viewer } = setupPlugin();
+    (plugin as unknown as { init: (v: unknown) => void }).init(viewer);
+
+    expect(plugin.mcpPort).toBe(DEFAULT_BRIDGE_PORT);
+    // Not pinned → same-origin derivation still applies where the HMI is served by CONNECT.
+    expect((plugin as unknown as { _explicitPort: boolean })._explicitPort).toBe(false);
+  });
+
+  it('a profile that still holds a Node port keeps it (the fallback is not taken away)', () => {
+    localStorage.setItem('rv-ai-bridge',
+      JSON.stringify({ enabled: false, port: NODE_FALLBACK_PORT }));
+    const { plugin, viewer } = setupPlugin();
+    (plugin as unknown as { init: (v: unknown) => void }).init(viewer);
+
+    expect(plugin.mcpPort).toBe(NODE_FALLBACK_PORT);
+    expect((plugin as unknown as { _explicitPort: boolean })._explicitPort).toBe(true);
+  });
+
+  it('switching to a Node port pins it, switching back to CONNECT un-pins it', () => {
+    const { plugin } = setupPlugin();
+    const p = plugin as unknown as { _explicitPort: boolean };
+
+    plugin.setPort(NODE_FALLBACK_PORT);
+    expect(p._explicitPort).toBe(true);
+
+    plugin.setPort(DEFAULT_BRIDGE_PORT);
+    expect(p._explicitPort).toBe(false);
+    expect(plugin.mcpPort).toBe(DEFAULT_BRIDGE_PORT);
   });
 });

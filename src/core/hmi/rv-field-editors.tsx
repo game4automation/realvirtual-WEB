@@ -37,6 +37,8 @@ export interface FieldEditorProps {
   fieldType: FieldType;
   fieldName: string;
   editable?: boolean;
+  /** Optional unit suffix rendered inside number inputs (e.g. "mm", "mm/s"). */
+  unit?: string;
 }
 
 // ── NumberEditor ──────────────────────────────────────────────────────────
@@ -46,7 +48,7 @@ export interface FieldEditorProps {
 // drafts like "1." or "-" don't snap the value to a premature parse result.
 const COMPLETE_NUMBER_RE = /^-?\d+(\.\d+)?$/;
 
-export function NumberEditor({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+export function NumberEditor({ value, onChange, unit }: { value: number; onChange: (v: number) => void; unit?: string }) {
   const [draft, setDraft] = useState(String(value));
 
   // Re-sync draft when the external value changes from outside (gizmo drag,
@@ -94,6 +96,7 @@ export function NumberEditor({ value, onChange }: { value: number; onChange: (v:
       max={Number.MAX_SAFE_INTEGER}
       step={1}
       fractionDigits={3}
+      unit={unit}
       sx={{ width: '100%' }}
     />
   );
@@ -111,10 +114,10 @@ export function BooleanEditor({ value, onChange }: { value: boolean; onChange: (
       checked={value}
       onChange={(_, checked) => onChange(checked)}
       sx={{
-        p: 0.25,
+        p: 0.125,
         color: 'rgba(255,255,255,0.35)',
         '&.Mui-checked': { color: 'primary.main' },
-        '& .MuiSvgIcon-root': { fontSize: 18 },
+        '& .MuiSvgIcon-root': { fontSize: 16 },
       }}
     />
   );
@@ -131,7 +134,7 @@ export function EnumEditor({ value, onChange, options }: { value: string; onChan
       sx={{
         fontSize: 11,
         fontFamily: 'monospace',
-        height: 24,
+        height: 18,
         width: '100%',
         bgcolor: 'rgba(255,255,255,0.04)',
         '& .MuiSelect-select': { py: 0.25, px: 1 },
@@ -164,7 +167,7 @@ export function StringEditor({ value, onChange }: { value: string; onChange: (v:
       onBlur={handleBlur}
       onKeyDown={(e) => { if (e.key === 'Enter') handleBlur(); }}
       slotProps={{
-        input: { sx: { fontSize: 11, fontFamily: 'monospace', height: 24 } },
+        input: { sx: { fontSize: 11, fontFamily: 'monospace', height: 18 } },
       }}
       sx={{
         width: '100%',
@@ -288,6 +291,9 @@ export function Vector3Editor({ value, onChange }: { value: { x: number; y: numb
       '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.15)' },
       '&.Mui-focused fieldset': { borderColor: 'primary.main' },
     },
+    // Tighten MUI's default 14px horizontal input padding so the three axis
+    // cells stay compact in the narrow field column.
+    '& .MuiOutlinedInput-input': { paddingLeft: '5px', paddingRight: '5px' },
     '& input[type=number]::-webkit-outer-spin-button, & input[type=number]::-webkit-inner-spin-button': {
       WebkitAppearance: 'none', margin: 0,
     },
@@ -295,9 +301,9 @@ export function Vector3Editor({ value, onChange }: { value: { x: number; y: numb
   };
 
   return (
-    <Box sx={{ display: 'flex', gap: 0.5, width: '100%' }}>
+    <Box sx={{ display: 'flex', gap: 0.25, width: '100%' }}>
       {(['x', 'y', 'z'] as const).map((axis) => (
-        <Box key={axis} sx={{ flex: 1, display: 'flex', alignItems: 'center', gap: 0.25 }}>
+        <Box key={axis} sx={{ flex: 1, display: 'flex', alignItems: 'center', gap: 0.125 }}>
           <DragLabel
             axis={axis}
             value={value[axis]}
@@ -312,7 +318,7 @@ export function Vector3Editor({ value, onChange }: { value: { x: number; y: numb
             onBlur={() => handleBlur(axis)}
             onKeyDown={(e) => { if (e.key === 'Enter') handleBlur(axis); }}
             slotProps={{
-              input: { sx: { fontSize: 10, fontFamily: 'monospace', height: 22 } },
+              input: { sx: { fontSize: 10, fontFamily: 'monospace', height: 18 } },
               htmlInput: { step: 'any' },
             }}
             sx={axisStyle}
@@ -425,12 +431,12 @@ export function ObjectEditor({ value, onChange }: {
 
 // ── FieldEditor (dispatcher) ─────────────────────────────────────────────
 
-export function FieldEditor({ value, onChange, fieldType, fieldName, editable }: FieldEditorProps) {
+export function FieldEditor({ value, onChange, fieldType, fieldName, editable, unit }: FieldEditorProps) {
   switch (fieldType) {
     case 'boolean':
       return <BooleanEditor value={value as boolean} onChange={(v) => onChange(v)} />;
     case 'number':
-      return <NumberEditor value={value as number} onChange={(v) => onChange(v)} />;
+      return <NumberEditor value={value as number} onChange={(v) => onChange(v)} unit={unit} />;
     case 'enum':
       return <EnumEditor value={String(value)} onChange={(v) => onChange(v)} options={ENUM_FIELDS[fieldName] ?? DIRECTION_OPTIONS} />;
     case 'vector3':

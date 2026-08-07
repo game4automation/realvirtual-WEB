@@ -2,6 +2,11 @@
 
 This document is written **for users coming from realvirtual on Unity**.
 
+> Authoring note: everything you reference across nodes in Unity — drive signals, sensor
+> targets, kinematic bodies — is exported as a **node path**, not as an object identity.
+> [doc-node-paths.md](doc-node-paths.md) explains how those paths are built and resolved, and
+> why node names must be unique across the *whole* export rather than just among siblings.
+
 If you are used to authoring a complete digital twin in the Unity Editor —
 scene, drives, sensors, signals, HMI panels, dashboards — and you are now
 looking at realvirtual WEB, the mental model is different and it is worth
@@ -83,7 +88,7 @@ confusion when comparing a Unity scene with the WEB Demo side-by-side.
 | `Web*` marker components (e.g. `WebSensor`) | yes (as marker only) | rendered by the matching `RVWeb*` TS class |
 | KPI bars, message panels, dashboards | **no** | yes — plugins + UI slots |
 | Cart / order basket | **no** | yes — `OrderManagerPlugin` |
-| Document / PDF viewer | **no** | yes — `DocsBrowserPlugin` |
+| Document / PDF viewer | **no** | yes — `DocViewerOverlay`, fed by `AasLinkPlugin` |
 | Multiuser sessions, avatars, follow-cam | **no** | yes — `MultiuserPlugin` + relay |
 | WebXR (VR / AR) | **no** | yes — `WebXRPlugin` |
 | Layout planner, annotations, measurements | **no** | yes — dedicated plugins |
@@ -98,7 +103,7 @@ UI inside Unity make that the wrong place for them.
 
 ---
 
-## 1. Two layers, one viewer
+## 1. Two layers, one runtime
 
 realvirtual WEB is split into two clearly separated layers:
 
@@ -111,7 +116,7 @@ The GLB is the **single source of truth for the digital twin**. Everything you c
 see in the 3D scene and all simulation behavior is reconstructed from `rv_extras`
 metadata embedded in the GLB file.
 
-The HMI on top of the scene is **not** in the GLB. It is composed by the viewer at
+The HMI on top of the scene is **not** in the GLB. realvirtual composes it at
 load time from plugins, UI slots and per-model plugin packs.
 
 ```
@@ -142,33 +147,38 @@ load time from plugins, UI slots and per-model plugin packs.
 > doesn't contain it. Where does it come from?"*
 
 The status overlays in the Demo are **not customized into the export**. They are
-implemented as **demo plugins** that the WEB viewer registers automatically when
+implemented as **demo plugins** that realvirtual registers automatically when
 one of the demo GLB files is loaded.
 
-The relevant plugins for the Demo scene are registered in
-`src/plugins/models/DemoRealvirtualWeb/index.ts` and include — among others:
+The complete registration list lives in
+`src/plugins/models/DemoRealvirtualWeb/index.ts` — this is the whole set, in
+registration order:
 
-| Plugin | What it renders |
-|--------|-----------------|
+| Plugin | What it does |
+|--------|--------------|
+| `ModelOptionPlugin` | Applies the active `?option=` variant (the AAS supplier swap). **Registered first on purpose** — see [doc-document-linking.md](doc-document-linking.md) |
+| `OperatorHmiControlsPlugin` | Hides the engineering sim controls (Play/Pause/Reset, Realtime/DES) in HMI mode |
+| `RobotFollowPositionPlugin` | Follow-camera anchor on the robot |
 | `KpiDemoPlugin` | OEE / Parts-per-hour / Cycle-time KPI cards (top KPI bar) |
 | `DemoHMIPlugin` | Messages, status badges, tiles |
+| `TestAxesPlugin` | Manual axis tester — floating panel with sliders for A1–A6 robot axis control |
 | `MachineControlPlugin` | Docked left "Machine Control" panel |
 | `MaintenancePlugin` | Maintenance dialog + step-by-step / flythrough procedures |
-| `TestAxesPlugin` | Manual axis tester — floating panel with sliders for A1–A6 robot axis control |
-| `OrderManagerPlugin` | Cart / order basket |
-| `AasLinkPlugin` | Asset-Administration-Shell tooltips & links |
 | `WebXRPlugin` | VR / AR entry |
 | `MultiuserPlugin` | Shared sessions (presence, avatars, follow-cam) |
-| `AnnotationPlugin`, `FpvPlugin`, ... | Additional optional features |
+| `FpvPlugin` | First-person walkthrough camera |
+| `AnnotationPlugin` | 3D annotations |
+| `AasLinkPlugin` | Asset-Administration-Shell tooltips, side panel and the PDF links that feed the document viewer |
+| `OrderManagerPlugin` | Cart / order basket |
 
-These plugins are part of the AGPL viewer codebase. None of their content lives
+These plugins are part of the AGPL codebase. None of their content lives
 inside the demo GLB. They are activated only for the Demo model — they appear
-because the viewer matches the loaded filename against
+because the model-plugin manager matches the loaded filename against
 `models = ['DemoRealvirtualWeb', 'RealvirtualWebTest']`.
 
 If you load your own GLB, none of these demo plugins activate. The 3D scene and
-simulation will run, but the HMI overlay will only contain the **generic** WEB
-viewer chrome (top-bar, hierarchy, settings, search bar, drive chart overlay,
+simulation will run, but the HMI overlay will only contain the **generic**
+realvirtual chrome (top-bar, hierarchy, settings, search bar, drive chart overlay,
 etc.).
 
 ---
@@ -218,7 +228,7 @@ Architecture, examples and slot reference: **[doc-extending-webviewer.md](doc-ex
 ### 3.3 Per-Model Plugin Pack — to ship customization with a specific GLB
 
 A *Model Plugin Pack* is a small folder under `src/plugins/models/<YourModel>/`
-that exports `models = [...]` and `registerModelPlugins(viewer)`. The viewer
+that exports `models = [...]` and `registerModelPlugins(viewer)`. realvirtual
 auto-loads it when the matching GLB is loaded and tears it down on model
 change.
 
@@ -231,8 +241,12 @@ easy to ship/share.
 
 ```
 src/plugins/models/
+├── model-option-plugin.ts      ← shared: the generic `?option=` variant mechanism
 ├── DemoRealvirtualWeb/         ← reference example
 │   ├── index.ts                 # entry point — exports models + register/unregister
+│   ├── model-options.ts         # optional: `?option=` variants of the same GLB
+│   ├── operator-hmi-controls.ts # model-specific plugin (hides engineering controls)
+│   ├── robot-follow-position.ts # model-specific plugin (follow-cam anchor)
 │   └── demo-kiosk-tour.ts       # optional: model-specific content
 ├── DemoProcessIndustry/
 │   └── index.ts
@@ -242,6 +256,11 @@ src/plugins/models/
     ├── YourMaintenancePanel.tsx
     └── content/                 # PDFs, JSON, images that belong to this model
 ```
+
+`model-options.ts` is picked up by a separate eager glob in `main.ts` and is
+what makes `?option=<id>` variants of one GLB possible — see
+[doc-document-linking.md](doc-document-linking.md) for the worked example
+(the Demo's Festo / SEW / Bosch supplier swap).
 
 The folder name is the convention; the actual **matching is done by the
 `models` array inside `index.ts`** (see below). One pack can claim several
@@ -257,18 +276,19 @@ by `core/rv-model-plugin-manager.ts`:
 // src/plugins/models/YourMachine/index.ts
 import type { RVViewer } from '../../../core/rv-viewer';
 
-// Optional: viewer plugins you want active only for this model.
+// Optional: built-in plugins you want active only for this model.
 import { YourKpiPlugin } from './YourKpiPlugin';
 import { OrderManagerPlugin } from '../../order-manager-plugin';
 import { AasLinkPlugin } from '../../aas-link-plugin';
-import { DocsBrowserPlugin } from '../../docs-browser-plugin';
 
 // (1) GLB filenames (without .glb) this pack handles.
 export const models = ['YourMachine', 'yourmachine', 'YourMachineRev2'];
 
 // (2) Optional defaults — applied on every load of this model.
 //     The user can still override these via Settings.
-export const defaultEnvironmentPreset = 'Indoor' as const;
+//     Valid names: 'Bright' | 'Dark' | 'White' | 'Concrete' | 'Outdoor'
+//     (ENVIRONMENT_PRESETS in src/core/hmi/environment-presets.ts).
+export const defaultEnvironmentPreset = 'Bright' as const;
 
 const registeredIds: string[] = [];
 
@@ -278,7 +298,6 @@ export function registerModelPlugins(viewer: RVViewer): void {
     new YourKpiPlugin(),
     new AasLinkPlugin(),
     new OrderManagerPlugin(),
-    new DocsBrowserPlugin(),
   ];
   for (const p of instances) {
     viewer.use(p);
@@ -310,11 +329,15 @@ Key points:
   so leaking plugins, event listeners or DOM nodes will break the next load.
 - **Order matters.** Plugins are activated in the order you put them into
   the array. If `PluginB` looks up `PluginA` via `viewer.getPlugin('a')` in
-  its own `onModelLoaded`, register `PluginA` first.
+  its own `onModelLoaded`, register `PluginA` first. The Demo pack depends
+  on this: `ModelOptionPlugin` must run before `AasLinkPlugin` pre-parses
+  the AASX files.
 - **Optional content alongside `index.ts`.** Anything you put next to
-  `index.ts` (kiosk tour JSON, PDFs, custom React components) is part of
-  the same package and travels with it. The `DemoRealvirtualWeb` pack does
-  this for its kiosk tour.
+  `index.ts` (tour JSON, PDFs, custom React components) is part of
+  the same package and travels with it. The `DemoRealvirtualWeb` pack keeps
+  a `demo-kiosk-tour.ts` this way — note that its kiosk registration is
+  currently commented out in `index.ts` ("disabled for now"), so the Demo
+  does *not* run a kiosk tour today.
 
 #### 3.3.3 Workflow — adding customization for a new machine
 
@@ -344,7 +367,7 @@ your use case and adapt it.
 
 ## 4. Cart and PDF / Machine Information
 
-Both features are **shipped with the AGPL viewer**. They are not part of the
+Both features are **shipped with the AGPL codebase**. They are not part of the
 GLB — they are plugins that you can enable for your own model.
 
 ### 4.1 Cart — `OrderManagerPlugin`
@@ -376,61 +399,66 @@ To enable for your model:
 
 ### 4.2 PDF / Machine Information System
 
-There is no single "PDF system" — what you see in the Demo is the combination
-of three plugins:
+There is no single "PDF system", and the Demo does **not** use a dedicated
+document-browser plugin. What you see there is two registered plugins plus one
+core overlay:
 
-| Plugin | Role |
-|--------|------|
-| `AasLinkPlugin` | Hover/click on a component → tooltip and side panel with vendor / part / datasheet links pulled from the AAS metadata in the GLB |
-| `DocsBrowserPlugin` (`docs-browser-plugin.tsx`) | Embedded document browser that opens PDFs / HTML pages inside the viewer (no download/leave-page) |
+| Piece | Role |
+|-------|------|
+| `AasLinkPlugin` (`src/plugins/aas-link-plugin.tsx`) | Hover/click on a component → tooltip and side panel with vendor / part / datasheet data pulled from the AAS metadata in the GLB. It also extracts the PDFs out of the AASX packages and writes them to `node.userData._rvPdfLinks`. |
+| `DocViewerOverlay` (core HMI, not a plugin) | The built-in PDF reader. It opens automatically for any node that carries `_rvPdfLinks` — no registration, no configuration. |
 | `MaintenancePlugin` (`src/plugins/demo/maintenance-plugin.ts`) | Authored maintenance procedures: step-by-step or flythrough with camera animation, highlighting and result capture |
+
+> `DocsBrowserPlugin` (`src/plugins/docs-browser-plugin.tsx`) also exists in the
+> codebase — a sidebar "document browsing mode". It is **not instantiated
+> anywhere**, including in the Demo. Treat it as available-but-unused, not as
+> part of the Demo stack.
 
 To implement "machine information" for your own GLB:
 
 1. **Author the content on the Unity side** as AAS links (datasheets, manuals,
    BOM URLs) — these travel with the GLB.
-2. **Place the document files** (PDFs, HTML) under `public/docs/` so the
-   docs-browser can resolve them, or use external URLs.
+2. **Place the documents** — either AASX packages under `public/aasx/` (indexed
+   by `scripts/build-aasx-index.mjs`) or plain PDFs mapped by node path in the
+   model's sidecar config. Both routes end in `_rvPdfLinks`.
+   See **[doc-document-linking.md](doc-document-linking.md)** for the full contract.
 3. **Author maintenance procedures** as part of `rv_extras` (parsed by
    `maintenance-parser.ts`) — each procedure is a sequence of steps with a
    camera pose, optional highlight nodes and a description.
-4. **Register the three plugins** in your model plugin pack.
+4. **Register `AasLinkPlugin`** (and `MaintenancePlugin` if you use procedures)
+   in your model plugin pack. The PDF viewer needs no registration.
 
 For the full procedure format, see `core/maintenance-parser.ts`.
 
 ---
 
-## 5. Beta features
+## 5. Maturity
 
-Features labeled "(Beta)" in the UI **are shipped** with the current
-version of realvirtual WEB, but they come with explicit caveats:
+realvirtual WEB as a whole still carries a **beta** notice (the welcome
+dialog states it: features, file formats and APIs may still change, and it is
+not intended for production use yet). That is a product-level statement, not a
+per-feature one.
 
-- **They may be buggy** and **are not deeply tested yet.** Treat them as
-  preview / early-access functionality, not as production-grade.
-- The **API surface, configuration format and UI may still evolve** in a
-  minor version. Backwards compatibility is best-effort, not guaranteed,
-  until the (Beta) label is removed.
-- Edge cases (large scenes, weak hardware, slow networks, exotic browsers,
-  unusual relay configurations) are very likely to surface issues before
-  more common paths do.
-- Use them for trials, demos, internal pilots and feedback rounds. For
-  customer-critical production deployments, prefer the non-Beta features
-  — or pin a specific version and validate it thoroughly for your use
-  case first.
-- Bug reports against Beta features are very welcome; that is in fact the
-  main reason they ship before being declared stable.
+Inside the UI there is exactly **one** feature carrying an explicit "Beta"
+badge today:
 
-Currently labeled "(Beta)":
+| Feature | Marked in the UI | Notes |
+|---------|------------------|-------|
+| **Full physics — all conveyors** (Settings ▸ Simulation) | Yes — `BetaChip` in `SimulationTab.tsx` | Runs every non-radial conveyor as a physical belt. Experimental, off by default, takes effect on the next model load. |
+| Layout Planner | No badge | Shipped; the persistence format is still evolving — see [doc-layout-planner.md](doc-layout-planner.md) |
+| Multiuser Sessions | No badge | Local mode and presence/avatars are solid; the relay-server deployment story and large-room scaling are the parts that see the least testing. See **[doc-multiuser-system.md](doc-multiuser-system.md)** |
+| WebXR VR/AR | No badge | Works across the browsers that support WebXR |
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Layout Planner | Beta | Library panel + planner mode are shipped; persistence format may still change, and rough edges are expected |
-| Multiuser Sessions | Beta — relay-dependent parts not deeply tested | Local-mode and presence/avatars are stable; the relay-server deployment story, large-room scaling and shared editing semantics are still being hardened. See **[doc-multiuser-system.md](doc-multiuser-system.md)** |
-| WebXR VR/AR | Released | Stable across all major browsers that support WebXR |
+What "beta" means in practice, for the product and for the badged feature
+alike: the API surface, configuration format and UI may still change in a minor
+version; edge cases (large scenes, weak hardware, slow networks, exotic
+browsers, unusual relay configurations) surface issues first; bug reports are
+very welcome — that is why these ship before being declared stable.
 
-If a feature is not visible in your build, check the **Settings panel**
-("Interfaces" / "Visual" / "Model" tabs) — some plugins are opt-in per
-deployment, and the kiosk / lock mode can hide them on purpose.
+If a feature is not visible in your build, check the **Settings panel** — some
+plugins are opt-in per deployment, and lock / kiosk mode can hide them on
+purpose. See [doc-ui-visibility.md](doc-ui-visibility.md) for the two
+independent axes that decide whether an element shows up.
 
 ---
 
@@ -485,7 +513,7 @@ this codebase, without you having to brief it manually:
 | `.claude/commands/` | Pre-wired slash commands: `/dev`, `/build`, `/test`, `/debug`, `/inspect`, `/license-check`. They encode the standard "run the right thing the right way" workflow. |
 | `.claude/settings.json` | Shared agent settings for the project. |
 | `doc-*.md` files | Per-area architectural documents (this one, behaviors, lifecycle, extending, multiuser, persistence, interfaces, debugging). They are the agent's reference material when it needs to look up *how something works* before changing it. |
-| `webviewer.mcp.md` | MCP tool reference: lists tools the agent can use to **inspect the running viewer** (signals, drives, sensors, errors, scene state). |
+| `webviewer.mcp.md` | MCP tool reference: lists tools the agent can use to **inspect the running session** (signals, drives, sensors, errors, scene state). |
 | Built-in `mcp-bridge-plugin` | Exposes the running scene over the debug API. Together with the [realvirtual-MCP](https://github.com/game4automation/realvirtual-MCP) server, agents can inspect and control the live browser session. |
 | `debug-endpoint-plugin` | HTTP debug API (`/__api/debug`) for snapshotting signals/drives/sensors/logs — the same data an agent reads to verify its changes worked. |
 
@@ -560,14 +588,21 @@ plugin pack; I review and ship."*
 
 ## 7. Where to go from here
 
+This document is the **developer** view. For the end-user manual — what the
+buttons do, how an operator drives the UI, the feature tour — use the product
+documentation site instead of restating it here:
+**<https://realvirtual.io/doc/web/>**.
+
 | You want to ... | Read |
 |------------------|------|
-| Understand the overall viewer architecture | [doc-webviewer.md](doc-webviewer.md) |
+| Understand the overall architecture | [doc-webviewer.md](doc-webviewer.md) |
 | Build a plugin, contribute a UI slot, hook lifecycle | [doc-extending-webviewer.md](doc-extending-webviewer.md) |
 | Write per-node behaviors against `rv_extras` | [doc-behaviors.md](doc-behaviors.md) |
+| Attach custom logic *inside* the GLB (JS-in-GLB) | [doc-scripting.md](doc-scripting.md) |
+| Link PDFs / AASX packages to nodes | [doc-document-linking.md](doc-document-linking.md) |
 | Add an industrial interface (WebSocket / MQTT / ctrlX) | [doc-webviewer-interface.md](doc-webviewer-interface.md) |
 | Wire multiuser sessions / shared views | [doc-multiuser-system.md](doc-multiuser-system.md) |
-| Debug a running viewer | [doc-web-debugging.md](doc-web-debugging.md) |
+| Debug a running session | [doc-web-debugging.md](doc-web-debugging.md) |
 
 ---
 
@@ -575,18 +610,20 @@ plugin pack; I review and ship."*
 
 - The Demo's machine status UI **is not in the GLB**. It is a stack of WEB
   plugins (`KpiDemoPlugin`, `DemoHMIPlugin`, `MachineControlPlugin`,
-  `MaintenancePlugin`, ...) activated only for the demo GLB filenames.
+  `MaintenancePlugin`, ...) activated only for the demo GLB filenames — the
+  full list is in §2.
 - Customization for a customer model is done by writing **plugins** and
   packaging them as a **per-model plugin pack** (`src/plugins/models/<YourModel>/index.ts`)
   that auto-loads when that GLB is opened.
 - **Cart** is the AGPL-shipped `OrderManagerPlugin`, fed by **AAS-link
   metadata** authored in Unity.
-- **PDF / Machine Information** is the combination of `AasLinkPlugin` +
-  `DocsBrowserPlugin` + `MaintenancePlugin`, again fed by metadata you
-  author in Unity and ship in the GLB.
-- "(Beta)" features are shipped but **may be buggy and are not deeply
-  tested yet** — fine for trials and demos, not recommended for
-  customer-critical production yet. API/UX is also not frozen.
+- **PDF / Machine Information** is `AasLinkPlugin` (which produces
+  `node.userData._rvPdfLinks`) plus the core `DocViewerOverlay` reader, and
+  `MaintenancePlugin` for authored procedures — all fed by metadata you author
+  in Unity and ship in the GLB. `DocsBrowserPlugin` exists but is not used.
+- realvirtual WEB as a product is still **beta** (see the welcome dialog);
+  inside the UI only "Full physics — all conveyors" carries an explicit Beta
+  badge.
 - **Not every WEB feature has — or will have — a Unity counterpart.** The
   WEB side is built and customized in TypeScript/React, and the intended
   development model is **with a coding agent (Claude Code) using the

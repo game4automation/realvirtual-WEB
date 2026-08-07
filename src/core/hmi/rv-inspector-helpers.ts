@@ -11,8 +11,26 @@
 
 import { getConsumedFields, getIgnoredFields, isKnownComponentType } from '../engine/rv-extras-validator';
 import { getCapabilities } from '../engine/rv-component-registry';
+import { COLLISION_ROLES } from '../engine/rv-collision-role';
 import type { SignalStore } from '../engine/rv-signal-store';
 import { readSignalValue, formatValue } from './rv-value-resolver';
+import {
+  SIGNAL_VALUE_NEUTRAL,
+  signalDirectionFromType,
+  signalValueColor,
+  signalValueColorForValue,
+} from './signal-colors';
+import type { SvgIconComponent } from '@mui/icons-material';
+import {
+  Settings,
+  RadioButtonChecked,
+  ViewStream,
+  PlayArrow,
+  Stop,
+  PanTool,
+  Sensors,
+  Widgets,
+} from '@mui/icons-material';
 
 // ── Hidden component types (not shown in inspector or hierarchy) ──────────
 
@@ -62,13 +80,62 @@ const DIRECTION_OPTIONS = [
 
 const ACTIVE_OPTIONS = ['Always', 'Connected', 'Disconnected'];
 
-/** Map of field names to their enum options. */
+/** plan-394 — the six preset collision roles (English, not localized). */
+const COLLISION_ROLE_OPTIONS = [...COLLISION_ROLES];
+
+/** Map of field names to their enum options. Indexed by the BARE field name
+ *  across all component types — which is why the collision field is called
+ *  `CollisionRole` and not `Role` (a generic `Role` would turn every
+ *  same-named field of any other component into this dropdown). */
 export const ENUM_FIELDS: Record<string, string[]> = {
   Direction: DIRECTION_OPTIONS,
   TransportDirection: DIRECTION_OPTIONS,
   RayCastDirection: DIRECTION_OPTIONS,
   Active: ACTIVE_OPTIONS,
+  CollisionRole: COLLISION_ROLE_OPTIONS,
+  CollisionRoleForMUs: COLLISION_ROLE_OPTIONS,
 };
+
+// ── Field units ──────────────────────────────────────────────────────────
+
+/**
+ * Units shown inside numeric inputs (right-aligned, e.g. "mm", "mm/s", "°", "s").
+ * Keyed by either the component-qualified field (`"Drive.TargetSpeed"`) or the
+ * bare field name (`"TargetSpeed"`). A qualified key wins over a bare key, so a
+ * field can carry different units per component. Extend this map to add units —
+ * `getFieldUnit()` is the single lookup point.
+ */
+export const FIELD_UNITS: Record<string, string> = {
+  // Distances / positions (millimetres)
+  StartPosition: 'mm',
+  TargetPosition: 'mm',
+  CurrentPosition: 'mm',
+  Offset: 'mm',
+  Position: 'mm',
+  MinPos: 'mm',
+  MaxPos: 'mm',
+  LowerLimit: 'mm',
+  UpperLimit: 'mm',
+  'Source.GenerateIfDistance': 'mm',
+  // Speeds (mm/s)
+  TargetSpeed: 'mm/s',
+  CurrentSpeed: 'mm/s',
+  Speed: 'mm/s',
+  // Accelerations (mm/s²)
+  Acceleration: 'mm/s²',
+  // Times (seconds)
+  Interval: 's',
+  TimeIn: 's',
+  TimeOut: 's',
+  Delay: 's',
+};
+
+/** Resolve the unit suffix for a numeric field, or undefined if none. Prefers a
+ *  component-qualified entry (`Type.Field`) over a bare `Field` entry. */
+export function getFieldUnit(componentType: string, fieldName: string): string | undefined {
+  const base = baseComponentType(componentType);
+  return FIELD_UNITS[`${base}.${fieldName}`] ?? FIELD_UNITS[fieldName];
+}
 
 // ── Hidden fields ────────────────────────────────────────────────────────
 
@@ -185,6 +252,25 @@ export function componentColor(type: string): string {
   return BADGE_COLORS[type] ?? '#90a4ae';
 }
 
+/**
+ * MUI icon component for a component type — the visual counterpart to
+ * {@link componentColor}. Used as a small leading glyph next to a signal badge
+ * to show which component a signal is bound to (plan-234 §3.1b). Returns a
+ * component reference (not JSX), so the caller renders it and applies the
+ * `componentColor(type)` tint. Unknown types fall back to a generic `Widgets`.
+ */
+export function componentTypeIcon(type: string): SvgIconComponent {
+  const base = baseComponentType(type);
+  if (base === 'Drive' || base.startsWith('Drive')) return Settings;
+  if (base === 'Sensor') return RadioButtonChecked;
+  if (base === 'TransportSurface') return ViewStream;
+  if (base === 'Source') return PlayArrow;
+  if (base === 'Sink') return Stop;
+  if (base === 'Gripper') return PanTool;
+  if (base === 'WebSensor') return Sensors;
+  return Widgets;
+}
+
 // ── Format display value for read-only fields ─────────────────────────────
 
 export function formatDisplayValue(value: unknown): string {
@@ -244,15 +330,19 @@ export function formatSensorStatus(signalStore: SignalStore | null, path: string
   return formatValue(value, { boolStyle: 'glyph' });
 }
 
-/** Get color for a signal reference chip — gray when off, component color when on. */
+/**
+ * Colour of a signal reference chip — a signal-VALUE surface (plan-341 §2.3):
+ * hue = direction, intensity = state, neutral when there is no reading.
+ * Non-signal reference types keep their component colour.
+ */
 export function getRefSignalColor(shortType: string, signalStore: SignalStore | null, path: string): string {
-  if (!signalStore) return '#808080';
+  const dir = signalDirectionFromType(shortType);
+  if (dir === 'unknown') return componentColor(shortType);
+  if (!signalStore) return SIGNAL_VALUE_NEUTRAL;
   const value = signalStore.getByPath(path);
-  if (value === undefined) return '#808080';
-  const isBool = shortType.includes('Bool');
-  if (isBool) return value === true ? componentColor(shortType) : '#808080';
-  if (typeof value === 'number' && value === 0) return '#808080';
-  return componentColor(shortType);
+  if (value === undefined) return SIGNAL_VALUE_NEUTRAL;
+  if (shortType.includes('Bool')) return signalValueColor(dir, value === true);
+  return signalValueColorForValue(dir, value);
 }
 
 /** Get color for a sensor reference chip — gray when not occupied, green when occupied. */
@@ -269,21 +359,21 @@ export function isSignalComponentType(type: string): boolean {
   return type.startsWith('PLCInput') || type.startsWith('PLCOutput');
 }
 
-/** Get signal header color matching hierarchy badge style.
- *  Bool false → gray, Bool true → Input red / Output green,
- *  Numeric 0 → gray, empty string → gray, otherwise → component color. */
+/**
+ * Colour of the inspector's live signal value — a signal-VALUE surface
+ * (plan-341 §2.3). Hue = direction, intensity = state; an empty reading or an
+ * em dash is "no value" and takes the neutral step, not the direction hue.
+ * Non-signal component types keep their component colour.
+ */
 export function getSignalHeaderColor(componentType: string, signalValue: string): string {
-  const isBool = componentType.includes('Bool');
-  if (isBool) {
-    if (signalValue === 'true') {
-      return componentType.startsWith('PLCInput') ? '#ef5350' : '#66bb6a';
-    }
-    return '#808080';
+  const dir = signalDirectionFromType(componentType);
+  if (dir === 'unknown') return componentColor(componentType);
+  if (componentType.includes('Bool')) {
+    if (signalValue === 'true') return signalValueColor(dir, true);
+    if (signalValue === 'false') return signalValueColor(dir, false);
+    return SIGNAL_VALUE_NEUTRAL;
   }
-  const num = parseFloat(signalValue);
-  if (!isNaN(num) && num === 0) return '#808080';
-  if (signalValue === '' || signalValue === '\u2014') return '#808080';
-  return componentColor(componentType);
+  return signalValueColorForValue(dir, signalValue);
 }
 
 // Header/live-value reads were moved to rv-value-resolver.ts:

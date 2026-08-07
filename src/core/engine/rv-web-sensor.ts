@@ -15,7 +15,7 @@
 
 import type { Object3D } from 'three';
 import type { ComponentContext, ComponentSchema, RVComponent } from './rv-component-registry';
-import { registerComponent, setComponentInstance } from './rv-component-registry';
+import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import type { GizmoHandle, GizmoShape } from './rv-gizmo-manager';
 
 // ─── Types ─────────────────────────────────────────────────────────────
@@ -158,12 +158,8 @@ export function parseIntStateMap(raw: string): Map<number, WebSensorState> {
 // ─── RVWebSensor ────────────────────────────────────────────────────────
 
 export class RVWebSensor implements RVComponent {
-  static readonly schema: ComponentSchema = {
-    SignalBool:  { type: 'componentRef' },
-    SignalInt:   { type: 'componentRef' },
-    IntStateMap: { type: 'string', default: '' },
-    Label:       { type: 'string', default: '' },
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('WebSensor');
 
   readonly node: Object3D;
   isOwner = true;
@@ -212,6 +208,7 @@ export class RVWebSensor implements RVComponent {
       size:    WebSensorConfig.defaultSize,
       // Wider outline so small sensor bodies (~4 cm) are visible from far.
       outlineScale: 2.0,
+      category: 'status',
     });
     // Note: GizmoOverlayManager auto-registers the sphere as an auxiliary
     // raycast target (resolving to this.node) when constructed with a
@@ -228,6 +225,7 @@ export class RVWebSensor implements RVComponent {
         opacity: 1.0,
         size: 0.15,   // small enough to not dominate the scene
         visible: false,
+        category: 'status',
       });
     }
 
@@ -340,6 +338,7 @@ registerComponent({
   displayName: 'Sensor',
   schema: RVWebSensor.schema,
   capabilities: {
+    authorable: true,   // addable in the asset editor (schema-complete)
     hoverable: true,
     hoverEnabledByDefault: true,   // ← enable hover/click out of the box
     selectable: true,

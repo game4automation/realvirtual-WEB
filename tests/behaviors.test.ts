@@ -151,7 +151,7 @@ describe('BehaviorManager — discovery + model match', () => {
 });
 
 describe('BehaviorManager — lifecycle via events', () => {
-  it('re-invokes bind on second model-loaded event', () => {
+  it('re-invokes bind on second model-logic-activated event', () => {
     const manager = new BehaviorManager();
     let count = 0;
     manager.register('m', defineBehavior({
@@ -165,11 +165,11 @@ describe('BehaviorManager — lifecycle via events', () => {
 
     currentRoot = new Object3D();
     currentUrl = '/models/Foo.glb';
-    events.emit('model-loaded', { result: {} });
+    events.emit('model-logic-activated', { result: {} });
     expect(count).toBe(1);
 
     events.emit('model-cleared', undefined);
-    events.emit('model-loaded', { result: {} });
+    events.emit('model-logic-activated', { result: {} });
     expect(count).toBe(2);
   });
 
@@ -184,7 +184,7 @@ describe('BehaviorManager — lifecycle via events', () => {
     let currentRoot: Object3D | null = new Object3D();
     manager.attach(host, () => currentRoot, () => '/models/X.glb');
 
-    events.emit('model-loaded', { result: {} });
+    events.emit('model-logic-activated', { result: {} });
     manager.tick(0.016);
     expect(tickSpy).toHaveBeenCalledTimes(1);
 
@@ -208,7 +208,7 @@ describe('BehaviorManager — lifecycle via events', () => {
     let currentRoot: Object3D | null = new Object3D();
     manager.disposeAll();
     manager.attach(host2, () => currentRoot, () => '/models/Foo.glb');
-    events.emit('model-loaded', { result: {} });
+    events.emit('model-logic-activated', { result: {} });
     const msgs = warn.mock.calls.map(c => String(c[0])).join('\n');
     expect(msgs).toMatch(/multiple behaviors matched/);
     warn.mockRestore();
@@ -235,7 +235,7 @@ describe('BehaviorManager — per placed LayoutObject dispatch', () => {
     const other = placedObject('SteelRack');     sceneRoot.add(other);
     manager.attach(host, () => sceneRoot, () => '/models/MyScene.glb');
 
-    events.emit('model-loaded', { result: {} });
+    events.emit('model-logic-activated', { result: {} });
 
     // Scene filename 'MyScene' matches nothing; only the placed conveyor binds,
     // scoped to its own subtree (not the scene root).
@@ -250,7 +250,7 @@ describe('BehaviorManager — per placed LayoutObject dispatch', () => {
     const { host, events } = makeHost();
     const sceneRoot = new Object3D();
     manager.attach(host, () => sceneRoot, () => '/models/MyScene.glb');
-    events.emit('model-loaded', { result: {} });
+    events.emit('model-logic-activated', { result: {} });
     expect(count).toBe(0);
 
     const conv = placedObject('ChainConveyor3m'); sceneRoot.add(conv);
@@ -327,7 +327,7 @@ describe('BehaviorManager — behavior signal initialValue registration', () => 
     const { host, events, values, registered } = makeHostWithStore();
     let currentRoot: Object3D | null = new Object3D();
     manager.attach(host, () => currentRoot, () => '/models/Foo.glb');
-    events.emit('model-loaded', { result: {} });
+    events.emit('model-logic-activated', { result: {} });
 
     expect(values.get('My.Run')).toBe(true);    // initialValue applied
     expect(values.get('My.Idle')).toBe(false);
@@ -346,7 +346,7 @@ describe('BehaviorManager — behavior signal initialValue registration', () => 
     values.set('My.Run', false);                 // already set (e.g. by a PLC / saved scene)
     let currentRoot: Object3D | null = new Object3D();
     manager.attach(host, () => currentRoot, () => '/models/Foo.glb');
-    events.emit('model-loaded', { result: {} });
+    events.emit('model-logic-activated', { result: {} });
     expect(values.get('My.Run')).toBe(false);    // preserved
   });
 
@@ -372,7 +372,7 @@ describe('BehaviorManager — behavior signal initialValue registration', () => 
     };
     let currentRoot: Object3D | null = new Object3D();
     manager.attach(host, () => currentRoot, () => '/models/Foo.glb');
-    events.emit('model-loaded', { result: {} });
+    events.emit('model-logic-activated', { result: {} });
     expect(values.get('My.Run')).toBe(true);   // seeded via set() fallback
   });
 });

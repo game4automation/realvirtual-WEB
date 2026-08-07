@@ -35,6 +35,7 @@ import type { ObjectHoverData } from '../../core/engine/rv-raycast-manager';
 import type { SnapMarkerRenderer } from './snap-marker-renderer';
 import { snapHoverStore } from './snap-hover-store';
 import { snapToolbarStore } from './snap-toolbar-store';
+import { ndcToScreen } from '../../core/engine/rv-ndc';
 
 /** Pixel radius around a visible marker that still counts as "on a marker". */
 export const DEFAULT_PIXEL_THRESHOLD = 36;
@@ -324,9 +325,10 @@ export class SnapPointController {
     this._tmpVec2.copy(this._tmpVec).project(cam);
     if (this._tmpVec2.z > 1) return null;
     const rect = this.canvas.getBoundingClientRect();
-    const x = ((this._tmpVec2.x + 1) / 2) * rect.width;
-    const y = ((1 - this._tmpVec2.y) / 2) * rect.height;
-    return { x, y, ndcZ: this._tmpVec2.z };
+    // Canvas-local pixels — left/top offsets deliberately zero.
+    const out = { x: 0, y: 0, ndcZ: this._tmpVec2.z };
+    ndcToScreen(this._tmpVec2.x, this._tmpVec2.y, { left: 0, top: 0, width: rect.width, height: rect.height }, out);
+    return out;
   }
 
   /** Whether the cursor is currently within pixelThreshold of any revealed snap. */

@@ -29,7 +29,12 @@ import type { RVViewer } from './rv-viewer';
 import type { RVDrive } from './engine/rv-drive';
 import type { RVSensor } from './engine/rv-sensor';
 import type { RVDrivesPlayback } from './engine/rv-drives-playback';
-import type { SignalStore } from './engine/rv-signal-store';
+import {
+  createSignalWriter,
+  type SignalStore,
+  type SignalWriter,
+} from './engine/rv-signal-store';
+import { pluginSignalWriterKind } from './rv-plugin-context';
 import type { RVTransportManager } from './engine/rv-transport-manager';
 import type { Object3D, Scene } from 'three';
 
@@ -47,6 +52,8 @@ export abstract class RVBehavior implements RVViewerPlugin {
   protected elapsed = 0;
 
   private _cleanups: (() => void)[] = [];
+  private _writerStore: SignalStore | null = null;
+  private _writer: SignalWriter | null = null;
 
   // ── Convenience getters (like MonoBehaviour.transform, .gameObject) ──
 
@@ -54,6 +61,19 @@ export abstract class RVBehavior implements RVViewerPlugin {
   protected get sensors(): RVSensor[] { return this.viewer?.transportManager?.sensors ?? []; }
   protected get playback(): RVDrivesPlayback | null { return this.viewer?.playback ?? null; }
   protected get signals(): SignalStore | null { return this.viewer?.signalStore ?? null; }
+  protected get signalWriter(): SignalWriter | null {
+    const store = this.viewer?.signalStore ?? null;
+    if (!store) {
+      this._writerStore = null;
+      this._writer = null;
+      return null;
+    }
+    if (this._writerStore !== store) {
+      this._writerStore = store;
+      this._writer = createSignalWriter(store, this.id, pluginSignalWriterKind(this.id));
+    }
+    return this._writer;
+  }
   protected get transportManager(): RVTransportManager | null { return this.viewer?.transportManager ?? null; }
   protected get scene(): Scene | null { return this.viewer?.scene ?? null; }
 
@@ -110,7 +130,7 @@ export abstract class RVBehavior implements RVViewerPlugin {
 
   /** Write a signal value by name. */
   protected setSignal(name: string, value: boolean | number): void {
-    this.viewer?.signalStore?.set(name, value);
+    this.signalWriter?.set(name, value);
   }
 
   /** Subscribe to signal changes by name. Cleanup is automatic on model clear / dispose. */
@@ -128,7 +148,7 @@ export abstract class RVBehavior implements RVViewerPlugin {
 
   /** Write a signal value by hierarchy path. */
   protected setSignalByPath(path: string, value: boolean | number): void {
-    this.viewer?.signalStore?.setByPath(path, value);
+    this.signalWriter?.setByPath(path, value);
   }
 
   // ── Helper methods ──
@@ -172,6 +192,8 @@ export abstract class RVBehavior implements RVViewerPlugin {
     this.onDestroy?.();
     this._runCleanups();
     this.viewer = null;
+    this._writerStore = null;
+    this._writer = null;
     this.elapsed = 0;
   }
 

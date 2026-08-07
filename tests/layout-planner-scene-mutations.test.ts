@@ -284,6 +284,28 @@ describe('layout-planner/scene-mutations', () => {
       expect(clone.name).toBe('belt_3');
     });
 
+    test('falls back to the catalog label when the GLB root is a glTF wrapper', () => {
+      // Assets saved before the exportAssetGlb fix really are rooted at
+      // `AuxScene_1` (one level per editor round trip). Without the fallback
+      // the placement would be labelled `AuxScene_1` in the hierarchy.
+      const h = makeHarness();
+      for (const wrapper of ['AuxScene', 'AuxScene_1', 'AuxScene_1_1', '__root__']) {
+        const clone = makeClone(wrapper);
+        h.modelRoot.add(clone);
+        resolveUniqueName(h.deps, clone, 'Gearbox Cell');
+        expect(clone.name).toBe('Gearbox Cell');
+        h.modelRoot.remove(clone);
+      }
+    });
+
+    test('a real GLB root name still wins over the catalog label', () => {
+      const h = makeHarness();
+      const clone = makeClone('belt');
+      h.modelRoot.add(clone);
+      resolveUniqueName(h.deps, clone, 'Conveyor 2m');
+      expect(clone.name).toBe('belt');
+    });
+
     test('returns silently when registry is unavailable', () => {
       const h = makeHarness();
       h.viewer.registry = null;

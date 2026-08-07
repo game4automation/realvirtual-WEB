@@ -18,11 +18,13 @@
 import { Vector2, Vector3, Object3D } from 'three';
 import type { SceneFacade } from '../rv-plugin-context';
 import type { RVViewer } from '../rv-viewer';
+import { ndcToScreen, type ScreenRect } from '../engine/rv-ndc';
 
 export class SceneFacadeImpl implements SceneFacade {
   // Pre-allocated temp vectors — GC-free hot path.
   private _tmpScreen = new Vector2();
   private _tmpV3 = new Vector3();
+  private _tmpRect: ScreenRect = { left: 0, top: 0, width: 0, height: 0 };
 
   constructor(private readonly _viewer: RVViewer) {}
 
@@ -50,8 +52,9 @@ export class SceneFacadeImpl implements SceneFacade {
     // Project: world -> NDC
     const ndc = this._tmpV3.copy(worldPoint).project(cam);
     if (ndc.z < -1 || ndc.z > 1) return null;  // behind camera or beyond far plane
-    target.x = (ndc.x + 1) * 0.5 * dom.clientWidth;
-    target.y = (-ndc.y + 1) * 0.5 * dom.clientHeight;
+    this._tmpRect.width = dom.clientWidth;
+    this._tmpRect.height = dom.clientHeight;
+    ndcToScreen(ndc.x, ndc.y, this._tmpRect, target);
     return target;
   }
 

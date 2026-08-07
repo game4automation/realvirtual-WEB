@@ -21,13 +21,14 @@
  * the extent is scaled ×1000 to millimetres to match the mm/s speed.
  */
 
-import { Box3, Vector3 } from 'three';
+import { Box3, Vector3, Quaternion } from 'three';
 import type { Object3D } from 'three';
 import {
   type MaterialFlowSelf,
   type MU,
   type TweenSpec,
 } from '../../core/material-flow/material-flow-self';
+import { muBugOffset, setMuForward } from './mu-reference';
 
 /** mm/s fallback when the belt has no configured drive (mirrors the Drive default). */
 const DEFAULT_SPEED_MM_S = 200;
@@ -59,6 +60,13 @@ export interface TransitTimer {
 // Pre-allocated scratch values — no per-call allocation.
 const _box = new Box3();
 const _v = new Vector3();
+const _q = new Quaternion();
+const _fwd = new Vector3();
+const _diff = new Vector3();
+const _swap = new Vector3();
+const _le = new Vector3(); // leading-edge entry (snap or bounds)
+const _lx = new Vector3(); // leading-edge exit  (snap or bounds)
+const _dir = new Vector3(); // unit flow direction
 
 /**
  * Resolve the belt speed (mm/s) for the DES transit time from the live belt
@@ -97,7 +105,6 @@ export function createTransitTimer(
 ): TransitTimer {
   let speed = 0.001;
   let length = 1;
-  let transitTime = 0.001;
   let entryPos: [number, number, number] = [0, 0, 0];
   let exitPos: [number, number, number] = [0, 0, 0];
 
@@ -113,42 +120,101 @@ export function createTransitTimer(
     if (!_box.isEmpty()) {
       _box.getSize(_v);
       const cx = (_box.min.x + _box.max.x) * 0.5;
-      const cy = (_box.min.y + _box.max.y) * 0.5;
       const cz = (_box.min.z + _box.max.z) * 0.5;
+      // Parts ride on the belt's TOP edge (the roller surface) — the general rule
+      // for conveyors. Using the bounds CENTRE sank parts into the rollers.
+      const top = _box.max.y;
       // Span the longest axis (the transport direction in most belt layouts).
       if (_v.x >= _v.y && _v.x >= _v.z) {
-        entry.set(_box.min.x, cy, cz); exit.set(_box.max.x, cy, cz);
+        entry.set(_box.min.x, top, cz); exit.set(_box.max.x, top, cz);
       } else if (_v.z >= _v.x && _v.z >= _v.y) {
-        entry.set(cx, cy, _box.min.z); exit.set(cx, cy, _box.max.z);
+        entry.set(cx, top, _box.min.z); exit.set(cx, top, _box.max.z);
       } else {
         entry.set(cx, _box.min.y, cz); exit.set(cx, _box.max.y, cz);
+      }
+
+      // The bounds give the two ends but NOT which is entry vs exit — plain
+      // min→max runs any belt that flows in a -world direction BACKWARDS
+      // (visible as parts moving the wrong way around a loop). Orient entry→exit
+      // along the belt's flow: its local +Z (the Conveyor flow convention — see
+      // Conveyor.ts "Material flows along its local +Z"). Projecting +Z (world)
+      // onto (exit−entry) and swapping on a negative dot makes the tween follow
+      // the real transport sense regardless of how the belt is rotated/placed.
+      belt.getWorldQuaternion(_q);
+      _fwd.set(0, 0, 1).applyQuaternion(_q);
+      if (_fwd.dot(_diff.copy(exit).sub(entry)) < 0) {
+        _swap.copy(entry); entry.copy(exit); exit.copy(_swap);
       }
     } else {
       belt.getWorldPosition(entry); exit.copy(entry);
     }
     entryPos = [entry.x, entry.y, entry.z];
     exitPos = [exit.x, exit.y, exit.z];
-
-    // Full-belt transit: length / speed. The discharge happens at the exit, so
-    // the part travels the whole belt regardless of where the sensor sits.
-    transitTime = Math.max(0.001, length / speed);
+    // Note: the transit TIME is computed lazily in the `transitTime` getter from the
+    // leading-edge (snap) distance / speed — the full-belt travel — so it stays in
+    // sync with the snap-anchored tween path; nothing time-related is cached here.
   }
 
   compute();
 
+  // Resolve the LEADING-EDGE path (entry→exit) for this transit into _le/_lx. Prefer
+  // the input/output PORT snap planes so consecutive belts share an identical
+  // hand-off point (no gap/jerk); fall back to the bounds-derived entry/exit. Lazy —
+  // ports are resolved by the time tween()/transitTime are read (onAccept), even
+  // though the timer is built in setup(). Returns true when snaps were used.
+  function leadingEdge(): boolean {
+    const inSnap = self.inputs?.()[0]?.snapNode;
+    const outSnap = self.outputs?.()[0]?.snapNode;
+    if (inSnap && outSnap) {
+      inSnap.getWorldPosition(_le);
+      outSnap.getWorldPosition(_lx);
+      // HEIGHT from the belt's TOP edge (entryPos[1] = belt-bounds max.y = roller
+      // surface) — parts ride ON the rollers. Taken from the bounds (NOT the snap Y)
+      // so it is consistent across adjacent level belts whose snap nodes may sit at
+      // slightly different heights (which used to make parts jump at the hand-off).
+      // Horizontal (X/Z) still follows the snaps (continuity + bug).
+      _le.y = _lx.y = entryPos[1];
+      return true;
+    }
+    _le.set(entryPos[0], entryPos[1], entryPos[2]);
+    _lx.set(exitPos[0], exitPos[1], exitPos[2]);
+    return false;
+  }
+
   return {
-    get transitTime(): number { return transitTime; },
+    get transitTime(): number {
+      // Travel distance = the leading-edge path length (snap-to-snap when available,
+      // so the part traverses the full pitch at belt speed, uniform across joins).
+      leadingEdge();
+      const distMm = _lx.distanceTo(_le) * METRES_TO_MM;
+      return Math.max(0.001, (distMm > 0 ? distMm : length) / speed);
+    },
     get speed(): number { return speed; },
     get length(): number { return length; },
     get entryPos(): [number, number, number] { return entryPos; },
     get exitPos(): [number, number, number] { return exitPos; },
     tween(mu: MU): TweenSpec {
+      // The MU ORIGIN rides one bug-offset BEHIND the leading edge, so its LEADING
+      // EDGE (the "Bug") — not its centre — follows the path: it never hangs over the
+      // belt end, and since belt_N.input_snap == belt_{N-1}.output_snap the origin
+      // path is continuous across the hand-off (no jump).
+      leadingEdge();
+      _dir.copy(_lx).sub(_le);
+      const len = _dir.length();
+      if (len > 1e-6) _dir.multiplyScalar(1 / len); else _dir.set(0, 0, 1);
+      // The MU now travels along this belt — record its heading as the single source
+      // of truth (SSOT) for the bug direction, then take the bug along it.
+      setMuForward(mu, _dir.x, _dir.z);
+      const bug = muBugOffset(mu);
       return {
         tween: {
           kind: 'position',
           target: (mu as { visual?: unknown }).visual ?? null,
-          from: entryPos,
-          to: exitPos,
+          // plan-262 Phase 3: the MU id rides the spec so the runner keeps the
+          // tween window for a headless MU (materialisation on FF exit).
+          muId: mu.id,
+          from: [_le.x - _dir.x * bug, _le.y - _dir.y * bug, _le.z - _dir.z * bug],
+          to: [_lx.x - _dir.x * bug, _lx.y - _dir.y * bug, _lx.z - _dir.z * bug],
         },
       };
     },

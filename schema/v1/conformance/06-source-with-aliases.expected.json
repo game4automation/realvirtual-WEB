@@ -1,0 +1,15 @@
+{
+  "description": "Source written with LEGACY field names: a conforming reader migrates SpawnInterval -> Interval and SpawnDistance -> GenerateIfDistance (aliases keyword).",
+  "nodes": {
+    "PartSource": {
+      "Source": {
+        "AutomaticGeneration": true,
+        "Interval": 5,
+        "GenerateIfDistance": 450,
+        "PlaceOnTransportSurface": true,
+        "ThisObjectAsMU": "",
+        "CollisionRoleForMUs": "None"
+      }
+    }
+  }
+}

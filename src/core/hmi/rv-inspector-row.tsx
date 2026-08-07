@@ -12,7 +12,7 @@
  * flex `minWidth/maxWidth` cannot promise once label lengths vary.
  *
  * Scalar row (4 tracks):
- *   [dot gutter] [label ≤40%] [flexible gap] [field ≤40%, right-anchored]
+ *   [dot gutter] [label ≤40%] [flexible gap] [field ≤50%, right-anchored]
  * Full-width row (`fullWidthField`, 3 tracks) — for composite editors that
  * cannot fit 40% (Vector3, editable object expander):
  *   [dot gutter] [label ≤40%] [field fills the rest]
@@ -47,9 +47,9 @@ export interface InspectorRowProps {
   trailing?: ReactNode;
   /** Row opacity (dim ignored/disabled fields). Default 1. */
   opacity?: number;
-  /** Min row height. Default 26 (editable) — pass 22 for read-only live rows. */
+  /** Min row height. Default 20 to match the hierarchy row height. */
   minHeight?: number;
-  /** Vertical padding (MUI spacing units). Default 0.375; bool rows pass 0.125. */
+  /** Vertical padding (MUI spacing units). Default 0. */
   py?: number;
   /** Wrap the row in a left-placed MUI Tooltip when set. */
   rowTooltip?: string;
@@ -67,12 +67,12 @@ export function InspectorRow({
   alignField = 'stretch',
   trailing,
   opacity = 1,
-  minHeight = 26,
-  py = 0.375,
+  minHeight = 20,
+  py = 0,
   rowTooltip,
   dense = false,
 }: InspectorRowProps) {
-  // Scalar: gutter · label(≤40%) · spacer(1fr) · field(≤40%).
+  // Scalar: gutter · label(≤40%) · spacer(1fr) · field(≤50%).
   // Full-width: gutter · label(≤40%) · field(1fr) — field spans the rest.
   const gridTemplateColumns = fullWidthField
     ? `${INSPECTOR_DOT_GUTTER}px minmax(0, ${INSPECTOR_LABEL_MAX}) 1fr`

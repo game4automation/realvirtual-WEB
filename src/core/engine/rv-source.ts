@@ -12,14 +12,16 @@ import {
 } from './rv-mu';
 import type { IMUAccessor } from './rv-mu';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponent } from './rv-component-registry';
+import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
+import type { CollisionRoleName } from './rv-collision-role';
 import { NodeRegistry } from './rv-node-registry';
 import { debug } from './rv-debug';
 import { MM_TO_METERS } from './rv-constants';
 import { buildSourceMarker } from './rv-source-marker';
 import { applyShadowFlags } from './rv-mesh-classifier';
 import type { RVTransportManager } from './rv-transport-manager';
-import type { RVTransportSurface } from './rv-transport-surface';
+import { RVTransportSurface } from './rv-transport-surface';
+import { AABB } from './rv-aabb';
 import type { EventEmitter } from '../rv-events';
 import type { ViewerEvents } from '../rv-viewer-events';
 import {
@@ -33,7 +35,77 @@ const _sourcePos = new Vector3();
 const _lastMUPos = new Vector3();
 const _placementPos = new Vector3();
 const _dischargeDir = new Vector3();
-const _identityQuat = new Quaternion();
+// Spawn orientation (Unity parity: Instantiate(template, transform.position, transform.rotation)
+// — `transform.rotation` is the WORLD rotation, so a spawned MU inherits the source's world
+// orientation instead of defaulting to identity).
+const _spawnQuat = new Quaternion();
+const _spawnParentQuat = new Quaternion();
+
+/**
+ * True when `n` carries no local transform (identity position/rotation/scale).
+ */
+export function isTransformNeutral(n: Object3D): boolean {
+  const { position: t, quaternion: q, scale: s } = n;
+  return (
+    t.x === 0 && t.y === 0 && t.z === 0 &&
+    q.x === 0 && q.y === 0 && q.z === 0 && q.w === 1 &&
+    s.x === 1 && s.y === 1 && s.z === 1
+  );
+}
+
+/**
+ * Resolve the node spawned MUs are parented to.
+ *
+ * Two invariants, both load-bearing:
+ *
+ * 1. MUs must never be added inside the source's own subtree — a self-template
+ *    source would then `clone()` a growing subtree (exponential nesting), and
+ *    every MU would ride along with the source.
+ * 2. The parent must be WORLD-ALIGNED. `RVTransportSurface` advances an MU by
+ *    adding a WORLD-space delta to `RVMovingUnit.setPosition()`, which writes
+ *    `node.position` — a LOCAL value — and eases the MU toward a WORLD-space
+ *    centre line. Both only hold while local space === world space. Parenting an
+ *    MU under a layout PLACEMENT ROOT (the planner stamps the placement pose
+ *    onto it, and since `ensureNeutralPlacementRoot()` that root may be an
+ *    inserted identity Group rather than the asset itself) makes the surface
+ *    drag the MU sideways off the belt every tick.
+ *
+ *    Placement roots are rejected STRUCTURALLY, by their `_layoutId` marker, not
+ *    by inspecting their transform: the planner stamps `_layoutId` before
+ *    `processExtras()` runs but applies the placement POSE afterwards, so at
+ *    resolve time the root still looks transform-neutral. The extra
+ *    `isTransformNeutral` check stays as a backstop for any other transformed
+ *    ancestor.
+ */
+/**
+ * True when `n` is a layout-planner placement root. Mirrors the `_layoutId`
+ * predicate used across the planner (see `layout-predicates.ts`); `_layoutObject`
+ * is set on every descendant and therefore cannot identify the root.
+ */
+export function isLayoutPlacementRoot(n: Object3D): boolean {
+  return typeof n.userData?.['_layoutId'] === 'string';
+}
+
+export function resolveSpawnParent(contextRoot: Object3D, sourceNode: Object3D): Object3D {
+  let candidate: Object3D = contextRoot;
+  for (let p: Object3D | null = contextRoot; p; p = p.parent) {
+    if (p === sourceNode) {
+      candidate = sourceNode.parent ?? contextRoot;
+      break;
+    }
+  }
+  // Walking UP can never re-enter the source's subtree, so invariant 1 holds.
+  while (
+    (isLayoutPlacementRoot(candidate) || !isTransformNeutral(candidate)) &&
+    candidate.parent
+  ) {
+    candidate = candidate.parent;
+  }
+  return candidate;
+}
+
+/** Reused spawn-gate query bounds (plan-255 F6a) — only min/max are used. */
+const _spawnAreaAABB = new AABB();
 
 /** How often (seconds) a source re-resolves what it stands on. Matches the Conveyor behavior's
  *  neighbour-refresh cadence — fast enough to react to topology changes, cheap enough to ignore. */
@@ -81,19 +153,34 @@ const _sourceFillShellMaterial = new MeshBasicMaterial({
 const _sourceEdgeMaterial = new LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 });
 
 /**
+ * Node → engine RVSource map for the DES path (off-node, see init()). Kept here
+ * (module WeakMap) instead of `userData` because Object3D.clone() JSON-serializes
+ * userData and an RVSource ref is circular. Auto-released when the node is GC'd.
+ */
+const _engineSourceByNode = new WeakMap<Object3D, RVSource>();
+
+/** Resolve the engine RVSource bound to a source LayoutObject node (or null).
+ *  The DES runner uses it to clone real MU meshes for its event-driven MUs. */
+export function getEngineSourceForNode(node: Object3D): RVSource | null {
+  return _engineSourceByNode.get(node) ?? null;
+}
+
+/** Bind an engine RVSource to a node (what `init()` does internally). Exported
+ *  for tests / custom wirings that stub the source — e.g. the DES headless-MU
+ *  materialisation path resolves its visual factory through this map. */
+export function registerEngineSourceForNode(node: Object3D, source: RVSource): void {
+  _engineSourceByNode.set(node, source);
+}
+
+/**
  * RVSource - Spawns new MU instances at regular intervals or by distance.
  *
  * Uses a template MU node from the GLB (found by name) and clones it.
  * Template is hidden at load time and used as a clone source.
  */
 export class RVSource implements RVComponent {
-  static readonly schema: ComponentSchema = {
-    AutomaticGeneration: { type: 'boolean', default: true },
-    Interval: { type: 'number', default: 0, aliases: ['SpawnInterval'] },
-    GenerateIfDistance: { type: 'number', default: 300, aliases: ['SpawnDistance'] },
-    PlaceOnTransportSurface: { type: 'boolean', default: true },
-    ThisObjectAsMU: { type: 'string', default: '' },
-  };
+  // Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
+  static readonly schema: ComponentSchema = loadSchemaFromSpec('Source');
 
   readonly node: Object3D;
   isOwner = true;
@@ -104,6 +191,10 @@ export class RVSource implements RVComponent {
   GenerateIfDistance = 300;
   PlaceOnTransportSurface = true;
   ThisObjectAsMU = '';
+  /** Collision role handed to every MU this source spawns (plan-394). It cannot
+   *  live on the MU itself: `stripComponentMetadata()` deletes the clone's
+   *  rv_extras, so the role travels via the transport manager's spawn hook. */
+  CollisionRoleForMUs: CollisionRoleName = 'None';
 
   // Derived properties (computed from schema properties)
   spawnMode: 'Interval' | 'Distance' | 'OnSignal' = 'Interval';
@@ -216,14 +307,12 @@ export class RVSource implements RVComponent {
    * via `processExtras(clone, …)` where `context.root` IS the placed source's
    * own subtree root → walking up from it reaches this source node, so we spawn
    * into the source's parent (the model root the clone was added to) instead.
+   *
+   * The result is additionally lifted to the nearest TRANSFORM-NEUTRAL ancestor
+   * — see {@link resolveSpawnParent} for why that invariant is load-bearing.
    */
   private _resolveSpawnParent(contextRoot: Object3D): Object3D {
-    let p: Object3D | null = contextRoot;
-    while (p) {
-      if (p === this.node) return this.node.parent ?? contextRoot;
-      p = p.parent;
-    }
-    return contextRoot;
+    return resolveSpawnParent(contextRoot, this.node);
   }
 
   /**
@@ -310,6 +399,14 @@ export class RVSource implements RVComponent {
 
     // Register in transport manager
     context.transportManager.sources.push(this);
+
+    // Map node → engine source so the DES path can find THIS source for
+    // on-demand mesh spawning (DES reuses RVSource.spawnMU() to give its
+    // event-driven MUs a visual — mirrors the Unity DESSource calling the normal
+    // Source.Generate()). MUST NOT go in `node.userData`: Object3D.clone()
+    // JSON-round-trips userData, and an RVSource ref is circular (→ node →
+    // userData) — it would crash every MU clone. A WeakMap keeps it off the node.
+    _engineSourceByNode.set(this.node, this);
   }
 
   /**
@@ -346,6 +443,16 @@ export class RVSource implements RVComponent {
     this.sourceIsTemplate = !templateRef || templateRef === '' ||
       templateRef === nodeName || templateRef.endsWith('/' + nodeName);
     this.muName = this.sourceIsTemplate ? nodeName : templateRef;
+  }
+
+  /** Re-derive spawn config after an inspector edit re-applied the schema.
+   *  The simulation reads the DERIVED fields (spawnMode / spawnInterval /
+   *  spawnDistance), not the raw GenerateIfDistance / Interval config — so an
+   *  edit only takes effect once these are recomputed. Idempotent and free of
+   *  subscriptions, so it is safe to call post-load.
+   *  IMPLEMENTS RVComponent::reapplyConfig */
+  reapplyConfig(): void {
+    if (this.rawExtras) this.computeSpawnConfig(this.rawExtras);
   }
 
   /** Set the template MU and pre-compute its half-size and center offset */
@@ -633,6 +740,12 @@ export class RVSource implements RVComponent {
     // held preview into empty space).
     if (mode === 'none') return null;
 
+    // Spawn gate (plan-255 F6a): when a live MU already occupies the spawn spot
+    // (a jam backed up to the source), hold this tick and retry next tick —
+    // no error, no MU stacked into a standing one. The interval timer holds
+    // too, so spawning resumes cleanly the moment the spot clears.
+    if (this._spawnPointOccupied()) return null;
+
     // Case 2 — on a ConveyorBehavior: gate purely on belt occupancy. Spawn the
     // next part only once the conveyor's surface(s) are clear (no MU on them).
     if (mode === 'conveyor') {
@@ -726,6 +839,28 @@ export class RVSource implements RVComponent {
     return out;
   }
 
+  /**
+   * True when a live MU's AABB overlaps the spawn spot (the MU template's
+   * footprint at the source's world position) — plan-255 F6a. Uses the
+   * transport manager's grid-backed occupancy query with the same candidate
+   * filters as the accumulation clamp (markedForRemoval/gripped skipped).
+   * Disabled together with the global accumulation kill-switch
+   * (`RVTransportSurface.accumulateDefault`) and without a manager/template
+   * (standalone sources keep the legacy always-spawn behavior).
+   */
+  private _spawnPointOccupied(): boolean {
+    if (!this.transportManager || !this.templateHalfSize) return false;
+    if (!RVTransportSurface.accumulateDefault) return false; // feature killed → legacy
+    this.node.getWorldPosition(_sourcePos);
+    const h = this.templateHalfSize;
+    const cx = _sourcePos.x + (this.templateLocalCenter?.x ?? 0);
+    const cy = _sourcePos.y + (this.templateLocalCenter?.y ?? 0);
+    const cz = _sourcePos.z + (this.templateLocalCenter?.z ?? 0);
+    _spawnAreaAABB.min.set(cx - h.x, cy - h.y, cz - h.z);
+    _spawnAreaAABB.max.set(cx + h.x, cy + h.y, cz + h.z);
+    return this.transportManager.isAreaOccupiedByMU(_spawnAreaAABB);
+  }
+
   /** True when any live MU sits on the conveyor's belt surface(s) (conveyor mode). */
   private _conveyorOccupied(): boolean {
     if (!this.transportManager) return false;
@@ -735,6 +870,23 @@ export class RVSource implements RVComponent {
   /** Create a new MU at this source's position (clone or instanced). When
    *  `forceClone` is true the instanced path is skipped so the MU has a real
    *  per-instance node (used by the Layout-Planner for selection). */
+  /**
+   * On-demand MU mesh spawn for the DES path (NOT time-gated, unlike `update()`).
+   * The event-driven DES runner calls this when its source generates an MU, so a
+   * DES MU gets a real visual the tween/`DESMUMover`-equivalent can drive — the
+   * same pattern as the Unity `DESSource.GenerateMU()` reusing `Source.Generate()`.
+   * Clone path (forceClone) so the DES runner owns each MU's lifecycle simply
+   * (no shared instancing pool to reconcile). Returns null if no template.
+   */
+  spawnMU(): (RVMovingUnit | InstancedMovingUnit) | null {
+    return this.spawn(true);
+  }
+
+  /** Despawn a DES-spawned MU mesh (sink consumed it / reset). Safe on null. */
+  despawnMU(mu: (RVMovingUnit | InstancedMovingUnit) | null): void {
+    mu?.dispose();
+  }
+
   private spawn(forceClone = false): (RVMovingUnit | InstancedMovingUnit) | null {
     if (!this.muTemplate || !this.spawnParent || !this.templateHalfSize) return null;
 
@@ -746,9 +898,11 @@ export class RVSource implements RVComponent {
       }
 
       this.node.getWorldPosition(_sourcePos);
+      // World rotation, not identity — the pool places instances in world space.
+      this.node.getWorldQuaternion(_spawnQuat);
       const muId = `imu_${this.node.name}_${this.muIdCounter++}`;
 
-      const mu = this.pool.spawn(_sourcePos, _identityQuat, muId, this.node.name);
+      const mu = this.pool.spawn(_sourcePos, _spawnQuat, muId, this.node.name);
       this.lastSpawnedMU = mu;
       this.spawnCount++;
       return mu;
@@ -761,6 +915,15 @@ export class RVSource implements RVComponent {
     // Position at source location (convert world → spawnParent local space)
     this.node.getWorldPosition(clone.position);
     this.spawnParent.worldToLocal(clone.position);
+
+    // Keep the source's WORLD orientation (Unity parity). `Object3D.clone()` copies the
+    // template's LOCAL quaternion, but the clone is re-parented under `spawnParent` — so on a
+    // rotated import (Z-up→Y-up conversion sits in the ancestors) the template's parent chain
+    // is lost and the MU would spawn visibly twisted. Convert world → spawnParent local space,
+    // mirroring the position handling above.
+    this.node.getWorldQuaternion(_spawnQuat);
+    this.spawnParent.getWorldQuaternion(_spawnParentQuat);
+    clone.quaternion.copy(_spawnParentQuat.invert()).multiply(_spawnQuat);
 
     this.spawnParent.add(clone);
 
@@ -860,8 +1023,8 @@ registerComponent({
   type: 'Source',
   schema: RVSource.schema,
   capabilities: {
+    authorable: true,   // addable in the asset editor (schema-complete)
     badgeColor: '#ab47bc',
-    simulationActive: true,
   },
   create: (node) => new RVSource(node),
 });

@@ -31,6 +31,7 @@
 
 import { Vector3, Quaternion } from 'three';
 import { lastPathSegment } from '../core/engine/rv-constants';
+import { setRemoteOwnershipActive } from '../core/engine/rv-slot-authority';
 import { RVBehavior } from '../core/rv-behavior';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import { AvatarManager } from '../core/engine/rv-avatar-manager';
@@ -117,6 +118,31 @@ export function getSharedViewSnapshot(): SharedViewSnapshot {
   return _sharedViewSnapshot;
 }
 
+// ── Transport injection (plan-320 Phase 3) ──────────────────────────────────
+
+/**
+ * Minimal WebSocket surface the plugin uses — injectable for tests. The
+ * default factory returns a native browser WebSocket; tests replace
+ * {@link MultiuserPlugin.transportFactory} with a mock whose handlers they
+ * drive directly (`rv-shared-view.test.ts` documents why the private `_ws`
+ * made the plugin untestable before).
+ */
+export interface MultiuserTransport {
+  readyState: number;
+  send(data: string): void;
+  close(): void;
+  onopen: (() => void) | null;
+  onmessage: ((e: { data: string }) => void) | null;
+  onerror: (() => void) | null;
+  onclose: (() => void) | null;
+}
+
+/** Creates the transport for a server URL (default: native WebSocket). */
+export type MultiuserTransportFactory = (url: string) => MultiuserTransport;
+
+/** WebSocket.OPEN — local constant so mock transports need no global WebSocket. */
+const WS_OPEN = 1;
+
 // ── Default configuration ────────────────────────────────────────────────────
 
 const DEFAULT_PORT = 7000;
@@ -146,8 +172,16 @@ export class MultiuserPlugin extends RVBehavior {
   private _localRole: string = 'observer';
   private _joinCode: string = '';
 
+  /**
+   * Injectable transport factory (plan-320 Phase 3) — the smallest production
+   * change that makes the plugin testable. Production keeps the native
+   * WebSocket; tests assign a mock factory BEFORE joinSession()/onStart().
+   */
+  transportFactory: MultiuserTransportFactory =
+    (url) => new WebSocket(url) as unknown as MultiuserTransport;
+
   // ── WebSocket state ──
-  private _ws: WebSocket | null = null;
+  private _ws: MultiuserTransport | null = null;
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _destroyed = false;
   private _inRoom = false;
@@ -324,6 +358,11 @@ export class MultiuserPlugin extends RVBehavior {
       }
     }
 
+    // Leaving the session ends remote ownership deterministically. (A mere
+    // transport drop keeps it raised — reconnect resumes the same authority;
+    // a model switch clears it via resetSlotAuthority() in clearModel().)
+    setRemoteOwnershipActive(false);
+
     this._emitChanged();
   }
 
@@ -334,7 +373,7 @@ export class MultiuserPlugin extends RVBehavior {
 
   /** True while the WebSocket is open and the room_join handshake has been sent. */
   get isConnected(): boolean {
-    return this._ws?.readyState === WebSocket.OPEN && this._inRoom;
+    return this._ws?.readyState === WS_OPEN && this._inRoom;
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -438,7 +477,7 @@ export class MultiuserPlugin extends RVBehavior {
     this._emitChanged();
 
     try {
-      this._ws = new WebSocket(this._serverUrl);
+      this._ws = this.transportFactory(this._serverUrl);
     } catch {
       this._status = 'error';
       this._statusMessage = 'Invalid server URL';
@@ -532,12 +571,12 @@ export class MultiuserPlugin extends RVBehavior {
   }
 
   private _sendLeave(): void {
-    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+    if (!this._ws || this._ws.readyState !== WS_OPEN) return;
     this._send({ type: 'room_leave' });
   }
 
   private _sendAvatarUpdate(): void {
-    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+    if (!this._ws || this._ws.readyState !== WS_OPEN) return;
     if (!this.viewer) return;
 
     const xr = this._getXRPlugin();
@@ -593,7 +632,7 @@ export class MultiuserPlugin extends RVBehavior {
   }
 
   private _send(payload: object): void {
-    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+    if (!this._ws || this._ws.readyState !== WS_OPEN) return;
     try {
       this._ws.send(JSON.stringify(payload));
     } catch {
@@ -749,15 +788,21 @@ export class MultiuserPlugin extends RVBehavior {
     const drives = msg['drives'] as DriveSnapshot[] | undefined;
     const players = msg['players'] as PlayerInfo[] | undefined;
 
+    // Atomic snapshot (plan-320 R4-1): adopt remote ownership BEFORE the first
+    // signal dispatch. Any listener fired by a snapshot signal already observes
+    // the remote-owned state (drives non-owner, service flag raised) — the
+    // pre-plan-320 order applied signals first and adopted drive ownership
+    // only afterwards in _applyDriveSync(). Narrow viewer stubs without a
+    // drives array (writer-inventory suite) keep pure observation behavior.
+    if (this.viewer?.drives) {
+      setRemoteOwnershipActive(true);
+      this._buildDriveMap();
+    }
+
     // Apply signal values via the viewer's signal store
     if (signals && this.viewer) {
-      const store = (this.viewer as unknown as Record<string, unknown>)['signalStore'] as
-        | { setByPath(path: string, value: boolean | number): void }
-        | undefined;
-      if (store) {
-        for (const sig of signals) {
-          store.setByPath(sig.path, sig.value);
-        }
+      for (const sig of signals) {
+        this.signalWriter?.setByPath(sig.path, sig.value);
       }
     }
 
@@ -783,7 +828,12 @@ export class MultiuserPlugin extends RVBehavior {
    * Also stops any running DrivesPlayback (server is now authority for drive positions).
    */
   private _buildDriveMap(): void {
-    if (this._driveMap || !this.viewer) return;
+    // Tolerate narrow viewer test doubles without a drives array (the writer
+    // inventory suite drives snapshots through such a stub).
+    if (this._driveMap || !this.viewer?.drives) return;
+    // Server becomes the write authority — raise the upstream ownership layer
+    // (also covers drive_sync-only sessions without a state_snapshot).
+    setRemoteOwnershipActive(true);
     this._driveMap = new Map();
     const reg = this.viewer.registry;
 

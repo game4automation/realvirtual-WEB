@@ -35,24 +35,32 @@ export class SensorMonitorPlugin implements RVViewerPlugin {
     this.viewer = viewer;
     this.sensors = viewer.transportManager?.sensors ?? [];
 
-    // Event-based: wrap sensor.onChanged callback (NOT 60Hz polling)
+    // Event-based: additive listener API preserves the public onChanged callback.
     for (const sensor of this.sensors) {
-      const originalOnChanged = sensor.onChanged;
-      sensor.onChanged = (occupied, s) => {
-        // Preserve original callback (SignalStore update)
-        originalOnChanged?.(occupied, s);
+      const listener = () => {
+        const occupied = sensor.occupied;
+        const s = sensor;
         // Emit event
         const path = (s.node.userData?.rv as Record<string, unknown> | undefined)?.['path'] as string
           ?? s.node.name;
         this.eventHistory.push({ sensorPath: path, occupied, time: this.elapsed });
+        // Payload is ADDITIVE (plan-259 sensor→MU bridge): `mu` carries a
+        // value-safe reference to the occupying MU (engine-wide numeric id +
+        // display name) so consumers (StopOnExit, script SDK) can resolve the
+        // actual MU. Old consumers reading only `occupied` are unaffected.
+        const occMu = occupied ? s.occupiedMU : null;
         this.viewer?.emit('component-event', {
           componentType: 'sensor',
           kind: 'changed',
           path,
-          payload: { occupied },
+          payload: {
+            occupied,
+            mu: occMu ? { id: occMu.id, type: occMu.getName() } : null,
+          },
         });
       };
-      this.cleanups.push(() => { sensor.onChanged = originalOnChanged; });
+      sensor.addFeedbackListener(listener);
+      this.cleanups.push(() => sensor.removeFeedbackListener(listener));
     }
   }
 

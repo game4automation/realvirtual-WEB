@@ -40,10 +40,15 @@ second adapter later if a use case needs it.
 A component is **one call** to `defineLibraryComponent(def)` in one file. The `def` is a plain
 object with named blocks. Here is the skeleton (Conveyor, simplified):
 
+**Simplified** — the `SIGNALS` contract below is cut to two entries so the
+skeleton stays readable. The real Conveyor declares four
+(`Run`, `Occupied`, `Running`, `PartCount`), which is the full material-flow
+contract described under *The interlock* further down.
+
 ```ts
 import { defineLibraryComponent, createTransitTimer, type RV } from './_shared/behavior-kit';
 
-const SIGNALS = { Run:'PLCInputBool', Occupied:'PLCOutputBool' } as const;  // the PLC contract
+const SIGNALS = { Run:'PLCInputBool', Occupied:'PLCOutputBool' } as const;  // simplified PLC contract
 
 interface ConveyorLocal { belt: RV.Node | null; partAtSensor: boolean; /* … */ }
 type ConveyorSelf = RV.Self<ConveyorLocal, typeof SIGNALS>;
@@ -193,11 +198,13 @@ Every block receives the same per-instance `self`, a facade over the runtime:
 | `self.state`, `self.setState(name)` | the FSM string |
 | `self.findTransport() / findSensor() / findRotaryDrive()` | resolve a convention node under the root |
 | `self.attachBelt(node) / attachDrive(node)` | a lazy belt/drive handle (`run`, `moveTo`, `isAtTarget`) |
+| `self.addComponent(node, type, wiring?)` | Unity-style AddComponent: attach a drive behavior model (`Drive_Simple`, `Drive_DestinationMotor`) to a drive node. Pass `wiring` to connect slots to signals created with `self.addSignal` (the explicit, readable form used by Conveyor/Turntable); slots left unwired are created from the component schema's `signal:` markers. Either way the result is identical to a GLB import (rv_extras stamp with ComponentReferences) |
+| `self.addSignal(node, slot, plcType, opts?)` | Unity-style AddSignal: create ONE signal for this component. The leaf lands in the component root's single `Signals` folder as `<node>.<slot>` (or under `opts.at` for any other hierarchy level), is registered in store + hierarchy and returns a handle whose `path` wires straight into a component property |
 | `self.surfaceOccupied(node)` | is a MU physically on this surface? |
 | `self.downstreamInterlock()` | the cached `{ occupied() }` reader for the downstream neighbour |
 | `self.declareFlowSignals()` | declare the standard 4 material-flow signals `Flow.*` (when not using a `signals` block) |
 | `self.disable(reason)` | abort binding (warns, skips the adapters) |
-| `self.outputs() / inputs() / freeOutputs()` | port connections from the snap graph |
+| `self.outputs() / inputs() / freeOutputs(mu?)` | port connections from the snap graph. `freeOutputs(mu?: MU): Port[]` takes the MU being routed as an optional argument, so a router can pick a port that fits *this* part (see `ChainTransfer.ts`, `self.freeOutputs(mu)[0]`) |
 | `self.transfer(mu, port?)` | hand a MU downstream (DES handshake; continuous: inert) |
 | `self.spawn()` | mint a new MU (Source) |
 | `self.in(delay, hook, mu?) / at(time, hook, mu?)` | schedule a DES event (continuous: inert) |
@@ -287,6 +294,10 @@ separate `partAtSensor` discharge trigger (and the part counter) and does **not*
 | `surface-occupancy.ts` | `isSurfaceOccupied(viewer, node)` |
 | `snap-graph-helpers.ts` | port topology: `classifyConnections`, `listOwnSnaps`, `findOutputPairings` |
 | `turntable-angle-math.ts` | rotary alignment / dispatch angles |
+| `aas-link.ts` | attach an Asset Administration Shell link to a node at runtime, in the same representation the GLB loader emits for an authored Unity `AASLink` |
+| `drive-des.ts` | the generic drive-level DES motion primitive: given a target axis position, compute the move time, schedule the completion event and build the tween. DES-only — guard on `self.mode === 'des'` |
+| `mu-reference.ts` | the MU's mutable travel state: its `forward` direction and the derived leading-edge ("Bug") offset used to place parts at transfer edges |
+| `robot-ik-des.ts` | DES tweens for robot axis moves (`RVRobotIK` axis phases → `TweenSpec`) |
 
 Trivial one-line rules and small constants stay **inline in the component** (so it reads top to
 bottom); only genuinely reusable, non-trivial machinery goes in `_shared/`.
@@ -300,8 +311,12 @@ bottom); only genuinely reusable, non-trivial machinery goes in `_shared/`.
    - resolve nodes + set defaults + build the menu in **`setup`** (runs on both paths);
    - wire triggers + apply physical effects in **`continuous`**;
    - add the event-driven version in **`des`**.
-4. Export both: `export const MyThingFlow = def;` (the DES runner/tests read the raw def) and
-   `export default defineLibraryComponent(def);` (the auto-discovered runnable Behavior).
+4. Export the default — `export default defineLibraryComponent(def);` — which is what
+   auto-discovery picks up. **Additionally** export the raw def
+   (`export const MyThingFlow = def;`) when the DES runner or your tests need to reach
+   into `def.logic` / `def.des` / `def.setup` directly, as Conveyor and Turntable do.
+   It is not universal: `Source.ts` and `Sink.ts` export only the default (they pass
+   `{ inert: true }` and have no separate `*Flow` export).
 5. Coordinate with neighbours by publishing/reading `Flow.Occupied[@id]` (set `signalNamespace: 'Flow'`).
 6. Add a test under `tests/` (a continuous parity test + a `tests/des/` timing test).
 
@@ -314,7 +329,8 @@ export default MyThingBehavior;                 // 3
 ```
 
 1. exports the **raw definition** — the DES runner and the unit tests reach into `def.logic` /
-   `def.des` / `def.setup` directly (they don't go through the runnable Behavior).
+   `def.des` / `def.setup` directly (they don't go through the runnable Behavior). **Optional:**
+   `Source.ts` and `Sink.ts` skip this line entirely and export only the default.
 2. `defineLibraryComponent(def)` turns the data `def` into a runnable **Behavior**: it registers the
    schema + inspector badge and builds the `bind()` the continuous runner calls. Pass
    `{ inert: true }` for a source/sink, or `{ badge, capabilities }` to override the defaults.

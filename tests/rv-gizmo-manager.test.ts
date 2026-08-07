@@ -4,6 +4,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Scene, Mesh, BoxGeometry, Group } from 'three';
 import { GizmoOverlayManager } from '../src/core/engine/rv-gizmo-manager';
+import { createStatusHighlightGizmos } from '../src/core/engine/rv-error-visual';
 
 describe('GizmoOverlayManager', () => {
   let scene: Scene;
@@ -153,5 +154,50 @@ describe('GizmoOverlayManager', () => {
     expect(entry.color).toBe(0x00ff00);
     expect(entry.baseOpacity).toBeCloseTo(0.8);
     expect(entry.blinkHz).toBe(2);
+  });
+
+  it('tick returns false with no blinking entries and true on a phase flip', () => {
+    const n = new Mesh(new BoxGeometry());
+    scene.add(n);
+    expect(mgr.tick(16)).toBe(false); // no entries at all
+    mgr.create(n, { shape: 'transparent-shell', color: 0xff0000, opacity: 0.5, blinkHz: 0 });
+    expect(mgr.tick(16)).toBe(false); // entry exists, but nothing blinks
+
+    mgr.create(n, { shape: 'mesh-glow-hull', color: 0xff0000, opacity: 1.0, blinkHz: 4 });
+    // Spin across enough wall-clock time to hit at least one phase flip.
+    let sawChange = false;
+    for (let i = 0; i < 40 && !sawChange; i++) {
+      sawChange = mgr.tick(16);
+      const t0 = performance.now();
+      while (performance.now() - t0 < 15) { /* spin */ }
+    }
+    expect(sawChange).toBe(true);
+  });
+
+  describe('createStatusHighlightGizmos (shared fill + edges status highlight)', () => {
+    it('creates fill + edges in one color, status category, raycast-excluded', () => {
+      const n = new Mesh(new BoxGeometry());
+      scene.add(n);
+      const handles = createStatusHighlightGizmos(mgr, n, 0xffb300);
+      expect(handles.length).toBe(2);
+      const entries = handles.map((h) => (mgr as any)._entries.get(h.id));
+      expect(entries.map((e) => e.shape)).toEqual(['mesh-overlay', 'mesh-edges']);
+      for (const e of entries) {
+        expect(e.color).toBe(0xffb300);
+        expect(e.category).toBe('status');
+        expect(e.excludeFromRaycast).toBe(true);
+        expect(e.blinkHz).toBe(0);
+        expect(e.depthTest).toBe(false);
+      }
+    });
+
+    it('disposing all handles removes every entry', () => {
+      const n = new Mesh(new BoxGeometry());
+      scene.add(n);
+      const handles = createStatusHighlightGizmos(mgr, n, 0x9c27b0);
+      expect((mgr as any)._entries.size).toBe(2);
+      for (const h of handles) h.dispose();
+      expect((mgr as any)._entries.size).toBe(0);
+    });
   });
 });
