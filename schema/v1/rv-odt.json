@@ -689,7 +689,8 @@
             "Workpiece",
             "Machine",
             "Robot",
-            "Environment"
+            "Environment",
+            "Cutter"
           ],
           "default": "None",
           "description": "Collision role assigned to every MU spawned by this source. 'None' = spawned MUs take part in no collision check."
@@ -834,6 +835,154 @@
         }
       }
     },
+    "SceneButtonBase": {
+      "type": "object",
+      "description": "Click/hover state machine of a 3D scene button. Sits on the node that carries the collider in Unity (OnMouseDown) and drives its SceneButtonMoveable cap. Field names keep the Unity camelCase spelling.",
+      "properties": {
+        "moveable": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "SceneButtonMoveable this state machine animates and lights (wire componentType realvirtual.SceneButtonMoveable)."
+        },
+        "autoLight": {
+          "type": "boolean",
+          "default": true,
+          "description": "Light follows the button's own active state. Wrappers set it to false when a lightSignal drives the light instead."
+        },
+        "isToggle": {
+          "type": "boolean",
+          "default": false,
+          "description": "Button latches on click instead of releasing after simpleClickTime."
+        },
+        "simpleClickTime": {
+          "type": "number",
+          "default": 0.5,
+          "unit": "s",
+          "description": "Hold time of a non-toggle (momentary) click before the button releases again."
+        }
+      }
+    },
+    "SceneButtonMoveable": {
+      "type": "object",
+      "description": "Animated cap of a 3D scene button: press/rotate offset along an axis plus the lit/unlit material pair. Field names keep the Unity camelCase spelling.",
+      "properties": {
+        "axis": {
+          "$ref": "#/$defs/Vector3",
+          "unityCoords": true,
+          "description": "Local movement axis of the cap; translation direction, or rotation axis when angularMovement is set."
+        },
+        "moveSpeed": {
+          "type": "number",
+          "default": 30,
+          "description": "Exponential approach rate of the cap towards its offset target (per second)."
+        },
+        "hoverOffset": {
+          "type": "number",
+          "default": 0.1,
+          "description": "Additional offset applied while the pointer hovers the button (metres, or degrees when angularMovement is set)."
+        },
+        "activeOffset": {
+          "type": "number",
+          "default": 0.05,
+          "description": "Offset the cap holds while the button is active (metres, or degrees when angularMovement is set)."
+        },
+        "mirrorHoverOffset": {
+          "type": "boolean",
+          "default": false,
+          "description": "Invert the hover offset while the button is active (handle switches that flip the other way)."
+        },
+        "angularMovement": {
+          "type": "boolean",
+          "default": false,
+          "description": "Rotate the cap around axis by offset degrees instead of translating it."
+        }
+      },
+      "rawFields": {
+        "baseMaterial": {
+          "type": "object",
+          "description": "Unity material descriptor {name, assetPath, shader} of the unlit state; read raw. Only the name is used - equal base/active names mean the button has no light."
+        },
+        "activeMaterial": {
+          "type": "object",
+          "description": "Unity material descriptor {name, assetPath, shader} of the lit state; read raw. Only the name is used - equal base/active names mean the button has no light."
+        },
+        "renderer": {
+          "type": "object",
+          "description": "Unity MeshRenderer reference of the cap; read raw and ignored - the cap mesh is found by traversing the node."
+        },
+        "currentOffset": {
+          "type": "number",
+          "description": "Unity runtime state (current animated offset); read raw and ignored - the viewer keeps its own."
+        }
+      }
+    },
+    "PushButton3D": {
+      "type": "object",
+      "description": "3D push button: writes a PLCInputBool while pressed (momentary or latching) and lights its cap either from its own state or from a PLCOutputBool. Field names keep the Unity camelCase spelling.",
+      "properties": {
+        "stateSignal": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Bool signal written by the operator click."
+        },
+        "lightSignal": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Bool signal driving the button light. Unset = the light follows the button's own state."
+        },
+        "label": {
+          "type": "string",
+          "description": "Button caption. Rendered only where the model carries a text mesh; otherwise informational."
+        },
+        "timer": {
+          "type": "number",
+          "default": 0.5,
+          "unit": "s",
+          "description": "Hold time of a momentary click before the button releases again (ignored when toggle is set)."
+        },
+        "toggle": {
+          "type": "boolean",
+          "default": false,
+          "description": "Button latches on click instead of releasing after timer."
+        },
+        "activeOnStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Button clicks itself once when the scene is ready."
+        }
+      }
+    },
+    "EmergencyButton3D": {
+      "type": "object",
+      "description": "3D emergency-stop button: latching mushroom head writing a PLCInputBool. Comfort trigger/status only - never a substitute for a hard-wired emergency stop.",
+      "properties": {
+        "stateSignal": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Bool signal written by the operator click."
+        },
+        "activeOnStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Button clicks itself once when the scene is ready."
+        }
+      }
+    },
+    "HandleSwitch3D": {
+      "type": "object",
+      "description": "3D handle switch: latching lever writing a PLCInputBool.",
+      "properties": {
+        "stateSignal": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Bool signal written by the operator click."
+        },
+        "activeOnStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Switch clicks itself once when the scene is ready."
+        }
+      }
+    },
     "EnergyChain": {
       "type": "object",
       "description": "Turns a rigid CAD energy-chain (cable carrier) mesh into an animated chain: straight strand, half-circle bend travelling at half the follower speed, constant length. Drive axis, bend radius, link height and chain length are MEASURED from the CAD rest pose; every numeric field left at 0 means auto-calibrate.",
@@ -894,10 +1043,143 @@
             "Workpiece",
             "Machine",
             "Robot",
-            "Environment"
+            "Environment",
+            "Cutter"
           ],
           "default": "None",
-          "description": "Collision role of this node's subtree. Bodies of different roles are checked against each other; identical roles never collide. 'None' = not checked."
+          "description": "Collision role of this node's subtree. Bodies of different roles are checked against each other; identical roles never collide. 'None' = not checked. 'Cutter' marks a cutting tool: its contact with a workpiece being machined by it is suppressed while the spindle runs."
+        }
+      }
+    },
+    "MachiningVolume": {
+      "type": "object",
+      "description": "Workpiece with real-time CSG material removal: an SDF voxel grid that the listed MachiningTools subtract from every tick (result = max(workpiece, -sweptTool)). The changed 16^3 chunks are re-tessellated into per-chunk meshes. Requires the private machining provider (rv_csg WASM kernel); without it the authored mesh stays untouched.",
+      "properties": {
+        "gridResolution": {
+          "$ref": "#/$defs/Vector3",
+          "default": { "x": 64, "y": 64, "z": 64 },
+          "description": "Voxel lattice resolution (x/y/z), including one padding voxel per side. Clamped to 4..256 per axis. Memory and cost scale with the product - 64^3 is the interactive default, 128^3 is usable with a visible mesh lag."
+        },
+        "workpieceSize": {
+          "$ref": "#/$defs/Vector3",
+          "default": { "x": 200, "y": 100, "z": 200 },
+          "unit": "mm",
+          "description": "Stock dimensions in millimeters (no coordinate flip - this is an extent, not a position). Ignored when Shape is Mesh, where the domain follows the render geometry's bounds."
+        },
+        "Shape": {
+          "type": "string",
+          "enum": ["Box", "Cylinder", "Mesh"],
+          "default": "Box",
+          "readonly": true,
+          "description": "Starting stock shape - this defines the MATERIAL, not the display mesh. Mesh voxelizes the node's own render geometry (WYSIWYG); the Unity StockMesh reference is not transferred. Read-only: the bare field name 'Shape' is shared with MachiningTool, so the generic enum editor cannot offer the right options."
+        },
+        "CylinderAxis": {
+          "type": "string",
+          "enum": ["X", "Y", "Z"],
+          "default": "X",
+          "description": "Axis a Cylinder workpiece lies along (X or Z = lying, Y = upright)."
+        },
+        "Tools": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ComponentReference" },
+          "default": [],
+          "description": "MachiningTool references that cut this volume, IN ORDER - the subtraction is sequential, so the order is part of the result."
+        },
+        "ToolGroup": {
+          "type": "string",
+          "default": "",
+          "description": "Optional group name: every MachiningTool whose node carries this group is registered in addition to the explicit Tools list. Leave empty to use only the list."
+        },
+        "SweepToolMotion": {
+          "type": "boolean",
+          "default": true,
+          "description": "Subtract the swept volume between two ticks so fast feed cuts a continuous groove instead of a dotted line."
+        },
+        "MaxSweepSubsteps": {
+          "type": "number",
+          "default": 16,
+          "description": "Upper bound of tool poses sampled per tick along the motion path, per tool. The actual count follows a half-voxel sampling density."
+        },
+        "Meshing": {
+          "type": "string",
+          "enum": ["MarchingCubes", "DualContouring"],
+          "default": "MarchingCubes",
+          "description": "Surface extraction: MarchingCubes (robust default, edges rounded within one voxel) or DualContouring (sharper edges, experimental)."
+        },
+        "CreaseAngle": {
+          "type": "number",
+          "default": 35,
+          "unit": "deg",
+          "description": "Hard-edge threshold in degrees. Incident faces diverging by more than this get a duplicated, unsmoothed vertex. 0 disables crease splitting (fully smooth)."
+        },
+        "GenerateUVs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Generate triplanar UV coordinates for the machined chunk meshes."
+        },
+        "StatisticsInterval": {
+          "type": "number",
+          "default": 0.25,
+          "unit": "s",
+          "description": "Seconds between MaterialRemainingPercent refreshes (a full-grid solid-voxel scan)."
+        },
+        "UpdateCollider": {
+          "type": "boolean",
+          "default": false,
+          "readonly": true,
+          "description": "Unity-only. realvirtual WEB v1 does not rebuild physics colliders for machined chunks; the flag is shown for parity and has no effect."
+        },
+        "SignalSpindleOn": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Spindle running - material is only removed while this is true. Unbound = always cutting."
+        },
+        "SignalReset": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Rising edge resets the workpiece to its original state (queued cuts are discarded)."
+        },
+        "SignalMachiningActive": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Written by the viewer: true while cuts or mesh rebuilds are still outstanding. Momentary state, not a latch."
+        }
+      }
+    },
+    "MachiningTool": {
+      "type": "object",
+      "description": "Cutter geometry for CSG material removal. Pure data - the node's world pose per tick defines where it cuts; a MachiningVolume must list it (or its group) to have any effect.",
+      "properties": {
+        "Shape": {
+          "type": "string",
+          "enum": ["Sphere", "Cylinder", "BallNose", "Torus", "ConicalEnd"],
+          "default": "Cylinder",
+          "readonly": true,
+          "description": "Cutter shape, evaluated as an analytic signed distance function. Read-only: the bare field name 'Shape' is shared with MachiningVolume, so the generic enum editor cannot offer the right options."
+        },
+        "ToolDiameter": {
+          "type": "number",
+          "default": 10,
+          "unit": "mm",
+          "description": "Cutter diameter in millimeters."
+        },
+        "ToolLength": {
+          "type": "number",
+          "default": 50,
+          "unit": "mm",
+          "description": "Cutter length/height in millimeters (cylindrical shapes)."
+        },
+        "CornerRadius": {
+          "type": "number",
+          "default": 2,
+          "unit": "mm",
+          "description": "Corner radius in millimeters - used by BallNose and Torus."
+        },
+        "TaperAngleDeg": {
+          "type": "number",
+          "default": 15,
+          "unit": "deg",
+          "description": "Taper half-angle in degrees - used by ConicalEnd."
         }
       }
     },
@@ -2526,6 +2808,190 @@
         }
       }
     },
+    "KinematicMechanism": {
+      "type": "object",
+      "description": "Container and constraint solver for a closed or open RIGID-BODY kinematic chain built from KinematicJoint components (plan-404). Distinct from the 'Kinematic' component above, which is a hierarchy re-structuring directive for the older axis-group system — a mechanism solves a joint graph with loop closure and free bodies instead. Collects every KinematicJoint in its subtree; actively driven joints (KinematicJoint.DrivenBy) are boundary conditions, all remaining generalized coordinates are solved once per fixed update.",
+      "properties": {
+        "SolverIterations": {
+          "type": "number",
+          "default": 4,
+          "description": "Fixed number of damped Newton-Raphson iterations per tick. Kept constant for determinism."
+        },
+        "Damping": {
+          "type": "number",
+          "default": 0.01,
+          "description": "Damped-least-squares damping factor guarding against Jacobian singularities."
+        },
+        "Tolerance": {
+          "type": "number",
+          "default": 0.001,
+          "unit": "mm",
+          "description": "Normalized constraint residual tolerance for the Converged flag."
+        },
+        "SignalConverged": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputBool",
+          "description": "Optional PLC diagnosis signal mirroring Converged."
+        },
+        "Converged": {
+          "type": "boolean",
+          "default": true,
+          "readonly": true,
+          "description": "True when the last solve met Tolerance. Written by the solver."
+        },
+        "ResidualError": {
+          "type": "number",
+          "default": 0,
+          "readonly": true,
+          "unit": "mm",
+          "description": "Max normalized constraint residual of the last solve. Written by the solver."
+        },
+        "SolveTimeMs": {
+          "type": "number",
+          "default": 0,
+          "readonly": true,
+          "unit": "ms",
+          "description": "Wall-clock duration of the last solve. Written by the solver."
+        }
+      }
+    },
+    "KinematicJoint": {
+      "type": "object",
+      "description": "Declarative, purely kinematic joint connecting two rigid links of a KinematicMechanism (plan-404). No physics involved — pure data consumed by the mechanism solver. Connected links need NOT be parented to each other, which is what makes closed loops expressible.",
+      "properties": {
+        "JointType": {
+          "enum": [
+            "Revolute",
+            "Prismatic",
+            "Spherical",
+            "Universal"
+          ],
+          "default": "Revolute",
+          "description": "Constraint kind. Only Revolute (1 rotational DOF about AxisA) and Prismatic (1 translational DOF along AxisA) can become spanning-tree edges; Spherical (3 DOF ball) and Universal (2 DOF cardan) are always loop-closure constraints."
+        },
+        "BodyA": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "First connected link. NORMATIVE (plan-404 §2.4): an ABSENT key means the joint is anchored against WORLD/static space — this is the authored world-anchor semantics, not a defect, because the Unity GLB serializer omits null fields entirely. A key that IS present but does not resolve is an error (finding UnresolvedBody), never silently treated as a world anchor."
+        },
+        "BodyB": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Second connected link. Required — a joint always needs a moving link on this side. An absent BodyB yields the MissingBodyB error finding."
+        },
+        "AnchorA": {
+          "$ref": "#/$defs/Vector3",
+          "unityCoords": true,
+          "unit": "mm",
+          "description": "Joint anchor point in Body A local space."
+        },
+        "AnchorB": {
+          "$ref": "#/$defs/Vector3",
+          "unityCoords": true,
+          "unit": "mm",
+          "description": "Joint anchor point in Body B local space. Should coincide with AnchorA in world space; a gap beyond tolerance yields the AnchorsApart warning."
+        },
+        "AxisA": {
+          "$ref": "#/$defs/Vector3",
+          "unityCoords": true,
+          "description": "Joint axis in Body A local space (Revolute, Prismatic, Universal). Unused by Spherical."
+        },
+        "SecondaryAxisB": {
+          "$ref": "#/$defs/Vector3",
+          "unityCoords": true,
+          "description": "Second joint axis in Body B local space (Universal/cardan only). Unset on a Universal joint yields the MissingSecondaryAxis warning."
+        },
+        "UseLimits": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the joint value is clamped between LowerLimit and UpperLimit. Only Revolute and Prismatic have a single scalar value a limit can clamp."
+        },
+        "LowerLimit": {
+          "type": "number",
+          "default": -180,
+          "description": "Lower limit in degrees (Revolute) or millimeters (Prismatic)."
+        },
+        "UpperLimit": {
+          "type": "number",
+          "default": 180,
+          "description": "Upper limit in degrees (Revolute) or millimeters (Prismatic)."
+        },
+        "DrivenBy": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Optional Drive that actively controls this joint value. Absent = passive joint solved by the mechanism."
+        },
+        "CurrentValue": {
+          "type": "number",
+          "default": 0,
+          "readonly": true,
+          "description": "Current joint value in degrees (Revolute/Universal) or millimeters (Prismatic). Written by the solver."
+        }
+      }
+    },
+    "MechanismBody": {
+      "type": "object",
+      "description": "Rigid-body mass properties of ONE link of a KinematicMechanism, used by the inverse-dynamics force analysis (plan-412). Place it on a link node. Mass, centre of mass and inertia tensor are computed from the geometry the link owns (its subtree minus any other link's subtree) times the effective density; Mass and COM can be overridden. Distinct from JTData.Mass, which is read-only CAD provenance whose unit is not recorded in the file and is therefore only ever offered as a suggestion, never applied automatically. A link WITHOUT this component disables the force analysis for its whole mechanism (the kinematic solve is unaffected).",
+      "properties": {
+        "DensityPreset": {
+          "enum": [
+            "steel",
+            "stainless",
+            "aluminum",
+            "pa",
+            "pom",
+            "custom"
+          ],
+          "default": "steel",
+          "description": "Material preset the density is taken from. Choose 'custom' to enter DensityKgM3 directly."
+        },
+        "DensityKgM3": {
+          "type": "number",
+          "default": 7850,
+          "unit": "kg/m^3",
+          "description": "Effective density applied to the computed volume. Follows DensityPreset unless the preset is 'custom'."
+        },
+        "MassOverrideKg": {
+          "type": "number",
+          "unit": "kg",
+          "description": "Optional. Replaces the computed mass entirely; the inertia tensor is scaled with it, so the part keeps its shape and only its density is corrected. Absent = use the computed mass."
+        },
+        "ComOverrideLocalMm": {
+          "$ref": "#/$defs/Vector3",
+          "unityCoords": true,
+          "unit": "mm",
+          "description": "Optional. Replaces the computed centre of mass, in the link's local space. Absent = use the computed centroid."
+        },
+        "MassSource": {
+          "type": "string",
+          "default": "mesh",
+          "readonly": true,
+          "description": "How the effective values were obtained: mesh, convex-hull, bounds, override or none. Diagnostic only - written by the analysis."
+        }
+      }
+    },
+    "KinematicTarget": {
+      "type": "object",
+      "description": "Inverse-mode companion of KinematicMechanism (plan-404 Phase 4): drives a mechanism's actively-driven joints so TargetLink follows this node's own Cartesian world position. Position only — no orientation constraint (a parallel platform such as a Delta has no independent orientation DOF).",
+      "properties": {
+        "Mechanism": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "The KinematicMechanism whose driven joints are solved for this target."
+        },
+        "TargetLink": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "The mechanism's own link (e.g. a Delta platform) that should track this node's world position."
+        },
+        "TrackingActive": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, an inverse solve runs every tick and takes over the mechanism's Drives. Switching it off releases the Drives back to normal forward behavior."
+        },
+        "Reachable": {
+          "type": "boolean",
+          "default": true,
+          "readonly": true,
+          "description": "False when the target lies outside the workspace or a limit was hit — the mechanism still moves to the closest achievable pose (least-squares) instead of freezing."
+        }
+      }
+    },
     "MU": {
       "type": "object",
       "description": "Movable Unit template marker. The node marked with MU is the template cloned by Source components. Carries no consumed configuration fields in v1.",
@@ -2682,17 +3148,44 @@
     },
     "Path": {
       "type": "object",
-      "description": "WebViewer-native arc-length path (plan-268): a chain of line/arc segments for path-based movement (AGV/FTS, overhead conveyors). The structured fields — 'segments' (array of { kind:'line', from, to } | { kind:'arc', center, radius, startAngle, degrees, clockwise?, plane? }), 'successors' (string[] path-id graph edges), 'align' ([x,y,z] up vector, default [0,1,0]) and the 'type'/'id' discriminators — are parsed by parsePathExtras() in rv-path.ts (the executable TS-SSOT); only the scalar fields are listed here. Detection is coupled to this payload (inner type 'Path' or absent), never to node names.",
+      "description": "WebViewer-native arc-length path (plan-268): a chain of line/arc segments for path-based movement (AGV/FTS, overhead conveyors). parsePathExtras() in rv-path.ts is the executable TS-SSOT for the structured field shapes ('segments', 'successors', 'align'); they are declared here as generic JSON fields so the inspector, the overlay editor and the MCP tools can author them. Detection is coupled to this payload (inner type 'Path' or absent), never to node names.",
       "properties": {
         "version": {
           "type": "number",
           "default": 1,
           "description": "Path schema version (migration anchor). Unknown versions parse best-effort with a warning."
         },
+        "id": {
+          "type": "string",
+          "description": "Stable path id for graph edges ('successors') and Agv.PathId. Empty/absent = the carrying node's name."
+        },
+        "segments": {
+          "type": "array",
+          "default": [],
+          "description": "Ordered segment chain in world meters: { kind:'line', from:[x,y,z], to:[x,y,z] } | { kind:'arc', center:[x,y,z], radius, startAngle, degrees, clockwise?, plane?:'XZ'|'XY'|'YZ' }. Unknown kinds are skipped with a warning."
+        },
         "closed": {
           "type": "boolean",
           "default": false,
           "description": "Circulating path (overhead conveyor / loop): arc-length addresses wrap modulo length."
+        },
+        "successors": {
+          "type": "array",
+          "default": [],
+          "description": "Path ids this path continues into (graph edges / switches). Dangling ids are tolerated until the referenced path loads."
+        },
+        "align": {
+          "type": "array",
+          "default": [0, 1, 0],
+          "description": "Up vector [x,y,z] for the traveler pose (default [0,1,0])."
+        },
+        "zone": {
+          "type": "string",
+          "description": "Control-point zone id (mutual exclusion at crossings). Empty/absent = unzoned."
+        },
+        "zoneCapacity": {
+          "type": "number",
+          "description": "Explicit zone capacity (>= 0; 0 = never enterable). Absent = default capacity 1."
         }
       }
     },
@@ -2862,6 +3355,152 @@
       "required": [
         "type"
       ]
+    },
+    "AssetReference": {
+      "type": "object",
+      "description": "Marks the node as a REFERENCE NODE: its subtree is not stored in this file but in another glTF/GLB asset, which a consumer resolves and grafts under this node (composition). Resolution order is normative: (1) 'assetId' through the consumer's asset resolver; (2) 'path', resolved RELATIVE TO THE FILE THE REFERENCE IS WRITTEN IN — never relative to the root scene of a composition; (3) otherwise the reference is UNRESOLVED and the node stays empty, which a consumer MUST report and MUST NOT treat as an error that aborts the load. 'sha256' is a change DETECTOR only and MUST NOT be used as a resolution key: a reference resolves to the CURRENT bytes of the asset so corrections in a library reach every referencing file. A consumer MUST bound recursion (cycle detection along the resolution path, plus a depth limit) and MUST NOT treat repeated use of the same asset on DIFFERENT paths as a cycle - that is a DAG and legitimate.",
+      "properties": {
+        "assetId": {
+          "type": "string",
+          "default": "",
+          "description": "Primary, location-independent identity of the referenced asset. Survives moving and renaming the file."
+        },
+        "providerId": {
+          "type": "string",
+          "default": "",
+          "description": "Optional id of the provider/resolver the assetId belongs to (library, project, catalog)."
+        },
+        "sourceId": {
+          "type": "string",
+          "default": "",
+          "description": "Optional id of the source within the provider (a specific library source)."
+        },
+        "path": {
+          "type": "string",
+          "default": "",
+          "description": "Fallback locator, relative to the file this reference is written in. Used only when assetId does not resolve."
+        },
+        "sha256": {
+          "type": "string",
+          "default": "",
+          "description": "Hex SHA-256 of the referenced bytes as of the last save. Change DETECTION only, never a resolution key; a mismatch means the referenced asset was updated and is reported as such."
+        },
+        "embedded": {
+          "type": "boolean",
+          "default": false,
+          "description": "True when a flat export inlined the referenced subtree into this file. The reference is then a provenance note; consumers MUST NOT resolve it again."
+        }
+      }
+    },
+    "AssetOverrides": {
+      "type": "object",
+      "description": "Sits on the SAME node as an AssetReference and carries what THIS file changes in the referenced subtree. The referenced file is never modified. Each patch is an RFC 7396 JSON Merge Patch over 'extras.realvirtual' of the target node - componentType to fieldName to value, where null DELETES the field. Addressing is by the target node's reserved 'NodeId' key, which is unique WITHIN the referenced file; the occurrence a node belongs to comes from the chain of reference nodes at composition time and is never written into a file, so the same asset may be referenced any number of times and each occurrence is overridden independently. An override whose target no longer exists is ORPHANED: consumers MUST report it and MUST NOT discard it silently. Strength ordering when several layers touch one field, weakest first: values in the referenced file, then overrides of the inner referencing file, then overrides of the outer referencing file, then the running session's edit log - the outer file always wins.",
+      "properties": {
+        "byNodeId": {
+          "type": "object",
+          "description": "NodeId of a node in the referenced subtree to an RFC 7396 merge patch over that node's extras.realvirtual."
+        },
+        "byPath": {
+          "type": "object",
+          "description": "Fallback addressing for targets without a NodeId: node path RELATIVE TO THE REFERENCE NODE to the same merge-patch shape. Consulted only after byNodeId misses."
+        }
+      }
+    },
+    "SceneCamera": {
+      "type": "object",
+      "description": "Authored camera start preset of the scene, written on the scene root node. Field-identical to the ModelCameraStart preset a viewer keeps per model, so moving a preset into the file (or back out) loses nothing. Positions and target are in the file's own coordinate system. A consumer MUST reject the preset when any of the six coordinates is not finite.",
+      "properties": {
+        "px": {
+          "type": "number",
+          "description": "Camera position X."
+        },
+        "py": {
+          "type": "number",
+          "description": "Camera position Y."
+        },
+        "pz": {
+          "type": "number",
+          "description": "Camera position Z."
+        },
+        "tx": {
+          "type": "number",
+          "description": "Orbit target X."
+        },
+        "ty": {
+          "type": "number",
+          "description": "Orbit target Y."
+        },
+        "tz": {
+          "type": "number",
+          "description": "Orbit target Z."
+        },
+        "duration": {
+          "type": "number",
+          "default": 1,
+          "unit": "s",
+          "description": "Tween duration when moving to the preset, in seconds; consumers clamp to [0.05, 60]."
+        },
+        "savedAt": {
+          "type": "number",
+          "description": "Wall-clock timestamp (milliseconds since the Unix epoch) the preset was saved, for display only."
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "user",
+            "author"
+          ],
+          "default": "author",
+          "description": "Origin of the preset: 'author' when it came with the file, 'user' when a viewer user saved it."
+        }
+      }
+    },
+    "PlacementMeta": {
+      "type": "object",
+      "description": "Marks the node as a LAYOUT PLACEMENT and carries the placement data an AssetReference cannot express. Its PRESENCE is normative: a consumer MUST treat a node carrying PlacementMeta as a placement of the containing scene and MUST NOT treat a reference node without it as one - that is how a placement is told apart from a reference an author wrote by hand. A placement node also carries the reserved 'NodeId' key, which is the placement's stable identity: a writer re-saving a scene MUST update the node with the matching NodeId in place rather than append a second one. A GAUSSIAN SPLAT placement carries NO AssetReference at all (a reference points at a glTF asset by definition) and puts its catalog identity in 'catalogId' instead. 'visible' lives here because glTF has no visibility flag, so a hidden placement would otherwise come back visible on the next load.",
+      "properties": {
+        "catalogId": {
+          "type": "string",
+          "default": "",
+          "description": "Catalog entry id of the placed asset. Written ONLY when the node carries no AssetReference to hold it (the splat case); otherwise AssetReference.assetId is the single source of truth."
+        },
+        "splatUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Source of the Gaussian splat this placement renders. When set, the placement has no glTF asset and the node carries no AssetReference."
+        },
+        "visible": {
+          "type": "boolean",
+          "default": true,
+          "description": "False when the user hid the placement. Absent means visible."
+        },
+        "signalMappings": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Live-signal bindings of this placement, stored verbatim. Each entry describes one binding: 'signal' (the signal name at the provider, or the model signal name), 'sourceKind' ('connect' or 'internal'; absent means 'connect'), 'direction' (PLC direction - read-only output vs. writable input), 'enabled', and optionally 'id', 'interfaceId' and 'topic'. A consumer MUST round-trip unknown members of an entry unchanged rather than normalise them away."
+        }
+      }
+    },
+    "SceneSettings": {
+      "type": "object",
+      "description": "Workspace settings of a scene, written on the scene root node. These belong to the scene as a whole rather than to any node: the library catalogues its placements are drawn from, and the layout grid it was laid out on. A consumer that finds no SceneSettings block MUST fall back to its own defaults; an ABSENT field means 'the file has no opinion' and MUST NOT be confused with a field carrying the default value, because only the former may be overridden by a user preference.",
+      "properties": {
+        "catalogUrls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Library catalogue URLs the scene draws its placements from."
+        },
+        "gridSizeMm": {
+          "type": "number",
+          "default": 500,
+          "unit": "mm",
+          "description": "Layout grid and translation snap step, in millimetres."
+        }
+      }
     }
   },
   "components": {
@@ -2916,11 +3555,44 @@
     "Lamp": {
       "$ref": "#/$defs/Lamp"
     },
+    "SceneButtonBase": {
+      "$ref": "#/$defs/SceneButtonBase"
+    },
+    "SceneButtonMoveable": {
+      "$ref": "#/$defs/SceneButtonMoveable"
+    },
+    "PushButton3D": {
+      "$ref": "#/$defs/PushButton3D"
+    },
+    "EmergencyButton3D": {
+      "$ref": "#/$defs/EmergencyButton3D"
+    },
+    "HandleSwitch3D": {
+      "$ref": "#/$defs/HandleSwitch3D"
+    },
     "EnergyChain": {
       "$ref": "#/$defs/EnergyChain"
     },
+    "KinematicMechanism": {
+      "$ref": "#/$defs/KinematicMechanism"
+    },
+    "KinematicJoint": {
+      "$ref": "#/$defs/KinematicJoint"
+    },
+    "KinematicTarget": {
+      "$ref": "#/$defs/KinematicTarget"
+    },
+    "MechanismBody": {
+      "$ref": "#/$defs/MechanismBody"
+    },
     "CollisionRole": {
       "$ref": "#/$defs/CollisionRole"
+    },
+    "MachiningVolume": {
+      "$ref": "#/$defs/MachiningVolume"
+    },
+    "MachiningTool": {
+      "$ref": "#/$defs/MachiningTool"
     },
     "WebSensor": {
       "$ref": "#/$defs/WebSensor"
@@ -3101,6 +3773,21 @@
     },
     "AASLink": {
       "$ref": "#/$defs/AASLink"
+    },
+    "AssetReference": {
+      "$ref": "#/$defs/AssetReference"
+    },
+    "AssetOverrides": {
+      "$ref": "#/$defs/AssetOverrides"
+    },
+    "SceneCamera": {
+      "$ref": "#/$defs/SceneCamera"
+    },
+    "PlacementMeta": {
+      "$ref": "#/$defs/PlacementMeta"
+    },
+    "SceneSettings": {
+      "$ref": "#/$defs/SceneSettings"
     }
   },
   "recording": {

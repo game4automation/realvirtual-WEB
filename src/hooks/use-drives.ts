@@ -30,7 +30,9 @@ export interface DriveFocusState {
   node: Object3D | null;
 }
 
-/** Returns the current list of drives. Updates on model-loaded / model-cleared. */
+/** Returns the current list of drives. Updates on model-loaded / model-cleared
+ *  and on every runtime change of the collection (`drives-changed`, plan-411
+ *  Phase 1) — a drive added in the asset editor shows up in the list at once. */
 export function useDrives(): RVDrive[] {
   const viewer = useViewer();
   const [drives, setDrives] = useState<RVDrive[]>(() => viewer.drives);
@@ -41,7 +43,8 @@ export function useDrives(): RVDrive[] {
 
     const offLoaded = viewer.on('model-loaded', () => setDrives([...viewer.drives]));
     const offCleared = viewer.on('model-cleared', () => setDrives([]));
-    return () => { offLoaded(); offCleared(); };
+    const offChanged = viewer.on('drives-changed', () => setDrives([...viewer.drives]));
+    return () => { offLoaded(); offCleared(); offChanged(); };
   }, [viewer]);
 
   return drives;

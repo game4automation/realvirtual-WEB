@@ -18,11 +18,17 @@
  *    exists, so nothing can reach disk before the store is attached;
  *  - `hydrateProjectScenes()` runs after `attachToSceneStore()` and is the
  *    first point at which `activate()` falls;
- *  - with neither `?project=` nor a last-opened project, the bundled project
- *    is the answer. There is always a project.
+ *  - with neither `?project=` nor a last-opened project, **"My Workspace"** is
+ *    the answer. There is always a project.
+ *
+ * That last term changed in plan-716 Phase 1 (§2.2 / F2): the answer used to be
+ * the read-only bundled demo. The bundled resolution itself is unchanged and is
+ * still pinned here — the cases that are about the bundled TIER rather than
+ * about the projectless boot say `workspaceDefault: false` and explain why.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { deadDraftKey, deadSlotExists, seedDeadDraft } from './helpers/dead-draft-slots';
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 
 /**
@@ -49,17 +55,19 @@ import {
   type SceneStoreLike,
 } from '../src/core/project/project-store';
 import { BundledBackend, SAMPLE_PROJECT_ID } from '../src/core/project/backends/bundled-backend';
+import {
+  WORKSPACE_DEFAULT_PROJECT_ID,
+  WORKSPACE_DEFAULT_PROJECT_NAME,
+} from '../src/core/project/rv-workspace-default';
 import { FolderBackend } from '../src/core/project/backends/folder-backend';
 import { clearSceneMutationListeners } from '../src/core/hmi/scene/rv-scene-mutations';
 import {
   clearAllScenes,
   getDraftScope,
-  readDraft,
   setDraftScope,
-  writeDraft,
 } from '../src/core/hmi/scene/rv-scene-storage';
 import { projectHandleKey } from '../src/core/engine/rv-local-filesystem';
-import { sceneRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
+import { sceneGlbRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
 import type { RvScene, SceneBase } from '../src/core/hmi/scene/rv-scene-types';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
@@ -69,7 +77,7 @@ const scene = (id: string, name: string): RvScene => ({
   name,
   createdAt: '2025-01-01T00:00:00.000Z',
   modifiedAt: '2025-01-01T00:00:00.000Z',
-  schemaVersion: 2,
+  schemaVersion: 3,
   base: { kind: 'empty' },
   edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
 });
@@ -89,12 +97,12 @@ async function grantedFolder(projectId: string, scenes: RvScene[] = []): Promise
     schemaVersion: 1,
     id: projectId,
     name: 'CustomerX',
-    scenes: scenes.map(s => ({ id: s.id, name: s.name, path: sceneRelPathFor(s) })),
+    scenes: scenes.map(s => ({ id: s.id, name: s.name, path: sceneGlbRelPathFor(s) })),
     models: [{ path: 'models/line.glb', label: 'Line' }],
   };
   root.seedText('project.json', JSON.stringify(manifest));
   const dir = root.seedDir('scenes');
-  for (const s of scenes) dir.seedText(sceneRelPathFor(s).split('/')[1]!, JSON.stringify(s));
+  for (const s of scenes) dir.seedText(sceneGlbRelPathFor(s).split('/')[1]!, JSON.stringify(s));
   grantedHandles.set(projectHandleKey(projectId), asDirHandle(root));
   return root;
 }
@@ -103,7 +111,6 @@ async function grantedFolder(projectId: string, scenes: RvScene[] = []): Promise
 function fakeSceneStore(log: string[]): SceneStoreLike {
   return {
     setSceneHydrator: () => { log.push('attach'); },
-    refreshScenesFromStorage: () => {},
     getSnapshot: () => ({ dirty: false, draft: null }),
   };
 }
@@ -133,10 +140,15 @@ afterEach(async () => {
 
 describe('resolveActiveProject', () => {
   it('runs with no SceneStore at all and still yields models and scenes', async () => {
+    // `workspaceDefault: false` on purpose: what this asserts is that half one
+    // produces models[] and scenes[] with no store in existence, and the bundled
+    // fixture is the one that HAS both. Which project a projectless boot opens
+    // is the separate question below (plan-716 F2).
     const resolved = await store.resolveActiveProject({
+      workspaceDefault: false,
       bundledBackend: bundled(
         [{ url: '/models/Demo.glb', label: 'Demo' }],
-        [{ file: 'A.scene.json', urlName: 'A', label: 'Demo A' }],
+        [{ file: 'A.scene.glb', urlName: 'A', label: 'Demo A' }],
       ),
     });
     expect(resolved.kind).toBe('bundled');
@@ -145,10 +157,28 @@ describe('resolveActiveProject', () => {
     expect(resolved.scenes.map(s => s.name)).toEqual(['Demo A']);
   });
 
-  it('falls back to bundled with neither ?project= nor a last-opened project', async () => {
+  it('opens My Workspace with neither ?project= nor a last-opened project', async () => {
+    // plan-716 Phase 1 (§2.2 / F2) — RE-PINNED. This used to read "falls back to
+    // bundled": the read-only demo was the answer to "no folder project", so the
+    // boot's active project and the place the user's bytes went were different
+    // things. Now the answer is a writable browser project with a fixed id.
     const resolved = await store.resolveActiveProject({ bundledBackend: bundled() });
-    expect(resolved.backend.kind).toBe('bundled');
+    expect(resolved.backend.kind).toBe('browser');
+    expect(resolved.project?.id).toBe(WORKSPACE_DEFAULT_PROJECT_ID);
+    expect(resolved.project?.name).toBe(WORKSPACE_DEFAULT_PROJECT_NAME);
     expect(resolved.project).not.toBeNull();   // there is ALWAYS a project
+    // Still read-only at this point in boot — the branch writes nothing.
+    expect(resolved.backend.isActive).toBe(false);
+  });
+
+  it('the bundled demo stays reachable — it is a source, not the boot default', async () => {
+    // F2's other half: the demo did not go away, it stopped being the default.
+    const resolved = await store.resolveActiveProject({
+      workspaceDefault: false,
+      bundledBackend: bundled(),
+    });
+    expect(resolved.backend.kind).toBe('bundled');
+    expect(resolved.project?.id).toBe(SAMPLE_PROJECT_ID);
   });
 
   it('prefers the last-opened folder project when its grant survived', async () => {
@@ -173,10 +203,15 @@ describe('resolveActiveProject', () => {
     expect(resolved.project?.id).toBe('prj_b');
   });
 
-  it('a lapsed grant degrades to bundled instead of failing boot', async () => {
+  it('a lapsed grant degrades to My Workspace instead of failing boot', async () => {
+    // plan-716 Phase 1 — RE-PINNED from `'bundled'`. The property under test is
+    // unchanged: a project whose folder grant is gone must not fail the boot. It
+    // now degrades to the writable workspace rather than to the read-only demo,
+    // which is strictly better for the user standing in front of it.
     localStorage.setItem(LS_KEY_LAST_PROJECT, 'prj_never_granted');
     const resolved = await store.resolveActiveProject({ bundledBackend: bundled() });
-    expect(resolved.kind).toBe('bundled');
+    expect(resolved.kind).toBe('browser');
+    expect(resolved.project?.id).toBe(WORKSPACE_DEFAULT_PROJECT_ID);
   });
 
   it('opens the backend READ-ONLY — nothing may reach disk yet', async () => {
@@ -201,9 +236,12 @@ describe('resolveActiveProject', () => {
     // The invariant §2.10 protects: `availablePublishedScenes` is derivable
     // at this point in boot, i.e. before the SceneStore constructor reads it.
     const resolved = await store.resolveActiveProject({
+      // The bundled tier is what publishes examples, so this net keeps resolving
+      // to it (plan-716 §2.2 — the option exists for exactly this).
+      workspaceDefault: false,
       bundledBackend: bundled([], [
-        { file: 'A.scene.json', urlName: 'A', label: 'A', mode: 'planner' },
-        { file: 'B.scene.json', urlName: 'B', label: 'B' },
+        { file: 'A.scene.glb', urlName: 'A', label: 'A', mode: 'planner' },
+        { file: 'B.scene.glb', urlName: 'B', label: 'B' },
       ]),
     });
     expect(resolved.scenes).toHaveLength(2);
@@ -236,7 +274,8 @@ describe('hydrateProjectScenes', () => {
 
   it('adopts the bundled project when that is what resolved', async () => {
     await store.resolveActiveProject({
-      bundledBackend: bundled([], [{ file: 'A.scene.json', urlName: 'A', label: 'A' }]),
+      workspaceDefault: false,
+      bundledBackend: bundled([], [{ file: 'A.scene.glb', urlName: 'A', label: 'A' }]),
     });
     store.attachToSceneStore(fakeSceneStore([]));
     expect(await store.hydrateProjectScenes()).toBe(true);
@@ -273,19 +312,22 @@ describe('draft scope under the always-present Sample project', () => {
     expect(getDraftScope()).toBeNull();
   });
 
-  it('a pre-existing unscoped draft survives adoption and the close after it', async () => {
-    writeDraft(base, scene('scn_draft', 'Work in progress'));
-    expect(readDraft(base)?.name).toBe('Work in progress');
+  it('a pre-existing unscoped draft slot survives adoption and the close after it', async () => {
+    // Nothing reads this slot any more (plan-413 phase 6), but the close path
+    // must still not reach into the unscoped keyspace: `clearDraftsForScope`
+    // deletes by project prefix, and a slot with no prefix belongs to nobody's
+    // project. Deleting it here would be the store tidying away data it does
+    // not own.
+    const key = seedDeadDraft(base);
 
     await store.resolveActiveProject({ bundledBackend: bundled() });
     store.attachToSceneStore(fakeSceneStore([]));
     await store.hydrateProjectScenes();
-    expect(readDraft(base)?.name).toBe('Work in progress');
+    expect(deadSlotExists(key)).toBe(true);
 
-    // The close path clears *scoped* drafts. Sample has no scope, so this
-    // must not reach the unscoped keyspace where every legacy draft lives.
     await store.closeProject();
-    expect(readDraft(base)?.name).toBe('Work in progress');
+    expect(deadSlotExists(key)).toBe(true);
+    expect(deadDraftKey(base)).toBe(key);   // still unscoped after the close
   });
 
   it('a folder project still gets its own scope (RR4 intact)', async () => {

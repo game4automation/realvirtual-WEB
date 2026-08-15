@@ -371,6 +371,99 @@ in place" rather than "fast-forward on resume".
 
 ---
 
+## 4.3 Runtime attachment — and the editor test run
+
+Attachment ("does time integrate at all") is owned by `SimulationRuntime`
+([`rv-simulation-runtime.ts`](src/core/engine/rv-simulation-runtime.ts)). Its
+baseline is driven by **workspace modes only**: `RVViewer`'s `'mode-changed'`
+listener calls the internal `_setAttached()` with
+`descriptor.runtime !== 'detached'`. The asset editor registers
+`runtime: 'detached'`, so authoring integrates no time at all — stronger than a
+pause reason, and not resumable by `clearPauseReasons()`.
+
+**Plan-410 adds exactly one sanctioned exception**, the in-place test run:
+
+```ts
+runtime.beginEditorTest();   // attach INSIDE a detached workspace
+runtime.endEditorTest();     // restore the attachment the descriptor implied
+runtime.isEditorTestActive;  // true while a run owns the attachment
+```
+
+This names the exception rather than weakening the invariant:
+
+- `_setAttached` stays **internal**. Nothing outside the mode listener and this
+  pair drives attachment.
+- **One owner.** A second `beginEditorTest()` warns and is ignored; the single
+  `endEditorTest()` that follows still restores correctly.
+- `endEditorTest()` restores the **pre-test** value — it does not blindly
+  detach. Starting a test in an already-attached workspace is therefore a no-op
+  round trip.
+- Pause reasons are untouched by both edges.
+
+### Who ends a test run (ownership)
+
+| Exit path | Ends the run | Restores the scene |
+|-----------|--------------|--------------------|
+| `requestMode()` (mode dropdown, deep links — the user-facing path) | the editor's **async exit guard**, which `await`s `session.stop()` before the switch proceeds | `stop()` — blob re-load + `restoreFromSnapshot` |
+| `setMode()` / `lock()` / boot / `dispose()` (guard-free) | `session.abortSync()` from `_deactivate` — synchronous detach, no scene work | `_deactivate` → `_restorePreviousScene`, its sole owner |
+| anything that still slips through | the `'mode-changed'` **safety net** in `rv-viewer.ts`: `endEditorTest()` before the descriptor derivation | nobody — attach hygiene only |
+
+There is deliberately **one restore owner per path**: the guard awaits `stop()`
+*before* the switch, so `_deactivate` never runs in parallel with a restore.
+
+### The test run itself
+
+`InPlaceTestSession` (`in-place-test-session.ts` in the commercial asset-editor plugin — not part of the AGPL core since plan-434)
+is a state machine `idle → preparing → running → restoring → idle` (plus
+`failed`):
+
+1. `await doc.whenIdle()` — drain the single-flight op queue.
+2. `await showNowAndPaint(…)` — the overlay is on screen *before* anything
+   destructive (§4.4 below).
+3. `doc.suspendAutosave()` — the draft slot keeps describing the **pre-test**
+   authoring state for the whole run.
+4. `viewer.emit('asset-editor-pre-export', { source: 'test-session' })`, then
+   `exportAssetGlb()`. The export function does **not** emit that event — every
+   caller must, or a drive-drag/jog preview pose bakes into the result.
+5. The exported blob is the test input **and** the restore snapshot.
+6. `loadModel(blob)` with default options → real drives, signals, LogicSteps.
+7. `runtime.beginEditorTest()`.
+
+`stop()` reverses it: `endEditorTest()`, overlay, `loadModel(blob, {
+preserveHierarchy: true })`, then `doc.restoreFromSnapshot(state)` — which sets
+op log, redo stack, baseline ids and the rename flag **without replaying
+anything**. Replay would re-apply ops that `markSaved` already baked into the
+base and turn a clean document dirty.
+
+Every `await` is followed by a generation check. `abortSync()` bumps the
+generation, so a slow export or a slow load coming back after a forced exit
+loads nothing, attaches nothing and changes no UI.
+
+Known limitation: the executor's undo trash (detached subtrees of
+`deleteNode` ops) references objects of the pre-test scene. Undoing a delete
+*across* a test round trip is therefore not guaranteed; the op log itself and
+every non-structural undo survive intact.
+
+## 4.4 Scene-transition overlay
+
+`loadModel()` clears the scene before it parses the next one, so a mode entry,
+a mode exit and each test edge would show an empty canvas.
+[`scene-transition-store.ts`](src/core/hmi/scene-transition-store.ts) masks that:
+
+- `await showNowAndPaint(label)` — resolves only after the overlay has been
+  committed by React **and** painted (double `requestAnimationFrame`). Use it
+  before every destructive transition. A synchronous store write is not enough:
+  React would commit *after* `clearModel`.
+- `showDelayed(label)` — ~200 ms delay, for non-destructive waits where valid
+  content is still on screen.
+- Token/refcount based (transitions nest), with a ~400 ms minimum display.
+
+`SceneTransitionOverlay` is rendered by the **always-mounted `HMIShell`**, never
+by a plugin slot: the editor's exit overlay must outlive the editor plugin,
+which is disabled while `_restorePreviousScene` is still running.
+
+---
+
 ## 5. Pause API
 
 `RVViewer.setSimulationPaused(reason: string, paused: boolean)` is the
@@ -485,6 +578,8 @@ surfaced as an event so components react:
    (registrations persist). Also fired standalone for DES stat-only resets.
 3. **`'simulation-start'`** — components (re)start from the clean state (e.g. a
    conveyor re-asserts `Run = true`).
+4. **Signal level re-apply** — `viewer.signalReapply.reapplyAll()` drives every
+   wired component INPUT slot once with the value currently in the SignalStore.
 
 Intentionally **untouched**:
 
@@ -493,6 +588,45 @@ Intentionally **untouched**:
   re-establishes only the signals it OWNS in its `onReset` / `onStart` handler
   (e.g. a conveyor zeroes `PartCount`, re-asserts `Run`).
 - **Pause state** — reset can be invoked while paused or running.
+
+#### The signal level re-apply (step 4, plan-427)
+
+A PLC is **level-based** (IEC 61131 scan cycle); the SignalStore is
+**edge-driven** (`subscribeByPath` fires only on a value CHANGE). Because the
+reset deliberately leaves signals alone but *does* reset the components reading
+them, a level that was already `true` before the reset would never be delivered
+again: `drive.reset()` clears `jogForward`, `EntryConveyorStart` stays `true` and
+never fires — the belt is dead for the rest of the session, and the source stops
+spawning.
+
+Step 4 closes that gap. Every `wireBoolSignal` / `wireNumberSignal` /
+`wireValueSignal` call registers its slot in the viewer-owned
+`SignalReapplyRegistry`; `reapplyAll()` re-reads the CURRENT store value (never a
+value cached at wire time) and calls the setter again.
+
+- **Position:** LAST, after all `'simulation-start'` subscribers. A behavior that
+  re-asserts its own level in `start()` runs first and the live PLC level wins
+  where the two overlap — consistent with "live signals always override local
+  behavior".
+- **Scope:** only registered component inputs. This is not a store broadcast, so
+  historian, charts, statistics and LogicStep edge detectors see nothing.
+- **Replay marker:** the setter receives `(value, { replay: true })`. Almost
+  every slot ignores it (idempotent or edge-guarded anyway); `RVIKPath.SignalStart`
+  uses it to re-sync its edge baseline instead of starting the path, since
+  `reset()` cleared that baseline and a held `true` would otherwise look like a
+  fresh rising edge.
+- **Feedback signals** (viewer → PLC, `IsAtPosition`, `IsDriving`, …) are NOT
+  touched — the next tick writes them from the reset state anyway.
+- **Only levels a component actually had** are restored. A numeric slot the PLC
+  has never written (`wireNumberSignal`) is skipped rather than seeded with the
+  store's registration value — otherwise every reset would zero the authored
+  `TargetSpeed` of a drive whose speed signal is bound but idle. See the helper
+  table in [doc-webviewer.md](doc-webviewer.md) § Signal Store.
+- **Lifecycle:** `WireResult.unsubscribe` drops the store subscription and the
+  registry slot together, so a component's `dispose()` leaves nothing behind;
+  `clearModel()` calls `signalReapply.clear()` before the geometry teardown.
+
+The second trigger is the reconnect path — see §7.
 
 Components subscribe via the bind-context hooks `onReset` / `onStart` /
 `onResetStat` (a material-flow definition adds top-level `reset` / `start` /
@@ -512,7 +646,7 @@ too. Non-DES scenes never produce run events.
 
 | | drives | signals | MUs | LogicSteps | pause | camera | listeners |
 |---|---|---|---|---|---|---|---|
-| `resetSimulation()` | reset to StartPosition | component-owned only | cleared | reset | kept | kept | kept |
+| `resetSimulation()` | reset to StartPosition, then current PLC levels re-applied | component-owned only | cleared | reset | kept | kept | kept |
 | `clearModel()` | gone | gone | gone | gone | kept | kept | kept |
 | `loadModel(newUrl)` | replaced | replaced | replaced | replaced | kept | kept | kept |
 | `dispose()` | gone | gone | gone | gone | gone | gone | gone |
@@ -535,6 +669,29 @@ This is the **viewer-wide** connection. Industrial-interface plugins
 additionally emit `'interface-connected'` / `'interface-disconnected'` /
 `'interface-error'` per-interface — see [doc-webviewer-interface.md](doc-webviewer-interface.md).
 
+### `'interface-signals-synced'` — the second re-apply trigger
+
+`BaseIndustrialInterface` emits `'interface-signals-synced'` once per
+(re)connect, and the viewer answers it with `signalReapply.reapplyAll()` — the
+same level re-apply §6.2 step 4 describes. A reconnect is the second moment at
+which a held level would otherwise be lost: the store carries pre-disconnect
+values, the components were never told they went stale.
+
+Why this event and not `'connection-state-changed'`:
+
+| moment | store contents | safe to re-apply? |
+|---|---|---|
+| `setConnectionState('connected')` | pre-disconnect values | **no** — discovery has not even started |
+| end of the discovery block | still pre-disconnect | **no** — incoming values sit in `pendingIncoming` |
+| first `pendingIncoming` flush | current remote state | **yes** → the event fires here |
+
+Re-applying earlier would actively write a stale level back onto the plant. The
+window is armed after a successful discovery (`_awaitingInitialSync`) and closed
+by the first flush; a 2 s timeout covers an endpoint that sends nothing at all
+(the store is then unchanged, so the re-apply is a harmless idempotent pass). A
+FAILED discovery arms nothing — no sync, no replay, exactly as before the
+feature. A disconnect closes an open window.
+
 Drives, LogicSteps, ReplayRecordings, and the playback subsystem have an
 `activeOnly` flag (`'EditorAndPlay'` / `'PlayMode'` / `'EditorOnly'`). The
 fixed-update gate `isActiveForState(activeOnly, isConnected)` decides
@@ -554,6 +711,8 @@ The full plugin interface lives in [src/core/rv-plugin.ts](src/core/rv-plugin.ts
 | `onConnectionStateChanged(state, viewer)` | When viewer-wide connection flips. |
 | `onModeActivate(mode, viewer)` | The plugin's workspace mode becomes active. Build mode-scoped resources here. The plugin instance itself persists across mode switches. |
 | `onModeDeactivate(from, viewer)` | The plugin's mode is left (`from` is `null` only for the initial boot). Tear down whatever `onModeActivate` created. |
+| `onDeactivate(viewer)` | The **user** switched the plugin off (`setPluginUserEnabled(id, false)`). Never fires on a mode switch or a `clearModel()`. See §8.1. |
+| `onActivate(viewer)` | The **user** switched the plugin back on, after re-enable + slot re-registration + any missed `onModelLoaded`, before `onModeActivate`. See §8.1. |
 | `onRenderBackendChanged(backend, viewer)` | The render backend flips between `'three'` and `'omniverse'`. |
 | `onFixedUpdatePre(dt)` | 60 Hz, before drive physics (TickStage.PRE). Use to set drive targets. |
 | `onFixedUpdatePost(dt)` | 60 Hz, after drive physics + transport (TickStage.POST). Use to read results / sample data / emit events. |
@@ -573,6 +732,52 @@ all lifecycle callbacks except (current behaviour) `dispose`.
 `order` controls invocation order in pre/post/render lists. Lower is
 earlier. Default `100`. `core: true` plugins always activate even in
 selective mode (`rv_plugins` declared on the GLB).
+
+### 8.1 The user toggle — `onDeactivate` / `onActivate` (plan-435)
+
+The feature-matrix switch is the only caller. Both sequences live in
+`RVViewer.setPluginUserEnabled`; `disablePlugin()` / `enablePlugin()` are **not** involved in the
+teardown, because they are also the mode reconcile path.
+
+```
+OFF  setPluginUserEnabled(id, false)
+  1. onModeDeactivate           (only when the plugin participates in the active mode)
+  2. onDeactivate(viewer)       — OR, without that hook and only if the plugin holds the
+                                  current model: onModelCleared(viewer)
+  3. disablePlugin(id)
+  4. uiRegistry.unregister(id)  (only when the plugin declares slots)
+  5. emit 'plugins-changed' { kind: 'user-disabled' }
+
+ON   setPluginUserEnabled(id, true)
+  1. uiRegistry.register(plugin)   — idempotent, keeps the original slot position
+  2. only when the plugin participates in the active mode:
+       enablePlugin(id)            — replays a missed onModelLoaded by itself
+       onActivate(viewer)          — OR, without that hook, a replay of the current model
+       onModeActivate
+  3. emit 'plugins-changed' { kind: 'user-enabled' }
+```
+
+**Three invariants** (they are also in the Doxygen on `RVViewerPlugin.onDeactivate`):
+
+1. `onActivate` and the fallback model replay **exclude each other** — a plugin never gets both
+   for one switch-on.
+2. An `onModelLoaded` replayed from the missed-load set may legitimately **precede** `onActivate`.
+   It means "you missed a model", not "you are being switched on". The order is guaranteed: model
+   first, activation second, so `onActivate` may assume `viewer.scene` matches the current model.
+3. `onDeactivate` releases **no** model-owned resources that `onModelCleared` owns — only what the
+   plugin holds beyond them (overlays, listeners, timers, sessions). The plugin therefore stays in
+   the model bookkeeping and still gets its `onModelCleared` on a later real `clearModel()`. A
+   plugin that bundles both into one private `teardown()` must make it idempotent
+   (`if (this._down) return;`).
+
+Both hooks are **synchronous** by contract — the switch hangs on a React `onChange`. Any async
+initialisation must therefore be abortable: bump a `_generation` counter in `onDeactivate` and have
+every async continuation bail with `if (gen !== this._generation) return;` before its first side
+effect. `webxr`, `aas-link` and `perf-test` do exactly that.
+
+A plugin that implements neither hook still works: the `onModelCleared` fallback covers it. The
+drift guard `tests/plugin-teardown-drift.node.test.ts` fails when a new plugin has an
+`onModelLoaded` but no teardown path at all.
 
 ---
 

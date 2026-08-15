@@ -165,6 +165,8 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
       enumMap: {
         None: 'None', Tool: 'Tool', Workpiece: 'Workpiece',
         Machine: 'Machine', Robot: 'Robot', Environment: 'Environment',
+        // plan-409 — appended, never inserted (see COLLISION_ROLES).
+        Cutter: 'Cutter',
       },
       default: 'None',
     },
@@ -202,6 +204,44 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     LampOn:             { type: 'boolean', default: false },
   },
 
+  // plan-417 — 3D scene buttons. The Unity classes use camelCase field names
+  // (untypical for realvirtual), so the schema keys do too: schema key = GLB
+  // extras key = C# field name, no conversion anywhere.
+  SceneButtonBase: {
+    moveable:        { type: 'componentRef' },
+    autoLight:       { type: 'boolean', default: true },
+    isToggle:        { type: 'boolean', default: false },
+    simpleClickTime: { type: 'number', default: 0.5 },
+  },
+
+  SceneButtonMoveable: {
+    axis:              { type: 'vector3', unityCoords: true },
+    moveSpeed:         { type: 'number', default: 30 },
+    hoverOffset:       { type: 'number', default: 0.1 },
+    activeOffset:      { type: 'number', default: 0.05 },
+    mirrorHoverOffset: { type: 'boolean', default: false },
+    angularMovement:   { type: 'boolean', default: false },
+  },
+
+  PushButton3D: {
+    stateSignal:   { type: 'componentRef', signal: 'PLCInputBool' },
+    lightSignal:   { type: 'componentRef', signal: 'PLCOutputBool' },
+    label:         { type: 'string' },
+    timer:         { type: 'number', default: 0.5 },
+    toggle:        { type: 'boolean', default: false },
+    activeOnStart: { type: 'boolean', default: false },
+  },
+
+  EmergencyButton3D: {
+    stateSignal:   { type: 'componentRef', signal: 'PLCInputBool' },
+    activeOnStart: { type: 'boolean', default: false },
+  },
+
+  HandleSwitch3D: {
+    stateSignal:   { type: 'componentRef', signal: 'PLCInputBool' },
+    activeOnStart: { type: 'boolean', default: false },
+  },
+
   // plan-362. Anchor/Follower are plain NODE refs (Unity `public Transform`),
   // not signal slots — hence no `signal` key. `readonly` because structural
   // references are not editable in the inspector; they are corrected through
@@ -225,9 +265,64 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
       enumMap: {
         None: 'None', Tool: 'Tool', Workpiece: 'Workpiece',
         Machine: 'Machine', Robot: 'Robot', Environment: 'Environment',
+        // plan-409 — appended, never inserted (see COLLISION_ROLES).
+        Cutter: 'Cutter',
       },
       default: 'None',
     },
+  },
+
+  // plan-405 — CSG material removal. Added AFTER the rv-ODT migration: not a
+  // pre-migration snapshot but the frozen reference for the determinism test.
+  // `Shape` is readonly on BOTH components on purpose: the bare field name is
+  // shared, and the generic enum editor is indexed by the bare name, so a
+  // writable row would offer the other component's options.
+  MachiningVolume: {
+    gridResolution: { type: 'vector3', default: { x: 64, y: 64, z: 64 } },
+    workpieceSize: { type: 'vector3', default: { x: 200, y: 100, z: 200 } },
+    Shape: {
+      type: 'enum',
+      enumMap: { Box: 'Box', Cylinder: 'Cylinder', Mesh: 'Mesh' },
+      default: 'Box',
+      readonly: true,
+    },
+    CylinderAxis: {
+      type: 'enum',
+      enumMap: { X: 'X', Y: 'Y', Z: 'Z' },
+      default: 'X',
+    },
+    Tools: { type: 'componentRefArray', default: [] },
+    ToolGroup: { type: 'string', default: '' },
+    SweepToolMotion: { type: 'boolean', default: true },
+    MaxSweepSubsteps: { type: 'number', default: 16 },
+    Meshing: {
+      type: 'enum',
+      enumMap: { MarchingCubes: 'MarchingCubes', DualContouring: 'DualContouring' },
+      default: 'MarchingCubes',
+    },
+    CreaseAngle: { type: 'number', default: 35 },
+    GenerateUVs: { type: 'boolean', default: true },
+    StatisticsInterval: { type: 'number', default: 0.25 },
+    UpdateCollider: { type: 'boolean', default: false, readonly: true },
+    SignalSpindleOn: { type: 'componentRef', signal: 'PLCOutputBool' },
+    SignalReset: { type: 'componentRef', signal: 'PLCOutputBool' },
+    SignalMachiningActive: { type: 'componentRef', signal: 'PLCInputBool' },
+  },
+
+  MachiningTool: {
+    Shape: {
+      type: 'enum',
+      enumMap: {
+        Sphere: 'Sphere', Cylinder: 'Cylinder', BallNose: 'BallNose',
+        Torus: 'Torus', ConicalEnd: 'ConicalEnd',
+      },
+      default: 'Cylinder',
+      readonly: true,
+    },
+    ToolDiameter: { type: 'number', default: 10 },
+    ToolLength: { type: 'number', default: 50 },
+    CornerRadius: { type: 'number', default: 2 },
+    TaperAngleDeg: { type: 'number', default: 15 },
   },
 
   WebSensor: {
@@ -450,10 +545,80 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
 
   // Path (plan-268) — scalar fields only; the structured fields
   // (segments/successors/align) are parsed by parsePathExtras() in rv-path.ts
-  // (the executable TS-SSOT) and documented in the $def description.
+  // (the executable TS-SSOT); they are declared as generic 'json' schema fields
+  // (plan-921) so the inspector / overlay editor / MCP tools can author them.
   Path: {
     version: { type: 'number', default: 1 },
+    id: { type: 'string' },
+    segments: { type: 'json', default: [] },
     closed: { type: 'boolean', default: false },
+    successors: { type: 'json', default: [] },
+    align: { type: 'json', default: [0, 1, 0] },
+    zone: { type: 'string' },
+    zoneCapacity: { type: 'number' },
+  },
+
+  // plan-404 — rigid-body mechanisms. Added AFTER the rv-ODT migration: not a
+  // pre-migration snapshot but the frozen reference for the determinism test.
+  // NOTE these are the RIGID-BODY types (joint graph + constraint solve), not
+  // the older axis-group `Kinematic` component under `structure`.
+  KinematicMechanism: {
+    SolverIterations: { type: 'number', default: 4 },
+    Damping:          { type: 'number', default: 0.01 },
+    Tolerance:        { type: 'number', default: 0.001 },
+    SignalConverged:  { type: 'componentRef', signal: 'PLCOutputBool' },
+    Converged:        { type: 'boolean', default: true, readonly: true },
+    ResidualError:    { type: 'number', default: 0, readonly: true },
+    SolveTimeMs:      { type: 'number', default: 0, readonly: true },
+  },
+
+  KinematicJoint: {
+    JointType: {
+      type: 'enum',
+      enumMap: {
+        Revolute: 'Revolute', Prismatic: 'Prismatic',
+        Spherical: 'Spherical', Universal: 'Universal',
+      },
+      default: 'Revolute',
+    },
+    // BodyA absent = world anchor (plan-404 §2.4); the schema cannot express
+    // that, the READ side must — see rv-kinematic-mechanism.ts.
+    BodyA:          { type: 'componentRef' },
+    BodyB:          { type: 'componentRef' },
+    AnchorA:        { type: 'vector3', unityCoords: true },
+    AnchorB:        { type: 'vector3', unityCoords: true },
+    AxisA:          { type: 'vector3', unityCoords: true },
+    SecondaryAxisB: { type: 'vector3', unityCoords: true },
+    UseLimits:      { type: 'boolean', default: false },
+    LowerLimit:     { type: 'number', default: -180 },
+    UpperLimit:     { type: 'number', default: 180 },
+    DrivenBy:       { type: 'componentRef' },
+    CurrentValue:   { type: 'number', default: 0, readonly: true },
+  },
+
+  KinematicTarget: {
+    Mechanism:      { type: 'componentRef' },
+    TargetLink:     { type: 'componentRef' },
+    TrackingActive: { type: 'boolean', default: false },
+    Reachable:      { type: 'boolean', default: true, readonly: true },
+  },
+
+  // plan-412 — per-link mass properties for the inverse-dynamics force analysis. No default for
+  // the two overrides: an ABSENT key means "use the value computed from the geometry", which is
+  // a different statement from "zero" and the one the exporter has to be able to write back.
+  MechanismBody: {
+    DensityPreset: {
+      type: 'enum',
+      default: 'steel',
+      enumMap: {
+        steel: 'steel', stainless: 'stainless', aluminum: 'aluminum',
+        pa: 'pa', pom: 'pom', custom: 'custom',
+      },
+    },
+    DensityKgM3:        { type: 'number', default: 7850 },
+    MassOverrideKg:     { type: 'number' },
+    ComOverrideLocalMm: { type: 'vector3', unityCoords: true },
+    MassSource:         { type: 'string', default: 'mesh', readonly: true },
   },
 };
 

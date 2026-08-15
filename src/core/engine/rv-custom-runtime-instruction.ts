@@ -45,6 +45,7 @@ import {
   createStatusHighlightGizmos,
 } from './rv-error-visual';
 import { showStatusOutline, hideStatusOutline } from './rv-status-outline';
+import { wireValueSignal } from './rv-signal-wiring';
 import type { InstructionEntry, InstructionStep } from './rv-instruction-runtime-store';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -235,9 +236,19 @@ export class RVCustomRuntimeInstruction implements RVComponent {
     // Subscribe only when a signal is bound. Read the initial level here but apply
     // it in onSceneReady (once the gizmo exists) — no flicker.
     if (this.signal) {
-      this._unsubscribe = ctx.signalStore.subscribeByPath(this.signal, (v) => this._onSignal(!!v));
-      const current = ctx.signalStore.getByPath(this.signal);
-      if (current !== undefined) this._signalHigh = !!current;
+      // plan-427: via the helper, so the level is re-applied after reset /
+      // reconnect. `_onSignal` is its own edge detector (`_signalHigh` compare),
+      // which makes a replay of an unchanged level a no-op — and lets a level
+      // that went high while the link was down still raise the instruction.
+      // The FIRST call is special-cased: at init() the gizmo does not exist
+      // yet, so the level is only recorded and `onSceneReady()` applies it (the
+      // no-flicker contract the hand-written initial read had).
+      let deferInitial = true;
+      this._unsubscribe = wireValueSignal(ctx.signalStore, this.signal, (v) => {
+        if (deferInitial) { deferInitial = false; this._signalHigh = !!v; return; }
+        this._onSignal(!!v);
+      }, undefined, ctx.reapply).unsubscribe;
+      deferInitial = false;
     } else {
       // No signal → static display (F7): shown once, never re-shown after dismiss.
       this._static = true;

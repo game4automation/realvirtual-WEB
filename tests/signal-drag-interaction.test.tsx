@@ -102,13 +102,27 @@ describe('SignalBadge — Shift+Drag interaction wiring (real DOM events)', () =
     expect(consumeSignalDragClick()).toBe(true);
   });
 
-  it('pointerdown WITHOUT Shift never arms a drag', () => {
+  /**
+   * plan-422 F6 replaced the contract this used to pin ("without Shift, never
+   * a drag"). Requiring Shift made the gesture undiscoverable, and it was never
+   * needed: the machine already separates a press from a drag by MOVEMENT, so a
+   * plain press can arm and the release decides.
+   *
+   * The property that had to survive is the force click, and that is what is
+   * asserted here — a plain press arms, and letting go without moving leaves
+   * the click alone so the chip forces exactly as before.
+   */
+  it('pointerdown WITHOUT Shift arms too, and a release under the threshold still clicks', () => {
     const { container } = render(
       <SignalBadge direction="output" plcType="PLCOutputBool" raw={true} signalName="MC07_Start" />,
     );
     const chip = container.querySelector('.MuiChip-root') as HTMLElement;
     fireEvent.pointerDown(chip, { shiftKey: false, button: 0, clientX: 200, clientY: 200 });
+    expect(getSignalDragPhase()).toBe('armed');
+    winPointer('pointerup', 201, 200); // < 4 px
     expect(getSignalDragPhase()).toBe('idle');
+    // NOT suppressed — unlike the Shift path, this click is the force gesture.
+    expect(consumeSignalDragClick()).toBe(false);
   });
 
   it('rect-union fallback: drop lands in the GAP between two cells of one target (slot-row case)', () => {

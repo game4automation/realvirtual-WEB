@@ -48,6 +48,39 @@ export interface TreeNode {
   /** LayoutObjects can hold uninjected Three.js descendants. Set so the row
    *  renders an expand caret even before children are lazily injected. */
   canExpandLazy?: boolean;
+  /**
+   * This row is the root of the loaded main GLB (plan-715).
+   *
+   * Set only by {@link buildStructureTree} and only when the caller passed
+   * {@link ModelRootInfo} derived from the real `viewer.currentModelRoot`. Drives
+   * the row's LOCK rendering (no eye, no drag handle, no inline rename) — the
+   * root is selectable and its metadata is editable, but it is structurally
+   * frozen (see `rv-model-root.ts`).
+   */
+  isModelRoot?: boolean;
+  /**
+   * Label to render INSTEAD of {@link name} (the document name for the root
+   * row). The path space keeps using `name`; this is presentation only, exactly
+   * like the snap and LayoutObject labels.
+   */
+  displayLabel?: string;
+}
+
+/**
+ * The model root as {@link buildStructureTree} needs it: already resolved to
+ * path-space keys by the CALLER, which is the only place that holds the real
+ * `Object3D` and can compare by identity (plan-715 §2.4.2).
+ *
+ * `buildStructureTree` synthesizes its nodes from path SEGMENTS and has no
+ * Object3D to compare against, so it matches on these derived keys. That is a
+ * derived identity check, not a name-based substitute for one — pass keys read
+ * off `viewer.currentModelRoot`, never a guessed name.
+ */
+export interface ModelRootInfo {
+  /** The root's own path in the registry (its bare name — see doc-node-paths.md §1). */
+  rootPath: string;
+  /** Display label for the root row (document name / GLB file name). */
+  label?: string;
 }
 
 export interface VisibleTreeRow {
@@ -117,10 +150,18 @@ const LAZY_EXPAND_TYPES = new Set(['LayoutObject', 'CADLink']);
  * Build the expansion-independent hierarchy structure from editable nodes.
  * LayoutObject/CADLink Three.js descendants are deliberately handled later by
  * `applyLazyInjection`, allowing this result to be cached across expand toggles.
+ *
+ * `modelRoot` (plan-715) makes the GLB root the visible top row instead of the
+ * level that gets folded away. Passing it changes ONE thing: the wrapper-collapse
+ * loop no longer consumes the first level when that level IS the model root.
+ * Deeper single-child wrappers still collapse exactly as before, and omitting the
+ * argument reproduces the pre-715 behaviour bit for bit — which is what keeps
+ * every legacy caller (and the structure-cache tests) unchanged.
  */
 export function buildStructureTree(
   nodes: EditableNodeInfo[],
   overlay: RVExtrasOverlay | null,
+  modelRoot?: ModelRootInfo | null,
 ): TreeNode[] {
   const root: BuildTreeNode = { name: '', path: null, types: [], hasOverrides: false, children: [], _childMap: new Map() };
 
@@ -167,9 +208,28 @@ export function buildStructureTree(
 
   // Flatten GLB root wrapper: if top level has a single child with no component types
   // (the synthetic gltf.scene node like "demoglb"), skip it and show its children instead.
+  //
+  // …UNLESS that single child is the MODEL ROOT (plan-715). It is a real,
+  // registered, selectable node — the asset's identity and, since plan-714, the
+  // anchor for its metadata — so folding it away hid the one row the user needs
+  // to address. The stop applies to level 1 only: a wrapper chain BELOW the root
+  // is still noise and still collapses.
   let topNodes = root.children;
   while (topNodes.length === 1 && topNodes[0].types.length === 0 && topNodes[0].children.length > 0) {
+    if (modelRoot && topNodes[0].path === modelRoot.rootPath) break;
     topNodes = topNodes[0].children;
+  }
+
+  // Tag by lookup rather than by position: in the planner the scene holds the
+  // model root AND `_layoutRoot` as siblings, so the root is not necessarily
+  // `topNodes[0]` — and the two must stay separate top-level groups, never
+  // merged into one row.
+  if (modelRoot) {
+    const rootRow = topNodes.find((n) => n.path === modelRoot.rootPath);
+    if (rootRow) {
+      rootRow.isModelRoot = true;
+      if (modelRoot.label) rootRow.displayLabel = modelRoot.label;
+    }
   }
 
   return topNodes;

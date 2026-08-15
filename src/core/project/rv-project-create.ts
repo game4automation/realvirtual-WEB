@@ -35,13 +35,14 @@ import {
   mergeManifest,
   readManifest,
   writeManifest,
-  writeSceneFile,
+  writeSceneGlbFile,
 } from './rv-project-storage';
+import { readSceneGlb } from '../storage/rv-scene-glb-store';
 import { writeBlobFile } from '../engine/rv-local-filesystem';
 import { setCachedFrom } from './rv-scene-owner';
 import {
   newProject,
-  sceneRelPathFor,
+  sceneGlbRelPathFor,
   type RvProject,
   type RvProjectSceneEntry,
 } from './rv-project-types';
@@ -49,8 +50,16 @@ import {
 export interface CreateProjectFromScenesOptions {
   /** Scene id to record as `activeSceneId`. Ignored when it was not written. */
   activeSceneId?: string | null;
-  /** Body lookup override. Tests inject; production uses the cache. */
+  /** Catalogue-row lookup override. Tests inject; production uses the cache. */
   readScene?: (id: string) => RvScene | null;
+  /**
+   * GLB body lookup override. Tests inject; production reads the OPFS store.
+   *
+   * The store rather than `readSceneGlbBody()`: that one asks the *open*
+   * project first, and the whole point of this function is that the scenes
+   * being migrated do not belong to a project yet.
+   */
+  readSceneGlb?: (id: string) => Promise<Uint8Array | null>;
 }
 
 export type CreateProjectFromScenesResult =
@@ -88,17 +97,24 @@ export async function createProjectFromScenes(
   }
 
   const read = opts.readScene ?? readScene;
+  const readGlb = opts.readSceneGlb ?? readSceneGlb;
   const entries: RvProjectSceneEntry[] = [];
   const written: string[] = [];
   const skipped: string[] = [];
 
   try {
     // ── bodies first ──
+    //
+    // A scene with no GLB body is skipped exactly like a scene with no
+    // catalogue row. Since plan-397 the body IS the scene; writing the row
+    // alone would put a card in the new project that opens to nothing.
     for (const id of sceneIds) {
       const scene = read(id);
       if (!scene) { skipped.push(id); continue; }
-      const relPath = sceneRelPathFor(scene);
-      await writeSceneFile(dir, relPath, scene);
+      const glb = await readGlb(id);
+      if (!glb) { skipped.push(id); continue; }
+      const relPath = sceneGlbRelPathFor(scene);
+      await writeSceneGlbFile(dir, relPath, glb);
       entries.push(sceneEntryOf(scene, relPath));
       written.push(id);
     }

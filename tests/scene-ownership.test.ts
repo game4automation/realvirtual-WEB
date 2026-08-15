@@ -7,7 +7,7 @@
  * These started life as `spike-372-scene-ownership.test.ts`, where they
  * *asserted the bug*: one `sceneId` living in two projects, a cache with no
  * origin, `hydrateScene()` handing project A's body to project B and the save
- * path writing it onto B's own `.scene.json`.
+ * path writing it onto B's own `.scene.glb`.
  *
  * The four bug assertions are inverted here. What stays untouched is the
  * cardinality half: a scene id belonging to more than one project is
@@ -43,18 +43,20 @@ import {
   setDraftScope,
   writeScene,
 } from '../src/core/hmi/scene/rv-scene-storage';
-import { sceneFileNameFor, type RvProject } from '../src/core/project/rv-project-types';
+import { sceneGlbFileNameFor, type RvProject } from '../src/core/project/rv-project-types';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
+import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { revisionOfBytes } from '../src/core/project/rv-scene-record';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
 const SCENE_ID = 'scn_shared';
 /**
  * Same display name in every variant, so both projects derive the SAME
- * `scenes/<file>.scene.json` path and an overwrite would be observable.
+ * `scenes/<file>.scene.glb` path and an overwrite would be observable.
  */
 const SCENE_NAME = 'Cell';
-const FILE_NAME = sceneFileNameFor({ id: SCENE_ID, name: SCENE_NAME });
+const FILE_NAME = sceneGlbFileNameFor({ id: SCENE_ID, name: SCENE_NAME });
 
 const MARK_A = 'content-of-project-A';
 const MARK_B = 'content-of-project-B';
@@ -66,7 +68,7 @@ function variant(marker: string, modifiedAt: string): RvScene {
     name: SCENE_NAME,
     createdAt: '2025-01-01T00:00:00.000Z',
     modifiedAt,
-    schemaVersion: 2,
+    schemaVersion: 3,
     base: { kind: 'empty' },
     edits: { ops: [], settings: { catalogUrls: [marker], gridSizeMm: 500 } },
   };
@@ -83,8 +85,28 @@ function putCache(scene: RvScene): void {
   localStorage.setItem('rv-scenes/' + scene.id, JSON.stringify(scene));
 }
 
-function markerOf(scene: RvScene | null): string | undefined {
-  return scene?.edits?.settings?.catalogUrls?.[0];
+/**
+ * The GLB body a project writes, marked so the two are distinguishable.
+ *
+ * Since plan-413 phase 6 a scene body is bytes, and the cached record is a
+ * SHELL that points at them — so "whose body does the cache hold?" is answered
+ * by the shell's revision, not by anything inside the record. That is a
+ * stronger measurement than the old one: it compares the actual content hash,
+ * where reading a field out of a copied op log only compared a copy.
+ */
+function glbFor(marker: string): Uint8Array {
+  return new TextEncoder().encode('glb:' + marker);
+}
+
+/** Which project's bytes the cached shell currently points at. */
+async function cachedBodyMarker(): Promise<string | undefined> {
+  const base = readScene(SCENE_ID)?.base;
+  const revision = base?.kind === 'scene-glb' ? base.revision : undefined;
+  if (!revision) return undefined;
+  for (const marker of [MARK_A, MARK_B]) {
+    if (await revisionOfBytes(glbFor(marker)) === revision) return marker;
+  }
+  return undefined;
 }
 
 async function manifestOf(dir: FakeDir): Promise<RvProject> {
@@ -130,14 +152,18 @@ async function twoProjectsSharingOneSceneId(): Promise<{
   // Index entry once; the body is pinned per step.
   writeScene(variant(MARK_B, '2025-06-01T00:00:00.000Z'));
 
+  const withBody = (marker: string) => ({ readSceneGlb: async () => glbFor(marker) });
+
   const dirB = new FakeDir('project-b');
   putCache(variant(MARK_B, '2025-06-01T00:00:00.000Z'));
-  const resB = await createProjectFromScenes(asDirHandle(dirB), 'Project B', [SCENE_ID]);
+  const resB = await createProjectFromScenes(
+    asDirHandle(dirB), 'Project B', [SCENE_ID], withBody(MARK_B));
   expect(resB.ok).toBe(true);
 
   const dirA = new FakeDir('project-a');
   putCache(variant(MARK_A, '2025-07-01T00:00:00.000Z'));
-  const resA = await createProjectFromScenes(asDirHandle(dirA), 'Project A', [SCENE_ID]);
+  const resA = await createProjectFromScenes(
+    asDirHandle(dirA), 'Project A', [SCENE_ID], withBody(MARK_A));
   expect(resA.ok).toBe(true);
 
   const idA = (await manifestOf(dirA)).id;
@@ -154,8 +180,8 @@ describe('cardinality of a sceneId in the shipped keyspace', () => {
     const mA = await manifestOf(dirA);
     const mB = await manifestOf(dirB);
 
-    expect(mA.scenes?.map(e => e.id)).toEqual([SCENE_ID]);
-    expect(mB.scenes?.map(e => e.id)).toEqual([SCENE_ID]);
+    expect(sceneDocumentsOf(mA).map(e => e.id)).toEqual([SCENE_ID]);
+    expect(sceneDocumentsOf(mB).map(e => e.id)).toEqual([SCENE_ID]);
     expect(mA.id).not.toBe(mB.id);
 
     // Both folders really carry a body, and the two bodies differ.
@@ -235,8 +261,7 @@ describe('hydrateScene() with a shared sceneId', () => {
     expect(await store.hydrateScene(SCENE_ID)).toBe(true);
 
     // THE MEASUREMENT, inverted: project B gets project B's body.
-    expect(markerOf(readScene(SCENE_ID))).toBe(MARK_B);
-    expect(markerOf(readScene(SCENE_ID))).not.toBe(MARK_A);
+    expect(await cachedBodyMarker()).toBe(MARK_B);
 
     // …and the cache now says whose body it holds.
     expect(readSceneOwner(SCENE_ID)?.cachedFrom).toBe(idB);
@@ -260,7 +285,7 @@ describe('hydrateScene() with a shared sceneId', () => {
     expect(await store.hydrateScene(SCENE_ID)).toBe(true);
 
     // project-store.ts — the short-circuit no longer applies to a foreign body.
-    expect(markerOf(readScene(SCENE_ID))).toBe(MARK_B);
+    expect(await cachedBodyMarker()).toBe(MARK_B);
     expect(readSceneOwner(SCENE_ID)?.cachedFrom).toBe(idB);
   });
 
@@ -275,7 +300,7 @@ describe('hydrateScene() with a shared sceneId', () => {
     expect(store.getLastConflicts().map(c => c.id)).toEqual([SCENE_ID]);
     // …but with no prompt installed the default is no longer "keep the cache":
     // adopting another project's body is the data loss, not the safety.
-    expect(markerOf(readScene(SCENE_ID))).toBe(MARK_B);
+    expect(await cachedBodyMarker()).toBe(MARK_B);
     expect(store.getSnapshot().warnings).toEqual([]);
 
     // Project A's folder is untouched either way.
@@ -300,7 +325,7 @@ describe('hydrateScene() with a shared sceneId', () => {
 // ─── The save path ──────────────────────────────────────────────────────
 
 describe('the save path after a shared-id hydration', () => {
-  it('a save inside project B leaves B .scene.json with B content', async () => {
+  it('a save inside project B leaves B .scene.glb with B content', async () => {
     const { dirA, dirB } = await twoProjectsSharingOneSceneId();
 
     const store = new ProjectStore();
@@ -317,8 +342,9 @@ describe('the save path after a shared-id hydration', () => {
     emitSceneMutation({ type: 'upsert', id: SCENE_ID, scene: readScene(SCENE_ID)! });
     await store.flush();
 
-    // After: still B's. The foreign body never reached the cache, so the
-    // writer had nothing foreign to write (rv-project-folder-writer.ts:299-312).
+    // After: still B's. Two reasons now, and both matter: the foreign body
+    // never reached the cache, AND since plan-413 phase 6 the folder writer
+    // records the manifest row without touching the body at all.
     const after = await sceneFileOf(dirB);
     expect(after).toContain(MARK_B);
     expect(after).not.toContain(MARK_A);
@@ -336,8 +362,8 @@ describe('the save path after a shared-id hydration', () => {
 
     // rv-project-folder-writer.ts:383-424 guards id<->path, never id<->project.
     // Unchanged by this plan: the provenance marker is what closes the gap.
-    expect(mB.scenes?.[0].path).toBe('scenes/' + FILE_NAME);
-    expect(sceneFileNameFor(variant(MARK_A, '2025-07-01T00:00:00.000Z'))).toBe(FILE_NAME);
+    expect(sceneDocumentsOf(mB)[0].path).toBe('scenes/' + FILE_NAME);
+    expect(sceneGlbFileNameFor(variant(MARK_A, '2025-07-01T00:00:00.000Z'))).toBe(FILE_NAME);
   });
 });
 
@@ -356,8 +382,12 @@ describe('an unknown origin keeps the historic behaviour', () => {
     clearSceneOwner(SCENE_ID);
 
     expect(await store.hydrateScene(SCENE_ID)).toBe(true);
-    // Unchanged pre-fix behaviour — the cached body is served as it always was…
-    expect(markerOf(readScene(SCENE_ID))).toBe(MARK_A);
+    // Unchanged pre-fix behaviour — the cached record is served as it always
+    // was, not replaced from the folder. It is still the pinned record (an
+    // empty base carrying A's marker), never a shell pointing at B's bytes.
+    expect(readScene(SCENE_ID)?.base.kind).toBe('empty');
+    expect(readScene(SCENE_ID)?.edits.settings.catalogUrls?.[0]).toBe(MARK_A);
+    expect(await cachedBodyMarker()).toBeUndefined();
     // …and from now on its origin is on record, so the next owner will see it.
     expect(readSceneOwner(SCENE_ID)?.cachedFrom).toBe(idB);
   });

@@ -28,11 +28,19 @@ import HELP_LAYOUT from './help/layout.md?raw';
 import HELP_SIMULATION from './help/simulation.md?raw';
 import HELP_PLC from './help/plc.md?raw';
 import HELP_DES from './help/des.md?raw';
+// The kinematize topic serves the customer-facing recipe verbatim — single source,
+// no copy in help/. It is the full workflow (perceive → knowledge folder → axes →
+// verify → materials) that editor.md only summarizes.
+import HELP_KINEMATIZE from '../../../recipes/kinematize-cad-import.md?raw';
 
 const TOPICS: Record<string, { summary: string; content: string }> = {
   editor: {
     summary: 'Asset Editor: kinematize & materialize CAD (open → perceive → act → verify → save)',
     content: HELP_EDITOR,
+  },
+  kinematize: {
+    summary: 'The full CAD-to-kinematic-model recipe: perception, knowledge folder, axes with visual verification, materials — read before kinematizing a raw import',
+    content: HELP_KINEMATIZE,
   },
   layout: {
     summary: 'Layout Planner: build connected conveyor lines, snap flow, conveyor heights, scenes',
@@ -53,9 +61,9 @@ const TOPICS: Record<string, { summary: string; content: string }> = {
 };
 
 export class McpHelpTool {
-  @McpTool('Get the deep how-to guide for a workflow domain. Topics: editor (kinematize/materialize CAD), layout (build conveyor lines, heights), simulation (debugging drives/signals/flow), plc, des. Call without topic to list them. Read the matching guide BEFORE starting a multi-step workflow.', { readOnly: true })
+  @McpTool('Get the deep how-to guide for a workflow domain. Topics: editor (kinematize/materialize CAD tool reference), kinematize (the full CAD-to-kinematic-model recipe incl. perception and verification), layout (build conveyor lines, heights), simulation (debugging drives/signals/flow), plc, des. Call without topic to list them. Read the matching guide BEFORE starting a multi-step workflow.', { readOnly: true })
   async webHelp(
-    @McpParam('topic', 'editor | layout | simulation | plc | des (omit to list topics).', 'string', false) topic: string,
+    @McpParam('topic', 'editor | kinematize | layout | simulation | plc | des (omit to list topics).', 'string', false) topic: string,
   ): Promise<string> {
     const key = (topic || '').trim().toLowerCase();
     const entry = TOPICS[key];

@@ -26,8 +26,9 @@
  * projects across a screen of mostly empty tiles.
  */
 
-import { Box, Button, ButtonBase, IconButton, Stack, Tooltip, Typography } from '@mui/material';
-import { ChevronRight, Close, FolderOpen } from '@mui/icons-material';
+import { useState } from 'react';
+import { Box, Button, ButtonBase, IconButton, Menu, MenuItem, Stack, Tooltip, Typography } from '@mui/material';
+import { ChevronRight, Close, FolderOpen, MoreVert } from '@mui/icons-material';
 import { RV_SCROLL_CLASS } from '../shared-sx';
 
 /** Where a row came from — recents are forgettable, workspace entries are not. */
@@ -39,6 +40,11 @@ export interface ProjectListRow {
   /** Secondary line: folder name, or the path a recent was opened from. */
   caption?: string | null;
   origin: ProjectOrigin;
+  /**
+   * True only for a real workspace subfolder: rename writes its manifest and
+   * delete removes the folder. The bundled demo and recents have neither.
+   */
+  canManage?: boolean;
 }
 
 export interface ProjectsListProps {
@@ -55,6 +61,8 @@ export interface ProjectsListProps {
   onOpenWorkspace: () => void;
   onOpenFolder: () => void;
   onForgetProject: (id: string) => void;
+  onRenameProject: (id: string) => void;
+  onDeleteProject: (id: string) => void;
 }
 
 const ROW_MAX_WIDTH = 760;
@@ -69,6 +77,8 @@ export function ProjectsList({
   onOpenWorkspace,
   onOpenFolder,
   onForgetProject,
+  onRenameProject,
+  onDeleteProject,
 }: ProjectsListProps) {
   // Kiosk builds get neither the picker nor the rows — the project they were
   // given is already open, and this screen would only offer ways to leave it.
@@ -169,6 +179,8 @@ export function ProjectsList({
                 active={row.id === activeProjectId}
                 onOpen={() => onOpenProject(row.id)}
                 onForget={() => onForgetProject(row.id)}
+                onRename={() => onRenameProject(row.id)}
+                onDelete={() => onDeleteProject(row.id)}
               />
             ))}
           </Stack>
@@ -183,16 +195,24 @@ function ProjectRow({
   active,
   onOpen,
   onForget,
+  onRename,
+  onDelete,
 }: {
   row: ProjectListRow;
   active: boolean;
   onOpen: () => void;
   onForget: () => void;
+  onRename: () => void;
+  onDelete: () => void;
 }) {
+  const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
   return (
     <Box sx={{ position: 'relative', display: 'flex', alignItems: 'stretch' }}>
       <ButtonBase
         onClick={onOpen}
+        onContextMenu={row.canManage
+          ? (e) => { e.preventDefault(); setMenuAnchor(e.currentTarget); }
+          : undefined}
         sx={{
           flex: 1,
           justifyContent: 'flex-start',
@@ -248,6 +268,35 @@ function ProjectRow({
             <Close sx={{ fontSize: 15 }} />
           </IconButton>
         </Tooltip>
+      )}
+
+      {/* A managed row (a real workspace subfolder) carries rename and delete.
+          Same MoreVert pattern the Assets-tab library headers use. */}
+      {row.canManage && (
+        <>
+          <IconButton
+            size="small"
+            aria-label={`Project actions for ${row.name}`}
+            onClick={(e) => setMenuAnchor(e.currentTarget)}
+            sx={{ alignSelf: 'center', ml: 0.5 }}
+          >
+            <MoreVert sx={{ fontSize: 15 }} />
+          </IconButton>
+          <Menu anchorEl={menuAnchor} open={!!menuAnchor} onClose={() => setMenuAnchor(null)}>
+            <MenuItem
+              onClick={() => { setMenuAnchor(null); onRename(); }}
+              sx={{ fontSize: 13 }}
+            >
+              Rename…
+            </MenuItem>
+            <MenuItem
+              onClick={() => { setMenuAnchor(null); onDelete(); }}
+              sx={{ fontSize: 13, color: 'error.main' }}
+            >
+              Delete…
+            </MenuItem>
+          </Menu>
+        </>
       )}
     </Box>
   );

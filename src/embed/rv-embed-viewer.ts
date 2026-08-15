@@ -266,6 +266,7 @@ export class RVEmbedViewer {
       tankFillManager: null,
       pipeFlowManager: null,
       lampManager: null,
+      sceneButtonManager: null,
       energyChainManager: null,
       // The embed runtime has no highlight system and no HMI shell, so a
       // collision report would have nowhere to go (plan-394).

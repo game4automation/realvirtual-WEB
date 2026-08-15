@@ -134,25 +134,46 @@ export function canvasToRvImage(
   return encodeRvImageWithinBudget(canvas, extra);
 }
 
+/** Where an unqualified `savePath` lands inside the project (plan-709 §2.6.2). */
+export const CAPTURES_FOLDER = 'captures';
+
 /**
- * Persist a captured canvas as PNG at a work-folder-relative path.
+ * Persist a captured canvas as PNG inside the OPEN PROJECT (plan-709 §2.6.2).
  *
  * An MCP image result reaches the agent as an encoded payload it cannot turn back into bytes, so
  * durable screenshots have to be written on this side. Returns a fragment to merge into the image
  * result's `extra`, reporting either where the file landed or why it did not — never silently
  * dropping the request, because the agent will otherwise write a reference to a file that is not
- * there.
+ * there. In particular: with no writable project open this REFUSES rather than writing somewhere
+ * else, because "somewhere else" is exactly the second store this plan removed.
+ *
+ * The path is project-relative. A bare name (`overview.png`) is placed under `captures/`; a path
+ * that already names its folder (`knowledge/Belt/views/x.png`) is taken as given, so an agent can
+ * keep a structure it chose.
  */
-export async function saveCanvasToWorkfolder(
+export async function saveCanvasToProject(
   canvas: HTMLCanvasElement,
   relPath: string,
 ): Promise<Record<string, unknown>> {
-  const withPng = /\.png$/i.test(relPath.trim()) ? relPath.trim() : `${relPath.trim()}.png`;
+  const trimmed = relPath.trim().replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!trimmed) return { saveError: 'savePath is empty' };
+  if (trimmed.split('/').includes('..')) return { saveError: 'savePath must not contain ".."' };
+  const withPng = /\.png$/i.test(trimmed) ? trimmed : `${trimmed}.png`;
+  const target = withPng.includes('/') ? withPng : `${CAPTURES_FOLDER}/${withPng}`;
+
+  const { getProjectStore } = await import('../../core/project/project-store');
+  const backend = getProjectStore().getBackend();
+  if (!backend?.writable) {
+    return { saveError: 'No writable project is open — open or create one in Projects to save captures.' };
+  }
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
   if (!blob) return { saveError: 'Could not encode the frame as PNG' };
-  const fs = await import('../../core/engine/rv-local-filesystem');
-  const result = await fs.writeWorkfolderBlob(withPng, blob);
-  return 'error' in result ? { saveError: result.error } : { savedPath: result.savedPath };
+  try {
+    await backend.writeBlob(target, blob);
+    return { savedPath: target };
+  } catch (e) {
+    return { saveError: `Could not write "${target}": ${e instanceof Error ? e.message : String(e)}` };
+  }
 }
 
 /** Composite frames into a labelled grid montage (burst-style styling). */

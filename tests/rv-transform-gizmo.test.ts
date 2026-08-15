@@ -5,7 +5,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Object3D, PerspectiveCamera, Scene } from 'three';
 import { TransformGizmo, type TransformGizmoHost } from '../src/core/engine/rv-transform-gizmo';
 import { HIGHLIGHT_OVERLAY_LAYER } from '../src/core/engine/rv-group-registry';
-import { EditorTransformTool } from '../src/plugins/asset-editor/EditorTransformTool';
+import { EditorTransformTool } from '@rv-private/plugins/asset-editor/EditorTransformTool';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { AssetDocument } from '../src/core/editor/rv-asset-document';
 

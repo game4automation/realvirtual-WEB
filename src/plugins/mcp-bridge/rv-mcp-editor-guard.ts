@@ -13,7 +13,7 @@ import type { RVViewer } from '../../core/rv-viewer';
 import {
   getActiveAssetContext,
   type ActiveAssetContext,
-} from '../asset-editor/active-asset-store';
+} from '../../core/editor/active-asset-store';
 
 export type EditorGuardResult = ActiveAssetContext | { error: string };
 

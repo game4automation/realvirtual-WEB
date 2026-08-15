@@ -11,7 +11,9 @@
 
 export { ThumbnailService } from './thumbnail-service';
 export type { ThumbnailLoader, ThumbnailServiceOptions } from './thumbnail-service';
-export { ThumbnailCache, THUMBNAIL_BUCKET_V2 } from './thumbnail-cache';
+export { ThumbnailCache, THUMBNAIL_BUCKET_V4 } from './thumbnail-cache';
 export { ThumbnailRenderer } from './thumbnail-renderer';
+export { bakeContactShadow } from './thumbnail-contact-shadow';
+export type { ContactShadowBake, ContactShadowOptions } from './thumbnail-contact-shadow';
 export { buildThumbnailKey, NO_PROJECT } from './thumbnail-key';
 export type { ThumbnailKeyParts } from './thumbnail-key';

@@ -73,7 +73,12 @@ The same pattern is reusable if you develop on top of realvirtual WEB yourself: 
 npm run deploy                       # build + upload to the configured remote path
 npm run deploy -- --path demo        # upload under a specific remote path prefix
 npm run deploy -- --dry-run          # stage only; build and upload nothing
+npm run deploy -- --demo --path demo --base /demo/   # hosted demo of the COMMERCIAL product
 ```
+
+`--demo` is the same public deploy with a different **code tier**: instead of the core-only AGPL build it compiles the full commercial feature set (the 15 features a customer receives — asset editor, CAD importers, DES, PLC, physics, machining, IK, …) into the very same public demo site. Everything else is identical: same remote prefix, same model allowlist, same test-scene prune, same GA/news/SEO injection, same signing.
+
+What the demo form does **not** do: it never sets `RV_INTERNAL` (agents and Omniverse are restricted features and stay out), it never emits source maps, and it stages no customer project. The private TypeScript ships as compiled chunks only — a `.map` next to a commercial chunk would be the source code itself, so the deploy refuses to upload any `.map`, `.ts` or `.tsx` found in the build output.
 
 The remote path comes from `BUNNY_REMOTE_PATH` (default empty = storage-zone root, printed as `(root)/`) and can be overridden per run with `--path`.
 
@@ -94,7 +99,9 @@ What happens, in order:
 
 ### What the public demo ships extra
 
-`includePublicDemoContent` (`scripts/_workspace-lib.mjs`) is the one staging switch that separates realvirtual's own demo from a customer artifact. It is on only for the **public** deploy — core tier, no project key — and it is what lets `public/scenes/` (the curated Examples, including DemoPlanner) and `public/aasx/` (the AAS supplier demos: Festo, SEW, Bosch) into the staged tree. Every customer delivery and every private project deploy filters both out: they are demo content, not product.
+`includePublicDemoContent` (`scripts/_workspace-lib.mjs`) is the one staging switch that separates realvirtual's own demo from a customer artifact. It is on for the two **hosted demo** forms — the plain public deploy (core tier, no project key) and `--demo` (commercial tier, no project key), which passes it explicitly — and it is what lets `public/scenes/` (the curated Examples, including DemoPlanner) and `public/aasx/` (the AAS supplier demos: Festo, SEW, Bosch) into the staged tree. Every customer delivery and every private project deploy filters both out: they are demo content, not product.
+
+The `--demo` staging differs from a customer delivery in one more way: `workspaceFiles: false`. A CDN deploy publishes code, not a repository, so no README, setup/start scripts, recipes or CONNECT helpers are generated — and the core `public/settings.json` survives untouched, which is the artifact the GA and news injection then writes into.
 
 ### Public model allowlist
 
@@ -390,6 +397,50 @@ npm run build                # produce dist/
 | **Large GLB** | Enable gzip/brotli and include `model/gltf-binary`/`model/gltf+json` in the compressible types (many servers compress text only). Mind per-file upload caps (nginx `client_max_body_size`, host limits) |
 | **Base path** | Default base is `./` (relative) — serve from root or any sub-path without rebuilding. For absolute-rooted asset URLs under a fixed sub-path, build with `--base /your-path/` (or set Vite `base`) and put the SPA fallback under that sub-path too |
 
+### Hosting a GLB for a shared link (`?glb=`)
+
+A shared link (see doc-webviewer.md § *Shared asset links*) may point at any
+host. The viewer runs on **your** origin and fetches the file from **theirs**,
+so exactly one thing decides whether it works: **CORS on the GLB response.**
+Everything else — MIME type included — the loader does not care about.
+
+Measured with `curl -I` against a foreign `Origin` (2026-08-05):
+
+| Host | `Access-Control-Allow-Origin` | Verdict |
+|---|---|---|
+| `raw.githubusercontent.com` | `*` | works. Serves `application/octet-stream`, which is irrelevant to `GLTFLoader` |
+| Bunny pull zone (`web.realvirtual.io`) | `*` | works; also allows/exposes `Range` |
+| Firebase Storage (`…?alt=media`) | yes | works — it is what the viewer's own demo GLB is served from |
+| A default nginx/Apache/IIS on your own domain | **usually absent** | **the common failure**: an empty viewport |
+
+For your own server, the whole fix is one header on the file:
+
+```nginx
+location ~* \.glb$ {
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Access-Control-Allow-Methods "GET, HEAD" always;
+    types { model/gltf-binary glb; }
+}
+```
+
+A missing header surfaces as a named error in the info card ("… did not allow
+this page to read the file (CORS)") rather than as a blank screen, so the
+support question answers itself. Note the browser cannot tell a CORS refusal
+from an unreachable host — the message names the likely cause and the host,
+and stops there.
+
+Two more things worth knowing before publishing a link:
+
+- **Size.** The fetch enforces a 250 MB budget on the *streamed body*.
+  `Content-Length` is only a hint (absent under chunked transfer, wrong behind
+  a rewriting proxy), so an oversize file is cut mid-transfer, not waved through.
+- **Redirects are fine**, and they do not widen the budget: the count runs
+  downstream of every hop.
+
+Links that we host (`?glb=s:<id>`) need none of this — they are resolved to a
+short-lived signed URL at runtime. That path needs the share backend; its HTTP
+contract is `src/core/share/rv-share-backend-contract.md`.
+
 ### nginx example
 
 ```nginx
@@ -433,6 +484,7 @@ server {
 | Flag | Effect |
 |------|--------|
 | `--private` | Private project mode |
+| `--demo` | Public demo content, commercial code tier (no `RV_INTERNAL`, no source maps). Mutually exclusive with `--private` |
 | `--project <name>` | Project to publish (private mode) |
 | `--list` | List private projects and exit |
 | `--path <prefix>` | Public remote path prefix (overrides `BUNNY_REMOTE_PATH`) |

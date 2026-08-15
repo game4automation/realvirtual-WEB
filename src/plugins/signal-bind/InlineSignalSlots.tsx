@@ -18,6 +18,12 @@
  * descriptor, bindable only once the scoped signal is materialised in the
  * SignalStore.
  *
+ * `PLCSignalSlot` renders the ONE synthetic slot of a raw `PLCInput*` /
+ * `PLCOutput*` node (plan-418 F6): the node IS the signal, so its component
+ * section gets a single `Value` row — the inspector-side twin of the badge and
+ * the tree context menu, and the only surface that also SHOWS why a node is
+ * not bindable (duplicate name, unregistered signal).
+ *
  * No-manager state (A1): with `signalBindingManager === null` the rows render
  * the GLB wiring read-only — no link icon, no picker, no drop target.
  */
@@ -30,6 +36,8 @@ import type { RVViewer } from '../../core/rv-viewer';
 import type { SignalStore } from '../../core/engine/rv-signal-store';
 import { NodeRegistry } from '../../core/engine/rv-node-registry';
 import { getSignalSlotFields } from '../../core/engine/rv-component-registry';
+import { PLC_SIGNAL_SLOT } from '../../core/engine/rv-binding-slot-resolver';
+import { SIGNAL_TYPES } from '../../core/engine/rv-signal-construction';
 import { instanceScope, scopeSignalName } from '../../core/engine/rv-instance-scope';
 import {
   computeRowQualifiers,
@@ -42,6 +50,7 @@ import {
 import { SignalSearchOverlay, type SignalSearchItem } from '../../core/hmi/SignalSearchOverlay';
 import { baseComponentType, isComponentRef } from '../../core/hmi/rv-inspector-helpers';
 import { getConnectSnapshot, subscribeConnectStore } from '../../core/hmi/connect-store';
+import { omitUndefined } from '../../core/hmi/rv-omit-undefined';
 import { collectConnectSignals } from './SignalBindPopover';
 import { slotRejectReason, type DropRejectReason } from './drop-accept';
 import {
@@ -51,6 +60,7 @@ import {
   upsertMappingForRow,
 } from './slot-row-models';
 import { createSignalBindingPersistence } from './signal-binding-persistence';
+import { emitSignalBindingApplied } from './binding-applied-pulse';
 import {
   findSignalBindTarget,
   signalBindEligibility,
@@ -73,6 +83,36 @@ function relativePathUnder(rootPath: string, nodePath: string): string {
   if (nodePath === rootPath) return '.';
   if (rootPath && nodePath.startsWith(`${rootPath}/`)) return nodePath.slice(rootPath.length + 1);
   return nodePath || '.';
+}
+
+/**
+ * The path the RESOLVER would use for this node (plan-422 F3).
+ *
+ * `relativePathUnder` is string arithmetic, and it is only sound when both
+ * sides are spelled the same way. The bind-target root always is — it comes
+ * from `registry.getPathForNode()`. The inspector's `nodePath` does not: a node
+ * is reachable under several registry keys (`doc-node-paths.md`: sanitisation
+ * layers, file-global dedup, aliases), and `selectNode()` stores whatever
+ * string its caller had — a viewport pick, a hierarchy click, a deep link, an
+ * MCP call, or a value restored from `localStorage` that an older build wrote.
+ *
+ * When that string is an ALIAS the subtraction fails silently: the relative
+ * path comes out as the whole alias instead of `.`, no row matches the slot's
+ * `componentPath`, and the inspector falls through to "not offered as a link
+ * target" — on a node whose slot resolved perfectly well. That is the
+ * `RobotAtConveyorPick` report, and it applies to every signal node reached by
+ * a non-canonical path.
+ *
+ * Resolving through the registry first puts both sides in the resolver's own
+ * spelling, which is what `relativeComponentPath()` does on the other side of
+ * the comparison. Unknown paths are returned untouched — a path the registry
+ * cannot resolve has no canonical form to offer.
+ */
+function canonicalNodePath(viewer: RVViewer | null, nodePath: string): string {
+  const registry = viewer?.registry;
+  const node = registry?.getNode(nodePath);
+  if (!registry || !node) return nodePath;
+  return registry.getPathForNode(node) ?? NodeRegistry.computeNodePath(node) ?? nodePath;
 }
 
 // ── Shared interactive block (rows + picker + persistence) ───────────────────
@@ -148,7 +188,17 @@ function BindableSlotRows({ viewer, target, buildRows, disabledReason }: {
 
   const bindRow = (row: SlotRow, source: PickerSignal): void => {
     const next = upsertMappingForRow(persistence.read(), row, source);
-    if (next) persist(next);
+    if (!next) return;
+    persist(next);
+    // THE user-initiated boundary (plan-425 F8). Deliberately not inside
+    // `persist`, which the unbind path also calls, nor inside applyMappings,
+    // which every model load runs.
+    emitSignalBindingApplied(viewer, targetId, {
+      componentPath: row.componentPath,
+      slot: row.slot,
+      signal: source.name,
+      sourceKind: source.origin === 'internal' ? 'internal' : 'connect',
+    });
   };
 
   return (
@@ -157,6 +207,7 @@ function BindableSlotRows({ viewer, target, buildRows, disabledReason }: {
         <SignalSlotRow
           key={slotRowKey(row)}
           row={row}
+          targetId={targetId}
           qualifier={qualifiers.get(slotRowKey(row))}
           viewer={viewer}
           signals={signals}
@@ -176,7 +227,9 @@ function BindableSlotRows({ viewer, target, buildRows, disabledReason }: {
         getRejectReason={pickerRejectReason}
         onPick={(_name, item) => {
           if (!pickerRow || !item) return;
-          bindRow(pickerRow, {
+          // omitUndefined: absent optionals must stay ABSENT (plan-422 F1) —
+          // a present `undefined` is what the GLB bake has to refuse.
+          bindRow(pickerRow, omitUndefined({
             name: item.name,
             interfaceId: item.interfaceId,
             topic: item.topic,
@@ -186,7 +239,7 @@ function BindableSlotRows({ viewer, target, buildRows, disabledReason }: {
             address: item.address,
             comment: item.comment,
             origin: item.origin,
-          });
+          }));
         }}
       />
     </>
@@ -248,7 +301,7 @@ export function ComponentSignalSlots({ viewer, signalStore, nodePath, componentT
 
   const targetId = signalBindTargetId(target);
   const rootPath = viewer.registry?.getPathForNode(target.node) ?? NodeRegistry.computeNodePath(target.node);
-  const relPath = relativePathUnder(rootPath, nodePath);
+  const relPath = relativePathUnder(rootPath, canonicalNodePath(viewer, nodePath));
   const fieldNames = new Set(fields.map((f) => f.field));
 
   const buildRows = (mappings: readonly import('../layout-planner/rv-layout-store').SignalMapping[]): SlotRow[] => {
@@ -279,6 +332,101 @@ export function ComponentSignalSlots({ viewer, signalStore, nodePath, componentT
     }
     for (const row of bySlot.values()) ordered.push(row);
     return ordered;
+  };
+
+  return (
+    <>
+      {eligibility && !eligibility.eligible && (
+        <Box sx={{ px: 1, py: 0.25 }}>
+          <Typography sx={{ fontSize: 11, color: INK_LOW }}>
+            Signal linking unavailable — {eligibility.reason}
+          </Typography>
+        </Box>
+      )}
+      <BindableSlotRows
+        viewer={viewer}
+        target={target}
+        buildRows={buildRows}
+        disabledReason={eligibility && !eligibility.eligible ? eligibility.reason : undefined}
+      />
+    </>
+  );
+}
+
+// ── PLCSignalSlot (plan-418 F6 — the one slot of a raw PLC signal node) ──────
+
+/** Human sentences for the resolver's fail-closed reasons. */
+const PLC_UNAVAILABLE_TEXT: Record<string, string> = {
+  'signal-not-registered': 'This signal is not registered in the loaded model — nothing to link to',
+  'duplicate-signal-name': 'Another node registers the same signal name — linking one would drive both',
+};
+
+/** Whether a component section belongs to a raw PLC signal node. */
+export function isPLCSignalComponent(componentType: string): boolean {
+  return SIGNAL_TYPES.includes(baseComponentType(componentType));
+}
+
+export interface PLCSignalSlotProps {
+  viewer: RVViewer | null;
+  nodePath: string;
+  /** Concrete component key of the section (may carry a `_N` dedup suffix). */
+  componentType: string;
+}
+
+export function PLCSignalSlot({ viewer, nodePath, componentType }: PLCSignalSlotProps) {
+  const base = baseComponentType(componentType);
+  const node = viewer?.registry?.getNode(nodePath) ?? null;
+  const mgr = viewer?.signalBindingManager ?? null;
+  const target = useMemo(
+    () => (viewer && mgr && node ? findSignalBindTarget(viewer, node) : null),
+    [viewer, mgr, node],
+  );
+  const eligibility = useMemo(
+    () => (viewer && target ? signalBindEligibility(viewer, target) : null),
+    [viewer, target],
+  );
+
+  if (!SIGNAL_TYPES.includes(base)) return null;
+
+  // No manager / no resolvable target (A1 parity): a single read-only row that
+  // still states the slot exists. Without a manager there is nothing to bind.
+  if (!viewer || !mgr || !target) {
+    return (
+      <SignalSlotRow
+        row={{ kind: 'unavailable', slot: PLC_SIGNAL_SLOT, reason: 'Signal linking is not available in this session' }}
+        viewer={viewer ?? undefined}
+        readOnly
+      />
+    );
+  }
+
+  const targetId = signalBindTargetId(target);
+  const rootPath = viewer.registry?.getPathForNode(target.node) ?? NodeRegistry.computeNodePath(target.node);
+  const relPath = relativePathUnder(rootPath, canonicalNodePath(viewer, nodePath));
+
+  const buildRows = (mappings: readonly import('../layout-planner/rv-layout-store').SignalMapping[]): SlotRow[] => {
+    const allRows = buildSlotRowModels(viewer, mgr, targetId, target.node, mappings);
+    // The active row of THIS node — in a Planner placement the resolver keeps
+    // the node's relative path, so the same filter works for both target kinds.
+    const mine = allRows.find((r) => r.kind !== 'unavailable'
+      && r.slot === PLC_SIGNAL_SLOT
+      && r.componentPath === relPath
+      && r.componentType !== undefined
+      && baseComponentType(r.componentType) === base);
+    if (mine) return [mine];
+
+    // Unavailable rows carry no componentPath, so they are only unambiguously
+    // ours when this node IS the bind target root.
+    const unavailable = relPath === '.'
+      ? allRows.find((r) => r.kind === 'unavailable' && r.slot === PLC_SIGNAL_SLOT)
+      : undefined;
+    const reason = unavailable?.reason;
+    return [{
+      kind: 'unavailable',
+      slot: PLC_SIGNAL_SLOT,
+      reason: (reason && PLC_UNAVAILABLE_TEXT[reason]) ?? reason
+        ?? 'This signal is not offered as a link target in the loaded scene',
+    }];
   };
 
   return (

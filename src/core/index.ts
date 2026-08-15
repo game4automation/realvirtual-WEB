@@ -26,7 +26,13 @@ export {
 } from './engine/rv-web-sensor';
 
 export { RVLamp } from './engine/rv-lamp';
+export { RVSceneButtonBase } from './engine/rv-scene-button-base';
+export { RVSceneButtonMoveable } from './engine/rv-scene-button-moveable';
+export { RVPushButton3D } from './engine/rv-push-button3d';
+export { RVEmergencyButton3D } from './engine/rv-emergency-button3d';
+export { RVHandleSwitch3D } from './engine/rv-handle-switch3d';
 export { LampManager } from './engine/rv-lamp-manager';
+export { SceneButtonManager } from './engine/rv-scene-button-manager';
 
 // ── Generic Gizmo Overlay System ───────────────────────────────────────
 export {

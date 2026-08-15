@@ -24,6 +24,7 @@ import type { ModeId } from './rv-mode-manager';
 import type { RenderMode } from './rv-render-modes';
 import type { Object3D } from 'three';
 import type { SignatureState } from './persistence/rv-sig-verify';
+import type { ModelProvenance } from './rv-model-provenance';
 
 export interface ViewerEvents {
   // ── Existing events (unchanged) ──
@@ -36,6 +37,11 @@ export interface ViewerEvents {
     signatureState: SignatureState;
     logicRunState: 'active' | 'gated' | 'activating';
   };
+  /** Fired when the provenance of the model ON SCREEN changes (plan-423 F6):
+   *  at the end of every load, and on `clearModel()`. Distinct from the
+   *  load-time `LoadTrustContext`, which is restored the moment a load returns
+   *  and is therefore never a valid source for anything the user sees. */
+  'model-provenance-changed': { provenance: ModelProvenance };
   'model-cleared': void;
   /** Fired when the asynchronous BVH build for the current model has completed
    *  (plan-240): all merged raycast geometries and per-mesh geometries now
@@ -60,6 +66,27 @@ export interface ViewerEvents {
   'scene-loaded': { scene: RvScene };
   'drive-chart-toggle': { open: boolean };
   'drive-filter': { filter: string; filteredDrives: RVDrive[] };
+  /** The tick-list `RVViewer.drives` gained or lost a member at RUNTIME
+   *  (plan-411 Phase 1). Fired by the drive lifecycle primitive
+   *  (`RVViewer.addDrive` / `removeDrive`) — NOT on the bulk model load, which
+   *  keeps announcing itself through `model-loaded`.
+   *
+   *  Consumers that keep their own derived view of the drive collection MUST
+   *  listen here, or a drive added in the editor ticks in the wrong order,
+   *  stays out of the recorder and never shows up in the UI list:
+   *    - `drive-order-plugin`   — re-runs the topological Gear/CAM sort
+   *    - `drive-recorder-plugin`— re-seeds the ring buffers
+   *    - `use-drives`           — refreshes the React list
+   *  Deliberately NOT reacting: the raycast/BVH drive-node set and the
+   *  drive-axis gizmo sources, which rebuild from the registry on their own
+   *  epoch bump (`instancePickIndex.bumpResolutionEpoch()`), and
+   *  `filteredDrives`, which the primitive re-derives itself before emitting. */
+  'drives-changed': { drives: readonly RVDrive[]; added: RVDrive | null; removed: RVDrive | null };
+  /** A runtime component construction was REFUSED (plan-411 Phase 1). The
+   *  typed channel for a construction finding: nothing was created, the caller
+   *  rolls the extras stamp back, and the reason is reported here instead of
+   *  failing silently. */
+  'component-construction-failed': { nodePath: string; componentType: string; reason: string };
   'node-filter': { filter: string; filteredNodes: NodeSearchResult[]; tooMany: boolean };
   'sensor-chart-toggle': { open: boolean };
   'groups-overlay-toggle': { open: boolean };
@@ -108,6 +135,37 @@ export interface ViewerEvents {
   'interface-disconnected': { interfaceId: string; reason?: string };
   'interface-error': { interfaceId: string; error: string };
   'interface-data': { interfaceId: string; signals: Record<string, unknown> };
+  /**
+   * The first incoming signal snapshot after a (re)connect has been COMMITTED
+   * to the SignalStore (plan-427 F2).
+   *
+   * Not the same moment as `'interface-connected'`: that fires before signal
+   * discovery, and the values arriving from discovery/subscription sit in the
+   * adapter's `pendingIncoming` buffer until the next fixed-step flush. Only
+   * after that flush does the store hold the CURRENT remote state — which is
+   * when re-applying signal levels onto components is safe. Emitted once per
+   * connect (a 2 s timeout covers a silent PLC that sends nothing at all); a
+   * failed discovery emits nothing, so no stale level is ever replayed.
+   */
+  'interface-signals-synced': { interfaceId: string };
+
+  /**
+   * A signal was just linked to a slot BY SOMEBODY — a drop, a picker, an MCP
+   * bind (plan-425 F8). The chip for that slot pulses once so the act is
+   * visibly acknowledged.
+   *
+   * Emitted at the user/agent-initiated upsert boundary and nowhere else.
+   * NOT from `applyMappings()`, which also runs on every model load and on the
+   * repair scan — putting it there would flash every restored binding on reload
+   * and fire twice for a single MCP bind (review round 1, finding 7).
+   */
+  'signal-binding-applied': {
+    targetId: string;
+    componentPath: string;
+    slot: string;
+    signalName: string;
+    sourceKind: 'connect' | 'internal';
+  };
 
   // ── Generic raycast events (emitted by RaycastManager) ──
   'object-hover': ObjectHoverData | null;
@@ -253,8 +311,13 @@ export interface ViewerEvents {
    *  cloned for GLB export. Listeners must restore any ephemeral live-preview
    *  state they hold (e.g. the Kinematics window's drive-jog pose) so preview
    *  poses never bake into the saved GLB. Any future export path MUST emit
-   *  this too. */
-  'asset-editor-pre-export': { source: 'save-flow' };
+   *  this too.
+   *
+   *  `exportAssetGlb()` does NOT emit it — the CALLER does, right before the
+   *  export (review finding R2-1). `'test-session'` is the editor's in-place
+   *  test run (plan-410 F5), which materialises through the very same export
+   *  path and therefore owes the same restore. */
+  'asset-editor-pre-export': { source: 'save-flow' | 'test-session' };
 
   // ── Runtime attachment events ──
   /** Fired when the SimulationRuntime attaches/detaches time integration

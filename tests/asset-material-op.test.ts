@@ -7,7 +7,8 @@ import {
   collectPaintableMeshes, materialToValue, materialForValue, materialValueKey,
   indexMeshPathsByMaterialValue,
 } from '../src/core/editor/rv-asset-material';
-import { canCoalesceAssetOps, mergeAssetOps, describeAssetOp, classifyAssetOpRaycastImpact } from '../src/core/editor/rv-asset-ops';
+import { classifyAssetOpRaycastImpact } from '../src/core/editor/rv-asset-ops';
+import { canCoalesceRvOps, mergeRvOps, describeRvOp } from '../src/core/ops/rv-unified-ops';
 import type { SetMaterialOp, MaterialValue } from '../src/core/editor/rv-asset-ops';
 
 const STEEL: MaterialValue = {
@@ -84,8 +85,8 @@ describe('setMaterial op semantics', () => {
   it('coalesces consecutive edits over the same selection', () => {
     const a = op();
     const b = op({ id: 'op_2', ts: 1100, material: { ...STEEL, roughness: 0.8 } });
-    expect(canCoalesceAssetOps(a, b)).toBe(true);
-    const merged = mergeAssetOps(a, b) as SetMaterialOp;
+    expect(canCoalesceRvOps(a, b)).toBe(true);
+    const merged = mergeRvOps(a, b) as SetMaterialOp;
     // Forward payload from the later op, inverse payload from the earlier one.
     expect(merged.material.roughness).toBe(0.8);
     expect(merged.prev).toBe(a.prev);
@@ -95,11 +96,11 @@ describe('setMaterial op semantics', () => {
   it('does not coalesce across different selections', () => {
     const a = op();
     const b = op({ id: 'op_2', ts: 1100, nodePaths: ['Asset/Other'] });
-    expect(canCoalesceAssetOps(a, b)).toBe(false);
+    expect(canCoalesceRvOps(a, b)).toBe(false);
   });
 
   it('does not coalesce outside the time window', () => {
-    expect(canCoalesceAssetOps(op(), op({ id: 'op_2', ts: 99000 }))).toBe(false);
+    expect(canCoalesceRvOps(op(), op({ id: 'op_2', ts: 99000 }))).toBe(false);
   });
 
   it('never invalidates the pick BVH', () => {
@@ -109,12 +110,12 @@ describe('setMaterial op semantics', () => {
   });
 
   it('describes itself with the material name and mesh count', () => {
-    expect(describeAssetOp(op())).toBe('Material Steel (1 mesh)');
+    expect(describeRvOp(op())).toBe('Material Steel (1 mesh)');
     const many = op({ prev: [
       { meshPath: 'a', material: null },
       { meshPath: 'b', material: null },
     ] });
-    expect(describeAssetOp(many)).toBe('Material Steel (2 meshes)');
+    expect(describeRvOp(many)).toBe('Material Steel (2 meshes)');
   });
 });
 

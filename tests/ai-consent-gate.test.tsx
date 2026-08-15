@@ -32,6 +32,7 @@ import {
   clearRequestedSettingsTab,
   getRequestedSettingsTab,
 } from '../src/core/hmi/settings-tab-store';
+import type { McpBridgeSnapshot } from '../src/plugins/mcp-bridge-plugin';
 
 const layout = vi.hoisted(() => ({ mobile: false }));
 
@@ -74,7 +75,7 @@ function stubGateway(reachable: boolean) {
   });
 }
 
-function createViewer() {
+function createViewer(mcp?: Partial<McpBridgeSnapshot>) {
   const editorSnapshot = { panelOpen: false, settingsOpen: false };
   const editorPlugin = {
     subscribe: () => () => undefined,
@@ -82,7 +83,17 @@ function createViewer() {
     togglePanel: vi.fn(),
     setSettingsOpen: vi.fn(),
   };
-  const mcpBridgePlugin = { getSnapshot: undefined };
+  // Without an override the bridge stays at the hook's disabled default, which
+  // is what most tests here want (no CONNECT in the room).
+  const mcpBridgePlugin = mcp
+    ? {
+        getSnapshot: () => ({
+          connected: false, port: '5100', toolCount: 0, toolNames: [],
+          enabled: false, reconnectAttempt: 0, reconnectDelay: 0, serverStatus: null,
+          ...mcp,
+        }),
+      }
+    : { getSnapshot: undefined };
   return {
     leftPanelManager: new LeftPanelManager(),
     uiRegistry: new UIPluginRegistry(),
@@ -110,7 +121,10 @@ function renderWithViewer(node: ReactNode, viewer: ReturnType<typeof createViewe
   );
 }
 
-const aiButton = () => screen.getByRole('button', { name: 'AI Bridge' });
+// The accessible name carries the bridge state ("AI Bridge — off" /
+// "— connecting…" / "— connected (N tools)"), so match on the stem.
+const AI_BUTTON_NAME = /^AI Bridge/;
+const aiButton = () => screen.getByRole('button', { name: AI_BUTTON_NAME });
 
 beforeEach(() => {
   layout.mobile = false;
@@ -157,11 +171,29 @@ describe('AI Bridge entry — activity bar', () => {
     expect(screen.queryByTestId('ai-connect-download-info')).not.toBeInTheDocument();
   });
 
+  // The accent is the only resting indication that an assistant can reach this
+  // scene — it must follow the connection, not the 3s tool-call flicker.
+  it('carries the accent and the state in its name while the bridge is connected', () => {
+    stubGateway(true);
+    renderWithViewer(<ActivityBar />, createViewer({ connected: true, enabled: true, toolCount: 42 }));
+
+    const btn = screen.getByRole('button', { name: 'AI Bridge — connected (42 tools)' });
+    expect(btn.className).toContain('colorPrimary');
+  });
+
+  it('stays neutral and says so while no bridge is connected', () => {
+    stubGateway(true);
+    renderWithViewer(<ActivityBar />, createViewer({ connected: false, enabled: true }));
+
+    const btn = screen.getByRole('button', { name: 'AI Bridge — connecting…' });
+    expect(btn.className).not.toContain('colorPrimary');
+  });
+
   it('stays removed when the feature matrix does not allow the entry', () => {
     stubGateway(true);
     renderWithViewer(<ActivityBar entryAllowlist={['settings']} />, createViewer());
 
-    expect(screen.queryByRole('button', { name: 'AI Bridge' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: AI_BUTTON_NAME })).not.toBeInTheDocument();
   });
 
   it('keeps the AI button out of the mobile bar — mobile enters through Settings', () => {
@@ -169,7 +201,7 @@ describe('AI Bridge entry — activity bar', () => {
     stubGateway(true);
     renderWithViewer(<ActivityBar />, createViewer());
 
-    expect(screen.queryByRole('button', { name: 'AI Bridge' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: AI_BUTTON_NAME })).not.toBeInTheDocument();
   });
 });
 

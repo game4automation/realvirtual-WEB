@@ -376,17 +376,26 @@ export function createDropTargetRegistry<T, R = never>(
     const entry = entryAt(x, y);
     const reason = entry ? evaluate(entry, payload) : null;
     const accepted = entry !== null && reason === null;
-    if (entry?.describe) {
-      const { targetId, accessibleLabel } = entry.describe();
-      outcomeEmitted = true;
+    // …then RESET before emitting (plan-341 §2.3 invariant 3, made good in
+    // plan-353 F1): a subscriber that inspects the DOM from its `outcome`
+    // handler must not see a target still painted as hovered. The identity is
+    // already captured above, so clearing here costs the outcome nothing —
+    // hence the two invariants are satisfied by ORDER, not by a consumer latch.
+    // Observable contract: on `outcome`, no target carries a hover value in
+    // `data-rv-drop-state`; a still-registered target shows its drag BASE state
+    // (`candidate` / null), which is what `leaveHover()` restores.
+    const describe = entry?.describe;
+    const outcome = describe ? describe() : null;
+    if (outcome || accepted) outcomeEmitted = true;
+    clearHover();
+    if (outcome) {
+      const { targetId, accessibleLabel } = outcome;
       if (accepted) emit({ phase: 'outcome', result: 'accepted', targetId, accessibleLabel });
       else emit({ phase: 'outcome', result: 'rejected', targetId, accessibleLabel, reason: reason as R });
-    } else if (accepted) {
-      // A legacy target consumed the drop: it announces nothing, but a later
-      // `outcome:none` would be a lie, so the slot counts as used.
-      outcomeEmitted = true;
     }
-    clearHover();
+    // A legacy target (no `describe`) consumed the drop: it announces nothing,
+    // but a later `outcome:none` would be a lie, so the slot counts as used —
+    // handled by the `|| accepted` above.
     if (!accepted) return false;
     entry!.onDrop(payload);
     return true;

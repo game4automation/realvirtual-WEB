@@ -28,15 +28,16 @@ describe('CollisionRole rv_extras round-trip', () => {
     expect(apply({ CollisionRole: 'Nonsense' }).CollisionRole).toBe('None');
   });
 
-  it('builds an identity enumMap covering all six roles', () => {
+  // plan-409 appended the seventh role `Cutter`.
+  it('builds an identity enumMap covering all seven roles', () => {
     const schema = loadSchemaFromSpec('CollisionRole');
     expect(schema.CollisionRole.type).toBe('enum');
     expect(Object.keys(schema.CollisionRole.enumMap!)).toEqual(
-      ['None', 'Tool', 'Workpiece', 'Machine', 'Robot', 'Environment']);
+      ['None', 'Tool', 'Workpiece', 'Machine', 'Robot', 'Environment', 'Cutter']);
     expect(schema.CollisionRole.default).toBe('None');
   });
 
-  it('gives Source a CollisionRoleForMUs enum with the same six values', () => {
+  it('gives Source a CollisionRoleForMUs enum with the same seven values', () => {
     const schema = RVSource.schema;
     expect(schema.CollisionRoleForMUs.type).toBe('enum');
     expect(schema.CollisionRoleForMUs.default).toBe('None');

@@ -14,9 +14,12 @@
  * Since plan-702 this selector no longer adds or removes libraries. That whole
  * surface existed twice (here and in the Assets tab of the Projects window) on
  * top of one shared `LibraryStore`, and two front-ends for one store is how
- * they drift. What stays is what BROWSING a library needs: pick one, re-scan a
- * local folder, re-grant its permission. The single management route is the
- * "Manage libraries…" entry in the dropdown foot.
+ * they drift. What stays is what BROWSING a library needs: pick one. The single
+ * management route is the "Manage libraries…" entry in the dropdown foot.
+ *
+ * The local-folder affordances that used to live here — re-scan the folder,
+ * re-grant its browser permission — went with the working folder itself
+ * (plan-709 §2.6). A project folder handles permission at the project level.
  */
 
 import { useState, type ReactNode } from 'react';
@@ -29,24 +32,21 @@ import {
   ListItemIcon,
   ListItemText,
   Divider,
-  Tooltip,
   Typography,
   CircularProgress,
 } from '@mui/material';
 import {
   ArrowDropDown,
   Check,
-  Refresh,
   Tune,
   Cloud,
   GitHub,
-  FolderOpen,
   Link as LinkIcon,
   CollectionsBookmark,
   MoreVert,
 } from '@mui/icons-material';
 
-export type LibraryKind = 'url' | 'github' | 'local' | 'cloud';
+export type LibraryKind = 'url' | 'github' | 'cloud';
 
 export interface LibraryItem {
   id: string;
@@ -54,8 +54,6 @@ export interface LibraryItem {
   kind: LibraryKind;
   /** Connection state for cloud (Asset Manager) libraries. */
   cloudStatus?: 'connected' | 'connecting' | 'error';
-  /** Local folder whose browser permission lapsed — selecting it re-grants. */
-  needsPermission?: boolean;
   /** Catalog failed to load (non-permission error). */
   error?: boolean;
 }
@@ -64,8 +62,6 @@ export interface LibrarySelectorProps {
   items: LibraryItem[];
   activeId: string | null;
   onSelect: (id: string) => void;
-  /** Refresh a local-folder library (re-scan files). */
-  onRefresh?: (id: string) => void;
   /** Open the Projects dashboard on its Assets tab — the only management route. */
   onManage: () => void;
   /** Compact mode (mobile): collapse the inline refresh button into a single
@@ -78,7 +74,6 @@ function kindIcon(kind: LibraryKind, status: LibraryItem['cloudStatus'], error?:
   const sx = { fontSize: 16 } as const;
   switch (kind) {
     case 'github': return <GitHub sx={sx} />;
-    case 'local': return <FolderOpen sx={{ ...sx, color: '#66bb6a' }} />;
     case 'cloud': {
       const color = status === 'connected' ? '#66bb6a' : status === 'connecting' ? '#ffb74d' : '#ef5350';
       return <Cloud sx={{ ...sx, color }} />;
@@ -87,7 +82,7 @@ function kindIcon(kind: LibraryKind, status: LibraryItem['cloudStatus'], error?:
   }
 }
 
-export function LibrarySelector({ items, activeId, onSelect, onRefresh, onManage, compact = false }: LibrarySelectorProps) {
+export function LibrarySelector({ items, activeId, onSelect, onManage, compact = false }: LibrarySelectorProps) {
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const close = () => setAnchor(null);
   // Compact-mode overflow ("⋮") menu anchor — separate from the library dropdown.
@@ -144,29 +139,13 @@ export function LibrarySelector({ items, activeId, onSelect, onRefresh, onManage
             <MoreVert sx={{ fontSize: 18 }} />
           </IconButton>
           <Menu anchorEl={actionAnchor} open={!!actionAnchor} onClose={closeActions}>
-            {active?.kind === 'local' && onRefresh && (
-              <MenuItem onClick={() => { onRefresh(active.id); closeActions(); }} sx={{ fontSize: 12 }}>
-                <ListItemIcon sx={{ minWidth: 26 }}><Refresh sx={{ fontSize: 16 }} /></ListItemIcon>
-                Refresh folder
-              </MenuItem>
-            )}
             <MenuItem onClick={() => { onManage(); closeActions(); }} sx={{ fontSize: 12 }}>
               <ListItemIcon sx={{ minWidth: 26 }}><Tune sx={{ fontSize: 16 }} /></ListItemIcon>
               Manage libraries…
             </MenuItem>
           </Menu>
         </>
-      ) : (
-        <>
-          {active?.kind === 'local' && onRefresh && (
-            <Tooltip title="Refresh folder">
-              <IconButton size="small" onClick={() => onRefresh(active.id)} sx={{ p: 0.5 }} aria-label="Refresh folder">
-                <Refresh sx={{ fontSize: 16 }} />
-              </IconButton>
-            </Tooltip>
-          )}
-        </>
-      )}
+      ) : null}
 
       <Menu
         anchorEl={anchor}
@@ -190,7 +169,7 @@ export function LibrarySelector({ items, activeId, onSelect, onRefresh, onManage
               </ListItemIcon>
               <ListItemText
                 primary={item.label}
-                secondary={item.needsPermission ? 'Permission needed — click to re-grant' : item.error ? 'Failed to load' : undefined}
+                secondary={item.error ? 'Failed to load' : undefined}
                 slotProps={{
                   primary: { sx: { fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
                   secondary: { sx: { fontSize: 10, color: item.error ? '#ef5350' : 'text.disabled' } },

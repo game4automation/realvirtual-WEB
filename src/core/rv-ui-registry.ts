@@ -12,10 +12,29 @@
 import type { UISlot, UISlotEntry } from './rv-ui-plugin';
 import { modeContext } from './rv-mode-manager';
 
+/** @internal — a registered slot plus the keys that keep its position stable. */
+interface RegisteredSlot {
+  /** The registry's OWN copy of the plugin's entry (never the plugin's object). */
+  readonly entry: UISlotEntry;
+  /** Monotonic registration sequence of the owning plugin (stable across re-register). */
+  readonly seq: number;
+  /** Declaration index within the plugin's own `slots` array. */
+  readonly index: number;
+}
+
 export class UIPluginRegistry {
-  private entries: UISlotEntry[] = [];
+  private _slots: RegisteredSlot[] = [];
   private _version = 0;
   private _listeners = new Set<() => void>();
+  /**
+   * First-registration sequence per plugin ID (plan-435 §2.7 point 2).
+   *
+   * Kept ACROSS unregister/register so a plugin switched off and on again
+   * lands back in its original position inside its `order` group instead of
+   * behind everyone else on the same level. Never reused, never reset.
+   */
+  private _seqByPlugin = new Map<string, number>();
+  private _nextSeq = 0;
 
   /** Notify all subscribers that the registry changed. */
   private _notify(): void {
@@ -50,41 +69,79 @@ export class UIPluginRegistry {
    *
    * This is the ONLY place where `modes` becomes UI visibility, and it never
    * reads `core` — see rv-plugin.ts `core?` and doc-ui-visibility.md.
+   *
+   * IDEMPOTENT (plan-435 §2.7): a second `register()` for the same plugin ID
+   * replaces its entries instead of duplicating them — the user toggle calls
+   * this every time a plugin is switched back on.
+   *
+   * NON-MUTATING (plan-435 §2.7 point 3): the plugin's own slot objects are
+   * never touched. The registry normalises a shallow COPY of each entry, so
+   * registering twice always starts from the plugin's pristine declaration
+   * and a pre-existing `shownOnlyInAny` is not progressively overwritten in
+   * the plugin's own data.
    */
   register(plugin: { id?: string; slots?: UISlotEntry[]; modes?: string[] }): void {
     if (!plugin.slots || plugin.slots.length === 0) return;
     const pluginId = (plugin as Record<string, unknown>).id as string | undefined;
+    // Idempotency: drop whatever this plugin registered before.
+    if (pluginId !== undefined) this.unregister(pluginId);
     const modeAny = plugin.modes && plugin.modes.length > 0
       ? plugin.modes.map((m) => modeContext(m))
       : null;
     plugin.slots.forEach((entry, i) => {
-      entry.pluginId = pluginId ?? entry.pluginId;
+      const copy: UISlotEntry = { ...entry };
+      copy.pluginId = pluginId ?? copy.pluginId;
       if (modeAny) {
-        entry.visibilityRule = { ...entry.visibilityRule, shownOnlyInAny: modeAny };
-        if (!entry.visibilityId) {
-          entry.visibilityId = `mode-slot:${pluginId ?? 'unknown'}:${entry.slot}:${i}`;
+        copy.visibilityRule = { ...copy.visibilityRule, shownOnlyInAny: modeAny };
+        if (!copy.visibilityId) {
+          copy.visibilityId = `mode-slot:${pluginId ?? 'unknown'}:${copy.slot}:${i}`;
         }
       }
+      this._slots.push({ entry: copy, seq: this._seqFor(copy.pluginId), index: i });
     });
-    this.entries.push(...plugin.slots);
-    this.entries.sort((a, b) => (a.order ?? 100) - (b.order ?? 100));
+    this._sort();
     this._notify();
+  }
+
+  /**
+   * Stable sequence number for a plugin ID. Assigned on first registration and
+   * remembered forever, so a re-registered plugin keeps its relative position.
+   * Anonymous entries (no ID at all) get a fresh sequence every time.
+   */
+  private _seqFor(pluginId: string | undefined): number {
+    if (pluginId === undefined) return this._nextSeq++;
+    let seq = this._seqByPlugin.get(pluginId);
+    if (seq === undefined) {
+      seq = this._nextSeq++;
+      this._seqByPlugin.set(pluginId, seq);
+    }
+    return seq;
+  }
+
+  /** Sort by (order, seq, declaration index) — see `_seqByPlugin`. */
+  private _sort(): void {
+    this._slots.sort((a, b) => {
+      const byOrder = (a.entry.order ?? 100) - (b.entry.order ?? 100);
+      if (byOrder !== 0) return byOrder;
+      if (a.seq !== b.seq) return a.seq - b.seq;
+      return a.index - b.index;
+    });
   }
 
   /** Remove all slot entries belonging to a plugin. */
   unregister(pluginId: string): void {
-    const before = this.entries.length;
-    this.entries = this.entries.filter(e => e.pluginId !== pluginId);
-    if (this.entries.length !== before) this._notify();
+    const before = this._slots.length;
+    this._slots = this._slots.filter((s) => s.entry.pluginId !== pluginId);
+    if (this._slots.length !== before) this._notify();
   }
 
   /** All components registered for a given slot. */
   getSlotComponents(slot: UISlot): UISlotEntry[] {
-    return this.entries.filter((e) => e.slot === slot);
+    return this._slots.filter((s) => s.entry.slot === slot).map((s) => s.entry);
   }
 
   /** All settings-tab entries. */
   getSettingsTabs(): UISlotEntry[] {
-    return this.entries.filter((e) => e.slot === 'settings-tab');
+    return this.getSlotComponents('settings-tab');
   }
 }

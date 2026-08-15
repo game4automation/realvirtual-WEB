@@ -34,6 +34,7 @@ import {
 import { Add, Save } from '@mui/icons-material';
 import type { Object3D } from 'three';
 import { FloatingPanel } from '../FloatingPanel';
+import { DIRTY_INK } from '../rv-dirty-dot';
 import type { UISlotProps } from '../../rv-ui-plugin';
 import type { RVViewer } from '../../rv-viewer';
 import { getSceneStore } from '../scene/scene-store-singleton';
@@ -421,7 +422,7 @@ export function ScriptEditorPanel({ viewer }: UISlotProps) {
         data-testid="script-des-badge"
       />
       {dirty && (
-        <Typography sx={{ fontSize: 10, color: '#ffb74d' }} data-testid="script-dirty">
+        <Typography sx={{ fontSize: 10, color: DIRTY_INK }} data-testid="script-dirty">
           modified
         </Typography>
       )}

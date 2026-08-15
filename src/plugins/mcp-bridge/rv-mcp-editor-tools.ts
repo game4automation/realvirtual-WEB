@@ -19,21 +19,38 @@
  */
 
 import { Box3, Euler, Quaternion, Vector3 } from 'three';
-import type { Object3D } from 'three';
+import type { BufferGeometry, Mesh, Object3D } from 'three';
 import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { getSchemaDefaults, getTypesWithCapability } from '../../core/engine/rv-component-registry';
 import { computeSubtreeAABB } from '../../core/engine/rv-traverse-utils';
 import { getDriveDragDriver } from '../../core/engine/drive-drag-driver';
 import { NodeRegistry } from '../../core/engine/rv-node-registry';
-import { computeMaterialStats } from '../asset-editor/materials/material-stats';
+import { isModelRoot } from '../../core/engine/rv-model-root';
+import { computeMaterialStats } from '@rv-private/plugins/asset-editor/materials/material-stats';
 import {
   indexMeshPathsByMaterialValue,
   materialToValue,
   materialValueKey,
 } from '../../core/editor/rv-asset-material';
 import type { MaterialValue, NodeTransform } from '../../core/editor/rv-asset-ops';
-import type { ActiveAssetContext } from '../asset-editor/active-asset-store';
+import type { ActiveAssetContext } from '../../core/editor/active-asset-store';
+import { libraryDocumentBase } from '../../core/editor/active-asset-store';
+// Type-only: the module itself is dynamically imported inside the mechanism
+// tools so the asset-editor chunk stays lazy (see the module header).
+import type {
+  DensityPresetId, JointKind, MechanismDocumentLike, MechanismOpPlan,
+} from '@rv-private/plugins/asset-editor/mechanism/mechanism-authoring';
+import type { MechanismUiBridge } from '../../core/engine/rv-kinematic-registry';
+import type { DownsampledSeries } from '@rv-private/plugins/asset-editor/mechanism/mechanism-force-downsample';
+import {
+  DEFAULT_WELD_THRESHOLD,
+  REASON_MULTI_MATERIAL,
+  REASON_SINGLE_PART,
+  groupModeIneligibility,
+  unsupportedMeshShapeReason,
+  type SeparateMode,
+} from '../../core/editor/rv-mesh-separator';
 import { requireEditor, isGuardError } from './rv-mcp-editor-guard';
 import { parsePathsParam } from './rv-object-analyzer-math';
 import { captureFrameCanvas, canvasToRvImage, compositeMontage } from './rv-frame-capture';
@@ -43,13 +60,56 @@ import {
   computeSameMaterialPaths,
   computeInvertPaths,
   expandToUniverseMeshes,
-} from '../asset-editor/select-actions';
+} from '@rv-private/plugins/asset-editor/select-actions';
 
 const r3 = (n: number): number => +n.toFixed(3);
+
+/** Refusal shown for every structural verb aimed at the GLB root (plan-715 F4). */
+const MODEL_ROOT_LOCKED =
+  'The model root is locked: it cannot be renamed, transformed, hidden, deleted or reparented '
+  + '(its name is the first segment of every node path and its pose is the asset origin). '
+  + 'Edit its components/metadata instead, or target a child node.';
 
 /** Kinematic component keys in rv_extras, tolerant of the `_N` dedup suffix. */
 const KINEMATIC_KEY_RE = /^Kinematic(_\d+)?$/;
 const DRIVE_KEY_RE = /^Drive(_\d+)?$/;
+/** Rigid-body MECHANISM container keys — the ancestor walk of `_mechCommit`. */
+const MECHANISM_KEY_RE = /^KinematicMechanism(_\d+)?$/;
+
+/**
+ * The one refusal every mechanism tool gives without the private bundle.
+ *
+ * It names the ALTERNATIVE, not just the absence: an agent that reads only
+ * "not available" retries the same call three times before giving up, whereas
+ * the axis-group system is right there and is what most single-axis authoring
+ * actually wants.
+ */
+const MECHANISM_UNAVAILABLE =
+  'Rigid-body mechanisms are not available in this build (private bundle missing). '
+  + 'Axis-group kinematics are available via web_editor_create_kinematic.';
+
+/**
+ * Narrow the `_requireMechanismBridge` union. Deliberately NOT `isGuardError`:
+ * that one is typed for the editor-mode guard's own union, and widening it would
+ * make an unrelated module the home of every "or an error" shape in the bridge.
+ */
+function isMechError(r: MechanismUiBridge | { error: string }): r is { error: string } {
+  return 'error' in r;
+}
+
+/**
+ * Upper bound on the force time series `web_editor_mechanism_forces` hands out.
+ *
+ * The recorder's ring buffer holds 3000 samples — ~60 kB of JSON per channel,
+ * which breaks the answer-size budget for one tool call. 200 points cost ~2 kB
+ * and still carry a duty cycle, which is the whole reason a series is requested
+ * next to peak and RMS. The reduction preserves the extremes
+ * (`mechanism-force-downsample.ts`), so the cap costs resolution, never the peak.
+ */
+const SERIES_MAX_POINTS = 200;
+
+/** Recorder sampling rate, mirrored so the forces tool needs no eager import. */
+const FORCE_SAMPLE_RATE_HZ = 10;
 
 const DRIVE_DIRECTIONS = ['LinearX', 'LinearY', 'LinearZ', 'RotationX', 'RotationY', 'RotationZ'];
 
@@ -89,23 +149,52 @@ function driveExtrasOf(node: Object3D): Record<string, unknown> | null {
 
 /** Lazily-loaded asset-editor action modules (the editor stays a lazy chunk). */
 interface EditorMods {
-  transform: typeof import('../asset-editor/kinematics/transform-actions');
-  create: typeof import('../asset-editor/kinematics/create-actions');
-  group: typeof import('../asset-editor/group-actions');
-  del: typeof import('../asset-editor/delete-selection');
-  save: typeof import('../asset-editor/save-flow');
-  pending: typeof import('../asset-editor/pending-open-store');
-  quickEdit: typeof import('../asset-editor/kinematics/quick-edit-context');
-  presets: typeof import('../asset-editor/materials/material-presets');
-  gizmoSource: typeof import('../asset-editor/editor-drive-gizmo-source');
-  draft: typeof import('../../core/editor/rv-asset-draft-storage');
+  transform: typeof import('@rv-private/plugins/asset-editor/kinematics/transform-actions');
+  create: typeof import('@rv-private/plugins/asset-editor/kinematics/create-actions');
+  group: typeof import('@rv-private/plugins/asset-editor/group-actions');
+  del: typeof import('@rv-private/plugins/asset-editor/delete-selection');
+  save: typeof import('@rv-private/plugins/asset-editor/save-flow');
+  pending: typeof import('@rv-private/plugins/asset-editor/pending-open-store');
+  quickEdit: typeof import('@rv-private/plugins/asset-editor/kinematics/quick-edit-context');
+  presets: typeof import('@rv-private/plugins/asset-editor/materials/material-presets');
+  gizmoSource: typeof import('@rv-private/plugins/asset-editor/editor-drive-gizmo-source');
+  draft: typeof import('../../core/ops/rv-document-drafts');
   importAsset: typeof import('../../core/import/rv-import-asset');
   cadProvider: typeof import('../../core/editor/rv-cad-provider');
-  fs: typeof import('../../core/engine/rv-local-filesystem');
+}
+
+/**
+ * One entry of the snap-candidate cache behind `web_editor_mechanism_snap_list`.
+ *
+ * The alternative — handing the full candidate geometry back and taking it in
+ * again on the commit — would ask the agent to reproduce a position and a normal
+ * vector without a rounding error, which is the exact failure class snapping
+ * exists to remove. Precedent in house: `web_layout_snap_list` →
+ * `web_layout_snap_attach`.
+ */
+interface CachedSnapCandidate {
+  id: string;
+  kind: string;
+  label: string;
+  nodePath: string;
+  worldPosition: Vector3;
+  worldNormal: Vector3;
+  radius?: number;
+  inner?: boolean;
+  recommended: boolean;
 }
 
 export class McpEditorTools {
   constructor(private readonly getViewer: () => RVViewer | undefined) {}
+
+  /**
+   * The candidate set of the LAST `snap_list`, addressed by `snap0..snapN`.
+   *
+   * A new listing invalidates the previous one on purpose: two live sets would
+   * make `snap3` ambiguous, and an id that silently means yesterday's bore is a
+   * wrong anchor with no error attached.
+   */
+  private _snapCache: CachedSnapCandidate[] = [];
 
   private get viewer(): RVViewer | undefined {
     return this.getViewer();
@@ -115,19 +204,18 @@ export class McpEditorTools {
 
   private _load(): Promise<EditorMods> {
     this._mods ??= (async () => ({
-      transform: await import('../asset-editor/kinematics/transform-actions'),
-      create: await import('../asset-editor/kinematics/create-actions'),
-      group: await import('../asset-editor/group-actions'),
-      del: await import('../asset-editor/delete-selection'),
-      save: await import('../asset-editor/save-flow'),
-      pending: await import('../asset-editor/pending-open-store'),
-      quickEdit: await import('../asset-editor/kinematics/quick-edit-context'),
-      presets: await import('../asset-editor/materials/material-presets'),
-      gizmoSource: await import('../asset-editor/editor-drive-gizmo-source'),
-      draft: await import('../../core/editor/rv-asset-draft-storage'),
+      transform: await import('@rv-private/plugins/asset-editor/kinematics/transform-actions'),
+      create: await import('@rv-private/plugins/asset-editor/kinematics/create-actions'),
+      group: await import('@rv-private/plugins/asset-editor/group-actions'),
+      del: await import('@rv-private/plugins/asset-editor/delete-selection'),
+      save: await import('@rv-private/plugins/asset-editor/save-flow'),
+      pending: await import('@rv-private/plugins/asset-editor/pending-open-store'),
+      quickEdit: await import('@rv-private/plugins/asset-editor/kinematics/quick-edit-context'),
+      presets: await import('@rv-private/plugins/asset-editor/materials/material-presets'),
+      gizmoSource: await import('@rv-private/plugins/asset-editor/editor-drive-gizmo-source'),
+      draft: await import('../../core/ops/rv-document-drafts'),
       importAsset: await import('../../core/import/rv-import-asset'),
       cadProvider: await import('../../core/editor/rv-cad-provider'),
-      fs: await import('../../core/engine/rv-local-filesystem'),
     }))();
     return this._mods;
   }
@@ -145,7 +233,7 @@ export class McpEditorTools {
     const policy = (ifDirty || 'fail').toLowerCase();
     const mods = await this._load();
     if (policy === 'discard') {
-      await mods.draft.clearAssetDraft();
+      await mods.draft.clearDocumentDraft(ctx.doc.draftFrame);
       // poison dirty so deactivate won't re-flush
       await ctx.doc.markSaved(ctx.doc.base, undefined, { clearDraft: true });
       return null;
@@ -166,7 +254,7 @@ export class McpEditorTools {
 
   /** Wait until the editor has an active document (bounded poll). */
   private async _awaitEditorContext(notDocId?: string, timeoutMs = 110_000): Promise<ActiveAssetContext | null> {
-    const { getActiveAssetContext } = await import('../asset-editor/active-asset-store');
+    const { getActiveAssetContext } = await import('../../core/editor/active-asset-store');
     const t0 = Date.now();
     for (;;) {
       const ctx = getActiveAssetContext();
@@ -185,8 +273,14 @@ export class McpEditorTools {
     const snap = ctx.doc.getSnapshot();
     let nodeCount = 0;
     v?.currentModelRoot?.traverse(() => { nodeCount++; });
+    // plan-706: the test-session state rides here rather than in a tool of its
+    // own — a whole extra entry in the roster for one enum is a worse trade for
+    // the agent's tool-selection budget than one more field on the status it
+    // already reads.
+    const { getTestSessionState } = await import('@rv-private/plugins/asset-editor/test-session-store');
     return JSON.stringify({
       active: true,
+      testSession: getTestSessionState(),
       name: snap.name,
       base: snap.base,
       dirty: snap.dirty,
@@ -234,11 +328,7 @@ export class McpEditorTools {
     mods.pending.setPendingAssetOpen(
       src === 'empty'
         ? { kind: 'empty' }
-        : {
-            kind: 'libraryGlb',
-            fileName: relPath.trim().split('/').pop() ?? relPath.trim(),
-            relPath: relPath.trim(),
-          },
+        : libraryDocumentBase(relPath.trim()),
     );
     v.modes.setMode('editor');
     const ctx = await this._awaitEditorContext(prevDocId);
@@ -267,27 +357,37 @@ export class McpEditorTools {
     return this._statusJson();
   }
 
-  @McpTool('Locate the KNOWLEDGE FOLDER for the open asset — the durable home for notes, a part catalogue and saved views across sessions. Returns the work folder NAME, the asset\'s library-relative path when it has one, and knowledgeRelPath ("knowledge/<AssetName>"). absolutePath is ALWAYS null: the browser File System Access API exposes no filesystem path, so resolve the root once per machine (search for a directory named workFolderName containing "library"), confirm it with the user, and record it in knowledge.md. web_render and web_screenshot_annotated write into this folder directly via their savePath parameter, which needs no absolute path.', { readOnly: true })
-  async webEditorWorkfolderInfo(): Promise<string> {
+  @McpTool('Locate the KNOWLEDGE FOLDER for the open asset inside the OPEN PROJECT — the durable home for notes, a part catalogue and saved views across sessions. Returns the project name/kind, whether it is writable, the asset\'s library-relative path when it has one, and knowledgeRelPath ("knowledge/<AssetName>"). Every path here is PROJECT-relative, which is all the other tools need: web_editor_import_glb / web_editor_import_cad read them, web_render / web_screenshot_annotated write them via savePath. absolutePath is ALWAYS null — the browser exposes no filesystem path, and a browser project (OPFS) has none; put files in through the app, not the OS file manager.', { readOnly: true })
+  async webEditorProjectInfo(): Promise<string> {
     const ctx = this._ctx();
     if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const mods = await this._load();
-    const meta = mods.fs.getWorkFolderMeta();
+    const { getProjectStore } = await import('../../core/project/project-store');
+    const store = getProjectStore();
+    const backend = store.getBackend();
+    const project = store.getProject();
     const snap = ctx.doc.getSnapshot();
     const assetName = (snap.name || 'Untitled').trim() || 'Untitled';
     // Folder-safe but still recognisable: the agent and the user both navigate to this by name.
     const safeName = assetName.replace(/[^A-Za-z0-9 ._-]/g, '_').replace(/\s+/g, ' ').trim() || 'Untitled';
     const base = snap.base;
-    const fromLibrary = base.kind === 'libraryGlb';
+    // plan-716 §2.6: `path` is project-relative and already carries the
+    // `library/` prefix, so "is this a library asset?" is a question about the
+    // path rather than about a kind of its own. The reported `assetRelPath`
+    // stays byte-identical to what the former `libraryGlb` branch produced —
+    // it is an MCP result shape agents parse.
+    const fromLibrary = base.kind === 'document' && base.path.startsWith('library/');
     return JSON.stringify({
-      configured: meta !== null,
-      workFolderName: meta?.displayName ?? null,
+      projectOpen: project !== null,
+      projectName: project?.name ?? null,
+      projectKind: backend?.kind ?? null,
+      writable: backend?.writable === true,
       absolutePath: null,
-      absolutePathNote: 'Not obtainable from the browser. Resolve once per machine, confirm with the user, and record it in knowledge.md.',
+      absolutePathNote: 'Not obtainable from the browser. Every path in this result is project-relative; the tools take those directly.',
       assetName,
       assetFromLibrary: fromLibrary,
-      assetRelPath: fromLibrary ? `library/${base.relPath}` : null,
+      assetRelPath: fromLibrary ? base.path : null,
       knowledgeRelPath: `knowledge/${safeName}`,
+      capturesRelPath: 'captures',
       dirty: snap.dirty,
       opCount: snap.opCount,
     });
@@ -361,6 +461,7 @@ export class McpEditorTools {
     if (isGuardError(ctx)) return JSON.stringify(ctx);
     const node = ctx.viewer.registry?.getNode(path);
     if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    if (isModelRoot(node, ctx.viewer.currentModelRoot)) return JSON.stringify({ error: MODEL_ROOT_LOCKED });
     const mods = await this._load();
     const prev = mods.transform.snapshotLocal(node);
     const num = (v: number | undefined, dflt: number): number =>
@@ -456,6 +557,7 @@ export class McpEditorTools {
     if (isGuardError(ctx)) return JSON.stringify(ctx);
     const node = ctx.viewer.registry?.getNode(path);
     if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    if (isModelRoot(node, ctx.viewer.currentModelRoot)) return JSON.stringify({ error: MODEL_ROOT_LOCKED });
     const trimmed = (name || '').trim();
     if (!trimmed) return JSON.stringify({ error: 'Empty name' });
     ctx.doc.renameNode(path, trimmed, node.name);
@@ -473,7 +575,7 @@ export class McpEditorTools {
     const mods = await this._load();
     const candidates = parsePathsParam(paths).filter((p) => {
       const node = ctx.viewer.registry?.getNode(p);
-      return !!node && !!node.parent && node !== ctx.viewer.currentModelRoot;
+      return !!node && !!node.parent && !isModelRoot(node, ctx.viewer.currentModelRoot);
     });
     const pruned = mods.del.pruneDescendantPaths(candidates);
     if (pruned.length === 0) return JSON.stringify({ error: 'No deletable nodes among the given paths' });
@@ -491,12 +593,85 @@ export class McpEditorTools {
     const list = parsePathsParam(paths);
     let changed = 0;
     for (const p of list) {
-      if (!ctx.viewer.registry?.getNode(p)) continue;
+      const node = ctx.viewer.registry?.getNode(p);
+      if (!node) continue;
+      // The model root stays visible (plan-715 F4). Reported rather than
+      // silently skipped so a single-path call gets a real answer.
+      if (isModelRoot(node, ctx.viewer.currentModelRoot)) {
+        if (list.length === 1) return JSON.stringify({ error: MODEL_ROOT_LOCKED });
+        continue;
+      }
       ctx.doc.setNodeVisible(p, visible !== false);
       changed++;
     }
     await ctx.doc.whenIdle();
     return JSON.stringify({ ok: true, changed, visible: visible !== false });
+  }
+
+  @McpTool('SEPARATE meshes into child parts (undoable, same op as the context menu "Separate ▸"): islands = connected loose parts, groups = one part per material group. Each source mesh is replaced by a same-named Group carrying the parts (children "<name>_part<N>"). Omit paths to separate the CURRENT selection.', { readOnly: false, timeoutMs: 120_000 })
+  async webEditorSeparate(
+    @McpParam('paths', 'Mesh node paths, comma/newline-separated (omit = current selection).', 'string', false) paths: string,
+    @McpParam('mode', 'islands | groups | auto (default auto: groups for multi-material meshes, islands otherwise).', 'string', false) mode: string,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    let list = parsePathsParam(paths ?? '');
+    if (list.length === 0) list = [...ctx.viewer.selectionManager.getSnapshot().selectedPaths];
+    if (list.length === 0) {
+      return JSON.stringify({ error: 'No paths given and nothing selected — pass paths or select first (web_select)' });
+    }
+    const requested = (mode?.trim() || 'auto').toLowerCase();
+    if (!['auto', 'islands', 'groups'].includes(requested)) {
+      return JSON.stringify({ error: 'mode must be islands | groups | auto' });
+    }
+
+    const results: Array<{ path: string; mode: SeparateMode; parts: number; children: string[] }> = [];
+    const skipped: Array<Record<string, unknown>> = [];
+
+    const separateOne = async (p: string): Promise<void> => {
+      const node = ctx.viewer.registry?.getNode(p) as Mesh | null;
+      if (!node || !(node as { isMesh?: boolean }).isMesh) {
+        skipped.push({ path: p, reason: node ? 'Not a mesh — pass a mesh leaf, not a group' : 'Node not found' });
+        return;
+      }
+      const geometry = node.geometry as BufferGeometry;
+      const m: SeparateMode = requested === 'auto'
+        ? (Array.isArray(node.material) || (geometry.groups?.length ?? 0) >= 2 ? 'groups' : 'islands')
+        : requested as SeparateMode;
+      // Cheap eligibility first (no union-find — separateMesh pays for that once):
+      // shape + group table / material arity.
+      const reason = m === 'groups'
+        ? groupModeIneligibility(node)
+        : unsupportedMeshShapeReason(node) ?? (Array.isArray(node.material) ? REASON_MULTI_MATERIAL : null);
+      if (reason) { skipped.push({ path: p, mode: m, reason }); return; }
+      try {
+        const children = await ctx.doc.separateMesh(p, m, { weldThreshold: DEFAULT_WELD_THRESHOLD });
+        if (children.length === 0) { skipped.push({ path: p, mode: m, reason: REASON_SINGLE_PART }); return; }
+        results.push({ path: p, mode: m, parts: children.length, children: children.slice(0, 8) });
+      } catch (e) {
+        skipped.push({ path: p, mode: m, reason: e instanceof Error ? e.message : String(e) });
+      }
+    };
+
+    if (list.length > 1) {
+      await ctx.doc.withTransaction(`Separate ${list.length} meshes`, async () => {
+        for (const p of list) await separateOne(p);
+      });
+    } else {
+      await separateOne(list[0]);
+    }
+    await ctx.doc.whenIdle();
+    // The Group took each source's path — re-selecting keeps the user in place,
+    // now with the parts one level below (same move as the context-menu flow).
+    if (results.length > 0) ctx.viewer.selectionManager?.select(results[0].path);
+    return JSON.stringify({
+      ok: results.length > 0,
+      separated: results,
+      skipped,
+      ...(results.length > 0
+        ? { next: 'Parts are children of the same-named Group at each source path; one web_editor_undo reverts everything' }
+        : {}),
+    });
   }
 
   // ═══ Structure / components / kinematics ══════════════════════════════
@@ -592,6 +767,838 @@ export class McpEditorTools {
     ctx.doc.setField(path, componentType, fieldName, value, prev);
     await ctx.doc.whenIdle();
     return JSON.stringify({ ok: true, path, componentType, fieldName, value, prev: prev ?? null });
+  }
+
+  // ── Rigid-body mechanisms (plan-404) ──────────────────────────────────
+  //
+  // These orchestrate COMPOSITES of the existing generic ops (addComponent /
+  // setField / unsetField) through `runMechanismPlan` — the op union and
+  // its dispatchers are untouched by design (plan-404 §2.6). `_validate` and
+  // `_jog` are TRANSIENT: they create no ops and no undo entries.
+  //
+  // NOTE the naming: "mechanism" is the RIGID-BODY joint-graph system, not the
+  // older `Kinematic` axis-group system that `web_editor_kinematize` /
+  // `web_editor_create_kinematic` below drive. The two are never mixed.
+
+  @McpTool('Add a rigid-body MECHANISM (KinematicMechanism) to a node — the container that solves a joint graph with loop closure and free bodies. Add joints afterwards with web_editor_mechanism_add_joint. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismCreate(
+    @McpParam('path', 'Node the mechanism component is added to.') path: string,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    if (!ctx.viewer.registry?.getNode(path)) return JSON.stringify({ error: `Node not found: ${path}` });
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    await this._mechCommit(ctx, bridge, path, m.planCreateMechanism(path));
+    return JSON.stringify({ ok: true, path, component: 'KinematicMechanism' });
+  }
+
+  @McpTool('Add a KinematicJoint to a mechanism. jointType = Revolute|Prismatic|Spherical|Universal. bodyBPath is required; OMIT bodyAPath to anchor the joint against WORLD/static space (the authored world-anchor form — an absent Body A, never an empty string). anchors are in millimetres in the respective body local frame; axisA is Body-A-local. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.', { readOnly: false })
+  async webEditorMechanismAddJoint(
+    @McpParam('path', 'Node the joint component is added to (a child of the mechanism node).') path: string,
+    @McpParam('jointType', 'Revolute | Prismatic | Spherical | Universal.') jointType: string,
+    @McpParam('bodyBPath', 'Node path of Body B (required).') bodyBPath: string,
+    @McpParam('bodyAPath', 'Node path of Body A. Omit for a world anchor.', 'string', false) bodyAPath: string,
+    @McpParam('anchorAJson', 'Anchor A as JSON {x,y,z} in mm (Body-A-local).', 'string', false) anchorAJson: string,
+    @McpParam('anchorBJson', 'Anchor B as JSON {x,y,z} in mm (Body-B-local).', 'string', false) anchorBJson: string,
+    @McpParam('axisAJson', 'Axis A as JSON {x,y,z} (Body-A-local).', 'string', false) axisAJson: string,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    const kinds = m.JOINT_KINDS as readonly string[];
+    if (!kinds.includes(jointType)) {
+      return JSON.stringify({ error: `Unknown jointType "${jointType}"`, availableTypes: kinds });
+    }
+    if (!ctx.viewer.registry?.getNode(path)) return JSON.stringify({ error: `Node not found: ${path}` });
+    if (!ctx.viewer.registry?.getNode(bodyBPath)) return JSON.stringify({ error: `Body B node not found: ${bodyBPath}` });
+    const bodyA = bodyAPath?.trim() || null;
+    if (bodyA && !ctx.viewer.registry?.getNode(bodyA)) {
+      return JSON.stringify({ error: `Body A node not found: ${bodyA}. Omit bodyAPath for a world anchor.` });
+    }
+    const vec = (json: string): { x: number; y: number; z: number } | undefined => {
+      if (!json) return undefined;
+      try {
+        const p = JSON.parse(json) as { x?: number; y?: number; z?: number };
+        return { x: Number(p.x ?? 0), y: Number(p.y ?? 0), z: Number(p.z ?? 0) };
+      } catch { return undefined; }
+    };
+    await this._mechCommit(ctx, bridge, path, m.planAddJoint({
+      nodePath: path,
+      jointType: jointType as JointKind,
+      bodyAPath: bodyA,
+      bodyBPath,
+      anchorA: vec(anchorAJson),
+      anchorB: vec(anchorBJson),
+      axisA: vec(axisAJson),
+    }));
+    return JSON.stringify({ ok: true, path, jointType, bodyA: bodyA ?? 'world', bodyB: bodyBPath });
+  }
+
+  @McpTool('Set a joint\'s anchor point(s), in millimetres, in the respective body local frame. Pass either or both. Both writes land in ONE composite, so an anchor snap is a single undo step. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).', { readOnly: false })
+  async webEditorMechanismSetAnchor(
+    @McpParam('path', 'Node path of the joint.') path: string,
+    @McpParam('componentType', 'Concrete joint key (e.g. KinematicJoint or KinematicJoint_1).') componentType: string,
+    @McpParam('anchorAJson', 'Anchor A as JSON {x,y,z} in mm.', 'string', false) anchorAJson: string,
+    @McpParam('anchorBJson', 'Anchor B as JSON {x,y,z} in mm.', 'string', false) anchorBJson: string,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const node = ctx.viewer.registry?.getNode(path);
+    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    if (!(componentType in rvOf(node))) {
+      return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
+    }
+    const parse = (json: string) => {
+      if (!json) return undefined;
+      try {
+        const p = JSON.parse(json) as { x?: number; y?: number; z?: number };
+        return { x: Number(p.x ?? 0), y: Number(p.y ?? 0), z: Number(p.z ?? 0) };
+      } catch { return undefined; }
+    };
+    const anchorA = parse(anchorAJson);
+    const anchorB = parse(anchorBJson);
+    if (!anchorA && !anchorB) return JSON.stringify({ error: 'Pass anchorAJson and/or anchorBJson as {"x":..,"y":..,"z":..}' });
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    await this._mechCommit(ctx, bridge, path, m.planSetAnchor(path, componentType, { anchorA, anchorB }));
+    return JSON.stringify({ ok: true, path, componentType, anchorA: anchorA ?? null, anchorB: anchorB ?? null });
+  }
+
+  @McpTool('Assign the Drive that actively controls a joint, or clear it. OMIT drivePath to make the joint PASSIVE again (the reference key is removed, which is the authored "no drive" form). NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismAssignDrive(
+    @McpParam('path', 'Node path of the joint.') path: string,
+    @McpParam('componentType', 'Concrete joint key (e.g. KinematicJoint).') componentType: string,
+    @McpParam('drivePath', 'Node path carrying the Drive. Omit to clear.', 'string', false) drivePath: string,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const node = ctx.viewer.registry?.getNode(path);
+    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    if (!(componentType in rvOf(node))) {
+      return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
+    }
+    const target = drivePath?.trim() || null;
+    if (target) {
+      const driveNode = ctx.viewer.registry?.getNode(target);
+      if (!driveNode) return JSON.stringify({ error: `Drive node not found: ${target}` });
+      if (!Object.keys(rvOf(driveNode)).some((k) => DRIVE_KEY_RE.test(k))) {
+        return JSON.stringify({ error: `Node "${target}" carries no Drive component` });
+      }
+    }
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    await this._mechCommit(ctx, bridge, path, m.planAssignDrive(path, componentType, target));
+    return JSON.stringify({ ok: true, path, componentType, drive: target });
+  }
+
+  @McpTool('Validate a rigid-body mechanism: structured findings (MissingBodyB, SameBodyAAndB, UnresolvedBody, AnchorsApart, MissingSecondaryAxis, IdleSpinRod, NegativeDof, DriveAxisMismatch, DriveTypeMismatch) plus topology metrics. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). TRANSIENT — creates no ops and no undo entry.', { readOnly: true })
+  async webEditorMechanismValidate(
+    @McpParam('path', 'Node path of the mechanism. Omit to validate all.', 'string', false) path: string,
+  ): Promise<string> {
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const target = path?.trim();
+    if (target) {
+      return JSON.stringify({ ok: true, path: target, findings: bridge.validate(target) });
+    }
+    return JSON.stringify({
+      ok: true,
+      mechanisms: bridge.list().map((m) => ({
+        path: m.nodePath, name: m.name, active: m.active, converged: m.converged,
+        residualError: m.residualError, disabledReason: m.disabledReason || null,
+        joints: m.jointCount, links: m.linkCount, loops: m.loopCount, dof: m.dof,
+        findings: m.findings,
+      })),
+    });
+  }
+
+  @McpTool('Jog one driven joint to an absolute value (degrees for Revolute, millimetres for Prismatic) and run ONE solve, reporting the REAL convergence and residual. TRANSIENT — writes a live drive value only, creates no ops and no undo entry. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).', { readOnly: false })
+  async webEditorMechanismJog(
+    @McpParam('path', 'Node path of the joint to jog.') path: string,
+    @McpParam('value', 'Absolute joint value (deg or mm).', 'number') value: number,
+    @McpParam('componentType', 'Concrete joint key (e.g. KinematicJoint_2) when several joints sit on one node. Omit for one-joint-per-node authoring.', 'string', false) componentType: string,
+  ): Promise<string> {
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const result = bridge.jog(path, Number(value), componentType?.trim() || undefined);
+    if (!result) {
+      return JSON.stringify({ error: `Joint "${path}"${componentType ? ` (${componentType})` : ''} not found, not driven, or its mechanism cannot solve` });
+    }
+    return JSON.stringify({ ok: true, path, ...(componentType ? { componentType } : {}), value: Number(value), ...result });
+  }
+
+  /** Adapter: the AssetDocument slice the mechanism plans need. */
+  private _mechDoc(ctx: ActiveAssetContext): MechanismDocumentLike {
+    return {
+      withTransaction: (label, fn) => ctx.doc.withTransaction(label, fn),
+      addComponent: (nodePath, baseType, fields) => ctx.doc.addComponent(nodePath, baseType, fields),
+      setField: (nodePath, componentType, fieldName, v, prev) =>
+        ctx.doc.setField(nodePath, componentType, fieldName, v, prev),
+      unsetField: (nodePath, componentType, fieldName, prev) =>
+        ctx.doc.unsetField(nodePath, componentType, fieldName, prev),
+    };
+  }
+
+  /** Adapter: read a field's current value for the inverse half of an op. */
+  private _mechReadField(ctx: ActiveAssetContext) {
+    return (nodePath: string, componentType: string, fieldName: string): unknown => {
+      const node = ctx.viewer.registry?.getNode(nodePath);
+      if (!node) return undefined;
+      const comp = rvOf(node)[componentType] as Record<string, unknown> | undefined;
+      return comp?.[fieldName];
+    };
+  }
+
+  /**
+   * The private mechanism bridge, or the uniform refusal (plan-706 F14/R2).
+   *
+   * Sixteen of the eighteen mechanism tools open with this. The two that do NOT
+   * are `web_editor_test_start` / `_stop`: the in-place test session exists
+   * independently of mechanisms and must stay usable in a public build, where it
+   * simply reports `forceRecording: false` instead of an error.
+   *
+   * Before plan-706 only `_validate` and `_jog` checked at all — the four
+   * WRITING tools happily authored `KinematicMechanism` components into a build
+   * with no solver behind them, which is document rubbish that only surfaces
+   * when the asset reaches a Professional build.
+   */
+  private async _requireMechanismBridge(): Promise<MechanismUiBridge | { error: string }> {
+    const { getMechanismUiBridge } = await import('../../core/engine/rv-kinematic-registry');
+    return getMechanismUiBridge() ?? { error: MECHANISM_UNAVAILABLE };
+  }
+
+  /**
+   * Which mechanism(s) a write on `targetPath` invalidates — THREE stages, in
+   * this order (plan-706, Review F3):
+   *
+   *  1. **Ancestor walk.** The first self-or-ancestor carrying a
+   *     `KinematicMechanism` key. This is the normal case for everything the
+   *     authoring flow produces: joints are placed on children of the mechanism
+   *     node, and an imported assembly's links hang under it too.
+   *  2. **`bridge.list()` search.** A mechanism that already references the
+   *     node as a joint or a link. Catches the legitimate case of a body OUTSIDE
+   *     the mechanism subtree, linked only by a `ComponentReference`.
+   *  3. **Everything.** Expensive, never wrong.
+   *
+   * Stage 1 comes FIRST because stage 2 structurally misses the commonest new
+   * write: `planAddBody` only puts a `MechanismBody` on a node, and until some
+   * joint references that node it appears in no `links[]` — so `add_body` and
+   * `set_mass` would have fallen through to "rebuild everything" every time,
+   * making the last-resort branch the normal path.
+   */
+  private _mechanismPathsFor(
+    ctx: ActiveAssetContext, bridge: MechanismUiBridge, targetPath: string,
+  ): string[] {
+    const registry = ctx.viewer.registry;
+    for (let node = registry?.getNode(targetPath) ?? null; node; node = node.parent) {
+      if (!Object.keys(rvOf(node)).some((k) => MECHANISM_KEY_RE.test(k))) continue;
+      const path = registry?.getPathForNode(node) ?? NodeRegistry.computeNodePath(node);
+      if (path) return [path];
+    }
+    const all = bridge.list();
+    const referencing = all.filter((m) =>
+      m.nodePath === targetPath
+      || m.joints.some((j) => j.nodePath === targetPath)
+      || m.links.some((l) => l.nodePath === targetPath));
+    return (referencing.length > 0 ? referencing : all).map((m) => m.nodePath);
+  }
+
+  /**
+   * Run an authoring composite AND make the solver see it (plan-706 F2).
+   *
+   * The panel has always done both — `runMechanismPlan` then
+   * `bridge.rebuild(mechanismPath)` (`MechanismSection.tsx`, the `commit`
+   * callbacks) — while the MCP tools did only the first half, so an anchor set
+   * by an agent took effect the next time a human happened to touch the panel.
+   * Every writing mechanism tool goes through here, which is what makes the
+   * following `validate`/`inspect` read the topology that was just written.
+   *
+   * The rebuild runs strictly AFTER `withTransaction` resolves: rebuilding a
+   * half-applied composite would hand the solver a joint whose body is not
+   * assigned yet.
+   */
+  private async _mechCommit(
+    ctx: ActiveAssetContext, bridge: MechanismUiBridge, targetPath: string, plan: MechanismOpPlan,
+  ): Promise<void> {
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    await m.runMechanismPlan(this._mechDoc(ctx), plan, this._mechReadField(ctx));
+    await ctx.doc.whenIdle();
+    for (const path of this._mechanismPathsFor(ctx, bridge, targetPath)) bridge.rebuild(path);
+  }
+
+  @McpTool('Read a rigid-body MECHANISM in full: joints (type, bodies, drive, current value, limits, world origin and axis, joggable), links with their mass properties (hasBody, massKg, massSource, massWarning), findings, and convergence (converged, residualError, dof, loopCount). Omit path to read every mechanism; use include to keep the answer small. This is the READ half of the authoring cycle — call it before and after every edit. NOTE: this is the joint-graph mechanism system, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Read-only.', { readOnly: true })
+  async webEditorMechanismInspect(
+    @McpParam('path', 'Node path of one mechanism. Omit to read all.', 'string', false) path: string,
+    @McpParam('include', 'Comma-separated subset of joints,links,findings (default all three).', 'string', false) include: string,
+  ): Promise<string> {
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const wanted = (include || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+    const want = (key: string): boolean => wanted.length === 0 || wanted.includes(key);
+    const target = path?.trim();
+    const all = bridge.list();
+    const mechanisms = target ? all.filter((m) => m.nodePath === target) : all;
+    if (target && mechanisms.length === 0) {
+      return JSON.stringify({
+        error: `No mechanism at "${target}"`,
+        availablePaths: all.map((m) => m.nodePath),
+      });
+    }
+    return JSON.stringify({
+      ok: true,
+      mechanisms: mechanisms.map((m) => ({
+        path: m.nodePath,
+        name: m.name,
+        active: m.active,
+        converged: m.converged,
+        residualError: m.residualError,
+        solveTimeMs: m.solveTimeMs,
+        disabledReason: m.disabledReason || null,
+        jointCount: m.jointCount,
+        linkCount: m.linkCount,
+        loopCount: m.loopCount,
+        dof: m.dof,
+        // The views travel VERBATIM. Renaming a field here would create a second
+        // vocabulary next to the panel's for the same facts, and an agent
+        // reading `massSource` in one place and `mass_source` in the other has
+        // no way to know they are the same thing.
+        ...(want('joints') ? { joints: m.joints } : {}),
+        ...(want('links') ? { links: m.links } : {}),
+        ...(want('findings') ? { findings: m.findings } : {}),
+      })),
+    });
+  }
+
+  /** Resolve a cached snap id, or the actionable refusal (R6). */
+  private _snapCandidate(
+    ctx: ActiveAssetContext, candidateId: string,
+  ): CachedSnapCandidate | { error: string; availableIds?: string[] } {
+    const id = (candidateId || '').trim();
+    const found = this._snapCache.find((c) => c.id === id);
+    if (!found) {
+      return {
+        error: `Unknown candidateId "${id}" — call web_editor_mechanism_snap_list first`,
+        availableIds: this._snapCache.map((c) => c.id),
+      };
+    }
+    // The model may have been rebuilt between the listing and the commit; a
+    // candidate pointing at geometry that no longer exists must refuse rather
+    // than write a plausible-looking anchor into a stale frame.
+    if (!ctx.viewer.registry?.getNode(found.nodePath)) {
+      return { error: `Node "${found.nodePath}" no longer exists — call web_editor_mechanism_snap_list again` };
+    }
+    return found;
+  }
+
+  @McpTool('List the SNAP CANDIDATES under a canvas point (x,y as 0..1 fractions) so an anchor or a joint axis can be set on real geometry instead of guessed millimetres: bore axes, circle centres, edge/face centres and vertices, each with a stable id, a world position and a world normal. Exactly one is recommended — what a click would take. Aim the camera first (web_camera_focus, web_view_pick), then pass the ids to web_editor_mechanism_set_anchor_snap or _set_axis. Ids live until the next call. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).', { readOnly: true })
+  async webEditorMechanismSnapList(
+    @McpParam('x', 'Horizontal position, fraction 0..1 of canvas width.', 'number') x: number,
+    @McpParam('y', 'Vertical position, fraction 0..1 of canvas height.', 'number') y: number,
+    @McpParam('maxCandidates', 'Cap on returned candidates (default 12).', 'integer', false) maxCandidates: number,
+  ): Promise<string> {
+    // requireEditor DESPITE readOnly: the gate here is the PICK PATH, not the
+    // write direction. Outside an authoring load a `BatchTable` exists and the
+    // triangle refinement would return a faceIndex into a render arena whose
+    // triangles belong to no single node — silently wrong candidates rather
+    // than an error (plan-706 R9).
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const v = ctx.viewer;
+    const canvas = v.renderer?.domElement;
+    if (!canvas) return JSON.stringify({ error: 'No canvas' });
+    const rect = canvas.getBoundingClientRect();
+    const fx = clamp01(Number(x), 0.5);
+    const fy = clamp01(Number(y), 0.5);
+
+    const { querySnapCandidates } = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-snap-query');
+    const cap = Math.max(1, Math.round(Number(maxCandidates) || 12));
+    const result = querySnapCandidates(
+      v, rect.left + fx * rect.width, rect.top + fy * rect.height, { maxCandidates: cap },
+    );
+    if (!result) {
+      this._snapCache = [];
+      return JSON.stringify({ ok: true, hit: false, candidates: [], hint: 'Nothing under that point — reframe with web_camera_focus and try again' });
+    }
+
+    this._snapCache = result.candidates.map((c, i) => ({
+      id: `snap${i}`,
+      kind: c.kind,
+      label: c.label,
+      nodePath: result.nodePath,
+      worldPosition: c.worldPosition,
+      worldNormal: c.worldNormal,
+      radius: c.radius,
+      inner: c.inner,
+      recommended: c.recommended,
+    }));
+    return JSON.stringify({
+      ok: true,
+      hit: true,
+      hitPath: result.nodePath,
+      candidates: this._snapCache.map((c) => ({
+        id: c.id,
+        kind: c.kind,
+        label: c.label,
+        nodePath: c.nodePath,
+        worldPosition: c.worldPosition.toArray().map(r3),
+        worldNormal: c.worldNormal.toArray().map(r3),
+        ...(c.radius !== undefined ? { radius: r3(c.radius) } : {}),
+        ...(c.inner !== undefined ? { inner: c.inner } : {}),
+        recommended: c.recommended,
+      })),
+    });
+  }
+
+  @McpTool('Set a joint anchor from a snap candidate listed by web_editor_mechanism_snap_list — the geometrically exact alternative to typing millimetres into web_editor_mechanism_set_anchor. Writes AnchorA or AnchorB in the body-local frame and, unless assignBody=false, assigns the picked part as that side\'s body — ONE composite, one undo step. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismSetAnchorSnap(
+    @McpParam('path', 'Node path of the joint.') path: string,
+    @McpParam('componentType', 'Concrete joint key (e.g. KinematicJoint or KinematicJoint_1).') componentType: string,
+    @McpParam('side', 'A | B — which side of the joint the point belongs to.') side: string,
+    @McpParam('candidateId', 'Id from web_editor_mechanism_snap_list, e.g. "snap0".') candidateId: string,
+    @McpParam('assignBody', 'Also assign the picked node as this side\'s body (default true).', 'boolean', false) assignBody: boolean,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const which = (side || '').trim().toUpperCase();
+    if (which !== 'A' && which !== 'B') return JSON.stringify({ error: 'side must be "A" or "B"' });
+    const node = ctx.viewer.registry?.getNode(path);
+    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    if (!(componentType in rvOf(node))) {
+      return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
+    }
+    const candidate = this._snapCandidate(ctx, candidateId);
+    if ('error' in candidate) return JSON.stringify(candidate);
+
+    const takeBody = assignBody !== false;
+    const joint = bridge.list().flatMap((m) => m.joints).find((j) => j.nodePath === path);
+    // Whose frame the anchor is expressed in: the newly picked body when we are
+    // assigning it, otherwise the body that side ALREADY carries. Getting this
+    // wrong writes a numerically fine anchor into the wrong frame — the silent
+    // failure planPickAnchor's one-composite rule exists to prevent.
+    const framePath = takeBody
+      ? candidate.nodePath
+      : (which === 'A' ? joint?.bodyAPath ?? null : joint?.bodyBPath ?? null);
+    const bodyNode = framePath ? ctx.viewer.registry?.getNode(framePath) ?? null : null;
+
+    const [{ planPickAnchor }, { worldPointToAnchorField }] = await Promise.all([
+      import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring'),
+      import('@rv-private/plugins/asset-editor/mechanism/mechanism-frames'),
+    ]);
+    const anchor = worldPointToAnchorField(candidate.worldPosition, bodyNode);
+    await this._mechCommit(ctx, bridge, path, planPickAnchor({
+      jointPath: path,
+      componentType,
+      side: which,
+      anchor,
+      bodyPath: takeBody ? candidate.nodePath : undefined,
+    }));
+    return JSON.stringify({
+      ok: true, path, componentType, side: which,
+      candidate: { id: candidate.id, kind: candidate.kind, label: candidate.label },
+      anchor, body: takeBody ? candidate.nodePath : framePath,
+    });
+  }
+
+  @McpTool('Set a joint\'s axis (AxisA, body-A-local) either from a snap candidate — a bore\'s normal IS its axis, so candidateId is the accurate route — or from an explicit world vector. Optionally set SecondaryAxisB for a Universal joint, and snapToPrincipal to magnet a nearly-axis-aligned direction onto X/Y/Z. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.', { readOnly: false })
+  async webEditorMechanismSetAxis(
+    @McpParam('path', 'Node path of the joint.') path: string,
+    @McpParam('componentType', 'Concrete joint key (e.g. KinematicJoint).') componentType: string,
+    @McpParam('candidateId', 'Snap id whose normal becomes the axis (from web_editor_mechanism_snap_list).', 'string', false) candidateId: string,
+    @McpParam('axisWorldJson', 'Axis as JSON {x,y,z} in WORLD space, when no candidateId is given.', 'string', false) axisWorldJson: string,
+    @McpParam('secondaryAxisWorldJson', 'Universal joints only: second axis as JSON {x,y,z} in WORLD space.', 'string', false) secondaryAxisWorldJson: string,
+    @McpParam('snapToPrincipal', 'Magnet the axis onto the nearest world X/Y/Z when within 5° (default false).', 'boolean', false) snapToPrincipal: boolean,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const node = ctx.viewer.registry?.getNode(path);
+    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    if (!(componentType in rvOf(node))) {
+      return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
+    }
+    const joints = bridge.list().flatMap((m) => m.joints);
+    const joint = joints.find((j) => j.nodePath === path);
+    if (!joint) {
+      return JSON.stringify({
+        error: `No solved joint at "${path}" — the axis frame depends on its type and Body A`,
+        availableJointPaths: joints.map((j) => j.nodePath),
+      });
+    }
+
+    const parseVec = (json: string): Vector3 | null => {
+      if (!json?.trim()) return null;
+      try {
+        const p = JSON.parse(json) as { x?: number; y?: number; z?: number };
+        const v = new Vector3(Number(p.x ?? 0), Number(p.y ?? 0), Number(p.z ?? 0));
+        return v.lengthSq() > 0 ? v : null;
+      } catch { return null; }
+    };
+
+    let axisWorld: Vector3 | null = null;
+    let from = 'vector';
+    if (candidateId?.trim()) {
+      const candidate = this._snapCandidate(ctx, candidateId);
+      if ('error' in candidate) return JSON.stringify(candidate);
+      axisWorld = candidate.worldNormal.clone();
+      from = `${candidate.id} (${candidate.kind})`;
+    } else {
+      axisWorld = parseVec(axisWorldJson);
+    }
+    if (!axisWorld) {
+      return JSON.stringify({ error: 'Pass candidateId, or axisWorldJson as {"x":..,"y":..,"z":..} with non-zero length' });
+    }
+
+    const frames = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-frames');
+    const { planSetAxis } = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    if (snapToPrincipal === true) axisWorld = frames.snapAxisToPrincipal(axisWorld);
+    const isTranslation = frames.axisIsTranslation(joint.jointType);
+    const bodyA = joint.bodyAPath ? ctx.viewer.registry?.getNode(joint.bodyAPath) ?? null : null;
+    const axis = frames.worldDirectionToAxisField(axisWorld, bodyA, isTranslation);
+
+    const secondaryWorld = parseVec(secondaryAxisWorldJson);
+    let secondary: ReturnType<typeof frames.worldDirectionToAxisField> | undefined;
+    if (secondaryWorld) {
+      if (joint.jointType !== 'Universal') {
+        return JSON.stringify({ error: `SecondaryAxisB applies to Universal joints only — "${path}" is ${joint.jointType}` });
+      }
+      // The second axis is BODY-B-local: it is the axis the other side rotates
+      // about, and expressing it in Body A's frame would silently skew every
+      // universal joint whose two bodies are not aligned.
+      const bodyB = joint.bodyBPath ? ctx.viewer.registry?.getNode(joint.bodyBPath) ?? null : null;
+      secondary = frames.worldDirectionToAxisField(secondaryWorld, bodyB, false);
+    }
+
+    await this._mechCommit(ctx, bridge, path, planSetAxis(path, componentType, axis, secondary));
+    return JSON.stringify({ ok: true, path, componentType, from, axis, secondaryAxis: secondary ?? null });
+  }
+
+  @McpTool('Add a MechanismBody to a link so the force analysis has a mass for it — without one the inverse dynamics reports "a link without mass" and every drive figure stays empty. densityPreset = steel|stainless|aluminum|pa|pom|custom. The mass itself is computed from the link\'s geometry and never stored, so it cannot go stale; use web_editor_mechanism_set_mass to override it. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismAddBody(
+    @McpParam('path', 'Node path of the link to give a body.') path: string,
+    @McpParam('densityPreset', 'steel | stainless | aluminum | pa | pom | custom (default steel).', 'string', false) densityPreset: string,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const node = ctx.viewer.registry?.getNode(path);
+    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    const preset = (densityPreset || 'steel').trim().toLowerCase();
+    const entry = m.DENSITY_PRESETS.find((p) => p.id === preset);
+    if (!entry) {
+      return JSON.stringify({
+        error: `Unknown densityPreset "${densityPreset}"`,
+        availablePresets: m.DENSITY_PRESETS.map((p) => p.id),
+      });
+    }
+    if (Object.keys(rvOf(node)).some((k) => /^MechanismBody(_\d+)?$/.test(k))) {
+      return JSON.stringify({ error: `"${path}" already carries a MechanismBody — change it with web_editor_mechanism_set_mass` });
+    }
+    await this._mechCommit(ctx, bridge, path, m.planAddBody(path, preset as DensityPresetId));
+    return JSON.stringify({
+      ok: true, path, densityPreset: entry.id,
+      densityKgM3: entry.density > 0 ? entry.density : 7850,
+    });
+  }
+
+  @McpTool('Set how heavy a link is — density preset, custom density, a pinned mass and a pinned centre of mass — in ONE composite and one undo step, because they are one decision. massKg="null" or comJson="null" DROP the respective override and return to the value computed from the geometry. Without masses the force figures are meaningless, so do this before reading web_editor_mechanism_forces. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismSetMass(
+    @McpParam('path', 'Node path of the link (must already carry a MechanismBody).') path: string,
+    @McpParam('densityPreset', 'steel | stainless | aluminum | pa | pom | custom.', 'string', false) densityPreset: string,
+    @McpParam('densityKgM3', 'Density in kg/m³ — only meaningful with densityPreset=custom.', 'number', false) densityKgM3: number,
+    @McpParam('massKg', 'Pinned mass in kg, or the string "null" to drop the override.', 'string', false) massKg: string,
+    @McpParam('comJson', 'Centre of mass as JSON {x,y,z} in link-local mm, or "null" to drop it.', 'string', false) comJson: string,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const node = ctx.viewer.registry?.getNode(path);
+    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    if (!Object.keys(rvOf(node)).some((k) => /^MechanismBody(_\d+)?$/.test(k))) {
+      return JSON.stringify({ error: `"${path}" carries no MechanismBody — add one with web_editor_mechanism_add_body first` });
+    }
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+
+    // The three panel buttons become ONE MechanismOpPlan by concatenating their
+    // intents. `MechanismOpPlan` is plain data, so no fourth builder is needed —
+    // and one transaction is the difference between an undo that restores "how
+    // heavy is this part" and one that half-restores it.
+    const applied: string[] = [];
+    const intents: MechanismOpPlan['intents'] = [];
+
+    if (densityPreset?.trim()) {
+      const preset = densityPreset.trim().toLowerCase();
+      if (!m.DENSITY_PRESETS.some((p) => p.id === preset)) {
+        return JSON.stringify({
+          error: `Unknown densityPreset "${densityPreset}"`,
+          availablePresets: m.DENSITY_PRESETS.map((p) => p.id),
+        });
+      }
+      intents.push(...m.planSetDensity(path, preset as DensityPresetId, densityKgM3).intents);
+      applied.push('density');
+    }
+
+    const massRaw = (massKg ?? '').toString().trim();
+    if (massRaw) {
+      if (massRaw.toLowerCase() === 'null') {
+        intents.push(...m.planSetMassOverride(path, null).intents);
+        applied.push('massOverrideCleared');
+      } else {
+        const kg = Number(massRaw);
+        if (!Number.isFinite(kg) || kg <= 0) {
+          return JSON.stringify({ error: `massKg must be a positive number or "null", got "${massKg}"` });
+        }
+        intents.push(...m.planSetMassOverride(path, kg).intents);
+        applied.push('massOverride');
+      }
+    }
+
+    const comRaw = (comJson ?? '').trim();
+    if (comRaw) {
+      if (comRaw.toLowerCase() === 'null') {
+        intents.push(...m.planSetComOverride(path, null).intents);
+        applied.push('comOverrideCleared');
+      } else {
+        try {
+          const p = JSON.parse(comRaw) as { x?: number; y?: number; z?: number };
+          intents.push(...m.planSetComOverride(path, {
+            x: Number(p.x ?? 0), y: Number(p.y ?? 0), z: Number(p.z ?? 0),
+          }).intents);
+          applied.push('comOverride');
+        } catch {
+          return JSON.stringify({ error: 'comJson must be JSON {"x":..,"y":..,"z":..} or "null"' });
+        }
+      }
+    }
+
+    if (intents.length === 0) {
+      return JSON.stringify({ error: 'Pass at least one of densityPreset, massKg or comJson' });
+    }
+    await this._mechCommit(ctx, bridge, path, { label: 'Set body mass properties', intents });
+    return JSON.stringify({ ok: true, path, applied });
+  }
+
+  @McpTool('Set or clear a joint\'s motion limits — the travel a jog or a drive may use. useLimits=false switches them off and the bounds are ignored; useLimits=true takes lower/upper in degrees (Revolute) or millimetres (Prismatic). Read the current values with web_editor_mechanism_inspect. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.', { readOnly: false })
+  async webEditorMechanismSetLimits(
+    @McpParam('path', 'Node path of the joint.') path: string,
+    @McpParam('componentType', 'Concrete joint key (e.g. KinematicJoint).') componentType: string,
+    @McpParam('useLimits', 'true to enforce the bounds, false to switch limits off.', 'boolean') useLimits: boolean,
+    @McpParam('lower', 'Lower bound (deg or mm) — only with useLimits=true.', 'number', false) lower: number,
+    @McpParam('upper', 'Upper bound (deg or mm) — only with useLimits=true.', 'number', false) upper: number,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const node = ctx.viewer.registry?.getNode(path);
+    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    if (!(componentType in rvOf(node))) {
+      return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
+    }
+    const on = useLimits === true;
+    const lo = Number.isFinite(Number(lower)) && lower !== undefined ? Number(lower) : undefined;
+    const hi = Number.isFinite(Number(upper)) && upper !== undefined ? Number(upper) : undefined;
+    if (on && lo !== undefined && hi !== undefined && lo > hi) {
+      return JSON.stringify({ error: `lower (${lo}) must not exceed upper (${hi})` });
+    }
+    const { planSetLimits } = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    await this._mechCommit(ctx, bridge, path,
+      planSetLimits(path, componentType, { useLimits: on, lower: lo, upper: hi }));
+    return JSON.stringify({
+      ok: true, path, componentType, useLimits: on,
+      lower: on ? lo ?? null : null, upper: on ? hi ?? null : null,
+    });
+  }
+
+  /**
+   * Shape one forces snapshot for the wire, adding the recorder's sizing figures.
+   *
+   * `_forces` and `_statics` both answer with this, which is deliberate: the
+   * only difference between "what did the cycle need" and "what does holding it
+   * need" is which evaluation filled the numbers, not what the caller has to
+   * parse.
+   */
+  private _forcesJson(
+    snapshot: import('../../core/engine/rv-kinematic-registry').MechanismForcesSnapshot,
+    recorder: import('../mechanism-force-recorder-plugin').MechanismForceRecorder,
+    opts: { channelId?: string; series?: DownsampledSeries | null } = {},
+  ): Record<string, unknown> {
+    return {
+      ok: true,
+      mechanismPath: snapshot.mechanismPath,
+      status: snapshot.status,
+      statusText: snapshot.statusText,
+      dynamicsValid: snapshot.dynamicsValid,
+      redundant: snapshot.redundant,
+      recording: recorder.recording,
+      channels: snapshot.channels.map((c) => {
+        const m = recorder.metrics(c.id);
+        return {
+          id: c.id, label: c.label, kind: c.kind, unit: c.unit, value: c.value,
+          peak: m.peak, rms: m.rms, holding: m.holding, sampleCount: m.sampleCount,
+          ...(opts.series && c.id === opts.channelId ? { series: opts.series } : {}),
+        };
+      }),
+      joints: snapshot.joints,
+    };
+  }
+
+  @McpTool('Read the DRIVE SIZING figures of a mechanism: per channel the current value plus peak, time-weighted RMS and holding force with their unit, and per joint the world reaction force and torque. This is what turns a built mechanism into a motor choice — continuous rating above RMS, peak rating above peak. Record a cycle first with web_editor_test_start/_stop; holding comes from web_editor_mechanism_statics. With channelId and series=true one channel also carries a downsampled time series. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Read-only.', { readOnly: true })
+  async webEditorMechanismForces(
+    @McpParam('mechanismPath', 'Node path of the mechanism.') mechanismPath: string,
+    @McpParam('channelId', 'Channel id from a previous call — required for series.', 'string', false) channelId: string,
+    @McpParam('series', 'Also return the recorded time series for channelId, downsampled (default false).', 'boolean', false) series: boolean,
+  ): Promise<string> {
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const v = this.viewer;
+    if (!v) return JSON.stringify({ error: 'No viewer' });
+    const path = (mechanismPath || '').trim();
+    if (!path) return JSON.stringify({ error: 'mechanismPath is required' });
+    const snapshot = bridge.forcesSnapshot(path);
+    if (!snapshot) {
+      return JSON.stringify({
+        error: `No force snapshot for "${path}" — the mechanism is unknown or the analysis was never armed (run web_editor_test_start)`,
+        availablePaths: bridge.list().map((m) => m.nodePath),
+      });
+    }
+    const { ensureForceRecorder } = await import('../mechanism-force-recorder-plugin');
+    const recorder = ensureForceRecorder(v).recorder;
+
+    let reduced: DownsampledSeries | null = null;
+    const wantedId = channelId?.trim();
+    if (series === true && wantedId) {
+      const recorded = recorder.getSeries(wantedId);
+      if (recorded) {
+        const { downsampleSeries } = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-force-downsample');
+        const times = recorder.timeBuffer.toArray();
+        const values = recorded.values.toArray();
+        // The shared time buffer and a series wrap independently; only the
+        // overlapping tail is index-aligned, and `dt` is read from it rather
+        // than assumed, so a paused window does not silently re-date the curve.
+        const n = Math.min(times.length, values.length);
+        const tail = values.slice(values.length - n);
+        const tTail = times.slice(times.length - n);
+        const dt = n > 1 ? (tTail[n - 1] - tTail[0]) / (n - 1) : 1 / FORCE_SAMPLE_RATE_HZ;
+        reduced = downsampleSeries(tail, dt, SERIES_MAX_POINTS, tTail[0] ?? 0);
+      }
+    }
+    const out = this._forcesJson(snapshot, recorder, { channelId: wantedId, series: reduced });
+    if (series === true && !wantedId) out.seriesNote = 'series needs a channelId — pick one from channels[]';
+    return JSON.stringify(out);
+  }
+
+  @McpTool('Solve the HOLDING forces of a mechanism in its current pose (velocity and acceleration zero) and file them as each channel\'s holding figure — "what does it take to just hold this here", answerable without running the machine. Returns the same shape as web_editor_mechanism_forces with holding filled. Changes no pose and appends no undo entry, but it does replace the previously recorded holding numbers, which the panel shows. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).', { readOnly: false })
+  async webEditorMechanismStatics(
+    @McpParam('mechanismPath', 'Node path of the mechanism.') mechanismPath: string,
+  ): Promise<string> {
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const v = this.viewer;
+    if (!v) return JSON.stringify({ error: 'No viewer' });
+    const path = (mechanismPath || '').trim();
+    if (!path) return JSON.stringify({ error: 'mechanismPath is required' });
+    const { ensureForceRecorder } = await import('../mechanism-force-recorder-plugin');
+    const plugin = ensureForceRecorder(v);
+    const snapshot = plugin.captureStatics(path);
+    if (!snapshot) {
+      return JSON.stringify({
+        error: `Statics could not be solved for "${path}" — unknown mechanism, or links without mass (web_editor_mechanism_add_body)`,
+        availablePaths: bridge.list().map((m) => m.nodePath),
+      });
+    }
+    return JSON.stringify(this._forcesJson(snapshot, plugin.recorder));
+  }
+
+  @McpTool('Apply the auto-fix of a FIXABLE finding on a joint and persist it as an ordinary field composite, so it undoes like a manual edit. Get the code from the findings of web_editor_mechanism_inspect or web_editor_mechanism_validate — only entries with fixable=true have one. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismFix(
+    @McpParam('path', 'Node path of the joint the finding concerns.') path: string,
+    @McpParam('code', 'Finding code, e.g. AnchorsApart or MissingSecondaryAxis.') code: string,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    if (!ctx.viewer.registry?.getNode(path)) return JSON.stringify({ error: `Node not found: ${path}` });
+    const finding = (code || '').trim();
+    if (!finding) return JSON.stringify({ error: 'code is required' });
+
+    // `suggestFix` RETURNS the field edits instead of applying them, which makes
+    // the preview free — there is nothing to persist until this tool does it.
+    const fix = bridge.suggestFix(path, finding);
+    if (!fix || Object.keys(fix).length === 0) {
+      const fixable = bridge.list()
+        .flatMap((m) => m.findings)
+        .filter((f) => f.fixable && f.jointPath === path)
+        .map((f) => f.code);
+      return JSON.stringify({ error: `No auto-fix for "${finding}" on ${path}`, fixableCodes: fixable });
+    }
+    const componentType = Object.keys(rvOf(ctx.viewer.registry.getNode(path)!))
+      .find((k) => /^KinematicJoint(_\d+)?$/.test(k)) ?? 'KinematicJoint';
+    await this._mechCommit(ctx, bridge, path, {
+      label: `Fix ${finding}`,
+      intents: Object.entries(fix).map(([fieldName, value]) => ({
+        op: 'setField' as const, nodePath: path, componentType, fieldName, value,
+      })),
+    });
+    return JSON.stringify({ ok: true, path, componentType, code: finding, applied: fix });
+  }
+
+  // ═══ In-place test session (plan-410, driven per plan-706 F12) ═════════════
+  //
+  // These two are the ONLY mechanism-area tools that do not require the private
+  // bridge: the test session materialises the authoring state and attaches the
+  // runtime, which is meaningful with or without a rigid-body solver. Without
+  // the bridge they simply report `forceRecording: false` — an honest fact, not
+  // an error (§2.5).
+
+  @McpTool('Start the editor\'s IN-PLACE TEST session: the authoring state is materialised through the real save path and the runtime is attached, so drives, logic and mechanisms actually run. Also arms the mechanism force recording, which is what makes web_editor_mechanism_forces return a cycle afterwards. Stop with web_editor_test_stop, which restores the authoring state exactly. Reports the state reached and whether force recording is on.', { readOnly: false, timeoutMs: 120_000 })
+  async webEditorTestStart(): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const { getActiveTestSession } = await import('@rv-private/plugins/asset-editor/test-session-store');
+    const session = getActiveTestSession();
+    if (!session) {
+      return JSON.stringify({ error: 'No test session available — open the asset editor first (web_editor_open)' });
+    }
+    // Install the recorder BEFORE starting: its session subscription is what
+    // arms the analysis, and a plugin that does not exist yet cannot subscribe.
+    const { ensureForceRecorder } = await import('../mechanism-force-recorder-plugin');
+    const plugin = ensureForceRecorder(ctx.viewer);
+    await session.start();
+    return JSON.stringify({
+      ok: true, state: session.state, forceRecording: plugin.recorder.recording,
+    });
+  }
+
+  @McpTool('Stop the editor\'s in-place test session and put the authoring state back exactly as it was before the run. The recorded force buffers are KEPT — "what did that cycle need?" is asked after the cycle — so web_editor_mechanism_forces still answers with peak and RMS afterwards. Reports the state reached and whether force recording is (still) on.', { readOnly: false, timeoutMs: 120_000 })
+  async webEditorTestStop(): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const { getActiveTestSession } = await import('@rv-private/plugins/asset-editor/test-session-store');
+    const session = getActiveTestSession();
+    if (!session) {
+      return JSON.stringify({ error: 'No test session available — open the asset editor first (web_editor_open)' });
+    }
+    const { ensureForceRecorder } = await import('../mechanism-force-recorder-plugin');
+    const plugin = ensureForceRecorder(ctx.viewer);
+    await session.stop();
+    return JSON.stringify({
+      ok: true, state: session.state, forceRecording: plugin.recorder.recording,
+    });
   }
 
   @McpTool('Create a new kinematic axis: an empty top-level node with a Kinematic component linked to a fresh group (Quick Edit "Add Kinematic"). Assign members afterwards with web_editor_assign_to_kinematic. Returns the axis path + group name.', { readOnly: false })
@@ -1201,13 +2208,13 @@ export class McpEditorTools {
 
   // ═══ Imports ══════════════════════════════════════════════════════════
 
-  @McpTool('Import a GLB file from the work folder into the open asset (undoable importCad op). relPath is relative to the work folder root (e.g. "imports/part.glb"). Returns the created root path.', { readOnly: false, timeoutMs: 120_000 })
+  @McpTool('Import a GLB file from the OPEN PROJECT into the open asset (undoable importCad op). relPath is project-relative (e.g. "library/imports/part.glb"). Returns the created root path.', { readOnly: false, timeoutMs: 120_000 })
   async webEditorImportGlb(
-    @McpParam('relPath', 'Work-folder-relative path of a .glb file.') relPath: string,
+    @McpParam('relPath', 'Project-relative path of a .glb file (e.g. "library/imports/part.glb").') relPath: string,
   ): Promise<string> {
     const ctx = this._ctx();
     if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const read = await this._readWorkfolderFile(relPath);
+    const read = await this._readProjectFile(relPath);
     if ('error' in read) return JSON.stringify(read);
     const mods = await this._load();
     try {
@@ -1220,9 +2227,9 @@ export class McpEditorTools {
     }
   }
 
-  @McpTool('Import a CAD file (STEP/JT) from the work folder into the open asset — converts via the CAD provider (private build), then attaches as an undoable importCad op. quality: draft | standard | fine (default standard).', { readOnly: false, timeoutMs: 600_000 })
+  @McpTool('Import a CAD file (STEP/JT) from the OPEN PROJECT into the open asset — converts via the CAD provider (private build), then attaches as an undoable importCad op. relPath is project-relative. quality: draft | standard | fine (default standard).', { readOnly: false, timeoutMs: 600_000 })
   async webEditorImportCad(
-    @McpParam('relPath', 'Work-folder-relative path of a CAD file (.step/.stp/.jt).') relPath: string,
+    @McpParam('relPath', 'Project-relative path of a CAD file (.step/.stp/.jt), e.g. "library/imports/machine.step".') relPath: string,
     @McpParam('quality', 'Tessellation quality: draft | standard | fine (default standard).', 'string', false) quality: string,
   ): Promise<string> {
     const ctx = this._ctx();
@@ -1231,7 +2238,7 @@ export class McpEditorTools {
     if (!mods.cadProvider.hasCadProvider()) {
       return JSON.stringify({ error: 'CAD provider not available in this build — import a GLB instead' });
     }
-    const read = await this._readWorkfolderFile(relPath);
+    const read = await this._readProjectFile(relPath);
     if ('error' in read) return JSON.stringify(read);
     const provider = mods.cadProvider.getCadProvider(mods.cadProvider.cadFormatOfName(read.name));
     if (!provider) {
@@ -1247,24 +2254,24 @@ export class McpEditorTools {
     }
   }
 
-  /** Read a file from the configured work folder (File System Access). */
-  private async _readWorkfolderFile(relPath: string):
+  /**
+   * Read a file out of the OPEN PROJECT (plan-709 §2.6.2).
+   *
+   * One store, whichever backend the project has: a folder project reads from
+   * disk, a browser project from OPFS, and the agent passes the same
+   * project-relative path either way. `readBlobBytes` is the bytes primitive
+   * added in §2.5 — no object URL is minted to read a file.
+   */
+  private async _readProjectFile(relPath: string):
     Promise<{ bytes: ArrayBuffer; name: string } | { error: string }> {
-    const mods = await this._load();
-    if (!relPath?.trim()) return { error: 'relPath is required' };
-    const root = await mods.fs.getWorkFolder(true);
-    if (!root) return { error: 'No writable project is open (open one in Projects)' };
-    try {
-      const segments = relPath.trim().replace(/\\/g, '/').split('/').filter(Boolean);
-      let dir: FileSystemDirectoryHandle = root;
-      for (const seg of segments.slice(0, -1)) dir = await dir.getDirectoryHandle(seg);
-      const name = segments[segments.length - 1];
-      const handle = await dir.getFileHandle(name);
-      const bytes = await (await handle.getFile()).arrayBuffer();
-      return { bytes, name };
-    } catch {
-      return { error: `File not found in work folder: ${relPath}` };
-    }
+    const trimmed = relPath?.trim().replace(/\\/g, '/').replace(/^\/+/, '') ?? '';
+    if (!trimmed) return { error: 'relPath is required' };
+    const { getProjectStore } = await import('../../core/project/project-store');
+    const backend = getProjectStore().getBackend();
+    if (!backend) return { error: 'No project is open (open one in Projects)' };
+    const bytes = await backend.readBlobBytes(trimmed);
+    if (!bytes) return { error: `File not found in the open project: ${trimmed}` };
+    return { bytes, name: trimmed.split('/').pop() || trimmed };
   }
 }
 

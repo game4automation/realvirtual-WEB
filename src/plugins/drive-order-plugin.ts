@@ -4,9 +4,15 @@
 /**
  * DriveOrderPlugin — Topological sort of viewer.drives for CAM/Gear dependencies.
  *
- * Runs once in onModelLoaded: re-orders the drives array so that
+ * Runs in onModelLoaded AND on every runtime change of the drive collection
+ * (`drives-changed`, plan-411 Phase 1): re-orders the drives array so that
  * master drives are updated before their slaves. Independent drives
  * keep their original order (stable sort).
+ *
+ * Reacting to the runtime event is not cosmetic — a Gear/CAM slave added in the
+ * editor is APPENDED to the tick list, i.e. behind nothing and before nothing,
+ * so without the re-sort it would read its master's position one tick late for
+ * the rest of the session.
  */
 
 import type { RVViewerPlugin } from '../core/rv-plugin';
@@ -21,7 +27,30 @@ export class DriveOrderPlugin implements RVViewerPlugin {
   /** Run early so drives are sorted before other plugins see them. */
   readonly order = 0;
 
+  /** Unsubscribe handle of the `drives-changed` subscription. */
+  private _off: (() => void) | null = null;
+
   onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
+    this.sort(viewer);
+    // Re-sort whenever the collection changes at runtime. The sort itself
+    // mutates `viewer.drives` IN PLACE without going through addDrive/
+    // removeDrive, so it cannot re-enter this handler.
+    this._off?.();
+    this._off = viewer.on('drives-changed', () => this.sort(viewer));
+  }
+
+  onModelCleared(): void {
+    this._off?.();
+    this._off = null;
+  }
+
+  dispose(): void {
+    this._off?.();
+    this._off = null;
+  }
+
+  /** Re-run the topological sort over the viewer's current drive list. */
+  sort(viewer: RVViewer): void {
     const sorted = this.topologicalSort(viewer.drives);
     // `topologicalSort` returns the SAME array instance when there is nothing to
     // reorder (no CAM/Gear dependencies). `sorted` would then alias viewer.drives,

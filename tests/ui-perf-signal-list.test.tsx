@@ -30,6 +30,7 @@ import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { setSignalActivityIndicator } from '../src/core/hmi/signal-activity-indicator-store';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { ConnectInterface, ConnectInterfaceSignal } from '../src/core/hmi/connect-store';
+import { findSignalRowLabel, getSignalRowLabel, querySignalRowLabel } from './helpers/signal-row-label';
 
 /** Shared UI ticker period — value flushes and activity pulls ride on it. */
 const TICK_MS = 200;
@@ -107,7 +108,7 @@ describe('SignalListView — parent body is off the value bus', () => {
     const store = makeStore(signals);
     const { bodyRenders } = renderList(iface, makeViewer(store));
 
-    await screen.findByText('Sig_0');
+    await findSignalRowLabel('Sig_0');
     const before = bodyRenders.count;
 
     const updates: Record<string, boolean> = {};
@@ -134,7 +135,7 @@ describe('SignalListView — parent body is off the value bus', () => {
     });
 
     renderList(iface, makeViewer(store));
-    await screen.findByText('Sig_0');
+    await findSignalRowLabel('Sig_0');
 
     const unique = new Set(subscribed);
     // Visible + overscan only — nowhere near all 500. The old implementation
@@ -162,13 +163,13 @@ describe('SignalListView — parent body is off the value bus', () => {
     });
 
     const { container } = renderList(iface, makeViewer(store));
-    await screen.findByText('Sig_0');
+    await findSignalRowLabel('Sig_0');
     const initialCount = live.size;
     expect(live.has('Sig_0')).toBe(true);
 
     const scroller = container.querySelector('[class*="rv-scroll"], .MuiBox-root [style*="overflow"]')
       ?? container.querySelector('div[style]');
-    const el = (screen.getByText('Sig_0').closest('div[class]')!
+    const el = (getSignalRowLabel('Sig_0').closest('div[class]')!
       .parentElement!.parentElement!.parentElement) as HTMLElement;
     const scrollEl = (scroller as HTMLElement | null) ?? el;
 
@@ -199,7 +200,7 @@ describe('SignalListView — parent body is off the value bus', () => {
     store.set('Burst_0', true);
 
     renderList(iface, makeViewer(store));
-    const row = rowRootFor(await screen.findByText('Burst_0'));
+    const row = rowRootFor(await findSignalRowLabel('Burst_0'));
     // `●` = TRUE, `○` = FALSE in SignalBadge.
     await waitFor(() => expect(row.textContent).toContain('●'));
 
@@ -226,7 +227,7 @@ describe('SignalListView — parent body is off the value bus', () => {
     });
 
     const { unmount } = renderList(iface, makeViewer(store));
-    await screen.findByText('Un_0');
+    await findSignalRowLabel('Un_0');
     expect(subscribes).toBeGreaterThan(0);
 
     unmount();
@@ -275,7 +276,7 @@ describe('SignalListView — activity indicator stays live in the row', () => {
     store.set('Act_0', true); // gives it a lastUpdateTs → 'live'
 
     const { bodyRenders } = renderList(iface, makeViewer(store));
-    const label = await screen.findByText('Act_0');
+    const label = await findSignalRowLabel('Act_0');
     const row = rowRootFor(label);
     await waitFor(() => expect(getComputedStyle(row).opacity).toBe('1'));
 

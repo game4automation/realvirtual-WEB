@@ -14,8 +14,8 @@
  *
  * ## The write side deliberately has no naive method (§2.2.2)
  *
- * `writeScene(relPath, scene)` reads like a thin wrapper over
- * `writeSceneFile()`. It must not be one. The folder path already has a
+ * `writeScene(relPath, write)` reads like a thin wrapper over a file write.
+ * It must not be one. The folder path already has a
  * writer — `RVProjectFolderWriter`, a debounced, mutation-bus-driven class
  * that carries the RR1 filename contract (`_checkPathOwnership` before every
  * write **and** every delete) and the RR3 write seams. A backend method that
@@ -45,11 +45,17 @@
  * exists.
  */
 
-import type { RvScene } from '../../hmi/scene/rv-scene-types';
 import type {
+  SceneRecord,
+  SceneRevision,
+  SceneWrite,
+} from '../rv-scene-record';
+export { WriteQueue } from './write-queue';
+import type { DocumentStat } from '../rv-project-documents';
+import type {
+  RvDocumentEntry,
   RvProject,
   RvProjectAssetEntry,
-  RvProjectSceneEntry,
 } from '../rv-project-types';
 
 // ─── Kind ───────────────────────────────────────────────────────────────
@@ -82,7 +88,15 @@ export interface ProjectReadProvider {
   readonly kind: BackendKind;
   readonly writable: boolean;
   readManifest(): Promise<RvProject | null>;
-  readScene(relPath: string): Promise<RvScene | null>;
+  /**
+   * Read one scene body.
+   *
+   * Returns a {@link SceneRecord} — bytes plus metadata plus a revision —
+   * **not** an `RvScene`. See `rv-scene-record.ts` for why the contract had to
+   * change rather than grow, and why `record.legacy` exists for exactly as
+   * long as plan-397 phase 7 takes.
+   */
+  readScene(relPath: string): Promise<SceneRecord | null>;
   readSettings(relPath?: string): Promise<unknown | null>;
 }
 
@@ -101,6 +115,18 @@ export interface ResolvedBackendBlob {
   release(): void;
 }
 
+/**
+ * The optional precondition of {@link ProjectBackend.writeBlob}.
+ *
+ * Its own interface rather than a bare parameter so a later addition (a
+ * content type, an "atomic rename" hint) does not change every implementation's
+ * signature again.
+ */
+export interface WriteBlobOptions {
+  /** See the table on {@link ProjectBackend.writeBlob}. */
+  expectedRevision?: SceneRevision | null;
+}
+
 export interface ProjectBackend extends ProjectReadProvider {
   readonly kind: BackendKind;
   /** Unique across all backends of one store. */
@@ -110,9 +136,47 @@ export interface ProjectBackend extends ProjectReadProvider {
   readonly isActive: boolean;
 
   // ── Listing ──
-  listScenes(): Promise<RvProjectSceneEntry[]>;
+  // `listScenes()` is gone (plan-716 Phase 6). It answered "which scenes does
+  // this project have", which stopped being a question with its own answer once
+  // a scene became an ordinary document: {@link listDocuments} returns them
+  // along with everything else, each row carrying the `section` that says which
+  // folder holds it.
   listModels(): Promise<RvProjectAssetEntry[]>;
   listLibrary(): Promise<RvProjectAssetEntry[]>;
+  /**
+   * The one list (plan-413 §2.4) — everything the three above return, as
+   * documents.
+   *
+   * It does **not** simply concatenate them, and the difference is where the
+   * folder backend lives: models and library are folder-driven there (dropping
+   * `Machine.glb` into `models/` *is* adding it), while `documents[]` in the
+   * manifest is derived from and mirrored back into the manifest arrays only.
+   * Keeping the two apart is what stops a folder scan from rewriting a
+   * customer's `project.json` with fifty entries nobody asked for.
+   *
+   * Ids are stable across calls: an entry that arrives without one gets a
+   * path-derived id (`stableDocumentId`), never a random one, or a list nothing
+   * could select in would come back different every render.
+   */
+  listDocuments(): Promise<RvDocumentEntry[]>;
+  /**
+   * Cheap size/mtime/digest for the documents this backend stores — the
+   * pre-filter of the classification scan (§2.5, SOL R1-7).
+   *
+   * Contract per medium, and the asymmetry is deliberate:
+   *
+   *  - **folder / browser** — real stats. They are writable, so a file can
+   *    change behind the manifest's back and the scan is how that is noticed.
+   *  - **bundled / HTTP** — an empty list. There is no reliable `mtime` over
+   *    `fetch`, and there is nothing to reconcile: the source is read-only, so
+   *    its manifest cannot be out of date with respect to bytes nobody can
+   *    modify. Returning stats we do not trust would turn every open into a
+   *    full re-download.
+   *
+   * A document with no stat is left alone by the scan. That is the same
+   * statement as "the manifest is authoritative here".
+   */
+  statDocuments(): Promise<DocumentStat[]>;
 
   // ── Lifecycle (§2.2.1b) ──
   /** Bring the write side into service. Only the active project may do this. */
@@ -121,12 +185,63 @@ export interface ProjectBackend extends ProjectReadProvider {
   deactivate(): Promise<void>;
 
   // ── Write (queueing surface — see the file header) ──
-  /** Queue a scene body write. Throws unless writable **and** active. */
-  writeScene(relPath: string, scene: RvScene): Promise<void>;
+  /**
+   * Store a scene body, atomically and under a precondition (§2.8).
+   *
+   * Three properties every implementation owes the caller:
+   *
+   *  1. **GLB only.** There is no way to put a JSON body in through this
+   *     surface. That is what stops the pre-397 format from being re-created
+   *     after the migration.
+   *  2. **Compare-and-swap.** `write.expectedRevision` is checked against
+   *     what is stored *now*; a mismatch throws
+   *     {@link SceneRevisionConflictError} instead of overwriting. This is
+   *     also how an edit made in the project folder behind our back surfaces —
+   *     it changed the bytes, so it changed the revision.
+   *  3. **All or nothing.** A failed write leaves the previous body exactly
+   *     as it was. Never a truncated file, never a zero-byte placeholder.
+   *
+   * Throws unless writable **and** active.
+   *
+   * @returns the revision of what is now stored.
+   */
+  writeScene(relPath: string, write: SceneWrite): Promise<SceneRevision>;
   /** Queue a scene deletion. Throws unless writable **and** active. */
   deleteScene(relPath: string): Promise<void>;
-  /** Store a binary artefact. Throws unless writable **and** active. */
-  writeBlob(relPath: string, blob: Blob): Promise<void>;
+  /**
+   * Store a binary artefact. Throws unless writable **and** active.
+   *
+   * ## The precondition is optional, and that is what makes it safe to add
+   *
+   * Until plan-709 this surface had **no** way to say "…unless somebody else
+   * changed it first", while `writeScene` right above it did. The asymmetry was
+   * not a policy: it was a missing capability, and it is why every asset write
+   * in the product (library rename/duplicate, classification, tree moves,
+   * settings-into-model) was a last-writer-wins overwrite.
+   *
+   * `opts` closes that gap **without touching a single existing caller**: with
+   * no `opts` the behaviour is byte-identical to before — unconditional. The
+   * three intents are exactly the ones {@link SceneWrite.expectedRevision}
+   * already defines, and they are checked by the same
+   * {@link assertRevisionPrecondition}, so a fourth backend cannot invent a
+   * fourth meaning of "conflict":
+   *
+   * | `expectedRevision` | means | throws when |
+   * |---|---|---|
+   * | omitted / `undefined` | unconditional (today's behaviour) | never |
+   * | a revision | "I read this and am replacing it" | stored bytes hash differently |
+   * | `null` | "create only — this must not exist yet" | anything is stored |
+   *
+   * The `null` mode is what a migration wants: copy in, never overwrite.
+   *
+   * A revision here is the same token as everywhere else — the SHA-256 of the
+   * stored bytes ({@link revisionOfBytes}) — so a caller can obtain one by
+   * hashing what it read, with no bookkeeping anywhere.
+   *
+   * @throws {@link SceneRevisionConflictError} when the precondition fails.
+   *   Nothing is written in that case.
+   */
+  writeBlob(relPath: string, blob: Blob, opts?: WriteBlobOptions): Promise<void>;
   /**
    * Remove a binary artefact. Throws unless writable **and** active.
    *
@@ -137,6 +252,19 @@ export interface ProjectBackend extends ProjectReadProvider {
   deleteBlob(relPath: string): Promise<void>;
   /** Resolve an artefact to something loadable. Read-only backends do this too. */
   readBlobUrl(relPath: string): Promise<ResolvedBackendBlob | null>;
+  /**
+   * The artefact's raw bytes, or null when nothing is stored at `relPath`.
+   *
+   * The sibling of {@link readBlobUrl} that hands over no resource (plan-709
+   * §2.5). Two of the three backends already hold the bytes and only wrap them
+   * in an object URL to satisfy the older contract — a wrapper the caller then
+   * has to own and revoke, which is the leak phase 4 removes. Reading bytes
+   * where bytes are what the caller wanted skips the whole question.
+   *
+   * `readBlobUrl` remains for the cases that genuinely need a base URL: a
+   * glTF with external buffers or textures resolves its siblings against it.
+   */
+  readBlobBytes(relPath: string): Promise<ArrayBuffer | null>;
   /** Await any queued write. Safe on a read-only or inactive backend. */
   flush(): Promise<void>;
 }

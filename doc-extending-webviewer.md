@@ -295,6 +295,67 @@ registerCapabilities('AASLink', {
 > it. A component that needs a per-frame tick gets a **dedicated viewer-owned
 > manager** instead — see § Per-frame components below.
 
+### A metadata entry with no factory (data that is not a component)
+
+Some rv_extras entries carry no behaviour at all — they are facts ABOUT a node that other
+code reads. Those want a schema and capabilities but **no `create` factory**, which is a
+deliberate choice with consequences worth knowing before you make it.
+
+`registerComponentSchema(type, schema, capabilities?)` is the one call for this. It
+registers the schema (so field descriptors resolve, `getSchemaDefaults` can seed an
+`authorable` "Add Component", and the extras validator stops treating the fields as
+unknown) and the capabilities, without any factory. `Group` (`rv-group-component.ts`),
+`JTData` (`rv-jt-data.ts`) and `NodeKnowledge` (`rv-node-knowledge.ts`) all do this.
+
+```typescript
+// src/core/engine/rv-node-knowledge.ts — one overwritable Markdown note per node
+registerComponentSchema('NodeKnowledge', {
+  Note:      { type: 'string', default: '' },
+  UpdatedAt: { type: 'string', default: '' },
+  Author:    { type: 'enum', enumMap: { agent: 'agent', user: 'user' }, default: 'agent' },
+  // …
+}, {
+  authorable: true,
+  hoverable: false,      // data, not an interactive object — no tooltip, no HMI surface
+  selectable: false,
+  badgeColor: '#8d6e63',
+});
+```
+
+What follows from having no factory:
+
+- **No live instance is ever created.** `constructComponentOnNode` returns `null` for a
+  factory-less type, so nothing lands in the NodeRegistry and the entry costs nothing per
+  tick. It also means `web_component_get` / `_get_all` (which serialize registry instances)
+  cannot see it.
+- **`applySchema` never runs at load.** The schema's defaults are therefore NOT applied to
+  loaded data — they only feed `getSchemaDefaults` for newly authored entries. **Your read
+  path has to default for itself.** `readNodeKnowledge()` is the shape to copy: read raw
+  `userData.realvirtual[type]`, narrow every field, return `null` when the entry is absent.
+- **Read raw `userData`, not the registry.** Besides there being no instance, a value written
+  in the current session lives in `userData` long before any reload; a registry-based read
+  would report the old state (or nothing).
+- **Writing still works normally.** The persistence chain validates no names, so
+  `EditTarget.setField` creates the entry and it round-trips into the GLB. That cuts both
+  ways — a typo'd field name is written permanently and silently — which is why anything
+  authoring such an entry programmatically should hold the type and field names in
+  **constants** rather than accept them as parameters.
+- **The optimistic UI mirror does not create the entry.** `updateOverlayField` reflects a
+  write into `userData` via `applyFieldToScene`, which returns early when the component key
+  does not exist yet. For the FIRST field of a new entry that is a no-op, and the entry only
+  appears once the op queue flushes. If a caller reads back synchronously, it has to stamp
+  the entry itself — see `mirrorIntoUserData` in `rv-mcp-knowledge-tools.ts`.
+- **You still owe the rv-ODT coverage test an answer.** `registerComponentSchema` puts the
+  type into `getRegisteredSchemaTypes()`, and `tests/spec-loading.test.ts` asserts that every
+  registered schema either has an entry in `schema/v1/rv-odt.json` or is declared out of
+  scope. A WEB-only type belongs on the out-of-scope list (`OUT_OF_SCOPE_EXACT`) with a
+  reason — rv-ODT describes types that exist on BOTH sides, so listing a WEB-only type there
+  would claim an interchange contract that does not exist. Skip this and the suite fails with
+  *"registered but missing from rv-ODT v1"*.
+
+Use plain `registerCapabilities(type, caps)` instead when there is no schema to register at
+all — a pipeline marker or an externally-defined key such as `AASLink`.
+
 ### Per-frame components (the manager pattern)
 
 Components are not ticked by the engine. A component that has to do something
@@ -1034,14 +1095,42 @@ viewer.clearPluginUserOverrides();
 A user-disabled plugin is excluded from fixed-update, render, model-load replay, and workspace-mode
 hooks. Disabling an active mode-scoped plugin runs its deactivation hook once; enabling it in its
 active mode restores the applicable lifecycle callbacks. The override survives workspace-mode
-changes, but it is intentionally session-only and is removed when the plugin is unregistered.
+changes.
 
-This is a lifecycle override, not an unload operation: registered UI slots remain available,
-subscriptions and allocated resources remain owned by the plugin, and the plugin instance stays in
-the registry. Interfaces should therefore describe the action as enabling or disabling lifecycle
-participation, never as removing or unloading the plugin. `clearPluginUserOverrides()` returns all
-overridden plugins to their normal workspace-mode-driven state; it does not restore a captured
-snapshot.
+**Since plan-435 the override is retroactive and it persists.** Switching a plugin off no longer
+only stops *future* callbacks — it undoes what the plugin already built:
+
+1. `onModeDeactivate`, when the plugin participates in the active mode (unchanged).
+2. **Teardown** — `onDeactivate(viewer)` if the plugin declares it, otherwise a single
+   `onModelCleared(viewer)`, and that fallback only when the plugin actually received the current
+   model.
+3. `disablePlugin(id)`.
+4. **Its UI slots are unregistered** — buttons, tabs and panels disappear.
+
+Switching it back on is the mirror image: slots are re-registered first (in their original
+position — the registry remembers a stable per-plugin sequence), then `enablePlugin()` replays a
+missed `onModelLoaded` if there was one, then `onActivate(viewer)` or, without that hook, a replay
+of the current model, then `onModeActivate`.
+
+The whole teardown lives in `setPluginUserEnabled` alone. `disablePlugin()` / `enablePlugin()` are
+deliberately untouched, because they are also the workspace-mode reconcile path — anchoring the
+teardown there would fire it on every mode switch.
+
+It is still not an unload: subscriptions the plugin chose to keep, its allocated resources and its
+own state stay with the instance, which stays in the registry. Describe the action as switching the
+plugin off, never as removing or unloading it. `clearPluginUserOverrides()` returns all overridden
+plugins to their normal workspace-mode-driven state; it does not restore a captured snapshot.
+
+**Persistence** (plan-435 Phase 3): overrides are stored per project (falling back to the model)
+under `rv-plugin-overrides/<scope>` and re-applied at boot before the model loads. `core: true` and
+protected plugins are never persisted or applied, so a stored record cannot boot the viewer into an
+unusable state; `?resetPlugins=1` wipes every scope before any of them is read. An override for a
+plugin that is only registered later (model plugins, the debug endpoint, the MCP bridge) is held as
+an intent on the viewer and applied the moment that plugin appears in `use()`.
+
+Plugins whose teardown cannot be made complete yet are **protected**: the switch is disabled and its
+tooltip says whether the lifecycle cannot be interrupted safely or the teardown is simply not
+implemented yet. Half-effective switches are worse than no switch.
 
 Successful override changes emit `plugins-changed` with `kind: 'user-disabled'` or
 `kind: 'user-enabled'`. Unknown plugin IDs and repeated requests for the current user-intent state
@@ -2052,7 +2141,8 @@ The file must export three things:
 import type { RVViewer } from '../../../core/rv-viewer';
 import type { ModelPluginModule } from '../../../core/rv-model-plugin-manager';
 
-// Which GLB filenames (without .glb) this module handles
+// DEPRECATED since plan-718 — bind in the manifest instead (see below).
+// Which GLB filenames (without .glb) this module handles.
 export const models = ['MyModel', 'MyModelVariant'];
 
 const registeredIds: string[] = [];
@@ -2078,11 +2168,37 @@ export function unregisterModelPlugins(viewer: RVViewer): void {
 export default { models, registerModelPlugins, unregisterModelPlugins } satisfies ModelPluginModule;
 ```
 
+### Binding: `scriptRef` in the manifest, not `models[]` in the module
+
+Since plan-718 the binding lives in `project.json`, on the document row:
+
+```jsonc
+{ "id": "ast_m8x", "path": "models/linie1.glb", "name": "Linie 1",
+  "scriptRef": "plugins/index.ts" }
+```
+
+Three things follow, and each of them is why the declaration moved:
+
+- **A rename cannot break it.** The reference hangs on the row, whose id is frozen
+  at birth; `models[]` matched a GLB *file name*.
+- **N:1 is free.** Several documents may carry the same `scriptRef` and share one
+  module — the module is imported once.
+- **The reference must stay inside the project.** `../` is refused, by the viewer
+  and by `scripts/validate-project.mjs`.
+
+A `scriptRef` that resolves to no bundled module loads **no** plugins; it does not
+fall back to the name match, because binding the wrong code is worse than binding
+none. `models[]` is still read for a project that has not been migrated, for one
+release generation — the migration (`rv-project-refs-migration.ts`, and
+`scripts/migrate-project-manifest.mjs` offline) converts declarations to
+references and reports any that differ from a document name only in case, since
+the match is case-SENSITIVE on both sides.
+
 ### How It Works
 
 1. `ModelPluginManager` uses `import.meta.glob` to discover all `plugins/index.ts` files at build time
-2. When `viewer.loadModel(url)` is called, the manager extracts the model filename
-3. It finds the matching plugin module (by `models` array or folder name)
+2. When `viewer.loadModel(url)` is called, the manager resolves the document row and reads its `scriptRef`
+3. It finds the matching plugin module (by `scriptRef`; failing a reference, by `models` array or folder name)
 4. Previous model's `unregisterModelPlugins()` is called — all plugins are disposed and removed
 5. New model's `registerModelPlugins()` is called — plugins are registered via `viewer.use()`
 6. Registered plugins receive `onModelLoaded` retroactively (standard `viewer.use()` behavior)
@@ -2551,7 +2667,7 @@ Most components need to react when their node is hovered, clicked, or selected. 
 
 ### How it works
 
-`registerComponent({ ... })` automatically tags `node.userData._rvComponentInstance = inst` in `afterCreate`. The dispatcher listens to the viewer's raycast/selection events, walks up the parent chain to find a tagged node, and invokes the matching component's optional callbacks:
+`registerComponent({ ... })` automatically tags the node in `afterCreate` — `node.userData._rvComponentInstance = inst` (first writer wins) **plus** an ordered `node.userData._rvComponentInstances` array holding every component on that node. The dispatcher listens to the viewer's raycast/selection events, walks up the parent chain and invokes the **first instance that implements the requested hook**:
 
 ```typescript
 interface RVComponent {
@@ -2574,6 +2690,12 @@ interface RVComponent {
 - `onSelect(false)` fires for nodes that **leave** the selection (tracked via internal `Set<Object3D>`)
 - All callback invocations are wrapped in `try/catch` — a faulty component never breaks the dispatcher
 - Listener cleanup on `dispose()`: viewer subscriptions are stored as unsubscribe fns and called on disposal (no listener leaks on scene reload)
+- **Several components on one node** are supported (plan-417): a Unity node may carry e.g. `SceneButtonMoveable` and `SceneButtonBase` at once. Lookup is per hook and per node in registration order, so a component without `onClick` never swallows the click of a sibling — or of an ancestor — that has one. Single-instance nodes behave exactly as before. Detach an instance in `dispose()` with `removeComponentInstance(node, this)`, which also promotes the next instance into `_rvComponentInstance`.
+
+### Reference consumers
+
+- **`RVWebSensor`** (`rv-web-sensor.ts`) — hover/click/select on an overlay gizmo.
+- **`RVSceneButtonBase`** (`rv-scene-button-base.ts`, plan-417) — the first *interactive* consumer: `onClick()` runs the button state machine and writes a PLC signal, `onHover()` drives the cap animation. It is also the reference for the two rules the dispatcher imposes on a component family: put the hooks on the node that carries the collider in Unity (never on a wrapper further up, whose event an intermediate component would otherwise absorb), and keep animated meshes out of the pick set so the BVH never holds a stale pose.
 
 ### Example
 

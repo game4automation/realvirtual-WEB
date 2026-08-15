@@ -93,14 +93,29 @@ export class FakeFile {
   async createWritable() {
     this.failures?.check('write', this.name);
     const self = this;
+    // The real API buffers into a swap file and only commits on `close()`.
+    // Modelling that matters for plan-397 §2.8: a test that asserts "an
+    // aborted write leaves no partial state" is meaningless against a fake
+    // that commits inside `write()`.
+    let staged: Blob | null = null;
+    let done = false;
     return {
       async write(data: Blob | ArrayBuffer | string) {
-        self.blob =
+        if (done) throw namedError('InvalidStateError', 'stream already closed');
+        staged =
           data instanceof Blob ? data
             : typeof data === 'string' ? new Blob([data])
               : new Blob([data]);
       },
-      async close() { /* no-op */ },
+      async close() {
+        if (done) return;
+        done = true;
+        if (staged !== null) self.blob = staged;
+      },
+      async abort() {
+        done = true;
+        staged = null;
+      },
     };
   }
 

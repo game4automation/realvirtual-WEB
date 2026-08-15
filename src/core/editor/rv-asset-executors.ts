@@ -4,7 +4,7 @@
 /**
  * rv-asset-executors — apply AssetOps to the live RVViewer scene.
  *
- * For every primitive `AssetOp.kind`: `applyAssetForward(op)` mutates the live
+ * For every primitive `RvAssetOp.kind`: `applyAssetForward(op)` mutates the live
  * scene, `applyAssetInverse(op)` reverses it via the op's `prev` payload.
  * Composites fan out (forward in order, inverse in reverse). Failures are
  * caught and logged — a stale op (e.g. node renamed outside the op flow) never
@@ -39,6 +39,7 @@ import { BufferGeometry, Group, Matrix4, Mesh, Object3D } from 'three';
 import type { Material } from 'three';
 import type { RVViewer } from '../rv-viewer';
 import { NodeRegistry } from '../engine/rv-node-registry';
+import { isModelRoot } from '../engine/rv-model-root';
 import {
   writeUserDataField,
   deleteUserDataField,
@@ -48,8 +49,10 @@ import {
   constructComponentOnNode,
   disposeComponentsInSubtree,
   processExtras,
+  removeDriveComponentFromNode,
   type RuntimeNodeDeps,
 } from '../engine/rv-scene-loader';
+import { DRIVE_BEHAVIOR_MAP } from '../engine/rv-signal-construction';
 import {
   computeGroupPartitions,
   computeMeshIslands,
@@ -71,9 +74,8 @@ import { getCadProvider, cadFormatOfName } from './rv-cad-provider';
 import { getCadGlb } from '../import/rv-cad-glb-cache';
 import { materialForValue } from './rv-asset-material';
 import { assetOpTouchesHierarchy, classifyAssetOpRaycastImpact } from './rv-asset-ops';
+import type { RvAssetOp, RvAssetPrimitiveOp, RvNodeTransform } from '../ops/rv-unified-ops';
 import type {
-  AssetOp,
-  AssetPrimitiveOp,
   ImportCadOp,
   TransformNodeOp,
   RenameNodeOp,
@@ -492,7 +494,7 @@ export class AssetExecutorContext {
    * `AssetDocument` can decline to record an op that never landed — recording one
    * was the mechanism behind "half-rebuilt scene, nothing to undo" (plan-359 Phase 3).
    */
-  async applyForward(op: AssetOp): Promise<void> {
+  async applyForward(op: RvAssetOp): Promise<void> {
     try {
       await this._withMatrixBatch(op, () => this._forwardAny(op));
     } finally {
@@ -503,7 +505,7 @@ export class AssetExecutorContext {
   }
 
   /** Inverse counterpart of {@link applyForward} — same rejection contract. */
-  async applyInverse(op: AssetOp): Promise<void> {
+  async applyInverse(op: RvAssetOp): Promise<void> {
     try {
       await this._withMatrixBatch(op, () => this._inverseAny(op));
     } finally {
@@ -531,7 +533,7 @@ export class AssetExecutorContext {
    * skipped refresh would break picking AND rendering — doc-render-picking.md §2.5,
    * "load-bearing invariant".
    */
-  private async _withMatrixBatch(op: AssetOp, body: () => Promise<void>): Promise<void> {
+  private async _withMatrixBatch(op: RvAssetOp, body: () => Promise<void>): Promise<void> {
     if (this._matrixBatch || !isPureMoveComposite(op)) return body();
     this._matrixBatch = new Set<Object3D>();
     try {
@@ -564,7 +566,7 @@ export class AssetExecutorContext {
    *  the registry silently drives nothing — a drive gizmo that moves an empty
    *  node. Sharing a try block with an arbitrary `editor-structure-changed`
    *  listener or a BVH rebuild made that outcome one unrelated exception away. */
-  private _afterApply(op: AssetOp): void {
+  private _afterApply(op: RvAssetOp): void {
     this._notifyStep(op, 'structure-changed', () => {
       if (assetOpTouchesHierarchy(op)) {
         this.viewer.emit('editor-structure-changed', { source: 'asset-editor' });
@@ -592,7 +594,7 @@ export class AssetExecutorContext {
   }
 
   /** Run one post-apply step; report its failure without taking the others down. */
-  private _notifyStep(op: AssetOp, step: string, body: () => void): void {
+  private _notifyStep(op: RvAssetOp, step: string, body: () => void): void {
     try {
       body();
     } catch (e) {
@@ -605,10 +607,10 @@ export class AssetExecutorContext {
   /** Re-sync GroupRegistry memberships for every Group-touching primitive in
    *  the op (composites recursed). Runs on both directions via _afterApply.
    *  Returns true when the registry changed. */
-  private _syncGroupOps(op: AssetOp): boolean {
+  private _syncGroupOps(op: RvAssetOp): boolean {
     if (op.kind === 'composite') {
       let changed = false;
-      for (const child of op.ops) changed = this._syncGroupOps(child) || changed;
+      for (const child of op.ops) changed = this._syncGroupOps(child as RvAssetPrimitiveOp) || changed;
       return changed;
     }
     if (
@@ -635,13 +637,13 @@ export class AssetExecutorContext {
    * so a half-applied one would be an un-undoable rebuild of the user's scene
    * (plan-359 §2.4 / Phase 3).
    */
-  private async _forwardAny(op: AssetOp): Promise<void> {
+  private async _forwardAny(op: RvAssetOp): Promise<void> {
     if (op.kind === 'composite') {
-      const applied: AssetPrimitiveOp[] = [];
+      const applied: RvAssetPrimitiveOp[] = [];
       try {
         for (const child of op.ops) {
-          await this._forwardAny(child);
-          applied.push(child);
+          await this._forwardAny(child as RvAssetPrimitiveOp);
+          applied.push(child as RvAssetPrimitiveOp);
         }
       } catch (e) {
         await this._unwind(applied, (child) => this._inverseAny(child), op.id);
@@ -687,13 +689,13 @@ export class AssetExecutorContext {
     }
   }
 
-  private async _inverseAny(op: AssetOp): Promise<void> {
+  private async _inverseAny(op: RvAssetOp): Promise<void> {
     if (op.kind === 'composite') {
-      const inverted: AssetPrimitiveOp[] = [];
+      const inverted: RvAssetPrimitiveOp[] = [];
       try {
         for (let i = op.ops.length - 1; i >= 0; i--) {
-          await this._inverseAny(op.ops[i]);
-          inverted.push(op.ops[i]);
+          await this._inverseAny(op.ops[i] as RvAssetPrimitiveOp);
+          inverted.push(op.ops[i] as RvAssetPrimitiveOp);
         }
       } catch (e) {
         // Re-apply what was already undone, so a failed undo is a no-op rather
@@ -710,8 +712,8 @@ export class AssetExecutorContext {
    *  Unwind failures are logged, never rethrown — the caller must learn the
    *  ORIGINAL error, and there is nothing better left to try. */
   private async _unwind(
-    done: AssetPrimitiveOp[],
-    reverse: (op: AssetPrimitiveOp) => Promise<void>,
+    done: RvAssetPrimitiveOp[],
+    reverse: (op: RvAssetPrimitiveOp) => Promise<void>,
     compositeId: string,
   ): Promise<void> {
     for (let i = done.length - 1; i >= 0; i--) {
@@ -726,7 +728,7 @@ export class AssetExecutorContext {
     }
   }
 
-  private async _forward(op: AssetPrimitiveOp): Promise<void> {
+  private async _forward(op: RvAssetPrimitiveOp): Promise<void> {
     switch (op.kind) {
       case 'importCad':       return this._importCadForward(op);
       case 'transformNode':   return this._applyTransform(op.nodePath, op.transform);
@@ -745,7 +747,7 @@ export class AssetExecutorContext {
     }
   }
 
-  private async _inverse(op: AssetPrimitiveOp): Promise<void> {
+  private async _inverse(op: RvAssetPrimitiveOp): Promise<void> {
     switch (op.kind) {
       case 'importCad':
         // Undo an import: park the subtree in the trash (redo re-attaches it).
@@ -895,17 +897,45 @@ export class AssetExecutorContext {
 
   // ─── transform / rename ───────────────────────────────────────────────
 
-  private _applyTransform(nodePath: string, t: NodeTransform): void {
+  /**
+   * `t.scale` is optional in the unified payload, and its ABSENCE is the scene
+   * lineage (see `RvNodeTransform`). Routing keeps scale-less transforms out of
+   * this executor entirely, so the guard below never fires in practice — it is
+   * here so that if one ever did arrive, the node keeps whatever scale it has
+   * instead of being silently reset to identity.
+   */
+  private _applyTransform(nodePath: string, t: RvNodeTransform): void {
     const node = this._node(nodePath);
     if (!node) return;
-    applyTransform(node, t);
+    if (this._skipRootReplay(node, nodePath, 'transformNode')) return;
+    applyTransform(node, { ...t, scale: t.scale ?? node.scale.toArray() as [number, number, number] });
     node.updateMatrixWorld(true);
     this.viewer.markShadowsDirty();
+  }
+
+  /**
+   * Root ops are SKIPPED on replay, not rejected (plan-715 Entscheidungs-Log).
+   *
+   * `AssetDocument` refuses a root rename/transform loudly, so no NEW op log can
+   * contain one. An OLD one can: the guards did not exist before plan-715, and a
+   * draft written then still lives in IndexedDB. Replay is crash recovery — the
+   * one path that must never throw — so a historical root op is dropped with a
+   * warning and the rest of the log applies. That also means old drafts defuse
+   * themselves on their next replay; no migration pass is needed.
+   */
+  private _skipRootReplay(node: Object3D, nodePath: string, verb: string): boolean {
+    if (!isModelRoot(node, this.viewer.currentModelRoot)) return false;
+    console.warn(
+      `[asset-edits] skipping replayed ${verb} on the model root "${nodePath}" ` +
+      '(historical op from before the root guards) — the rest of the log still applies.',
+    );
+    return true;
   }
 
   private _rename(nodePath: string, name: string): void {
     const node = this._node(nodePath);
     if (!node) return;
+    if (this._skipRootReplay(node, nodePath, 'renameNode')) return;
     node.name = name;
     // Re-key every registered path under this subtree (nodes + components).
     this.viewer.registry?.recomputePathsForSubtrees([node]);
@@ -1268,7 +1298,7 @@ export class AssetExecutorContext {
         root, v.registry, v.signalStore, v.transportManager, v.scene,
         v.gizmoManager, v, v.errorStore, v.instructionStore,
         { logicRunState: v.logicRunState },
-        v.outlineManager, v.lampManager, v.energyChainManager,
+        v.outlineManager, v.lampManager, v.energyChainManager, v.sceneButtonManager,
       );
       // The returns are live runtime state, not diagnostics — dropping them
       // would leave drives unsimulated and gated logic never started. The
@@ -1880,7 +1910,20 @@ export class AssetExecutorContext {
     ud['realvirtual'] = rv;
 
     const deps = this._runtimeDeps();
-    if (deps) constructComponentOnNode(deps, node, componentType, { ...fields });
+    if (deps) {
+      const instance = constructComponentOnNode(deps, node, componentType, { ...fields });
+      // A REFUSED construction (plan-411 Phase 1: a drive behavior without its
+      // drive, a drive without a direction) must not leave the extras stamp
+      // behind — that half-state is exactly the silent failure the finding
+      // replaces. Only the Drive family can refuse; every other type either
+      // constructs or has no factory at all (unchanged: the stamp stays, so an
+      // unknown component still round-trips through the GLB).
+      if (!instance && isDriveFamilyType(componentType)) {
+        const back = { ...(ud['realvirtual'] as Record<string, unknown> | undefined) };
+        delete back[componentType];
+        ud['realvirtual'] = back;
+      }
+    }
     // Components change hoverable/CADLink/Drive resolution — re-resolve lazily.
     this.viewer.instancePickIndex?.bumpResolutionEpoch();
     this.viewer.markRenderDirty();
@@ -1893,8 +1936,15 @@ export class AssetExecutorContext {
   private _removeComponentByKey(nodePath: string, componentType: string): void {
     const node = this._node(nodePath);
     if (!node) return;
+    // Drive / drive behaviors own their teardown (tick-list membership, the
+    // drive↔behavior link) — plan-411 Phase 1, the symmetric half of the
+    // construction branches.
+    const deps = this._runtimeDeps();
+    const handled = deps
+      ? removeDriveComponentFromNode(deps, nodePath, componentType)
+      : false;
     // Dispose the live instance and unregister it.
-    const comps = this.viewer.registry?.getComponentsAt(nodePath) ?? [];
+    const comps = handled ? [] : this.viewer.registry?.getComponentsAt(nodePath) ?? [];
     const entry = comps.find(([type]) => type === componentType);
     if (entry) {
       const inst = entry[1] as { dispose?: () => void };
@@ -1959,17 +2009,29 @@ export class AssetExecutorContext {
       transportManager: v.transportManager,
       gizmoManager: v.gizmoManager,
       lampManager: v.lampManager,
+      sceneButtonManager: v.sceneButtonManager,
       errorStore: v.errorStore,
       instructionStore: v.instructionStore,
+      // plan-411 Phase 1: the viewer IS the drive lifecycle host, and it is the
+      // typed event bus the construction findings travel on.
+      driveHost: v,
+      events: v,
     };
   }
 }
 
 // ─── module helpers ───────────────────────────────────────────────────
 
+/** `Drive` or one of the `Drive_*` behaviors (with or without a `_N` dedup
+ *  suffix) — the family whose runtime construction can REFUSE (plan-411). */
+function isDriveFamilyType(componentType: string): boolean {
+  const base = componentType.replace(/_\d+$/, '');
+  return base === 'Drive' || base in DRIVE_BEHAVIOR_MAP;
+}
+
 /** A composite that only moves and renames nodes — the shape `reparentNodesBatch`
  *  produces, and the only one whose world-matrix refresh may be batched. */
-function isPureMoveComposite(op: AssetOp): boolean {
+function isPureMoveComposite(op: RvAssetOp): boolean {
   return op.kind === 'composite'
     && op.ops.length > 1
     && op.ops.every((child) => child.kind === 'reparentNode' || child.kind === 'renameNode');
@@ -2099,8 +2161,9 @@ function firstNameCollision(names: readonly string[], siblings: readonly Object3
  * Deep copy of a node's `userData`.
  *
  * JSON round-trip on purpose (same as `deepCloneJSON`): it drops exactly the
- * things that must not be copied — the non-enumerable `_rvComponentInstance`
- * back-reference and any function — while duplicating `realvirtual` deeply, so
+ * things that must not be copied — the non-enumerable `_rvComponentInstance` /
+ * `_rvComponentInstances` back-references and any function — while duplicating
+ * `realvirtual` deeply, so
  * the Group and the parked original never share a mutable object.
  */
 function cloneUserData(userData: Record<string, unknown>): Record<string, unknown> {

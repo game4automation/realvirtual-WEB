@@ -65,7 +65,12 @@ export function deduplicateMaterials(root: Object3D): DedupResult {
     // Lamp materials are instance-local runtime state. Count and retain them,
     // but never place them in the value-fingerprint map where an equivalent
     // non-lamp material could replace the clone.
-    if (mesh.userData?._rvLampMesh || mesh.parent?.userData?._rvLampMesh) {
+    if (
+      mesh.userData?._rvLampMesh || mesh.parent?.userData?._rvLampMesh
+      // Scene-button cap material clones are instance-local runtime state too
+      // (plan-417) — same treatment as a Lamp clone.
+      || mesh.userData?._rvSceneButtonMesh || mesh.parent?.userData?._rvSceneButtonMesh
+    ) {
       const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       for (const material of materials) {
         if (!material) continue;

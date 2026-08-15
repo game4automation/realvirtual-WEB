@@ -118,7 +118,9 @@ describe('CAD import provider delivery', () => {
   it.each(DELIVERY_KEYS)('delivers the STEP dialog tab to %s', (projectKey) => {
     const delivery = loadDeliveryConfig(privateRoot, projectKey, manifest);
     const profile: Profile = { tier: delivery.tier, restrictedFeatures: delivery.restrictedFeatures };
-    expect(delivery.restrictedFeatures).toContain('step-import');
+    // `step-import` is commercial since plan-434 Phase 2b, so the tab ships without any
+    // entitlement — the delivery's `restrictedFeatures` list is empty at both customers.
+    expect(resolveTier(manifest, 'src/features/step-import.register.ts').tier).toBe('commercial');
     expect(stagedFor(manifest, 'features/step-import.register.ts', profile)).toBe(true);
     expect(stagedFor(manifest, 'plugins/import-providers/step-import-provider.tsx', profile)).toBe(true);
   });

@@ -368,6 +368,9 @@ export function applyUberMaterial(
     // a shared vertex attribute, which would make `mesh.material = newMat` a
     // visual no-op.
     if (mesh.userData?._rvLampMesh || mesh.parent?.userData?._rvLampMesh) return;
+    // Scene-button caps swap between a lit and an unlit material clone
+    // (plan-417) — an uber bake would freeze the emissive into the geometry.
+    if (mesh.userData?._rvSceneButtonMesh || mesh.parent?.userData?._rvSceneButtonMesh) return;
     if (mesh.userData?._rvType === 'Pipe' || mesh.parent?.userData?._rvType === 'Pipe') return;
     if (mesh.userData?._rvType === 'Tank' || mesh.parent?.userData?._rvType === 'Tank') return;
 

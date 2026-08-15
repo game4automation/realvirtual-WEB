@@ -92,8 +92,22 @@ export interface CoreSubsystemsHost {
   /** tick() returns true when a blinking material's opacity was written. */
   readonly gizmoManager: { tick(elapsedMs: number): boolean };
   readonly lampManager: { update(dt: number): boolean } | null;
+  /** Scene-button press/turn animation + momentary timers (plan-417). A true
+   *  return means geometry moved — render AND shadow dirty.
+   *
+   *  OPTIONAL like `machiningManager`: hosts without interactive buttons (the
+   *  embed runtime, unit-test fakes) simply omit it. */
+  readonly sceneButtonManager?: { update(dt: number): boolean } | null;
   /** EnergyChain bone update. A true return means BOTH render and shadow dirty. */
   readonly energyChainManager: { update(dt: number): boolean } | null;
+  /** CSG machining tick (plan-405): submits tool poses and applies the chunk
+   *  meshes that came back from the worker. A true return means BOTH render and
+   *  shadow dirty — a machined chunk changes the silhouette.
+   *
+   *  OPTIONAL, unlike its siblings: hosts that never load a machining model
+   *  (the embed viewer, unit-test fakes) simply omit it. Making it required
+   *  would force every host to carry a `null` for a subsystem it cannot use. */
+  readonly machiningManager?: { update(dt: number): boolean } | null;
   /** Collision check (plan-394). Runs LAST in the visuals stage so it sees the
    *  poses of this tick. A true return means a NEW collision was reported (new
    *  highlight) — render dirty, no shadow change (nothing moved). */
@@ -231,12 +245,32 @@ export class CoreSubsystems {
       h.markRenderDirty();
     }
 
+    // ── Scene-button caps (plan-417): press/turn animation and the momentary
+    // release timers. Shadow dirty as well — the cap is real geometry moved
+    // outside the drive loop, so its shadow would otherwise stay frozen.
+    if (h.sceneButtonManager?.update(dt)) {
+      h.markRenderDirty();
+      h.markShadowsDirty();
+    }
+
     // ── EnergyChain bone update (runs AFTER the drive stage, so the follower
     // pose of this frame is already applied). Marks SHADOW dirty as well: a
     // chain can be moved by a live PLC signal or an external transform, and
     // neither raises the drive-loop shadow flag above — its shadow would
     // otherwise stay frozen in the rest pose.
     if (h.energyChainManager?.update(dt)) {
+      h.markRenderDirty();
+      h.markShadowsDirty();
+    }
+
+    // ── CSG material removal (plan-405). Runs in the visuals stage AFTER the
+    // drive stage on purpose: the tool poses submitted here must be the ones
+    // the freshly applied axis positions of THIS tick produce, otherwise every
+    // cut lags one tick behind the machine. Applying the chunk meshes that
+    // arrived from the worker happens in the same call. A true return means the
+    // workpiece silhouette changed — render AND shadow dirty (nothing else in
+    // the pipeline raises the shadow flag for a geometry-only change).
+    if (h.machiningManager?.update(dt)) {
       h.markRenderDirty();
       h.markShadowsDirty();
     }

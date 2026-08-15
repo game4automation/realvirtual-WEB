@@ -68,6 +68,14 @@ function subtreeIsRegistered(
 }
 
 describe('plan-371 T13 — legacy placement paths stay in full mode', () => {
+  // Autosave hygiene (same pattern as clone-placement / boot-dedup): each
+  // planner autosaves its placements to localStorage, and `_loadCatalogs`
+  // restores them on the NEXT planner's boot — without clearing, every test
+  // re-places what the previous one built and the count assertions drift.
+  const AUTOSAVE_KEY = 'rv-layout-autosave';
+  beforeEach(() => { localStorage.removeItem(AUTOSAVE_KEY); });
+  afterEach(() => { localStorage.removeItem(AUTOSAVE_KEY); });
+
   it('placeComponent (also the MCP web_layout_place path)', async () => {
     const { plugin, viewer } = setupPlanner();
     const id = await plugin.placeComponent(GLB_ENTRY, [0, 0, 0]);

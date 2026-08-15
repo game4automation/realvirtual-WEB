@@ -102,6 +102,78 @@ describe('buildTree', () => {
     expect(tree.map(n => n.name)).toEqual(['Z', 'A', 'M']);
   });
 
+  // ── Model root row (plan-715) ────────────────────────────────────────────
+  //
+  // Passing `modelRoot` stops the wrapper-collapse at level 1 for the ROOT only.
+  // The legacy 2-arg call must keep flattening exactly as the tests above expect,
+  // which is what lets both behaviours live in one function.
+  describe('with model root', () => {
+    it('keeps the model root as the single top-level row', () => {
+      const tree = buildStructureTree([
+        info('Robot/Base'),
+        info('Robot/Arm/Joint1'),
+        info('Robot/Arm/Joint2'),
+      ], null, { rootPath: 'Robot' });
+      expect(tree.map(n => n.name)).toEqual(['Robot']);
+      expect(tree[0].isModelRoot).toBe(true);
+      expect(tree[0].children.map(n => n.name)).toEqual(['Base', 'Arm']);
+    });
+
+    it('carries the display label without touching the node name', () => {
+      const tree = buildStructureTree([info('Robot/Base')], null, {
+        rootPath: 'Robot', label: 'Welding Cell',
+      });
+      expect(tree[0].name).toBe('Robot');       // path space is untouched
+      expect(tree[0].displayLabel).toBe('Welding Cell');
+    });
+
+    it('stops the collapse AT the root — the chain below it stays intact', () => {
+      // The collapse was always a LEADING-chain rule, applied from the very top
+      // down; it never folded wrappers anywhere else in the tree. Stopping at
+      // the root therefore ends the chain there by construction, and W1/W2
+      // become ordinary rows under it. This is the whole behaviour change of
+      // plan-715, pinned so a future "make it recursive" is a deliberate act.
+      const tree = buildStructureTree([
+        info('Robot/W1/W2/Leaf', ['Drive']),
+      ], null, { rootPath: 'Robot' });
+      expect(tree.map(n => n.name)).toEqual(['Robot']);
+      expect(tree[0].children.map(n => n.name)).toEqual(['W1']);
+      expect(tree[0].children[0].children[0].children[0].types).toEqual(['Drive']);
+    });
+
+    it('still collapses the leading chain when the top row is NOT the model root', () => {
+      // The override scan ("Runtime view") and every legacy caller land here —
+      // the collapse must keep working untouched for them.
+      const tree = buildStructureTree([
+        info('W1/W2/Leaf', ['Drive']),
+      ], null, { rootPath: 'SomeOtherRoot' });
+      expect(tree.map(n => n.name)).toEqual(['Leaf']);
+    });
+
+    it('keeps _layoutRoot content as a separate top-level group, never merged into the root row', () => {
+      const tree = buildStructureTree([
+        info('Robot/Base', ['Drive']),
+        info('_layoutRoot/Conveyor', ['LayoutObject']),
+      ], null, { rootPath: 'Robot' });
+      expect(tree.map(n => n.name)).toEqual(['Robot', '_layoutRoot']);
+      expect(tree[0].isModelRoot).toBe(true);
+      expect(tree[1].isModelRoot).toBeUndefined();
+    });
+
+    it('tags nothing when the root path is not among the top-level rows', () => {
+      const tree = buildStructureTree([info('Other/Base')], null, { rootPath: 'Robot' });
+      expect(tree.every(n => !n.isModelRoot)).toBe(true);
+    });
+
+    it('behaves exactly as the 2-arg call when no root info is passed', () => {
+      const nodes = [info('Robot/Base'), info('Robot/Arm/Joint1')];
+      expect(buildStructureTree(nodes, null, null))
+        .toEqual(buildStructureTree(nodes, null));
+      expect(buildStructureTree(nodes, null, undefined).map(n => n.name))
+        .toEqual(['Base', 'Arm']);
+    });
+  });
+
   it('handles deeply nested paths (single-child typeless wrappers are flattened)', () => {
     // Inserting a single leaf "A/B/C/D/E/F" produces a chain of single-child typeless
     // wrappers — the wrapper-flatten rule unwraps them all and the result is just [F].

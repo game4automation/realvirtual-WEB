@@ -22,7 +22,7 @@ import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { computeSubtreeAABB } from '../../core/engine/rv-traverse-utils';
 import { parsePathsParam } from './rv-object-analyzer-math';
-import { captureFrameCanvas, canvasToRvImage, saveCanvasToWorkfolder } from './rv-frame-capture';
+import { captureFrameCanvas, canvasToRvImage, saveCanvasToProject } from './rv-frame-capture';
 import { findPickOwner } from '../../core/engine/rv-pick-owner';
 import { projectLabelAnchors, drawAnnotations, type LabelTarget } from './rv-annotate';
 import {
@@ -30,7 +30,7 @@ import {
   computeSameMaterialPaths,
   computeInvertPaths,
   expandToUniverseMeshes,
-} from '../asset-editor/select-actions';
+} from '@rv-private/plugins/asset-editor/select-actions';
 
 const r3 = (n: number): number => +n.toFixed(3);
 const vec3 = (v: Vector3): [number, number, number] => [r3(v.x), r3(v.y), r3(v.z)];
@@ -247,7 +247,7 @@ export class McpViewTools {
     @McpParam('labels', 'Optional labels, comma-separated, same order as paths.', 'string', false) labels: string,
     @McpParam('cropPath', 'Optional node path to crop the shot to.', 'string', false) cropPath: string,
     @McpParam('numbers', 'Label markers #1..#n instead of names.', 'boolean', false) numbers: boolean,
-    @McpParam('savePath', 'Optional work-folder-relative path to also write the shot as PNG (e.g. "knowledge/MyAsset/views/axis-z.png"). Creates directories; ".png" is appended when missing. The result reports savedPath, or saveError when the write failed.', 'string', false) savePath?: string,
+    @McpParam('savePath', 'Optional PROJECT-relative path to also write the shot as PNG. A bare name lands in "captures/"; a path that names its own folders is taken as given (e.g. "knowledge/MyAsset/views/axis-z.png"). ".png" is appended when missing. Requires an open writable project. The result reports savedPath, or saveError when the write failed.', 'string', false) savePath?: string,
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
@@ -281,7 +281,7 @@ export class McpViewTools {
     const ctx = r.canvas.getContext('2d');
     if (!ctx) return JSON.stringify({ error: 'No 2D context' });
     drawAnnotations(ctx, anchors);
-    const saved = savePath?.trim() ? await saveCanvasToWorkfolder(r.canvas, savePath) : {};
+    const saved = savePath?.trim() ? await saveCanvasToProject(r.canvas, savePath) : {};
     return canvasToRvImage(r.canvas, {
       labels: anchors.map(a => ({ label: a.label, behindCamera: a.behind, offCrop: a.clamped })),
       ...(unresolved.length ? { unresolved } : {}),

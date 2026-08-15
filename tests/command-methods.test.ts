@@ -15,7 +15,7 @@ import {
   type RVComponent,
 } from '../src/core/engine/rv-component-registry';
 import {
-  BINDING_SLOT_RV_KEYS,
+  bindingSlotRvKeys,
   resolveBindableSlots,
 } from '../src/core/engine/rv-binding-slot-resolver';
 import type { RVDrive } from '../src/core/engine/rv-drive';
@@ -50,7 +50,7 @@ function buildBehavior(type: 'Drive_Simple' | 'Drive_Cylinder' | 'Drive_Destinat
 
 describe('component command methods', () => {
   it('covers every schema control slot of the v1 direct drive set in both directions', () => {
-    const v1Types = BINDING_SLOT_RV_KEYS.filter((key) => key.startsWith('Drive_'));
+    const v1Types = bindingSlotRvKeys().filter((key) => key in DRIVE_BEHAVIOR_MAP);
     for (const type of v1Types) {
       const behavior = DRIVE_BEHAVIOR_MAP[type];
       const instance = new behavior.ctor(new Object3D()) as RVComponent & Record<string, unknown>;

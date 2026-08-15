@@ -11,6 +11,15 @@
 export const MM_TO_METERS = 1000;
 
 /**
+ * Default conveyor speed (mm/s) for library transport assets that carry no
+ * authored speed — the naming-convention scanner stamps it on the synthetic
+ * Transport drive, and the DES transit timer falls back to it when a belt has
+ * no drive. 300 mm/s ≈ 18 m/min, a typical pallet roller/chain conveyor speed.
+ * (The bare RVDrive default of 100 mm/s is a Unity-parity contract and stays.)
+ */
+export const DEFAULT_TRANSPORT_SPEED_MM_S = 300;
+
+/**
  * Simulation pause reason owned by the user (toolbar Play/Pause button + Space
  * key, see sim-controller plugin). Editing gestures in the Layout-Planner
  * (placing an asset, moving or changing a placed object) auto-stop the sim by

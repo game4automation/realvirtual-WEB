@@ -10,6 +10,7 @@ import { clearCadGlbCache, getCadGlbCacheSize } from '../../import/rv-cad-glb-ca
 import { isSettingsLocked } from '../../rv-app-config';
 import { isAnalyticsConfigured, useAnalyticsConsent, resetAnalyticsConsent } from '../../consent-store';
 import { SettingsSection } from './settings-helpers';
+import { WorkfolderMigrationSection } from './WorkfolderMigrationSection';
 
 /**
  * Enumerate legacy WebViewer localStorage keys that the unified Scene model
@@ -273,6 +274,11 @@ export function BackupTab() {
           </Box>
         </SettingsSection>
       )}
+
+      {/* The permanent way back into an old working folder (plan-709 §2.6). Not
+          an upgrade banner: it never expires, because a browser-backed project
+          has no other in-app route to those files. */}
+      {!isSettingsLocked() && <WorkfolderMigrationSection />}
 
       {/* Analytics consent — only shown when a tracker is configured (GDPR withdrawal). */}
       {analyticsConfigured && (

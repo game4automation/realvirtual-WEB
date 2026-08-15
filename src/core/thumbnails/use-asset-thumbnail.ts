@@ -71,6 +71,12 @@ export interface AssetThumbnailResult<E extends HTMLElement> {
   ref: React.RefObject<E | null>;
   /** Object URL of the rendered PNG, or null while absent. */
   url: string | null;
+  /**
+   * The asset decoded fine but contains nothing renderable — a freshly
+   * created "New asset", typically. A fact of its own rather than a failed
+   * preview, so the card can SAY empty instead of showing a blank square.
+   */
+  empty: boolean;
 }
 
 /**
@@ -86,6 +92,7 @@ export function useAssetThumbnail<E extends HTMLElement>(
   const { service, keyParts, resolve, enabled = true } = opts;
   const { ref, visible } = useThumbnailVisibility<E>();
   const [url, setUrl] = useState<string | null>(null);
+  const [empty, setEmpty] = useState(false);
 
   // The key is a string so it can be an effect dependency; a fresh parts object
   // on every render would restart the effect on every render.
@@ -110,6 +117,18 @@ export function useAssetThumbnail<E extends HTMLElement>(
         if (!source) throw new Error('asset could not be resolved');
         try {
           const gltf = await gltfLoader.loadAsync(source.url);
+          // Nothing renderable — a freshly created asset. Report it as a fact
+          // and skip the render: a picture of nothing is a blank square, and
+          // a blank square reads as a bug.
+          let renderable = false;
+          gltf.scene.traverse((o) => {
+            const any = o as { isMesh?: boolean; isPoints?: boolean; isLine?: boolean };
+            if (any.isMesh || any.isPoints || any.isLine) renderable = true;
+          });
+          if (!renderable) {
+            if (!cancelled) setEmpty(true);
+            throw new Error('asset is empty');
+          }
           return gltf.scene;
         } finally {
           // Released the moment the bytes are decoded — holding it would pin
@@ -136,7 +155,7 @@ export function useAssetThumbnail<E extends HTMLElement>(
 
   // A key change means a different asset — drop the previous picture rather
   // than showing it under the new card until the new render lands.
-  useEffect(() => { setUrl(null); }, [key]);
+  useEffect(() => { setUrl(null); setEmpty(false); }, [key]);
 
-  return { ref, url };
+  return { ref, url, empty };
 }

@@ -27,7 +27,7 @@ import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { computeSubtreeAABB, traverseMeshes } from '../../core/engine/rv-traverse-utils';
 import { parsePathsParam } from './rv-object-analyzer-math';
-import { canvasToRvImage, saveCanvasToWorkfolder } from './rv-frame-capture';
+import { canvasToRvImage, saveCanvasToProject } from './rv-frame-capture';
 import { buildSceneSnapshot, type SceneNodeSnapshot } from './rv-scene-snapshot';
 import { analyzeShapePoints, gatherSubtreePoints } from './rv-shape-descriptor';
 
@@ -226,7 +226,7 @@ export class McpObserveTools {
     @McpParam('cameraPosition', 'World camera position "x,y,z" (default: auto ¾ view).', 'string', false) cameraPosition?: string,
     @McpParam('cameraTarget', 'Look-at point "x,y,z" (default: bounds center).', 'string', false) cameraTarget?: string,
     @McpParam('size', 'Long-edge pixels 256..1024 (default 800).', 'number', false) size?: number,
-    @McpParam('savePath', 'Optional work-folder-relative path to also write the frame as PNG (e.g. "knowledge/MyAsset/views/overview.png"). Creates directories; ".png" is appended when missing. The result reports savedPath, or saveError when the write failed.', 'string', false) savePath?: string,
+    @McpParam('savePath', 'Optional PROJECT-relative path to also write the frame as PNG. A bare name lands in "captures/"; a path that names its own folders is taken as given (e.g. "knowledge/MyAsset/views/overview.png"). ".png" is appended when missing. Requires an open writable project. The result reports savedPath, or saveError when the write failed.', 'string', false) savePath?: string,
   ): Promise<string> {
     const v = this.viewer;
     const reg = v?.registry;
@@ -253,7 +253,7 @@ export class McpObserveTools {
       if (grouping === 'geometry') {
         // All copies of an identical part (geometry-signature match — the same
         // identity select_similar 'identical' uses) share one color.
-        const { geometrySignature, signaturesMatch } = await import('../asset-editor/select-actions');
+        const { geometrySignature, signaturesMatch } = await import('@rv-private/plugins/asset-editor/select-actions');
         const reps: Array<{ sig: ReturnType<typeof geometrySignature>; path: string; meshes: Mesh[]; paths: string[] }> = [];
         traverseMeshes(rootNode, (mesh) => {
           if (!mesh.geometry) return;
@@ -408,7 +408,7 @@ export class McpObserveTools {
       // Legend + camera/bounds travel as METADATA (the bridge forwards the
       // extra __rvImage fields as a text content block) — the image itself
       // stays pure geometry, nothing burned in.
-      const saved = savePath?.trim() ? await saveCanvasToWorkfolder(canvas, savePath) : {};
+      const saved = savePath?.trim() ? await saveCanvasToProject(canvas, savePath) : {};
       return canvasToRvImage(canvas, {
         mode: renderMode,
         ...(renderMode === 'idmask' ? { groupBy: grouping } : {}),

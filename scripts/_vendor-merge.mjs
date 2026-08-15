@@ -340,8 +340,32 @@ const VENDOR_MANIFEST_FIELDS = Object.freeze(['schemaVersion', 'vendor', 'canoni
 /**
  * Manifest sections we own, but entry-wise: an entry whose `path` falls under
  * `vendor.handover` stays the customer's.
+ *
+ * `documents` joined the list in plan-413 phase 6, when it stopped being a
+ * mirror of `models`/`library` and became the manifest's only list. It is
+ * merged with the SAME entry-wise rule and by the same `path`, so a document
+ * the customer authored under a handover glob survives a delivery exactly as
+ * its `library[]` twin used to — the zone a file belongs to is a property of
+ * its path, not of the array it is listed in.
+ *
+ * `models` and `library` stay because a customer repository that has not been
+ * opened by a current client still carries them; on a migrated manifest they
+ * are simply absent and the loop skips them.
  */
-const VENDOR_MANIFEST_SECTIONS = Object.freeze(['models', 'library', 'docs', 'aasx', 'connect', 'rag', 'plugins']);
+const VENDOR_MANIFEST_SECTIONS = Object.freeze(['documents', 'models', 'library', 'docs', 'aasx', 'connect', 'rag', 'plugins']);
+
+/**
+ * The folder an entry's `path` is relative to, for zone classification.
+ *
+ * `models[]` and `library[]` are section-relative (`a.glb` under `models/`),
+ * which is why the merge prefixes them with the section name. A document's
+ * path already carries its folder (`models/a.glb`, `scenes/x.scene.glb`) —
+ * prefixing it again would produce `documents/models/a.glb`, which matches no
+ * vendor glob and would silently classify every customer document as ours.
+ */
+function pathForClassification(section, entryPath) {
+  return section === 'documents' ? entryPath : `${section}/${entryPath}`;
+}
 
 /**
  * Merges the one file that carries both zones.
@@ -381,7 +405,7 @@ export function mergeProjectManifest(customerManifest, vendorManifest, vendorGlo
       // section that is otherwise ours to replace.
       const kept = Array.isArray(merged[section])
         ? merged[section].filter((entry) => typeof entry?.path === 'string'
-          && classifyPath(`${section}/${entry.path}`, vendorGlobs) === PATH_CLASS.customer)
+          && classifyPath(pathForClassification(section, entry.path), vendorGlobs) === PATH_CLASS.customer)
         : [];
       const keptPaths = new Set(kept.map((entry) => entry.path));
       const next = [...incoming.filter((entry) => !keptPaths.has(entry?.path)), ...kept];

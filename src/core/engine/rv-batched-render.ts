@@ -115,8 +115,14 @@ const FILL_YIELD_VERTEX_BUDGET = 500_000;
 // ─── Candidate classification ───────────────────────────────────────
 
 /** Ancestor component keys whose SUBTREES mutate materials/templates at
- *  runtime — batching anything below them would freeze that behavior. */
-const EXCLUDED_SUBTREE_KEYS = ['TransportSurface', 'Source', 'Sink', 'MU', 'Cam'] as const;
+ *  runtime — batching anything below them would freeze that behavior.
+ *
+ *  `MachiningVolume` (plan-405) is the one entry that mutates GEOMETRY rather
+ *  than materials: its `CsgChunks` child rewrites vertex and index buffers
+ *  every time the CSG kernel re-tessellates a dirty chunk. The batcher bakes
+ *  the HOME pose into a static arena exactly once, so a batched workpiece would
+ *  keep showing its uncut shape forever. */
+const EXCLUDED_SUBTREE_KEYS = ['TransportSurface', 'Source', 'Sink', 'MU', 'Cam', 'MachiningVolume'] as const;
 
 function isSkinnedOrMorphed(mesh: Mesh): boolean {
   if ((mesh as Mesh & { skeleton?: unknown }).skeleton) return true;
@@ -129,6 +135,10 @@ function isExcludedMesh(mesh: Mesh): boolean {
   if (ud._rvBatchSource || ud._rvBatchedRender || ud._rvRaycastBVH) return true;
   if (ud._highlightOverlay || ud._driveHoverOverlay || ud._isGhostOverlay) return true;
   if (ud._rvLampMesh || mesh.parent?.userData?._rvLampMesh) return true;
+  // Scene-button caps (plan-417): they translate/rotate every frame and swap
+  // material for the button light — baking them into a static arena would
+  // freeze both. Only the cap is excluded; the button base stays batched.
+  if (ud._rvSceneButtonMesh || mesh.parent?.userData?._rvSceneButtonMesh) return true;
   if (mesh.name.endsWith('_sensorViz') || mesh.name === '_tankFillViz') return true;
   // Pipe/Tank fluid-color material swap (mirrors the uber-bake exclusion).
   if (ud._rvType === 'Pipe' || ud._rvType === 'Tank') return true;

@@ -13,6 +13,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, waitFor, cleanup } from '@testing-library/react';
 import { useAssetThumbnail } from '../src/core/thumbnails/use-asset-thumbnail';
 import type { ThumbnailService } from '../src/core/thumbnails/thumbnail-service';
+import { buildEmptyGlbBlob } from '../src/core/hmi/scene/empty-glb';
 
 function fakeService(blob: Blob | null, available = true) {
   return {
@@ -28,8 +29,8 @@ function fakeService(blob: Blob | null, available = true) {
 const KEY = { projectId: 'prj_a', providerId: 'project', sourceId: 'src', assetId: 'a.glb' };
 
 function Probe(props: Parameters<typeof useAssetThumbnail>[0]) {
-  const { ref, url } = useAssetThumbnail<HTMLDivElement>(props);
-  return <div ref={ref} data-testid="card" data-url={url ?? ''} />;
+  const { ref, url, empty } = useAssetThumbnail<HTMLDivElement>(props);
+  return <div ref={ref} data-testid="card" data-url={url ?? ''} data-empty={String(empty)} />;
 }
 
 describe('useAssetThumbnail', () => {
@@ -61,6 +62,20 @@ describe('useAssetThumbnail', () => {
         resolve={async () => ({ url: 'blob:fake', release })} />,
     );
     await waitFor(() => expect(release).toHaveBeenCalled());
+    cleanup();
+  });
+
+  it('reports an asset with nothing renderable as empty instead of rendering it', async () => {
+    // The exact bytes "New asset" writes: a valid GLB with no meshes. The card
+    // must learn the fact rather than receive a picture of nothing.
+    const url = URL.createObjectURL(buildEmptyGlbBlob());
+    const service = fakeService(new Blob(['png']));
+    const { getByTestId } = render(
+      <Probe service={service} keyParts={KEY} resolve={async () => ({ url })} />,
+    );
+    await waitFor(() => expect(getByTestId('card').dataset.empty).toBe('true'));
+    expect(getByTestId('card').dataset.url).toBe('');
+    URL.revokeObjectURL(url);
     cleanup();
   });
 

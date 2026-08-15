@@ -113,6 +113,106 @@ Rules:
 - **Format version:** writers SHOULD stamp `_formatVersion: "1.0"` at the root of
   `extras.realvirtual`. Readers MUST report an incompatibility when the major
   version is greater than the version they implement.
+- **Reserved key `NodeId`:** a **string** (not a component object) directly under
+  `extras.realvirtual`, carrying a stable identity for the node it sits on. See
+  Section 5a.
+
+### 5a. Stable node identity (`NodeId`)
+
+Scene paths (above) identify a node by the chain of names leading to it. That is
+enough inside one file, and not enough across files: renaming a node in a
+referenced asset silently invalidates every reference written by whoever
+references it. `NodeId` is the second addressing axis and exists for exactly that
+case. Both remain valid; a consumer that finds both prefers `NodeId`.
+
+```json
+{ "extras": { "realvirtual": { "NodeId": "3f9a1c02b7d4e5f6", "Drive": { "TargetSpeed": 100 } } } }
+```
+
+Rules:
+
+- `NodeId` is a **string**, unique **within its own file**. It is deliberately NOT
+  globally unique: a file that is referenced ten times contributes ten nodes
+  carrying the same `NodeId`, and telling those ten apart is the job of the
+  *occurrence address* (Section 5b), not of the id.
+- A writer that owns a file (its own scenes and assets) SHOULD stamp a random
+  `NodeId` (UUID v4 or equivalent) on every node it writes and MUST carry an
+  existing `NodeId` through unchanged on re-save. Regenerating ids on save
+  orphans every override anyone wrote against that file.
+- A consumer reading a file that carries **no** `NodeId` — every glTF written
+  before this section existed — MUST NOT invent a random one. Such a file may be
+  read-only (a library asset that must stay untouched), so a generated id could
+  never be written back and would differ on the next load. It MUST instead
+  **derive** the id deterministically from data that does not change while the
+  file does not change: the hex SHA-256 of the file's bytes and the node's index
+  in the glTF `nodes[]` array. The derivation is normative so two independent
+  consumers agree:
+
+  ```
+  NodeId = first 16 hex chars of SHA-256( <file sha256, lowercase hex> ":" <node index, decimal> )
+  ```
+
+- When the referenced file changes, its derived ids change with it. This is
+  correct and intended: it is the same situation as a renamed node, and it
+  surfaces through the orphaned-override report (Section 5b) rather than by
+  silently retargeting an override at whatever node inherited the index.
+- `NodeId` MUST NOT be written with a leading underscore. Consumers commonly
+  strip `_`-prefixed keys on export as runtime bookkeeping; `NodeId` is authored
+  data and must survive an export/import round-trip unchanged.
+
+### 5b. Composition: references, overrides and strength ordering
+
+A node carrying an `AssetReference` (Section 7d.8) does not contain its subtree —
+it names another asset that does. Resolving those references and grafting the
+resulting subtrees into one tree is called **composition**. A consumer MUST
+complete composition **before** it interprets the tree in any other way, so that
+a referenced subtree is subject to exactly the same processing as the root file's
+own nodes.
+
+**Occurrence address.** Because `NodeId` is only file-unique, the full address of
+a node in a composed tree is a pair: the chain of `NodeId`s of the reference nodes
+traversed from the root, and then the node's own `NodeId`.
+
+```
+occurrence address = NodeId(ref₁) "/" NodeId(ref₂) "/" …      (empty for the root file)
+full address       = <occurrence address> "#" <NodeId>
+
+example:  a1b2c3/d4e5f6#7890ab
+          └ reference node "Press_02" in the plant
+                   └ reference node "Gripper" in the press
+                            └ target node "Motor" in the gripper
+```
+
+Each reference node lives in exactly one file, where its own `NodeId` is unique —
+so the chain is globally unique without any file needing to know where it is
+installed. The occurrence address is computed during composition and is **never
+written into a file**.
+
+**Overrides.** A referencing file changes values in a referenced subtree through
+`AssetOverrides` (Section 7d.9) on the reference node. The referenced file is
+never modified. Because the overrides sit on the reference node, their `byNodeId`
+keys are unambiguous by construction.
+
+**Strength ordering.** When more than one layer sets the same field, the
+following order applies, **weakest first**:
+
+1. the value in the referenced file itself;
+2. `AssetOverrides` of the inner referencing file;
+3. `AssetOverrides` of the outer referencing file;
+4. the running session's own edits.
+
+In short: **the outer file always wins.**
+
+**Orphaned overrides.** An override whose target node no longer exists in the
+resolved asset MUST be reported to the user and MUST NOT be dropped silently.
+
+**Trust is transitive and per subtree.** Where a consumer gates behaviour on a
+file's signature, the gate MUST be evaluated **per referenced file**, and the
+status of a subtree is the **weakest** status along its resolution path. A signed
+root file MUST NOT cause the logic of an unsigned referenced file to run as
+trusted — that would make a reference a privilege escalation. The same rule
+applies to any sidecar data a consumer applies next to a file: it is governed by
+the signature status of the file it belongs to, not of the root.
 
 ## 6. Data Types
 
@@ -424,7 +524,7 @@ Spawns new MU (Movable Unit) instances at intervals or by distance.
 | `GenerateIfDistance` | number | 300 | Distance in millimeters from the source at which new MUs are generated. |
 | `PlaceOnTransportSurface` | boolean | true | If true newly spawned MUs are placed onto the transport surface below the source. |
 | `ThisObjectAsMU` | string | "" | Name of the GameObject used as the MU prototype; defaults to this node when empty. |
-| `CollisionRoleForMUs` | enum(None, Tool, Workpiece, Machine, Robot, Environment) | "None" | Collision role assigned to every MU spawned by this source; `None` keeps spawned MUs out of every collision check. |
+| `CollisionRoleForMUs` | enum(None, Tool, Workpiece, Machine, Robot, Environment, Cutter) | "None" | Collision role assigned to every MU spawned by this source; `None` keeps spawned MUs out of every collision check. |
 
 Raw fields (`rawFields`):
 
@@ -881,10 +981,17 @@ fields and documents the structure here.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `version` | number | 1 | Path schema version (migration anchor). Unknown versions parse best-effort with a warning. |
+| `id` | string | - | Stable path id for graph edges (`successors`) and `Agv.PathId`. Empty or absent = the carrying node's name. |
+| `segments` | array | [] | Ordered segment chain in world meters; the segment grammar is detailed below. Unknown kinds are skipped with a warning. |
 | `closed` | boolean | false | Circulating path (loop): arc-length addresses wrap modulo length. |
+| `successors` | array | [] | Path ids this path continues into (graph edges / switches). Dangling ids are tolerated until the referenced path loads. |
+| `align` | array | [0,1,0] | Up vector for the traveler pose, applied as `lookRotation(tangent, align)`. |
+| `zone` | string | - | Control-point zone id for mutual exclusion at crossings. Empty or absent = unzoned. |
+| `zoneCapacity` | number | - | Explicit zone capacity (>= 0; 0 = never enterable). Absent = the default capacity of 1. |
 
-Structured fields (parsed by the TS-SSOT, not part of the scalar $def
-properties above):
+Structured field shapes — the fields above whose value is a structured JSON
+payload, plus the `type` discriminator, which is not a `$def` property. The
+shapes are parsed by the TS-SSOT `parsePathExtras()`, not by the JSON schema:
 
 | Structured field | Shape | Default | Description |
 |---|---|---|---|
@@ -965,10 +1072,291 @@ no check at all, and a body is never checked against a body nested inside it.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `CollisionRole` | enum(None, Tool, Workpiece, Machine, Robot, Environment) | "None" | Collision role of this node's subtree; `None` excludes the node from every collision check. |
+| `CollisionRole` | enum(None, Tool, Workpiece, Machine, Robot, Environment, Cutter) | "None" | Collision role of this node's subtree; `None` excludes the node from every collision check. `Cutter` marks a cutting tool — its contact with a workpiece that a `MachiningVolume` is machining with it is suppressed while the spindle runs. |
 
 ```json
 { "CollisionRole": { "CollisionRole": "Robot" } }
+```
+
+#### 7a.39 MachiningVolume
+
+Workpiece with real-time CSG material removal. The material is an SDF voxel grid
+(never the display mesh); every listed `MachiningTool` subtracts its swept volume
+from that grid once per tick (`result = max(workpiece, -sweptTool)`), and the
+changed 16^3 chunks are re-tessellated into per-chunk meshes. Tools are applied
+**in list order** — the order is part of the result. Requires the machining
+provider (the `rv_csg` WASM kernel); without it the authored mesh stays untouched
+and nothing is machined.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `gridResolution` | Vector3 | {"x":64,"y":64,"z":64} | Voxel lattice resolution including one padding voxel per side; clamped to 4..256 per axis. |
+| `workpieceSize` | Vector3 | {"x":200,"y":100,"z":200} | Stock dimensions in millimeters (an extent, so no coordinate flip). Ignored for `Shape: Mesh`. |
+| `Shape` | enum(Box, Cylinder, Mesh) | "Box" | Starting stock shape. `Mesh` voxelizes the node's own render geometry (WYSIWYG). |
+| `CylinderAxis` | enum(X, Y, Z) | "X" | Axis a cylinder workpiece lies along (X or Z lying, Y upright). |
+| `Tools` | ComponentReference[] | [] | MachiningTool references cutting this volume, in subtraction order. |
+| `ToolGroup` | string | "" | Optional group name; every MachiningTool carrying it is registered in addition to `Tools`. |
+| `SweepToolMotion` | boolean | true | Subtract the swept volume between two ticks so fast feed cuts a continuous groove. |
+| `MaxSweepSubsteps` | number | 16 | Upper bound of tool poses sampled per tick along the motion path, per tool. |
+| `Meshing` | enum(MarchingCubes, DualContouring) | "MarchingCubes" | Surface extraction algorithm. |
+| `CreaseAngle` | number | 35 | Hard-edge threshold in degrees; 0 disables crease splitting. |
+| `GenerateUVs` | boolean | true | Generate triplanar UV coordinates for the machined chunk meshes. |
+| `StatisticsInterval` | number | 0.25 | Seconds between material-remaining refreshes. |
+| `UpdateCollider` | boolean | false | Unity-only; a web runtime does not rebuild physics colliders for machined chunks. |
+| `SignalSpindleOn` | ComponentReference | - | Spindle running; material is only removed while true. Unbound = always cutting. |
+| `SignalReset` | ComponentReference | - | Rising edge resets the workpiece to its original state and discards queued cuts. |
+| `SignalMachiningActive` | ComponentReference | - | Written by the runtime: true while cuts or mesh rebuilds are outstanding (momentary, not latched). |
+
+```json
+{
+  "MachiningVolume": {
+    "gridResolution": { "x": 64, "y": 64, "z": 64 },
+    "workpieceSize": { "x": 200, "y": 100, "z": 200 },
+    "Shape": "Box",
+    "Tools": [{ "path": "CNC/Spindle/Mill" }],
+    "SignalSpindleOn": { "path": "CNC/Signals/SpindleOn" }
+  }
+}
+```
+
+#### 7a.40 MachiningTool
+
+Cutter geometry for CSG material removal, evaluated as an analytic signed
+distance function. Pure data: the node's world pose per tick decides where it
+cuts, and a `MachiningVolume` must list it (or its group) for it to have any
+effect at all.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Shape` | enum(Sphere, Cylinder, BallNose, Torus, ConicalEnd) | "Cylinder" | Cutter shape. |
+| `ToolDiameter` | number | 10 | Cutter diameter in millimeters. |
+| `ToolLength` | number | 50 | Cutter length/height in millimeters (cylindrical shapes). |
+| `CornerRadius` | number | 2 | Corner radius in millimeters, used by BallNose and Torus. |
+| `TaperAngleDeg` | number | 15 | Taper half-angle in degrees, used by ConicalEnd. |
+
+```json
+{ "MachiningTool": { "Shape": "BallNose", "ToolDiameter": 6, "ToolLength": 40 } }
+```
+
+#### 7a.41 KinematicMechanism
+
+Container and constraint solver for a closed or open **rigid-body** kinematic
+chain built from `KinematicJoint` components. Note the naming carefully: this is
+NOT the `Kinematic` component of Section 7d, which is a hierarchy
+re-structuring directive for the older axis-group system. A *mechanism* solves a
+joint GRAPH — a spanning tree of one-DOF joints plus loop-closure constraints
+plus free bodies for links the tree cannot reach.
+
+The mechanism collects every `KinematicJoint` in its own subtree. Joints with a
+`DrivenBy` Drive are boundary conditions; every remaining generalized coordinate
+is solved once per fixed update by a bounded damped Newton-Raphson iteration.
+`Converged`, `ResidualError` and `SolveTimeMs` are written BY the solver and are
+diagnosis outputs, never inputs.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `SolverIterations` | number | 4 | Fixed number of damped Newton-Raphson iterations per tick; constant for determinism. |
+| `Damping` | number | 0.01 | Damped-least-squares factor guarding against Jacobian singularities. |
+| `Tolerance` | number | 0.001 | Normalized constraint residual tolerance in millimeters for the `Converged` flag. |
+| `SignalConverged` | ComponentReference | - | Optional `PLCOutputBool` mirroring `Converged`. |
+| `Converged` | boolean | true | Read-only: true when the last solve met `Tolerance`. |
+| `ResidualError` | number | 0 | Read-only: max normalized constraint residual of the last solve, in millimeters. |
+| `SolveTimeMs` | number | 0 | Read-only: wall-clock duration of the last solve. |
+
+```json
+{ "KinematicMechanism": { "SolverIterations": 4, "Damping": 0.01, "Tolerance": 0.001 } }
+```
+
+#### 7a.42 KinematicJoint
+
+One declarative constraint edge of a `KinematicMechanism`. Purely kinematic — it
+never applies forces. Body A and Body B are explicit node references rather than
+a parent relation, which is what makes closed loops expressible at all: a
+four-bar coupler satisfies two joints simultaneously and cannot be a hierarchy
+child of both.
+
+**`BodyA` carries a normative absence rule.** A MISSING `BodyA` key means the
+joint is anchored against world/static space — that is the authored world
+anchor, and it is exactly how a null reference serializes (null fields are
+omitted entirely). A `BodyA` key that IS present but does not resolve is an
+error, never a world anchor. Consumers MUST keep the two cases apart.
+
+Only `Revolute` and `Prismatic` have a single scalar value, so only they can be
+spanning-tree edges and only they support limits; `Spherical` and `Universal`
+are always loop-closure constraints.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `JointType` | enum(Revolute, Prismatic, Spherical, Universal) | "Revolute" | Constraint kind enforced between the two links. |
+| `BodyA` | ComponentReference | - | First link. ABSENT = anchored against world/static space (see the rule above). |
+| `BodyB` | ComponentReference | - | Second link. Required — a joint always needs a moving link on this side. |
+| `AnchorA` | Vector3 | - | Anchor point in Body A local space, in millimeters. |
+| `AnchorB` | Vector3 | - | Anchor point in Body B local space, in millimeters; should coincide with `AnchorA` in world space. |
+| `AxisA` | Vector3 | - | Joint axis in Body A local space (Revolute, Prismatic, Universal); unused by Spherical. |
+| `SecondaryAxisB` | Vector3 | - | Second joint axis in Body B local space (Universal / cardan only). |
+| `UseLimits` | boolean | false | Clamp the joint value between `LowerLimit` and `UpperLimit`. |
+| `LowerLimit` | number | -180 | Lower limit in degrees (Revolute) or millimeters (Prismatic). |
+| `UpperLimit` | number | 180 | Upper limit in degrees (Revolute) or millimeters (Prismatic). |
+| `DrivenBy` | ComponentReference | - | Drive that actively controls this joint value; ABSENT = passive joint solved by the mechanism. |
+| `CurrentValue` | number | 0 | Read-only: current joint value in degrees or millimeters, written by the solver. |
+
+```json
+{ "KinematicJoint": { "JointType": "Revolute", "BodyB": { "type": "ComponentReference", "path": "Machine/Arm", "componentType": "UnityEngine.Transform" }, "AnchorA": { "x": 0, "y": 0, "z": 0 }, "AxisA": { "x": 0, "y": 0, "z": 1 } } }
+```
+
+#### 7a.43 KinematicTarget
+
+Inverse-mode companion of `KinematicMechanism`: drives the mechanism's actively
+driven joints so that `TargetLink` follows this node's own Cartesian world
+position.
+
+Position only, deliberately no orientation constraint — the parallel platforms
+this primarily serves (Delta above all) have no independent orientation degree
+of freedom, so an orientation residual would over-constrain a solve that
+position alone already determines.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Mechanism` | ComponentReference | - | The `KinematicMechanism` whose driven joints are solved for this target. |
+| `TargetLink` | ComponentReference | - | The mechanism's own link (e.g. a Delta platform) that should track this node. |
+| `TrackingActive` | boolean | false | While true an inverse solve runs each tick and takes over the mechanism's Drives. |
+| `Reachable` | boolean | true | Read-only: false when the target lies outside the workspace or a limit was hit; the mechanism still moves to the closest achievable pose. |
+
+```json
+{ "KinematicTarget": { "TrackingActive": true } }
+```
+
+#### 7a.44 MechanismBody
+
+Rigid-body mass properties of ONE link of a `KinematicMechanism`, consumed by the
+inverse-dynamics force analysis (drive sizing and joint reaction loads). Place it
+on a link node.
+
+Mass, centre of mass and the inertia tensor are computed from the geometry the
+link **owns** — its own subtree minus the subtree of any other link of the same
+mechanism, because links need not be nested and "everything below me" would
+otherwise count a child link's mass twice. The computed values are not stored in
+the document: a cached number goes stale the moment the geometry changes, and a
+stale mass is a wrong drive size with no warning attached. Only the density and
+the optional overrides are authored.
+
+A link **without** this component switches the force analysis off for its whole
+mechanism (with a warning naming the link). The kinematic solve is unaffected —
+a missing mass is an analysis gap, not a broken mechanism.
+
+Distinct from `JTData.Mass`, which is read-only CAD provenance whose unit is not
+recorded in the file; it is offered as a suggestion in the editor and never
+applied automatically.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `DensityPreset` | enum(steel, stainless, aluminum, pa, pom, custom) | "steel" | Material preset the density comes from. Choose `custom` to enter `DensityKgM3` directly. |
+| `DensityKgM3` | number | 7850 | Effective density in kilograms per cubic metre, applied to the computed volume. Follows `DensityPreset` unless that is `custom`. |
+| `MassOverrideKg` | number | - | Optional: replaces the computed mass, in kilograms. The inertia tensor is scaled with it, so the part keeps its shape and only its density is corrected. |
+| `ComOverrideLocalMm` | Vector3 | - | Optional: replaces the computed centre of mass, in the link's local space, in millimeters. |
+| `MassSource` | string | "mesh" | Read-only diagnosis: `mesh`, `convex-hull`, `bounds`, `override` or `none`. |
+
+```json
+{ "MechanismBody": { "DensityPreset": "aluminum", "DensityKgM3": 2700 } }
+```
+
+#### 7a.45 SceneButtonBase
+
+Click/hover state machine of a 3D scene button. It sits on the node that carries
+the collider (in Unity the node whose `OnMouseDown` fires) and drives the
+`SceneButtonMoveable` cap referenced by `moveable`. A wrapper component
+(`PushButton3D`, `EmergencyButton3D`, `HandleSwitch3D`) supplies the PLC signal
+and, for push buttons, overrides `isToggle` / `simpleClickTime` / `autoLight`.
+The field names keep the Unity camelCase spelling.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `moveable` | ComponentReference | - | The `SceneButtonMoveable` cap this state machine animates and lights. |
+| `autoLight` | boolean | true | Light follows the button's own active state; a wrapper clears it when a `lightSignal` drives the light instead. |
+| `isToggle` | boolean | false | Button latches on click instead of releasing after `simpleClickTime`. |
+| `simpleClickTime` | number | 0.5 | Hold time in seconds of a momentary click before the button releases again. |
+
+```json
+{ "SceneButtonBase": { "moveable": { "type": "ComponentReference", "path": "Cell/Button/Cap", "componentType": "SceneButtonMoveable" }, "autoLight": true, "isToggle": false, "simpleClickTime": 0.3 } }
+```
+
+#### 7a.46 SceneButtonMoveable
+
+Animated cap of a 3D scene button: the pressed / rotated offset along `axis`
+plus the lit and unlit material state. Consumers animate the cap towards its
+offset target with an exponential approach at `moveSpeed` per second, and must
+keep the cap mesh out of static batching — it moves and swaps material at
+runtime. `baseMaterial` / `activeMaterial` are Unity material DESCRIPTORS, not
+material data: equal names mean the button has no light, only movement.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `axis` | Vector3 | - | Local movement axis of the cap: translation direction, or rotation axis when `angularMovement` is set. |
+| `moveSpeed` | number | 30 | Exponential approach rate of the cap towards its offset target, per second. |
+| `hoverOffset` | number | 0.1 | Extra offset while the pointer hovers the button, in metres, or degrees when `angularMovement` is set. |
+| `activeOffset` | number | 0.05 | Offset the cap holds while the button is active, in metres, or degrees when `angularMovement` is set. |
+| `mirrorHoverOffset` | boolean | false | Invert the hover offset while the button is active, for handle switches that flip the other way. |
+| `angularMovement` | boolean | false | Rotate the cap around `axis` by the offset in degrees instead of translating it. |
+
+Raw fields (`rawFields`):
+
+| Raw field | Type | Notes |
+|---|---|---|
+| `baseMaterial` | object | Unity material descriptor `{name, assetPath, shader}` of the unlit state; only `name` is interpreted. |
+| `activeMaterial` | object | Unity material descriptor `{name, assetPath, shader}` of the lit state; only `name` is interpreted. |
+| `renderer` | object | Unity `MeshRenderer` reference of the cap; consumers find the mesh by traversing the node instead. |
+| `currentOffset` | number | Unity runtime state; consumers keep their own animation state. |
+
+```json
+{ "SceneButtonMoveable": { "axis": { "x": 0, "y": 0, "z": 1 }, "moveSpeed": 30, "hoverOffset": 0.002, "activeOffset": -0.007, "mirrorHoverOffset": false, "angularMovement": false } }
+```
+
+#### 7a.47 PushButton3D
+
+3D push button. A click writes `stateSignal` (a PLC INPUT — the operator drives
+it) either momentarily for `timer` seconds or latching when `toggle` is set. The
+cap light follows `lightSignal` when one is wired, otherwise the button's own
+state.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `stateSignal` | ComponentReference | - | Boolean PLC input signal written by the operator click. |
+| `lightSignal` | ComponentReference | - | Boolean PLC output signal driving the button light; unset means the light follows the button state. |
+| `label` | string | - | Button caption. Rendered where the model carries a text mesh, otherwise informational. |
+| `timer` | number | 0.5 | Hold time in seconds of a momentary click; ignored when `toggle` is set. |
+| `toggle` | boolean | false | Button latches on click instead of releasing after `timer`. |
+| `activeOnStart` | boolean | false | Button clicks itself once when the scene is ready. |
+
+```json
+{ "PushButton3D": { "stateSignal": { "type": "ComponentReference", "path": "PLC/StartButton", "componentType": "PLCInputBool" }, "label": "Start", "timer": 0.3, "toggle": false, "activeOnStart": false } }
+```
+
+#### 7a.48 EmergencyButton3D
+
+3D emergency-stop button: a latching mushroom head writing `stateSignal`. A
+virtual emergency stop is a comfort trigger and a status display — never a
+substitute for a hard-wired safety function.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `stateSignal` | ComponentReference | - | Boolean PLC input signal written by the operator click. |
+| `activeOnStart` | boolean | false | Button clicks itself once when the scene is ready. |
+
+```json
+{ "EmergencyButton3D": { "stateSignal": { "type": "ComponentReference", "path": "PLC/Emergency", "componentType": "PLCInputBool" }, "activeOnStart": false } }
+```
+
+#### 7a.49 HandleSwitch3D
+
+3D handle switch: a latching lever writing `stateSignal`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `stateSignal` | ComponentReference | - | Boolean PLC input signal written by the operator click. |
+| `activeOnStart` | boolean | false | Switch clicks itself once when the scene is ready. |
+
+```json
+{ "HandleSwitch3D": { "stateSignal": { "type": "ComponentReference", "path": "PLC/OnSwitch", "componentType": "PLCInputBool" }, "activeOnStart": true } }
 ```
 
 ### 7b. Logic Steps
@@ -1368,6 +1756,92 @@ Asset Administration Shell link.
 | `AASId` | string | "" | AAS identifier (e.g. 'http://smart.festo.com/aas/9992020...'). |
 | `Description` | string | "" | Optional description shown in the tooltip header. |
 | `ServerUrl` | string | "" | Optional AAS server URL; when empty the AASX is loaded from the local aasx/ folder. |
+
+#### 7d.8 AssetReference
+
+Marks the node as a **reference node**: its subtree lives in another asset and is
+grafted in during composition (Section 5b). `assetId` is the resolution key,
+`path` the fallback — resolved relative to the file the reference is written in,
+never relative to the root of the composition. `sha256` only detects that the
+referenced asset changed; it is never a resolution key, because a corrected
+library asset must reach every file referencing it.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `assetId` | string | "" | Primary, location-independent identity of the referenced asset. Survives moving and renaming the file. |
+| `providerId` | string | "" | Optional id of the provider/resolver the assetId belongs to (library, project, catalog). |
+| `sourceId` | string | "" | Optional id of the source within the provider (a specific library source). |
+| `path` | string | "" | Fallback locator, relative to the file this reference is written in. Used only when assetId does not resolve. |
+| `sha256` | string | "" | Hex SHA-256 of the referenced bytes as of the last save. Change detection only, never a resolution key. |
+| `embedded` | boolean | false | True when a flat export inlined the referenced subtree into this file; the reference is then provenance only and MUST NOT be resolved again. |
+
+#### 7d.9 AssetOverrides
+
+Sits on the same node as an `AssetReference` and carries what **this** file
+changes in the referenced subtree — the referenced file itself is never modified.
+Each patch is an RFC 7396 JSON Merge Patch over the target node's
+`extras.realvirtual` (`null` deletes a field). Strength ordering and orphan
+reporting are specified in Section 5b.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `byNodeId` | object | - | NodeId of a node in the referenced subtree → merge patch over that node's extras.realvirtual. |
+| `byPath` | object | - | Fallback addressing: node path relative to the reference node → the same merge-patch shape. Consulted only after byNodeId misses. |
+
+#### 7d.10 SceneCamera
+
+Authored camera start preset, written on the scene root node. Field-identical to
+the per-model camera preset a viewer keeps outside the file, so moving a preset
+into the file (or back out) is lossless.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `px` | number | - | Camera position X. |
+| `py` | number | - | Camera position Y. |
+| `pz` | number | - | Camera position Z. |
+| `tx` | number | - | Orbit target X. |
+| `ty` | number | - | Orbit target Y. |
+| `tz` | number | - | Orbit target Z. |
+| `duration` | number | 1 | Tween duration when moving to the preset, in seconds; consumers clamp to [0.05, 60]. |
+| `savedAt` | number | - | Wall-clock timestamp (milliseconds since the Unix epoch) the preset was saved, for display only. |
+| `source` | enum(user, author) | "author" | Origin of the preset: 'author' when it came with the file, 'user' when a viewer user saved it. |
+
+#### 7d.11 PlacementMeta
+
+Marks the node as a **layout placement** and carries the placement data an
+`AssetReference` cannot express. Its *presence* is normative: a node carrying
+`PlacementMeta` is a placement of the containing scene, and a reference node
+without it is not — that is how a placement is told apart from a reference an
+author wrote by hand. A placement node also carries the reserved `NodeId` key as
+its stable identity, and a writer re-saving the scene MUST update the node with
+the matching `NodeId` in place rather than append a second one.
+
+A Gaussian-splat placement carries **no** `AssetReference` at all — a reference
+points at a glTF asset by definition — and puts its catalog identity in
+`catalogId` instead. `visible` lives here because glTF has no visibility flag, so
+a hidden placement would otherwise come back visible on the next load.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `catalogId` | string | "" | Catalog entry id of the placed asset. Written only when the node carries no AssetReference to hold it (the splat case). |
+| `splatUrl` | string | "" | Source of the Gaussian splat this placement renders. When set, the placement has no glTF asset. |
+| `visible` | boolean | true | False when the user hid the placement. Absent means visible. |
+| `signalMappings` | object[] | - | Live-signal bindings of this placement, stored verbatim; unknown members of an entry MUST round-trip unchanged. |
+
+#### 7d.12 SceneSettings
+
+Workspace settings of a scene, written on the scene root node. These belong to
+the scene as a whole rather than to any node: the library catalogues its
+placements are drawn from, and the layout grid it was laid out on. A consumer
+that finds no `SceneSettings` block falls back to its own defaults; an **absent**
+field means "the file has no opinion" and MUST NOT be confused with a field
+carrying the default value, because only the former may be overridden by a user
+preference.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `catalogUrls` | string[] | - | Library catalogue URLs the scene draws its placements from. |
+| `gridSizeMm` | number | 500 | Layout grid and translation snap step, in millimetres. |
 
 ### 7e. Recording
 

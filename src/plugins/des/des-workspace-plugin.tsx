@@ -131,6 +131,23 @@ export class DESWorkspacePlugin implements RVViewerPlugin {
     this._syncKernelToDes(viewer);
   }
 
+  /**
+   * plan-435: `onModelLoaded` pushes the unified kernel into DES mode, and the
+   * only way back is `onModeDeactivate`. Switching the plugin off must not
+   * leave the kernel executing DES events with no DES workspace in sight, so
+   * the teardown is the mode-leave path. Kernel mode is not model state
+   * (invariant 3).
+   */
+  onDeactivate(viewer: RVViewer): void {
+    this.onModeDeactivate(null, viewer);
+  }
+
+  /** Back into DES — but only while the DES workspace is actually active. */
+  onActivate(viewer: RVViewer): void {
+    if (viewer.modes.activeMode !== 'des') return;
+    this._syncKernelToDes(viewer);
+  }
+
   private _syncKernelToDes(viewer: RVViewer): void {
     const kernel = viewer.simulationKernel;
     if (kernel?.hasDesRunner()) kernel.setMode('des');

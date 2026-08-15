@@ -10,27 +10,42 @@
  *    Both unguarded callers (the Models-panel row and the `web_scene_open`
  *    MCP tool) go through `SceneStore.openScene()`, so the pre-fetch hook
  *    installed here is what keeps them working.
- *  - **RR4:** `rv-scenes/draft/<baseKey>` carries no project reference, so
- *    an unsaved draft made in project A would resurrect in project B.
+ *  - **RR4:** `rv-scenes/draft/<baseKey>` carried no project reference, so an
+ *    unsaved draft made in project A resurrected in project B. Both draft
+ *    keyspaces are dead since plan-413 phase 6 — no writer, no reader — so what
+ *    is left to hold is the scoping of the *key*, which is what lets
+ *    `clearDraftsForScope` remove one project's leftovers without touching
+ *    another's.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  deadDraftKey,
+  deadSceneDraftKey,
+  deadSlotExists,
+  seedDeadDraft,
+  seedDeadSceneDraft,
+} from './helpers/dead-draft-slots';
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 import { ProjectStore, resetProjectStore } from '../src/core/project/project-store';
-import { clearSceneMutationListeners } from '../src/core/hmi/scene/rv-scene-mutations';
+import {
+  clearSceneMutationListeners,
+  emitSceneMutation,
+} from '../src/core/hmi/scene/rv-scene-mutations';
 import {
   clearAllScenes,
   clearDraftsForScope,
   getDraftScope,
   readActiveId,
-  readDraft,
   readScene,
-  readSceneDraft,
   setDraftScope,
-  writeDraft,
-  writeSceneDraft,
+  writeScene as writeSceneToStorage,
 } from '../src/core/hmi/scene/rv-scene-storage';
-import { sceneRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
+import {
+  RV_PROJECT_SCHEMA_VERSION,
+  sceneGlbRelPathFor,
+  type RvProject,
+} from '../src/core/project/rv-project-types';
 import type { RvScene, SceneBase } from '../src/core/hmi/scene/rv-scene-types';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
@@ -40,7 +55,7 @@ const scene = (id: string, name: string): RvScene => ({
   name,
   createdAt: '2025-01-01T00:00:00.000Z',
   modifiedAt: '2025-01-01T00:00:00.000Z',
-  schemaVersion: 2,
+  schemaVersion: 3,
   base: { kind: 'empty' },
   edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
 });
@@ -58,14 +73,14 @@ function makeFolder(project: Partial<RvProject>, bodies: RvScene[] = []): FakeDi
   if (bodies.length > 0) {
     const scenes = root.seedDir('scenes');
     for (const b of bodies) {
-      scenes.seedText(sceneRelPathFor(b).split('/')[1], JSON.stringify(b));
+      scenes.seedText(sceneGlbRelPathFor(b).split('/')[1], JSON.stringify(b));
     }
   }
   return root;
 }
 
 function entryFor(s: RvScene) {
-  return { id: s.id, name: s.name, path: sceneRelPathFor(s), baseKind: s.base.kind };
+  return { id: s.id, name: s.name, path: sceneGlbRelPathFor(s), baseKind: s.base.kind };
 }
 
 let store: ProjectStore;
@@ -105,7 +120,7 @@ describe('openProjectFolder', () => {
     root.seedText('project.json', JSON.stringify({ name: 'Toray', code: 'toray' }));
     expect(await store.openProjectFolder(asDirHandle(root))).toBe(true);
     expect(store.getProject()?.code).toBe('toray');
-    expect(store.getProject()?.schemaVersion).toBe(1);
+    expect(store.getProject()?.schemaVersion).toBe(RV_PROJECT_SCHEMA_VERSION);
   });
 
   it('refuses a folder without a manifest unless asked to create one', async () => {
@@ -154,7 +169,7 @@ describe('every load step is conditional', () => {
   it('a manifest with no scenes[] at all opens cleanly', async () => {
     const root = makeFolder({});
     expect(await store.openProjectFolder(asDirHandle(root))).toBe(true);
-    expect(store.getProjectSceneIds().size).toBe(0);
+    expect(store.getSnapshot().documents).toEqual([]);
   });
 
   it('applies a settings bundle when one is present', async () => {
@@ -245,12 +260,15 @@ describe('hydration is lazy', () => {
     expect(store.getSnapshot().warnings.join(' ')).toContain('missing or not a valid scene');
   });
 
-  it('exposes the project scene id set for Models-panel scoping', async () => {
+  // `getProjectSceneIds()` scoped the Models panel against the scene half of
+  // the two-tier merge; both went in plan-716 Phase 6. The snapshot carries one
+  // artefact list now, and this asserts the same fact against it.
+  it('exposes the project documents for panel scoping', async () => {
     const a = scene('scn_a', 'A');
     const b = scene('scn_b', 'B');
     const root = makeFolder({ scenes: [entryFor(a), entryFor(b)] }, [a, b]);
     await store.openProjectFolder(asDirHandle(root));
-    expect([...store.getProjectSceneIds()].sort()).toEqual(['scn_a', 'scn_b']);
+    expect(store.getSnapshot().documents.map(d => d.id).sort()).toEqual(['scn_a', 'scn_b']);
   });
 });
 
@@ -262,7 +280,6 @@ describe('RR2 — openScene() must not throw on a lazily-hydrated project scene'
     let hydrator: ((id: string) => Promise<boolean>) | null = null;
     return {
       setSceneHydrator(fn: ((id: string) => Promise<boolean>) | null) { hydrator = fn; },
-      refreshScenesFromStorage: vi.fn(),
       /** Mirrors the real openScene() pre-fetch + throw. */
       async openScene(id: string) {
         if (!readScene(id) && hydrator) await hydrator(id);
@@ -322,9 +339,8 @@ describe('RR4 — an unsaved draft from project A must not appear in project B',
     await store.openProjectFolder(asDirHandle(rootA));
     expect(getDraftScope()).toBe('prj_A');
 
-    // Unsaved edits on a built-in inside project A.
-    writeDraft(base, { ...scene('draft', 'Secret work in A'), base });
-    expect(readDraft(base)?.name).toBe('Secret work in A');
+    // A leftover slot inside project A.
+    const keyA = seedDeadDraft(base);
 
     // Switch to project B — same built-in, different project.
     const rootB = makeFolder({ id: 'prj_B', name: 'B' });
@@ -334,47 +350,45 @@ describe('RR4 — an unsaved draft from project A must not appear in project B',
     await storeB.openProjectFolder(asDirHandle(rootB));
 
     expect(getDraftScope()).toBe('prj_B');
-    expect(readDraft(base)).toBeNull();          // ← the leak, closed
+    // Project B addresses a DIFFERENT key for the same base — the leak, closed.
+    expect(deadDraftKey(base)).not.toBe(keyA);
   });
 
   it('does not leak into "no project" either', async () => {
     const rootA = makeFolder({ id: 'prj_A', name: 'A' });
     await store.openProjectFolder(asDirHandle(rootA));
-    writeDraft(base, { ...scene('draft', 'Secret work in A'), base });
+    const keyA = deadDraftKey(base);
 
     await store.closeProject();
 
     expect(getDraftScope()).toBeNull();
-    expect(readDraft(base)).toBeNull();
+    expect(deadDraftKey(base)).not.toBe(keyA);
   });
 
   it('keeps the historic unscoped key when no project is open', () => {
     setDraftScope(null);
-    writeDraft(base, { ...scene('draft', 'Global draft'), base });
-    expect(readDraft(base)?.name).toBe('Global draft');
-    expect(localStorage.getItem(`rv-scenes/draft/builtin:${encodeURIComponent(base.url)}`)).toBeTruthy();
+    expect(deadDraftKey(base))
+      .toBe(`rv-scenes/draft/builtin:${encodeURIComponent(base.url)}`);
   });
 
-  it('a scoped draft is written under a project-prefixed key', () => {
+  it('a scoped slot is addressed under a project-prefixed key', () => {
     setDraftScope('prj_A');
-    writeDraft(base, { ...scene('draft', 'Scoped'), base });
-    const scopedKey = `rv-scenes/draft/prj_A:builtin:${encodeURIComponent(base.url)}`;
-    expect(localStorage.getItem(scopedKey)).toBeTruthy();
+    const key = seedDeadDraft(base);
+    expect(key).toBe(`rv-scenes/draft/prj_A:builtin:${encodeURIComponent(base.url)}`);
     setDraftScope(null);
-    expect(readDraft(base)).toBeNull();
+    expect(deadDraftKey(base)).not.toBe(key);
   });
 
-  it('clearDraftsForScope removes only that project’s drafts', () => {
+  it('clearDraftsForScope removes only that project\u2019s leftovers', () => {
     setDraftScope('prj_A');
-    writeDraft(base, { ...scene('draft', 'A'), base });
+    const keyA = seedDeadDraft(base);
     setDraftScope('prj_B');
-    writeDraft(base, { ...scene('draft', 'B'), base });
+    const keyB = seedDeadDraft(base);
 
     clearDraftsForScope('prj_A');
 
-    expect(readDraft(base)?.name).toBe('B');     // still in scope B
-    setDraftScope('prj_A');
-    expect(readDraft(base)).toBeNull();
+    expect(deadSlotExists(keyA)).toBe(false);
+    expect(deadSlotExists(keyB)).toBe(true);
   });
 });
 
@@ -464,21 +478,19 @@ describe('conflict reconciliation on open', () => {
     expect(readScene('scn_a')?.name).toBe('Cell A (from git)');
   });
 
-  it('B3 — "folder wins" also clears the draft, so openScene cannot resurrect it', async () => {
+  it('B3 — "folder wins" sweeps the dead draft slot on its way through', async () => {
     const cached = { ...scene('scn_a', 'Cell A'), modifiedAt: OLD };
     const onDisk = { ...scene('scn_a', 'Cell A (from git)'), modifiedAt: NEW };
     seedCache(cached);
-    // A stale per-saved-scene draft that matches the saved record — no unsaved
-    // work, so this is a clean folder-wins, and the draft must not survive it.
-    writeSceneDraft('scn_a', cached);
+    // Nothing reads this slot since plan-413 phase 6, but leaving it behind
+    // after the row it belonged to was replaced is how stale keys accumulate.
+    const key = seedDeadSceneDraft('scn_a');
     const root = makeFolder({ scenes: [entryAt(onDisk, NEW)] }, [onDisk]);
 
     await store.openProjectFolder(asDirHandle(root));
 
-    expect(readSceneDraft('scn_a')).toBeNull();
-    // What `openScene()` would load — `readSceneDraft(id) ?? scene` — is now
-    // unambiguously the folder version.
-    expect((readSceneDraft('scn_a') ?? readScene('scn_a'))?.name).toBe('Cell A (from git)');
+    expect(deadSlotExists(key)).toBe(false);
+    expect(readScene('scn_a')?.name).toBe('Cell A (from git)');
   });
 
   it('leaves an identical scene alone — no conflict, no prompt', async () => {
@@ -567,35 +579,39 @@ describe('conflict prompt', () => {
     expect(store.getLastConflicts().map(c => c.id)).toEqual(['scn_a']);
   });
 
-  it('B3 — an unsaved draft prompts even though the folder is newer', async () => {
+  // B3 used to say: an UNSAVED DRAFT always prompts, even against a newer
+  // folder. There is no draft to be unsaved any more (plan-413 phase 6) — an
+  // autosave is a GLB body and the conflict question is about the saved
+  // catalogue row alone. A leftover slot must therefore change nothing about
+  // the decision, which is what these two pin.
+  it('a leftover draft slot does not turn a clean folder-wins into a prompt', async () => {
     const cached = { ...scene('scn_a', 'Cell A'), modifiedAt: OLD };
     const onDisk = { ...scene('scn_a', 'Folder version'), modifiedAt: NEW };
     seedCache(cached);
-    writeSceneDraft('scn_a', { ...cached, name: 'Cell A — unsaved work' });
+    seedDeadSceneDraft('scn_a');
     const root = makeFolder({ scenes: [entryAt(onDisk, NEW)] }, [onDisk]);
 
-    const seen: unknown[] = [];
-    store.setConflictPrompt(items => { seen.push(...items); return {}; });
-
+    const prompt = vi.fn();
+    store.setConflictPrompt(prompt);
     await store.openProjectFolder(asDirHandle(root));
 
-    expect(seen).toEqual([expect.objectContaining({ id: 'scn_a', hasUnsavedDraft: true })]);
-    // Nothing chosen → the unsaved work is still there.
-    expect(readSceneDraft('scn_a')?.name).toBe('Cell A — unsaved work');
+    expect(prompt).not.toHaveBeenCalled();
+    expect(readScene('scn_a')?.name).toBe('Folder version');
   });
 
-  it('choosing the folder for an unsaved draft reads the body and clears the draft', async () => {
-    const cached = { ...scene('scn_a', 'Cell A'), modifiedAt: OLD };
-    const onDisk = { ...scene('scn_a', 'Folder version'), modifiedAt: NEW };
+  it('choosing the folder reads the body and sweeps the dead slot', async () => {
+    const cached = { ...scene('scn_a', 'Cell A'), modifiedAt: NEW };
+    const onDisk = { ...scene('scn_a', 'Folder version'), modifiedAt: OLD };
     seedCache(cached);
-    writeSceneDraft('scn_a', { ...cached, name: 'Cell A — unsaved work' });
-    const root = makeFolder({ scenes: [entryAt(onDisk, NEW)] }, [onDisk]);
+    const key = seedDeadSceneDraft('scn_a');
+    const root = makeFolder({ scenes: [entryAt(onDisk, OLD)] }, [onDisk]);
 
     store.setConflictPrompt(items => Object.fromEntries(items.map(i => [i.id, 'use-folder' as const])));
     await store.openProjectFolder(asDirHandle(root));
 
     expect(readScene('scn_a')?.name).toBe('Folder version');
-    expect(readSceneDraft('scn_a')).toBeNull();
+    expect(deadSlotExists(key)).toBe(false);
+    expect(deadSceneDraftKey('scn_a')).toBe(key);
   });
 
   it('a prompt that throws keeps the cache instead of guessing', async () => {
@@ -617,7 +633,6 @@ describe('dirty guard', () => {
   function dirtySceneStore(dirty: boolean) {
     return {
       setSceneHydrator() { /* unused here */ },
-      refreshScenesFromStorage: vi.fn(),
       getSnapshot: () => ({ dirty, draft: { name: 'Cell A' } }),
     };
   }
@@ -706,5 +721,49 @@ describe('dirty guard', () => {
 
     const rootB = makeFolder({ id: 'prj_B', name: 'B' });
     expect(await store.openProjectFolder(asDirHandle(rootB))).toBe(true);
+  });
+});
+
+// ─── plan-413 phase 4: the document list is live ────────────────────────
+
+/**
+ * `listDocuments()` runs once, on open — it is a folder scan. That is right for
+ * models and library assets and wrong for scenes, which the user creates from
+ * the dashboard that reads this very list. A document grid that only showed
+ * yesterday's scenes would be the phase-4 UI's first bug report, so the scene
+ * half is re-derived from the live manifest on every publish.
+ */
+describe('snapshot.documents follows scenes created after the project opened', () => {
+  let store: ProjectStore;
+
+  beforeEach(() => { store = new ProjectStore(); });
+  afterEach(async () => { await store.closeProject(); });
+
+  it('a scene saved after open shows up as a document', async () => {
+    const root = makeFolder({ scenes: [] });
+    expect(await store.openProjectFolder(asDirHandle(root))).toBe(true);
+    expect(store.getSnapshot().documents.map(d => d.name)).toEqual([]);
+
+    // The writer resolves the body out of scene storage, exactly as a real
+    // save does — the mutation is the notification, not the payload.
+    const fresh = writeSceneToStorage(scene('scn_new', 'Fresh'));
+    emitSceneMutation({ type: 'upsert', id: 'scn_new', scene: fresh });
+    await store.flush();
+
+    const docs = store.getSnapshot().documents;
+    expect(docs.map(d => d.name)).toEqual(['Fresh']);
+    expect(docs[0]!.section).toBe('scenes');
+  });
+
+  it('and disappears again when the scene is deleted', async () => {
+    const s = scene('scn_gone', 'Gone');
+    const root = makeFolder(
+      { scenes: [{ id: 'scn_gone', name: 'Gone', path: sceneGlbRelPathFor(s) }] }, [s]);
+    await store.openProjectFolder(asDirHandle(root));
+    expect(store.getSnapshot().documents.map(d => d.name)).toEqual(['Gone']);
+
+    emitSceneMutation({ type: 'delete', id: 'scn_gone' });
+    await store.flush();
+    expect(store.getSnapshot().documents.map(d => d.name)).toEqual([]);
   });
 });

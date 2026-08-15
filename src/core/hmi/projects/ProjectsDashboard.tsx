@@ -52,12 +52,31 @@ import {
 export interface ProjectsDashboardProps {
   /** Header headline — "Projects", or the open project's name. */
   title: string;
+  /**
+   * Quiet facts beside the title — backend kind, document count, read-only.
+   *
+   * In the header because they describe the PROJECT, and the header is the one
+   * place that already names it; the detail pane below is reserved for the
+   * current selection and shows nothing when there is none.
+   */
+  subtitle?: string;
   /** Supplied only on the project screen; renders the back arrow. */
   onBack?: () => void;
   /** Tab strip, rendered next to the title rather than above the content. */
   headerTabs?: React.ReactNode;
+  /** Controls on the title row itself (project menu), left of the close X. */
+  titleActions?: React.ReactNode;
   /** Hide the search field on screens with nothing worth filtering. */
   showSearch?: boolean;
+  /**
+   * Full-width band between the title row and the tools, for the open document
+   * (plan-709 F3).
+   *
+   * Above the search bar and not beside it: the search bar is for finding what
+   * you have not opened yet, and the one thing you HAVE opened should not have
+   * to compete with it for the same row.
+   */
+  hero?: React.ReactNode;
   /** Header actions rendered left of the close button. */
   headerActions?: React.ReactNode;
   /** The screen itself. Laid out as a row so a detail pane can sit beside it. */
@@ -66,9 +85,12 @@ export interface ProjectsDashboardProps {
 
 export function ProjectsDashboard({
   title,
+  subtitle,
   onBack,
   headerTabs,
+  titleActions,
   showSearch = true,
+  hero,
   headerActions,
   children,
 }: ProjectsDashboardProps) {
@@ -90,14 +112,15 @@ export function ProjectsDashboard({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [snap.open, onKeyDown]);
 
-  if (!snap.open) return null;
-
   const root = getFloatingPanelRoot();
 
   const content = (
     <Box
       role="region"
       aria-label="Projects"
+      // Hidden, not unmounted, while closed (the host gates the very first
+      // mount): reopening must be instant and must resume the exact view —
+      // tree expansion, scroll, selection — which unmounting threw away.
       sx={{
         position: 'fixed',
         top: insets.top,
@@ -105,7 +128,7 @@ export function ProjectsDashboard({
         right: 0,
         bottom: 0,
         zIndex: PROJECTS_DASHBOARD_ZINDEX,
-        display: 'flex',
+        display: snap.open ? 'flex' : 'none',
         flexDirection: 'column',
         // Tier-3 glass over the viewport (DESIGN.md) — the 3D scene stays
         // faintly visible so the overlay reads as part of the same product.
@@ -134,8 +157,17 @@ export function ProjectsDashboard({
           </Tooltip>
         )}
         <Typography sx={{ fontSize: 15, fontWeight: 600 }}>{title}</Typography>
+        {subtitle && (
+          <Typography
+            data-testid="projects-header-subtitle"
+            sx={{ fontSize: 11, color: 'text.secondary', whiteSpace: 'nowrap', mt: '2px' }}
+          >
+            {subtitle}
+          </Typography>
+        )}
         {headerTabs}
         <Box sx={{ flex: 1 }} />
+        {titleActions}
         <Tooltip title="Close (Esc)">
           <IconButton size="small" onClick={closeProjectsDashboard} aria-label="Close Projects">
             <Close sx={{ fontSize: 18 }} />
@@ -143,16 +175,17 @@ export function ProjectsDashboard({
         </Tooltip>
       </Box>
 
-      {/* Sub-header — the tools, on their own bar.
-          Search and the verbs used to ride the title row and drifted to the far
-          right, the opposite corner from the content they act on. A bar of their
-          own, centred, puts them over the list itself. */}
+      {/* The open document, full width, above the tools. */}
+      {hero}
+
+      {/* Sub-header — the tools, on their own bar. Filters and verbs read
+          left-to-right from the start of the bar; search sits centred, under
+          the hero card it shares an axis with. */}
       {(showSearch || headerActions) && (
         <Box
           sx={{
             display: 'flex',
             alignItems: 'center',
-            justifyContent: 'center',
             flexWrap: 'wrap',
             gap: 1,
             px: 1.5,
@@ -161,6 +194,11 @@ export function ProjectsDashboard({
             flexShrink: 0,
           }}
         >
+          {headerActions}
+          {/* Two equal spacers, not one: search sits in the CENTRE of the bar,
+              so the flexible space has to be split either side of it rather
+              than all collected before it. The verbs keep the left edge. */}
+          <Box sx={{ flex: 1 }} />
           {showSearch && (
             <TextField
               size="small"
@@ -180,7 +218,7 @@ export function ProjectsDashboard({
               sx={{ width: 240 }}
             />
           )}
-          {headerActions}
+          <Box sx={{ flex: 1 }} />
         </Box>
       )}
 

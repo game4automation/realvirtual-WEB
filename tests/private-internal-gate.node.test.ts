@@ -32,6 +32,10 @@ const INTERNAL_MANIFEST = resolve(
   __dirname,
   '../../realvirtual-WebViewer-Private~/src/internal-plugins.ts',
 );
+const FEATURE_MATRIX_ADAPTER = resolve(
+  __dirname,
+  '../../realvirtual-WebViewer-Private~/src/features/feature-matrix.register.ts',
+);
 
 function sourceFiles(root: string): string[] {
   const files: string[] = [];
@@ -74,10 +78,47 @@ describe.skipIf(!existsSync(PRIVATE_MANIFEST))('private-plugins internal gate', 
     );
   });
 
-  it('registers feature-matrix only from the internal manifest', () => {
+  it('registers feature-matrix from the customer tier, through its adapter', () => {
+    // plan-434 §2.7 / ADR-047: feature-matrix carries no tier rule, so it inherits
+    // `commercial` from the manifest default and every standard delivery generates
+    // a call to its adapter (tier-gate.node.test.ts). The demo shows that same
+    // commercial scope, so the checked-in customer tier registers it too — and
+    // internal-plugins.ts must NOT, or the internal build registers it twice.
+    // (The earlier version of this test asserted the opposite; its premise, that
+    // the adapter sits on the internal tier, stopped being true when the manifest
+    // default flipped to `commercial`.)
+    expect(/import\(\s*['"]\.\/features\/feature-matrix\.register['"]\s*\)/.test(src())).toBe(true);
     const internal = readFileSync(INTERNAL_MANIFEST, 'utf-8');
-    expect(/from\s+['"]\.\/plugins\/feature-matrix\/feature-matrix-plugin['"]/.test(internal)).toBe(true);
-    expect(/viewer\.use\(new\s+FeatureMatrixPlugin\(\),\s*['"]internal['"]\)/.test(internal)).toBe(true);
+    expect(/features\/feature-matrix\.register/.test(internal)).toBe(false);
+    const adapter = readFileSync(FEATURE_MATRIX_ADAPTER, 'utf-8');
+    expect(/from\s+['"]\.\.\/plugins\/feature-matrix\/feature-matrix-plugin['"]/.test(adapter)).toBe(true);
+    expect(/viewer\.use\(new\s+FeatureMatrixPlugin\(\),\s*['"]internal['"]\)/.test(adapter)).toBe(true);
+  });
+
+  it('customer tier registers exactly the commercial features of the manifest', () => {
+    // The checked-in entry point and the one `generateCustomerPrivatePlugins()`
+    // writes into a customer workspace must select the SAME features, or the demo
+    // and a standard commercial delivery stop being the same product. Restricted
+    // features (agents, omniverse) need a per-customer assignment and belong to
+    // neither — they stay in the __RV_INTERNAL__-gated internal tier.
+    const manifest = JSON.parse(
+      readFileSync(resolve(__dirname, '../../realvirtual-WebViewer-Private~/tier-manifest.json'), 'utf-8'),
+    ) as { rules: { path: string; tier: string }[]; registrations: Record<string, { adapter: string }> };
+    const restricted = new Set(
+      manifest.rules
+        .filter((rule) => rule.tier === 'restricted')
+        .map((rule) => rule.path.replace(/^src\//, '').replace(/\.ts$/, '')),
+    );
+    // Split at the GATE, not at the first mention of the flag — the file header
+    // names `__RV_INTERNAL__` in prose long before the branch exists.
+    const customerBlock = src().split(/if\s*\(\s*__RV_INTERNAL__\s*\)/)[0]!;
+    const internal = readFileSync(INTERNAL_MANIFEST, 'utf-8');
+    for (const [feature, registration] of Object.entries(manifest.registrations)) {
+      const adapter = registration.adapter.replace(/^\.\//, '');
+      const isRestricted = restricted.has(adapter);
+      expect(customerBlock.includes(`'./${adapter}'`), `${feature} in customer tier`).toBe(!isRestricted);
+      expect(internal.includes(`./${adapter}'`), `${feature} in internal tier`).toBe(isRestricted);
+    }
   });
 
   it('has no static feature-matrix imports in the public source tree', () => {

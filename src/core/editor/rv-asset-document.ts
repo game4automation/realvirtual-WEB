@@ -2,21 +2,48 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-asset-document — the op-log document behind the asset editor.
+ * rv-asset-document — the asset-editor's view of the ONE op-log document.
  *
- * Owns the ordered `AssetOp[]` history with undo/redo, coalescing,
- * transactions, dirty tracking and debounced IndexedDB draft autosave.
- * Deliberately does NOT own model loading — the AssetEditorPlugin loads the
- * base (empty scene or a library GLB) and constructs the document around it.
+ * ── What changed in plan-703 Phase 3 ────────────────────────────────────────
  *
- * Ops flow through a single-flight queue (mirrors the SceneStore): two ops
- * never execute concurrently, and the queue is drained in order. Application
- * to the live scene is delegated to {@link AssetExecutorContext}.
+ * This class used to *be* an op-log document: it carried its own single-flight
+ * queue, transaction orchestration, coalescing, undo/redo stacks, dirty
+ * derivation and React store — a second, independently maintained copy of the
+ * machinery `SceneStore` also carried. All of that is now GONE from here and
+ * delegated to a single {@link RvDocument} in `'asset'` mode. Phase 1 built that
+ * class; this is the point at which it acquires a production consumer.
+ *
+ * What is left here is what is genuinely asset-specific and belongs nowhere
+ * else:
+ *   - the {@link AssetBase} the document was opened from,
+ *   - WHICH draft frame this document writes to, and the test-session
+ *     suspension of that writing — the writing itself is {@link RvDraftAutosave}
+ *     since plan-710 Phase 2, which retired the hand-rolled debounce and the
+ *     single legacy slot that used to sit beside it,
+ *   - the convenience mutators that RESOLVE an op against the live scene
+ *     (world-preserving reparent maths, `_N` name deduplication, merge/separate
+ *     partitioning, per-mesh material `prev` capture) before handing it over.
+ *
+ * That split is the point: op-log mechanics are one implementation, op
+ * CONSTRUCTION stays with the lineage that knows the geometry.
+ *
+ * The public API is deliberately UNCHANGED — `applyOp`, `withTransaction`,
+ * `undo`/`redo`, `getSnapshot`, `executor`, every mutator. ~20 of these methods
+ * are called directly by the MCP editor tools, which are an external API surface
+ * used by agents; their names and return shapes are a contract, not an
+ * implementation detail.
+ *
+ * Since plan-710 there is nothing left to convert on the way in or out: ops are
+ * authored, applied and persisted as {@link RvAssetOp}, the origin-filtered view
+ * of the ONE union. The `upcastAssetOp` / `toAssetOp` pair that used to bracket
+ * every entry point is gone — it was an identity cast between two names for the
+ * same records.
  */
 
 import { Matrix4, Quaternion, Vector3 } from 'three';
 import type { BufferGeometry, Mesh, Object3D } from 'three';
 import type { RVViewer } from '../rv-viewer';
+import { isModelRoot, isModelRootPath } from '../engine/rv-model-root';
 import {
   AssetExecutorContext,
   type MergeMeshPayload,
@@ -33,8 +60,6 @@ import {
   type SeparateMode,
 } from './rv-mesh-separator';
 import {
-  type AssetOp,
-  type AssetPrimitiveOp,
   type CADLinkExtras,
   type NodeTransform,
   type MaterialValue,
@@ -42,99 +67,252 @@ import {
   type MergeOutputSpec,
   type MergeSourceSignature,
   assetOpHeader,
-  canCoalesceAssetOps,
-  mergeAssetOps,
-  describeAssetOp,
   dedupeComponentKey,
 } from './rv-asset-ops';
-import { MAX_OP_HISTORY } from '../ops/rv-op-utils';
+import { RvDocument, type RvDocumentCore } from '../ops/rv-document';
+import { RvUnifiedExecutor } from '../ops/rv-unified-executors';
+import { needsRecomposeToUndo, undoViaRecompose } from '../ops/rv-document-projection';
+import { makeAssetComposite } from '../ops/rv-unified-ops';
+import type { RvOp, RvAssetOp, RvAssetPrimitiveOp } from '../ops/rv-unified-ops';
+import type { AssetDraft, AssetDraftBase } from './rv-asset-draft-storage';
 import {
-  saveAssetDraft,
-  clearAssetDraft,
-  type AssetDraft,
-  type AssetDraftBase,
-} from './rv-asset-draft-storage';
+  RvDraftAutosave,
+  clearDocumentDraft,
+  rootFrame,
+  sharedDocumentFrame,
+  type RvDraftBytesCache,
+  type RvDraftFrameKey,
+} from '../ops/rv-document-drafts';
 import type { CadImportResult } from './rv-cad-provider';
 import { putCadGlb } from '../import/rv-cad-glb-cache';
 import { parseGlbSubtree } from '../engine/rv-glb-parse';
 import { NodeRegistry } from '../engine/rv-node-registry';
 import { captureMaterialPrev } from './rv-asset-material';
+import { guardReferenceOp } from '../ops/rv-reference-guard';
+import { outermostReference } from '../engine/rv-reference-scope';
 
 /** Where the document started from. */
 export type AssetBase = AssetDraftBase;
 
-/** Immutable UI snapshot (useSyncExternalStore). */
-export interface AssetDocumentSnapshot {
+/**
+ * Immutable UI snapshot (useSyncExternalStore).
+ *
+ * The three intrinsics come from {@link RvDocumentCore} — derived once in the
+ * document layer, spread here (plan-710 §2.4). What this interface ADDS is what
+ * is genuinely asset-specific: the identity and the base it was opened from.
+ */
+export interface AssetDocumentSnapshot extends RvDocumentCore {
   id: string;
   name: string;
   base: AssetBase;
-  dirty: boolean;
-  busy: boolean;
-  canUndo: boolean;
-  canRedo: boolean;
   undoLabel: string | null;
   redoLabel: string | null;
   opCount: number;
 }
 
-/** Debounce for the IndexedDB draft autosave (same cadence as SceneStore). */
-const DRAFT_AUTOSAVE_MS = 2000;
+/**
+ * Everything a document's history consists of, frozen (plan-410 §2.4).
+ *
+ * Deliberately NOT an {@link AssetDraft}: a draft is a replay recipe, this is a
+ * state photograph. See {@link AssetDocument.captureSessionState}.
+ */
+export interface AssetDocumentSessionState {
+  shell: { id: string; name: string; base: AssetBase; createdAt: number };
+  ops: RvAssetOp[];
+  redoOps: RvAssetOp[];
+  baselineIds: string[];
+  metaDirty: boolean;
+}
 
 export class AssetDocument {
   readonly id: string;
-  private _name: string;
   private _base: AssetBase;
-  private readonly _createdAt: number;
 
   private readonly viewer: RVViewer;
+  /**
+   * The asset-lineage executor, created eagerly and published as a stable
+   * handle: the CAD / separate / merge payload hand-off and the
+   * `takeMissingCadGeometry` reporting all key on this identity.
+   */
   readonly executor: AssetExecutorContext;
 
-  private _ops: AssetOp[] = [];
-  private _redo: AssetOp[] = [];
-  /** Ids of `_ops` at the last clean point (fresh open / save). */
-  private _baselineIds: string[] = [];
-
-  /** Single-flight op queue tail. */
-  private _queue: Promise<void> = Promise.resolve();
-  private _busyDepth = 0;
-
-  /** Transaction collection buffer (null = not inside a transaction). */
-  private _txnOps: AssetOp[] | null = null;
-  /** First failure seen inside the open transaction. Set by the fire-and-forget
-   *  mutators, whose promise no caller holds — without this a transaction could
-   *  commit around an op that never applied. */
-  private _txnError: unknown = null;
-  /** True while a failed transaction is unwinding: the rollback drives the
-   *  executor op by op and must not wake React per step (a 434-op rollback would
-   *  emit 868 store updates — the overflow this plan removes). */
-  private _notifyPaused = false;
   /**
-   * Busy state OWNED BY the open transaction (F6).
-   *
-   * A transaction suppresses intermediate notifications, which also swallowed the
-   * `busy` transition its ops would have produced: a bulk import left the toolbar
-   * looking idle for its whole duration. So the transaction publishes busy ONCE
-   * when it opens, and drops the flag when it commits or unwinds — the UI gets a
-   * deliberate "working / done", not the accidental silence.
+   * The one op-log document (plan-703 Phase 1). Everything this class used to
+   * duplicate — queue, transactions, coalescing, undo/redo, dirty, cap — lives
+   * here now, once.
    */
-  private _txnBusy = false;
+  private readonly _doc: RvDocument;
+  private readonly _unsubDoc: () => void;
 
-  private _autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * This facade BORROWED its document from another projection (plan-711 §2.2).
+   *
+   * Three things follow from it, and they are the whole difference: the
+   * document is not disposed with the facade (its owner is still showing it),
+   * the draft seam hangs on {@link RvDocument.attachCommitHook} instead of on
+   * the constructor's `onChanged`, and a discard has a FLOOR to roll back to
+   * rather than a whole log to clear.
+   */
+  private readonly _bound: boolean;
+  /** Detaches the commit hook of a bound document; null when not bound. */
+  private _detachCommitHook: (() => void) | null = null;
+  /** `opCount` at the moment of the bind — see {@link discardBoundEdits}. */
+  private _bindFloor = 0;
+  /** Rebuilds this projection's tree — see {@link setReprojectTree}. */
+  private _reprojectTree: (() => Promise<void>) | null = null;
+  /** What the other projection's bytes hold of this log — {@link setDraftBytesCache}. */
+  private _bytesCache: (() => RvDraftBytesCache | null) | null = null;
+
+  /**
+   * The ONE op-draft writer (plan-710 §2.3).
+   *
+   * This class used to carry its own `setTimeout` debounce and its own
+   * `_writeDraft` branch beside {@link RvDraftAutosave}, which was finished code
+   * that nothing ever instantiated. There is one writer now, it lives in the
+   * draft layer, and the facade only decides WHICH FRAME it points at.
+   */
+  private readonly _autosave: RvDraftAutosave;
+  /** Autosave is off while an editor test run holds the document (plan-410 F5). */
+  private _autosaveSuspended = false;
   private _disposed = false;
 
-  // React store plumbing
-  private _version = 0;
+  /**
+   * A base swap is in flight — see {@link beginBaseSwap} (plan-710 §2.4).
+   *
+   * The asset counterpart of the scene lineage's `!loading` gate. It did not
+   * exist before this phase: the scene had the guard, the asset lineage had the
+   * same hazard and no answer for it.
+   */
+  private _baseSwapping = false;
+
+  /**
+   * This document's slot in the per-frame draft keyspace
+   * (`<projectId>:<rootDocumentId>:<occurrenceChain>`).
+   *
+   * Never null since plan-710 Phase 2. A document that is not in a stack gets
+   * its OWN root frame rather than falling back to a shared legacy slot — that
+   * slot is gone, and "some documents write here, others there" was the split
+   * this phase closed. {@link RvDocumentStack} still overrides it via
+   * {@link setDraftFrame} for every frame it opens, root included, because only
+   * the stack knows the project id and the occurrence chain.
+   */
+  private _draftFrame: RvDraftFrameKey;
+
+  // React store plumbing. The document has its own snapshot; this one adds
+  // `base`, which is asset-specific and therefore not in `RvDocumentSnapshot`.
   private _snapshot: AssetDocumentSnapshot | null = null;
   private readonly _listeners = new Set<() => void>();
 
-  constructor(viewer: RVViewer, opts: { id: string; name: string; base: AssetBase; createdAt?: number }) {
+  constructor(
+    viewer: RVViewer,
+    opts: {
+      id: string;
+      name: string;
+      base: AssetBase;
+      createdAt?: number;
+      /**
+       * BIND instead of construct (plan-711 §2.2, F2).
+       *
+       * The living `RvDocument` of the other projection, handed over — never
+       * looked up. When present this facade does not mint a document: it
+       * borrows one, so the op log, the undo/redo stacks, the clean point and
+       * `dirty` are literally the same objects the scene is showing, which is
+       * what "one Undo stack across the boundary" means.
+       */
+      adopt?: RvDocument;
+    },
+  ) {
     this.viewer = viewer;
+    // A FRESH context in either case — never the one the other projection was
+    // driving. `_trash`/`_trashGroup` hold references into the tree that has
+    // just been replaced, and carrying them over does not merely lose an undo:
+    // `_restoreFromTrash` re-registers the detached subtree into the LIVE
+    // registry, where its path shadows the real node (plan-711 Spike (d),
+    // MESSUNG d1). The ops that depended on it are re-projected instead.
     this.executor = new AssetExecutorContext(viewer);
     this.id = opts.id;
-    this._name = opts.name;
     this._base = opts.base;
-    this._createdAt = opts.createdAt ?? Date.now();
+    this._bound = opts.adopt !== undefined;
+    this._doc = opts.adopt ?? new RvDocument({
+      id: opts.id,
+      name: opts.name,
+      mode: 'asset',
+      // Hand in OUR executor so `doc.executor` and the one the document drives
+      // are the same object.
+      executor: new RvUnifiedExecutor(viewer, 'asset', this.executor),
+      // The asset lineage has no protected leading ops — undo goes to zero.
+      baselineFloor: 0,
+      createdAt: opts.createdAt,
+      // Phase 2 named this the draft seam; this is it in production.
+      onChanged: (doc) => {
+        if (this._disposed || this._autosaveSuspended) return;
+        this._autosave.onChanged(doc);
+      },
+      // Ops queued while the document's BASE is being swapped out are stale by
+      // the time the queue reaches them (§2.4, R2-F4).
+      canApply: () => !this._baseSwapping,
+      // plan-710 F7 — the asset lineage's half of the page unload guard's
+      // question. `hasPendingWrite` was built with the writer in Phase 2 and had
+      // no consumer until now: an armed debounce is work that exists only in
+      // memory, and the page guard asked nothing about it in any mode.
+      hasUnpersistedWork: () => this._autosave.hasPendingWrite,
+    });
+    if (opts.adopt) {
+      // The borrowed document's `onChanged` belongs to the lineage that built
+      // it, and is a private readonly field there — so the asset half of the
+      // seam arrives through the COMMIT-channel hook instead (plan-711
+      // R2-Arch-F1), and leaves again with the binding. Deliberately not
+      // `subscribe`: that also fires for busy transitions and for
+      // `restoreHistory`, i.e. exactly during a recompose, which is the one
+      // moment the log does not describe the tree.
+      this._detachCommitHook = this._doc.attachCommitHook((doc) => {
+        if (this._disposed || this._autosaveSuspended) return;
+        this._autosave.onChanged(doc);
+      });
+      // The shared document is driven through OUR context from here on, so
+      // `doc.executor === AssetDocument.executor` holds for a bound document
+      // too — the identity the CAD/merge payload hand-off keys on (§9.7).
+      const unified = this._doc.executor;
+      if (unified instanceof RvUnifiedExecutor) unified.adoptAssetContext(this.executor);
+      // The projection follows the executor in the same breath. `setProjection`
+      // is what keeps `RvDocument.mode` (composite tagging, snapshot) and
+      // `RvUnifiedExecutor.mode` (resolveOpTarget) from ever disagreeing.
+      this._doc.setProjection('asset');
+      // Metadata, not history: the borrowed document carries the scene's name
+      // and the header card would otherwise read empty.
+      this._doc.setNameSilently(opts.name);
+      // What a discard of THIS binding has to take back (plan-711 R1-S1). Read
+      // after the projection switch and before any editor op can be recorded.
+      this._bindFloor = this._doc.opCount;
+    }
+    // A SHARED document keys its draft on its IDENTITY, not on this instance
+    // (plan-711 §2.4, F5): both projections have to write the one slot, and the
+    // side that recovers it after a crash never saw the instance id. Everything
+    // else keeps the instance-keyed frame it always had.
+    this._draftFrame = sharedDocumentFrame(opts.base) ?? rootFrame(null, opts.id);
+    this._autosave = new RvDraftAutosave({
+      frame: this._draftFrame,
+      // Read at flush time, so a rename between edit and write is picked up.
+      shell: () => ({
+        id: this.id, name: this._doc.name, base: this._base, createdAt: this._doc.createdAt,
+      }),
+      bytesCache: () => this._bytesCache?.() ?? null,
+    });
+    // One subscription, forwarded: the document already coalesces notifications
+    // across a transaction and a rollback, so this inherits that for free.
+    this._unsubDoc = this._doc.subscribe(() => {
+      this._snapshot = null;
+      for (const fn of this._listeners) fn();
+    });
   }
+
+  /**
+   * The unified document behind this facade.
+   *
+   * Exposed for the document stack (plan-703 Phase 4) and the unified draft
+   * layer, which speak `RvOp`. Op AUTHORING still goes through this class.
+   */
+  get document(): RvDocument { return this._doc; }
 
   /** Fresh "Untitled" document. */
   static newUntitled(viewer: RVViewer): AssetDocument {
@@ -147,30 +325,49 @@ export class AssetDocument {
 
   // ─── Metadata ───────────────────────────────────────────────────────
 
-  /** Document metadata dirty (rename) — OR'd into `dirty` alongside the op log. */
-  private _metaDirty = false;
-
-  get name(): string { return this._name; }
+  get name(): string { return this._doc.name; }
   get base(): AssetBase { return this._base; }
-  get dirty(): boolean {
-    if (this._metaDirty) return true;
-    const ids = this._ops.map((o) => o.id);
-    if (ids.length !== this._baselineIds.length) return true;
-    return ids.some((id, i) => id !== this._baselineIds[i]);
-  }
+  get dirty(): boolean { return this._doc.dirty; }
+
+  /**
+   * Would a page reload lose work? (plan-710 F7)
+   *
+   * Not the same question as {@link dirty}, and stricter where it matters: a
+   * dirty document whose op draft is already written comes back after an F5,
+   * while one whose debounce has not fired does not. The page unload guard asks
+   * this — through `ProjectStore.hasUnpersistedWork()` — in EVERY mode, so an
+   * asset left open behind the planner is covered too.
+   */
+  hasUnpersistedWork(): boolean { return this._doc.hasUnpersistedWork(); }
 
   /** Rename the DOCUMENT (not a scene node). Metadata only — not an op, but
    *  marks the document dirty so the exit guard prompts to save. */
   renameDocument(name: string): void {
-    const trimmed = name.trim();
-    if (!trimmed || trimmed === this._name) return;
-    this._name = trimmed;
-    this._metaDirty = true;
-    this._scheduleAutosave();
-    this._notify();
+    this._doc.renameDocument(name);
   }
 
   // ─── Op application ─────────────────────────────────────────────────
+
+  /** The op log, in the asset vocabulary. Read-only — mutate through the op API. */
+  get ops(): readonly RvAssetOp[] { return this._doc.ops as readonly RvAssetOp[]; }
+
+  /**
+   * The ops appended since `index` — the TAIL only (plan-707 §2.3).
+   *
+   * Read-only, and deliberately not a new op kind: the {@link RvAssetOp} union
+   * is untouched. It exists so the MCP effect probe can ask "what did this one
+   * call append?" without taking the whole log for an answer it will slice
+   * anyway. That mattered more before plan-710 (`ops` re-mapped the entire log
+   * on every access); it is a plain cast today, but a probe that runs ahead of
+   * EVERY editor write should not depend on that staying true.
+   *
+   * An index past the end yields an empty list rather than throwing — the log
+   * can shrink under an undo between the two reads.
+   */
+  opsSince(index: number): readonly RvAssetOp[] {
+    const from = Math.max(0, index);
+    return this._doc.ops.slice(from) as readonly RvAssetOp[];
+  }
 
   /** Queue an op: forward-apply to the live scene, then record it.
    *
@@ -178,11 +375,22 @@ export class AssetDocument {
    *  NOT recorded. Recording an op the executor never applied is what produced
    *  "the scene disagrees with its own history" — and inside a bulk edit, a scene
    *  half-rebuilt with nothing to undo (plan-359 Phase 3). */
-  applyOp(op: AssetOp): Promise<void> {
-    return this._enqueue(async () => {
-      await this.executor.applyForward(op);
-      this._record(op);
+  applyOp(op: RvAssetOp): Promise<void> {
+    const unified: RvOp = op;
+    const verdict = guardReferenceOp(unified, (nodePath) => {
+      const node = this.viewer.registry?.getNode(nodePath);
+      if (!node) return null;
+      return { reference: outermostReference(node, this.viewer.currentModelRoot ?? null) };
     });
+    if (!verdict.ok) {
+      // F8: a structural edit inside a referenced subtree cannot be WRITTEN
+      // DOWN — `AssetOverrides` is a value merge patch and has no vocabulary
+      // for tree surgery (§2.4, and §8's four independent confirmations).
+      // Rejecting at the op is the honest place: earlier and the UI cannot
+      // explain itself, later and the user has already lost the edit.
+      return Promise.reject(new Error(verdict.message));
+    }
+    return this._doc.applyOp(unified);
   }
 
   /**
@@ -193,103 +401,99 @@ export class AssetDocument {
    * reuse actions that open their own transactions.
    *
    * ALL-OR-NOTHING. If the body throws, or any op inside it failed (including the
-   * fire-and-forget mutators, whose failure lands in `_txnError`), everything the
-   * transaction did apply is rolled back, NOTHING is recorded, and the original
-   * error is re-thrown at the caller. Before this, a failure mid-transaction left
-   * the ops applied and unrecorded.
+   * fire-and-forget mutators, whose failure the document remembers), everything
+   * the transaction did apply is rolled back, NOTHING is recorded, and the
+   * original error is re-thrown at the caller.
    */
   async withTransaction(label: string, fn: () => Promise<void>): Promise<void> {
-    if (this._txnOps) { await fn(); return; }
-    // Publish "busy" BEFORE suppression starts — this is the only notification
-    // the UI gets while the transaction runs (F6).
-    this._txnBusy = true;
-    this._notify();
-    this._txnOps = [];
-    this._txnError = null;
-    let bodyError: unknown = null;
-    let bodyFailed = false;
-    try {
-      try {
-        await fn();
-      } catch (e) {
-        bodyError = e;
-        bodyFailed = true;
-      }
-      // Commit (or unwind) INSIDE the queue, so no other op can interleave.
-      await this._enqueue(async () => {
-        const collected = this._txnOps ?? [];
-        const failed = bodyFailed || this._txnError !== null;
-        const failure = bodyFailed ? bodyError : this._txnError;
-        this._txnOps = null;
-        this._txnError = null;
-        this._txnBusy = false;
-        if (failed) {
-          await this._rollback(collected);
-          throw failure;
-        }
-        if (collected.length === 0) return;
-        const flattened = collected.flatMap((o) => (o.kind === 'composite' ? o.ops : [o]));
-        this._record({ ...assetOpHeader(), kind: 'composite', label, ops: flattened });
-      });
-    } finally {
-      this._txnOps = null;
-      this._txnError = null;
-      this._txnBusy = false;
-    }
-  }
-
-  /**
-   * Reverse the ops a failed transaction already applied, newest first, so the
-   * scene ends where it started.
-   *
-   * Individual rollback failures are logged, never re-thrown: the caller must
-   * learn the ORIGINAL error, and there is nothing better left to try.
-   */
-  private async _rollback(ops: AssetOp[]): Promise<void> {
-    if (ops.length === 0) return;
-    this._notifyPaused = true;
-    try {
-      for (let i = ops.length - 1; i >= 0; i--) {
-        try {
-          await this.executor.applyInverse(ops[i]);
-        } catch (e) {
-          console.error(
-            '[asset-editor] transaction rollback failed — the scene may be inconsistent:', e,
-          );
-        }
-      }
-    } finally {
-      this._notifyPaused = false;
-    }
+    await this._doc.withTransaction(label, fn);
   }
 
   /** Undo the newest op. The stacks move only AFTER the inverse applied — popping
    *  first (as this used to) discarded the entry on a failed undo, leaving the
-   *  change in the scene with no way back. */
+   *  change in the scene with no way back.
+   *
+   *  At a BOUND document the newest op may belong to the OTHER projection —
+   *  a planner placement, say, undone from the editor. Its inverse would not
+   *  fail there; it would be swallowed while the log pops, and the tree and the
+   *  history would part company in silence (plan-711 Spike (c), MESSUNG c1). So
+   *  the decision is made by KIND, before anything is applied, and such an op is
+   *  taken back by re-projecting the log without it. */
   async undo(): Promise<void> {
-    await this._enqueue(async () => {
-      const op = this._ops[this._ops.length - 1];
-      if (!op) return;
-      await this.executor.applyInverse(op);
-      this._ops.pop();
-      this._redo.push(op);
-    });
-    this._scheduleAutosave();
-    this._notify();
+    const newest = this._doc.ops[this._doc.opCount - 1];
+    if (this._bound && newest && this._reprojectTree
+        && needsRecomposeToUndo(newest, this._doc.mode)) {
+      const outcome = await undoViaRecompose({
+        doc: this._doc,
+        reload: this._reprojectTree,
+        label: this._doc.name,
+      });
+      if (!outcome.ok && outcome.reason !== 'nothing-to-undo') {
+        console.warn(`[rv-asset-document] undo deferred: ${outcome.message}`);
+      }
+      this._snapshot = null;
+      for (const fn of this._listeners) fn();
+      return;
+    }
+    await this._doc.undo();
+  }
+
+  /**
+   * How to rebuild the tree this document is projected into (plan-711 §2.3).
+   *
+   * Supplied by the binder — only IT knows how the bytes of this projection are
+   * produced (the editor loads the scene's bake through `viewer.loadModel`).
+   * Absent means "no re-projection available", and the undo path then behaves
+   * exactly as it did before the binding existed.
+   */
+  setReprojectTree(fn: (() => Promise<void>) | null): void {
+    this._reprojectTree = fn;
+  }
+
+  /**
+   * Where this document's BYTES projection stands (plan-711 §2.4).
+   *
+   * Supplied by the binder for the same reason as {@link setReprojectTree}: the
+   * scene owns the bake, so only it can say which slot holds which revision at
+   * which op count. Stamped into every draft write, and it is what lets the
+   * recovery on the other side of a crash tell a usable cache from a stale one
+   * instead of guessing (`decideDocumentRecovery`).
+   */
+  setDraftBytesCache(read: (() => RvDraftBytesCache | null) | null): void {
+    this._bytesCache = read;
   }
 
   /** Redo the newest undone op. Same stack discipline as {@link undo}. */
   async redo(): Promise<void> {
-    await this._enqueue(async () => {
-      const op = this._redo[this._redo.length - 1];
-      if (!op) return;
-      await this.executor.applyForward(op);
-      this._redo.pop();
-      this._ops.push(op);
-    });
-    this._scheduleAutosave();
-    this._notify();
+    await this._doc.redo();
   }
+
+  // ─── Base swap gate (plan-710 §2.4) ──────────────────────────────────
+
+  /**
+   * Declare that the document's BASE is being replaced — CAD re-import.
+   *
+   * Ops queued while this holds are dropped inside the queue: not applied, not
+   * recorded, no error. That is the same contract the scene lineage has had
+   * against a scene load (`canApply: () => !loading`), for the same reason. A
+   * re-import spends seconds tessellating and parsing before it deletes the old
+   * CAD root, and an edit issued in that window targets nodes that are about to
+   * stop existing — applying it edits the outgoing tree, recording it puts an
+   * unreplayable op in the incoming document's history.
+   *
+   * The gate covers the PREPARATION only. The re-import's own ops run after
+   * {@link endBaseSwap}, inside its transaction, and must of course apply.
+   *
+   * Always pair through `try/finally`: a flag left standing silently swallows
+   * every subsequent edit, which is worse than the hazard it guards.
+   */
+  beginBaseSwap(): void { this._baseSwapping = true; }
+
+  /** End the window opened by {@link beginBaseSwap}. */
+  endBaseSwap(): void { this._baseSwapping = false; }
+
+  /** True while a base swap is in flight and ops are being refused. */
+  get isBaseSwapping(): boolean { return this._baseSwapping; }
 
   // ─── Convenience op creators (EditTarget adapter + tools) ───────────
 
@@ -345,15 +549,13 @@ export class AssetDocument {
    * Queue an op from one of the SYNC mutators below, whose `void` signature the
    * UI event handlers depend on and whose promise therefore nobody holds.
    *
-   * Inside a transaction the failure is remembered in `_txnError`, so
+   * Inside a transaction the document remembers the failure, so
    * `withTransaction` still rolls back and rejects: a caller that opened a
    * transaction always learns that part of it did not apply, even when the op was
    * issued through an API that cannot hand the error back directly.
    */
-  private _voidApply(op: AssetOp): void {
-    void this.applyOp(op).catch((e) => {
-      if (this._txnOps && this._txnError === null) this._txnError = e;
-    });
+  private _voidApply(op: RvAssetOp): void {
+    this._doc.applyOpDetached(op);
   }
 
   setField(nodePath: string, componentType: string, fieldName: string, value: unknown, prev: unknown): void {
@@ -364,11 +566,35 @@ export class AssetDocument {
     this._voidApply({ ...assetOpHeader(), kind: 'unsetField', nodePath, componentType, fieldName, prev });
   }
 
+  /**
+   * Is `nodePath` the model root — the one node no structural verb may touch?
+   *
+   * The guard sits HERE rather than in each caller (plan-715 §2.4.4): every
+   * structural op in the app — UI, MCP tools, quick-edit actions — funnels
+   * through `AssetDocument`, so one check covers all of them, and a new caller
+   * inherits it instead of having to remember it.
+   *
+   * Refusal is LOUD (a warning), not silent: an op that quietly does nothing is
+   * how a caller learns the wrong lesson about what it may do. The Executor
+   * REPLAY path is the deliberate exception — see `_rename`/`_applyTransform`.
+   */
+  private _rejectRootOp(nodePath: string, verb: string): boolean {
+    if (!isModelRootPath(nodePath, this.viewer.registry, this.viewer.currentModelRoot)) return false;
+    console.warn(
+      `[asset-edits] ${verb} refused on the model root "${nodePath}": the GLB root is ` +
+      'structurally locked (its name is the first segment of every node path, its pose ' +
+      'is the asset origin). Edit its metadata instead.',
+    );
+    return true;
+  }
+
   transformNode(nodePath: string, transform: NodeTransform, prev: NodeTransform): void {
+    if (this._rejectRootOp(nodePath, 'transformNode')) return;
     this._voidApply({ ...assetOpHeader(), kind: 'transformNode', nodePath, transform, prev });
   }
 
   renameNode(nodePath: string, name: string, prevName: string): void {
+    if (this._rejectRootOp(nodePath, 'renameNode')) return;
     this._voidApply({ ...assetOpHeader(), kind: 'renameNode', nodePath, name, prevName });
   }
 
@@ -393,6 +619,7 @@ export class AssetDocument {
 
   /** Show/hide a node (no-op when the state already matches). */
   setNodeVisible(nodePath: string, visible: boolean): void {
+    if (this._rejectRootOp(nodePath, 'setNodeVisible')) return;
     const prev = this.viewer.registry?.getNode(nodePath)?.visible ?? true;
     if (prev === visible) return;
     this._voidApply({ ...assetOpHeader(), kind: 'setNodeVisible', nodePath, visible, prev });
@@ -470,7 +697,7 @@ export class AssetDocument {
     const movable = nodePaths.filter((p) => {
       const node = registry.getNode(p);
       if (!node || !node.parent) return false;
-      if (node === this.viewer.currentModelRoot) return false;
+      if (isModelRoot(node, this.viewer.currentModelRoot)) return false;
       // Same-parent is "already there" ONLY when no explicit slot is asked for;
       // with an index it is a legitimate reorder within the parent.
       if (node.parent === newParent && targetIndex === undefined) return false;
@@ -545,7 +772,7 @@ export class AssetDocument {
 
     // Inside an outer transaction (e.g. "group into empty") the caller owns
     // the undo unit — just emit the ops.
-    if (this._txnOps !== null || (movable.length === 1 && !label && !singleNeedsRename)) {
+    if (this._doc.inTransaction || (movable.length === 1 && !label && !singleNeedsRename)) {
       await doMoves();
     } else {
       const fallback = movable.length === 1
@@ -574,7 +801,7 @@ export class AssetDocument {
    * event, one BVH classification, one matrix flush, one undo step.
    *
    * DELIBERATELY NOT A NEW OP KIND. It composes the existing `renameNode` and
-   * `reparentNode` primitives inside an `AssetCompositeOp`, so undo, redo, draft
+   * `reparentNode` primitives inside ONE composite, so undo, redo, draft
    * replay, coalescing and the op-log schema all keep working untouched — a new
    * persisted kind would have had to be threaded through every switch in
    * `rv-asset-ops.ts` and would have changed the draft format for no measured gain
@@ -606,7 +833,7 @@ export class AssetDocument {
     for (const p of nodePaths) {
       const node = registry.getNode(p);
       if (!node || !node.parent) continue;
-      if (node === this.viewer.currentModelRoot) continue;
+      if (isModelRoot(node, this.viewer.currentModelRoot)) continue;
       if (node.parent === newParent && targetIndex === undefined) continue;
       if (seen.has(node)) continue;
       let cyclic = false;
@@ -655,7 +882,7 @@ export class AssetDocument {
       return Math.max(0, index);
     };
 
-    const ops: AssetPrimitiveOp[] = [];
+    const ops: RvAssetPrimitiveOp[] = [];
     const movedPaths: string[] = [];
     for (let i = 0; i < block.length; i++) {
       const node = block[i];
@@ -704,7 +931,10 @@ export class AssetDocument {
     if (ops.length === 1) {
       await this.applyOp(ops[0]);
     } else {
-      await this.applyOp({ ...assetOpHeader(), kind: 'composite', label, ops });
+      // Origin-typed constructor, not an inline record: `ops` is the batch's own
+      // asset-lineage primitives, and this is the point where that is still
+      // provable (plan-710 §2.2).
+      await this.applyOp(makeAssetComposite(label, ops));
     }
     return movedPaths;
   }
@@ -839,65 +1069,202 @@ export class AssetDocument {
   // ─── Draft persistence ───────────────────────────────────────────────
 
   /** Replay a recovered draft's ops onto the freshly loaded base. */
-  async replayOps(ops: AssetOp[]): Promise<void> {
-    for (const op of ops) {
-      await this.executor.applyForward(op);
-      this._ops.push(op);
-    }
-    this._notify();
+  async replayOps(ops: readonly RvOp[]): Promise<void> {
+    await this._doc.replayOps(ops);
   }
 
   toDraft(): AssetDraft {
     return {
-      shell: { id: this.id, name: this._name, base: this._base, createdAt: this._createdAt },
-      ops: [...this._ops],
+      shell: { id: this.id, name: this._doc.name, base: this._base, createdAt: this._doc.createdAt },
+      ops: [...this._doc.ops],
       savedAt: Date.now(),
     };
   }
 
-  /** Persist the draft NOW (bypasses the debounce — used by the exit guard). */
+  /**
+   * Persist the draft NOW (bypasses the debounce — used by the exit guard and
+   * by the end of an in-place test run).
+   *
+   * `writeNow` rather than `flush`: on both of those paths autosave was
+   * suspended or already flushed, so there may be no announced change pending,
+   * and a plain flush would write nothing at all.
+   */
   async flushDraft(): Promise<void> {
-    if (this._autosaveTimer) { clearTimeout(this._autosaveTimer); this._autosaveTimer = null; }
-    await saveAssetDraft(this.toDraft());
+    await this._autosave.writeNow(this._doc);
+  }
+
+  // ─── Draft frame ─────────────────────────────────────────────────────
+
+  /** This document's per-frame draft slot. */
+  get draftFrame(): RvDraftFrameKey { return this._draftFrame; }
+
+  /**
+   * Point the document at a stack frame's draft slot.
+   *
+   * A pending debounced write is CANCELLED rather than redirected: it described
+   * the document under the old key, and writing it under the new one is exactly
+   * the cross-frame contamination the per-frame keyspace exists to prevent.
+   * {@link RvDraftAutosave.setFrame} is that rule; this just forwards.
+   */
+  setDraftFrame(frame: RvDraftFrameKey): void {
+    this._draftFrame = frame;
+    this._autosave.setFrame(frame);
+  }
+
+  // ─── Editor test session (plan-410 F5) ───────────────────────────────
+
+  /**
+   * Stop autosaving until {@link resumeAutosave} (in-place test run).
+   *
+   * The test replaces the live scene with a materialised copy; the draft slot
+   * must keep describing the PRE-TEST authoring state for the whole run, so a
+   * crash mid-test recovers the document the user was editing — not the test
+   * scene. A pending debounced write is cancelled, not deferred.
+   */
+  suspendAutosave(): void {
+    this._autosaveSuspended = true;
+    this._autosave.cancel();
+  }
+
+  /** Re-enable autosave after {@link suspendAutosave}. Does not write. */
+  resumeAutosave(): void {
+    this._autosaveSuspended = false;
+  }
+
+  /** True while autosave is suspended (test run in progress). */
+  get isAutosaveSuspended(): boolean { return this._autosaveSuspended; }
+
+  /**
+   * Freeze everything the document's HISTORY consists of, so a test run can put
+   * it back byte for byte (plan-410 §2.4).
+   *
+   * Not `toDraft()`: a draft is a REPLAY recipe, and replaying it after a save
+   * would re-apply ops that `markSaved` already baked into the base — a clean
+   * document would come back dirty (review finding R1-2). The scene itself is
+   * restored from the exported GLB blob instead; this carries only the metadata
+   * that the blob cannot: op log, redo stack, clean-point baseline, rename flag.
+   *
+   * Every array is copied — the live stacks keep moving underneath.
+   */
+  captureSessionState(): AssetDocumentSessionState {
+    const history = this._doc.captureHistory();
+    return {
+      shell: { id: this.id, name: this._doc.name, base: this._base, createdAt: this._doc.createdAt },
+      ops: history.ops as RvAssetOp[],
+      redoOps: history.redoOps as RvAssetOp[],
+      baselineIds: history.baselineIds,
+      metaDirty: history.metaDirty,
+    };
+  }
+
+  /**
+   * Put a {@link captureSessionState} snapshot back, WITHOUT replaying anything
+   * (plan-410 §2.4). The caller has already re-loaded the exported blob, so the
+   * scene is the frozen authoring state; this only re-attaches the history to
+   * it. Autosave resumes — the document is exactly as dirty (or clean) as it
+   * was before the test.
+   */
+  restoreFromSnapshot(state: AssetDocumentSessionState): void {
+    this._base = state.shell.base;
+    this._doc.restoreHistory({
+      ops: [...state.ops],
+      redoOps: [...state.redoOps],
+      baselineIds: [...state.baselineIds],
+      baselineFloor: 0,
+      metaDirty: state.metaDirty,
+    });
+    // The name is metadata, not history: put it back WITHOUT `renameDocument`,
+    // which would set the meta-dirty flag `restoreHistory` just restored.
+    this._doc.setNameSilently(state.shell.name);
+    this.resumeAutosave();
+    this._snapshot = null;
   }
 
   // ─── Save / lifecycle ────────────────────────────────────────────────
 
-  /** Mark the current state as saved: re-base, flush trash, replace the draft.
-   *  A library save leaves a CLEAN draft (saved base + name, no ops) so a
-   *  reload re-opens the saved asset instead of a fresh Untitled; other bases
-   *  — and explicit discards (`clearDraft: true`) — clear the draft. The
-   *  returned promise resolves once the draft write/clear has landed; callers
-   *  that may race a page reload (the save flow) await it. */
-  markSaved(base: AssetBase, name?: string, opts?: { clearDraft?: boolean }): Promise<void> {
+  /** Mark the current state as saved: re-base, flush trash, drop the draft.
+   *
+   *  "Saved" means the frame has nothing outstanding, so the slot is CLEARED —
+   *  a clean draft record left behind is exactly what `planStackRecovery` would
+   *  later offer back as unsaved work. (Until plan-710 the unbound case wrote a
+   *  clean legacy record instead, so a reload would re-open the saved library
+   *  asset; that job belongs to `saveLastEditedAsset`/`setOpenDocumentBase`,
+   *  which the editor already writes on every successful open.)
+   *
+   *  The returned promise resolves once the clear has landed; callers that may
+   *  race a page reload (the save flow) await it. */
+  markSaved(base: AssetBase, name?: string, _opts?: { clearDraft?: boolean }): Promise<void> {
     this._base = base;
-    if (name) this._name = name;
-    this._baselineIds = this._ops.map((o) => o.id);
-    this._metaDirty = false;
     this.executor.flushTrash();
-    // Cancel a pending autosave — it would overwrite the clean draft below
-    // with the stale pre-save op log.
-    if (this._autosaveTimer) { clearTimeout(this._autosaveTimer); this._autosaveTimer = null; }
-    const draftDone = !opts?.clearDraft && base.kind === 'libraryGlb'
-      ? saveAssetDraft({
-          shell: { id: this.id, name: this._name, base, createdAt: this._createdAt },
-          ops: [],
-          savedAt: Date.now(),
-        })
-      : clearAssetDraft();
-    this._notify();
+    // Re-base the op log. This notifies, which schedules an autosave — so the
+    // cancel below MUST come after it, or the debounced write would overwrite
+    // the cleared draft with the stale pre-save log.
+    this._doc.markSaved(name ? { name } : undefined);
+    this._autosave.cancel();
+    const draftDone = clearDocumentDraft(this._draftFrame);
+    this._snapshot = null;
+    for (const fn of this._listeners) fn();
     return draftDone;
   }
 
   /** Wait for all queued ops to finish (save pipeline calls this first). */
   whenIdle(): Promise<void> {
-    return this._queue;
+    return this._doc.whenIdle();
+  }
+
+  /** Did this facade borrow its document from another projection? (plan-711 §2.2) */
+  get isBound(): boolean { return this._bound; }
+
+  /**
+   * The op count at the moment of the bind — the floor a discard rolls back to.
+   *
+   * Zero for an unbound document, where "everything since the bind" and
+   * "everything" are the same set.
+   */
+  get bindFloor(): number { return this._bindFloor; }
+
+  /**
+   * Discard what was authored SINCE the bind, for real (plan-711 R1-S1).
+   *
+   * The unbound editor discards by clearing its draft and letting the document
+   * die; a BOUND one cannot, because the document outlives the editor session —
+   * so "discard" has to mean discard. {@link RvDocument.rollbackTo} applies the
+   * inverses and cuts the log, on the queue, and the scene never sees the ops.
+   *
+   * Deliberately NOT `markSaved({floor})`: that rebases the clean point onto
+   * the ops that are there, which at a shared document hands the user's
+   * discarded work to the other projection as a clean, saved state
+   * (rv-asset-document.ts `markSaved` → `RvDocument.markSaved`).
+   */
+  async discardBoundEdits(): Promise<number> {
+    if (!this._bound) return 0;
+    const undone = await this._doc.rollbackTo(this._bindFloor);
+    this._snapshot = null;
+    for (const fn of this._listeners) fn();
+    return undone;
   }
 
   dispose(): void {
     this._disposed = true;
-    if (this._autosaveTimer) { clearTimeout(this._autosaveTimer); this._autosaveTimer = null; }
-    this.executor.dispose();
+    this._autosave.dispose();
+    this._unsubDoc();
+    this._detachCommitHook?.();
+    this._detachCommitHook = null;
+    if (this._bound) {
+      // NOT disposed: the document belongs to the projection that lent it, and
+      // that projection is still showing it. What goes is this facade's half of
+      // the binding — the commit hook above, and the asset executor context,
+      // which is tree-bound state of a tree that is about to be replaced. It is
+      // released THROUGH the unified executor so the shared document does not
+      // keep pointing at a disposed context; the next asset op builds a fresh
+      // one against the tree that is live by then.
+      const unified = this._doc.executor;
+      if (unified instanceof RvUnifiedExecutor) unified.releaseAssetContext();
+      else this.executor.dispose();
+    } else {
+      // Disposes the unified executor, which disposes the asset context we gave it.
+      this._doc.dispose();
+    }
     this._listeners.clear();
   }
 
@@ -910,102 +1277,23 @@ export class AssetDocument {
 
   getSnapshot = (): AssetDocumentSnapshot => {
     if (!this._snapshot) {
-      const lastOp = this._ops[this._ops.length - 1] ?? null;
-      const nextRedo = this._redo[this._redo.length - 1] ?? null;
+      const s = this._doc.getSnapshot();
+      // The three intrinsics, derived once in the document layer. Spread from
+      // `core` and not from `s`, so this object carries exactly the fields this
+      // interface declares — `RvDocumentSnapshot` also has `mode`, which is not
+      // part of the asset facade's contract.
       this._snapshot = {
-        id: this.id,
-        name: this._name,
+        ...this._doc.core,
+        id: s.id,
+        name: s.name,
         base: this._base,
-        dirty: this.dirty,
-        busy: this._busyDepth > 0 || this._txnBusy,
-        canUndo: this._ops.length > 0,
-        canRedo: this._redo.length > 0,
-        undoLabel: lastOp ? describeAssetOp(lastOp) : null,
-        redoLabel: nextRedo ? describeAssetOp(nextRedo) : null,
-        opCount: this._ops.length,
+        undoLabel: s.undoLabel,
+        redoLabel: s.redoLabel,
+        opCount: s.opCount,
       };
     }
     return this._snapshot;
   };
-
-  // ─── internals ───────────────────────────────────────────────────────
-
-  private _record(op: AssetOp): void {
-    if (this._txnOps) {
-      // Inside a transaction: collect, don't touch history yet.
-      this._txnOps.push(op);
-      return;
-    }
-    const last = this._ops[this._ops.length - 1];
-    if (last && canCoalesceAssetOps(last, op)) {
-      this._ops[this._ops.length - 1] = mergeAssetOps(last, op);
-    } else {
-      this._ops.push(op);
-      if (this._ops.length > MAX_OP_HISTORY) this._ops.shift();
-    }
-    this._redo.length = 0; // a new edit invalidates the redo branch
-    this._scheduleAutosave();
-    this._notify();
-  }
-
-  /**
-   * Run `work` on the single-flight queue.
-   *
-   * Two promises, deliberately: the QUEUE TAIL never rejects (a rejected tail
-   * would fail every later op through `.then`), while the promise handed to the
-   * CALLER does. That split is what lets a failed op be both survivable for the
-   * document and observable for whoever asked for it.
-   */
-  private _enqueue(work: () => Promise<void>): Promise<void> {
-    this._busyDepth++;
-    this._notify();
-    let failure: unknown = null;
-    let failed = false;
-    const tail = this._queue.then(async () => {
-      try {
-        await work();
-      } catch (e) {
-        failure = e;
-        failed = true;
-        console.warn('[asset-editor] op failed:', e);
-      } finally {
-        this._busyDepth--;
-        this._notify();
-      }
-    });
-    this._queue = tail;
-    return tail.then(() => { if (failed) throw failure; });
-  }
-
-  private _scheduleAutosave(): void {
-    if (this._disposed) return;
-    if (this._autosaveTimer) clearTimeout(this._autosaveTimer);
-    this._autosaveTimer = setTimeout(() => {
-      this._autosaveTimer = null;
-      void saveAssetDraft(this.toDraft());
-    }, DRAFT_AUTOSAVE_MS);
-  }
-
-  /**
-   * Invalidate the snapshot and wake the React store.
-   *
-   * Coalesced while a transaction is open: `_enqueue` notifies twice per op (busy in, busy out), so
-   * a bulk edit inside one transaction produced two notifications PER NODE. A PLMXML kinematics
-   * import moves 434 nodes and thereby raised React's "Maximum update depth exceeded" mid-apply —
-   * with no rollback in this API, that left the scene half-mutated. Chunking the caller's work did
-   * not help (measured, with a frame between chunks); the notification count is the actual lever.
-   *
-   * Suppressing here is safe because the transaction always ends with notifications that DO pass:
-   * the composite `_record` and `_enqueue`'s own finally both run after `_txnOps` is cleared. The
-   * trade is that intermediate states are not rendered during a bulk edit — which is what the
-   * `replayOps` path already does deliberately (one notify after the whole replay).
-   */
-  private _notify(): void {
-    if (this._txnOps || this._notifyPaused) return;
-    this._snapshot = null;
-    this._version++;
-    for (const fn of this._listeners) fn();
-  }
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────

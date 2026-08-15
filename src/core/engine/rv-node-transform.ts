@@ -11,7 +11,7 @@
  * IKTarget nodes ship scale (-1,1,1)) that must survive the edit.
  *
  * Shared by the IK target edit plugin (gizmo drags), the scene-op executors
- * (`setNodeTransform` forward/inverse) and the scene loader (persisted node
+ * (`transformNode` forward/inverse) and the scene loader (persisted node
  * transforms applied after model load).
  */
 

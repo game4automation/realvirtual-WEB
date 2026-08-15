@@ -31,13 +31,11 @@ import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
 import {
   assetOpHeader,
-  canCoalesceAssetOps,
   assetOpTouchesHierarchy,
   classifyAssetOpRaycastImpact,
-  describeAssetOp,
-  type AssetOp,
   type SeparateMeshOp,
 } from '../src/core/editor/rv-asset-ops';
+import { canCoalesceRvOps, describeRvOp, type RvAssetOp } from '../src/core/ops/rv-unified-ops';
 import { exportAssetGlb } from '../src/core/editor/rv-asset-glb-export';
 import { computeBVHAsync } from '../src/core/engine/rv-scene-loader';
 import type { BVHBuildPort } from '../src/core/engine/rv-bvh-build-port';
@@ -165,13 +163,13 @@ describe('9.6 separateMesh op semantics', () => {
 
   it('never coalesces — a split is one deliberate action', () => {
     const next: SeparateMeshOp = { ...op, ...assetOpHeader() };
-    expect(canCoalesceAssetOps(op, next)).toBe(false);
+    expect(canCoalesceRvOps(op, next)).toBe(false);
     // Also not against a different kind, and not in either order.
-    const other: AssetOp = {
+    const other: RvAssetOp = {
       ...assetOpHeader(), kind: 'renameNode', nodePath: 'Asset/Box', name: 'B', prevName: 'Box',
     };
-    expect(canCoalesceAssetOps(op, other)).toBe(false);
-    expect(canCoalesceAssetOps(other, op)).toBe(false);
+    expect(canCoalesceRvOps(op, other)).toBe(false);
+    expect(canCoalesceRvOps(other, op)).toBe(false);
   });
 
   it('touches the hierarchy, forces a raycast rebuild, and describes itself', () => {
@@ -179,11 +177,11 @@ describe('9.6 separateMesh op semantics', () => {
     const impact = classifyAssetOpRaycastImpact(op);
     expect(impact.rebuild).toBe(true);
     expect(impact.refitPaths).toEqual([]);
-    expect(describeAssetOp(op)).toBe('Separate Box (2 parts)');
+    expect(describeRvOp(op)).toBe('Separate Box (2 parts)');
   });
 
   it('propagates through a composite', () => {
-    const composite: AssetOp = {
+    const composite: RvAssetOp = {
       ...assetOpHeader(), kind: 'composite', label: 'Batch', ops: [op],
     };
     expect(assetOpTouchesHierarchy(composite)).toBe(true);
@@ -251,7 +249,7 @@ describe('9.7 undo, redo and replay', () => {
       addMesh(model, 'Raw');
       register();
       const doc = AssetDocument.newUntitled(viewer);
-      const rename: AssetOp = {
+      const rename: RvAssetOp = {
         ...assetOpHeader(), kind: 'renameNode', nodePath: 'Asset/Raw', name: 'Box', prevName: 'Raw',
       };
       const split: SeparateMeshOp = {

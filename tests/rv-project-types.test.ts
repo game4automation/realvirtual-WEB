@@ -19,9 +19,9 @@ import {
   isValidProjectV1,
   newProject,
   newProjectId,
-  sceneFileNameFor,
+  sceneGlbFileNameFor,
   sceneIdToken,
-  sceneRelPathFor,
+  sceneGlbRelPathFor,
   type RvProject,
 } from '../src/core/project/rv-project-types';
 
@@ -58,7 +58,7 @@ describe('isValidProjectV1 — forward compatibility', () => {
   it('never rejects an unknown field inside a scenes[] entry', () => {
     const p = {
       ...minimal(),
-      scenes: [{ id: 'scn_a', name: 'A', path: 'scenes/a.scene.json', tags: ['wip'] }],
+      scenes: [{ id: 'scn_a', name: 'A', path: 'scenes/a.scene.glb', tags: ['wip'] }],
     };
     expect(isValidProjectV1(p)).toBe(true);
   });
@@ -146,33 +146,33 @@ describe('RR1 — scene filenames are derived from the id, not the name', () => 
   it('two identically-named scenes never collide on one file', () => {
     const a = { id: 'scn_aaa_111', name: 'Cell' };
     const b = { id: 'scn_bbb_222', name: 'Cell' };
-    expect(sceneFileNameFor(a)).not.toBe(sceneFileNameFor(b));
-    expect(sceneRelPathFor(a)).not.toBe(sceneRelPathFor(b));
+    expect(sceneGlbFileNameFor(a)).not.toBe(sceneGlbFileNameFor(b));
+    expect(sceneGlbRelPathFor(a)).not.toBe(sceneGlbRelPathFor(b));
   });
 
   it('the legacy name-only slug WOULD have collided (regression witness)', () => {
-    const legacy = (name: string) => `${name.replace(/\s+/g, '_')}.scene.json`;
+    const legacy = (name: string) => `${name.replace(/\s+/g, '_')}.scene.glb`;
     expect(legacy('Cell')).toBe(legacy('Cell'));   // the bug, demonstrated
-    expect(sceneFileNameFor({ id: 'scn_a', name: 'Cell' }))
-      .not.toBe(sceneFileNameFor({ id: 'scn_b', name: 'Cell' }));
+    expect(sceneGlbFileNameFor({ id: 'scn_a', name: 'Cell' }))
+      .not.toBe(sceneGlbFileNameFor({ id: 'scn_b', name: 'Cell' }));
   });
 
   it('is stable for the same scene', () => {
     const s = { id: 'scn_x_1', name: 'Line A' };
-    expect(sceneFileNameFor(s)).toBe(sceneFileNameFor({ ...s }));
+    expect(sceneGlbFileNameFor(s)).toBe(sceneGlbFileNameFor({ ...s }));
   });
 
   it('stays filesystem-safe for hostile names', () => {
     const name = 'a/b\\c:d*e?f"g<h>i|j';
-    const file = sceneFileNameFor({ id: 'scn_q_9', name });
-    expect(file).toMatch(/^[a-z0-9_.-]+\.scene\.json$/);
+    const file = sceneGlbFileNameFor({ id: 'scn_q_9', name });
+    expect(file).toMatch(/^[a-z0-9_.-]+\.scene\.glb$/);
     expect(file).not.toContain('/');
     expect(file).not.toContain('\\');
   });
 
   it('survives an empty name by falling back to a slug placeholder', () => {
-    expect(sceneFileNameFor({ id: 'scn_z_8', name: '' })).toBe('project-z_8.scene.json');
-    expect(sceneFileNameFor({ id: 'scn_z_8' })).toBe('project-z_8.scene.json');
+    expect(sceneGlbFileNameFor({ id: 'scn_z_8', name: '' })).toBe('project-z_8.scene.glb');
+    expect(sceneGlbFileNameFor({ id: 'scn_z_8' })).toBe('project-z_8.scene.glb');
   });
 
   it('keeps the id token distinct for distinct ids', () => {
@@ -182,6 +182,6 @@ describe('RR1 — scene filenames are derived from the id, not the name', () => 
   });
 
   it('puts scene files under scenes/', () => {
-    expect(sceneRelPathFor({ id: 'scn_a_1', name: 'X' })).toMatch(/^scenes\//);
+    expect(sceneGlbRelPathFor({ id: 'scn_a_1', name: 'X' })).toMatch(/^scenes\//);
   });
 });

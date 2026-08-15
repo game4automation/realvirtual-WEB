@@ -3,10 +3,18 @@ export interface DeliveryProfile {
   project?: string;
   /** Repository-level slug; defaults to the config file name. */
   customer?: string;
-  /** Every project folder this customer repository carries (§2.10). */
+  /** Every project folder this customer repository carries (§2.10). Empty for a `standard` customer. */
   projects?: string[];
-  /** The one project a resolving load was asked for. */
-  projectKey?: string;
+  /** Relationship kind from the customer register; a `standard` customer is delivered projectless. */
+  kind?: 'development' | 'standard';
+  /**
+   * True when this delivery goes into the ONE repository shared by all standard
+   * customers (plan-434 §2.7). Nothing customer-specific may be generated into it —
+   * above all no `connectLicensePrefill`.
+   */
+  sharedRepo?: boolean;
+  /** The one project a resolving load was asked for; `null` for a projectless delivery. */
+  projectKey?: string | null;
   configName?: string;
   path?: string;
   tier: 'core' | 'commercial';
@@ -43,8 +51,22 @@ export function loadDeliveryConfig(privateRoot: string, projectKey: string, mani
 export function loadDeliveryConfigByCustomer(privateRoot: string, customer: string, manifest?: TierManifest): DeliveryProfile;
 export function listDeliveryConfigs(privateRoot: string, manifest?: TierManifest): DeliveryProfile[];
 export function hasDeliveryConfig(privateRoot: string, projectKey: string): boolean;
+export interface SharedDeliveryTarget {
+  org: string;
+  repo: string;
+  remote: string;
+  /** Slugs of every customer receiving this one repository, sorted. */
+  customers: string[];
+}
+export function sharedDeliveryTarget(privateRoot: string, manifest?: TierManifest): SharedDeliveryTarget | null;
 export function generateCustomerPrivatePlugins(manifest: TierManifest, profile: DeliveryProfile): string;
-export function renderFeatureMatrix(manifest: TierManifest, deliveries: DeliveryProfile[], customerProjectKey?: string | null): string;
+export function renderFeatureMatrix(
+  manifest: TierManifest,
+  deliveries: DeliveryProfile[],
+  customerProjectKey?: string | null,
+  projectPlugins?: Array<{ file: string; name: string }> | null,
+  options?: { customerScoped?: boolean },
+): string;
 export function stageFilteredSourceTree(options: Record<string, any>): { workspaceRoot: string; coreRoot: string; privateRoot: string | null; project: any; projectKey: string | null; projectKeys: string[]; delivery: any; manifest: TierManifest };
 export function assertNoCrossTierLeak(workspaceRoot: string, manifest: TierManifest, profile: DeliveryProfile): void;
 export function assertWorkspaceGuards(workspaceRoot: string, options?: Record<string, any>): void;
@@ -64,4 +86,23 @@ export function formatMergeSummary(snapshot: MergedSnapshot): string;
 export function mergeCommitNote(snapshot: MergedSnapshot): string;
 export function summariseMerge(result: { actions: Record<string, string>; conflicts: unknown[] }): Record<string, number>;
 export function createDeliveryManifest(options: Record<string, any>): Record<string, any>;
+export interface PrivateSourceInventory { count: number; sha256: string; paths: string[] }
+export interface BaselineSourceInventory { paths: string[]; trusted: boolean; reason: string | null }
+export interface PrivateSourceDiff {
+  gated: boolean;
+  trusted: boolean;
+  reason: string | null;
+  added: string[];
+  removed: string[];
+}
+export function inventoryDigest(paths: readonly string[]): string;
+export function collectPrivateSourceInventory(workspaceRoot: string): PrivateSourceInventory;
+export function parseBaselineSourceInventory(baseline: string | Record<string, any> | null | undefined): BaselineSourceInventory | null;
+export function diffPrivateSourceInventory(baseline: BaselineSourceInventory | null, current: PrivateSourceInventory): PrivateSourceDiff;
+export function assertPrivateSourceInventory(
+  baseline: BaselineSourceInventory | null,
+  current: PrivateSourceInventory,
+  options?: { acceptNew?: boolean },
+): PrivateSourceDiff;
+export function readBaselineSourceInventory(clone: string, baselineTag: string | null): BaselineSourceInventory | null;
 export function deliveryChangelog(coreRoot: string, previousCoreCommit: string | null, options?: { limit?: number }): string;

@@ -37,9 +37,10 @@ import {
   slotsForChannel,
 } from '../src/core/engine/rv-slot-authority';
 import { createTestViewer, type TestViewerHandle } from './helpers/create-test-viewer';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
-const GLB_URL = '/models/tests.glb';
-const SMALL_GLB_URL = '/models/physics-zone-test.glb';
+const GLB_URL = DEV_GLB.tests;
+const SMALL_GLB_URL = DEV_GLB.physicsZone;
 
 let handle: TestViewerHandle | null = null;
 

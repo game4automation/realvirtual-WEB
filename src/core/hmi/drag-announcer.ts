@@ -38,14 +38,19 @@
  *
  * ## The outcome closes the drag for this listener
  *
- * `dropAt()` emits the `outcome` and only THEN clears the hover, so the real
- * stream order on a successful drop is `outcome:accepted` followed by `leave`
- * — the plan's "outcome is always last" holds for the drop decision, not for
- * the byte order of the emissions. Taken literally, that trailing `leave` would
- * call `dropPending()` and swallow the success sentence while it is still
- * inside the debounce window, so the user would hear nothing at all about the
- * link they just made. Everything after the first `outcome` of a drag is
- * therefore ignored until the next `grabbed`.
+ * Since plan-353 (F1) `dropAt()` clears the hover BEFORE it emits, so the
+ * stream order on a successful drop is `enter → leave → outcome:accepted` and
+ * the `outcome` really is last — the registry now guarantees the invariant at
+ * the source instead of leaving it to be compensated here.
+ *
+ * The `settled` latch is kept anyway, as a REDUNDANT-BY-DESIGN second line of
+ * defence, not as the mechanism: it costs one boolean and it still mutes a
+ * `leave` that arrives from a FOREIGN emitter after the drag has been decided
+ * (a target unmounting, an overlay tearing down). Its original job — catching
+ * the registry's own trailing `leave`, which would call `dropPending()` and
+ * swallow the success sentence inside the debounce window — no longer exists.
+ * Everything after the first `outcome` of a drag stays ignored until the next
+ * `grabbed`.
  *
  * ## What is deliberately NOT here
  *
@@ -186,7 +191,9 @@ export function createDragAnnouncer(options: DragAnnouncerOptions = {}): DragAnn
   /** The payload of the running drag — the `outcome` carries the slot, not the signal. */
   let dragged: SignalDragPayload | null = null;
   let wasDragging = false;
-  /** Set by the first `outcome` of a drag; mutes the trailing `leave` (see module doc). */
+  /** Set by the first `outcome` of a drag. Redundant by design since plan-353:
+   *  the registry already clears the hover before emitting, so this only mutes
+   *  a `leave` from a foreign emitter after the drag is decided (module doc). */
   let settled = false;
 
   function flush(): void {

@@ -19,6 +19,7 @@ import { connectToServer, _resetConnectStore } from '../src/core/hmi/connect-sto
 import { SignalListView } from '../src/core/hmi/ConnectPanel';
 import { rvDarkTheme } from '../src/core/hmi/theme';
 import { RVViewerProvider } from '../src/hooks/use-viewer';
+import { findSignalRowLabel, getSignalRowLabel, querySignalRowLabel } from './helpers/signal-row-label';
 
 const viewerStub = {
   signalStore: null,
@@ -62,7 +63,10 @@ function renderSignalList(current: ConnectInterface) {
 
 /** Row element carrying the depth marker for a rendered label. */
 function rowOf(label: string): HTMLElement {
-  const el = screen.getByText(label);
+  // Signal leaves print their name twice (row label + chip) since plan-422 F4,
+  // so a bare getByText is ambiguous for them; topic NODES have only the one
+  // label and no `title`, so they still come from getByText.
+  const el = querySignalRowLabel(label) ?? screen.getByText(label);
   let node: HTMLElement | null = el;
   while (node && !node.hasAttribute('data-rv-depth')) node = node.parentElement;
   if (!node) throw new Error(`No depth-carrying row for '${label}'`);
@@ -123,16 +127,16 @@ describe('SignalListView MQTT topic tree', () => {
 
   it('collapses a single level without touching its siblings', async () => {
     renderSignalList(mqttFlatFixture());
-    await screen.findByText('OpenDoor');
+    await findSignalRowLabel('OpenDoor');
 
     fireEvent.click(rowOf('out'));
 
     await waitFor(() => {
-      expect(screen.queryByText('OpenDoor')).toBeNull();
-      expect(screen.queryByText('Machining')).toBeNull();
+      expect(querySignalRowLabel('OpenDoor')).toBeNull();
+      expect(querySignalRowLabel('Machining')).toBeNull();
     });
     // The sibling branch stays open, and so do the levels above.
-    expect(screen.getByText('OnSwitch')).toBeTruthy();
+    expect(getSignalRowLabel('OnSwitch')).toBeTruthy();
     expect(screen.getByText('out')).toBeTruthy();
   });
 
@@ -151,7 +155,7 @@ describe('SignalListView MQTT topic tree', () => {
     renderSignalList(iface);
 
     // The whole topic string is ONE group row — the tree never applies to topic entries (F5).
-    expect(await screen.findByText('Start')).toBeTruthy();
+    expect(await findSignalRowLabel('Start')).toBeTruthy();
     expect(screen.getAllByText('rv/cmd/start').length).toBeGreaterThan(0);
     expect(screen.queryByText('cmd')).toBeNull();
     // Topic groups carry no tree depth — nothing was split into levels.
@@ -173,9 +177,10 @@ describe('SignalListView MQTT topic tree', () => {
     renderSignalList(iface);
 
     // Unchanged single-level group row: label + total, no tree depth.
+    // Data_Q_1 is the ProcessImage TOPIC group row, not a signal row.
     const group = (await screen.findByText('Data_Q_1')).parentElement!;
     expect(within(group).getByText('2')).toBeTruthy();
-    expect(screen.getByText('Q1')).toBeTruthy();
+    expect(getSignalRowLabel('Q1')).toBeTruthy();
     expect(document.querySelectorAll('[data-rv-depth]')).toHaveLength(0);
   });
 
@@ -188,8 +193,8 @@ describe('SignalListView MQTT topic tree', () => {
     };
     renderSignalList(iface);
 
-    expect(await screen.findByText('Merker')).toBeTruthy();
-    expect(screen.getByText('Out')).toBeTruthy();
+    expect(await findSignalRowLabel('Merker')).toBeTruthy();
+    expect(getSignalRowLabel('Out')).toBeTruthy();
     // No tree node exists, so no row carries a depth marker.
     expect(document.querySelectorAll('[data-rv-depth]')).toHaveLength(0);
   });
@@ -200,28 +205,28 @@ describe('SignalListView MQTT topic tree', () => {
     renderSignalList(mqttFlatFixture());
 
     await screen.findByText('rv');
-    expect(screen.queryByText('OpenDoor')).toBeNull();
+    expect(querySignalRowLabel('OpenDoor')).toBeNull();
 
     const input = await openFilter();
     fireEvent.change(input, { target: { value: 'OpenDoor' } });
 
-    expect(await screen.findByText('OpenDoor')).toBeTruthy();
+    expect(await findSignalRowLabel('OpenDoor')).toBeTruthy();
     expect(screen.getByText('demo')).toBeTruthy();
     expect(screen.getByText('out')).toBeTruthy();
   });
 
   it('filter_prunesEmptyBranches', async () => {
     renderSignalList(mqttFlatFixture());
-    await screen.findByText('OpenDoor');
+    await findSignalRowLabel('OpenDoor');
 
     const input = await openFilter();
     fireEvent.change(input, { target: { value: 'OnSwitch' } });
 
-    expect(await screen.findByText('OnSwitch')).toBeTruthy();
+    expect(await findSignalRowLabel('OnSwitch')).toBeTruthy();
     await waitFor(() => {
       // The whole out/ branch disappears — no empty node is left behind.
       expect(screen.queryByText('out')).toBeNull();
-      expect(screen.queryByText('OpenDoor')).toBeNull();
+      expect(querySignalRowLabel('OpenDoor')).toBeNull();
     });
     expect(screen.getByText('in')).toBeTruthy();
   });
@@ -230,10 +235,10 @@ describe('SignalListView MQTT topic tree', () => {
     // A legacy (untyped) key must NOT collapse the tree node of the same name.
     seedCollapsed('mqtt-tree', ['rv']);
     const first = renderSignalList(mqttFlatFixture());
-    expect(await screen.findByText('OpenDoor')).toBeTruthy();
+    expect(await findSignalRowLabel('OpenDoor')).toBeTruthy();
 
     fireEvent.click(rowOf('demo'));
-    await waitFor(() => expect(screen.queryByText('OpenDoor')).toBeNull());
+    await waitFor(() => expect(querySignalRowLabel('OpenDoor')).toBeNull());
     // Persisted with its type prefix, next to the untouched legacy topic key.
     expect(storedCollapsed('mqtt-tree')).toContain('tree:rv/demo');
     expect(storedCollapsed('mqtt-tree')).toContain('rv');
@@ -242,7 +247,7 @@ describe('SignalListView MQTT topic tree', () => {
     renderSignalList(mqttFlatFixture());
 
     expect(await screen.findByText('demo')).toBeTruthy();
-    expect(screen.queryByText('OpenDoor')).toBeNull();  // collapse survived the remount
+    expect(querySignalRowLabel('OpenDoor')).toBeNull();  // collapse survived the remount
     expect(screen.getByText('rv')).toBeTruthy();        // the legacy key did not collapse `rv`
   });
 
@@ -270,7 +275,7 @@ describe('SignalListView MQTT topic tree', () => {
     await connectToServer();
 
     renderSignalList(mqttFlatFixture());
-    await screen.findByText('OpenDoor');
+    await findSignalRowLabel('OpenDoor');
 
     expect(screen.getByRole('button', { name: "Edit signal 'OpenDoor'" })).toBeTruthy();
     expect(screen.getByRole('button', { name: "Delete signal 'OpenDoor'" })).toBeTruthy();

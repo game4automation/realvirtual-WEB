@@ -1,0 +1,89 @@
+{
+  "$comment": [
+    "plan-718 §9.7 — the ONE fixture both languages assert against.",
+    "TypeScript reads it from tests/rv-project-refs.test.ts; the CONNECT xUnit",
+    "side (stage 1) reads this same file, so a schema drift between the two",
+    "readers fails a test instead of failing a customer's project.",
+    "Pattern: Fixtures/workspace-id-vectors.json (plan-363 phase 5).",
+    "It is deliberately NOT a valid project on disk: knowledge/versand.json is",
+    "absent so the dead-reference case has something to be dead about."
+  ],
+  "manifest": {
+    "schemaVersion": 2,
+    "id": "prj_refs_fixture",
+    "name": "Reference model fixture",
+    "canonicalName": "project-refs-vectors",
+    "connect": {
+      "agentsRef": "connect/agents.json",
+      "secretsRef": "connect/secrets.local.json",
+      "ragRef": "knowledge/linie1-rag.zip"
+    },
+    "documents": [
+      {
+        "id": "ast_m8x",
+        "path": "models/linie1.glb",
+        "name": "Linie 1",
+        "section": "models",
+        "connectRef": "connect/linie-1.connect.json",
+        "scriptRef": "scripts/linie1/index.ts",
+        "knowledgeRef": "knowledge/linie-1.json"
+      },
+      {
+        "id": "ast_p4q",
+        "path": "models/linie1-detail.glb",
+        "name": "Linie 1 Detail",
+        "section": "models",
+        "connectRef": "connect/linie-1.connect.json",
+        "scriptRef": "scripts/linie1/index.ts"
+      },
+      {
+        "id": "ast_c07",
+        "path": "library/foerderer.glb",
+        "name": "Foerderer",
+        "section": "library",
+        "scriptRef": "scripts/conveyor.ts"
+      },
+      {
+        "id": "ast_z12",
+        "path": "models/versand.glb",
+        "name": "Versand",
+        "section": "models",
+        "knowledgeRef": "knowledge/versand.json"
+      },
+      {
+        "id": "ast_esc",
+        "path": "models/escape.glb",
+        "name": "Escape attempt",
+        "section": "models",
+        "connectRef": "../outside/steal.connect.json"
+      }
+    ]
+  },
+  "expect": {
+    "connectRefN1": {
+      "ref": "connect/linie-1.connect.json",
+      "documentIds": ["ast_m8x", "ast_p4q"]
+    },
+    "scriptRefN1": {
+      "ref": "scripts/linie1/index.ts",
+      "documentIds": ["ast_m8x", "ast_p4q"]
+    },
+    "deadRefs": [
+      { "documentId": "ast_z12", "field": "knowledgeRef", "ref": "knowledge/versand.json" }
+    ],
+    "rejectedRefs": [
+      { "documentId": "ast_esc", "field": "connectRef", "ref": "../outside/steal.connect.json" }
+    ],
+    "secretsRef": "connect/secrets.local.json",
+    "agentsRef": "connect/agents.json",
+    "ragRef": "knowledge/linie1-rag.zip",
+    "presentFiles": [
+      "connect/linie-1.connect.json",
+      "connect/agents.json",
+      "knowledge/linie1-rag.zip",
+      "scripts/linie1/index.ts",
+      "scripts/conveyor.ts",
+      "knowledge/linie-1.json"
+    ]
+  }
+}

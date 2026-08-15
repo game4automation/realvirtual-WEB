@@ -22,6 +22,7 @@
 import { describe, it, expect } from 'vitest';
 import { Mesh, BoxGeometry, Object3D } from 'three';
 import { createTransitTimer } from '../src/behaviors/_shared/transit-timing';
+import { DEFAULT_TRANSPORT_SPEED_MM_S } from '../src/core/engine/rv-constants';
 import {
   type MaterialFlowSelf,
   type MU,
@@ -85,18 +86,18 @@ describe('createTransitTimer — geometry + drive resolution', () => {
     expect(timer.length).toBeCloseTo(1500, 1);
   });
 
-  it('speed falls back to 200 mm/s when the belt has no drive', () => {
+  it('speed falls back to the default transport speed when the belt has no drive', () => {
     const belt = makeBeltMesh(1.0, 0.1, 0.2);
     const timer = createTransitTimer(makeSelf(), belt);
-    expect(timer.speed).toBe(200);
-    expect(timer.transitTime).toBeCloseTo(5, 6); // 1000 / 200
+    expect(timer.speed).toBe(DEFAULT_TRANSPORT_SPEED_MM_S);
+    expect(timer.transitTime).toBeCloseTo(1000 / DEFAULT_TRANSPORT_SPEED_MM_S, 6);
   });
 
-  it('speed falls back to 200 mm/s when the drive TargetSpeed is 0', () => {
+  it('speed falls back to the default transport speed when the drive TargetSpeed is 0', () => {
     const belt = makeBeltMesh(1.0, 0.1, 0.2);
     const drives: DriveMap = new Map([[belt, { TargetSpeed: 0 }]]);
     const timer = createTransitTimer(makeSelf(drives), belt);
-    expect(timer.speed).toBe(200);
+    expect(timer.speed).toBe(DEFAULT_TRANSPORT_SPEED_MM_S);
   });
 
   it('drive TargetSpeed wins when positive', () => {
@@ -113,7 +114,7 @@ describe('createTransitTimer — geometry + drive resolution', () => {
     belt.updateMatrixWorld(true);
 
     const timer = createTransitTimer(makeSelf(), belt);
-    // length falls back to 1 mm; speed 200 → 0.005 s (still finite & > 0).
+    // length falls back to 1 mm; default speed → still finite & > 0.
     expect(Number.isFinite(timer.transitTime)).toBe(true);
     expect(timer.transitTime).toBeGreaterThan(0);
     expect(timer.entryPos).toEqual([3, 4, 5]);

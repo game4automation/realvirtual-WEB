@@ -20,6 +20,7 @@ import type { ComponentContext, ComponentSchema, RVComponent } from './rv-compon
 import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import type { GizmoHandle } from './rv-gizmo-manager';
 import { NodeRegistry } from './rv-node-registry';
+import { wireValueSignal } from './rv-signal-wiring';
 import {
   normalizeHighlightStyle,
   resolveUseRing,
@@ -76,15 +77,17 @@ export class RVWebError implements RVComponent {
     });
 
     // Subscribe only when a signal is bound (no signal → never active).
+    // plan-427: the helper adds a re-apply slot so an error level held across a
+    // reset re-raises the highlight. The FIRST call only CAPTURES the level —
+    // the gizmos do not exist until onSceneReady(), which applies it (that was
+    // the point of the hand-written initial read this replaces).
     if (this.SignalError) {
-      this._unsubscribe = ctx.signalStore.subscribeByPath(
-        this.SignalError,
-        (v) => this._onChange(!!v),
-      );
-      // Note: initial state is applied in onSceneReady once the gizmos exist —
-      // we still read it here to capture a value set before init (no race).
-      const current = ctx.signalStore.getByPath(this.SignalError);
-      if (current !== undefined) this._active = !!current;
+      let deferInitial = true;
+      this._unsubscribe = wireValueSignal(ctx.signalStore, this.SignalError, (v) => {
+        if (deferInitial) { deferInitial = false; this._active = !!v; return; }
+        this._onChange(!!v);
+      }, undefined, ctx.reapply).unsubscribe;
+      deferInitial = false;
     }
   }
 

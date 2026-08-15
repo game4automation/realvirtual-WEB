@@ -16,6 +16,7 @@ import type { UISlotEntry, UISlotProps } from '../../core/rv-ui-plugin';
 import type { RVDrive } from '../../core/engine/rv-drive';
 import type { ActiveOnly } from '../../core/engine/rv-active-only';
 import { RVBehavior } from '../../core/rv-behavior';
+import { modeContext } from '../../core/rv-mode-manager';
 import { NavButton } from '../../core/hmi/NavButton';
 import { debug } from '../../core/engine/rv-debug';
 
@@ -101,7 +102,25 @@ function TestAxesButton({ viewer }: UISlotProps) {
 export class TestAxesPlugin extends RVBehavior {
   readonly id = 'test-axes';
   readonly slots: UISlotEntry[] = [
-    { slot: 'button-group', component: TestAxesButton, order: 60 },
+    // plan-423: jogging single axes by hand is a commissioning tool, so the
+    // entry opts INTO that workspace. Written as `hiddenIn` (fails OPEN) rather
+    // than a positive list on purpose: the ruleless entry was visible in `hmi`
+    // AND in the no-mode window (CONNECT embed, pre-mode-boot), and a
+    // `shownOnlyInAny` would have silently removed it there. The four listed
+    // modes are exactly where ButtonPanel's ruleless auto-hide used to hide it.
+    {
+      slot: 'button-group',
+      component: TestAxesButton,
+      order: 60,
+      visibilityRule: {
+        hiddenIn: [
+          modeContext('des'),
+          modeContext('planner'),
+          modeContext('editor'),
+          modeContext('viewer'),
+        ],
+      },
+    },
   ];
 
   static readonly AXIS_NAMES = ['A1', 'A2', 'A3', 'A4', 'A5', 'A6'];

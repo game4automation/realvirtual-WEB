@@ -29,3 +29,18 @@ export function useViewer(): RVViewer {
   }
   return viewer;
 }
+
+/**
+ * The RVViewer if there is one, `null` if there is not.
+ *
+ * For the handful of components that mount OUTSIDE any viewer — the storage
+ * notice banner is one: it reports on browser storage, which is true whether or
+ * not a scene ever loaded. Likewise for a component that only *enriches* itself
+ * with the viewer — a card that would generate a thumbnail if it could — and
+ * must still render in a tree that has no provider above it, which is every
+ * unit test of that component. Throwing at them would make an absent viewer a
+ * rendering error rather than the ordinary condition it is.
+ */
+export function useOptionalViewer(): RVViewer | null {
+  return useContext(ViewerContext);
+}

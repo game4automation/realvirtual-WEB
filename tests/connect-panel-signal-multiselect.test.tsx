@@ -15,6 +15,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { ThemeProvider } from '@mui/material/styles';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { ConnectInterface, ConnectInterfaceSignal } from '../src/core/hmi/connect-store';
+import { findSignalRowLabel, getSignalRowLabel, querySignalRowLabel } from './helpers/signal-row-label';
 
 const updateInterfaceMock = vi.fn(async () => {});
 
@@ -76,7 +77,10 @@ function renderList(iface: ConnectInterface) {
  * carries — `data-rv-depth` exists only on MQTT tree leaves, so it would miss topic-nested rows.
  */
 function rowOf(name: string): HTMLElement {
-  let node: HTMLElement | null = screen.getByText(name);
+  // Anchored on the row LABEL, not on any element containing the text: since
+  // plan-422 F4 the chip renders the signal name as its own text node too, so a
+  // bare getByText matches twice on every visible row.
+  let node: HTMLElement | null = getSignalRowLabel(name);
   while (node && !node.hasAttribute('aria-selected')) node = node.parentElement;
   if (!node) throw new Error(`no row for '${name}'`);
   return node;
@@ -167,7 +171,8 @@ describe('CONNECT signal list — multi-selection wiring', () => {
     renderList(iface);
 
     // The group renders collapsed-by-default in some states; make sure the rows are there.
-    if (!screen.queryByText('Motor')) fireEvent.click(screen.getByText('Data_Q_1'));
+    // Data_Q_1 is the ProcessImage TOPIC group, not a signal row — plain text.
+    if (!querySignalRowLabel('Motor')) fireEvent.click(screen.getByText('Data_Q_1'));
 
     fireEvent.click(rowOf('Motor'));
     fireEvent.click(rowOf('Valve'), { ctrlKey: true });

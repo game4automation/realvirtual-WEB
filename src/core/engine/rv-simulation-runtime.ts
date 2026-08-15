@@ -14,6 +14,13 @@
  *    Deliberately NOT a pause reason — `clearPauseReasons()` can never
  *    resurrect simulation inside a detached workspace, and pause state
  *    survives an editor round-trip untouched.
+ *
+ *    ONE sanctioned exception (plan-410 F5): the editor's in-place test run,
+ *    via {@link beginEditorTest}/{@link endEditorTest}. It does not weaken the
+ *    invariant, it names it — workspace modes remain the only driver of the
+ *    BASELINE attachment, and the test run is a scoped, owned override that
+ *    restores exactly what the mode descriptor implied. `_setAttached` stays
+ *    internal, and there is at most one test owner at a time.
  * 2. **Pause reasons** — delegated to the loop's refcounted pause set
  *    (unchanged semantics; `RVViewer.setSimulationPaused` keeps working).
  * 3. **Execution mode** — `'continuous' | 'discrete'`, mapped onto the
@@ -77,6 +84,45 @@ export class SimulationRuntime {
     this.host.getLoop().setIntegrationEnabled(attached);
     this.host.emit('runtime-attach-changed', { attached });
   }
+
+  // ─── Axis 1b: editor test run (scoped attach override) ─────────────
+
+  /** True while an editor test run holds the attachment. */
+  private _editorTest = false;
+  /** Attachment as the workspace mode left it, restored by endEditorTest. */
+  private _preEditorTestAttached = true;
+
+  /**
+   * Attach the runtime for an EDITOR TEST RUN inside a detached workspace
+   * (plan-410 F5) — kinematics, signals and LogicSteps run in place, without a
+   * save-and-switch round trip.
+   *
+   * Owner semantics: exactly one active test owner. A second `begin` without an
+   * `end` is a bug in the caller's state machine, so it warns and is otherwise
+   * ignored (the first owner keeps the attachment, and the single `end` that
+   * follows still restores correctly). {@link endEditorTest} restores the
+   * attachment the mode descriptor implied when the test started — it does not
+   * simply attach or detach.
+   */
+  beginEditorTest(): void {
+    if (this._editorTest) {
+      console.warn('[SimulationRuntime] beginEditorTest ignored — a test run is already active');
+      return;
+    }
+    this._editorTest = true;
+    this._preEditorTestAttached = this._attached;
+    this._setAttached(true);
+  }
+
+  /** End the test run and restore the pre-test attachment. Idempotent. */
+  endEditorTest(): void {
+    if (!this._editorTest) return;
+    this._editorTest = false;
+    this._setAttached(this._preEditorTestAttached);
+  }
+
+  /** True while an editor test run is attached. */
+  get isEditorTestActive(): boolean { return this._editorTest; }
 
   // ─── Axis 2: pause reasons (delegated to the loop) ─────────────────
 

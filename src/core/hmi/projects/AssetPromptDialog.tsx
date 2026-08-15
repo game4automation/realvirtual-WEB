@@ -24,8 +24,12 @@ import {
 } from '@mui/material';
 
 export interface AssetPromptState {
-  kind: 'renameAsset' | 'collections';
-  /** Asset path relative to `library/`. */
+  /**
+   * `renameNode` is the same prompt for a card in the folder-contents grid
+   * (Lauf 13): a different write path at the caller, an identical question here.
+   */
+  kind: 'renameAsset' | 'collections' | 'renameNode';
+  /** Asset path relative to `library/` — or a tree path, for `renameNode`. */
   relPath: string;
   value: string;
 }
@@ -37,7 +41,7 @@ export interface AssetPromptDialogProps {
 }
 
 export function AssetPromptDialog({ state, onChange, onSubmit }: AssetPromptDialogProps) {
-  const isRename = state?.kind === 'renameAsset';
+  const isRename = state?.kind === 'renameAsset' || state?.kind === 'renameNode';
   // Clearing collections is meaningful; clearing a file name is not.
   const canSubmit = !isRename || (state?.value.trim().length ?? 0) > 0;
 

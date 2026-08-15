@@ -24,6 +24,7 @@ import {
   type SignalMapping,
 } from '../layout-planner/rv-layout-store';
 import type { BindableRowKind, PickerSignal, SlotRow } from '../../core/hmi/rv-signal-slot-row';
+import { omitUndefined } from '../../core/hmi/rv-omit-undefined';
 import { mapDiscoveredDirection } from './signal-bind-store';
 
 /** Probe writer for the row-level canWriteSlot() reason — a generic
@@ -166,7 +167,7 @@ export function collectInternalSignals(
  */
 export function upsertMappingForRow(
   mappings: readonly SignalMapping[],
-  row: Pick<SlotRow, 'slot' | 'componentPath' | 'kind' | 'direction'>,
+  row: Pick<SlotRow, 'slot' | 'componentPath' | 'kind' | 'direction' | 'componentType'>,
   source: PickerSignal,
 ): SignalMapping[] | null {
   if (source.conflict) return null;
@@ -175,10 +176,22 @@ export function upsertMappingForRow(
   if (!internal && !source.interfaceId) return null;
   const direction = mapDiscoveredDirection(source.direction, row.direction ?? 'plcInput');
   const others = mappings.filter((m) => !mappingMatchesRow(m, row));
-  const next: SignalMapping = internal
+  // `omitUndefined` is load-bearing, not tidiness (plan-422 F1): an optional key
+  // written as a PRESENT `undefined` — `topic` on a CONNECT signal that has no
+  // MQTT topic, `componentPath` on a node-level row — is a value the GLB bake
+  // must refuse, because `JSON.stringify` would drop it without saying so. The
+  // refusal is per FILE, so one such key used to kill the entire draft autosave.
+  // An absent key round-trips to the same `undefined` on read, losing nothing.
+  // The resolved slot's component type, recorded so a re-parented slot can be
+  // looked for later (plan-425 F3). The row IS the resolved slot, so this is the
+  // one moment the type is known without guessing; `omitUndefined` keeps it
+  // absent rather than present-and-undefined on fixtures that have no type.
+  const componentType = row.componentType;
+  const next: SignalMapping = omitUndefined(internal
     ? {
       kind,
       componentPath: row.componentPath,
+      componentType,
       slot: row.slot,
       sourceKind: 'internal',
       signal: source.name,
@@ -188,13 +201,14 @@ export function upsertMappingForRow(
     : {
       kind,
       componentPath: row.componentPath,
+      componentType,
       slot: row.slot,
       signal: source.name,
       interfaceId: source.interfaceId,
       topic: source.topic,
       direction,
       enabled: true,
-    };
+    });
   return [...others, next];
 }
 

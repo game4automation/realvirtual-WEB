@@ -14,7 +14,7 @@ import { GroupRegistry } from '../src/core/engine/rv-group-registry';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
 import {
   zeroLocalPosition, rotate90, toGround, pivotToBottom, alignYUp, centerKinematicToGroup, pivotToObjectCenter,
-} from '../src/plugins/asset-editor/kinematics/transform-actions';
+} from '@rv-private/plugins/asset-editor/kinematics/transform-actions';
 
 function makeViewer() {
   const scene = new Scene();

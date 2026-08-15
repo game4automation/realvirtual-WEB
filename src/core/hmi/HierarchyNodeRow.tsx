@@ -17,7 +17,7 @@
 
 import { useCallback, useMemo, memo } from 'react';
 import { Box, IconButton, Tooltip, Typography } from '@mui/material';
-import { ExpandMore, ChevronRight, VisibilityOutlined, VisibilityOffOutlined, OpenInNewRounded } from '@mui/icons-material';
+import { ExpandMore, ChevronRight, VisibilityOutlined, VisibilityOffOutlined, OpenInNewRounded, Inventory2Outlined } from '@mui/icons-material';
 import type { EditableNodeInfo } from './rv-extras-editor';
 import type { RVViewer } from '../rv-viewer';
 import type { SignalStore } from '../engine/rv-signal-store';
@@ -46,8 +46,12 @@ export type DropZone = 'before' | 'after' | 'onto';
 const DND_ACCENT = '79, 195, 247';
 
 /** Classify the pointer's vertical position within a row into a drop zone:
- *  top ~25% = before, bottom ~25% = after, middle ~50% = onto (Unity model). */
-function dropZoneFromPointer(e: React.DragEvent): DropZone {
+ *  top ~25% = before, bottom ~25% = after, middle ~50% = onto (Unity model).
+ *
+ *  Exported since plan-703 Phase 6: the project tree drags files between
+ *  folders with the same three zones and the same thresholds, and a second
+ *  copy would be a second set of thresholds that could drift from this one. */
+export function dropZoneFromPointer(e: React.DragEvent): DropZone {
   const rect = e.currentTarget.getBoundingClientRect();
   const rel = (e.clientY - rect.top) / Math.max(1, rect.height);
   if (rel < 0.25) return 'before';
@@ -81,7 +85,18 @@ export const rowDomId = (path: string): string => `rvrow-${encodeURIComponent(pa
 export interface VisibilityRowProps {
   /** The node's OWN visible flag (eye icon state). */
   getNodeVisible?: (path: string) => boolean;
-  /** False when the node OR an ancestor is hidden (row dimming). */
+  /**
+   * False when the row should be DIMMED.
+   *
+   * Two independent reasons, one styling (plan-703 §2.4.2): the node or an
+   * ancestor is hidden (the eye), or the node lies inside an `AssetReference`
+   * and its structure therefore belongs to another file. The caller folds both
+   * in — a second reason must never grow a second visual, or "greyed out" stops
+   * meaning one thing.
+   *
+   * Independent of {@link getNodeVisible}: the reference reason applies in every
+   * mode, including those with no eye toggles at all.
+   */
   getEffectiveVisible?: (path: string) => boolean;
   onToggleVisible?: (path: string) => void;
 }
@@ -196,6 +211,11 @@ export const TreeNodeRow = memo(function TreeNodeRow({
   const isExpanded = expanded.has(expandKey);
   const hasChildren = node.children.length > 0 || node.canExpandLazy === true;
   const hasComponents = node.types.length > 0;
+  // The GLB root row (plan-715): selectable and inspectable, structurally frozen.
+  // Everything gated on this is a REMOVAL — no eye, no drag handle — so the lock
+  // is legible as "fewer affordances", not as a new decoration to learn.
+  const isRootRow = node.isModelRoot === true;
+  const label = node.displayLabel ?? node.name;
   // Mesh-only children get a path but no component types; the caret icon
   // handles expand/collapse via stopPropagation so row clicks still select.
   const isSelectable = !!node.path;
@@ -205,9 +225,12 @@ export const TreeNodeRow = memo(function TreeNodeRow({
   const domId = useMemo(() => (node.path ? rowDomId(node.path) : undefined), [node.path]);
 
   // Editor eye toggle (props present only while the asset editor is active).
-  const canToggleVis = !!(onToggleVisible && getNodeVisible && node.path);
+  // Never on the root: the asset root always stays visible (F4).
+  const canToggleVis = !!(onToggleVisible && getNodeVisible && node.path) && !isRootRow;
   const selfVisible = canToggleVis ? getNodeVisible!(node.path!) : true;
-  const effectiveVisible = canToggleVis ? (getEffectiveVisible?.(node.path!) ?? true) : true;
+  // NOT gated on `canToggleVis`: dimming now also carries "inside a reference",
+  // which is true in modes that have no eye toggles (plan-703 §2.4.2).
+  const effectiveVisible = node.path ? (getEffectiveVisible?.(node.path) ?? true) : true;
 
   // Check if this node has a LogicStep component
   const hasLogicStep = node.types.some(isLogicStepType);
@@ -266,7 +289,10 @@ export const TreeNodeRow = memo(function TreeNodeRow({
   });
 
   // ── Drag & drop (asset editor only) ──
-  const canDrag = !!(dndEnabled && isSelectable && node.path);
+  // The root is never a drag SOURCE (it has no parent to move within), but it
+  // stays a drop TARGET: dropping onto it is how you move a node back to the
+  // top level, which is existing behaviour and stays.
+  const canDrag = !!(dndEnabled && isSelectable && node.path) && !isRootRow;
   const handleDragStart = useCallback((e: React.DragEvent) => {
     if (node.path) onRowDragStart?.(node.path, e);
   }, [node.path, onRowDragStart]);
@@ -357,22 +383,38 @@ export const TreeNodeRow = memo(function TreeNodeRow({
         {/* Status dot for LogicStep nodes */}
         {stepInfo && <StepStateDot stepState={stepInfo.state} />}
 
-        <Tooltip title={node.name} placement="right" enterDelay={400} slotProps={{ tooltip: { sx: { fontSize: 10 } } }}>
+        {/* Root marker: one quiet glyph, no colour of its own. It says "this is
+            the file", which is also why it is not an interactive control. */}
+        {isRootRow && (
+          <Inventory2Outlined
+            aria-hidden
+            sx={{ fontSize: 13, mr: 0.5, flexShrink: 0, color: isSelected ? 'primary.main' : 'text.disabled' }}
+          />
+        )}
+
+        <Tooltip
+          title={isRootRow ? `${label}\nModel root — locked (node: ${node.name})` : node.name}
+          placement="right"
+          enterDelay={400}
+          slotProps={{ tooltip: { sx: { fontSize: 10, whiteSpace: 'pre-line' } } }}
+        >
           <Typography
             sx={{
               fontSize: 12,
               lineHeight: 1.3,
               // Selection carries a non-color cue (weight) too, not blue alone —
               // readable for low-vision users and in screenshots.
-              fontWeight: isSelected ? 600 : hasComponents ? 400 : 500,
+              fontWeight: isSelected || isRootRow ? 600 : hasComponents ? 400 : 500,
               color: isSelected
                 ? 'primary.main'
-                : isMeshOnly
-                  ? 'text.disabled'
-                  : hasComponents
-                    ? 'text.primary'
-                    : 'text.secondary',
-              fontStyle: isMeshOnly ? 'italic' : 'normal',
+                : isRootRow
+                  ? 'text.primary'
+                  : isMeshOnly
+                    ? 'text.disabled'
+                    : hasComponents
+                      ? 'text.primary'
+                      : 'text.secondary',
+              fontStyle: isMeshOnly && !isRootRow ? 'italic' : 'normal',
               opacity: effectiveVisible ? 1 : 0.45,
               flex: 1,
               overflow: 'hidden',
@@ -382,7 +424,7 @@ export const TreeNodeRow = memo(function TreeNodeRow({
               mr: 0.25,
             }}
           >
-            {node.name}
+            {label}
           </Typography>
         </Tooltip>
 
@@ -459,7 +501,8 @@ export const FlatNodeRow = memo(function FlatNodeRow({
   const canToggleVis = !!(onToggleVisible && getNodeVisible);
   const domId = useMemo(() => rowDomId(info.path), [info.path]);
   const selfVisible = canToggleVis ? getNodeVisible!(info.path) : true;
-  const effectiveVisible = canToggleVis ? (getEffectiveVisible?.(info.path) ?? true) : true;
+  // See TreeNodeRow: dimming is independent of the eye toggle since plan-703.
+  const effectiveVisible = getEffectiveVisible?.(info.path) ?? true;
 
   const handleClick = useCallback((e: React.MouseEvent) => {
     onSelect(info.path, { shift: e.shiftKey, toggle: e.ctrlKey || e.metaKey });

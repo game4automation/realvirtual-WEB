@@ -19,7 +19,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadDeliveryConfig, loadDeliveryConfigByCustomer, readPlasticChangeset } from './_workspace-lib.mjs';
+import { RELEASE_TAG_PATTERN, loadDeliveryConfig, loadDeliveryConfigByCustomer, readPlasticChangeset } from './_workspace-lib.mjs';
 import { assertValidProject } from './validate-project.mjs';
 import { ragSeedIndex, tmpDir } from './lib/rv-machine-paths.mjs';
 
@@ -34,8 +34,10 @@ const generator = join(scriptDir, 'generate-customer-workspace.mjs');
 // C:\Users\<user>\wkspaces\game4automation-release alike. See scripts/lib/rv-machine-paths.mjs.
 const DEFAULT_SEED_INDEX = ragSeedIndex();
 const DEFAULT_TMP = tmpDir();
-// Kept in sync with gitProvenance() in _workspace-lib.mjs.
-const RELEASE_TAG = /^viewer-v\d+\.\d+\.\d+(?:[-+].+)?$/;
+// The one definition, shared with gitProvenance() in _workspace-lib.mjs — two copies had already
+// drifted apart from the tag scheme once. It accepts the current `realvirtual-v` prefix and the
+// pre-6.3.16 `viewer-v` one alike.
+const RELEASE_TAG = RELEASE_TAG_PATTERN;
 
 //! Preflight/resolution failures throw this so the top-level handler can print a clean message.
 class DeliverError extends Error {}
@@ -60,7 +62,7 @@ function assertCleanTree(label, dir) {
 function assertReleaseTag(dir, version) {
   const tags = git(['tag', '--points-at', 'HEAD'], dir).split(/\r?\n/).filter(Boolean);
   if (!tags.some((tag) => RELEASE_TAG.test(tag))) {
-    fail(`Core HEAD carries no viewer-vX.Y.Z release tag:\n  ${dir}\n  Tag the release first, e.g.: git -C "${dir}" tag viewer-v${version}`);
+    fail(`Core HEAD carries no realvirtual-vX.Y.Z release tag:\n  ${dir}\n  Tag the release first, e.g.: git -C "${dir}" tag realvirtual-v${version}`);
   }
 }
 
@@ -90,7 +92,10 @@ function resolveDelivery({ projectKey, customer }) {
   return {
     channel,
     customer: config.customer,
+    kind: config.kind ?? 'development',
     projects: config.projects,
+    // null for a `standard` customer: an empty `projects[]` is a projectless
+    // delivery, not a defect (plan-434 Phase 4).
     primary: config.projectKey,
     remote: typeof config.remote === 'string' && config.remote.trim() ? config.remote.trim() : '<remote>',
     requestyApiKey: config.requestyApiKey,
@@ -184,7 +189,10 @@ Arguments:
                  has to match, because one config may carry several projects.
 
 Flags:
-  --customer     deliver every project of one customer repository instead of one key
+  --customer     deliver every project of one customer repository instead of one key.
+                 The only way to reach a "standard" customer: they carry no projects,
+                 so a positional <projectKey> cannot address them. Such a delivery is
+                 projectless — an empty projects/ folder, and no diagnosis package.
   --push         build + push the workspace to the customer remote (omit for a dry run)
   --dry-run      stage + build only, never push (the default when --push is absent)
   --fast         reuse the build cache when the lockfiles are unchanged
@@ -192,12 +200,17 @@ Flags:
                  needed for a repository delivered before plan-700 (no baseline tag),
                  where "never delivered" and "deleted on purpose" cannot be told apart
                  and the report therefore only asks.
+  --accept-new-private-files
+                 confirm private source files that this customer has never received before.
+                 Without it the delivery aborts and lists them by name: the manifest default
+                 is "commercial", so a new file under src/ ships to everyone unless a tier
+                 rule says otherwise, and this is the one place that says so out loud.
   --no-rag       deliver without the CONNECT diagnosis package (no rag.zip, no connect/ folder).
                  Neither the RAG seed index nor a <projectKey>.diagnosis.json preset is needed.
 
 Preflight (runs before anything is built):
   - both WebViewer git trees clean (core + private)
-  - a viewer-vX.Y.Z release tag on the core HEAD
+  - a realvirtual-vX.Y.Z release tag on the core HEAD
 
 Auto-resolved paths (override with env vars):
   RV_RAG_SEED_INDEX   overrides the seed index. Without it: the project's own
@@ -231,17 +244,24 @@ async function main() {
 
   const push = argv.includes('--push');
   const fast = argv.includes('--fast');
-  const noRag = argv.includes('--no-rag');
   const seedMissing = argv.includes('--seed-missing');
+  const acceptNewPrivateFiles = argv.includes('--accept-new-private-files');
   const dryRun = !push; // never push unless explicitly asked
 
   const version = JSON.parse(readFileSync(join(coreRoot, 'package.json'), 'utf8')).version;
 
   // ── Resolve the request to ONE customer repository. ────────────────────────────────────
-  const { channel, remote, projects, primary, requestyApiKey, requestyBaseUrl } =
+  const { channel, remote, projects, primary, kind, customer: customerSlug, requestyApiKey, requestyBaseUrl } =
     resolveDelivery({ projectKey: requestedKey, customer });
   const projectKey = primary;
-  console.log(`[deliver] project=${projectKey} mode=${push ? 'PUSH' : 'dry-run'}${fast ? ' fast' : ''}${noRag ? ' no-rag' : ''} viewer=${version}`);
+  // A `standard` customer receives the product with an empty `projects/` folder.
+  // There is no corpus to embed and no diagnosis preset to read, so --no-rag is
+  // not a choice here, it is the only shape this delivery has (plan-434 Phase 4).
+  const projectless = projects.length === 0;
+  const noRag = argv.includes('--no-rag') || projectless;
+  console.log(`[deliver] ${projectless ? `customer=${customerSlug} (projectless)` : `project=${projectKey}`}`
+    + ` mode=${push ? 'PUSH' : 'dry-run'}${fast ? ' fast' : ''}${noRag ? ' no-rag' : ''} viewer=${version}`);
+  if (projectless) console.log(`[deliver] ${kind} customer: projectless delivery, no RAG`);
   if (projects.length > 1) console.log(`[deliver] repository carries ${projects.length} projects: ${projects.join(', ')}`);
 
   // ── Preflight: fail early, before any path resolution, network, or build. ──────────────
@@ -255,6 +275,8 @@ async function main() {
   // fetched, built or pushed, because that is the last moment failing is free.
   // Every project of the repository is gated, not just the one that was named:
   // they all end up in the same push.
+  // A projectless delivery gates nothing here — there is no project to validate,
+  // which is exactly what the count below says.
   for (const key of projects) assertValidProject(join(privateRoot, 'projects', key), `projects/${key}`);
   console.log(`[deliver] preflight ok: both trees clean, release tag present, ${projects.length} project(s) valid.`);
 
@@ -313,8 +335,13 @@ async function main() {
   console.log(`[deliver] connect-channel:  ${effectiveChannel}${effectiveChannel !== channel ? ` (requested "${channel}", fell back to stable)` : ''}`);
 
   // ── Spawn the generator, forwarding its exit code. ─────────────────────────────────────
-  const args = [generator, '--project', projectKey, '--connect-lock', lockPath];
+  // `--project` cannot address a projectless customer — there is no key — so the
+  // generator is asked for the whole customer repository instead.
+  const args = projectless
+    ? [generator, '--customer', customerSlug, '--connect-lock', lockPath]
+    : [generator, '--project', projectKey, '--connect-lock', lockPath];
   if (seedMissing) args.push('--seed-missing');
+  if (acceptNewPrivateFiles) args.push('--accept-new-private-files');
   if (noRag) args.push('--no-rag');
   else args.push('--seed-index', seedIndex, '--diagnosis-config', diagnosisConfig);
   if (push) args.push('--push');
@@ -350,8 +377,9 @@ async function main() {
 
   const changeset = readPlasticChangeset(resolve(coreRoot, '../../../..'));
   const versionTag = Number.isInteger(changeset) ? `${version}-${changeset}` : version;
-  if (push) console.log(`delivered ${projectKey} → ${remote} (viewer ${versionTag})`);
-  else console.log(`[dry-run] staged ${projectKey} (viewer ${versionTag}); no remote was modified.`);
+  const delivered = projectless ? `customer ${customerSlug} (projectless)` : projectKey;
+  if (push) console.log(`delivered ${delivered} → ${remote} (viewer ${versionTag})`);
+  else console.log(`[dry-run] staged ${delivered} (viewer ${versionTag}); no remote was modified.`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

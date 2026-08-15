@@ -26,7 +26,7 @@ import { AssetDocument } from '../src/core/editor/rv-asset-document';
 import { registerCadProvider } from '../src/core/editor/rv-cad-provider';
 import { objectToGlb } from '../src/core/import/rv-import-object';
 import { clearCadGlbCache, getCadGlb, putCadGlb } from '../src/core/import/rv-cad-glb-cache';
-import { clearAssetDraft } from '../src/core/editor/rv-asset-draft-storage';
+import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
 import type { CADLinkExtras } from '../src/core/editor/rv-asset-ops';
 
 function makeMockViewer() {
@@ -90,7 +90,7 @@ let glb: ArrayBuffer;
 
 beforeEach(async () => {
   registerCadProvider('step', null); // simulate a PUBLIC build
-  await clearAssetDraft();
+  await __clearDraftStoresForTests();
   await clearCadGlbCache();
   glb = await objectToGlb(cadTree());
 });

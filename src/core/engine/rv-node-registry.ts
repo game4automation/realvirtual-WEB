@@ -6,6 +6,7 @@ import type { RVDrive } from './rv-drive';
 import type { RVSensor } from './rv-sensor';
 import { lastPathSegment } from './rv-constants';
 import { tooltipRegistry } from '../hmi/tooltip/tooltip-registry';
+import { ROOT_OCCURRENCE, ROOT_SOURCE_KEY, fullNodeAddress, getNodeId } from './rv-node-id';
 
 /**
  * Search result from NodeRegistry.search().
@@ -56,6 +57,24 @@ export interface SignalConsumerRef {
  */
 function isSignalComponentTypeKey(type: string): boolean {
   return type.startsWith('PLCInput') || type.startsWith('PLCOutput');
+}
+
+/**
+ * Bare component name from a Unity componentType.
+ *
+ * The GLB serializer writes the C# type NAMESPACED (`realvirtual.MachiningTool`,
+ * `UnityEngine.Transform`), while every TypeScript component is registered under its
+ * bare name (`MachiningTool`). Callers that compare exactly must strip the namespace
+ * first, or the component is reported as unknown even though it exists.
+ *
+ * `UnityEngine.Transform` is deliberately NOT stripped: `resolve()` treats that exact
+ * string as the wire contract for a plain node reference, and a bare `Transform` is
+ * not a component the registry knows.
+ */
+export function stripComponentNamespace(componentType: string): string {
+  if (!componentType || componentType === 'UnityEngine.Transform') return componentType;
+  const dot = componentType.lastIndexOf('.');
+  return dot >= 0 ? componentType.slice(dot + 1) : componentType;
 }
 
 /**
@@ -491,12 +510,25 @@ export class NodeRegistry {
     signalAddress?: string | null;
     /** Plain scene node (Unity `Transform` field). See the generic branch below. */
     node?: Object3D | null;
+    /**
+     * Any OTHER registered component type, resolved generically (plan-411 §2.2).
+     * Present only when a matching instance was actually found — a miss keeps
+     * the raw-path pass-through the deferred-resolution consumers rely on
+     * (`MachiningVolume.Tools`, DES references), so this field is purely
+     * additive and can never turn a working late resolution into a null.
+     */
+    component?: unknown;
   } {
     if (!ref || ref.type !== 'ComponentReference' || !ref.path) {
       return {};
     }
 
-    const ct = ref.componentType ?? '';
+    // Unity writes the componentType NAMESPACED (`realvirtual.MachiningTool`), and
+    // every lookup below compares against the bare TypeScript component name. The
+    // known kinds got away with it only because they match via `includes()`; any
+    // exact comparison — and every component type added later — has to see the bare
+    // name. Strip once, here, so there is exactly one place that knows about it.
+    const ct = stripComponentNamespace(ref.componentType ?? '');
 
     // Drive reference
     if (ct.includes('Drive')) {
@@ -560,7 +592,38 @@ export class NodeRegistry {
       return { node: node ?? null };
     }
 
-    console.warn(`[NodeRegistry] Unknown componentType: "${ref.componentType}" at "${ref.path}"`);
+    // GENERIC component reference (plan-411 §2.2). Every type the registry knows
+    // resolves the same way the Drive/Sensor branches do — exact path, alias,
+    // suffix (all inside getByPath) and finally the scoped name fallback.
+    //
+    // Before this branch existed, a `realvirtual.KinematicMechanism` reference
+    // (and any component type added later) ended here as `{}`, which
+    // `resolveComponentRefs()` flattens to `null` for a SCALAR field — the
+    // reason plan-404 had to keep the raw path in a component-specific
+    // `mechanismRefPath` workaround.
+    //
+    // A MISS deliberately falls through to the pass-through below instead of
+    // returning `{ component: null }`: `MachiningVolume.Tools` and the DES
+    // references resolve their raw path LATER, when the target may finally
+    // exist. Reporting a miss as a hard null here would break that contract for
+    // the sake of a nicer-looking API.
+    if (this.typeIndex.has(ct)) {
+      let component = this.getByPath<unknown>(ct, ref.path);
+      if (component === null && scope) component = this.findComponentInScope<unknown>(ct, ref.path, scope);
+      if (component !== null && component !== undefined) return { component };
+      console.warn(`[NodeRegistry] ${ct} not found: "${ref.path}"`);
+    } else {
+      // The warning is about the TYPE, not about the resolution: a component type
+      // this registry actually knows is a supported pass-through and must stay silent
+      // (before the namespace was stripped, `realvirtual.MachiningTool` was reported as
+      // unknown on every load — plan-405 live finding F2). A type nothing in the scene
+      // carries is still worth flagging, because then nobody will resolve it later.
+      console.warn(`[NodeRegistry] Unknown componentType: "${ref.componentType}" at "${ref.path}"`);
+    }
+    // RAW PATH pass-through: `resolveComponentRefs()` keeps `ref.path` for array
+    // fields when nothing is returned here, and the consuming component resolves
+    // it against the registry itself (two-phase construction — the target
+    // instance need not exist yet at this point).
     return {};
   }
 
@@ -873,6 +936,18 @@ export class NodeRegistry {
     const removed = new Set<string>();
 
     root.traverse((node) => {
+      // The NodeId index is keyed by address, not by path, and is taken down
+      // BEFORE the path guard: a node can legitimately carry a NodeId without
+      // ever having been path-registered (a referenced subtree whose
+      // registration failed part-way), and leaving its address behind would keep
+      // handing out an Object3D that is no longer in the scene — the same leak
+      // `aliasPaths` had.
+      const address = this.nodeAddresses.get(node);
+      if (address !== undefined) {
+        if (this.nodeIdIndex.get(address) === node) this.nodeIdIndex.delete(address);
+        this.nodeAddresses.delete(node);
+      }
+
       const path = this.nodePaths.get(node);
       if (!path) return;
 
@@ -1022,6 +1097,123 @@ export class NodeRegistry {
     this._signalNameIndexBuilt = false;
     this.gltfNodeIndices.clear();
     this.gltfNodeNames = [];
+    this.gltfNodeSources.clear();
+    this.gltfSourceNames.clear();
+    // The NodeId index is per-composition: a reloaded scene composes its
+    // references afresh, so carrying entries over could only hand out nodes
+    // from the previous tree.
+    this.nodeIdIndex.clear();
+    this.nodeAddresses.clear();
+    this.nodeIdRemap.clear();
+  }
+
+  // ─── NodeId index — (occurrence, NodeId) → node ─────────────────
+
+  /**
+   * `<occurrence>#<NodeId>` → node.
+   *
+   * COMPOSITE on purpose. `NodeId` is unique inside its own FILE, not globally:
+   * reference the same press ten times and all ten subtrees carry the same ids,
+   * because they came from the same bytes. A flat `Map<NodeId, Object3D>` — the
+   * shape `nodes` above has — would collapse those ten onto one entry, and an
+   * edit meant for occurrence 3 would land on whichever happened to register
+   * last. The occurrence chain (the ids of the reference nodes above the node)
+   * is what tells them apart, and it exists only at runtime: no file ever
+   * records where it is installed.
+   */
+  private nodeIdIndex = new Map<string, Object3D>();
+
+  /** node → its full `<occurrence>#<NodeId>` address (reverse lookup). */
+  private nodeAddresses = new Map<Object3D, string>();
+
+  /**
+   * Old full address → new full address, for structural changes in a referenced
+   * asset (USD had to add `relocate` for the same reason: stable ids alone do
+   * not survive someone restructuring the file). Consulted by
+   * {@link getNodeByAddress} when the direct lookup misses, so an override
+   * written before the change still finds its target instead of orphaning.
+   */
+  private nodeIdRemap = new Map<string, string>();
+
+  /**
+   * Index a node under its occurrence and its own `NodeId`.
+   *
+   * A node with no `NodeId` is skipped rather than rejected: the entire
+   * pre-existing export corpus has none, and those nodes stay perfectly usable
+   * through the path index.
+   *
+   * @param occurrence Chain of the reference nodes above this node; empty for
+   *   nodes of the root file.
+   * @returns The full address it was registered under, or null when skipped.
+   */
+  registerNodeId(node: Object3D, occurrence: string = ROOT_OCCURRENCE): string | null {
+    const nodeId = getNodeId(node);
+    if (!nodeId) return null;
+    const address = fullNodeAddress(occurrence, nodeId);
+
+    const existing = this.nodeIdIndex.get(address);
+    if (existing && existing !== node) {
+      // Two nodes with the same id in the SAME occurrence means the source file
+      // is malformed (a producer duplicated an id). Keeping the first and saying
+      // so beats silently retargeting every override written against that id.
+      console.warn(
+        `[NodeRegistry] Duplicate NodeId "${nodeId}" within occurrence "${occurrence || '<root>'}" — `
+        + 'keeping the first registration; overrides addressed at this id may target the wrong node.',
+      );
+      return address;
+    }
+
+    this.nodeIdIndex.set(address, node);
+    this.nodeAddresses.set(node, address);
+    return address;
+  }
+
+  /**
+   * Index every node of a subtree that carries a `NodeId`.
+   * @returns How many nodes were indexed.
+   */
+  registerNodeIdsForSubtree(root: Object3D, occurrence: string = ROOT_OCCURRENCE): number {
+    let count = 0;
+    root.traverse((node) => {
+      if (this.registerNodeId(node, occurrence)) count++;
+    });
+    return count;
+  }
+
+  /**
+   * The node at `(occurrence, nodeId)`, or null.
+   *
+   * Falls back to the remap table once, so a target that MOVED in an updated
+   * referenced asset is still found. The fallback is deliberately single-step:
+   * chains of remaps would make the resolution order unpredictable, and one hop
+   * covers the case this exists for.
+   */
+  getNodeByAddress(nodeId: string, occurrence: string = ROOT_OCCURRENCE): Object3D | null {
+    const address = fullNodeAddress(occurrence, nodeId);
+    const direct = this.nodeIdIndex.get(address);
+    if (direct) return direct;
+    const remapped = this.nodeIdRemap.get(address);
+    if (remapped) return this.nodeIdIndex.get(remapped) ?? null;
+    return null;
+  }
+
+  /** The full `<occurrence>#<NodeId>` address a node is registered under, or null. */
+  getAddressForNode(node: Object3D): string | null {
+    return this.nodeAddresses.get(node) ?? null;
+  }
+
+  /**
+   * Record that a node moved: overrides addressed at `fromAddress` should now
+   * resolve to `toAddress`. Both are full `<occurrence>#<NodeId>` addresses.
+   */
+  addNodeIdRemap(fromAddress: string, toAddress: string): void {
+    if (fromAddress === toAddress) return;
+    this.nodeIdRemap.set(fromAddress, toAddress);
+  }
+
+  /** All full addresses currently indexed (diagnostics, orphan reporting). */
+  getRegisteredAddresses(): string[] {
+    return [...this.nodeIdIndex.keys()];
   }
 
   // ─── glTF source indices ────────────────────────────────────────
@@ -1044,15 +1236,63 @@ export class NodeRegistry {
    */
   private gltfNodeNames: readonly (string | undefined)[] = [];
 
+  /**
+   * node → which FILE its index belongs to.
+   *
+   * After composition (plan-397 Phase 3) the tree holds nodes from several
+   * files, each numbered from zero in its own `nodes[]`. An index without the
+   * file it belongs to is not just useless, it is dangerous: the write path
+   * would patch `nodes[7]` of the root file with what belongs in `nodes[7]` of
+   * a referenced one. Nodes from the root file carry {@link ROOT_SOURCE_KEY}.
+   */
+  private gltfNodeSources = new Map<Object3D, string>();
+
+  /** sourceKey → that file's raw glTF node names, for the per-file identity check. */
+  private gltfSourceNames = new Map<string, readonly (string | undefined)[]>();
+
   /** Hand over the load's `associations`-derived index map (see `collectGltfNodeIndices`). */
   setGltfNodeIndices(indices: Map<Object3D, number>, names: readonly (string | undefined)[] = []): void {
     this.gltfNodeIndices = indices;
     this.gltfNodeNames = names;
+    this.gltfNodeSources.clear();
+    for (const node of indices.keys()) this.gltfNodeSources.set(node, ROOT_SOURCE_KEY);
+    this.gltfSourceNames.set(ROOT_SOURCE_KEY, names);
   }
 
-  /** The captured glTF node names, for the source-identity check. Empty when unknown. */
-  getGltfNodeNames(): readonly (string | undefined)[] {
-    return this.gltfNodeNames;
+  /**
+   * Add the index map of ONE referenced file's occurrence.
+   *
+   * Called once per composed occurrence: the indices are keyed on that
+   * occurrence's own cloned nodes, while `sourceKey` and `names` describe the
+   * file they all came from — ten occurrences of one asset add ten index maps
+   * under one `sourceKey`.
+   */
+  addGltfNodeSource(
+    sourceKey: string,
+    indices: Map<Object3D, number>,
+    names: readonly (string | undefined)[] = [],
+  ): void {
+    for (const [node, index] of indices) {
+      this.gltfNodeIndices.set(node, index);
+      this.gltfNodeSources.set(node, sourceKey);
+    }
+    if (!this.gltfSourceNames.has(sourceKey)) this.gltfSourceNames.set(sourceKey, names);
+  }
+
+  /**
+   * The captured glTF node names, for the source-identity check. Empty when unknown.
+   *
+   * Without an argument this answers for the ROOT file — the behaviour every
+   * pre-composition caller relies on.
+   */
+  getGltfNodeNames(sourceKey: string = ROOT_SOURCE_KEY): readonly (string | undefined)[] {
+    if (sourceKey === ROOT_SOURCE_KEY) return this.gltfNodeNames;
+    return this.gltfSourceNames.get(sourceKey) ?? [];
+  }
+
+  /** Every file the current tree was composed from, root first. */
+  getGltfSourceKeys(): string[] {
+    return [...this.gltfSourceNames.keys()];
   }
 
   /**
@@ -1061,11 +1301,31 @@ export class NodeRegistry {
    *
    * Resolution goes through {@link getNode}, so aliases, space-normalisation
    * and the unambiguous-suffix fallback all apply.
+   *
+   * NOTE for writers: an index alone is only meaningful together with
+   * {@link getGltfLocation}'s `sourceKey`. This accessor stays for the
+   * single-file callers that predate composition.
    */
   getGltfNodeIndex(path: string): number | null {
     const node = this.getNode(path);
     if (!node) return null;
     return this.gltfNodeIndices.get(node) ?? null;
+  }
+
+  /**
+   * Which file a path's node came from, and its index there.
+   *
+   * The pair a writer needs: patch `sourceKey`'s file at `index`, and check that
+   * file's own `expectedNames`. `sourceKey === ROOT_SOURCE_KEY` means the node
+   * belongs to the scene's own file — anything else belongs to a referenced
+   * asset, which this plan says must never be written to (§2.6).
+   */
+  getGltfLocation(path: string): { sourceKey: string; index: number } | null {
+    const node = this.getNode(path);
+    if (!node) return null;
+    const index = this.gltfNodeIndices.get(node);
+    if (index === undefined) return null;
+    return { sourceKey: this.gltfNodeSources.get(node) ?? ROOT_SOURCE_KEY, index };
   }
 
   /** Get registry stats */

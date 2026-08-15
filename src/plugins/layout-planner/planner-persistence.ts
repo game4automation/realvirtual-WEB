@@ -4,9 +4,11 @@
 /**
  * Persistence and autosave helpers for the LayoutPlannerPlugin.
  *
- * Hosts catalog loading, catalog-entry lookup, and the placement-URL
- * resolution logic (including the cloud-asset re-download fallback used
- * when a Unity Asset Manager extension is wired up).
+ * Hosts catalog-entry lookup and the placement-URL resolution logic
+ * (including the cloud-asset re-download fallback used when a Unity Asset
+ * Manager extension is wired up). Libraries are never loaded implicitly —
+ * every catalog comes from an explicit reference (user, project manifest,
+ * constructor option or `?library=` parameter).
  *
  * Extracted from `index.ts` (Plan-177 Phase 8). Functions take explicit
  * dependencies (store / extension / cloud store) instead of `this`, so
@@ -17,101 +19,11 @@
  */
 
 import {
-  normalizeCatalogEntry,
   type LayoutStore,
   type LibraryCatalogEntry,
   type PlacedComponent,
 } from './rv-layout-store';
 import type { LayoutPlannerCloudStore } from './cloud-types';
-
-/**
- * Auto-load the realvirtual component library.
- *
- * The library belongs to the DemoRealvirtual project and is BUNDLED: it lives
- * in `public/library/`, so `<BASE_URL>library/` reaches it in dev and in a
- * build alike. That base is also what the catalog's relative `glbUrl`s resolve
- * against.
- *
- * Mutates the provided `store` via `addCatalogDirect`. Returns silently on
- * any fetch / parse error so the planner can still boot offline.
- */
-export async function loadBundledLibrary(store: LayoutStore): Promise<string | null> {
-  const baseUrl = (import.meta.env.BASE_URL ?? '/') + 'library/';
-  const catalogUrl = baseUrl + 'catalog.json';
-  try {
-    const resp = await fetch(catalogUrl);
-    if (resp.ok) {
-      const data = await resp.json();
-      if (data.entries && Array.isArray(data.entries)) {
-        const catalog = {
-          version: '1.0' as const,
-          name: data.name ?? 'Standard Library',
-          entries: data.entries.map(
-            (e: Partial<LibraryCatalogEntry> & { glbUrl: string }) =>
-              normalizeCatalogEntry(e, baseUrl),
-          ),
-        };
-        store.addCatalogDirect(catalogUrl, catalog);
-        return catalogUrl;
-      }
-    }
-  } catch { /* no catalog — fall through to the legacy glob below */ }
-
-  // Legacy fallback: enumerate GLBs still sitting under `public/models/library/`
-  // via import.meta.glob. The shipped library moved into the DemoRealvirtual
-  // project, so this now only catches local scratch (`Custom/`, `imports/`).
-  // These assets live in `public/`, so Vite serves them at the ROOT path
-  // (WITHOUT the `/public` prefix) and the `?url` import VALUE is unreliable
-  // (Vite warns: "Assets in the public directory are served at the root
-  // path"). We therefore read the glob KEYS and derive the served path
-  // ourselves: strip the `/public/models/library/` prefix to get each asset's
-  // sub-path (e.g. `PalletHandling/CartonBox.glb`), pass it as a RELATIVE
-  // glbUrl resolved against `baseUrl`, and use the first sub-folder as the
-  // collection facet so subfolders become library categories.
-  const glbModules = import.meta.glob('/public/models/library/**/*.glb', {
-    query: '?url', import: 'default', eager: true,
-  }) as Record<string, string>;
-
-  const PUBLIC_PREFIX = '/public/models/library/';
-  const keys = Object.keys(glbModules);
-  if (keys.length === 0) return null;
-
-  const catalog = {
-    version: '1.0' as const,
-    name: 'Standard Library',
-    entries: keys.map((key) => {
-      const sub = key.startsWith(PUBLIC_PREFIX)
-        ? key.slice(PUBLIC_PREFIX.length)
-        : (key.split('/').pop() ?? key);
-      const parts = sub.split('/');
-
-      // Category (enum): first subfolder if it maps to a known category,
-      // otherwise 'custom'. Mirrors the Local Folder convention so existing
-      // category-based UIs keep working.
-      const folder = parts.length > 1 ? parts[0].toLowerCase() : '';
-      const category = (['conveyor', 'robot', 'machine', 'fixture', 'des'].includes(folder)
-        ? folder
-        : 'custom') as LibraryCatalogEntry['category'];
-
-      // Collections (chips): every parent directory becomes a chip, cumulative
-      // for nested folders — `PalletHandling/Conveyors/Roll.glb` →
-      // ["PalletHandling", "PalletHandling/Conveyors"]. Same as Local Folder.
-      const dirSegments = parts.slice(0, -1).filter(Boolean);
-      const collections: string[] = [];
-      for (let i = 0; i < dirSegments.length; i++) {
-        collections.push(dirSegments.slice(0, i + 1).join('/'));
-      }
-
-      return normalizeCatalogEntry(
-        { glbUrl: sub, category, collections: collections.length > 0 ? collections : undefined },
-        baseUrl,
-      );
-    }),
-  };
-  const fallbackUrl = 'bundled://library';
-  store.addCatalogDirect(fallbackUrl, catalog);
-  return fallbackUrl;
-}
 
 /** Find a catalog entry by its stable id across all loaded catalogs. */
 export function findCatalogEntryById(
@@ -190,7 +102,7 @@ export async function resolvePlacementUrl(
 
   // 2. Current catalog entry has a stable URL — use it.
   //    Local-folder catalog entries carry FRESH blob URLs produced by
-  //    `restoreLocalFolder()` at boot, so we accept them too (the saved
+  //    a local-folder catalog scan at boot, so we accept them too (the saved
   //    `comp.glbUrl` blob is stale, but the catalog's is alive).
   const entry = findCatalogEntryById(store, comp.catalogId);
   if (entry?.glbUrl) {
@@ -261,7 +173,7 @@ export async function refreshCloudGlbUrl(
   let glbUrl = comp.glbUrl;
 
   // Local-folder placements: the saved blob URL is stale after a page
-  // reload. `restoreLocalFolder()` re-mounted the working folder at boot
+  // reload. A local-folder scan re-mounted the working folder at boot
   // and rebuilt catalog entries with fresh blob URLs, so re-resolve via
   // the catalog. If the entry vanished (folder removed / different machine),
   // skip with a warning.

@@ -14,6 +14,7 @@ import type { RVViewerPlugin } from '../rv-plugin';
 import type { LoadResult } from '../engine/rv-scene-loader';
 import { NodeRegistry } from '../engine/rv-node-registry';
 import type { RVViewer } from '../rv-viewer';
+import { RvReferenceDrill } from '../engine/rv-reference-scope';
 import type { ContextMenuTarget } from './context-menu-store';
 import { loadOverlay, saveOverlay, saveOriginals, loadOriginals, removeOriginals, type RVExtrasOverlay } from '../engine/rv-extras-overlay-store';
 import { materialise as materialiseEdits } from './scene/rv-scene-edits';
@@ -262,8 +263,17 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
       ? showInspectorOrSource
       : sourceArg;
     if (source === 'viewport') {
-      const resolved = this.findLayoutObjectAncestor(path);
-      if (resolved) path = resolved;
+      // Reference wins over LayoutObject: decision 22 says the unit of selection
+      // is the OUTERMOST reference, and a reference always encloses whatever
+      // LayoutObject markers sit inside the file it points at. Resolving to the
+      // inner marker first would select a part of another asset — the very thing
+      // the rule exists to prevent.
+      const reference = this.findOutermostReferenceAncestor(path);
+      if (reference) path = reference;
+      else {
+        const resolved = this.findLayoutObjectAncestor(path);
+        if (resolved) path = resolved;
+      }
     }
     this._selectedNodePath = path;
     this._showInspector = show;
@@ -297,6 +307,77 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
     }
     this._ancestorCache.set(path, null);
     return null;
+  }
+
+  /** Drill state for the reference selection rule (plan-703 §2.4.1). */
+  private readonly _referenceDrill = new RvReferenceDrill();
+  /** Same shape of cache as `_ancestorCache`, cleared with it. */
+  private _referenceCache = new Map<string, string | null>();
+
+  /**
+   * The OUTERMOST enclosing `AssetReference` of `path` (inclusive), or null.
+   *
+   * The sibling of {@link findLayoutObjectAncestor}: same walk, same cache
+   * discipline, different marker — and outermost rather than nearest, because a
+   * nested reference belongs to a file the open document cannot restructure
+   * either (F8). Honours the current drill level, so a double-click that went
+   * one level in keeps selecting at that level until the anchor changes.
+   *
+   * Cheap and OUTSIDE the picking path: this runs on the already-resolved hit,
+   * at the same place the LayoutObject resolution has always run
+   * (`doc-render-picking.md` §2.4 rule 1).
+   */
+  findOutermostReferenceAncestor(path: string): string | null {
+    const cached = this._referenceCache.get(path);
+    if (cached !== undefined && this._referenceDrill.drillLevel === 0) return cached;
+    if (!this._viewer?.registry) return null;
+    const node = this._viewer.registry.getNode(path);
+    if (!node) return null;
+
+    const result = this._referenceDrill.select(
+      node, 'viewport', this._viewer.currentModelRoot ?? null,
+    );
+    if (!result.resolved) {
+      if (this._referenceDrill.drillLevel === 0) this._referenceCache.set(path, null);
+      return null;
+    }
+    const resolved = this._viewer.registry.getPathForNode(result.node);
+    if (this._referenceDrill.drillLevel === 0) this._referenceCache.set(path, resolved);
+    return resolved;
+  }
+
+  /**
+   * Double-click in the viewport: one reference level in (decision 22).
+   *
+   * Returns the newly selected path, or null when the hit is not inside a
+   * reference at all — the caller then keeps its ordinary double-click meaning.
+   */
+  drillIntoReference(path: string): string | null {
+    if (!this._viewer?.registry) return null;
+    const node = this._viewer.registry.getNode(path);
+    if (!node) return null;
+    const result = this._referenceDrill.drillIn(node, this._viewer.currentModelRoot ?? null);
+    const next = this._viewer.registry.getPathForNode(result.node);
+    if (!next) return null;
+    this.selectNode(next, 'api');
+    return next;
+  }
+
+  /** Escape: one reference level back out. */
+  drillOutOfReference(path: string): string | null {
+    if (!this._viewer?.registry) return null;
+    const node = this._viewer.registry.getNode(path);
+    if (!node) return null;
+    const result = this._referenceDrill.drillOut(node, this._viewer.currentModelRoot ?? null);
+    const next = this._viewer.registry.getPathForNode(result.node);
+    if (!next) return null;
+    this.selectNode(next, 'api');
+    return next;
+  }
+
+  /** Forget the drill level — a fresh gesture starts at the outermost again. */
+  resetReferenceDrill(): void {
+    this._referenceDrill.reset();
   }
 
   /** Convenience: read the currently selected node path. */
@@ -527,6 +608,37 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
   }
 
   /**
+   * Drop an overlay entry optimistically — the erase half of the optimistic
+   * write in {@link updateOverlayField}.
+   *
+   * Without it the cache only ever GROWS on the op-based path: `unsetField` is
+   * deferred through the target's queue, and the SceneStore subscription that
+   * would re-materialise the truth only runs where SceneStore IS the target.
+   * Inside the asset editor the document is an `AssetDocument`, nothing
+   * re-materialises, and a reverted field stayed marked as overridden until the
+   * next model load — in the badge and, since Lauf 12, in the descend hint's
+   * count. Same idempotence argument as the write: where the subscription does
+   * run it recomputes the identical (absent) entry and no-ops.
+   *
+   * `componentType`/`fieldName` narrow the scope; omitting `fieldName` drops the
+   * whole component, omitting both drops the node.
+   */
+  private pruneOverlayEntry(nodePath: string, componentType?: string, fieldName?: string): void {
+    const nodeOverrides = this._overlay?.nodes[nodePath];
+    if (!nodeOverrides) return;
+    if (componentType === undefined) {
+      delete this._overlay!.nodes[nodePath];
+      return;
+    }
+    const fields = nodeOverrides[componentType];
+    if (!fields) return;
+    if (fieldName === undefined) delete nodeOverrides[componentType];
+    else delete fields[fieldName];
+    if (fields && Object.keys(fields).length === 0) delete nodeOverrides[componentType];
+    if (Object.keys(nodeOverrides).length === 0) delete this._overlay!.nodes[nodePath];
+  }
+
+  /**
    * Reset a single field override. Op-based path emits an `unsetField` op;
    * the executor restores the prev value from the inverse path.
    */
@@ -535,6 +647,8 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
     const target = getActiveEditTarget();
     if (target.available) {
       target.unsetField(nodePath, componentType, fieldName, prev);
+      this.pruneOverlayEntry(nodePath, componentType, fieldName);
+      this.notify();
       return;
     }
 
@@ -571,6 +685,8 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
           target.unsetField(nodePath, componentType, fieldName, prev);
         }
       });
+      this.pruneOverlayEntry(nodePath, componentType);
+      this.notify();
       return;
     }
 
@@ -616,6 +732,8 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
           target.unsetField(nodePath, w.componentType, w.fieldName, w.prev);
         }
       });
+      this.pruneOverlayEntry(nodePath);
+      this.notify();
       return;
     }
 
@@ -972,6 +1090,11 @@ export class RvExtrasEditorPlugin implements RVViewerPlugin {
     if (!this._viewer) return;
     this._editableNodesStale = false;
     this._ancestorCache.clear();
+    // Same lifetime, same reason: both cache a parent walk over a tree that has
+    // just changed. The drill level goes with them — the anchor it referred to
+    // may not exist any more.
+    this._referenceCache.clear();
+    this._referenceDrill.reset();
     if (this._hierarchyRootOverride) {
       this._scanOverrideNodes(this._hierarchyRootOverride);
       this.notify();

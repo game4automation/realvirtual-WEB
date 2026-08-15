@@ -2,7 +2,7 @@
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * scene-draft-setcode.test.ts — plan-210 phase 0.5 (`setCode` EditOp).
+ * scene-draft-setcode.test.ts — plan-210 phase 0.5 (the `setCode` op).
  *
  * The WebComponent script source is edited through the existing scene op log:
  *  - `setCode` materialises into `overlay.nodes[path].WebComponent.Code`
@@ -22,22 +22,40 @@ import {
   WEB_COMPONENT_CODE_FIELD,
   freshOpId,
   materialise,
-  canCoalesce,
-  mergeOps,
   inverseOp,
-  describeOp,
 } from '../src/core/hmi/scene/rv-scene-edits';
+import { canCoalesceRvOps, mergeRvOps, describeRvOp } from '../src/core/ops/rv-unified-ops';
 import {
   type RvScene,
   type SceneBase,
-  newSceneId,
+  baseKeyOf,
   makeDraftScene,
 } from '../src/core/hmi/scene/rv-scene-types';
-import { writeScene, readDraft, readScene } from '../src/core/hmi/scene/rv-scene-storage';
+import { writeScene, readScene } from '../src/core/hmi/scene/rv-scene-storage';
+import { deadDraftKey, deadSlotExists } from './helpers/dead-draft-slots';
+import { readSceneGlb } from '../src/core/storage/rv-scene-glb-store';
+import { parseGlbChunks } from '../src/core/persistence/rv-glb-chunks';
+// plan-716 Phase 3: a save writes a document file, so the round-trip case needs
+// a project. Every other case here is about the op itself and is untouched.
+import { documentsOf } from '../src/core/project/rv-project-documents';
+import { resetProjectStore } from '../src/core/project/project-store';
+import { installFakeDocumentProject } from './helpers/fake-document-project';
+import { legacySceneId } from './helpers/legacy-scene-id';
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 const NODE = 'Line1/Turntable';
+
+/** Wait for the debounced GLB autosave to land a body in `slot`. */
+async function waitForDraftBody(slot: string, timeoutMs = 10000): Promise<Uint8Array | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const body = await readSceneGlb(slot);
+    if (body) return body;
+    if (Date.now() > deadline) return null;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
 
 function setCode(code: string, prev: string | undefined, ts = Date.now(), nodePath = NODE): SetCodeOp {
   return { id: freshOpId(), ts, schemaV: 1, kind: 'setCode', nodePath, code, prev };
@@ -58,6 +76,8 @@ interface FakeViewer {
   currentModelUrl: string | null;
   registry: null;
   markRenderDirty: () => void;
+  /** `openDocument` records the active mode with the session pointer. */
+  modes: { has: (id: string) => boolean; setMode: (id: string) => void; activeMode: string | null };
 }
 
 function makeViewer(): FakeViewer {
@@ -67,6 +87,7 @@ function makeViewer(): FakeViewer {
     currentModelUrl: null,
     registry: null,
     markRenderDirty: vi.fn(),
+    modes: { has: () => false, setMode: () => {}, activeMode: null },
     loadScene: vi.fn(async (s: RvScene) => {
       v.currentScene = s;
       v.currentModelUrl = s.base.kind === 'builtin' ? s.base.url : 'empty:';
@@ -156,8 +177,8 @@ describe('setCode — inverseOp', () => {
     }
   });
 
-  it('describeOp yields a code-aware label', () => {
-    expect(describeOp(setCode('x', undefined))).toBe('Edit script on Turntable');
+  it('describeRvOp yields a code-aware label', () => {
+    expect(describeRvOp(setCode('x', undefined))).toBe('Edit script on Turntable');
   });
 });
 
@@ -167,8 +188,8 @@ describe('setCode — keystroke coalescing', () => {
   it('same node within the window coalesces, keeping the FIRST prev', () => {
     const a = setCode('f', undefined, 1000);
     const b = setCode('fu', 'f', 1100);
-    expect(canCoalesce(a, b)).toBe(true);
-    const merged = mergeOps(a, b);
+    expect(canCoalesceRvOps(a, b)).toBe(true);
+    const merged = mergeRvOps(a, b);
     expect(merged.kind).toBe('setCode');
     if (merged.kind === 'setCode') {
       expect(merged.code).toBe('fu');
@@ -180,13 +201,13 @@ describe('setCode — keystroke coalescing', () => {
   it('different nodes do not coalesce', () => {
     const a = setCode('f', undefined, 1000);
     const b = setCode('g', undefined, 1100, 'Line1/Other');
-    expect(canCoalesce(a, b)).toBe(false);
+    expect(canCoalesceRvOps(a, b)).toBe(false);
   });
 
   it('outside the coalesce window does not coalesce', () => {
     const a = setCode('f', undefined, 1000);
     const b = setCode('fu', 'f', 5000);
-    expect(canCoalesce(a, b)).toBe(false);
+    expect(canCoalesceRvOps(a, b)).toBe(false);
   });
 });
 
@@ -225,49 +246,112 @@ describe('setCode — SceneStore undo/redo', () => {
 // ─── Persist → reload round-trip (autosave rides the existing pipeline) ──
 
 describe('setCode — persistence round-trip', () => {
-  it('autosaved draft survives a store reload with the code intact', async () => {
-    vi.useFakeTimers();
+  it('autosaves the code INTO the draft GLB body, not into an op log', async () => {
+    // Since plan-397 phase 6 the debounced autosave bakes a GLB instead of
+    // writing the op array. The code therefore survives as node extras in the
+    // file — which is the whole point: a scene is now a file, and a reader
+    // that never saw the op log can still find the script.
+    const { objectToGlb } = await import('../src/core/import/rv-import-object');
+    const { Group } = await import('three');
+    const group = new Group();
+    group.name = 'Demo';
+    const demoGlb = await objectToGlb(group);
+
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('.glb')) return new Response(demoGlb.slice(0), { status: 200 });
+      return realFetch(input, init);
+    }) as typeof fetch;
+
     try {
-      await store.openBuiltin('/models/Demo.glb', 'Demo');
-      await store.applyOp(setCode('function setup(self) { return {}; }', undefined));
-      vi.runAllTimers();   // flush the debounced draft autosave
+      const viewer2 = makeViewer() as unknown as { registry: unknown };
+      viewer2.registry = {
+        getNode: () => null,
+        getComponentsAt: () => [],
+        getGltfNodeNames: () => [],
+        getGltfLocation: () => ({ sourceKey: '', index: 0 }),
+        getPathForNode: () => null,
+      };
+      const store2 = new SceneStore(viewer2 as unknown as ConstructorParameters<typeof SceneStore>[0]);
+      await store2.openBuiltin('/models/Demo.glb', 'Demo');
+      await store2.applyOp(setCode('function setup(self) { return {}; }', undefined));
 
-      const draft = readDraft(builtin);
-      expect(draft).not.toBeNull();
-      expect(codeInOverlay(draft!.edits.ops)).toBe('function setup(self) { return {}; }');
+      // Poll rather than sleep past the debounce: firing the timer only STARTS
+      // the write, which then bakes, hashes and puts into OPFS. A fixed delay
+      // tuned on an idle machine is the test that passes alone and fails in the
+      // full suite — which is exactly what it did.
+      const body = await waitForDraftBody(`draft/${baseKeyOf(builtin)}`);
+      expect(body).not.toBeNull();
+      const json = JSON.stringify(parseGlbChunks(body!).json);
+      expect(json).toContain('function setup(self)');
+
+      // The op log is deliberately NOT persisted any more — the slot that used
+      // to hold it stays empty.
+      expect(deadSlotExists(deadDraftKey(builtin))).toBe(false);
     } finally {
-      vi.useRealTimers();
+      globalThis.fetch = realFetch;
     }
-
-    // Fresh store (≙ browser reload): openBuiltin resumes the per-base draft.
-    const store2 = new SceneStore(makeViewer() as unknown as ConstructorParameters<typeof SceneStore>[0]);
-    await store2.openBuiltin('/models/Demo.glb', 'Demo');
-    const snap = store2.getSnapshot();
-    expect(snap.dirty).toBe(true);
-    expect(codeInOverlay(snap.draft!.edits.ops)).toBe('function setup(self) { return {}; }');
   });
 
-  it('save() persists the setCode op; readScene round-trips the code', async () => {
-    await store.openBuiltin('/models/Demo.glb', 'Demo');
-    await store.applyOp(setCode('let a = 1;', undefined));
-    await store.save();
+  it('save() persists the setCode op into the document file', async () => {
+    // PORTED (plan-716 Phase 3, §9.0 "portieren — setCode-Mechanik unverändert").
+    // The MECHANIC under test is untouched: a `setCode` op survives a save and
+    // is readable again afterwards. What changed is WHERE it survives. It used
+    // to be carried in the catalogue row's op array (`readScene(id).edits.ops`),
+    // which is the row path this phase deletes; it is baked into the document's
+    // GLB now, and a fresh store reads it back by opening the document.
+    const { objectToGlb } = await import('../src/core/import/rv-import-object');
+    const { Group } = await import('three');
+    const group = new Group();
+    group.name = 'Demo';
+    const demoGlb = await objectToGlb(group);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('.glb')) return new Response(demoGlb.slice(0), { status: 200 });
+      return realFetch(input, init);
+    }) as typeof fetch;
 
-    const id = store.getSnapshot().saved!.id;
-    const persisted = readScene(id)!;
-    expect(codeInOverlay(persisted.edits.ops)).toBe('let a = 1;');
+    const project = installFakeDocumentProject();
+    try {
+      const bakeViewer = makeViewer() as unknown as { registry: unknown };
+      bakeViewer.registry = {
+        getNode: () => null,
+        getComponentsAt: () => [],
+        getGltfNodeNames: () => [],
+        getGltfLocation: () => ({ sourceKey: '', index: 0 }),
+        getPathForNode: () => null,
+      };
+      store = new SceneStore(bakeViewer as unknown as ConstructorParameters<typeof SceneStore>[0]);
+      await store.openBuiltin('/models/Demo.glb', 'Demo');
+      await store.applyOp(setCode('let a = 1;', undefined));
+      await store.save();
 
-    // Full open cycle on a fresh store.
-    const store2 = new SceneStore(makeViewer() as unknown as ConstructorParameters<typeof SceneStore>[0]);
-    await store2.openScene(id);
-    expect(store2.getSnapshot().dirty).toBe(false);
-    expect(codeInOverlay(store2.getSnapshot().draft!.edits.ops)).toBe('let a = 1;');
+      const id = store.getSnapshot().saved!.id;
+      const row = documentsOf(project.project()).find(d => d.id === id)!;
+      expect(row).toBeDefined();
+      // The bake is the real one here, so the code is IN the bytes.
+      const written = project.files.get(row.path)!;
+      expect(JSON.stringify(parseGlbChunks(written).json)).toContain('let a = 1;');
+
+      // Full open cycle on a fresh store, through the one open verb.
+      const store2 = new SceneStore(makeViewer() as unknown as ConstructorParameters<typeof SceneStore>[0]);
+      await store2.openDocument(id);
+      expect(store2.getSnapshot().dirty).toBe(false);
+      store2.dispose();
+    } finally {
+      project.restore();
+      resetProjectStore();
+      globalThis.fetch = realFetch;
+    }
   });
 
   it('seeded saved scene with a setCode op loads and materialises', async () => {
     const op = setCode('x', undefined);
     const seeded = writeScene({
       ...makeDraftScene(builtin, 'Scripted'),
-      id: newSceneId(),
+      id: legacySceneId(),
       edits: { ops: [op], settings: { catalogUrls: [], gridSizeMm: 500 } },
     });
     await store.openScene(seeded.id);

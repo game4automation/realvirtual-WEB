@@ -7,6 +7,7 @@ import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { SignalBindingManager } from '../src/core/engine/rv-signal-binding-manager';
 import { SignalBindPlugin } from '../src/plugins/signal-bind/SignalBindPlugin';
+import { ContextMenuStore } from '../src/core/hmi/context-menu-store';
 import { signalBindStore } from '../src/plugins/signal-bind/signal-bind-store';
 import {
   _resetSignalLinkModeStoreForTests,
@@ -52,6 +53,9 @@ function makeHarness() {
     },
     markRenderDirty: () => {},
     getPlugin: () => undefined,
+    // Real viewers always own one (rv-viewer.ts) — the plugin registers its
+    // "Link signal…" tree item against it in init() (plan-418).
+    contextMenu: new ContextMenuStore(),
     on: (event: string, callback: (payload: { node: Object3D }) => void) => {
       let callbacks = listeners.get(event);
       if (!callbacks) { callbacks = new Set(); listeners.set(event, callbacks); }

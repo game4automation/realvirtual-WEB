@@ -36,7 +36,7 @@ That single omission is the whole rule. `core` buys participation and nothing el
 
 ### The registered modes
 
-Five workspace modes are registered in `main.ts`, in this order. A mode's UI context id is
+Six workspace modes are registered in `main.ts`, in this order. A mode's UI context id is
 `mode:<id>` (`modeContext(id)`), which is what `modes` compiles into:
 
 | `ModeId` | Label | `order` | Runtime |
@@ -45,7 +45,30 @@ Five workspace modes are registered in `main.ts`, in this order. A mode's UI con
 | `hmi` | HMI | 10 | `simulation` |
 | `des` | DES | 20 | `simulation` |
 | `planner` | Planner | 30 | `simulation` |
+| `commissioning` | Commissioning | 35 | `simulation` (default) — the virtual-commissioning workspace (plan-423) |
 | `editor` | Editor | 40 | **`detached`** — the SimulationRuntime performs no time integration (asset authoring) |
+
+**`commissioning` vs `viewer`** — the pair is worth understanding together, because they are
+built from the same two axes and differ only in which elements carry the string:
+
+| | `viewer` | `commissioning` |
+|---|---|---|
+| KPI bar, message stack, views slot, AI activity overlay | hidden | hidden |
+| Inspector, Hierarchy, CONNECT panel + opener, AI-bridge entry, context menu, search | hidden | **visible** |
+| ButtonPanel container | hidden | **visible** |
+| `button-group` tools | — | Signal Link, Test Axes, Measure, Section/Clip |
+
+Both were built the same way: the mode is registered, and `'mode:<id>'` is APPENDED to the
+`hiddenIn` array of every element that goes away. No rule is rewritten and no element is removed,
+which is what keeps the HMI workspace element-identical (pinned by
+`tests/hmi-mode-regression.test.tsx`).
+
+The `button-group` row is the one that reads backwards, and it caught the plan-423 review. In a
+focused mode ButtonPanel hides every entry WITHOUT a rule (see the host table in §2), so the
+operator buttons disappear from `commissioning` by themselves — while the TOOLS had to opt IN:
+`SignalBindPlugin` extends its `shownOnlyInAny` list, `TestAxesPlugin` gained a `hiddenIn` naming
+the four modes where the auto-hide used to do the job (a positive list would have removed it from
+the no-mode CONNECT embed), and Measure/Clip already carried rules that admit the new mode.
 
 Registration happens *after* all plugins are registered, so the dropdown reflects the full set;
 the active mode is applied only after the model loads. That ordering is exactly why a positive
@@ -204,6 +227,28 @@ separate.
 
 If a future change does merge them, it must first answer what happens to every `core` plugin that
 carries a `modes` list — that is the set this document exists to protect.
+
+---
+
+## 4.5 A third reason a slot can be missing: the user switched the plugin off
+
+The two axes above explain a slot that is *hidden*. Since plan-435 there is a third cause, and it
+is different in kind: the slot is not hidden, it is **not registered at all**.
+
+`setPluginUserEnabled(id, false)` calls `uiRegistry.unregister(id)`, so every slot entry of that
+plugin leaves the registry. Switching the plugin back on calls `register(plugin)` again, which is
+idempotent (it unregisters first) and restores the original position, because the registry keeps a
+stable per-plugin sequence number and sorts by `(order, seq, declaration index)`.
+
+Two consequences worth knowing:
+
+- **The override survives a reload** (persisted per project under `rv-plugin-overrides/<scope>`),
+  so "the button was there yesterday" is a real possibility. Check the Features tab in Settings, or
+  boot with `?resetPlugins=1`.
+- **`register()` no longer mutates the plugin's own slot objects.** It normalises a shallow copy,
+  so registering twice always starts from the plugin's pristine declaration and the `modes` gate
+  cannot be applied cumulatively. Anything reading `plugin.slots[i].pluginId` or `.visibilityId`
+  after registration was reading a side effect that no longer happens — read the registry instead.
 
 ---
 

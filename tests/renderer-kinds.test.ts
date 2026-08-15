@@ -26,8 +26,9 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createTestViewer, type TestViewerHandle } from './helpers/create-test-viewer';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
-const SMOKE_GLB_URL = '/models/EuropalletEmpty.glb';
+const SMOKE_GLB_URL = DEV_GLB.europalletEmpty;
 const VIEWER_TEST_TIMEOUT = 60_000;
 
 /**

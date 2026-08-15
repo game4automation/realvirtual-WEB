@@ -30,6 +30,7 @@ import type { ComponentContext, ComponentSchema, RVComponent } from './rv-compon
 import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import { NodeRegistry } from './rv-node-registry';
 import { createLeadingEdgeDebounce, type LeadingEdgeDebounce } from '../../plugins/diagnose/debounce';
+import { wireValueSignal } from './rv-signal-wiring';
 
 /** Suppression window for the leading-edge debounce (ms). */
 export const DIAGNOSE_DEBOUNCE_MS = 1000;
@@ -107,20 +108,18 @@ export class RVWebDiagnostics implements RVComponent {
 
   private _subscribe(ctx: ComponentContext): void {
     this._unsubscribe?.();
+    // Int wins over Bool — the two slots are ALTERNATIVES, never both live, so
+    // the single `_unsubscribe` handle always holds the one active wiring.
+    // plan-427: both go through the helper, which registers a re-apply slot and
+    // skips an unresolved path (the `current !== undefined` guard this
+    // replaces). `_onIntChange`/`_onBoolChange` are explicit edge guards, so a
+    // replay of an unchanged value fires no diagnose request.
     if (this.SignalInt) {
-      this._unsubscribe = ctx.signalStore.subscribeByPath(
-        this.SignalInt,
-        (v) => this._onIntChange(Number(v)),
-      );
-      const current = ctx.signalStore.getByPath(this.SignalInt);
-      if (current !== undefined) this._onIntChange(Number(current));
+      this._unsubscribe = wireValueSignal(ctx.signalStore, this.SignalInt,
+        (v) => this._onIntChange(Number(v)), undefined, ctx.reapply).unsubscribe;
     } else if (this.SignalBool) {
-      this._unsubscribe = ctx.signalStore.subscribeByPath(
-        this.SignalBool,
-        (v) => this._onBoolChange(!!v),
-      );
-      const current = ctx.signalStore.getByPath(this.SignalBool);
-      if (current !== undefined) this._onBoolChange(!!current);
+      this._unsubscribe = wireValueSignal(ctx.signalStore, this.SignalBool,
+        (v) => this._onBoolChange(!!v), undefined, ctx.reapply).unsubscribe;
     }
   }
 

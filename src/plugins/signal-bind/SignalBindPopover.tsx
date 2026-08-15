@@ -45,11 +45,13 @@ import {
   removeMappingForRow,
   upsertMappingForRow,
 } from './slot-row-models';
+import { emitSignalBindingApplied } from './binding-applied-pulse';
 import { slotRejectReason, type DropRejectReason } from './drop-accept';
 import { signalProviderKey } from '../../core/engine/rv-signal-provider';
 import { popoverContentRegistry } from '../../core/hmi/popover-store';
 import { getConnectSnapshot, subscribeConnectStore, type ConnectInterface } from '../../core/hmi/connect-store';
 import { BINDING_STATE_LABEL } from '../../core/hmi/signal-vocabulary';
+import { omitUndefined } from '../../core/hmi/rv-omit-undefined';
 
 // Re-exports: the row/picker shapes moved to the shared core row (plan-325);
 // existing imports from this module keep working.
@@ -248,7 +250,9 @@ export function SignalBindPopover({
         getRejectReason={pickerRejectReason}
         onPick={(_name, item) => {
           if (!pickerRow || !item) return;
-          bindSignal(pickerRow, {
+          // omitUndefined: absent optionals must stay ABSENT (plan-422 F1) —
+          // a present `undefined` is what the GLB bake has to refuse.
+          bindSignal(pickerRow, omitUndefined({
             name: item.name,
             interfaceId: item.interfaceId,
             topic: item.topic,
@@ -258,7 +262,7 @@ export function SignalBindPopover({
             address: item.address,
             comment: item.comment,
             origin: item.origin,
-          });
+          }));
         }}
       />
     </Box>
@@ -342,7 +346,16 @@ function SignalBindPopoverConnected({ viewer }: { viewer: RVViewer }) {
   ) => {
     if (!source) return;
     const next = upsertMappingForRow(mappings, { slot, componentPath, kind, direction }, source);
-    if (next) persist(next);
+    if (!next) return;
+    persist(next);
+    // Same boundary as the inline drop (plan-425 F8) — the picker is the other
+    // way a person makes a link, and it must acknowledge the same way.
+    emitSignalBindingApplied(viewer, targetId, {
+      componentPath,
+      slot,
+      signal: source.name,
+      sourceKind: source.origin === 'internal' ? 'internal' : 'connect',
+    });
   };
 
   return (

@@ -305,6 +305,57 @@ export function claimedSlotCount(): number {
   return _claims.size;
 }
 
+// ─── Slot write-role registry (plan-353 F6) ─────────────────────────────────
+
+/**
+ * What a slot is FOR, from the slot's side:
+ *  - `control`  — the slot commands the model (PLC output → drive/conveyor).
+ *  - `feedback` — the slot reports model state back (sensor/position → PLC input).
+ *  - `unknown`  — the role could not be derived; treated like `control`, i.e.
+ *                 conservatively, so an underived slot never gains a right.
+ *
+ * Same triple as the binding manager's private `SlotRole`, deliberately: this
+ * registry is a MIRROR with a defined lifecycle, not a second derivation.
+ * `_deriveSlotRole()` stays the only place a role is computed.
+ */
+export type SlotWriteRole = 'control' | 'feedback' | 'unknown';
+
+const _slotRoles = new Map<SlotId, SlotWriteRole>();
+
+/**
+ * Publish a slot's role so the write gate can see it (plan-353 F6).
+ *
+ * Called on bind, on every role change and never per tick — the write path only
+ * ever READS this map, which is what keeps the gate allocation-free: the role is
+ * a Map lookup there, not a derivation.
+ */
+export function registerSlotWriteRole(slotId: SlotId, role: SlotWriteRole): void {
+  _slotRoles.set(slotId, role);
+}
+
+/** Forget a slot's role (unbind / element removed). */
+export function clearSlotWriteRole(slotId: SlotId): void {
+  _slotRoles.delete(slotId);
+}
+
+/**
+ * A slot's role, defaulting to `'control'` for anything never registered.
+ *
+ * The default is the CONSERVATIVE one on purpose: `control` is exactly the
+ * pre-plan-353 behaviour (a bound slot rejects local writes), so an unregistered
+ * slot — a hand-built fixture, a direct-property slot that has no channel, a
+ * code path that forgot to mirror — can only ever keep the old rule, never
+ * silently acquire the feedback exemption.
+ */
+export function getSlotWriteRole(slotId: SlotId): SlotWriteRole {
+  return _slotRoles.get(slotId) ?? 'control';
+}
+
+/** Diagnostics/tests: number of slots with a registered role. */
+export function slotWriteRoleCount(): number {
+  return _slotRoles.size;
+}
+
 /** UI summary of the dominating authority on a value channel (plan-320 Phase 5). */
 export interface ChannelAuthorityInfo {
   /** Highest authority among the slots indexed against the channel. */
@@ -337,10 +388,56 @@ export function describeChannelAuthority(channelId: SignalChannelId): ChannelAut
 /** Set of instance-scoped signal names currently under live control. */
 const _controlled = new Set<string>();
 
-/** Mark or unmark a scoped signal name as live-controlled. */
+/** Live-control transition listeners, per scoped signal name (plan-418). */
+const _liveControlListeners = new Map<string, Set<(controlled: boolean) => void>>();
+
+/**
+ * Mark or unmark a scoped signal name as live-controlled.
+ *
+ * Called for EVERY slot of every bound element in the 60 Hz tick
+ * (rv-signal-binding-manager.ts), so the no-op case must stay cheap: the
+ * membership test short-circuits before any set mutation, and listeners are
+ * only consulted on a REAL state change — a steady-state tick allocates
+ * nothing and calls nothing.
+ */
 export function setSignalLiveControlled(scopedName: string, controlled: boolean): void {
+  if (_controlled.has(scopedName) === controlled) return;
   if (controlled) _controlled.add(scopedName);
   else _controlled.delete(scopedName);
+  const listeners = _liveControlListeners.get(scopedName);
+  if (!listeners) return;
+  for (const listener of listeners) listener(controlled);
+}
+
+/**
+ * Observe the live-control TRANSITIONS of one scoped signal name; returns the
+ * unsubscribe function.
+ *
+ * Exists because the gate is a bare membership set: a writer that only reacts
+ * to its own source changing (`RVConnectSignal`) has no way to notice that the
+ * suppression it respected has been lifted, and would keep the stale value
+ * until the source happens to change again. The callback fires only on an
+ * actual `false → true` / `true → false` edge, never on a repeat.
+ *
+ * Subscriptions are model state: {@link resetSlotAuthority} drops them all, so
+ * a model switch cannot leak callbacks into the next scene.
+ */
+export function subscribeLiveControl(
+  scopedName: string,
+  callback: (controlled: boolean) => void,
+): () => void {
+  let listeners = _liveControlListeners.get(scopedName);
+  if (!listeners) {
+    listeners = new Set();
+    _liveControlListeners.set(scopedName, listeners);
+  }
+  listeners.add(callback);
+  return () => {
+    const current = _liveControlListeners.get(scopedName);
+    if (!current) return;
+    current.delete(callback);
+    if (current.size === 0) _liveControlListeners.delete(scopedName);
+  };
 }
 
 /** True when the given instance-scoped signal name is currently live-controlled. */
@@ -370,7 +467,14 @@ export function liveControlledCount(): number {
   return _controlled.size;
 }
 
-/** Clear all live-control state. Used on service reset / test reset. */
+/**
+ * Clear all live-control state. Used on service reset / test reset.
+ *
+ * Deliberately silent: this is a teardown, not a handover — the subscribers it
+ * would notify are being torn down with it. (The RELEASE path that matters to
+ * them, an unbind on a live scene, goes through `setSignalLiveControlled`.)
+ * Subscriptions themselves are dropped by {@link resetSlotAuthority}.
+ */
 export function clearLiveControl(): void {
   _controlled.clear();
 }
@@ -416,7 +520,13 @@ export function resetSlotAuthority(): void {
   _claims.clear();
   _slotToChannel.clear();
   _channelToSlots.clear();
+  // Roles belong to the bindings of the model being torn down (plan-353 F6):
+  // left behind, they would answer for identically-keyed slots of the NEXT
+  // model, and a stale `feedback` is a write right handed to the wrong scene.
+  _slotRoles.clear();
   _controlled.clear();
+  // Transition subscriptions belong to the model that registered them.
+  _liveControlListeners.clear();
   for (const instance of _flaggedInstances) instance.liveControlled = false;
   _flaggedInstances.clear();
   // Phase 3: a model switch never inherits foreign remote ownership (9.8).

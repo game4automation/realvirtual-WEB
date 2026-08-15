@@ -22,8 +22,12 @@ import type { RVTransportManager } from './rv-transport-manager';
 import type { AABB } from './rv-aabb';
 import type { GizmoOverlayManager } from './rv-gizmo-manager';
 import type { LampManager } from './rv-lamp-manager';
+import type { SceneButtonManager } from './rv-scene-button-manager';
 import type { EnergyChainManager } from './rv-energy-chain-manager';
+import type { MachiningManager } from './rv-machining-manager';
 import type { CollisionRoleRegistrar } from './rv-collision-role';
+import type { KinematicManagerLike } from './rv-kinematic-registry';
+import type { SignalReapplyRegistry } from './rv-signal-reapply-registry';
 import type { RVOutlineManager } from './rv-outline-manager';
 import type { ErrorStore } from './rv-error-store';
 import type { InstructionRuntimeStore } from './rv-instruction-runtime-store';
@@ -34,7 +38,7 @@ import type { ViewerEvents } from '../rv-viewer-events';
 
 // ─── Schema Types ────────────────────────────────────────────────
 
-export type FieldType = 'number' | 'boolean' | 'string' | 'vector3' | 'componentRef' | 'componentRefArray' | 'enum';
+export type FieldType = 'number' | 'boolean' | 'string' | 'vector3' | 'componentRef' | 'componentRefArray' | 'enum' | 'json';
 
 /** PLC signal type a componentRef slot expects (Unity parity: the C# field type,
  *  e.g. `public PLCOutputBool Forward`). */
@@ -161,6 +165,12 @@ export function loadSchemaFromSpec(name: string): ComponentSchema {
       desc = { type: 'enum', enumMap };
     } else if (p.type === 'number' || p.type === 'boolean' || p.type === 'string') {
       desc = { type: p.type };
+    } else if (p.type === 'array' || p.type === 'object') {
+      // Structured JSON field (e.g. Path.segments) — carried verbatim; the
+      // component's own parser is the SSOT for the inner shape. Generic on
+      // purpose: any component can declare structured fields this way and gets
+      // inspector + overlay + MCP editability without a dedicated tool.
+      desc = { type: 'json' };
     } else {
       throw new Error(`rv-ODT spec: unsupported property type for ${name}.${field}`);
     }
@@ -205,6 +215,10 @@ export interface ComponentContext {
   gizmoManager?: GizmoOverlayManager;
   /** Optional viewer-owned registry for fixed-update Lamp flashing. */
   lampManager?: LampManager;
+  /** Optional viewer-owned registry for 3D scene buttons (plan-417): press/turn
+   *  animation, momentary-click timers and the component lifecycle. Components
+   *  that animate a button cap must null-check before use. */
+  sceneButtonManager?: SceneButtonManager;
   /** Optional — the viewer's OutlinePass wrapper. Components that drive the
    *  status outline (CustomRuntimeInstruction step highlight) must null-check
    *  before use. */
@@ -227,12 +241,42 @@ export interface ComponentContext {
    */
   energyChainManager?: EnergyChainManager;
   /**
+   * Optional viewer-owned CSG machining registry (plan-405). `MachiningVolume`
+   * components register themselves here in `onSceneReady()` (after Kinematic
+   * re-parenting, so tool nodes are in their final hierarchy position); every
+   * other component ignores it. Absent → no machining at all: the authored
+   * workpiece mesh stays visible and untouched (F10).
+   */
+  machiningManager?: MachiningManager;
+  /**
    * Optional viewer-owned collision registry (plan-394). `CollisionRole`
    * components register their node here; every other component ignores it.
    * Typed as the narrow registrar interface so the context does not drag in
    * the manager implementation.
    */
   collisionManager?: CollisionRoleRegistrar;
+  /**
+   * Optional rigid-body mechanism manager (plan-404). Set from the module
+   * singleton `getKinematicManager()` on EVERY context construction path
+   * (initial load, processExtras/asset placement, createRuntimeNode,
+   * constructComponentOnNode) — the lifecycle matrix in plan-404 §2.3 requires
+   * a mechanism created on any path to reach the tick loop. Undefined in a
+   * public build, where the private manager was never installed; the mechanism
+   * components themselves are absent there too, so nothing reads it.
+   */
+  kinematicManager?: KinematicManagerLike;
+  /**
+   * Optional viewer-owned re-apply registry (plan-427). Components pass it as
+   * the last argument of the `wireXSignal` helpers so their input slots can be
+   * re-driven with the CURRENT signal level after `resetSimulation()` and after
+   * a reconnect — the edge-driven store alone never repeats a held level.
+   *
+   * Set on EVERY context construction path; where no option bag carries it, the
+   * module slot `getActiveSignalReapplyRegistry()` fills in (same rationale as
+   * `kinematicManager` above). Undefined only in pure unit tests, where the
+   * helpers then behave exactly as before the feature.
+   */
+  reapply?: SignalReapplyRegistry;
   /**
    * True when this context belongs to a load path that WILL still call
    * `onSceneReady()` — `loadGLB` and `processExtras`. Both run the Kinematic
@@ -339,6 +383,10 @@ export function applySchema(
       if (desc.default !== undefined) {
         if (desc.type === 'vector3' && desc.default instanceof Vector3) {
           instance[key] = (desc.default as Vector3).clone();
+        } else if (desc.type === 'json') {
+          // Deep-copy — a shared mutable default (array/object) across
+          // instances would let one instance's edit leak into every other.
+          instance[key] = structuredClone(desc.default);
         } else {
           instance[key] = desc.default;
         }
@@ -394,6 +442,11 @@ export function applySchema(
         }
         break;
       }
+
+      case 'json':
+        // Verbatim deep copy — the component's parser validates the shape.
+        instance[key] = structuredClone(raw);
+        break;
     }
   }
 }
@@ -406,7 +459,9 @@ export function applySchema(
  * Signal refs (PLCOutputBool, PLCInputBool, etc.) → resolved signal address string
  * Sensor refs → RVSensor instance
  * Drive refs → RVDrive instance
- * Unresolvable refs → null (does not throw)
+ * Any other REGISTERED component type → that instance (plan-411 §2.2)
+ * Unresolvable refs → null (does not throw); inside an ARRAY the raw path is
+ *   kept instead, because array consumers resolve late.
  * Primitive fields are left untouched.
  */
 export function resolveComponentRefs(
@@ -433,6 +488,12 @@ export function resolveComponentRefs(
             resolved.push(res.drive);
           } else if (res.node !== undefined) {
             resolved.push(res.node);
+          } else if (res.component !== undefined) {
+            // Generic registered component (plan-411 §2.2) — same treatment as
+            // a Drive/Sensor element, so an array of mechanism/tool references
+            // arrives as instances rather than as strings the consumer has to
+            // resolve a second time.
+            resolved.push(res.component);
           } else {
             // Keep the raw ref path for DES component resolution
             resolved.push(ref.path);
@@ -462,6 +523,11 @@ export function resolveComponentRefs(
       // Generic node ref (Unity `Transform` field, plan-362). A resolved node
       // must NOT be flattened to null by the fallthrough below.
       instance[key] = resolved.node;
+    } else if (resolved.component !== undefined) {
+      // Generic registered component (plan-411 §2.2) — e.g. a
+      // `realvirtual.KinematicMechanism` reference, which used to land in the
+      // null fallthrough below and forced a per-component path workaround.
+      instance[key] = resolved.component;
     } else {
       // Unresolvable — set to null rather than throwing
       instance[key] = null;
@@ -602,6 +668,8 @@ const registeredFactories = new Map<string, ComponentFactory>();
  * the same node (e.g. hot-reload) doesn't throw on re-definition.
  */
 export function setComponentInstance(node: Object3D, instance: object): void {
+  const list = _instanceList(node, true)!;
+  if (!list.includes(instance)) list.push(instance);
   if (node.userData._rvComponentInstance) return; // first-writer wins
   Object.defineProperty(node.userData, '_rvComponentInstance', {
     value: instance,
@@ -609,6 +677,63 @@ export function setComponentInstance(node: Object3D, instance: object): void {
     enumerable: false,
     configurable: true,
   });
+}
+
+/**
+ * The ORDERED list of component instances attached to a node (plan-417 §2.4).
+ *
+ * A Unity node legitimately carries several rv_extras components — the demo
+ * scene buttons put `SceneButtonMoveable` AND `SceneButtonBase` on the same
+ * node. `_rvComponentInstance` can only ever hold one of them ("first-writer
+ * wins", kept for every existing single-instance consumer), so the full set
+ * lives alongside it in a non-enumerable `_rvComponentInstances` array in
+ * registration order. Falls back to the single instance for nodes that were
+ * stamped directly (components that define `_rvComponentInstance` themselves),
+ * and to an empty array for nodes without any component.
+ */
+export function getComponentInstances(node: Object3D): readonly object[] {
+  const list = _instanceList(node, false);
+  if (list && list.length > 0) return list;
+  const single = node.userData?._rvComponentInstance as object | undefined;
+  return single ? [single] : EMPTY_INSTANCES;
+}
+
+/**
+ * Detach one instance from a node — the counterpart of
+ * {@link setComponentInstance}, used by component `dispose()` and the runtime
+ * node teardown. Removes it from the ordered list and, when it was also the
+ * single `_rvComponentInstance`, promotes the next remaining instance (or
+ * drops the property when none is left).
+ */
+export function removeComponentInstance(node: Object3D, instance: object): void {
+  const list = _instanceList(node, false);
+  if (list) {
+    const i = list.indexOf(instance);
+    if (i >= 0) list.splice(i, 1);
+  }
+  if (node.userData?._rvComponentInstance !== instance) return;
+  const next = list && list.length > 0 ? list[0] : undefined;
+  if (next) node.userData._rvComponentInstance = next;
+  else delete node.userData._rvComponentInstance;
+}
+
+const EMPTY_INSTANCES: readonly object[] = Object.freeze([]);
+
+/** The node's instance array; created (non-enumerable) on demand. */
+function _instanceList(node: Object3D, create: boolean): object[] | undefined {
+  const existing = node.userData?._rvComponentInstances as object[] | undefined;
+  if (existing || !create) return existing;
+  const list: object[] = [];
+  // Non-enumerable for the same reason as `_rvComponentInstance`: Three.js
+  // clones userData through a JSON round-trip and would choke on the circular
+  // instance ↔ node reference.
+  Object.defineProperty(node.userData, '_rvComponentInstances', {
+    value: list,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return list;
 }
 
 /**
@@ -626,25 +751,22 @@ export function registerComponent(factory: ComponentFactory): void {
     ...factory,
     afterCreate(instance: RVComponent, node: Object3D): void {
       if (originalAfterCreate) originalAfterCreate(instance, node);
-      if (!node.userData._rvComponentInstance) {
-        // Non-enumerable so JSON.stringify() skips this circular reference
-        // (component → node → userData → component). Three.js Object3D.clone()
-        // klont userData per JSON round-trip and would otherwise crash here
-        // with "Converting circular structure to JSON" — seen since
-        // conditional geometry clone (plan-153) reshapes spawn paths such that
-        // some sources fall back to Object3D.clone() instead of instancing.
-        Object.defineProperty(node.userData, '_rvComponentInstance', {
-          value: instance,
-          writable: true,
-          configurable: true,
-          enumerable: false,
-        });
-      }
+      // Always via setComponentInstance: it keeps `_rvComponentInstance`
+      // first-writer-wins AND appends to the ordered `_rvComponentInstances`
+      // list the dispatcher walks (plan-417 §2.4). Both properties are
+      // non-enumerable so JSON.stringify() skips the circular reference
+      // (component → node → userData → component). Three.js Object3D.clone()
+      // clones userData per JSON round-trip and would otherwise crash here
+      // with "Converting circular structure to JSON" — seen since conditional
+      // geometry clone (plan-153) reshapes spawn paths such that some sources
+      // fall back to Object3D.clone() instead of instancing.
+      setComponentInstance(node, instance);
     },
   };
   registeredFactories.set(factory.type, wrappedFactory);
   registeredSchemas.set(factory.type, factory.schema);
   _signalSlotFieldsCache.delete(factory.type);
+  _schemaRegistrationEpoch++;
   if (factory.capabilities) {
     registerCapabilities(factory.type, factory.capabilities);
   }
@@ -666,10 +788,29 @@ export function getDisplayName(type: string): string {
 /** Registered component schemas for auto-derivation of CONSUMED fields */
 const registeredSchemas = new Map<string, ComponentSchema>();
 
+/**
+ * Monotonic counter, bumped on EVERY schema registration (via
+ * `registerComponent` or `registerComponentSchema`).
+ *
+ * Registration happens as a module-load side effect, so any consumer that
+ * derives a set from `getRegisteredSchemaTypes()` cannot freeze its result at
+ * module-load time — it would capture whatever happened to be imported first.
+ * Comparing this epoch lets such a consumer cache its derivation and recompute
+ * exactly once after a late registration (see `bindingSlotRvKeys()` in
+ * rv-binding-slot-resolver.ts).
+ */
+let _schemaRegistrationEpoch = 0;
+
+/** Current schema-registration epoch — a cache token, not an identity. */
+export function getSchemaRegistrationEpoch(): number {
+  return _schemaRegistrationEpoch;
+}
+
 /** Register a component schema for CONSUMED field auto-derivation, with optional capabilities. */
 export function registerComponentSchema(componentType: string, schema: ComponentSchema, capabilities?: ComponentCapabilities): void {
   registeredSchemas.set(componentType, schema);
   _signalSlotFieldsCache.delete(componentType);
+  _schemaRegistrationEpoch++;
   if (capabilities) {
     registerCapabilities(componentType, capabilities);
   }
@@ -792,7 +933,11 @@ export function getSchemaDefaults(componentType: string): Record<string, unknown
     // scope:'none' fields are never stamped — they have no inspector presence,
     // so seeding a default would create an orphan row with no overlay path.
     if (desc.scope === 'none') continue;
-    if (desc.default !== undefined) out[key] = desc.default;
+    if (desc.default !== undefined) {
+      // json defaults are arrays/objects — deep-copy so the stamped extras
+      // never share a mutable reference with the schema (or other nodes).
+      out[key] = desc.type === 'json' ? structuredClone(desc.default) : desc.default;
+    }
   }
   return out;
 }

@@ -144,6 +144,24 @@ function buildConnectWsSettings(serverUrl: string): InterfaceSettings {
   };
 }
 
+// ── Boot auto-reconnect (plan-421 F1) ────────────────────────────────
+
+/**
+ * Backoff ladder of the page-load auto-probe, in milliseconds. The LAST entry
+ * repeats forever: after the fast opening chain the plugin keeps probing at
+ * most once per 60 s, so a CONNECT that is started minutes AFTER the page still
+ * gets picked up without any user action. A finite chain would have missed
+ * exactly the case the user reported (plan-421 F1 / SOL-R1-4).
+ */
+const BOOT_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000] as const;
+
+/**
+ * Minimum spacing between two wake-triggered probes (visibility/online). Those
+ * events are user/OS driven and may arrive in bursts (alt-tabbing); the spacing
+ * keeps a burst from turning into a burst of gateway requests.
+ */
+const WAKE_MIN_SPACING_MS = 1_000;
+
 // ── Plugin Class ─────────────────────────────────────────────────────
 
 export class ConnectPlugin implements RVViewerPlugin {
@@ -177,36 +195,225 @@ export class ConnectPlugin implements RVViewerPlugin {
   private lastMirroredInterfaces: ConnectInterface[] | null = null;
   private readonly registeredProviders = new Map<string, Pick<SignalSourceRef, 'interfaceId' | 'topic'>>();
 
+  // ── Boot auto-reconnect state (plan-421 F1) ──
+  /** Loop is running: a timer is pending or an attempt is in flight. */
+  private retryArmed = false;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Index into {@link BOOT_RETRY_DELAYS_MS}; saturates on the last (60 s) entry. */
+  private retryStep = 0;
+  /**
+   * Cancellation token. Every cancel point — dispose, re-init, a manual Connect,
+   * a URL change — bumps it, so an attempt whose async steps resolve afterwards
+   * writes no state and schedules nothing.
+   */
+  private retryGeneration = 0;
+  /** At most ONE probe in flight; a firing timer never stacks a second one. */
+  private retryInFlight = false;
+  /** `Date.now()` of the last started probe — wake-trigger spacing only. */
+  private lastAttemptAt = Number.NEGATIVE_INFINITY;
+  private disposed = false;
+  private lastSeenServerUrl = '';
+  private lastSeenState: ConnectSnapshot['state'] = 'disconnected';
+
   /** Start model-independent CONNECT discovery and state observation. */
   init(): void {
-    this.unsubscribe = subscribeConnectStore(() => this.syncStream());
+    // A re-init supersedes whatever the previous one left running.
+    this.cancelRetries();
+    this.disposed = false;
     const snap = getConnectSnapshot();
-    // An explicit Disconnect is remembered across reloads — never probe against the user's will.
-    //
-    // On a hosted (non-loopback) origin a LOCAL gateway target may only be auto-probed after
-    // the user connected explicitly at least once (hasUserConnectedBefore): Chrome's Local
-    // Network Access prompt belongs to the explicit Connect click, never to a page load. A
-    // stored NON-local gateway URL keeps auto-connecting as before — no browser prompt exists
-    // for public targets. canSilentlyProbeGateway() below stays as the second, permission-
-    // state-based gate.
-    const mayProbe = isLoopbackOrigin()
+    this.lastSeenServerUrl = snap.serverUrl;
+    this.lastSeenState = snap.state;
+    this.unsubscribe = subscribeConnectStore(() => this.onConnectStoreChanged());
+    // Coming back to the tab or regaining the network is the moment a gateway is
+    // most likely to have appeared — probe then instead of waiting out the 60 s.
+    if (typeof window !== 'undefined') window.addEventListener('online', this.handleWake);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleWake);
+    }
+    this.maybeStartRetries();
+  }
+
+  /**
+   * May a page-load probe touch the gateway at all?
+   *
+   * An explicit Disconnect is remembered across reloads — never probe against the user's will
+   * (checked by the caller). On a hosted (non-loopback) origin a LOCAL gateway target may only
+   * be auto-probed after the user connected explicitly at least once (hasUserConnectedBefore):
+   * Chrome's Local Network Access prompt belongs to the explicit Connect click, never to a page
+   * load. A stored NON-local gateway URL keeps auto-connecting as before — no browser prompt
+   * exists for public targets. canSilentlyProbeGateway() stays as the second, permission-state-
+   * based gate inside {@link attemptAutoConnect}.
+   */
+  private mayProbe(snap: ConnectSnapshot): boolean {
+    return isLoopbackOrigin()
       || (hasStoredServerUrl()
         && (!isLocalGatewayTarget(snap.serverUrl) || hasUserConnectedBefore()));
-    if (snap.state === 'disconnected' && !hasAutoConnectOptOut() && mayProbe) {
-      canSilentlyProbeGateway()
-        .then((ok) => {
-          if (!ok || getConnectSnapshot().state !== 'disconnected') return;
-          return connectToServer();
-        })
-        .catch(() => {
-          // Silent fail — the user can connect manually from the CONNECT panel.
-        });
+  }
+
+  /**
+   * Last logged idle reason — every guard that silences the auto-reconnect logs WHY, but only
+   * on a reason change, never per tick (debug-026: four agents of archaeology because all
+   * gates failed without a trace).
+   */
+  private lastIdleReason: string | null = null;
+
+  private logIdle(reason: string): void {
+    if (this.lastIdleReason === reason) return;
+    this.lastIdleReason = reason;
+    console.info(`[connect] auto-reconnect idle: ${reason}`);
+  }
+
+  /** Arm the loop and fire the first probe, unless a guard forbids it right now. */
+  private maybeStartRetries(): void {
+    if (this.retryArmed || this.disposed) return;
+    const snap = getConnectSnapshot();
+    // `error` is a retryable state, not a dead end: connectToServer() leaves it
+    // behind after every failed attempt (connect-store.ts:959), so a loop that
+    // only retried on `disconnected` would run exactly once (SOL-R1-1).
+    if (snap.state !== 'disconnected' && snap.state !== 'error') return;
+    if (hasAutoConnectOptOut()) {
+      this.logIdle('user disconnected explicitly - click Connect to re-enable');
+      return;
     }
+    if (!this.mayProbe(snap)) {
+      this.logIdle('silent probing needs one successful explicit Connect on this origin first');
+      return;
+    }
+    this.retryArmed = true;
+    this.retryStep = 0;
+    this.scheduleAttempt(0);
+  }
+
+  /** Disarm the loop. An in-flight attempt settles quietly (it re-checks `retryArmed`). */
+  private stopRetries(): void {
+    this.retryArmed = false;
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+  }
+
+  /** Disarm AND invalidate the in-flight attempt — nothing of it may land anymore. */
+  private cancelRetries(): void {
+    this.retryGeneration++;
+    this.retryInFlight = false;
+    this.stopRetries();
+  }
+
+  private scheduleAttempt(delayMs: number): void {
+    if (!this.retryArmed) return;
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    const generation = this.retryGeneration;
+    if (delayMs <= 0) {
+      void this.attemptAutoConnect(generation);
+      return;
+    }
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.attemptAutoConnect(generation);
+    }, delayMs);
+  }
+
+  /** Queue the next probe, advancing the backoff ladder (last step repeats forever). */
+  private rearm(generation: number): void {
+    if (generation !== this.retryGeneration || !this.retryArmed || this.disposed) return;
+    const last = BOOT_RETRY_DELAYS_MS.length - 1;
+    const delay = BOOT_RETRY_DELAYS_MS[Math.min(this.retryStep, last)];
+    this.retryStep = Math.min(this.retryStep + 1, last);
+    this.scheduleAttempt(delay);
+  }
+
+  /**
+   * One silent probe. EVERY guard is re-evaluated here, not once at boot: an
+   * explicit Disconnect (opt-out) or a revoked LNA permission has to stop the
+   * loop at the next attempt, not only at the next page load.
+   */
+  private async attemptAutoConnect(generation: number): Promise<void> {
+    if (generation !== this.retryGeneration || !this.retryArmed || this.retryInFlight) return;
+
+    if (hasAutoConnectOptOut()) {
+      this.logIdle('user disconnected explicitly - click Connect to re-enable');
+      this.stopRetries();
+      return;
+    }
+    const snap = getConnectSnapshot();
+    if (snap.state === 'connected') { this.stopRetries(); return; }
+    if (snap.state !== 'disconnected' && snap.state !== 'error') { this.rearm(generation); return; }
+    if (!this.mayProbe(snap)) {
+      this.logIdle('silent probing needs one successful explicit Connect on this origin first');
+      this.stopRetries();
+      return;
+    }
+
+    this.retryInFlight = true;
+    this.lastAttemptAt = Date.now();
+    try {
+      const ok = await canSilentlyProbeGateway();
+      if (generation !== this.retryGeneration) return;
+      if (!ok) {
+        // The loop keeps ticking but never fetches: Chrome's local-network-access permission
+        // is not 'granted', and only an explicit Connect (user gesture) may surface the prompt.
+        this.logIdle('browser local-network-access permission not granted - click Connect once to allow');
+      } else {
+        this.lastIdleReason = null;
+      }
+      const state = getConnectSnapshot().state;
+      if (ok && (state === 'disconnected' || state === 'error')) await connectToServer();
+    } catch {
+      // Silent fail — the user can always connect manually from the CONNECT panel.
+    } finally {
+      // A cancel point already cleared the flag and moved the generation on; the
+      // superseded attempt must not resurrect it.
+      if (generation === this.retryGeneration) this.retryInFlight = false;
+    }
+
+    if (generation !== this.retryGeneration || this.disposed) return;
+    if (getConnectSnapshot().state === 'connected') { this.stopRetries(); return; }
+    this.rearm(generation);
+  }
+
+  /** Tab became visible / network came back → pull the next probe forward. */
+  private readonly handleWake = (): void => {
+    if (!this.retryArmed || this.retryInFlight || this.disposed) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    const since = Date.now() - this.lastAttemptAt;
+    this.retryStep = 0;
+    this.scheduleAttempt(since >= WAKE_MIN_SPACING_MS ? 0 : WAKE_MIN_SPACING_MS - since);
+  };
+
+  /** Store observer: keep the retry loop in step with what the user/gateway did. */
+  private onConnectStoreChanged(): void {
+    const snap = getConnectSnapshot();
+    const previousState = this.lastSeenState;
+    const previousUrl = this.lastSeenServerUrl;
+    this.lastSeenState = snap.state;
+    this.lastSeenServerUrl = snap.serverUrl;
+
+    if (snap.serverUrl !== previousUrl) {
+      // The target moved — a probe in flight belongs to the old gateway.
+      this.cancelRetries();
+    } else if (snap.state === 'connecting' && previousState !== 'connecting' && !this.retryInFlight) {
+      // A Connect the user asked for; ours never reaches here (retryInFlight).
+      this.cancelRetries();
+    } else if (snap.state === 'connected') {
+      this.stopRetries();
+    }
+    this.maybeStartRetries();
+    this.syncStream();
   }
 
   /** Attach the current model to CONNECT's live signal stream. */
   onModelLoaded(result: LoadResult, viewer: RVViewer): void {
     this.detachModel();
+    // plan-386 F17: a shared GLB gets no live stream. Everything below opens a
+    // WebSocket to the CONNECT gateway and starts pushing this model's signal
+    // names into it — a foreign file must not be able to trigger that just by
+    // being linked. The REST connection state itself is model-independent and
+    // stays exactly as the user left it.
+    if (!viewer.loadTrust.trusted) return;
     this.viewer = viewer;
     this.lastMirroredInterfaces = null;
     this.registeredProviders.clear();
@@ -226,6 +433,24 @@ export class ConnectPlugin implements RVViewerPlugin {
   /** Detach model-scoped streaming while preserving the REST connection state. */
   onModelCleared(_viewer: RVViewer): void {
     this.detachModel();
+  }
+
+  /**
+   * plan-435: switching the plugin off must stop the live signal stream — that
+   * IS its visible effect. Declared explicitly rather than leaning on the
+   * `onModelCleared` fallback so the model bookkeeping stays intact: the model
+   * has not gone anywhere, only this plugin has, and a later real
+   * `clearModel()` must still reach `onModelCleared` (invariant 3 —
+   * `detachModel()` is idempotent, so running it twice is safe).
+   */
+  onDeactivate(): void {
+    this.detachModel();
+  }
+
+  /** Re-attach the stream to the model that is still loaded. */
+  onActivate(viewer: RVViewer): void {
+    const result = viewer.lastLoadResult;
+    if (result) this.onModelLoaded(result, viewer);
   }
 
   /** Open/close the live value stream so it follows the CONNECT REST connection state. */
@@ -313,6 +538,14 @@ export class ConnectPlugin implements RVViewerPlugin {
   }
 
   dispose(): void {
+    // Order matters: `disposed` first, so an attempt resolving during teardown
+    // finds the flag set and writes nothing back into a dead plugin.
+    this.disposed = true;
+    this.cancelRetries();
+    if (typeof window !== 'undefined') window.removeEventListener('online', this.handleWake);
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleWake);
+    }
     this.unsubscribe?.();
     this.unsubscribe = null;
     this.detachModel();

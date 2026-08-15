@@ -15,6 +15,7 @@
  */
 
 import { expect, test, type Page } from 'playwright/test';
+import { DEV_GLB } from '../tests/fixtures/glb-paths.mjs';
 
 const TOGGLE = '[data-testid="signal-link-mode-toggle"]';
 
@@ -191,14 +192,14 @@ test.describe('slot authority e2e (9.10)', () => {
     expect(await slotAuthority(page, info!)).toBe('bound');
 
     // 4) Model switch clears every claim (unconditional reset in clearModel).
-    const claimsAfterSwitch = await page.evaluate(async () => {
+    const claimsAfterSwitch = await page.evaluate(async (modelUrl) => {
       const viewer = (window as unknown as {
         __rvViewer: { loadModel: (url: string) => Promise<unknown> };
       }).__rvViewer;
-      await viewer.loadModel('/models/physics-zone-test.glb');
+      await viewer.loadModel(modelUrl);
       const authority = await import('/src/core/engine/rv-slot-authority.ts');
       return authority.claimedSlotCount();
-    });
+    }, DEV_GLB.physicsZone);
     expect(claimsAfterSwitch).toBe(0);
   });
 });

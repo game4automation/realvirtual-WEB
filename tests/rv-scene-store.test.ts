@@ -11,24 +11,55 @@
  *   - save / saveAs / discard / rename / duplicate / delete
  *   - per-base draft autosave-and-restore
  *   - dirty flag behaviour via markDirty (subscription wiring is integration-tested)
+ *
+ * ## plan-716 Phase 3 — partially ported (§9.0)
+ *
+ * The plan's disposition for this file is "portieren → open-save-document.test.ts-
+ * Familie", and that is what happened: every case that asserted on the DELETED
+ * row save (a `scn_` mint, a catalogue row, a body slot) moved to
+ * `open-save-document.test.ts`, where it is restated against the document file.
+ * What stays here is the mechanics that survive the phase untouched — the
+ * workspace lifecycle, the fork, the draft slots, rename, and the catalogue
+ * fallbacks that live until Phase 6 deletes the catalogue itself.
+ *
+ * The cases that DO still call a save verb install a writable project, because
+ * since Phase 3 a save writes a document file and needs somewhere to put it.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// Phase 3: a save BAKES and writes the result as a document file. The bytes are
+// irrelevant to every case in this file, and baking for real would need a live
+// Three.js scene — which is exactly what the fake viewer exists to avoid.
+vi.mock('../src/core/hmi/scene/rv-scene-glb-bake', () => ({
+  bakeIntoGlb: async () => ({
+    glb: new Uint8Array([0x67, 0x6c, 0x54, 0x46, 1, 2, 3, 4]),
+    warnings: [],
+    writtenReferences: [],
+  }),
+  makeRegistryBakeResolver: () => ({}),
+  bakeRequiresFullPath: () => false,
+}));
+import { deadDraftKey, deadSlotExists, seedDeadDraft } from './helpers/dead-draft-slots';
 import { SceneStore } from '../src/core/hmi/scene/scene-store';
 import {
   type RvScene,
   type SceneBase,
-  newSceneId,
   makeDraftScene,
 } from '../src/core/hmi/scene/rv-scene-types';
 import {
   readScene,
   writeScene,
-  readDraft,
-  writeDraft,
   listMetas,
   readActiveId,
 } from '../src/core/hmi/scene/rv-scene-storage';
+import { documentsOf } from '../src/core/project/rv-project-documents';
+import { resetProjectStore } from '../src/core/project/project-store';
+import {
+  installFakeDocumentProject,
+  type FakeDocumentProject,
+} from './helpers/fake-document-project';
+import { legacySceneId } from './helpers/legacy-scene-id';
 
 // ─── Fake viewer ────────────────────────────────────────────────────────
 
@@ -39,11 +70,26 @@ interface FakeViewer {
   availableModels: { url: string; label: string }[];
   currentScene: RvScene | null;
   currentModelUrl: string | null;
+  /**
+   * `openDocument` records the active mode with the session pointer, so a fake
+   * viewer that has no `modes` makes every document open throw on the way out.
+   * Present since plan-716 Phase 6 — before it, this file reached that verb only
+   * on the paths that already failed here.
+   */
+  modes: { has: (id: string) => boolean; setMode: (id: string) => void; activeMode: string | null };
   loadScenes: RvScene[];
+  registry: unknown;
+  currentModelRoot: unknown;
+  lastLoadResult: unknown;
 }
 
 function makeViewer(): FakeViewer {
   const v: FakeViewer = {
+    // The bake needs a registry to resolve names against; mocked bake, real
+    // guard (`_bakeCurrent` returns null without one).
+    registry: { getGltfNodeNames: () => [], getGltfNodeIndex: () => -1 },
+    currentModelRoot: null,
+    lastLoadResult: null,
     loadScenes: [],
     availableModels: [
       { url: '/models/Demo.glb', label: 'Demo' },
@@ -51,6 +97,7 @@ function makeViewer(): FakeViewer {
     ],
     currentScene: null,
     currentModelUrl: null,
+    modes: { has: () => false, setMode: () => {}, activeMode: null },
     loadScene: vi.fn(async (s: RvScene) => {
       v.loadScenes.push(s);
       v.currentScene = s;
@@ -71,12 +118,21 @@ const empty: SceneBase = { kind: 'empty' };
 describe('SceneStore', () => {
   let viewer: FakeViewer;
   let store: SceneStore;
+  /** Installed per test — see the file header for why it is not global. */
+  let project: FakeDocumentProject | null = null;
 
   beforeEach(() => {
     localStorage.clear();
+    resetProjectStore();
+    project = null;
     viewer = makeViewer();
     // Cast the fake viewer; SceneStore only uses the methods/fields above.
     store = new SceneStore(viewer as unknown as ConstructorParameters<typeof SceneStore>[0]);
+  });
+
+  afterEach(() => {
+    project?.restore();
+    resetProjectStore();
   });
 
   // ─── Catalogue ────────────────────────────────────────────────────────
@@ -88,8 +144,9 @@ describe('SceneStore', () => {
       expect(snap.builtins[0].label).toBe('Demo');
     });
 
-    it('starts with empty My Scenes', () => {
-      expect(store.listScenes()).toEqual([]);
+    it('has no scene catalogue at all — the accessor is gone (plan-716 Phase 6)', () => {
+      expect('listScenes' in store).toBe(false);
+      expect('listBuiltins' in store).toBe(false);
     });
   });
 
@@ -107,30 +164,17 @@ describe('SceneStore', () => {
       expect(viewer.loadScenes[0].edits.ops).toEqual([]);
     });
 
-    it('restores an autosaved per-base draft if one exists', async () => {
-      const draftWithEdits: RvScene = {
-        ...makeDraftScene(builtinDemo, 'Demo'),
-        edits: {
-          ops: [{
-            id: 'op_seed', ts: 1, schemaV: 1, kind: 'setField',
-            nodePath: 'Conv1', componentType: 'Drive',
-            fieldName: 'TargetSpeed', value: 999, prev: 100,
-          }],
-          settings: { catalogUrls: [], gridSizeMm: 500 },
-        },
-      };
-      writeDraft(builtinDemo, draftWithEdits);
+    it('ignores a leftover op-log draft slot (plan-413 phase 6)', async () => {
+      // A previous release could autosave an op log here. That reader is gone:
+      // an autosave is a GLB body, and resuming a JSON op log would mean two
+      // formats claiming the same workspace. The slot is simply not consulted.
+      seedDeadDraft(builtinDemo);
 
       await store.openBuiltin('/models/Demo.glb', 'Demo');
       const snap = store.getSnapshot();
-      expect(snap.draft?.edits.ops).toHaveLength(1);
-      expect(snap.draft?.edits.ops[0].kind).toBe('setField');
-      // Restored built-in draft has no associated saved scene — its clean
-      // baseline is the unmodified GLB (empty op log). The restored ops
-      // are deltas from that, so the workspace is dirty on open and the
-      // UI surfaces "Unsaved" until the user explicitly saves or discards.
-      expect(snap.dirty).toBe(true);
-      expect(viewer.loadScenes[0].edits.ops).toHaveLength(1);
+      expect(snap.draft?.edits.ops).toEqual([]);
+      expect(snap.dirty).toBe(false);
+      expect(viewer.loadScenes[0].edits.ops).toEqual([]);
     });
   });
 
@@ -146,53 +190,44 @@ describe('SceneStore', () => {
   // ─── Save / Save As ───────────────────────────────────────────────────
 
   describe('save / saveAs', () => {
-    it('save() promotes a draft into a saved scene with a fresh id', async () => {
+    // PORTED (plan-716 Phase 3, §9.0). The two cases that pinned the row save —
+    // "promotes a draft into a saved scene with a fresh `scn_` id" and "updates
+    // in place, catalogue row carries the op log" — now live in
+    // `open-save-document.test.ts` against the document file. What is kept here
+    // is the surviving statement of each: a save makes the workspace clean and
+    // named, and `saveAs` always produces a DIFFERENT document.
+
+    it('save() promotes a draft into a saved document', async () => {
+      project = installFakeDocumentProject();
       await store.openBuiltin('/models/Demo.glb', 'Demo');
-      // Manually mutate draft: pretend the user changed the name.
-      const before = store.getSnapshot().draft!;
-      // Simulate a name override.
-      Object.assign(before, { name: 'My Robot Cell' });
+      await store.applyOp({
+        id: 'op_promote', ts: Date.now(), schemaV: 1, kind: 'setField',
+        nodePath: 'Conv1', componentType: 'Drive', fieldName: 'TargetSpeed',
+        value: 200, prev: 100,
+      });
+
       await store.save();
 
       const snap = store.getSnapshot();
       expect(snap.saved).not.toBeNull();
-      expect(snap.saved!.id).toMatch(/^scn_/);
       expect(snap.saved!.id).not.toBe('draft');
       expect(snap.dirty).toBe(false);
-      expect(listMetas()).toHaveLength(1);
-      expect(readActiveId()).toBe(snap.saved!.id);
-    });
-
-    it('save() on an existing scene updates in place (same id)', async () => {
-      // Seed a saved scene
-      const seeded = writeScene({
-        ...makeDraftScene(builtinDemo, 'Existing'),
-        id: newSceneId(),
-      });
-      await store.openScene(seeded.id);
-      // Apply an op so save has something to persist.
-      await store.applyOp({
-        id: 'op_test', ts: Date.now(), schemaV: 1, kind: 'setField',
-        nodePath: 'Conv1', componentType: 'Drive', fieldName: 'TargetSpeed',
-        value: 200, prev: 100,
-      });
-      await store.save();
-      const snap = store.getSnapshot();
-      expect(snap.saved!.id).toBe(seeded.id);
-      expect(readScene(seeded.id)?.edits.ops).toHaveLength(1);
-      expect(listMetas()).toHaveLength(1);
-      expect(snap.dirty).toBe(false);   // baseline reset
+      // RE-PINNED: a document row, never a catalogue row and never a `scn_`.
+      expect(snap.saved!.id.startsWith('scn_')).toBe(false);
+      expect(documentsOf(project.project())).toHaveLength(1);
+      expect(listMetas()).toEqual([]);
     });
 
     it('saveAs always creates a new id', async () => {
+      project = installFakeDocumentProject();
       const seeded = writeScene({
         ...makeDraftScene(builtinDemo, 'A'),
-        id: newSceneId(),
+        id: legacySceneId(),
       });
       await store.openScene(seeded.id);
       const newId = await store.saveAs('B');
       expect(newId).not.toBe(seeded.id);
-      expect(listMetas()).toHaveLength(2);
+      expect(documentsOf(project.project())).toHaveLength(1);
       expect(store.getSnapshot().saved?.name).toBe('B');
     });
   });
@@ -203,7 +238,7 @@ describe('SceneStore', () => {
     it('reloads the saved snapshot when one exists', async () => {
       const seeded = writeScene({
         ...makeDraftScene(builtinDemo, 'A'),
-        id: newSceneId(),
+        id: legacySceneId(),
       });
       await store.openScene(seeded.id);
       Object.assign(store.getSnapshot().draft!, { name: 'B (unsaved)' });
@@ -217,83 +252,48 @@ describe('SceneStore', () => {
     it('on a fresh draft (no saved), reloads the bare base', async () => {
       await store.openBuiltin('/models/Demo.glb', 'Demo');
       Object.assign(store.getSnapshot().draft!, { name: 'My edits' });
-      // Persist as draft first so discard has something to clear.
-      writeDraft(builtinDemo, store.getSnapshot().draft!);
+      // Nothing writes this slot any more, but discard still has to sweep what
+      // an earlier release left in it — otherwise a stale key outlives the
+      // scene it belonged to forever.
+      const key = seedDeadDraft(builtinDemo);
       await store.discard();
-      expect(readDraft(builtinDemo)).toBeNull();
+      expect(deadSlotExists(key)).toBe(false);
     });
   });
 
-  describe('rename', () => {
-    it('renames a saved scene and updates index + active state', async () => {
+  // ── rename / duplicate / createEmpty / delete are DOCUMENT ops ──────────
+  //
+  // Four describe blocks stood here, each exercising the catalogue fallback of
+  // one verb, and each already labelled "kept until Phase 6". The verbs no
+  // longer have a catalogue branch to take: `duplicate`, `delete` and
+  // `createEmpty` refuse an id that names no document, and `rename` writes the
+  // manifest row. Their coverage is the §9.3 family in
+  // `open-save-document.test.ts`, against a project they can actually write to.
+
+  describe('the catalogue verbs refuse what is not a document', () => {
+    it('duplicate and delete throw on a bare catalogue row', async () => {
       const seeded = writeScene({
         ...makeDraftScene(builtinDemo, 'A'),
-        id: newSceneId(),
+        id: legacySceneId(),
       });
-      await store.openScene(seeded.id);
-      store.rename(seeded.id, 'A Renamed');
-      expect(readScene(seeded.id)?.name).toBe('A Renamed');
-      expect(store.getSnapshot().saved?.name).toBe('A Renamed');
+      await expect(store.duplicate(seeded.id)).rejects.toThrow(/not found/i);
+      await expect(store.delete(seeded.id)).rejects.toThrow(/not found/i);
+      // Refused, not half-done: the row and its body are exactly as they were.
+      expect(readScene(seeded.id)?.name).toBe('A');
     });
-  });
 
-  describe('duplicate', () => {
-    it('produces a new entry with a fresh id, parentId set', () => {
+    it('rename is a no-op for an id with no manifest row', async () => {
       const seeded = writeScene({
         ...makeDraftScene(builtinDemo, 'A'),
-        id: newSceneId(),
+        id: legacySceneId(),
       });
-      const dupId = store.duplicate(seeded.id);
-      const dup = readScene(dupId)!;
-      expect(dup.id).not.toBe(seeded.id);
-      expect(dup.parentId).toBe(seeded.id);
-      expect(dup.name).toMatch(/copy/i);
-    });
-  });
-
-  // The dashboard catalogues rather than switches: creating a scene must add a
-  // row WITHOUT replacing the open workspace, and must persist so a reload
-  // keeps it. (newEmpty() is the other half of the pair and does switch.)
-  describe('createEmpty', () => {
-    it('adds a saved scene without touching the workspace', async () => {
-      await store.openBuiltin(builtinDemo.url, builtinDemo.label);
-      const before = store.getSnapshot().draft;
-
-      const id = store.createEmpty();
-
-      const created = readScene(id)!;
-      expect(created.base.kind).toBe('empty');
-      expect(store.listScenes().some(m => m.id === id)).toBe(true);
-      // The open workspace is untouched — no switch, so no dirty prompt owed.
-      expect(store.getSnapshot().draft?.id).toBe(before?.id);
+      await store.rename(seeded.id, 'A Renamed');
+      expect(readScene(seeded.id)?.name).toBe('A');
     });
 
-    it('does not collide when called twice', () => {
-      const a = store.createEmpty();
-      const b = store.createEmpty();
-      expect(a).not.toBe(b);
-      expect(readScene(a)!.name).not.toBe(readScene(b)!.name);
-    });
-  });
-
-  describe('delete', () => {
-    it('removes a non-active scene from index and storage', async () => {
-      const a = writeScene({ ...makeDraftScene(builtinDemo, 'A'), id: newSceneId() });
-      const b = writeScene({ ...makeDraftScene(builtinDemo, 'B'), id: newSceneId() });
-      await store.openScene(a.id);
-      await store.delete(b.id);
-      expect(readScene(b.id)).toBeNull();
-      expect(listMetas().map(m => m.id)).toEqual([a.id]);
-    });
-
-    it('falls back to first builtin when deleting the active scene', async () => {
-      const a = writeScene({ ...makeDraftScene(empty, 'A'), id: newSceneId() });
-      await store.openScene(a.id);
-      await store.delete(a.id);
-      const snap = store.getSnapshot();
-      // Active fell back to first built-in (Demo).
-      expect(snap.draft?.base.kind).toBe('builtin');
-      expect((snap.draft?.base as { kind: 'builtin'; url: string }).url).toBe('/models/Demo.glb');
+    it('createEmpty says so when there is nowhere to put a document', async () => {
+      await expect(store.createEmpty()).rejects.toThrow(/writable project/i);
+      expect(listMetas()).toEqual([]);
     });
   });
 
@@ -325,30 +325,23 @@ describe('SceneStore', () => {
       expect(snap.draft?.base).toEqual(builtinDemo);
     });
 
-    it('newEmpty + saveAs creates a named empty scene', async () => {
+    it('newEmpty + saveAs creates a named empty document', async () => {
+      // RE-PINNED (Phase 3): both halves became document verbs. `newEmpty`
+      // MINTS a document, and `saveAs` copies it under the given name — so the
+      // project ends with two rows and the second one carries the name.
+      project = installFakeDocumentProject();
       await store.newEmpty();
       const id = await store.saveAs('Empty A');
-      expect(id).toMatch(/^scn_/);
-      expect(readScene(id)?.base.kind).toBe('empty');
-      expect(readScene(id)?.name).toBe('Empty A');
+
+      expect(id).toMatch(/^doc_/);
+      const row = documentsOf(project.project()).find(d => d.id === id)!;
+      expect(row.name).toBe('Empty A');
+      expect(row.path).toBe('scenes/Empty A.glb');
+      expect(listMetas()).toEqual([]);
     });
 
-    it('exportSceneJSON triggers a download', () => {
-      const seeded = writeScene({ ...makeDraftScene(builtinDemo, 'A'), id: newSceneId() });
-      const orig = URL.createObjectURL;
-      const created: string[] = [];
-      URL.createObjectURL = (b: Blob) => {
-        const u = `blob:fake-${created.length}`;
-        created.push(u);
-        return u;
-      };
-      try {
-        store.exportSceneJSON(seeded.id);
-        expect(created.length).toBeGreaterThan(0);
-      } finally {
-        URL.createObjectURL = orig;
-      }
-    });
+    // `exportSceneJSON` went with the JSON scene reader (plan-413 phase 6):
+    // a v3 catalogue row describes a body it does not carry, so the file it
+    // produced could not be opened anywhere. `Export .glb…` is the verb now.
   });
-
 });

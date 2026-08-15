@@ -32,7 +32,7 @@ import {
   resolveSeedPaths,
   geometrySignature,
   signaturesMatch,
-} from '../src/plugins/asset-editor/select-actions';
+} from '@rv-private/plugins/asset-editor/select-actions';
 
 // Universe: two boxes SHARING one geometry (loader-dedup situation) with
 // different materials, one sphere. Red1/Red2 are distinct Material objects

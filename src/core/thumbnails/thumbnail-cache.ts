@@ -29,12 +29,27 @@
  * Previews are cheap, derived data, so the honest move is to drop them and let
  * them regenerate. That happens exactly once, via a versioned bucket name: the
  * new bucket starts empty and the old one is deleted in the background.
+ *
+ * ## The same applies to a render-quality change
+ *
+ * Bucket v3 (plan-712) is not a key-format change: the keys are identical, the
+ * *pictures* changed (256px flat renders → 512px supersampled renders with AO
+ * and a contact shadow). Since the size is deliberately not part of the key,
+ * the bucket name is the only invalidation lever there is — without the bump
+ * every card would keep serving its old 256px blob forever.
  */
 
 const LEGACY_BUCKET = 'rv-planner-thumbnails';
 
-/** Bucket name for the identity-keyed generation. Bump on any key-format change. */
-export const THUMBNAIL_BUCKET_V2 = 'rv-thumbnails-v2';
+/** Superseded buckets, deleted once per session. `rv-thumbnails-v3` held the
+ *  short-lived plan-712 previews with the too-bright ambient fill (see the
+ *  plan's `## Fix 2026-08-12`); `rv-thumbnails-v2` the pre-plan-712 256px
+ *  previews; `rv-planner-thumbnails` the pre-plan-372 glbUrl-keyed ones. */
+const SUPERSEDED_BUCKETS = ['rv-thumbnails-v3', 'rv-thumbnails-v2', LEGACY_BUCKET];
+
+/** Bucket name for the current preview generation. Bump on any key-format
+ *  change AND on any change to how previews look. */
+export const THUMBNAIL_BUCKET_V4 = 'rv-thumbnails-v4';
 
 /** Guards the one-time legacy purge per bucket name (module-scope, per document). */
 const _purged = new Set<string>();
@@ -44,26 +59,28 @@ export class ThumbnailCache {
   /** Set once the legacy purge for this instance has been kicked off. */
   private _purgeStarted = false;
 
-  constructor(bucket = THUMBNAIL_BUCKET_V2) {
+  constructor(bucket = THUMBNAIL_BUCKET_V4) {
     this._bucket = bucket;
   }
 
   /**
-   * Delete the pre-plan-372 bucket once per session. Best-effort and
+   * Delete every superseded bucket once per session. Best-effort and
    * deliberately un-awaited by callers: failing to free old previews must never
    * keep a card from rendering.
    */
   private _purgeLegacyOnce(): void {
     if (this._purgeStarted) return;
     this._purgeStarted = true;
-    // Only the default bucket supersedes the legacy one; a test bucket must not
+    // Only the default bucket supersedes the older ones; a test bucket must not
     // delete a real user's cache.
-    if (this._bucket !== THUMBNAIL_BUCKET_V2) return;
-    if (_purged.has(LEGACY_BUCKET)) return;
-    _purged.add(LEGACY_BUCKET);
-    try {
-      void Promise.resolve(caches.delete(LEGACY_BUCKET)).catch(() => { /* ignore */ });
-    } catch { /* Cache API unavailable — nothing to purge */ }
+    if (this._bucket !== THUMBNAIL_BUCKET_V4) return;
+    for (const bucket of SUPERSEDED_BUCKETS) {
+      if (_purged.has(bucket)) continue;
+      _purged.add(bucket);
+      try {
+        void Promise.resolve(caches.delete(bucket)).catch(() => { /* ignore */ });
+      } catch { /* Cache API unavailable — nothing to purge */ }
+    }
   }
 
   /** Cache API keys must be http(s) Requests; wrap the stable key in a synthetic one. */

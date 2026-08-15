@@ -68,13 +68,21 @@ export interface UpdateProgress {
   fraction: number | null;
 }
 
-/** The states an update job passes through. Mirrors `UpdateStates` in C#. */
+/**
+ * The states an update job passes through. Mirrors `UpdateStates` in C#.
+ *
+ * `downloaded` is the terminal success of the download-only flow: the verified new program file
+ * lies beside the running one and the operator installs it by stopping CONNECT and starting the
+ * downloaded file. `staging`/`restarting`/`verifying-health`/`succeeded`/`rolled-back` remain in
+ * the vocabulary for gateways older than this build, which still perform the background swap.
+ */
 export type UpdatePhase =
   | 'idle'
   | 'checking'
   | 'available'
   | 'downloading'
   | 'verifying'
+  | 'downloaded'
   | 'staging'
   | 'restarting'
   | 'verifying-health'
@@ -84,7 +92,7 @@ export type UpdatePhase =
 
 /** True when no further work is pending for a job in this state. */
 export function isTerminalPhase(phase: UpdatePhase): boolean {
-  return phase === 'succeeded' || phase === 'failed' || phase === 'rolled-back';
+  return phase === 'downloaded' || phase === 'succeeded' || phase === 'failed' || phase === 'rolled-back';
 }
 
 /** True while the gateway is carrying an operation out (nothing may be offered meanwhile). */
@@ -117,6 +125,8 @@ export interface ConnectUpdateSnapshot {
   /** Reason belonging to a `failed` / `rolled-back` phase. */
   jobReason: string | null;
   progress: UpdateProgress | null;
+  /** Where the finished download lies (phase `downloaded`) — the file the operator has to start. */
+  downloadedPath: string | null;
   pinWillChange: boolean;
   pinPath: string | null;
   /** True while the gateway is restarting and the viewer is re-establishing the connection. */
@@ -229,6 +239,7 @@ function initialSnapshot(): ConnectUpdateSnapshot {
     phase: 'idle',
     jobReason: null,
     progress: null,
+    downloadedPath: null,
     pinWillChange: false,
     pinPath: null,
     reconnecting: false,
@@ -376,6 +387,7 @@ interface StatusBody {
   state?: string;
   jobReason?: string | null;
   progress?: { receivedBytes?: number; totalBytes?: number | null; fraction?: number | null } | null;
+  downloadedPath?: string | null;
   pinWillChange?: boolean;
   pinPath?: string | null;
   channels?: Record<string, UpdateChannelOffer>;
@@ -422,6 +434,7 @@ async function fetchStatus(): Promise<void> {
         fraction: body.progress.fraction ?? null,
       }
       : null,
+    downloadedPath: body.downloadedPath ?? null,
     pinWillChange: body.pinWillChange === true,
     pinPath: body.pinPath ?? null,
   });

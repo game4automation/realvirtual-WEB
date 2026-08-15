@@ -13,11 +13,16 @@ import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
 import { dedupeSiblingNames } from '../src/core/editor/rv-asset-executors';
+import { libraryDocumentBase } from '../src/core/editor/active-asset-store';
 import {
-  saveAssetDraft,
-  loadAssetDraft,
-  clearAssetDraft,
-} from '../src/core/editor/rv-asset-draft-storage';
+  __clearDraftStoresForTests,
+  clearDocumentDraft,
+  listAllDocumentDrafts,
+  listDirtyStack,
+  loadDocumentDraft,
+  rootFrame,
+  type RvDraftFrameKey,
+} from '../src/core/ops/rv-document-drafts';
 
 function makeMockViewer() {
   const scene = new Scene();
@@ -51,7 +56,7 @@ function makeMockViewer() {
 }
 
 beforeEach(async () => {
-  await clearAssetDraft();
+  await __clearDraftStoresForTests();
 });
 
 describe('AssetDocument ops', () => {
@@ -231,10 +236,10 @@ describe('AssetDocument ops', () => {
     await doc.whenIdle();
     expect(doc.dirty).toBe(true);
 
-    doc.markSaved({ kind: 'libraryGlb', fileName: 'Asset.glb', relPath: 'Custom/Asset.glb' }, 'Asset');
+    doc.markSaved(libraryDocumentBase('Custom/Asset.glb'), 'Asset');
     expect(doc.dirty).toBe(false);
     expect(doc.name).toBe('Asset');
-    expect(doc.base).toEqual({ kind: 'libraryGlb', fileName: 'Asset.glb', relPath: 'Custom/Asset.glb' });
+    expect(doc.base).toEqual(libraryDocumentBase('Custom/Asset.glb'));
     doc.dispose();
   });
 
@@ -259,21 +264,21 @@ describe('AssetDocument ops', () => {
 });
 
 describe('AssetDocument drafts (IndexedDB)', () => {
-  it('draft save/load/clear round-trip preserves shell + ops', async () => {
+  it('draft write/load/clear round-trip preserves shell + ops', async () => {
     const { viewer, boxPath } = makeMockViewer();
     const doc = AssetDocument.newUntitled(viewer);
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 120, 50);
     await doc.whenIdle();
 
-    await saveAssetDraft(doc.toDraft());
-    const loaded = await loadAssetDraft();
+    await doc.flushDraft();
+    const loaded = await loadDocumentDraft(doc.draftFrame);
     expect(loaded).not.toBeNull();
     expect(loaded!.shell.name).toBe('Untitled');
     expect(loaded!.ops).toHaveLength(1);
     expect(loaded!.ops[0].kind).toBe('setField');
 
-    await clearAssetDraft();
-    expect(await loadAssetDraft()).toBeNull();
+    await clearDocumentDraft(doc.draftFrame);
+    expect(await loadDocumentDraft(doc.draftFrame)).toBeNull();
     doc.dispose();
   });
 
@@ -292,5 +297,124 @@ describe('AssetDocument drafts (IndexedDB)', () => {
     expect((second.box.userData.realvirtual as any).Drive.TargetSpeed).toBe(999);
     expect(restored.dirty).toBe(true);
     restored.dispose();
+  });
+});
+
+/**
+ * The per-frame draft keyspace is the ONLY one (plan-710 Phase 2).
+ *
+ * plan-703 Phase 4 bound a document to a stack frame but left an unbound one on
+ * the legacy single slot, so which store received a write depended on whether
+ * someone had pushed a frame. That fork is gone: a document with no stack
+ * position owns its own ROOT frame, and every write of every document goes
+ * through one writer into one keyspace. What is checked here is that split
+ * being closed — plus the two properties it existed to protect: sibling frames
+ * never overwrite each other, and a clean document leaves nothing behind for
+ * recovery to offer back.
+ */
+describe('AssetDocument draft frame', () => {
+  const frameOf = (occurrence: string): RvDraftFrameKey => ({
+    projectId: 'proj', rootDocumentId: 'root-doc', occurrence,
+  });
+
+  beforeEach(async () => {
+    await __clearDraftStoresForTests();
+  });
+
+  it('ohne Stack-Frame schreibt das Dokument seinen EIGENEN Root-Frame', async () => {
+    const { viewer, boxPath } = makeMockViewer();
+    const doc = AssetDocument.newUntitled(viewer);
+    expect(doc.draftFrame).toEqual(rootFrame(null, doc.id));
+
+    doc.setField(boxPath, 'Drive', 'TargetSpeed', 120, 50);
+    await doc.whenIdle();
+    await doc.flushDraft();
+
+    const all = await listAllDocumentDrafts();
+    expect(all).toHaveLength(1);
+    expect(all[0].frame).toEqual(rootFrame(null, doc.id));
+    doc.dispose();
+  });
+
+  it('mit Frame schreibt es genau diesen Slot — und keinen zweiten', async () => {
+    const { viewer, boxPath } = makeMockViewer();
+    const doc = AssetDocument.newUntitled(viewer);
+    doc.setDraftFrame(frameOf('ref-a/ref-b'));
+
+    doc.setField(boxPath, 'Drive', 'TargetSpeed', 120, 50);
+    await doc.whenIdle();
+    await doc.flushDraft();
+
+    expect(await listAllDocumentDrafts()).toHaveLength(1);
+    const stored = await loadDocumentDraft(frameOf('ref-a/ref-b'));
+    expect(stored).not.toBeNull();
+    expect(stored!.depth).toBe(2);
+    expect(stored!.ops).toHaveLength(1);
+    expect(stored!.ops[0].kind).toBe('setField');
+    doc.dispose();
+  });
+
+  it('zwei Frames schreiben in getrennte Slots — das Kind laesst den Eltern-Draft stehen', async () => {
+    const parentEnv = makeMockViewer();
+    const parent = AssetDocument.newUntitled(parentEnv.viewer);
+    parent.setDraftFrame(frameOf(''));
+    parent.setField(parentEnv.boxPath, 'Drive', 'TargetSpeed', 111, 50);
+    await parent.whenIdle();
+    await parent.flushDraft();
+
+    const childEnv = makeMockViewer();
+    const child = AssetDocument.newUntitled(childEnv.viewer);
+    child.setDraftFrame(frameOf('ref-child'));
+    child.setField(childEnv.boxPath, 'Drive', 'TargetSpeed', 222, 50);
+    await child.whenIdle();
+    await child.flushDraft();
+
+    const parentDraft = await loadDocumentDraft(frameOf(''));
+    const childDraft = await loadDocumentDraft(frameOf('ref-child'));
+    expect(parentDraft!.ops[0]).toMatchObject({ kind: 'setField' });
+    expect((parentDraft!.ops[0] as { value?: unknown }).value).toBe(111);
+    expect((childDraft!.ops[0] as { value?: unknown }).value).toBe(222);
+
+    // Bottom-first recovery order, which is what `planStackRecovery` promises.
+    const stack = await listDirtyStack({ projectId: 'proj', rootDocumentId: 'root-doc' });
+    expect(stack.map((d) => d.frame.occurrence)).toEqual(['', 'ref-child']);
+
+    parent.dispose();
+    child.dispose();
+  });
+
+  it('ein sauberes Dokument raeumt seinen Frame-Slot, statt einen Draft zu hinterlassen', async () => {
+    const { viewer, boxPath } = makeMockViewer();
+    const doc = AssetDocument.newUntitled(viewer);
+    doc.setDraftFrame(frameOf('ref-a'));
+    doc.setField(boxPath, 'Drive', 'TargetSpeed', 120, 50);
+    await doc.whenIdle();
+    await doc.flushDraft();
+    expect(await loadDocumentDraft(frameOf('ref-a'))).not.toBeNull();
+
+    await doc.undo();          // back to the baseline — the document is clean
+    expect(doc.dirty).toBe(false);
+    await doc.flushDraft();
+
+    expect(await loadDocumentDraft(frameOf('ref-a'))).toBeNull();
+    doc.dispose();
+  });
+
+  it('markSaved raeumt den Frame-Slot — auch fuer eine libraryGlb-Basis', async () => {
+    const { viewer, boxPath } = makeMockViewer();
+    const doc = AssetDocument.newUntitled(viewer);
+    doc.setDraftFrame(frameOf('ref-a'));
+    doc.setField(boxPath, 'Drive', 'TargetSpeed', 120, 50);
+    await doc.whenIdle();
+    await doc.flushDraft();
+
+    await doc.markSaved(libraryDocumentBase('Custom/a.glb'));
+
+    // A library save used to leave a CLEAN record behind so a reload reopened
+    // the saved asset. That job belongs to `saveLastEditedAsset`; a draft record
+    // for a saved document is only something recovery would offer back as work.
+    expect(await loadDocumentDraft(frameOf('ref-a'))).toBeNull();
+    expect(await listAllDocumentDrafts()).toHaveLength(0);
+    doc.dispose();
   });
 });

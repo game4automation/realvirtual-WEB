@@ -12,7 +12,7 @@ import {
 import {
   getButtonSimSnapshot,
   _setSimTimingsForTest,
-} from '../src/plugins/asset-editor/button-sim-store';
+} from '@rv-private/plugins/asset-editor/button-sim-store';
 
 interface FakeViewer {
   viewer: RVViewer;

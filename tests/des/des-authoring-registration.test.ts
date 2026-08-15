@@ -59,8 +59,11 @@ describe('DES registration and planner authoring', () => {
     const { bindSceneToRunner } = await import('@rv-private/plugins/des/des-scene-binding');
 
     const store = new LayoutStore();
+    // The catalog registers only while the DES mode is ACTIVE — it no longer
+    // auto-loads into every session — so the host has to say the mode is on.
     new DESHMIPlugin().ensureViewer({
       getPlugin: (id: string) => id === 'layout-planner' ? { store } : null,
+      modes: { activeMode: 'des' },
     } as never);
     const catalog = store.getSnapshot().catalogs.get('des-components');
     expect(catalog).toBeDefined();

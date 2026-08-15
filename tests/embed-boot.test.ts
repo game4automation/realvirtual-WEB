@@ -14,8 +14,9 @@ import {
   MockIntersectionObserver,
   type EmbedBrowserMocks,
 } from './embed-test-kit';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
-const MODEL_URL = '/models/physics-zone-test.glb';
+const MODEL_URL = DEV_GLB.physicsZone;
 const elements: RVEmbedElement[] = [];
 let mocks: EmbedBrowserMocks;
 

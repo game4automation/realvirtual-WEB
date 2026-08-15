@@ -29,9 +29,11 @@ import {
   type TweenSpec,
 } from '../../core/material-flow/material-flow-self';
 import { muBugOffset, setMuForward } from './mu-reference';
+import { DEFAULT_TRANSPORT_SPEED_MM_S } from '../../core/engine/rv-constants';
 
-/** mm/s fallback when the belt has no configured drive (mirrors the Drive default). */
-const DEFAULT_SPEED_MM_S = 200;
+/** mm/s fallback when the belt has no configured drive — shared with the
+ *  naming-convention scanner so DES timing and animation agree. */
+const DEFAULT_SPEED_MM_S = DEFAULT_TRANSPORT_SPEED_MM_S;
 /** Scene/world units are metres (the GLB unit); ×1000 converts a length to mm. */
 const METRES_TO_MM = 1000;
 

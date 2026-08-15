@@ -29,6 +29,7 @@ import type { SignalStore } from './rv-signal-store';
 import type { RVTransportManager } from './rv-transport-manager';
 import { NodeRegistry } from './rv-node-registry';
 import { instanceScopeNode, scopeSignalName } from './rv-instance-scope';
+import { getActiveSignalReapplyRegistry } from './rv-signal-reapply-registry';
 
 /** Pending component awaiting resolveComponentRefs + init() in the caller's Step 2 phase. */
 export interface PendingComponentEntry {
@@ -60,6 +61,71 @@ export const DRIVE_BEHAVIOR_MAP: Record<string, { ctor: new (n: Object3D) => RVC
 
 /** Signal type names recognized from GLB extras. */
 export const SIGNAL_TYPES = ['PLCOutputBool', 'PLCInputBool', 'PLCOutputFloat', 'PLCInputFloat', 'PLCOutputInt', 'PLCInputInt'];
+
+// ─── Signal-NAME collision index (plan-418) ─────────────────────────────────
+
+/**
+ * Per-store index `signal name → the node paths registered under it`.
+ *
+ * WHY it exists: `SignalStore.register()` overwrites `nameToPath` (last one
+ * wins, rv-signal-store.ts:985-993), so a store lookup can only ever reveal
+ * EARLIER duplicates — the last registrant looks unique. Binding a slot is
+ * name-keyed all the way down (`setSignalLiveControlled`, the relay's
+ * `setMany`), so a name shared by two nodes would silently drive the foreign
+ * one too. {@link isDuplicateSignalName} lets the bind-slot resolver fail
+ * closed for BOTH collision partners, independent of registration order.
+ *
+ * Keyed by store (WeakMap) because `loadGLB()` builds a FRESH `SignalStore`
+ * per model (rv-scene-loader.ts:2057) — a model switch therefore resets the
+ * index by construction, while `processExtras()` (planner add-GLB, same store)
+ * correctly keeps accumulating. A store that is `clear()`ed and refilled is
+ * covered too: membership is re-validated against the live `pathToName` index
+ * on every query, so paths the clear removed no longer count.
+ *
+ * Suffix/alias paths (`SignalStore.registerPathAlias`) never reach
+ * `registerSignal()` and are therefore never counted as a collision.
+ */
+const _signalNamePaths = new WeakMap<SignalStore, Map<string, Set<string>>>();
+
+function namePathIndex(store: SignalStore): Map<string, Set<string>> {
+  let index = _signalNamePaths.get(store);
+  if (!index) {
+    index = new Map();
+    _signalNamePaths.set(store, index);
+  }
+  return index;
+}
+
+/**
+ * True when `name` is registered by MORE THAN ONE still-live node path in
+ * `store` — the fail-closed condition for offering a raw PLC signal node as a
+ * bind target (plan-418). Order-independent: both partners answer `true`.
+ */
+export function isDuplicateSignalName(store: SignalStore, name: string): boolean {
+  const paths = _signalNamePaths.get(store)?.get(name);
+  if (!paths || paths.size < 2) return false;
+  let live = 0;
+  for (const path of paths) {
+    // Re-validate against the store: a cleared/re-registered store must not
+    // keep reporting collisions from a previous model.
+    if (store.exactNameForPath(path) === name && ++live >= 2) return true;
+  }
+  return false;
+}
+
+/** All currently colliding signal names of a store (diagnostics/tests). */
+export function duplicateSignalNames(store: SignalStore): ReadonlySet<string> {
+  const out = new Set<string>();
+  for (const name of _signalNamePaths.get(store)?.keys() ?? []) {
+    if (isDuplicateSignalName(store, name)) out.add(name);
+  }
+  return out;
+}
+
+/** Drop the collision index of a store (test reset / explicit store reuse). */
+export function resetDuplicateSignalNames(store: SignalStore): void {
+  _signalNamePaths.delete(store);
+}
 
 /**
  * Register a PLC signal in the SignalStore and the NodeRegistry, identical
@@ -112,6 +178,17 @@ export function registerSignal(
   }
 
   registry.register(sigType, path, { address: path, signalName });
+
+  // plan-418: count the name against its node path so the bind-slot resolver
+  // can fail closed on collisions (see _signalNamePaths). A Set — the same
+  // (name, path) registered twice is not a collision.
+  const index = namePathIndex(signalStore);
+  let paths = index.get(signalName);
+  if (!paths) {
+    paths = new Set();
+    index.set(signalName, paths);
+  }
+  paths.add(path);
 
   // Best-effort descriptive metadata from rv_extras (purely for the HMI tooltip).
   // Only the comment is meaningful for scene signals — they have no protocol
@@ -424,6 +501,9 @@ export interface DriveBehaviorHostViewer {
   transportManager?: RVTransportManager | null;
   gizmoManager?: ComponentContext['gizmoManager'];
   lampManager?: ComponentContext['lampManager'];
+  sceneButtonManager?: ComponentContext['sceneButtonManager'];
+  /** plan-427 — the viewer-owned signal re-apply registry (`RVViewer.signalReapply`). */
+  signalReapply?: ComponentContext['reapply'];
 }
 
 /**
@@ -559,6 +639,11 @@ export function attachDriveBehaviorByCode(
     root: driveNode,
     gizmoManager: viewer.gizmoManager,
     lampManager: viewer.lampManager,
+    sceneButtonManager: viewer.sceneButtonManager,
+    // plan-427 F12 — the explicit wiring path is a ComponentContext producer
+    // too; without this an explicitly wired behavior would silently miss the
+    // post-reset / post-reconnect level re-apply.
+    reapply: viewer.signalReapply ?? getActiveSignalReapplyRegistry() ?? undefined,
   };
   resolveComponentRefs(instRecord, registry);
   inst.init(ctx);

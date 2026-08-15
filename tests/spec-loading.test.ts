@@ -45,8 +45,17 @@ import rvOdt from '../schema/v1/rv-odt.json';
  *    SourceBehavior, SinkBehavior, ChainTransferBehavior, ...).
  *  - Material-flow dynamic schemas registered by material-flow/registry.ts for
  *    library types without an engine factory (Conveyor, Turntable, ChainTransfer).
+ *  - `NodeKnowledge` (plan-394) — a WEB-ONLY entry with no Unity counterpart. rv-ODT
+ *    describes the types that exist on BOTH sides, so adding it there would assert an
+ *    interchange contract that does not exist; the plan's decision is explicitly that
+ *    `schema/v1/rv-odt.json` stays untouched. Its inline schema lives in
+ *    `src/core/engine/rv-node-knowledge.ts`, which `doc-extending-webviewer.md`
+ *    sanctions for exactly this case.
  */
-const OUT_OF_SCOPE_EXACT = new Set(['Conveyor', 'Turntable', 'ChainTransfer']);
+const OUT_OF_SCOPE_EXACT = new Set([
+  'Conveyor', 'Turntable', 'ChainTransfer',
+  'NodeKnowledge',
+]);
 function isInScope(name: string): boolean {
   if (name.startsWith('DES')) return false;
   if (name.endsWith('Behavior')) return false;

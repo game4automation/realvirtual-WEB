@@ -24,6 +24,7 @@ import {
   MockIntersectionObserver,
   type EmbedBrowserMocks,
 } from './embed-test-kit';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
 let mocks: EmbedBrowserMocks;
 let element: RVEmbedElement | null = null;
@@ -49,7 +50,7 @@ describe('<rv-embed> disposal contract', () => {
     const mediaAdd = vi.spyOn(mocks.media, 'addEventListener');
 
     element = document.createElement('rv-embed') as RVEmbedElement;
-    element.setAttribute('src', '/models/physics-zone-test.glb');
+    element.setAttribute('src', DEV_GLB.physicsZone);
     element.setAttribute('run', 'manual');
     element.style.width = '320px';
     element.style.height = '200px';

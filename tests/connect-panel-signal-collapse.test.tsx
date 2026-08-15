@@ -9,6 +9,7 @@ import type { ConnectInterface, ConnectInterfaceSignal } from '../src/core/hmi/c
 import { computeFilterAutoOpen, SignalListView } from '../src/core/hmi/ConnectPanel';
 import { rvDarkTheme } from '../src/core/hmi/theme';
 import { RVViewerProvider } from '../src/hooks/use-viewer';
+import { findSignalRowLabel, getSignalRowLabel, querySignalRowLabel } from './helpers/signal-row-label';
 
 const viewerStub = {
   signalStore: null,
@@ -117,13 +118,13 @@ describe('SignalListView topic collapse while filtering', () => {
     seedFilter(iface.id, 'A_Signal');
     renderSignalList();
 
-    expect(await screen.findByText('A_Signal')).toBeTruthy();
+    expect(await findSignalRowLabel('A_Signal')).toBeTruthy();
     expectTopicIcon('A', 'ExpandLessIcon');
 
     fireEvent.click(topicRow('A'));
 
     await waitFor(() => {
-      expect(screen.queryByText('A_Signal')).toBeNull();
+      expect(querySignalRowLabel('A_Signal')).toBeNull();
       expectTopicIcon('A', 'ExpandMoreIcon');
     });
     expect(storedCollapsed(iface.id)).toEqual(new Set(['A']));
@@ -133,18 +134,18 @@ describe('SignalListView topic collapse while filtering', () => {
     seedFilter(iface.id, 'A_Signal');
     renderSignalList();
 
-    await screen.findByText('A_Signal');
+    await findSignalRowLabel('A_Signal');
     fireEvent.click(topicRow('A'));
-    await waitFor(() => expect(screen.queryByText('A_Signal')).toBeNull());
+    await waitFor(() => expect(querySignalRowLabel('A_Signal')).toBeNull());
 
     fireEvent.click(topicRow('A'));
-    expect(await screen.findByText('A_Signal')).toBeTruthy();
+    expect(await findSignalRowLabel('A_Signal')).toBeTruthy();
     expectTopicIcon('A', 'ExpandLessIcon');
 
     await openFilter();
     fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
 
-    expect(await screen.findByText('A_Signal')).toBeTruthy();
+    expect(await findSignalRowLabel('A_Signal')).toBeTruthy();
     expectTopicIcon('A', 'ExpandLessIcon');
     expect(storedCollapsed(iface.id)).toEqual(new Set());
   });
@@ -154,25 +155,25 @@ describe('SignalListView topic collapse while filtering', () => {
     renderSignalList();
 
     // Explicit pre-filter assertion: the persisted initial user state is A open, B closed.
-    expect(await screen.findByText('A_Signal')).toBeTruthy();
-    expect(screen.queryByText('B_Signal')).toBeNull();
+    expect(await findSignalRowLabel('A_Signal')).toBeTruthy();
+    expect(querySignalRowLabel('B_Signal')).toBeNull();
     expectTopicIcon('A', 'ExpandLessIcon');
     expectTopicIcon('B', 'ExpandMoreIcon');
 
     const input = await openFilter();
     fireEvent.change(input, { target: { value: 'Signal' } });
 
-    expect(await screen.findByText('B_Signal')).toBeTruthy();
+    expect(await findSignalRowLabel('B_Signal')).toBeTruthy();
     expectTopicIcon('B', 'ExpandLessIcon');
     expect(storedCollapsed(iface.id)).toEqual(new Set(['B']));
 
     fireEvent.click(topicRow('A'));
-    await waitFor(() => expect(screen.queryByText('A_Signal')).toBeNull());
+    await waitFor(() => expect(querySignalRowLabel('A_Signal')).toBeNull());
     fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
 
     await waitFor(() => {
-      expect(screen.queryByText('A_Signal')).toBeNull();
-      expect(screen.queryByText('B_Signal')).toBeNull();
+      expect(querySignalRowLabel('A_Signal')).toBeNull();
+      expect(querySignalRowLabel('B_Signal')).toBeNull();
       expectTopicIcon('A', 'ExpandMoreIcon');
       expectTopicIcon('B', 'ExpandMoreIcon');
     });
@@ -183,15 +184,15 @@ describe('SignalListView topic collapse while filtering', () => {
     seedFilter(iface.id, 'A_Signal');
     renderSignalList();
 
-    await screen.findByText('A_Signal');
+    await findSignalRowLabel('A_Signal');
     fireEvent.click(topicRow('A'));
-    await waitFor(() => expect(screen.queryByText('A_Signal')).toBeNull());
+    await waitFor(() => expect(querySignalRowLabel('A_Signal')).toBeNull());
 
     const input = await openFilter();
     fireEvent.change(input, { target: { value: 'Signal' } });
 
-    expect(await screen.findByText('A_Signal')).toBeTruthy();
-    expect(await screen.findByText('B_Signal')).toBeTruthy();
+    expect(await findSignalRowLabel('A_Signal')).toBeTruthy();
+    expect(await findSignalRowLabel('B_Signal')).toBeTruthy();
     expectTopicIcon('A', 'ExpandLessIcon');
   });
 
@@ -204,7 +205,7 @@ describe('SignalListView topic collapse while filtering', () => {
     seedCollapsed(ifaceB.id, ['B1']);
 
     const view = render(signalListTree(ifaceA));
-    expect(await screen.findByText('A1_Signal')).toBeTruthy();
+    expect(await findSignalRowLabel('A1_Signal')).toBeTruthy();
     expectTopicIcon('A1', 'ExpandLessIcon');
     expect(storedCollapsed(ifaceA.id)).toEqual(new Set(['A1']));
 
@@ -212,7 +213,7 @@ describe('SignalListView topic collapse while filtering', () => {
 
     await screen.findByText('B1');
     expect(screen.queryByText('A1')).toBeNull();
-    expect(screen.queryByText('B1_Signal')).toBeNull();
+    expect(querySignalRowLabel('B1_Signal')).toBeNull();
     expectTopicIcon('B1', 'ExpandMoreIcon');
     expect(storedCollapsed(ifaceA.id)).toEqual(new Set(['A1']));
     expect(storedCollapsed(ifaceB.id)).toEqual(new Set(['B1']));
@@ -224,26 +225,26 @@ describe('SignalListView topic collapse while filtering', () => {
 
     const input = await openFilter();
     fireEvent.change(input, { target: { value: 'Signal' } });
-    expect(await screen.findByText('B_Signal')).toBeTruthy();
+    expect(await findSignalRowLabel('B_Signal')).toBeTruthy();
     expect(storedCollapsed(iface.id)).toEqual(new Set(['B']));
 
     fireEvent.click(topicRow('A'));
-    await waitFor(() => expect(screen.queryByText('A_Signal')).toBeNull());
+    await waitFor(() => expect(querySignalRowLabel('A_Signal')).toBeNull());
     fireEvent.click(topicRow('B'));
-    await waitFor(() => expect(screen.queryByText('B_Signal')).toBeNull());
+    await waitFor(() => expect(querySignalRowLabel('B_Signal')).toBeNull());
     fireEvent.click(topicRow('B'));
-    expect(await screen.findByText('B_Signal')).toBeTruthy();
+    expect(await findSignalRowLabel('B_Signal')).toBeTruthy();
     expect(storedCollapsed(iface.id)).toEqual(new Set(['A']));
 
     fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
-    await waitFor(() => expect(screen.queryByText('A_Signal')).toBeNull());
-    expect(await screen.findByText('B_Signal')).toBeTruthy();
+    await waitFor(() => expect(querySignalRowLabel('A_Signal')).toBeNull());
+    expect(await findSignalRowLabel('B_Signal')).toBeTruthy();
 
     firstMount.unmount();
     renderSignalList();
 
-    await screen.findByText('B_Signal');
-    expect(screen.queryByText('A_Signal')).toBeNull();
+    await findSignalRowLabel('B_Signal');
+    expect(querySignalRowLabel('A_Signal')).toBeNull();
     expectTopicIcon('A', 'ExpandMoreIcon');
     expectTopicIcon('B', 'ExpandLessIcon');
     expect(storedCollapsed(iface.id)).toEqual(new Set(['A']));

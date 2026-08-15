@@ -77,23 +77,71 @@ export class IKPathVisualizerPlugin implements RVViewerPlugin {
 
   init(viewer: RVViewer): void {
     this.viewer = viewer;
-    this.unsub = viewer.on('selection-changed', (snap) => this.onSelectionChanged(snap));
-    // Hide the marker of the pathpoint being edited — the edit gizmo sits exactly
-    // on it and the fat sphere would bury the gizmo's centre handle.
-    this.unsubEdit = ikEditStore.subscribe(() => this.syncActiveMarker());
+    this.attachRuntime();
   }
 
   onModelCleared(): void {
     this.clearAll();
   }
 
+  /**
+   * User switched the plugin off (plan-436). Drops the path visuals and both
+   * subscriptions that `init()` installed. `hiddenMarkerPath` is deliberately
+   * NOT reset — it is plain bookkeeping, and `onActivate` re-reads it from the
+   * edit store anyway.
+   */
+  onDeactivate(): void {
+    this.detachRuntime();
+  }
+
+  /**
+   * User switched the plugin back on (plan-436). With `onActivate` present the
+   * host replays NO `onModelLoaded` (plan-435 invariant 2), so the paths have
+   * to be pulled back from the current selection rather than waited for.
+   */
+  onActivate(viewer: RVViewer): void {
+    this.viewer = viewer;
+    this.attachRuntime();
+    // The edit store may have moved while the subscription was off.
+    this.hiddenMarkerPath = ikEditStore.getSnapshot()?.path ?? null;
+    const snap = viewer.selectionManager?.getSnapshot();
+    if (snap) this.onSelectionChanged(snap);
+    // FORCE the marker state onto the freshly built visuals. Never
+    // `syncActiveMarker()` here: it early-returns when the store path already
+    // equals `hiddenMarkerPath`, which would leave the actively edited marker
+    // fully visible on top of its edit gizmo (plan-436 §2.2).
+    this.applyActiveMarker();
+  }
+
   dispose(): void {
+    this.detachRuntime();
+    this.viewer = null;
+  }
+
+  // ── Attach / detach (ONE path, shared by init/dispose and the toggle) ──
+
+  /** Install both subscriptions. Idempotent — repeated off/on cycles never
+   *  double a listener (plan-436 F5). */
+  private attachRuntime(): void {
+    const viewer = this.viewer;
+    if (!viewer) return;
+    this.unsub?.();
+    this.unsub = viewer.on('selection-changed', (snap) => this.onSelectionChanged(snap));
+    // Hide the marker of the pathpoint being edited — the edit gizmo sits exactly
+    // on it and the fat sphere would bury the gizmo's centre handle.
+    this.unsubEdit?.();
+    this.unsubEdit = ikEditStore.subscribe(() => this.syncActiveMarker());
+  }
+
+  /** Release both subscriptions and every path visual. Shared by `dispose()`
+   *  and the user toggle; the plugin holds no permanent resources beyond
+   *  them (each `PathVisual` owns its own geometry/material). */
+  private detachRuntime(): void {
     this.clearAll();
     this.unsub?.();
     this.unsub = null;
     this.unsubEdit?.();
     this.unsubEdit = null;
-    this.viewer = null;
   }
 
   /** Fade out the marker under the active edit gizmo; restore the previous one. */

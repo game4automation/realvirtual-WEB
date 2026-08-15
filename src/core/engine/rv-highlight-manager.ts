@@ -43,7 +43,7 @@ import type { Scene } from 'three';
 import type { InstancedMovingUnit } from './rv-mu';
 import { HIGHLIGHT_OVERLAY_LAYER } from './rv-group-registry';
 import type { RVOutlineManager } from './rv-outline-manager';
-import { DEFAULT_OUTLINE_STYLE, DEFAULT_HOVER_OUTLINE_STYLE } from './rv-outline-manager';
+import { DEFAULT_OUTLINE_STYLE, DEFAULT_HOVER_OUTLINE_STYLE, ATTENTION_OUTLINE_GEOMETRY } from './rv-outline-manager';
 import type { GizmoHandle, GizmoOverlayManager } from './rv-gizmo-manager';
 import type { PickMetrics, HighlightStrategy } from './rv-pick-metrics';
 import type { HighlightProfile, HighlightVisual } from './rv-highlight-profiles';
@@ -1071,9 +1071,7 @@ export class RVHighlightManager {
       om.setFlashStyle({
         visibleEdgeColor: opts.color,
         hiddenEdgeColor: dark(opts.color),
-        edgeStrength: 20,
-        edgeThickness: 10,
-        edgeGlow: 1.5,
+        ...ATTENTION_OUTLINE_GEOMETRY,
         pulsePeriod: FLASH_PULSE_PERIOD_S,
       });
       om.setFlashOutlined(resolved.targets);

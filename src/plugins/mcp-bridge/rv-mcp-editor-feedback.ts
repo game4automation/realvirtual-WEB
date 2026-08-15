@@ -30,7 +30,7 @@ import {
   getStoredKinematicsPanelWidth,
   getStoredMaterialsPanelWidth,
 } from '../../core/hmi/layout-constants';
-import { simulateButtonClick } from '../asset-editor/button-sim-store';
+import { simulateButtonClick } from '@rv-private/plugins/asset-editor/button-sim-store';
 import { parsePathsParam } from './rv-object-analyzer-math';
 
 type Rec = Record<string, unknown>;
@@ -253,6 +253,13 @@ export async function prepareEditorChoreography(
     if (spec.buttonId) {
       const id = typeof spec.buttonId === 'function' ? spec.buttonId(args) : spec.buttonId;
       if (id) {
+        // A HIDDEN tab has no one watching this, and Chrome clamps setTimeout
+        // there to >=1 s (up to 60 s once heavily throttled) — so the 80 ms
+        // "beat" below silently becomes the reason the whole tool call blows
+        // through the bridge's 15 s timeout and reports outcome=unknown.
+        // Cosmetic feedback must never be the thing that fails the edit: skip
+        // the click choreography while hidden and let the tool do its work.
+        if (typeof document !== 'undefined' && document.hidden) return;
         // A just-opened panel needs a beat to render its buttons.
         await sleep(80);
         await simulateButtonClick(id);

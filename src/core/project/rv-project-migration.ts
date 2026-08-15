@@ -60,6 +60,7 @@ import { listMetas } from '../hmi/scene/rv-scene-storage';
 import { onSceneMutation } from '../hmi/scene/rv-scene-mutations';
 import { SAMPLE_PROJECT_ID } from './backends/bundled-backend';
 import { readManifest } from './rv-project-storage';
+import { sceneDocumentsOf } from './rv-project-documents';
 import {
   clearSceneOwner,
   listSceneOwnerIds,
@@ -171,7 +172,7 @@ export async function findGrantedFolderScenes(
       const result = await readManifest(dir);
       const project = result?.project;
       if (!project?.id) continue;
-      for (const entry of project.scenes ?? []) {
+      for (const entry of sceneDocumentsOf(project)) {
         if (entry?.id && !found.has(entry.id)) found.set(entry.id, project.id);
       }
     } catch {

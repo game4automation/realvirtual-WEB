@@ -44,10 +44,7 @@ export class ConnectionGizmoPlugin implements RVViewerPlugin {
 
   init(viewer: RVViewer): void {
     this.viewer = viewer;
-    this.unsubscribe = getConnectionSystem().subscribe(() => {
-      // Edge/type changes can burst (model load) — coalesce to one rebuild.
-      this.rebuildQueued = true;
-    });
+    this.attachRuntime();
   }
 
   onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
@@ -57,6 +54,27 @@ export class ConnectionGizmoPlugin implements RVViewerPlugin {
 
   onModelCleared(): void {
     this.clear();
+  }
+
+  /**
+   * User switched the plugin off (plan-436). Drops the cables AND the registry
+   * subscription that `init()` installed — without it the plugin would keep
+   * queueing rebuilds for a layer nobody renders.
+   */
+  onDeactivate(): void {
+    this.detachRuntime();
+  }
+
+  /**
+   * User switched the plugin back on (plan-436). No selection replay is needed
+   * here: `rebuild()` reads `getConnectionSystem().all()`, a PULL store — the
+   * cables are a function of the edge set, not of an event that may never fire
+   * again for an unchanged model (plan-436 §2.2).
+   */
+  onActivate(viewer: RVViewer): void {
+    this.viewer = viewer;
+    this.attachRuntime();
+    this.rebuild();
   }
 
   onRender(): void {
@@ -73,9 +91,36 @@ export class ConnectionGizmoPlugin implements RVViewerPlugin {
   }
 
   dispose(): void {
+    this.detachRuntime();
+    this.viewer = null;
+  }
+
+  // ── Attach / detach (ONE path, shared by init/dispose and the toggle) ──
+
+  /**
+   * Install the runtime subscription. Idempotent: an existing subscription is
+   * dropped first, so `init()` → `onDeactivate()` → `onActivate()` can never
+   * end up with two listeners (plan-436 F5).
+   */
+  private attachRuntime(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = getConnectionSystem().subscribe(() => {
+      // Edge/type changes can burst (model load) — coalesce to one rebuild.
+      this.rebuildQueued = true;
+    });
+  }
+
+  /**
+   * Release everything the plugin runs on. Shared by `dispose()` and the user
+   * toggle — the plugin owns no permanent resources beyond this (the `handles`
+   * are GizmoManager-owned and released by `clear()`).
+   */
+  private detachRuntime(): void {
     this.clear();
     this.unsubscribe?.();
     this.unsubscribe = null;
+    // A rebuild queued just before the switch-off must not survive it.
+    this.rebuildQueued = false;
   }
 
   // ── Internals ─────────────────────────────────────────────────────────

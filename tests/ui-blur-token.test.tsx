@@ -279,7 +279,42 @@ describe('ui blur token — source invariant', () => {
     // (ProjectsDashboard.tsx, 12px) added one — checked, it goes through the
     // scale factor — and Phase 13 deleted rv-project-switcher.tsx, removing the
     // one added the day before.
-    expect(scaled.length).toBe(37);
+    //
+    // 07.08.2026, plan-397 phase 6: 38. StorageNoticeBanner.tsx (8px) is the
+    // consumer the storage layer never had — checked, it goes through the
+    // factor, and it deliberately copies GPUWarningBanner's glass so the two
+    // top-of-screen banners cannot drift apart.
+    //
+    // 08.08.2026, plan-410: 42. Three new editor-continuity surfaces, all
+    // checked to go through the factor — SceneTransitionOverlay.tsx contributes
+    // two (6px on the full-viewport scrim that covers a scene being torn down,
+    // 16px on the status card, which copies OmniverseStatusOverlay's glass) and
+    // the test-run banner in EditorToolbarButtons.tsx one (16px). The fourth is
+    // SharedGlbInfoCard.tsx (8px): plan-386 phase 1 had introduced it as the one
+    // NAKED blur in the tree, which is precisely what this invariant exists to
+    // catch — so it was converted to the scaled form rather than exempted.
+    //
+    // 10.08.2026, plan-703 phase 4: still 42, and the exception is worth
+    // recording. DocumentStackBar.tsx is a new FLOATING-tier glass surface with
+    // a 16px radius, but it calls `uiBlur(16)` instead of writing the calc()
+    // inline, so it is not part of this INLINE inventory. It is still scaled —
+    // the assertion below pins that the helper emits the identical form.
+    //
+    // 11.08.2026, plan-423 (merge of main into the plan-423 branch): 43.
+    // CommissioningTrustBanner.tsx (8px) — the shared-model trust banner, which
+    // copies SigWarningBanner's glass on purpose: the two can stand on screen
+    // together and must not look like two different products. Checked, it goes
+    // through the factor. plan-703 added no INLINE blur, so its 42 plus this
+    // one is 43.
+    //
+    // 12.08.2026: back to 42 — a REMOVAL, the first one this inventory records.
+    // The editor's test-run banner (the 16px added by plan-410 above) is gone:
+    // its Play/Stop moved into the leading toolbar group, and a fixed
+    // top-center banner then sat on top of the very Stop button it pointed at.
+    // Nothing replaced its glass — the red Stop segment and the greyed-out
+    // authoring buttons carry the "a run is live" signal now — so this is one
+    // inline blur fewer, not one relocated.
+    expect(scaled.length).toBe(42);
   });
 
   it('the uiBlur() helper emits the same form as the inline declarations', () => {

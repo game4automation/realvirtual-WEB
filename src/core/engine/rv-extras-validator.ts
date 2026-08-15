@@ -42,6 +42,14 @@ const CONSUMED: Record<string, string[]> = {
   ConnectSignal: [], // all fields in RVConnectSignal.schema
   Lamp: ['OnColor'], // Unity Color is read raw; scalar fields are schema-derived
 
+  // plan-417 — 3D scene buttons. Only the material NAMES are read raw (they
+  // decide whether the cap has a light at all); the rest is schema-derived.
+  SceneButtonBase: [],
+  SceneButtonMoveable: ['baseMaterial', 'activeMaterial'],
+  PushButton3D: [],
+  EmergencyButton3D: [],
+  HandleSwitch3D: [],
+
   // Drive behaviors — schema fields auto-derived
   Drive_Simple: [],       // all fields in RVDriveSimple.schema
   Drive_Cylinder: [],     // all fields in RVDriveCylinder.schema
@@ -213,7 +221,25 @@ const CONSUMED: Record<string, string[]> = {
  */
 const GLOBAL_IGNORED: string[] = ['_fullTypeName', '_version', '_enabled'];
 
+/**
+ * Runtime status of the C# `LogicStep` base class (`LogicStep.cs`): the inspector
+ * progress bar and the two execution flags. Every exported LogicStep carries them, so
+ * they are spread into each `LogicStep_*` entry instead of being repeated by hand.
+ * Status, not configuration — the TypeScript logic engine owns its own step state.
+ */
+const LOGIC_STEP_STATUS: string[] = ['State', 'StepActive', 'IsWaiting'];
+
 const IGNORED: Record<string, string[]> = {
+  // plan-417 — 3D scene buttons. `Name`/`Active` are realvirtual component
+  // metadata; `renderer`/`colliders` are Unity component references the viewer
+  // resolves by traversal instead; `currentOffset` is Unity runtime state and
+  // the UnityEvents have no web equivalent.
+  SceneButtonBase: ['Name', 'Active', 'OnToggleOn', 'OnToggleOff'],
+  SceneButtonMoveable: ['renderer', 'currentOffset', 'Name', 'Active'],
+  PushButton3D: ['Name', 'Active'],
+  EmergencyButton3D: ['Name', 'Active'],
+  HandleSwitch3D: ['Name', 'Active'],
+
   Drive: [
     // Runtime status (read-only in C#, meaningless at load time)
     'CurrentSpeed', 'CurrentPosition', 'PositionOverwriteValue',
@@ -331,31 +357,45 @@ const IGNORED: Record<string, string[]> = {
   ReplayRecording: ['Name'],  // Active moved to CONSUMED
 
   // LogicStep containers — generic fields (Active moved to CONSUMED)
-  LogicStep_SerialContainer: ['Name'],
-  LogicStep_ParallelContainer: ['Name'],
-  LogicStep_SetSignalBool: ['Name'],
-  LogicStep_WaitForSensor: ['Name'],
-  LogicStep_WaitForSignalBool: ['Name'],
-  LogicStep_Delay: ['Name'],
-  LogicStep_DriveToPosition: ['Name'],
-  LogicStep_SetDriveSpeed: ['Name'],
-  LogicStep_Enable: ['Name'],
-  LogicStep_Pause: ['Name'],
-  LogicStep_DriveTo: ['Name'],
-  LogicStep_StartDriveTo: ['Name', 'LiveEdit'],
-  LogicStep_StartDriveSpeed: ['Name'],
-  LogicStep_WaitForDrivesAtTarget: ['Name'],
-  LogicStep_SetSignalFloat: ['Name'],
-  LogicStep_WaitForSignalFloat: ['Name'],
-  LogicStep_GripPick: ['Name'],
-  LogicStep_GripPlace: ['Name'],
-  LogicStep_JumpOnSignal: ['Name'],
-  LogicStep_SetActiveOnly: ['Name', 'Behaviors', 'SetToAlways'],
-  LogicStep_CinemachineCamera: ['Name', 'Camera', 'UseCustomBlend', 'CustomBlendTime', 'CustomBlendStyle'],
-  LogicStep_StatStartCycle: ['Name', 'StatCycleTimeComponent'],
-  LogicStep_StatEndCycle: ['Name', 'StatCycleTimeComponent'],
-  LogicStep_StatState: ['Name', 'StatStatesComponent', 'SetState'],
-  LogicStep_StatOutput: ['Name', 'StatOutputComponent', 'OutputIncrement'],
+  // Containers additionally export their step cursor and the inspector cycle-time
+  // statistics (`LogicStep_SerialContainer.cs`) — runtime status, recomputed by the
+  // TypeScript logic engine.
+  LogicStep_SerialContainer: [
+    ...LOGIC_STEP_STATUS, 'Name',
+    'ActiveLogicStep', 'NumberLogicSteps',
+    'minCycleTimeDisplay', 'maxCycleTimeDisplay', 'medianCycleTimeDisplay',
+    'completedCyclesDisplay',
+  ],
+  LogicStep_ParallelContainer: [
+    ...LOGIC_STEP_STATUS, 'Name',
+    'ActiveLogicStep', 'NumberLogicSteps',
+    'minCycleTimeDisplay', 'maxCycleTimeDisplay', 'medianCycleTimeDisplay',
+    'completedCyclesDisplay',
+  ],
+  LogicStep_SetSignalBool: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_WaitForSensor: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_WaitForSignalBool: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_Delay: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_DriveToPosition: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_SetDriveSpeed: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_Enable: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_Pause: [...LOGIC_STEP_STATUS, 'Name'],
+  // `LiveEdit` is an editor-only handle toggle — already ignored for StartDriveTo.
+  LogicStep_DriveTo: [...LOGIC_STEP_STATUS, 'Name', 'LiveEdit'],
+  LogicStep_StartDriveTo: [...LOGIC_STEP_STATUS, 'Name', 'LiveEdit'],
+  LogicStep_StartDriveSpeed: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_WaitForDrivesAtTarget: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_SetSignalFloat: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_WaitForSignalFloat: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_GripPick: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_GripPlace: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_JumpOnSignal: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_SetActiveOnly: [...LOGIC_STEP_STATUS, 'Name', 'Behaviors', 'SetToAlways'],
+  LogicStep_CinemachineCamera: [...LOGIC_STEP_STATUS, 'Name', 'Camera', 'UseCustomBlend', 'CustomBlendTime', 'CustomBlendStyle'],
+  LogicStep_StatStartCycle: [...LOGIC_STEP_STATUS, 'Name', 'StatCycleTimeComponent'],
+  LogicStep_StatEndCycle: [...LOGIC_STEP_STATUS, 'Name', 'StatCycleTimeComponent'],
+  LogicStep_StatState: [...LOGIC_STEP_STATUS, 'Name', 'StatStatesComponent', 'SetState'],
+  LogicStep_StatOutput: [...LOGIC_STEP_STATUS, 'Name', 'StatOutputComponent', 'OutputIncrement'],
 
   // RuntimeMetadata — Unity-only UI references
   RuntimeMetadata: ['window', 'interactable'],
@@ -380,9 +420,40 @@ const IGNORED: Record<string, string[]> = {
   // Group — component metadata
   Group: ['Name', 'Active', '_fullTypeName', '_version', '_enabled'],
 
+  // Machining (plan-405) — the configuration fields are schema-derived; what remains
+  // is runtime status the TypeScript side computes itself, one Unity-only meshing
+  // option, and the standard component metadata.
+  MachiningVolume: [
+    // Runtime status, recomputed from the worker's acks / countSolid
+    'MaterialRemainingPercent', 'VoxelsModified', 'LastUpdateMs', 'IsInitialized',
+    // Unity-only: the WASM kernel's crease-angle normals cover this (CreaseAngle)
+    'SmoothNormals',
+    'ConnectionInfo', 'Name', 'Active',
+  ],
+  MachiningTool: ['ConnectionInfo', 'Name', 'Active'],
+
   // Pipeline — Unity-only fields (mesh handling, shader state)
   Pipe: ['entryPoint', 'exitPoint'],
   ResourceTank: ['connections'],
+
+  // ── Rigid-body mechanism (plan-404) ──────────────────────────────────────
+  // These five fields DO ride along in a Unity mechanism export but are
+  // deliberately not consumed by the web host, so the dev parity check must not
+  // report them. They are not "not yet implemented" — they have no web meaning:
+  //   Active            realvirtualBehavior metadata; enable/disable is driven by
+  //                     the mechanism's own disabled-reason path, not this flag.
+  //   capturedJointLocalPos/Rot, hasCapture
+  //                     Unity EDITOR authoring state — the pose KinematicJoint
+  //                     captures so the Unity inspector can restore it. It is the
+  //                     documented, deliberately accepted `[HideInInspector]`
+  //                     side effect of plan-273 §2.3 and has no runtime role on
+  //                     either side. The web host derives joint state from the
+  //                     solver, never from a captured editor pose.
+  KinematicMechanism: ['Active'],
+  KinematicJoint: [
+    'Active',
+    'capturedJointLocalPos', 'capturedJointLocalRot', 'hasCapture',
+  ],
 };
 
 /** Summary of unhandled fields per component type (collected during load) */

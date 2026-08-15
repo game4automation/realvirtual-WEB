@@ -24,6 +24,7 @@
 
 import type { RVViewer } from './rv-viewer';
 import type { RVViewerPlugin } from './rv-plugin';
+import { debug } from './engine/rv-debug'; // TEMP open-perf instrumentation
 
 /** Workspace mode identifier. Extensible via any string. */
 export type ModeId = 'hmi' | 'des' | 'planner' | (string & {});
@@ -173,6 +174,7 @@ export class ModeManager {
 
     const from = this._active;
     this._switching = true;
+    const perfT0 = performance.now(); // TEMP open-perf instrumentation
     try {
       this.host.emit('mode-changing', { from, to: id });
 
@@ -204,6 +206,11 @@ export class ModeManager {
       this.host.emit('mode-changed', { from, to: id });
     } finally {
       this._switching = false;
+      // TEMP open-perf instrumentation: the whole switch is one synchronous
+      // main-thread block — no overlay can paint while it runs.
+      debug('perf', `[open-perf] setMode ${from ?? 'null'}->${id} sync block`, {
+        ms: Math.round(performance.now() - perfT0),
+      });
     }
   }
 

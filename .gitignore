@@ -2,6 +2,10 @@ node_modules/
 dist/
 dist-private/
 dist-embed/
+# Per-tier build outputs for the three-tier build proof (tests/mechanism-tier.node.test.ts)
+dist-public/
+dist-customer/
+dist-internal/
 .vite/
 
 # CONNECT's workspace runtime folder (plan-363 Phase 4). In Dev mode CONNECT keeps
@@ -61,3 +65,8 @@ public/models/library/Custom/Side Cutting.glb
 public/models/library/Custom/P1002_M46_Deckelhandling_Kinematik.glb
 public/_tmp/
 public/models/D5347024_1-matrices.glb
+
+# Vitest browser failure screenshots - auto-generated on every red test run,
+# never read back by anything (no toMatchScreenshot in the repo). Untracked
+# on purpose; the previously committed ones were removed 2026-08-11.
+tests/**/__screenshots__/

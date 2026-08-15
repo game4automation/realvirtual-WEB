@@ -235,9 +235,13 @@ export class AasLinkPlugin implements RVViewerPlugin {
   private hoverOff: (() => void) | null = null;
   private unhoverOff: (() => void) | null = null;
   private readonly docHoverTipId = 'tooltip-hover:aas-docmode';
+  /** plan-435 §2.10 abort generation — bumped by `onDeactivate`, checked by
+   *  the async AASX indexing before it writes anything into the scene. */
+  private _generation = 0;
 
   onModelLoaded(result: LoadResult, viewer: RVViewer): void {
     this.viewer = viewer;
+    const generation = this._generation;
 
     // Motor datasheet on hover (normal viewing modes — this plugin is not loaded
     // in the planner; the layout-planner plugin runs the same augmenter there).
@@ -270,6 +274,9 @@ export class AasLinkPlugin implements RVViewerPlugin {
     // Stores searchable text (nameplate + technical data values) on each node's
     // _rvAasLink.searchText so the search resolver can find them synchronously.
     loadIndex(assetsBasePath).then(index => {
+      // Abort guard (plan-435 §2.10): the user switched the plugin off while
+      // the index was in flight — nothing below may touch the scene any more.
+      if (generation !== this._generation) return;
       if (Object.keys(index).length === 0) return;
 
       // Collect unique AAS IDs from the scene
@@ -351,7 +358,30 @@ export class AasLinkPlugin implements RVViewerPlugin {
     }
   }
 
+  /**
+   * plan-435: the hover subscriptions live until `dispose()`, so the fallback
+   * would leave the datasheet tooltip alive behind a switched-off plugin.
+   * Detach them and cancel the in-flight AASX indexing (§2.10). The scene
+   * markings written by a completed index are model data owned by
+   * `onModelCleared`-style teardown, not by this hook (invariant 3).
+   */
+  onDeactivate(): void {
+    this._generation++;
+    this.hoverOff?.();
+    this.unhoverOff?.();
+    this.hoverOff = null;
+    this.unhoverOff = null;
+    tooltipStore.hide(this.docHoverTipId);
+  }
+
+  /** Re-attach the hover augmenter for the model that is still loaded. */
+  onActivate(viewer: RVViewer): void {
+    const result = viewer.lastLoadResult;
+    if (result) this.onModelLoaded(result, viewer);
+  }
+
   dispose(): void {
+    this._generation++;
     this.hoverOff?.();
     this.unhoverOff?.();
     this.hoverOff = null;

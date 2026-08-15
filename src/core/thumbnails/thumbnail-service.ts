@@ -26,7 +26,10 @@
  *   renderer's render target and clear alpha and restores them afterwards
  *   (`thumbnail-renderer.ts` `render()`); it is *not* re-entrant. Two
  *   concurrent renders would interleave those swaps and leak a wrong render
- *   target back into the main scene. One job at a time, always.
+ *   target back into the main scene. One job at a time, always. Formally this
+ *   queue only serialises *its own* jobs; the direct callers outside it
+ *   (`rv-asset-library-save.ts`, `DocumentCard`'s `renderNow`) are safe purely
+ *   because `render()` is synchronous and therefore cannot interleave.
  * - **WebGPU is permanently unavailable, never retried.** The renderer needs
  *   `WebGLRenderTarget` + synchronous `readRenderTargetPixels`, neither of
  *   which exists under a `WebGPURenderer` (plan-271). On such a viewer the
@@ -54,7 +57,7 @@ export interface ThumbnailServiceOptions {
   isWebGPU?: boolean;
   /** Injectable for tests; defaults to the shared versioned bucket. */
   cache?: ThumbnailCache;
-  /** Square edge length of the generated PNG. */
+  /** Square edge length of the generated PNG. Defaults to 512 (plan-712). */
   size?: number;
 }
 
@@ -86,7 +89,7 @@ export class ThumbnailService {
     this._renderer = opts.renderer;
     this._scene = opts.scene;
     this._cache = opts.cache ?? new ThumbnailCache();
-    this._size = opts.size ?? 256;
+    this._size = opts.size ?? 512;
     this._unavailable = opts.isWebGPU === true;
   }
 
@@ -148,6 +151,27 @@ export class ThumbnailService {
   renderNow(model: Object3D, size?: number): string | null {
     if (!this.isAvailable) return null;
     return this._render(model, size);
+  }
+
+  /**
+   * Render the LIVE scene (no clone, no dispose) immediately — the hero card's
+   * "picture of what is open right now".
+   *
+   * NEVER use `renderNow` for the live model root: its clone/dispose cycle is
+   * O(model) and destroys resources shared with the live scene (see
+   * `ThumbnailRenderer.renderLive`). Being synchronous on the one shared
+   * renderer, this cannot interleave with a queued job — same rule as
+   * `renderNow`.
+   *
+   * Returns `null` on a WebGPU viewer, after dispose, or when the subtree has
+   * no mesh content.
+   */
+  renderLiveNow(root: Object3D, size?: number): string | null {
+    if (!this.isAvailable) return null;
+    if (!this._thumbRenderer) {
+      this._thumbRenderer = new ThumbnailRenderer(this._renderer, this._scene);
+    }
+    return this._thumbRenderer.renderLive(root, size ?? this._size);
   }
 
   /** Drop every queued request and release the renderer. Idempotent. */

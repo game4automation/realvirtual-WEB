@@ -181,10 +181,24 @@ function extractStringLiterals(text) {
 }
 
 /**
- * The three places a credential-shaped string is legitimately part of a
+ * The four places a credential-shaped string is legitimately part of a
  * delivered schema. Anywhere else it is a leak.
+ *
+ * The fourth is plan-718's: a `rv-connect-config/1.0` file may carry a secret
+ * REFERENCE — `{"$secretRef": "linie1.plc"}` — and a reference is a name, not a
+ * credential. The allowance is deliberately for the `$secretRef` LEAF only: the
+ * sibling value it replaces (`"Password": "hunter2"`) stays scanned, which is
+ * what makes "a committed connect file may not contain a plaintext secret" a
+ * mechanical rule rather than a review habit.
+ *
+ * The connect file's own path is not fixed — it is whatever a `connectRef`
+ * names — so the match is on the `$secretRef` property name, not on a file name.
  */
 export function isAllowedSecretSchemaPath(relativePath, propertyPath) {
+  if (propertyPath[propertyPath.length - 1] === '$secretRef'
+    && /(^|\/)connect\/[^/]+\.json$/i.test(String(relativePath).replace(/\\/g, '/'))) {
+    return true;
+  }
   return relativePath === 'connect/project-config.json'
     && propertyPath.length === 2
     && propertyPath[0] === 'Diagnosis'
@@ -250,7 +264,16 @@ function isSubresourceIntegrityLiteral(value) {
 //! Longest unbroken run inside a separator-delimited fragment still read as a word, not a token.
 //! Calibrated against real customer deliveries: engineering identifiers peak near 17 characters
 //! per segment, while every token format keeps a random run of 33+ even behind a prefix.
-const MAX_IDENTIFIER_SEGMENT = 24;
+//!
+//! Raised 24 -> 30 after the contract-test identifiers of the share backend
+//! (`myShares_DeleteRemovesAndReturns410`, `upload_CrossOwnerConfirmOrDelete_403`) aborted every
+//! customer delivery: their CamelCase middle runs 25-26 characters. The value stays below the 33
+//! this comment already calibrates for real tokens, so the band that only ever held false
+//! positives is what got given up — nothing a token format reaches.
+//!
+//! Treating a CamelCase boundary as a separator was considered and rejected: a random mixed-case
+//! token is *made* of case changes and would have been excused by it.
+const MAX_IDENTIFIER_SEGMENT = 30;
 
 //! True for `_`/`-` separated compound identifiers — machine designations, drawing numbers, signal
 //! and file names — which only reach the 32-character fragment length by joining short words.
@@ -314,6 +337,139 @@ export function secretContentViolation(relLower, extension, text) {
   return null;
 }
 
+// ─── Secrets as references (plan-718 §2.3 / F3) ─────────────────────────
+
+/**
+ * Property names whose VALUE is a credential.
+ *
+ * The one home for this list, for the reason the whole module exists: a second
+ * copy in `validate-project.mjs` would drift, and the copies would each look
+ * reasonable. Matched case-insensitively on the leaf property name only —
+ * `Interfaces[0].Settings.Password`, not a path.
+ *
+ * Deliberately short and about VALUES, not about names in general:
+ * `KeyFile`/`Keyword`/`Monkey` must not trip it, so the match is on the whole
+ * name or on a `…Password`/`…Token`/`…Secret`/`…ApiKey` suffix.
+ */
+export const CREDENTIAL_PROPERTY_NAMES = Object.freeze([
+  'password', 'passwd', 'pwd', 'passphrase', 'token', 'secret', 'apikey', 'api_key',
+  'accesskey', 'privatekey', 'clientsecret', 'credential',
+]);
+
+//! True when a property NAME says its value is a credential.
+export function isCredentialPropertyName(name) {
+  const lower = String(name ?? '').toLowerCase().replace(/[^a-z_]/g, '');
+  return CREDENTIAL_PROPERTY_NAMES.some(n => lower === n || lower.endsWith(n));
+}
+
+/**
+ * True when a value is a REFERENCE to a secret rather than the secret itself.
+ *
+ * The two accepted forms of plan-718 §2.3 — `{"$secretRef": "linie1.plc"}` and
+ * `"${env:RV_LINIE1_PLC}"` — plus the empty string, which configures nothing and
+ * therefore leaks nothing.
+ */
+export function isSecretReferenceValue(value) {
+  if (value === null || value === undefined) return true;
+  if (typeof value === 'string') {
+    return value.trim() === '' || /^\$\{env:[^}]+\}$/.test(value.trim());
+  }
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return typeof value.$secretRef === 'string' && value.$secretRef.trim() !== '';
+  }
+  return false;
+}
+
+/**
+ * Every `$secretRef` key a parsed connect config names, in document order.
+ *
+ * Feeds the collision warning: secret keys are one flat namespace, so two
+ * different connect files reaching for `plc.password` are either sharing on
+ * purpose or colliding by accident, and only the author can tell which.
+ */
+export function collectSecretRefKeys(value, keys = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectSecretRefKeys(item, keys);
+    return keys;
+  }
+  if (value && typeof value === 'object') {
+    if (typeof value.$secretRef === 'string' && value.$secretRef.trim() !== '') {
+      keys.push(value.$secretRef.trim());
+    }
+    for (const item of Object.values(value)) collectSecretRefKeys(item, keys);
+  }
+  return keys;
+}
+
+/**
+ * Credential-named properties carrying a plaintext value, as `path` strings.
+ *
+ * A hard failure for a committed connect file (F3): the file travels — git, a
+ * zip, a customer delivery — and a password in it is an incident, not a lint
+ * warning. Entropy heuristics do not help here; `"Password": "hunter2"` is low
+ * entropy and every bit as leaked, which is why the rule is about the property
+ * NAME and the SHAPE of its value.
+ */
+export function plaintextSecretPaths(value, path = [], out = []) {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => plaintextSecretPaths(item, [...path, index], out));
+    return out;
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      if (isCredentialPropertyName(key) && !isSecretReferenceValue(item)) {
+        out.push([...path, key].join('.'));
+        continue;
+      }
+      plaintextSecretPaths(item, [...path, key], out);
+    }
+  }
+  return out;
+}
+
+// ─── Secret VALUES in operator-owned registers (plan-434 §2.3) ───────────
+
+/**
+ * A CONNECT licence key as the gateway actually issues them.
+ *
+ * The pattern lived as a literal inside `_workspace-lib.mjs`'s
+ * `assertDeliveryFields`. The customer register (`_rv-customers.mjs`) has to
+ * recognise the very same shape to refuse a key that was typed into the
+ * register instead of the secrets file — and two independently maintained
+ * copies of a secret pattern is exactly the drift this module exists to
+ * prevent, so the definition moved here and both callers import it.
+ */
+export const CONNECT_LICENSE_KEY_PATTERN = /^LIC(-[A-Z0-9]{4}){3}$/i;
+
+/**
+ * A bare UUID. Not a secret by itself — but it *is* the shape the Requesty /
+ * Scaleway inference keys carry, and `containsHighEntropyFragment` deliberately
+ * excuses it (five short `-`-separated segments read as a compound identifier).
+ * So a register value has to be judged by this rule too, or the one API key
+ * format actually in use here would sail straight through.
+ */
+const UUID_SHAPED_SECRET = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * True when a *value* looks like a credential rather than a description.
+ *
+ * Used on operator-owned metadata (the customer register), never on delivered
+ * content — {@link secretContentViolation} is the rule for that, and it stays
+ * unchanged. The question here is narrower and stricter: "did somebody paste a
+ * key where only a reference belongs?".
+ */
+export function looksLikeSecretValue(value) {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (CONNECT_LICENSE_KEY_PATTERN.test(trimmed)) return true;
+  if (KNOWN_SECRET_FORMAT.test(trimmed)) return true;
+  if (COMPACT_JWS_FORMAT.test(trimmed)) return true;
+  if (UUID_SHAPED_SECRET.test(trimmed)) return true;
+  if (/^RVC1-[A-Za-z0-9_-]+$/.test(trimmed)) return true;
+  return !isHttpUrlLiteral(trimmed) && containsHighEntropyFragment(trimmed);
+}
+
 /**
  * Walks a tree and throws on the first secret found, by name or by content.
  *
@@ -350,15 +506,63 @@ export function assertNoSecrets(root, { skipDirs = ['.git', 'node_modules', 'dis
  * `projects/` is scratch and is ignored rather than reported, because the
  * guard's question is "which names are customer names", not "is this folder
  * well-formed".
+ *
+ * `{ kind: 'customer' }` narrows the answer to the folders that actually
+ * declare themselves customer material (plan-434 §2.6). That is the form the
+ * foreign-name guard wants: with every folder in the list, an internal
+ * playground called `festo` or `new-project` reads as a foreign customer's name
+ * and aborts a delivery over a fixture. Without the option the result is
+ * unchanged, so existing callers keep their behaviour.
  */
-export function knownProjectKeys(privateRoot) {
+export function knownProjectKeys(privateRoot, options = {}) {
   const projectsDir = join(privateRoot, 'projects');
   if (!existsSync(projectsDir)) return [];
-  return readdirSync(projectsDir, { withFileTypes: true })
+  const keys = readdirSync(projectsDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
     .map((entry) => entry.name)
     .filter((name) => existsSync(join(projectsDir, name, 'project.json')))
     .sort();
+  const wanted = options.kind;
+  if (wanted === undefined) return keys;
+  return keys.filter((name) => projectKindOf(projectsDir, name) === wanted);
+}
+
+/**
+ * How a project folder declares itself (plan-434 §2.6).
+ *
+ * The register answers "which customers exist"; this answers the other half,
+ * "what is this folder", and the two are not the same question — a folder can be
+ * a customer project long before anybody wrote its register entry, and most
+ * folders under `projects/` are neither.
+ *
+ *  - `customer` — real customer material. Travels under an NDA, is delivered,
+ *    and is the only kind the foreign-name guard has to defend.
+ *  - `demo` — something we show publicly.
+ *  - `internal` — everything else: test fixtures, scratch, spikes.
+ */
+export const PROJECT_KINDS = Object.freeze(['customer', 'demo', 'internal']);
+
+//! True when a value is one of {@link PROJECT_KINDS}.
+export function isProjectKind(value) {
+  return typeof value === 'string' && PROJECT_KINDS.includes(value);
+}
+
+/**
+ * The declared `kind` of one project folder, or `null` when it declares none.
+ *
+ * Unreadable and unmigrated manifests both yield `null` rather than a guess: the
+ * one consumer that filters on this is the foreign-customer-name guard, and
+ * "I could not tell" must never silently become "customer".
+ */
+export function projectKindOf(projectsDir, name) {
+  const manifest = join(projectsDir, name, 'project.json');
+  if (!existsSync(manifest)) return null;
+  try {
+    const kind = JSON.parse(readFileSync(manifest, 'utf8'))?.kind;
+    return isProjectKind(kind) ? kind : null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Vendor globs (plan-700 §2.3) ────────────────────────────────────────

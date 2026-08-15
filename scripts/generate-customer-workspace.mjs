@@ -10,7 +10,9 @@ import {
   applyMergedSnapshot,
   assertLfsPointer,
   assertNoCrossTierLeak,
+  assertPrivateSourceInventory,
   assertWorkspaceGuards,
+  collectPrivateSourceInventory,
   createDeliveryManifest,
   deliveryChangelog,
   formatMergeSummary,
@@ -19,6 +21,7 @@ import {
   loadDeliveryConfigByCustomer,
   loadTierManifest,
   mergeCommitNote,
+  readBaselineSourceInventory,
   readPlasticChangeset,
   runBuild,
   stageFilteredSourceTree,
@@ -48,6 +51,14 @@ function requireArg(args, name) {
 function buildRagPair(args, projectKey, projectDir) {
   if (args.includes('--no-rag')) {
     console.log('[customer-workspace] --no-rag: no diagnosis package is built or delivered.');
+    return null;
+  }
+  // A projectless (standard) delivery has no project corpus to embed and no
+  // preset to read, so the diagnosis package cannot exist — this is the same
+  // branch as --no-rag, reached by what the customer IS rather than by a flag
+  // (plan-434 Phase 4).
+  if (!projectKey) {
+    console.log('[customer-workspace] projectless delivery: no diagnosis package is built or delivered.');
     return null;
   }
   const supplied = arg(args, 'connect-artifacts');
@@ -131,7 +142,7 @@ function previousCoreCommit(clone) {
  */
 export function snapshotPush({
   workspaceRoot, remote, projects, version, plasticChangeset = null,
-  push = false, coreRoot = null, seedMissing = false,
+  push = false, coreRoot = null, seedMissing = false, acceptNewPrivateFiles = false,
 }) {
   const header = Number.isInteger(plasticChangeset) ? `viewer ${version}-${plasticChangeset}` : `viewer ${version}`;
   let message = header;
@@ -148,6 +159,24 @@ export function snapshotPush({
     const snapshot = applyMergedSnapshot(workspaceRoot, clone, { projects, version, seedMissing });
     const summary = formatMergeSummary(snapshot);
     if (summary) console.log(summary);
+    // The tier diff gate (§2.4). It runs before `git add`, so an abort here leaves the
+    // customer repository untouched — the clone is thrown away by the finally block.
+    const inventoryDiff = assertPrivateSourceInventory(
+      readBaselineSourceInventory(clone, snapshot.baselineTag),
+      collectPrivateSourceInventory(workspaceRoot),
+      { acceptNew: acceptNewPrivateFiles },
+    );
+    if (!inventoryDiff.gated) {
+      console.log('[tier-gate] first delivery for this customer; no baseline inventory to compare against.');
+    } else {
+      if (inventoryDiff.added.length) {
+        console.log(`[tier-gate] ${inventoryDiff.added.length} new private source file(s) accepted via --accept-new-private-files:`);
+        for (const path of inventoryDiff.added) console.log(`[tier-gate]   + ${path}`);
+      }
+      // A removal never blocks, but it must be visible: a file that silently stops
+      // being delivered is how a customer loses a feature without anyone noticing.
+      for (const path of inventoryDiff.removed) console.log(`[tier-gate]   - ${path} (no longer delivered)`);
+    }
     // A conflict is a normal, expected outcome, not a failure: the customer keeps
     // their file and we say so. It belongs in the commit message so it is visible
     // in the Forgejo history, and on stdout — never in an exit code.
@@ -173,6 +202,7 @@ async function main() {
   const push = args.includes('--push');
   const fast = args.includes('--fast');
   const seedMissing = args.includes('--seed-missing');
+  const acceptNewPrivateFiles = args.includes('--accept-new-private-files');
   const manifest = loadTierManifest(privateRoot);
   // Either one project (the primary; its customer's other projects come along) or a
   // whole customer. Both end at the same delivery config — one customer repository.
@@ -180,10 +210,17 @@ async function main() {
   const delivery = customer
     ? loadDeliveryConfigByCustomer(privateRoot, customer, manifest)
     : loadDeliveryConfig(privateRoot, requireArg(args, 'project'), manifest);
+  // A `standard` customer carries no projects (plan-434 Phase 4): no primary key,
+  // no project directory, no project.json. `null` travels all the way down —
+  // staging, the generated files and the manifest each have a projectless form.
   const projectKey = delivery.projectKey;
   const projectKeys = delivery.projects;
-  const projectDir = join(privateRoot, 'projects', projectKey);
-  const project = JSON.parse(readFileSync(join(projectDir, 'project.json'), 'utf8'));
+  const projectDir = projectKey ? join(privateRoot, 'projects', projectKey) : null;
+  const project = projectDir ? JSON.parse(readFileSync(join(projectDir, 'project.json'), 'utf8')) : null;
+  if (!projectKey) {
+    console.log(`[customer-workspace] ${delivery.kind ?? 'standard'} customer "${delivery.customer}": `
+      + 'projectless delivery, no RAG.');
+  }
   const core = gitProvenance(coreRoot, { requireTag: true });
   const privateRepo = gitProvenance(privateRoot);
   const plasticChangeset = readPlasticChangeset(resolve(coreRoot, '../../../..'));
@@ -216,10 +253,14 @@ async function main() {
       privateRepo,
       profile: { tier: delivery.tier, restrictedFeatures: delivery.restrictedFeatures },
       connect: { channel: delivery.connectChannel, ...connectPin },
+      // null for a projectless delivery — see createDeliveryManifest.
       projectRoot: projectDir,
       viewerVersion: packageJson.version,
       plasticChangeset,
       projects: stagedProjects,
+      // Recorded at staging time, from the tree that is actually about to be delivered
+      // — this is what the NEXT delivery diffs against (§2.4).
+      privateSources: collectPrivateSourceInventory(staged.workspaceRoot),
     });
     writeFileSync(join(staged.workspaceRoot, 'delivery-manifest.json'), JSON.stringify(deliveryManifest, null, 2) + '\n');
     assertNoCrossTierLeak(staged.workspaceRoot, manifest, delivery);
@@ -230,7 +271,16 @@ async function main() {
       // of six projects; `festo` and `demo-realvirtual` were missing, which meant
       // the foreign-customer-name guard could not recognise them — and that guard
       // exists precisely to stop one customer's material reaching another.
-      knownProjectKeys: knownProjectKeys(privateRoot),
+      //
+      // Narrowed to `kind: 'customer'` in plan-434 §2.6. The guard aborts a
+      // delivery when a foreign project's NAME appears anywhere in the staged
+      // tree, so every extra name in this list is a way for the delivery to fail
+      // over nothing: `festo`, `new-project` and `demo-realvirtual` are words a
+      // demo scene, a fixture path or a doc sentence legitimately contains. Only
+      // a folder that declares itself customer material carries the secret this
+      // guard defends — a name that must never surface in another customer's
+      // repository.
+      knownProjectKeys: knownProjectKeys(privateRoot, { kind: 'customer' }),
       lfsRepoRoot: staged.workspaceRoot,
     });
     const build = runBuild(staged.workspaceRoot, { mode: 'private', projectKey, fast });
@@ -248,6 +298,7 @@ async function main() {
       push,
       coreRoot,
       seedMissing,
+      acceptNewPrivateFiles,
     });
     // Provenance is recorded only for a push that actually landed, and on the
     // SOURCE manifests, not the staged copies about to be deleted (§2.8 / B15).

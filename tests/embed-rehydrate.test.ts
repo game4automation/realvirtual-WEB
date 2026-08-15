@@ -19,9 +19,10 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { RVEmbedViewer } from '../src/embed/rv-embed-viewer';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
-const GLB_URL = '/models/tests.glb';
-const SMALL_GLB_URL = '/models/physics-zone-test.glb';
+const GLB_URL = DEV_GLB.tests;
+const SMALL_GLB_URL = DEV_GLB.physicsZone;
 const VIGNETTE_URL = '/embed/vignettes/conveyor-sensor.glb';
 
 async function glbAvailable(url: string): Promise<boolean> {

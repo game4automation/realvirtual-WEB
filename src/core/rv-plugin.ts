@@ -121,6 +121,60 @@ export interface RVViewerPlugin {
    */
   onModeDeactivate?(mode: ModeId | null, viewer: RVViewer): void;
 
+  // ── User toggle hooks (plan-435) ──
+
+  /**
+   * Called when the USER switches this plugin OFF in the feature matrix
+   * (`viewer.setPluginUserEnabled(id, false)`) — never on a workspace mode
+   * switch, never on `clearModel()`. Tear down everything the plugin built
+   * that is still visible or still running: scene objects, DOM overlays,
+   * subscriptions, timers, sessions.
+   *
+   * When this hook is ABSENT, the viewer falls back to calling
+   * {@link onModelCleared} (only if the plugin actually received the current
+   * model). When it is PRESENT it wins outright — the fallback never runs.
+   *
+   * Synchronous by contract (the toggle hangs on a React `onChange`). Async
+   * work started elsewhere must be cancellable: bump a `_generation` counter
+   * here and have every async continuation bail out with
+   * `if (gen !== this._generation) return;` before its first side effect
+   * (plan-435 §2.10).
+   *
+   * THE THREE INVARIANTS of the toggle contract:
+   *
+   * 1. `onActivate` and the fallback restore exclude each other. A plugin
+   *    never gets both for one enable.
+   * 2. An `onModelLoaded` replayed from the missed-load set may legitimately
+   *    PRECEDE `onActivate` — it means "you missed a model", not "you are
+   *    being switched on". The order is guaranteed: model first, activation
+   *    second, so `onActivate` may assume `viewer.scene` matches the current
+   *    model.
+   * 3. `onDeactivate` releases NO model-owned resources that
+   *    {@link onModelCleared} owns — only what the plugin holds beyond them
+   *    (overlays, listeners, timers, sessions). The plugin stays in the
+   *    "has the model" bookkeeping, so a later real `clearModel()` still
+   *    delivers its `onModelCleared`. If a plugin bundles both into one
+   *    private `teardown()`, that teardown MUST be idempotent
+   *    (`if (this._down) return;`) — otherwise the later `onModelCleared`
+   *    runs on already-released state.
+   */
+  onDeactivate?(viewer: RVViewer): void;
+
+  /**
+   * Called when the USER switches this plugin back ON
+   * (`viewer.setPluginUserEnabled(id, true)`), after the plugin has been
+   * re-enabled, its UI slots re-registered and any missed `onModelLoaded`
+   * replayed — and before `onModeActivate`. Rebuild exactly what
+   * {@link onDeactivate} tore down.
+   *
+   * Only called when the plugin participates in the active mode (a mode-scoped
+   * plugin switched on outside its mode stays disabled and is activated later
+   * by the mode transition). Present-hook-wins: when this exists, the
+   * `onModelLoaded` fallback replay is skipped. See the three invariants on
+   * {@link onDeactivate}.
+   */
+  onActivate?(viewer: RVViewer): void;
+
   /**
    * Called when the active 3D render backend changes (plan-256), e.g. Three.js
    * → Omniverse RTX stream. Interactive 3D plugins (raycast/gizmo/camera) have

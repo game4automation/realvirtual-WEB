@@ -45,8 +45,9 @@ import { ikSolverRegistry, targetPoseInBase, type JointChainParams } from '../sr
 import type { RVRobotIK } from '../src/core/engine/rv-robot-ik';
 import type { RVIKTarget } from '../src/core/engine/rv-ik-target';
 import { WasmIKSolver } from '@rv-private/ik-solver/rv-ik-solver-provider';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
-const GLB_URL = '/models/DemoRobotIK.glb';
+const GLB_URL = DEV_GLB.robotIK;
 
 // ── Test-local mini-FK (same convention as ik-cobot.test.ts / fk.rs) ─────────
 

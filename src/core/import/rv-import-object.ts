@@ -39,9 +39,6 @@ export interface ImportPlannerLike {
     position: [number, number, number],
     opts?: { skipAutoAlign?: boolean },
   ): Promise<string>;
-  store?: {
-    refreshLocalFolder?: () => Promise<void>;
-  };
 }
 
 /** The slice of RVViewer `importObject` relies on. Structural (unknown
@@ -208,7 +205,6 @@ export async function importObject(
   const placeOpts = options?.skipAutoAlign ? { skipAutoAlign: true } : undefined;
 
   const outcome: ImportObjectOutcome = { placedIds: [], persisted: true, warnings: [] };
-  let wroteToFolder = false;
 
   for (const item of list) {
     if (item.kind === 'catalog') {
@@ -227,19 +223,11 @@ export async function importObject(
     if (!persistResult.persisted) {
       outcome.persisted = false;
       if (persistResult.warning) outcome.warnings.push(persistResult.warning);
-    } else {
-      wroteToFolder = true;
     }
 
     outcome.placedIds.push(
       await planner.placeComponent(persistResult.entry, position, placeOpts),
     );
-  }
-
-  // The working folder gained new files — refresh the local library catalog
-  // (fire-and-forget; the placement itself is already done).
-  if (wroteToFolder) {
-    void planner.store?.refreshLocalFolder?.()?.catch?.(() => undefined);
   }
 
   return outcome;

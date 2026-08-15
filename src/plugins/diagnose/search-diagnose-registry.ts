@@ -10,7 +10,7 @@
  * public search UI only ever asks this registry. An empty registry IS the
  * no-op fallback — no button, no call, no CONNECT knowledge in the search bar.
  * Follows the codebase's registry-over-hard-wiring preference
- * (hierarchy-header-registry, componentActionRegistry, …).
+ * (componentActionRegistry, fieldRendererRegistry, …).
  */
 
 import { useSyncExternalStore } from 'react';

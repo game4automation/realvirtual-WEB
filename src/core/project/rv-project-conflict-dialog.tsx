@@ -235,6 +235,9 @@ export function ProjectDialogHost() {
         open={guard !== null}
         sceneName={guard?.context.sceneName ?? guard?.context.projectName ?? '(project)'}
         canSave={canSaveExisting}
+        // plan-703 §2.7.3 — every unsaved open document is named, not just the
+        // scene. "Discard" here reaches all of them, so all of them are said.
+        alsoUnsaved={guard?.context.dirtyDocuments.map(d => d.name) ?? []}
         onSave={() => { void onGuardSave(); }}
         onSaveAs={() => { void onGuardSave(); }}
         onDiscard={() => { void onGuardDiscard(); }}

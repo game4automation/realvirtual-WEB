@@ -6,7 +6,7 @@ import type { ComponentSchema, ComponentContext, RVComponent } from './rv-compon
 import { registerComponentSchema, loadSchemaFromSpec } from './rv-component-registry';
 import { RVDrive } from './rv-drive';
 import { NodeRegistry } from './rv-node-registry';
-import { wireBoolSignal, scaleFeedbackPosition } from './rv-signal-wiring';
+import { wireBoolSignal, wireNumberSignal, scaleFeedbackPosition } from './rv-signal-wiring';
 import { createSignalWriter } from './rv-signal-store';
 
 /**
@@ -59,6 +59,10 @@ export class RVDriveSimple implements RVComponent {
   private feedbackCb: ((d: RVDrive) => void) | null = null;
   private drive: RVDrive | null = null;
   private readonly feedbackListeners: (() => void)[] = [];
+  /** Store subscriptions + re-apply slots of the four input signals. Held so
+   *  `dispose()` can drop them — before plan-427 the handles were discarded and
+   *  a removed drive kept receiving PLC commands. */
+  private readonly inputUnsubs: (() => void)[] = [];
 
   constructor(node: Object3D) {
     this.node = node;
@@ -129,20 +133,23 @@ export class RVDriveSimple implements RVComponent {
     this.drive = drive;
 
     // ── Inputs (PLC → drive) ──
-    wireBoolSignal(ctx.signalStore, this.Forward,
-      (v) => this.commandForward(v), `Drive_Simple "${drive.name}": Forward signal`);
-    wireBoolSignal(ctx.signalStore, this.Backward,
-      (v) => this.commandBackward(v), `Drive_Simple "${drive.name}": Backward signal`);
-    if (this.Speed) {
-      ctx.signalStore.subscribeByPath(this.Speed, (v) => {
-        this.commandSpeed(v);
-      });
-    }
-    if (this.Accelaration) {
-      ctx.signalStore.subscribeByPath(this.Accelaration, (v) => {
-        this.commandAccelaration(v);
-      });
-    }
+    // All four via the wiring helpers so the CURRENT level is re-applied after
+    // `resetSimulation()` / reconnect — a `Forward` held true across a reset is
+    // exactly the case this drive would otherwise sleep through (plan-427).
+    this.inputUnsubs.push(
+      wireBoolSignal(ctx.signalStore, this.Forward,
+        (v) => this.commandForward(v),
+        `Drive_Simple "${drive.name}": Forward signal`, ctx.reapply).unsubscribe,
+      wireBoolSignal(ctx.signalStore, this.Backward,
+        (v) => this.commandBackward(v),
+        `Drive_Simple "${drive.name}": Backward signal`, ctx.reapply).unsubscribe,
+      wireNumberSignal(ctx.signalStore, this.Speed,
+        (v) => this.commandSpeed(v),
+        `Drive_Simple "${drive.name}": Speed signal`, ctx.reapply).unsubscribe,
+      wireNumberSignal(ctx.signalStore, this.Accelaration,
+        (v) => this.commandAccelaration(v),
+        `Drive_Simple "${drive.name}": Accelaration signal`, ctx.reapply).unsubscribe,
+    );
 
     // ── Feedback (drive → PLC) — ALWAYS, also under liveControlled ──
     // Chained via addAfterUpdate so a sibling behavior on the same drive is
@@ -160,6 +167,8 @@ export class RVDriveSimple implements RVComponent {
     if (this.drive && this.feedbackCb) {
       this.drive.removeAfterUpdate(this.feedbackCb);
     }
+    for (const unsub of this.inputUnsubs) unsub();
+    this.inputUnsubs.length = 0;
     this.feedbackCb = null;
     this.drive = null;
     this.feedbackListeners.length = 0;

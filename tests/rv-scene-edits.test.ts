@@ -4,8 +4,8 @@
 /**
  * Tests for the pure operation-log helpers in rv-scene-edits.ts:
  *   - materialise() determinism + composite flattening + tolerant transforms
- *   - canCoalesce() / mergeOps() rules across kinds
- *   - describeOp() label formatting
+ *   - canCoalesceRvOps() / mergeRvOps() rules across kinds
+ *   - describeRvOp() label formatting
  *   - inverseOp() round-trips
  *   - opsEqual() identity semantics
  *   - freshOpId() stability properties
@@ -13,26 +13,28 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  type EditOp,
   type SetFieldOp,
   type AddPlacementOp,
   type RemovePlacementOp,
   type TransformPlacementOp,
   type SetCameraOp,
-  type CompositeOp,
   type UnsetFieldOp,
-  type PrimitiveEditOp,
   COALESCE_WINDOW_MS,
   MAX_OP_HISTORY,
   freshOpId,
   materialise,
-  canCoalesce,
-  mergeOps,
-  describeOp,
   inverseOp,
   opsEqual,
   deepCloneJSON,
 } from '../src/core/hmi/scene/rv-scene-edits';
+import {
+  canCoalesceRvOps,
+  mergeRvOps,
+  describeRvOp,
+  type RvOp,
+  type RvCompositeOp,
+  type RvScenePrimitiveOp,
+} from '../src/core/ops/rv-unified-ops';
 import type { PlacedComponent } from '../src/plugins/layout-planner/rv-layout-store';
 
 // ─── Builders ────────────────────────────────────────────────────────────
@@ -88,7 +90,7 @@ function setCamera(preset: { px: number; py: number; pz: number; tx: number; ty:
   return { id: freshOpId(), ts, schemaV: 1, kind: 'setCamera', preset, prev };
 }
 
-function composite(label: string, ops: PrimitiveEditOp[], ts = 1000): CompositeOp {
+function composite(label: string, ops: RvScenePrimitiveOp[], ts = 1000): RvCompositeOp {
   return { id: freshOpId(), ts, schemaV: 1, kind: 'composite', label, ops };
 }
 
@@ -121,7 +123,7 @@ describe('materialise', () => {
   });
 
   it('unsetField clears the override and prunes empty containers', () => {
-    const ops: EditOp[] = [
+    const ops: RvOp[] = [
       setField('Conv1', 'Drive', 'TargetSpeed', 250, 100),
       setField('Conv1', 'Drive', 'Acceleration', 50, 100),
       unsetField('Conv1', 'Drive', 'TargetSpeed', 250),
@@ -132,7 +134,7 @@ describe('materialise', () => {
   });
 
   it('unsetField on the LAST field on a node prunes node entry entirely', () => {
-    const ops: EditOp[] = [
+    const ops: RvOp[] = [
       setField('Conv1', 'Drive', 'TargetSpeed', 250, 100),
       unsetField('Conv1', 'Drive', 'TargetSpeed', 250),
     ];
@@ -169,7 +171,7 @@ describe('materialise', () => {
   });
 
   it('composite ops are flattened in apply order', () => {
-    const ops: EditOp[] = [
+    const ops: RvOp[] = [
       composite('Reset Drive', [
         setField('Conv1', 'Drive', 'TargetSpeed', 100, 100),
         setField('Conv1', 'Drive', 'Acceleration', 25, 25),
@@ -181,7 +183,7 @@ describe('materialise', () => {
   });
 
   it('determinism: same op array produces structurally-equal output across calls', () => {
-    const ops: EditOp[] = [
+    const ops: RvOp[] = [
       setField('Conv1', 'Drive', 'TargetSpeed', 250, 100),
       addP(placement('p1', 'A')),
       transformP('p1', [1, 2, 3]),
@@ -192,37 +194,37 @@ describe('materialise', () => {
   });
 });
 
-// ─── canCoalesce / mergeOps ─────────────────────────────────────────────
+// ─── canCoalesceRvOps / mergeRvOps ─────────────────────────────────────────────
 
-describe('canCoalesce', () => {
+describe('canCoalesceRvOps', () => {
   it('coalesces same-target setField inside the window', () => {
     const a = setField('Conv1', 'Drive', 'TargetSpeed', 200, 100, 1000);
     const b = setField('Conv1', 'Drive', 'TargetSpeed', 250, 200, 1100);
-    expect(canCoalesce(a, b)).toBe(true);
+    expect(canCoalesceRvOps(a, b)).toBe(true);
   });
 
   it('does NOT coalesce when window is exceeded', () => {
     const a = setField('Conv1', 'Drive', 'TargetSpeed', 200, 100, 1000);
     const b = setField('Conv1', 'Drive', 'TargetSpeed', 250, 200, 1000 + COALESCE_WINDOW_MS + 1);
-    expect(canCoalesce(a, b)).toBe(false);
+    expect(canCoalesceRvOps(a, b)).toBe(false);
   });
 
   it('does NOT coalesce different fields', () => {
     const a = setField('Conv1', 'Drive', 'TargetSpeed', 200, 100, 1000);
     const b = setField('Conv1', 'Drive', 'Acceleration', 50, 25, 1100);
-    expect(canCoalesce(a, b)).toBe(false);
+    expect(canCoalesceRvOps(a, b)).toBe(false);
   });
 
   it('does NOT coalesce different node paths', () => {
     const a = setField('Conv1', 'Drive', 'TargetSpeed', 200, 100, 1000);
     const b = setField('Conv2', 'Drive', 'TargetSpeed', 200, 100, 1100);
-    expect(canCoalesce(a, b)).toBe(false);
+    expect(canCoalesceRvOps(a, b)).toBe(false);
   });
 
   it('does NOT coalesce different kinds', () => {
     const a = setField('Conv1', 'Drive', 'TargetSpeed', 200, 100, 1000);
     const b = unsetField('Conv1', 'Drive', 'TargetSpeed', 200, 1100);
-    expect(canCoalesce(a, b)).toBe(false);
+    expect(canCoalesceRvOps(a, b)).toBe(false);
   });
 
   it('coalesces transformPlacement on same id', () => {
@@ -230,28 +232,28 @@ describe('canCoalesce', () => {
       { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }, 1000);
     const b = transformP('p1', [2, 0, 0], [0, 0, 0], [1, 1, 1],
       { position: [1, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }, 1100);
-    expect(canCoalesce(a, b)).toBe(true);
+    expect(canCoalesceRvOps(a, b)).toBe(true);
   });
 
   it('does NOT coalesce add/removePlacement', () => {
     const p = placement('p1');
-    expect(canCoalesce(addP(p, 1000), addP(p, 1100))).toBe(false);
-    expect(canCoalesce(removeP(p, 1000), removeP(p, 1100))).toBe(false);
+    expect(canCoalesceRvOps(addP(p, 1000), addP(p, 1100))).toBe(false);
+    expect(canCoalesceRvOps(removeP(p, 1000), removeP(p, 1100))).toBe(false);
   });
 
   it('does NOT coalesce composites', () => {
     const a = composite('A', [setField('n', 'c', 'f', 1, 0)], 1000);
     const b = setField('n', 'c', 'f', 2, 1, 1100);
-    expect(canCoalesce(a, b)).toBe(false);
-    expect(canCoalesce(b, a)).toBe(false);
+    expect(canCoalesceRvOps(a, b)).toBe(false);
+    expect(canCoalesceRvOps(b, a)).toBe(false);
   });
 });
 
-describe('mergeOps', () => {
+describe('mergeRvOps', () => {
   it('setField merge keeps original prev, adopts new value', () => {
     const a = setField('Conv1', 'Drive', 'TargetSpeed', 200, 100, 1000);
     const b = setField('Conv1', 'Drive', 'TargetSpeed', 250, 200, 1100);
-    const merged = mergeOps(a, b) as SetFieldOp;
+    const merged = mergeRvOps(a, b) as SetFieldOp;
     expect(merged.value).toBe(250);
     expect(merged.prev).toBe(100);
     expect(merged.id).toBe(a.id);
@@ -263,42 +265,42 @@ describe('mergeOps', () => {
       { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }, 1000);
     const b = transformP('p1', [5, 0, 0], [0, 0, 0], [1, 1, 1],
       { position: [1, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }, 1100);
-    const merged = mergeOps(a, b) as TransformPlacementOp;
+    const merged = mergeRvOps(a, b) as TransformPlacementOp;
     expect(merged.position).toEqual([5, 0, 0]);
     expect(merged.prev.position).toEqual([0, 0, 0]);
   });
 });
 
-// ─── describeOp ─────────────────────────────────────────────────────────
+// ─── describeRvOp ─────────────────────────────────────────────────────────
 
-describe('describeOp', () => {
+describe('describeRvOp', () => {
   it('formats setField with leaf node + value', () => {
-    expect(describeOp(setField('Robot/Cell/Conv1', 'Drive', 'TargetSpeed', 250, 100)))
+    expect(describeRvOp(setField('Robot/Cell/Conv1', 'Drive', 'TargetSpeed', 250, 100)))
       .toBe('Set Drive.TargetSpeed = 250 on Conv1');
   });
   it('formats float values trimmed', () => {
-    expect(describeOp(setField('A', 'C', 'F', 1.5, 0)))
+    expect(describeRvOp(setField('A', 'C', 'F', 1.5, 0)))
       .toBe('Set C.F = 1.5 on A');
   });
   it('formats string values quoted', () => {
-    expect(describeOp(setField('A', 'C', 'F', 'hello', '')))
+    expect(describeRvOp(setField('A', 'C', 'F', 'hello', '')))
       .toBe('Set C.F = "hello" on A');
   });
   it('formats unsetField', () => {
-    expect(describeOp(unsetField('A/B', 'Drive', 'X', 1)))
+    expect(describeRvOp(unsetField('A/B', 'Drive', 'X', 1)))
       .toBe('Reset Drive.X on B');
   });
   it('formats add/remove placement', () => {
-    expect(describeOp(addP(placement('p1', 'My Robot')))).toBe('Add My Robot');
-    expect(describeOp(removeP(placement('p1', 'My Robot')))).toBe('Remove My Robot');
+    expect(describeRvOp(addP(placement('p1', 'My Robot')))).toBe('Add My Robot');
+    expect(describeRvOp(removeP(placement('p1', 'My Robot')))).toBe('Remove My Robot');
   });
   it('formats setCamera', () => {
-    expect(describeOp(setCamera({ px: 1, py: 2, pz: 3, tx: 0, ty: 0, tz: 0 })))
+    expect(describeRvOp(setCamera({ px: 1, py: 2, pz: 3, tx: 0, ty: 0, tz: 0 })))
       .toBe('Set camera view');
-    expect(describeOp(setCamera(null))).toBe('Clear camera view');
+    expect(describeRvOp(setCamera(null))).toBe('Clear camera view');
   });
   it('formats composite using its label', () => {
-    expect(describeOp(composite('Reset Drive', [setField('A', 'B', 'C', 0, 1)])))
+    expect(describeRvOp(composite('Reset Drive', [setField('A', 'B', 'C', 0, 1)])))
       .toBe('Reset Drive');
   });
 });
@@ -349,7 +351,7 @@ describe('inverseOp', () => {
       setField('A', 'B', 'F1', 10, 1),
       setField('A', 'B', 'F2', 20, 2),
     ]);
-    const inv = inverseOp(op) as CompositeOp;
+    const inv = inverseOp(op) as RvCompositeOp;
     expect(inv.kind).toBe('composite');
     expect(inv.ops.length).toBe(2);
     // Reversed: F2 inverse first, then F1 inverse
@@ -424,9 +426,9 @@ describe('deepCloneJSON', () => {
   });
 });
 
-// ─── setNodeTransform ───────────────────────────────────────────────────
+// ─── transformNode (scene lineage: no `scale`) ──────────────────────────
 
-describe('setNodeTransform', () => {
+describe('transformNode', () => {
   const P0: [number, number, number] = [0, 0, 0];
   const Q0: [number, number, number, number] = [0, 0, 0, 1];
 
@@ -437,9 +439,14 @@ describe('setNodeTransform', () => {
     prev: { position: [number, number, number]; quaternion: [number, number, number, number] } = { position: P0, quaternion: Q0 },
     ts = 1000,
   ) {
+    // No `scale` key at all — the marker that says "this node's scale belongs
+    // to the base GLB". Never `scale: undefined`, so the op still round-trips
+    // through JSON without growing a null.
     return {
       id: freshOpId(), ts, schemaV: 1 as const,
-      kind: 'setNodeTransform' as const, nodePath, position: pos, quaternion: quat, prev,
+      kind: 'transformNode' as const, nodePath,
+      transform: { position: pos, quaternion: quat },
+      prev,
     };
   }
 
@@ -491,12 +498,16 @@ describe('setNodeTransform', () => {
   it('inverseOp swaps transform and prev', () => {
     const op = transformN('Robot/Path/T1', [1, 2, 3], [0, 1, 0, 0], { position: [9, 9, 9], quaternion: Q0 });
     const inv = inverseOp(op);
-    expect(inv.kind).toBe('setNodeTransform');
-    if (inv.kind === 'setNodeTransform') {
-      expect(inv.position).toEqual([9, 9, 9]);
-      expect(inv.quaternion).toEqual(Q0);
+    expect(inv.kind).toBe('transformNode');
+    if (inv.kind === 'transformNode') {
+      expect(inv.transform.position).toEqual([9, 9, 9]);
+      expect(inv.transform.quaternion).toEqual(Q0);
       expect(inv.prev.position).toEqual([1, 2, 3]);
       expect(inv.prev.quaternion).toEqual([0, 1, 0, 0]);
+      // The inverse of a scale-less op is scale-less: an undo must not change
+      // the lineage of the op it reverses.
+      expect(inv.transform.scale).toBeUndefined();
+      expect(inv.prev.scale).toBeUndefined();
     }
   });
 
@@ -504,18 +515,18 @@ describe('setNodeTransform', () => {
     const a = transformN('Robot/Path/T1', [1, 0, 0], Q0, { position: P0, quaternion: Q0 }, 1000);
     const b = transformN('Robot/Path/T1', [2, 0, 0], Q0, { position: [1, 0, 0], quaternion: Q0 }, 1100);
     const c = transformN('Robot/Path/T2', [3, 0, 0], Q0, { position: P0, quaternion: Q0 }, 1150);
-    expect(canCoalesce(a, b)).toBe(true);
-    expect(canCoalesce(a, c)).toBe(false);
-    const merged = mergeOps(a, b);
-    expect(merged.kind).toBe('setNodeTransform');
-    if (merged.kind === 'setNodeTransform') {
-      expect(merged.position).toEqual([2, 0, 0]); // next payload
-      expect(merged.prev.position).toEqual(P0);   // first prev survives
+    expect(canCoalesceRvOps(a, b)).toBe(true);
+    expect(canCoalesceRvOps(a, c)).toBe(false);
+    const merged = mergeRvOps(a, b);
+    expect(merged.kind).toBe('transformNode');
+    if (merged.kind === 'transformNode') {
+      expect(merged.transform.position).toEqual([2, 0, 0]); // next payload
+      expect(merged.prev.position).toEqual(P0);             // first prev survives
       expect(merged.id).toBe(a.id);
     }
   });
 
   it('describes the op with the node leaf name', () => {
-    expect(describeOp(transformN('Robot/Path/T1', [1, 2, 3]))).toBe('Move T1');
+    expect(describeRvOp(transformN('Robot/Path/T1', [1, 2, 3]))).toBe('Move T1');
   });
 });

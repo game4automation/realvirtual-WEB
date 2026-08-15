@@ -5,7 +5,7 @@ import type { Object3D } from 'three';
 import type { RVViewer } from '../../core/rv-viewer';
 import type { NodeRegistry } from '../../core/engine/rv-node-registry';
 import type { SignalBindingManager } from '../../core/engine/rv-signal-binding-manager';
-import { BINDING_SLOT_RV_KEYS } from '../../core/engine/rv-binding-slot-resolver';
+import { hasResolverComponent } from '../../core/engine/rv-binding-slot-resolver';
 import {
   findSignalBindTarget,
   signalBindEligibility,
@@ -32,15 +32,6 @@ export interface BindableTargetViewerLike {
   signalBindingManager: SignalBindingManager | null;
   behaviors: RVViewer['behaviors'];
   getPlugin: RVViewer['getPlugin'];
-}
-
-function hasResolverComponent(node: Object3D): boolean {
-  const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
-  if (!rv) return false;
-  for (const key of BINDING_SLOT_RV_KEYS) {
-    if (rv[key] !== undefined) return true;
-  }
-  return false;
 }
 
 /** Payload-free discovery for persistent signal-link-mode badges. */

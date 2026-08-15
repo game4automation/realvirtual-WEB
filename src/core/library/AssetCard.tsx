@@ -25,7 +25,7 @@
 
 import { forwardRef, type ReactNode } from 'react';
 import { Box, Typography, Tooltip } from '@mui/material';
-import { TimerOutlined, Landscape } from '@mui/icons-material';
+import { TimerOutlined, Landscape, PrecisionManufacturingOutlined } from '@mui/icons-material';
 import type { LibraryCatalogEntry } from './library-types';
 
 /** Matches `CatalogBrowserVariant`; kept structural to avoid a circular import. */
@@ -56,6 +56,12 @@ export interface AssetCardProps {
   cursor?: string;
   /** Rendered inside the preview square when the entry has no thumbnail. */
   placeholderAction?: ReactNode;
+  /**
+   * The asset decoded but holds nothing renderable (a freshly created "New
+   * asset"). Renders a stated "Empty" tile instead of a blank preview square —
+   * an empty file is a fact, a blank square is a bug report.
+   */
+  empty?: boolean;
   /** Tooltip body (usually the component's behaviour description). */
   tooltip?: ReactNode;
   /** Controlled tooltip visibility — suppressed while dragging. */
@@ -64,6 +70,7 @@ export interface AssetCardProps {
   onDragStart?: React.DragEventHandler<HTMLDivElement>;
   onDragEnd?: React.DragEventHandler<HTMLDivElement>;
   onClick?: React.MouseEventHandler<HTMLDivElement>;
+  onDoubleClick?: React.MouseEventHandler<HTMLDivElement>;
   onContextMenu?: React.MouseEventHandler<HTMLDivElement>;
   onMouseEnter?: React.MouseEventHandler<HTMLDivElement>;
   onMouseLeave?: React.MouseEventHandler<HTMLDivElement>;
@@ -78,6 +85,7 @@ const SCALE = {
 
 const ACCENT = 'rgba(79, 195, 247';   // Instrument Blue (DESIGN.md), alpha appended
 const SPLAT = 'rgba(139, 195, 74';
+const NEUTRAL = 'rgba(255, 255, 255';
 
 export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function AssetCard(
   {
@@ -88,6 +96,7 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
     draggable = false,
     cursor,
     placeholderAction,
+    empty = false,
     tooltip,
     tooltipOpen,
     ...handlers
@@ -124,6 +133,15 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
       label="Splat"
       labelSize={s.glyphLabel}
     />
+  ) : empty ? (
+    // Neutral, not accented: an empty asset is a normal state on the way to
+    // authored content, not something to advertise.
+    <GlyphTile
+      accent={NEUTRAL}
+      icon={<PrecisionManufacturingOutlined sx={{ fontSize: s.glyph, color: `${NEUTRAL}, 0.45)` }} />}
+      label="Empty"
+      labelSize={s.glyphLabel}
+    />
   ) : (
     <Box
       sx={{
@@ -141,10 +159,25 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
     </Box>
   );
 
+  // A clickable card is a real control: focusable, activatable with Enter or
+  // Space. Selection gates the detail pane — "the accessible route" — so a
+  // pointer-only card would lock keyboard users out of every asset verb.
+  const clickable = typeof handlers.onClick === 'function';
+
   const card = (
     <Box
       ref={ref}
       draggable={draggable}
+      role={clickable ? 'button' : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      onKeyDown={clickable
+        ? (e: React.KeyboardEvent<HTMLDivElement>) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              handlers.onClick?.(e as unknown as React.MouseEvent<HTMLDivElement>);
+            }
+          }
+        : undefined}
       {...handlers}
       sx={{
         position: 'relative',
@@ -158,6 +191,12 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
         bgcolor: selected ? `${ACCENT}, 0.15)` : 'rgba(255,255,255,0.03)',
         border: selected ? `1px solid ${ACCENT}, 0.5)` : '1px solid rgba(255,255,255,0.06)',
         '&:hover': { bgcolor: `${ACCENT}, 0.08)`, borderColor: `${ACCENT}, 0.2)` },
+        // DESIGN.md: a visible focus ring, never removed. Inset so the grid's
+        // scroll container cannot clip it.
+        '&:focus-visible': {
+          outline: `1px solid ${ACCENT}, 1)`,
+          outlineOffset: '-1px',
+        },
         transition: 'all 0.15s',
         userSelect: 'none',
         // Skip layout/paint for cards outside the viewport (plan-372 §2.8).

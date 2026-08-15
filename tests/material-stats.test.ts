@@ -3,7 +3,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { Group, Mesh, BoxGeometry, MeshStandardMaterial, Texture } from 'three';
-import { computeMaterialStats, formatBytes } from '../src/plugins/asset-editor/materials/material-stats';
+import { computeMaterialStats, formatBytes } from '@rv-private/plugins/asset-editor/materials/material-stats';
 
 function meshWith(name: string, mat: MeshStandardMaterial): Mesh {
   const m = new Mesh(new BoxGeometry(1, 1, 1), mat);

@@ -12,7 +12,7 @@
  * - Utility functions for signal direction, color, and label resolution
  */
 
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Box, Typography, Chip, Tooltip, Popover, TextField, Button } from '@mui/material';
 import { ArrowRightAlt, Close } from '@mui/icons-material';
 import type { RVViewer } from '../rv-viewer';
@@ -22,10 +22,19 @@ import { getViewerMode, getConnectSnapshot } from './connect-store';
 import { componentColor } from './rv-inspector-helpers';
 import { navigateToRef } from './rv-reference-display';
 import { requestForceConfirm } from './force-confirm-store';
-import { AUTHORITY_SENTENCE } from './signal-vocabulary';
+import {
+  AUTHORITY_SENTENCE,
+  PROVENANCE_DRIVES_TITLE,
+  PROVENANCE_REFERENCED_TITLE,
+} from './signal-vocabulary';
 import { useThrottledSignalValue } from '../../hooks/use-throttled-signal';
 import { useSignalDisplaySettings, type SignalTooltipFields, type SignalChipVariant } from './signal-display-store';
-import { armSignalDrag, consumeSignalDragClick, useSignalDragActive } from './signal-drag-store';
+import {
+  armSignalDrag,
+  consumeSignalDragClick,
+  useSignalDragActive,
+  SIGNAL_DRAG_THRESHOLD_PX,
+} from './signal-drag-store';
 import {
   describeChannelAuthority,
   makeSignalChannelId,
@@ -34,13 +43,36 @@ import {
 } from '../engine/rv-slot-authority';
 import { CHIP_RADIUS } from './shared-sx';
 import { signalValueColor, signalValueColorForValue } from './signal-colors';
-import { middleTruncate } from './rv-middle-truncate';
+import { omitUndefined } from './rv-omit-undefined';
 
 const REFRESH_MS = 200;
-const SIGNAL_CHIP_NAME_MAX = 24;
+/**
+ * Character cap for signal names in NON-DOM contexts (plan-422 F4).
+ *
+ * The DOM chip no longer uses it. A fixed character count is a guess about
+ * width, and it was guessing against a popover column wide enough for the whole
+ * name — which is how "PLC_ExitConveyorRun" reached the user as
+ * "PLC_ExitCon…". CSS knows the real width; the chip now ellipsises there and
+ * carries the full name in its `title`.
+ *
+ * Kept, and exported, for surfaces where CSS cannot help: anything measured in
+ * characters rather than pixels. The 3D badges are NOT such a surface — they
+ * are icon sprites (`port-marker-texture.ts`) and have never drawn the signal
+ * name at all, so there is no canvas limit here to raise.
+ */
+export const SIGNAL_CHIP_NAME_MAX = 24;
 
 /** Amber used for the "forced" (operator-pinned) state, matching the ISA amber palette. */
 const FORCE_COLOR = '#ffb300';
+
+/**
+ * Touch hold that arms a chip drag (plan-422 F6).
+ *
+ * Matches the `LONG_PRESS_MS` the ConnectPanel signal rows already use for
+ * their touch context menu, so the two long presses a user can perform in the
+ * same panel take the same amount of time to commit.
+ */
+const TOUCH_DRAG_LONG_PRESS_MS = 500;
 
 // ── Signal direction ──────────────────────────────────────────────────
 
@@ -82,30 +114,55 @@ export function signalBadgeLabel(plcType: string): string {
  * so 'full' really shows the complete information at every call site. Without
  * either name, 'full' degrades to "TypeLabel Value" and 'standard' to the value.
  */
-export function buildChipLabel(variant: SignalChipVariant, parts: {
+export function buildChipLabel(variant: SignalChipVariant, parts: ChipLabelInput): string {
+  const { name, tail } = buildChipLabelParts(variant, parts);
+  return name ? `${name}  ${tail}` : tail;
+}
+
+export interface ChipLabelInput {
   displayName?: string;
   /** SignalStore key (dot notation) — name fallback for 'full'/'standard'. */
   signalName?: string;
   plcType?: string;
   direction: SignalDirection;
   valueStr: string;
-}): string {
+}
+
+/**
+ * The same label, split where it is allowed to be cut (plan-422 F4).
+ *
+ * A chip is "name, then reading", and only the first half is expendable. The
+ * old single string could not express that: giving it `text-overflow: ellipsis`
+ * would eat the VALUE — the one part nobody can infer — so the name had to be
+ * pre-cut to 24 characters instead, in a column that was often wide enough for
+ * all of it.
+ *
+ * Splitting moves the decision to where the width actually is. The renderer
+ * lets `name` shrink and ellipsise while `tail` keeps its intrinsic size, so a
+ * long name gives way to the reading rather than the other way round, and the
+ * whole name stays reachable through the chip's `title`.
+ */
+export function buildChipLabelParts(
+  variant: SignalChipVariant,
+  parts: ChipLabelInput,
+): { name?: string; tail: string } {
   const { displayName, signalName, plcType, direction, valueStr } = parts;
   if (variant === 'minimal') {
     const dir = direction === 'output' ? 'O' : direction === 'input' ? 'I' : '';
-    return dir ? `${dir} ${valueStr}` : valueStr;
+    return { tail: dir ? `${dir} ${valueStr}` : valueStr };
   }
-  const rawName = displayName ?? signalName;
-  const name = rawName ? middleTruncate(rawName, SIGNAL_CHIP_NAME_MAX) : undefined;
+  // The name travels WHOLE from here on. Fitting it is a layout question,
+  // answered by CSS ellipsis against the real width.
+  const name = displayName ?? signalName;
   if (variant === 'standard') {
-    return name ? `${name}  ${valueStr}` : valueStr;
+    return name ? { name, tail: valueStr } : { tail: valueStr };
   }
   // 'full'
   const typeLabel = plcType
     ? signalBadgeLabel(plcType)
     : (direction === 'output' ? 'Out' : direction === 'input' ? 'In' : '');
   const core = typeLabel ? `${typeLabel} ${valueStr}` : valueStr;
-  return name ? `${name}  ${core}` : core;
+  return name ? { name, tail: core } : { tail: core };
 }
 
 /** Resolve signal direction and full PLC type from registry or signal store. */
@@ -261,11 +318,39 @@ export function activityLabel(activity: SignalActivity, ageMs?: number): string 
   }
 }
 
-/** Planner slot manually driven by a signal. */
+/**
+ * Planner slot manually driven by a signal — the row shape of
+ * `SignalBindingManager.getLinksForSource()` (structural mirror of its
+ * `SourceLink`, kept local so the tooltip model stays engine-independent).
+ *
+ * `slot` is the identity; `componentType`/`label` are the display pair
+ * (plan-353 F2) and are optional — see {@link signalLinkedSlotLabel}.
+ */
 export interface SignalLinkedSlot {
   path: string;
   slot: string;
   placedId: string;
+  /** rv_extras component key of the owning instance (e.g. `Drive_Simple`). */
+  componentType?: string;
+  /** Human-readable slot name; falls back to the raw `slot`. */
+  label?: string;
+}
+
+/**
+ * Display text for one driven slot (plan-353 F2): `componentType · label`.
+ *
+ * Pure & testable. Two deliberate rules:
+ *  - the LABEL is the label SSOT (`resolved.label`) and falls back to the raw
+ *    slot key — never a second humanisation of the slot name here;
+ *  - a missing `componentType` yields the bare label, NOT a placeholder type.
+ *    "Forward" is honest; "Component · Forward" invents a fact.
+ *
+ * The technical type name is printed verbatim (`Drive_DestinationMotor`), which
+ * is what the rest of the binding UI shows too.
+ */
+export function signalLinkedSlotLabel(link: SignalLinkedSlot): string {
+  const name = link.label ?? link.slot;
+  return link.componentType ? `${link.componentType} · ${name}` : name;
 }
 
 /** Plain-data model the tooltip renders — kept separate so it can be unit-tested. */
@@ -343,32 +428,59 @@ export function resolveInterfaceOrigin(
 export interface InterfaceOriginCandidate {
   id: string;
   type: string;
-  topics?: ReadonlyArray<{ signals?: ReadonlyArray<{ name: string }> }>;
+  /** `topic` carries the MQTT topic name so the origin can report it (plan-353 F3). */
+  topics?: ReadonlyArray<{ topic?: string; signals?: ReadonlyArray<{ name: string }> }>;
   signals?: ReadonlyArray<{ name: string }>;
 }
 
 /**
- * Resolve a signal's originating CONNECT interface (plan-246 F6).
+ * Where a signal comes from: the CONNECT interface, plus the topic that carries
+ * it when the provider is topic-based (plan-353 F3).
+ */
+export interface SignalOrigin {
+  interfaceId: string;
+  /** MQTT topic the signal was found under; absent for flat/heuristic hits. */
+  topic?: string;
+}
+
+/**
+ * Resolve a signal's originating CONNECT interface (plan-246 F6, extended by
+ * plan-353 F3 to carry the topic).
+ *
  * Primary: SIGNAL MEMBERSHIP — the connect-store snapshot knows every
- * interface's signal lists (topic + flat); if the signal name appears there,
- * that interface's id is the origin. Fallback: the source-label heuristic
- * ({@link resolveInterfaceOrigin}) for signals not in the snapshot (e.g.
- * legacy metadata after a gateway restart). Pure & testable.
+ * interface's signal lists (topic-nested + flat); if the signal name appears
+ * there, that interface's id is the origin, and a topic-nested hit reports its
+ * topic as well. Fallback: the source-label heuristic
+ * ({@link resolveInterfaceOrigin}) for signals not in the snapshot (e.g. legacy
+ * metadata after a gateway restart) — that path knows no topic.
+ *
+ * Multiple membership is resolved DETERMINISTICALLY by first find, scanning
+ * interfaces in order and, within an interface, topics before the flat list.
+ * The same signal name genuinely can sit on two interfaces (a mirrored signal);
+ * picking "the first" is arbitrary but STABLE, which is what a tooltip needs —
+ * an origin that flips between renders would be worse than an imperfect one.
+ *
+ * Pure & testable.
  */
 export function resolveInterfaceOriginForSignal(
   signalName: string | undefined,
   source: string | undefined,
   interfaces: ReadonlyArray<InterfaceOriginCandidate>,
-): string | undefined {
+): SignalOrigin | undefined {
   if (signalName) {
     for (const iface of interfaces) {
       for (const topic of iface.topics ?? []) {
-        if (topic.signals?.some((s) => s.name === signalName)) return iface.id;
+        if (topic.signals?.some((s) => s.name === signalName)) {
+          return topic.topic !== undefined
+            ? { interfaceId: iface.id, topic: topic.topic }
+            : { interfaceId: iface.id };
+        }
       }
-      if (iface.signals?.some((s) => s.name === signalName)) return iface.id;
+      if (iface.signals?.some((s) => s.name === signalName)) return { interfaceId: iface.id };
     }
   }
-  return resolveInterfaceOrigin(source, interfaces);
+  const interfaceId = resolveInterfaceOrigin(source, interfaces);
+  return interfaceId !== undefined ? { interfaceId } : undefined;
 }
 
 /**
@@ -439,6 +551,14 @@ interface TooltipBindingRow {
   path: string;
   label: string;
   color: string;
+  /**
+   * Dim right-hand qualifier (plan-353 §3.1): WHICH node this row belongs to.
+   * `label` answers "what" (`Drive_Simple · Forward`) and repeats across rows
+   * when one signal drives the same slot on several placements — without the
+   * node name those rows would be indistinguishable. Optional: blocks whose
+   * label already contains the path (Referenced by) leave it out.
+   */
+  secondary?: string;
 }
 
 /** Shared clickable provenance block used for manual and GLB-name bindings. */
@@ -474,6 +594,14 @@ function TooltipBindingBlock({
           <Typography component="span" sx={{ fontSize: 10, color: row.color }}>
             {row.label}
           </Typography>
+          {row.secondary && (
+            <Typography
+              component="span"
+              sx={{ fontSize: 9, opacity: 0.5, ml: 'auto', pl: 1, flexShrink: 0 }}
+            >
+              {row.secondary}
+            </Typography>
+          )}
         </Box>
       ))}
       {moreRows > 0 && (
@@ -497,14 +625,19 @@ function SignalTooltipContent({ model, viewer, fields }: { model: SignalTooltipM
     ? (model.source ? `${model.address}  ·  ${model.source}` : model.address)
     : (model.source ?? '');
   const driveRows: TooltipBindingRow[] = (model.linkedSlots ?? []).map((link, index) => {
+    // The COLOUR still comes from the registry (it knows a node's components
+    // even when the binding carried no type), but the TEXT is the binding's own
+    // display pair (plan-353 F2) — one label source, no second derivation.
     const componentTypes = viewer?.registry?.getComponentTypes(link.path) ?? [];
-    const componentType = componentTypes.find((type) => type !== 'LayoutObject')
+    const componentType = link.componentType
+      ?? componentTypes.find((type) => type !== 'LayoutObject')
       ?? componentTypes[0]
       ?? 'Component';
     return {
       key: `${link.placedId}\u0000${link.slot}\u0000${index}`,
       path: link.path,
-      label: `${leafNodeName(link.path)} · ${link.slot}`,
+      label: signalLinkedSlotLabel(link),
+      secondary: leafNodeName(link.path),
       color: componentColor(componentType),
     };
   });
@@ -532,6 +665,23 @@ function SignalTooltipContent({ model, viewer, fields }: { model: SignalTooltipM
       >
         {model.name}
       </Typography>
+      {/* Liveness, line 2 — fixed position directly under the name (plan-353 F5).
+          `activityLabel` was computed and carried in the model since plan-234 but
+          never rendered: the tooltip could show a stale value with no hint that
+          it was stale. Ungated for the same reason the interface origin is
+          ungated — it qualifies the VALUE above it, so hiding it would leave a
+          number without its trust level. Deliberately NOT colour-coded: the
+          badge dot already carries the colour signal, and a second palette for
+          the same fact is how the two start disagreeing. */}
+      {model.activityLabel && (
+        <Typography
+          component="div"
+          data-testid="signal-activity-label"
+          sx={{ fontSize: 10, opacity: 0.7 }}
+        >
+          {model.activityLabel}
+        </Typography>
+      )}
       {fields.value && (
         <Typography component="div" sx={{ fontSize: 10, opacity: 0.85 }}>{valueLine}</Typography>
       )}
@@ -553,10 +703,16 @@ function SignalTooltipContent({ model, viewer, fields }: { model: SignalTooltipM
         </Typography>
       )}
       {/* Manual SignalMapping provenance is structural and therefore intentionally
-          independent of the optional decorative `fields.binding` setting. */}
-      <TooltipBindingBlock title="Drives" rows={driveRows} viewer={viewer} />
+          independent of the optional decorative `fields.binding` setting.
+          Title (plan-353 F4): "Drives these slots" says WHAT the rows are —
+          slots this signal writes — and can no longer be read as the reverse
+          direction of the "Referenced by" block right below it. */}
+      <TooltipBindingBlock title={PROVENANCE_DRIVES_TITLE} rows={driveRows} viewer={viewer} />
+      {/* "Referenced by" is the SAME concept as the property inspector's footer
+          (components pointing AT this object), so it deliberately keeps the same
+          word — one term per thing. Both read it from the vocabulary module. */}
       {fields.binding && (
-        <TooltipBindingBlock title="Referenced by" rows={referencedRows} viewer={viewer} />
+        <TooltipBindingBlock title={PROVENANCE_REFERENCED_TITLE} rows={referencedRows} viewer={viewer} />
       )}
       {/* Write-authority note (plan-320): who dominates this slot right now.
           Amber matches the force palette — the note most often concerns forces. */}
@@ -662,17 +818,26 @@ export function SignalBadge({
     : String(shown);
   // Per-usage `variant` prop wins over the global Settings default (F3).
   const effectiveVariant = variant ?? display.chipVariant;
-  const label = buildChipLabel(effectiveVariant, { displayName, signalName, plcType, direction, valueStr });
+  const labelParts = buildChipLabelParts(effectiveVariant, { displayName, signalName, plcType, direction, valueStr });
+  const label = labelParts.name ? `${labelParts.name}  ${labelParts.tail}` : labelParts.tail;
+  /** Names give way; readings do not (plan-422 F4). */
+  const ELIDE_SX = { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } as const;
+  const labelNode = labelParts.name ? (
+    <Box component="span" sx={{ display: 'inline-flex', alignItems: 'baseline', gap: 0.5, minWidth: 0 }}>
+      <Box component="span" sx={ELIDE_SX}>{labelParts.name}</Box>
+      <Box component="span" sx={{ flexShrink: 0 }}>{labelParts.tail}</Box>
+    </Box>
+  ) : labelParts.tail;
   const chipLabel = relationSource ? (
     <Box
       component="span"
       sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.35, minWidth: 0, whiteSpace: 'nowrap' }}
     >
-      <Box component="span">{middleTruncate(relationSource, SIGNAL_CHIP_NAME_MAX)}</Box>
+      <Box component="span" sx={ELIDE_SX}>{relationSource}</Box>
       <ArrowRightAlt data-testid="slot-chain-arrow" sx={{ fontSize: 10, flexShrink: 0 }} />
-      <Box component="span">{label}</Box>
+      <Box component="span" sx={{ minWidth: 0, overflow: 'hidden' }}>{labelNode}</Box>
     </Box>
-  ) : label;
+  ) : labelNode;
 
   // Numeric signals get a value-entry popover; bool signals toggle directly.
   // `plcType` is authoritative; fall back to the displayed value's runtime type.
@@ -705,45 +870,119 @@ export function SignalBadge({
   const metaAddress = meta?.address;
   const metaComment = meta?.comment;
   const metaSource = meta?.source;
-  const onChipPointerDown = useCallback((e: React.PointerEvent<HTMLElement>) => {
-    if (!e.shiftKey || !signalName || e.button !== 0) return;
-    e.preventDefault();
-    e.stopPropagation();
-    // Provenance is resolved ONCE, here (plan-341 §2.8 a): the explicit props
-    // first (the picker and the CONNECT row both know), CONNECT membership by
-    // name as the fallback. A payload without `origin` is refused as
-    // `no-provider`, so this is the one place that must not leave it to chance.
+  /**
+   * The drag payload of this chip.
+   *
+   * Provenance is resolved ONCE, here (plan-341 §2.8 a): the explicit props
+   * first (the picker and the CONNECT row both know), CONNECT membership by
+   * name as the fallback. A payload without `origin` is refused as
+   * `no-provider`, so this is the one place that must not leave it to chance.
+   */
+  const buildDragPayload = useCallback((name: string) => {
     const explicitInterfaceId = dragSource?.interfaceId;
-    const resolvedInterfaceId = explicitInterfaceId
-      ?? (origin === 'internal'
-        ? undefined
-        : resolveInterfaceOriginForSignal(signalName, metaSource, getConnectSnapshot().interfaces));
-    armSignalDrag(
-      {
-        name: signalName,
-        direction,
-        plcType,
-        address: metaAddress,
-        comment: metaComment,
-        source: metaSource,
-        interfaceId: resolvedInterfaceId,
-        // Topic only travels with an EXPLICIT source: membership lookup by name
-        // resolves the interface, not the MQTT topic it sits under.
-        topic: explicitInterfaceId ? dragSource?.topic : undefined,
-        origin: origin ?? (resolvedInterfaceId ? 'connect' : 'internal'),
-      },
-      e.clientX,
-      e.clientY,
-    );
-  }, [signalName, direction, plcType, metaAddress, metaComment, metaSource, origin, dragSource?.interfaceId, dragSource?.topic]);
+    const membership = explicitInterfaceId || origin === 'internal'
+      ? undefined
+      : resolveInterfaceOriginForSignal(name, metaSource, getConnectSnapshot().interfaces);
+    const resolvedInterfaceId = explicitInterfaceId ?? membership?.interfaceId;
+    // omitUndefined: an optional the source does not have must stay ABSENT.
+    // Carried as a present `undefined` it reaches the persisted mapping and
+    // the GLB bake refuses the whole file over it (plan-422 F1).
+    return omitUndefined({
+      name,
+      direction,
+      plcType,
+      address: metaAddress,
+      comment: metaComment,
+      source: metaSource,
+      interfaceId: resolvedInterfaceId,
+      // Topic follows its interface (plan-353 F3): from the explicit source when
+      // there is one, otherwise from the membership hit — which now reports the
+      // MQTT topic it found the signal under instead of dropping it. A dragged
+      // signal therefore keeps its topic even when the drag started from a
+      // surface that only knew the name.
+      topic: explicitInterfaceId ? dragSource?.topic : membership?.topic,
+      origin: origin ?? (resolvedInterfaceId ? 'connect' : 'internal'),
+    });
+  }, [direction, plcType, metaAddress, metaComment, metaSource, origin, dragSource?.interfaceId, dragSource?.topic]);
+
+  /** Pending touch long-press; see {@link onChipPointerDown}. */
+  const longPress = useRef<{ timer: ReturnType<typeof setTimeout>; x: number; y: number } | null>(null);
+  const cancelLongPress = useCallback(() => {
+    if (!longPress.current) return;
+    clearTimeout(longPress.current.timer);
+    longPress.current = null;
+  }, []);
+  useEffect(() => cancelLongPress, [cancelLongPress]);
+
+  /**
+   * One pointerdown, three gestures (plan-422 F6).
+   *
+   * - **Shift + press** — the historical path, byte for byte: the drag arms
+   *   immediately and the trailing click is swallowed whatever happens.
+   * - **Plain press (mouse/pen)** — arms too, but `clickOnRelease` keeps the
+   *   force click intact for a release that never crossed the threshold. The
+   *   event is deliberately NOT `preventDefault`ed here: swallowing it would
+   *   take the click with it, which is the very thing being preserved.
+   * - **Touch** — no Shift, no hover, and a press that becomes a drag competes
+   *   with scrolling. So a LONG press arms it and any movement before the timer
+   *   fires hands the gesture back to the scroller. A tap never arms and
+   *   reaches the chip as an ordinary click.
+   */
+  const onChipPointerDown = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    if (!signalName || e.button !== 0) return;
+
+    if (e.pointerType === 'touch') {
+      cancelLongPress();
+      const { clientX: x, clientY: y } = e;
+      longPress.current = {
+        x, y,
+        timer: setTimeout(() => {
+          longPress.current = null;
+          // A long press is a deliberate drag attempt, not a tap — releasing it
+          // without movement must not force. Hence no `clickOnRelease`.
+          armSignalDrag(buildDragPayload(signalName), x, y);
+        }, TOUCH_DRAG_LONG_PRESS_MS),
+      };
+      return;
+    }
+
+    if (e.shiftKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      armSignalDrag(buildDragPayload(signalName), e.clientX, e.clientY);
+      return;
+    }
+
+    // stopPropagation, but NOT preventDefault: an ancestor that also arms a
+    // drag (the ConnectPanel signal row) would otherwise re-arm over this one
+    // and, in re-arming, suppress the very click being preserved. The click
+    // event itself is separate and still reaches this chip.
+    e.stopPropagation();
+    armSignalDrag(buildDragPayload(signalName), e.clientX, e.clientY, { clickOnRelease: true });
+  }, [signalName, buildDragPayload, cancelLongPress]);
+
+  /** Movement before the long-press timer fires is a scroll, not a drag. */
+  const onChipPointerMove = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    const pending = longPress.current;
+    if (!pending) return;
+    if (Math.hypot(e.clientX - pending.x, e.clientY - pending.y) >= SIGNAL_DRAG_THRESHOLD_PX) {
+      cancelLongPress();
+    }
+  }, [cancelLongPress]);
 
   const chip = (
     <Chip
       label={chipLabel}
       data-testid={relationSource ? 'slot-chain-chip' : undefined}
+      // The whole label in plain text, so an ellipsised name is never a dead
+      // end even without the rich tooltip (plan-422 F4).
+      title={label}
       size="small"
       onClick={fc.enabled ? onChipClick : undefined}
       onPointerDown={signalName ? onChipPointerDown : undefined}
+      onPointerMove={signalName ? onChipPointerMove : undefined}
+      onPointerUp={signalName ? cancelLongPress : undefined}
+      onPointerCancel={signalName ? cancelLongPress : undefined}
       // Release is a SEPARATE action — the ✕ only appears while forced.
       onDelete={fc.forced ? (e) => { e.stopPropagation(); fc.release(); } : undefined}
       deleteIcon={fc.forced ? <Close sx={{ fontSize: 8 }} /> : undefined}
@@ -800,10 +1039,15 @@ export function SignalBadge({
         const ts = store.getLastUpdateTs(signalName);
         actLabel = activityLabel(activity, ts !== undefined ? now - ts : undefined);
       }
-      // Origin: signal membership in the CONNECT snapshot first, source-label fallback.
-      interfaceOrigin = dragSource?.interfaceId
-        ?? resolveInterfaceOriginForSignal(signalName, meta?.source, getConnectSnapshot().interfaces);
-      topic = dragSource?.topic;
+      // Origin: signal membership in the CONNECT snapshot first, source-label
+      // fallback. The membership hit now also carries the MQTT topic (plan-353
+      // F3), so a signal the tooltip resolved BY NAME shows its topic line too
+      // — previously only an explicit drag source could supply one.
+      const resolvedOrigin = resolveInterfaceOriginForSignal(
+        signalName, meta?.source, getConnectSnapshot().interfaces,
+      );
+      interfaceOrigin = dragSource?.interfaceId ?? resolvedOrigin?.interfaceId;
+      topic = dragSource?.topic ?? resolvedOrigin?.topic;
     }
     // Authority note (plan-320): remote-override hint is computed even while
     // the tooltip is closed (cheap flag reads) so the FORCED chip is never

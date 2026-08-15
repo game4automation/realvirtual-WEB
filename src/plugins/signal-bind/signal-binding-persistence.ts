@@ -6,6 +6,7 @@ import type { SignalMapping } from '../layout-planner/rv-layout-store';
 import type { SignalBindTarget } from './signal-bind-target';
 import { persistFieldOp } from '../../core/hmi/scene/scene-field-ops';
 import { noteSignalMappingsWritten } from './first-link-notice';
+import { isDuplicateSignalName } from '../../core/engine/rv-signal-construction';
 
 export interface SignalBindingPersistenceAdapter {
   read(): SignalMapping[];
@@ -33,6 +34,28 @@ function legacyNodeMappings(target: SignalBindTarget): SignalMapping[] {
 }
 
 /**
+ * The name to anchor a node carrier by, or nothing (plan-425 F2, "case A").
+ *
+ * A node mapping is stored against the carrier's PATH, and a path is precisely
+ * what a Unity re-parent rewrites. When the carrier is itself a registered PLC
+ * signal, its NAME survives that move — and since plan-418 a name shared by two
+ * live nodes is fail-closed, so a unique name identifies the carrier at least as
+ * well as the path did.
+ *
+ * Both conditions are required and both are checked HERE rather than at read
+ * time: an anchor is only worth writing if it was true when it was written. A
+ * carrier that is not a signal, or whose name is already ambiguous, gets no
+ * anchor at all and keeps exactly today's behaviour.
+ */
+function carrierSignalNameFor(viewer: RVViewer, nodePath: string): string | undefined {
+  const store = viewer.signalStore;
+  if (!store) return undefined;
+  const name = store.exactNameForPath(nodePath);
+  if (!name || isDuplicateSignalName(store, name)) return undefined;
+  return name;
+}
+
+/**
  * Planner mappings keep their existing store. GLB-node mappings are recorded as
  * SignalLinks/Mappings setField ops; the source GLB is never mutated.
  */
@@ -56,12 +79,14 @@ export function createSignalBindingPersistence(
   }
 
   if (!nodeMappings.has(target.node)) nodeMappings.set(target.node, legacyNodeMappings(target));
+  const carrierName = carrierSignalNameFor(viewer, target.nodePath);
   return {
     read: () => (nodeMappings.get(target.node) ?? []).map((mapping) => ({ ...mapping })),
     write: (mappings) => {
       const prev = (nodeMappings.get(target.node) ?? legacyNodeMappings(target))
         .map((mapping) => ({ ...mapping }));
-      const next = mappings.map((mapping) => ({ ...mapping }));
+      const next = mappings.map((mapping) => (
+        carrierName ? { ...mapping, carrierSignalName: carrierName } : { ...mapping }));
       syncNodeSignalBindingPersistence(target.node, next);
       persistFieldOp(target.nodePath, 'SignalLinks', 'Mappings', next, prev);
       noteSignalMappingsWritten(prev.length, next.length);

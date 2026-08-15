@@ -2,6 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { expect, test, type Page } from 'playwright/test';
+import { DEV_GLB } from '../tests/fixtures/glb-paths.mjs';
 
 const TOGGLE = '[data-testid="signal-link-mode-toggle"]';
 
@@ -328,12 +329,12 @@ test.describe('signal link mode e2e', () => {
   test('model switch and reload leave no stale or duplicate badges', async ({ page }) => {
     await page.locator(TOGGLE).click();
     await expect.poll(() => badgeCount(page)).toBeGreaterThan(0);
-    await page.evaluate(async () => {
+    await page.evaluate(async (modelUrl) => {
       const viewer = (window as unknown as {
         __rvViewer: { loadModel: (url: string) => Promise<unknown> };
       }).__rvViewer;
-      await viewer.loadModel('/models/physics-zone-test.glb');
-    });
+      await viewer.loadModel(modelUrl);
+    }, DEV_GLB.physicsZone);
     expect(await badgeCount(page)).toBe(0);
     await page.reload({ waitUntil: 'domcontentloaded' });
     await waitForViewerReady(page);

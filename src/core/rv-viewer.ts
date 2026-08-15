@@ -146,13 +146,29 @@ import { TankFillManager } from './engine/rv-tank-fill';
 import { PipeFlowManager } from './engine/rv-pipe-flow';
 import { GizmoOverlayManager } from './engine/rv-gizmo-manager';
 import { LampManager } from './engine/rv-lamp-manager';
+import { SceneButtonManager } from './engine/rv-scene-button-manager';
 import { RVCollisionManager } from './engine/rv-collision-manager';
+import {
+  SignalReapplyRegistry,
+  setActiveSignalReapplyRegistry,
+  getActiveSignalReapplyRegistry,
+} from './engine/rv-signal-reapply-registry';
 import { EnergyChainManager } from './engine/rv-energy-chain-manager';
+import { MachiningManager } from './engine/rv-machining-manager';
 import {
   registerOverlayProducer, resetOverlayProducers,
   isOverlayVisible, subscribeOverlayVisibility,
 } from './overlay-visibility-store';
 import { SignalBindingManager } from './engine/rv-signal-binding-manager';
+// plan-386 F17 — load provenance. Re-exported below so existing importers of
+// the viewer keep finding the type where they expect it.
+import { withLoadTrust, TRUSTED_LOAD, type LoadTrustContext } from './rv-load-trust';
+export { TRUSTED_LOAD, type LoadTrustContext } from './rv-load-trust';
+// plan-423 F6 — the PERSISTENT counterpart of the load-time trust context.
+import {
+  LOCAL_PROVENANCE, setModelProvenance, type ModelProvenance,
+} from './rv-model-provenance';
+export { LOCAL_PROVENANCE, type ModelProvenance } from './rv-model-provenance';
 import {
   resetSlotAuthority,
   setAuthorityRanking,
@@ -189,6 +205,7 @@ import type { ContextMenuTarget } from './hmi/context-menu-store';
 import type { SelectionSnapshot } from './engine/rv-selection-manager';
 import { isMobileDevice } from '../hooks/use-mobile-layout';
 import { resetDynamicContexts, setContext } from './hmi/ui-context-store';
+import { isPluginOverrideProtected } from './plugin-overrides/rv-plugin-override-store';
 import { ModeManager, computeModePluginSets, modeContext, pluginParticipatesInMode } from './rv-mode-manager';
 import type { ModeId, ModeHost, ModePluginSets } from './rv-mode-manager';
 import { getAppConfig } from './rv-app-config';
@@ -435,12 +452,31 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   readonly gizmoManager: GizmoOverlayManager;
   /** Viewer-owned registry for Lamp lifecycle and fixed-update flashing. */
   readonly lampManager: LampManager;
+  /** Viewer-owned registry for the 3D scene-button family (plan-417): press /
+   *  turn animation, momentary release timers and the component lifecycle. */
+  readonly sceneButtonManager: SceneButtonManager;
   /** Viewer-owned registry for EnergyChain rigs and their per-frame bone update. */
   readonly energyChainManager: EnergyChainManager;
+  /** Viewer-owned registry for CSG machining volumes and their per-tick cut +
+   *  chunk-mesh apply (plan-405). Survives model loads; `clear()` on every
+   *  model switch destroys the worker-side grids and the chunk geometries,
+   *  `dispose()` terminates the worker. */
+  readonly machiningManager: MachiningManager;
   /** Viewer-owned collision registry + per-tick check (plan-394). Survives model
    *  loads; `clear()` on every model switch drops registry, highlight, signals
    *  and an open modal. */
   readonly collisionManager: RVCollisionManager;
+
+  /**
+   * Viewer-owned registry of wired component input slots (plan-427).
+   *
+   * The SignalStore is edge-driven, a PLC is level-based. After
+   * `resetSimulation()` — which deliberately leaves signals untouched — and
+   * after a (re)connect, `reapplyAll()` drives every registered slot once with
+   * the value CURRENTLY in the store, so a level held `true` across the reset
+   * takes effect again. Survives model loads; `clear()` on every model switch.
+   */
+  readonly signalReapply = new SignalReapplyRegistry();
 
   // --- Planner Signal Linking (gated by RVViewerOptions.plannerSignalLinking) ---
   /** Binding/override engine that links placed Planner elements to live CONNECT
@@ -449,6 +485,17 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   signalBindingManager: SignalBindingManager | null = null;
   /** Cached feature-flag from RVViewerOptions. */
   private readonly _plannerSignalLinking: boolean = false;
+
+  // --- Load trust (plan-386 F17) ---
+  /** Trust context of the load currently in flight. See {@link loadTrust}. */
+  private _loadTrust: LoadTrustContext = TRUSTED_LOAD;
+  /** The slot `withLoadTrust` installs into and restores. */
+  private readonly _trustSlot = {
+    get: (): LoadTrustContext => this._loadTrust,
+    set: (next: LoadTrustContext): void => { this._loadTrust = next; },
+  };
+  /** Provenance of the model ON SCREEN. See {@link modelProvenance}. */
+  private _modelProvenance: ModelProvenance = LOCAL_PROVENANCE;
   /** Write-gate mode applied to every per-model SignalStore (plan-320 Phase 4). */
   private _signalWriteGate: SignalWriteGateMode = 'shadow';
 
@@ -811,7 +858,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       get pipeFlowManager() { return viewer.pipeFlowManager; },
       get gizmoManager() { return viewer.gizmoManager; },
       get lampManager() { return viewer.lampManager; },
+      get sceneButtonManager() { return viewer.sceneButtonManager; },
       get energyChainManager() { return viewer.energyChainManager; },
+      get machiningManager() { return viewer.machiningManager; },
       get collisionManager() { return viewer.collisionManager; },
       markRenderDirty: () => viewer.markRenderDirty(),
       markShadowsDirty: () => viewer.markShadowsDirty(),
@@ -820,6 +869,17 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   private _disabledIds = new Set<string>();
   /** Session-scoped user overrides that mode reconciliation must not undo. */
   private _userDisabledIds = new Set<string>();
+  /**
+   * The persisted INTENT to keep a plugin switched off (plan-435 §2.9),
+   * deliberately independent of the plugin registry.
+   *
+   * `setPluginUserEnabled()` returns immediately for an unknown ID, but plenty
+   * of plugins are only registered while the model loads (`resolvePlugin`), or
+   * even after it (`DebugEndpointPlugin`, `McpBridgePlugin`). Holding the
+   * intent here means it survives "that ID does not exist yet" and is applied
+   * the moment the plugin shows up in {@link use}.
+   */
+  private _persistedUserDisabled = new Set<string>();
   /**
    * IDs of plugins that were disabled when a model loaded and therefore MISSED
    * their `onModelLoaded` call. `enablePlugin()` replays `_lastLoadResult` to
@@ -999,6 +1059,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       this.uiRegistry.register(plugin);
     }
 
+    // A persisted override for a LATE-registered plugin (plan-435 §2.9) is
+    // applied here — BEFORE the retroactive delivery below, so the plugin
+    // never builds anything up just to have it torn down again.
+    if (this._persistedUserDisabled.has(plugin.id) && plugin.core !== true) {
+      this.setPluginUserEnabled(plugin.id, false);
+    }
+
     // Retroactive: if model already loaded, call onModelLoaded immediately (skip
     // disabled and mode-scoped plugins outside their mode — the mode transition
     // replays the missed call via enablePlugin()).
@@ -1053,31 +1120,94 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   }
 
   /**
-   * Apply a session-scoped user override without unloading plugin resources or
-   * UI slots. Mode hooks only run when the plugin participates in an active
-   * workspace; the callback lists are disabled even during the boot null-mode.
+   * Does a plugin take part in the CURRENT workspace mode? Thin wrapper around
+   * `pluginParticipatesInMode` — which already handles the boot null-mode
+   * correctly: `core` and shared (`modes === undefined`) plugins participate,
+   * mode-scoped ones do not (rv-mode-manager.ts). Deliberately NOT guarded by
+   * an extra `activeMode !== null`: that guard is what used to strand a
+   * shared/core plugin in `_disabledIds` forever when it was toggled during
+   * boot, because `computeModePluginSets` never lists shared/core plugins and
+   * therefore never heals them (plan-435 §2.3).
+   */
+  private _shouldParticipate(plugin: RVViewerPlugin): boolean {
+    return pluginParticipatesInMode(plugin, this.modes.activeMode);
+  }
+
+  /**
+   * Apply a user override for a plugin, with a real retroactive teardown
+   * (plan-435). Switching OFF removes what the plugin has already built;
+   * switching ON restores it symmetrically, including its UI slot positions.
+   *
+   * The teardown lives HERE and nowhere else. `disablePlugin()` /
+   * `enablePlugin()` stay untouched on purpose — they are also the mode
+   * system's reconcile path, and anchoring a teardown there would fire it on
+   * every workspace mode switch (plan-435 §2.2).
+   *
+   * OFF: mode-deactivate hook → `onDeactivate` (or, as a fallback, a single
+   * `onModelCleared` when the plugin actually holds the current model) →
+   * disable → unregister UI slots → event.
+   *
+   * ON: re-register UI slots → (only when the plugin participates in the
+   * active mode) enable, which replays a missed `onModelLoaded` by itself →
+   * `onActivate`, or as a fallback a replay of the current model → mode
+   * activate hook → event.
+   *
+   * The plugin instance itself is never disposed and keeps its own state.
    */
   setPluginUserEnabled(id: string, enabled: boolean): void {
     const plugin = this._plugins.find((candidate) => candidate.id === id);
     if (!plugin) return;
+    const hasSlots = plugin.slots !== undefined && plugin.slots.length > 0;
 
     if (!enabled) {
       if (this._userDisabledIds.has(id)) return;
       this._userDisabledIds.add(id);
+      // Keep the persisted intent in step. `core` plugins are never persisted:
+      // a reload must not be able to boot into a crippled viewer.
+      if (plugin.core !== true) this._persistedUserDisabled.add(id);
       const activeMode = this.modes.activeMode;
       if (activeMode !== null && pluginParticipatesInMode(plugin, activeMode)) {
         callPlugin(plugin, 'onModeDeactivate', activeMode, this);
       }
+      // Retroactive teardown. A present `onDeactivate` wins outright; only
+      // without it does the model-cleared fallback run, and only when this
+      // plugin actually received the current model. `_modelLoadedIds` is
+      // cleared ONLY on that fallback branch — see the invariants on
+      // RVViewerPlugin.onDeactivate.
+      if (plugin.onDeactivate) {
+        callPlugin(plugin, 'onDeactivate', this);
+      } else if (this._modelLoadedIds.has(id)) {
+        callPlugin(plugin, 'onModelCleared', this);
+        this._modelLoadedIds.delete(id);
+      }
       this.disablePlugin(id);
+      if (hasSlots) this.uiRegistry.unregister(id);
       this.emit('plugins-changed', { kind: 'user-disabled', id });
       return;
     }
 
     if (!this._userDisabledIds.delete(id)) return;
-    const activeMode = this.modes.activeMode;
-    if (activeMode !== null && pluginParticipatesInMode(plugin, activeMode)) {
+    this._persistedUserDisabled.delete(id);
+    // Slots come back BEFORE the lifecycle so an activate hook already sees
+    // its own UI. `register()` is idempotent and restores the slot position.
+    if (hasSlots) this.uiRegistry.register(plugin);
+    if (this._shouldParticipate(plugin)) {
       this.enablePlugin(id);
-      callPlugin(plugin, 'onModeActivate', activeMode, this);
+      if (plugin.onActivate) {
+        callPlugin(plugin, 'onActivate', this);
+      } else if (
+        this._lastLoadResult
+        && !this._modelLoadedIds.has(id)
+        && this._isPluginEligibleForCurrentModel(plugin)
+      ) {
+        // Fallback restore — but never hand a plugin a model that model's
+        // own `rv_plugins` list excludes.
+        this._deliverModelLoaded(plugin, this._lastLoadResult);
+      }
+      const activeMode = this.modes.activeMode;
+      if (activeMode !== null && pluginParticipatesInMode(plugin, activeMode)) {
+        callPlugin(plugin, 'onModeActivate', activeMode, this);
+      }
     }
     this.emit('plugins-changed', { kind: 'user-enabled', id });
   }
@@ -1087,6 +1217,44 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     for (const id of [...this._userDisabledIds]) {
       this.setPluginUserEnabled(id, true);
     }
+    this._persistedUserDisabled.clear();
+  }
+
+  /**
+   * Apply persisted user overrides (plan-435 §2.9). Call once at boot, after
+   * the last `use()` and BEFORE `loadModel()` — then a switched-off plugin
+   * never receives an `onModelLoaded` it would only have to undo.
+   *
+   * Two safety nets, applied here as well as when saving: `core: true` plugins
+   * and protected IDs are skipped even if the storage claims otherwise, so a
+   * hand-edited or stale record cannot lock the user out of their own viewer.
+   *
+   * IDs that are not registered yet are remembered, not dropped — {@link use}
+   * applies them the moment the plugin appears.
+   */
+  applyPersistedPluginOverrides(ids: Iterable<string>): void {
+    for (const id of ids) {
+      if (isPluginOverrideProtected(id)) continue;
+      const plugin = this._plugins.find((candidate) => candidate.id === id);
+      if (plugin?.core === true) continue;
+      this._persistedUserDisabled.add(id);
+      if (plugin) this.setPluginUserEnabled(id, false);
+    }
+  }
+
+  /**
+   * The IDs to persist: the current user overrides minus everything that must
+   * never survive a reload (`core: true`, protected). Counterpart to
+   * {@link applyPersistedPluginOverrides}.
+   */
+  getPersistedPluginOverrideIds(): string[] {
+    const ids: string[] = [];
+    for (const id of this._userDisabledIds) {
+      if (isPluginOverrideProtected(id)) continue;
+      if (this._plugins.find((candidate) => candidate.id === id)?.core === true) continue;
+      ids.push(id);
+    }
+    return ids;
   }
 
   /** Type-safe plugin lookup by ID. */
@@ -1190,6 +1358,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._invalidatePluginSnapshots();
     this._disabledIds.delete(id);
     this._userDisabledIds.delete(id);
+    // Also drop the PERSISTED intent (plan-435): an explicit unregistration is
+    // a deliberate act, and a re-registered plugin must not silently come back
+    // switched off. Without this, `removePlugin()` + `use()` would resurrect
+    // the override that `_userDisabledIds.delete` above just cleared.
+    this._persistedUserDisabled.delete(id);
     this._missedModelLoad.delete(id);
     this._modelLoadedIds.delete(id);
     this._pluginOrigins.delete(id);
@@ -1472,10 +1645,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     return !!createRuntimeNode({
       registry: this.registry, signalStore: this.signalStore, scene: this.scene,
       transportManager: this.transportManager, gizmoManager: this.gizmoManager,
-      lampManager: this.lampManager, energyChainManager: this.energyChainManager,
+      lampManager: this.lampManager, sceneButtonManager: this.sceneButtonManager,
+      energyChainManager: this.energyChainManager,
+      machiningManager: this.machiningManager,
       collisionManager: this.collisionManager,
       errorStore: this.errorStore,
       instructionStore: this.instructionStore, outlineManager: this.outlineManager,
+      reapply: this.signalReapply,
     }, spec);
   }
 
@@ -1563,7 +1739,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    */
   private _fitGroundToContent(): void {
     if (!this._groundMesh || !this.currentModel) return;
-    const box = new Box3().setFromObject(this.currentModel);
+    // NOT `Box3.setFromObject`: that counts BatchedMesh arenas by their raw
+    // buffer bbox (see _computeContentBounds).
+    const box = this._computeContentBounds(this.currentModel);
     const center = new Vector3();
     let fullExtent: number;
     if (box.isEmpty()) {
@@ -2043,6 +2221,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
 
     // ── Phase 3: START ──────────────────────────────────────────────────────
     this.emit('simulation-start');
+
+    // plan-427: put the PLC's CURRENT signal levels back onto the freshly reset
+    // components. `drive.reset()` above wiped jog flags and speeds back to the
+    // authored defaults, but the store is edge-driven — a level that was
+    // already `true` before the reset would never fire again and the plant
+    // would stay dead. Runs LAST on purpose: behaviors re-assert their own
+    // levels inside the `simulation-start` handlers above, and where the two
+    // overlap the live signal must win ("live signals always override local").
+    this.signalReapply.reapplyAll();
   }
 
   /**
@@ -2202,6 +2389,54 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   }
   // #endregion NodeFilter
 
+  // #region DriveLifecycle
+  // ─── Drive lifecycle primitive (plan-411 Phase 1) ─────────────────────────
+  //
+  // `drives` is the SIM-LOOP tick list (CoreSubsystems.drives iterates it every
+  // fixed step). A drive created at runtime — the asset editor's `addComponent
+  // Drive` — is useless until it is IN this array, and a removed one must leave
+  // it again or it keeps ticking as a ghost (and reappears twice on redo).
+  //
+  // Membership therefore has exactly ONE mutation point for the runtime path:
+  // these two methods. They keep the registry-independent derived state
+  // (`filteredDrives`) consistent and announce the change, so the consumers
+  // that hold their own view of the collection can re-derive it. The BULK model
+  // load stays as it is (`this.drives = result.drives` + `model-loaded`) — it
+  // replaces the whole array once and every consumer already handles that event.
+
+  /** Add a drive to the sim-loop tick list. Idempotent: a drive already in the
+   *  list is not added twice (redo after undo must not duplicate it).
+   *  @returns true when the collection actually changed. */
+  addDrive(drive: RVDrive): boolean {
+    if (this.drives.includes(drive)) return false;
+    this.drives.push(drive);
+    this._onDrivesChanged(drive, null);
+    return true;
+  }
+
+  /** Remove a drive from the sim-loop tick list. No-op when it is not a member.
+   *  @returns true when the collection actually changed. */
+  removeDrive(drive: RVDrive): boolean {
+    const index = this.drives.indexOf(drive);
+    if (index < 0) return false;
+    this.drives.splice(index, 1);
+    if (this.focusedDrive === drive) this.clearFocus();
+    this._onDrivesChanged(null, drive);
+    return true;
+  }
+
+  /** Re-derive the filtered subset and announce the collection change. */
+  private _onDrivesChanged(added: RVDrive | null, removed: RVDrive | null): void {
+    // `filteredDrives` is derived from `drives`; a removed drive must not stay
+    // in it (it would keep a disposed instance alive in the drive chart).
+    if (this._filteredDrives.length > 0) {
+      this._filteredDrives = this._filteredDrives.filter((d) => this.drives.includes(d));
+    }
+    this.emit('drives-changed', { drives: this.drives, added, removed });
+    this.markRenderDirty();
+  }
+  // #endregion DriveLifecycle
+
   /** Drive pinned by a card click (shown in tooltip until cleared). */
   focusedDrive: RVDrive | null = null;
   focusedNode: Object3D | null = null;
@@ -2222,7 +2457,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    *  rv-extras overlay is applied during traversal (no race window).
    */
   /** Typed result returned by the host's progress-aware model loader. */
-  loadModelWithProgress: ((url: string, options?: { overlay?: RVExtrasOverlay }) => Promise<ModelLoadOutcome>) | null = null;
+  loadModelWithProgress: ((url: string, options?: {
+    overlay?: RVExtrasOverlay;
+    /** Stable identity of the model these bytes ARE — see {@link loadModel}. */
+    identityUrl?: string;
+    /** Bytes the caller already holds; `url` is then only their name. */
+    data?: ArrayBuffer;
+  }) => Promise<ModelLoadOutcome>) | null = null;
 
   /**
    * Optional gate promise that must resolve before model loading begins.
@@ -2426,7 +2667,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // automatically participates in raycasting (hover/click resolves to owner node).
     this.gizmoManager = new GizmoOverlayManager(this.scene, () => this.raycastManager);
     this.lampManager = new LampManager();
+    this.sceneButtonManager = new SceneButtonManager();
     this.energyChainManager = new EnergyChainManager();
+    this.machiningManager = new MachiningManager();
     // plan-394: collided bodies get the OutlinePass STATUS outline — the same
     // pulsing severity silhouette the error-message system uses (user decision
     // 2026-08-07), persistent while the pair is latched and independent of the
@@ -2438,6 +2681,22 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
         { ownerKey: 'collision', pulsePeriod: 0.6 }),
       hideCollision: () => hideStatusOutline(this, 'collision'),
     });
+    // plan-409: machining reports which cutter is legitimately inside which
+    // workpiece, so that pair goes quiet while the spindle runs — and only that
+    // pair. Wired here, in the constructor, because both managers live for the
+    // whole viewer; a model change clears the associations, not the wiring.
+    this.machiningManager.setCollisionBridge(this.collisionManager);
+    // plan-427: publish the re-apply registry for the ComponentContext
+    // producers that are called positionally from outside the viewer
+    // (`processExtras` — Layout Planner, asset editor). Same module-slot
+    // rationale as `setKinematicManager`; cleared in dispose().
+    setActiveSignalReapplyRegistry(this.signalReapply);
+    // Second re-apply trigger (the first is `resetSimulation()`): once an
+    // interface has COMMITTED its first incoming snapshot after a (re)connect,
+    // push those levels onto the components. Anchored on the commit and not on
+    // `'connection-state-changed'` — that fires before signal discovery, so a
+    // re-apply there would write pre-disconnect values back onto the plant.
+    this.on('interface-signals-synced', () => { this.signalReapply.reapplyAll(); });
     // Ping pulses render as mesh-glow-hull gizmos (same visual as the
     // CustomRuntimeInstruction highlight).
     this.highlighter.setGizmoManager(this.gizmoManager);
@@ -2654,6 +2913,16 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // fully off. Subscribed AFTER the ModeManager commit ('mode-changed'), so
     // plugin onModeDeactivate hooks still ran with a live runtime.
     this.on('mode-changed', ({ to }) => {
+      // Safety net, NOT the normal path (plan-410 F6): an editor test run is
+      // ended by the editor's async exit guard before the switch is allowed to
+      // proceed. Guard-free switches (boot, lock(), programmatic setMode) skip
+      // that, and a still-attached test owner would make the descriptor
+      // derivation below a no-op. Attach hygiene only — the scene/document
+      // restore belongs to the editor's own deactivate path.
+      if (this.runtime.isEditorTestActive) {
+        console.warn('[RVViewer] mode change with an active editor test run — ending it');
+        this.runtime.endEditorTest();
+      }
       this.runtime._setAttached(this.modes.descriptor(to)?.runtime !== 'detached');
       // A mode switch rebuilds the visuals — re-push the collision status
       // outline so an active collision keeps its emphasis across the switch
@@ -3145,7 +3414,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.ikPaths = result.registry.getAll<RVIKPath>('IKPath').map((record) => record.instance);
     this._kernel = null;
 
-    if (this._plannerSignalLinking && !this.signalBindingManager && this.signalStore && this.registry) {
+    // plan-386 F17: signal binding wires model slots to LIVE external signals.
+    // Foreign content must not get that wiring handed to it automatically.
+    if (this._plannerSignalLinking && this._loadTrust.trusted
+      && !this.signalBindingManager && this.signalStore && this.registry) {
       this.signalBindingManager = new SignalBindingManager(this.signalStore, this.registry);
     }
     if (this.logicEngine) this.logicEngine.start();
@@ -3163,10 +3435,60 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   }
 
   /**
+   * Trust context of the load currently in flight (plan-386 F17).
+   *
+   * Valid from the first line of `loadModel`/`loadScene` up to and including
+   * plugin `onModelLoaded` dispatch, then restored in a `finally` — on the
+   * error path too, so a failed foreign load cannot leave the viewer marked
+   * untrusted for the next, legitimate one (§9.2 `trust_ContextResetAfterFailure`,
+   * `trust_NormalLoadAfterShareIsTrusted`).
+   *
+   * Reads `{ trusted: true }` whenever no load is running, which is what makes
+   * every existing caller and every explicit user action behave exactly as
+   * before.
+   */
+  get loadTrust(): LoadTrustContext {
+    return this._loadTrust;
+  }
+
+  /**
+   * Provenance of the model currently on screen (plan-423 F6).
+   *
+   * Unlike {@link loadTrust}, which is a LOAD-TIME context and reads
+   * `{ trusted: true }` again the moment the load returns, this survives until
+   * the next load. It is what the commissioning trust banner and its revocation
+   * read — and the only thing they may read, because a banner asking about a
+   * load that has already finished cannot use a value that has already been
+   * restored (review finding SOL-R1 F1).
+   *
+   * Lifecycle: `clearModel()` resets it to {@link LOCAL_PROVENANCE} — which
+   * every load runs first, so a FAILED load leaves "no foreign model on screen"
+   * rather than the previous model's record. A successful load adopts
+   * `options.provenance` at the very end, guarded by the load generation so a
+   * superseded load cannot publish over its successor.
+   */
+  get modelProvenance(): ModelProvenance {
+    return this._modelProvenance;
+  }
+
+  /** Publish provenance to the field, the React store and the event bus at once. */
+  private _setModelProvenance(next: ModelProvenance): void {
+    if (this._modelProvenance === next) return;
+    this._modelProvenance = next;
+    setModelProvenance(next);
+    this.emit('model-provenance-changed', { provenance: next });
+  }
+
+  /**
    * Load a GLB model and start all simulation systems.
    *
    * @param url      GLB URL (file, blob:, or empty-glb URL)
    * @param options  Optional load options (e.g. an rv-extras overlay applied during traversal).
+   *
+   * `options.trust` marks the bytes as foreign (plan-386 F17). This thin
+   * wrapper exists only to install and unconditionally restore that context
+   * around the real load — putting the `try`/`finally` here rather than around
+   * the 400-line body keeps the reset impossible to fall out of.
    */
   async loadModel(url: string, options?: {
     overlay?: RVExtrasOverlay;
@@ -3174,6 +3496,39 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     preserveHierarchy?: boolean;
     /** Stable local filename or URL-derived identity for signature unlock persistence. */
     modelName?: string;
+    /** Provenance of these bytes. Defaults to trusted — see {@link LoadTrustContext}. */
+    trust?: LoadTrustContext;
+    /**
+     * Identity + trust state to publish as {@link modelProvenance} once the
+     * load succeeds (plan-423 F6). Defaults to {@link LOCAL_PROVENANCE}.
+     *
+     * A load OPTION rather than a setter the caller pokes before/after: only
+     * the share boot knows the identity, and only the load knows whether it was
+     * superseded. Passing it through means the two facts meet at the one place
+     * that can honour both.
+     */
+    provenance?: ModelProvenance;
+    /**
+     * The URL these bytes are the model OF, when `url` is only where they came
+     * from. A resumed scene body is a `blob:` object URL with a random UUID —
+     * a source of bytes, never an identity. Everything keyed by "which model is
+     * this" (model plugins, camera presets, the model selector, `?option=`)
+     * keys off this instead, or a drafted scene reloads as an unknown model and
+     * loses its whole plugin pack.
+     */
+    identityUrl?: string;
+  }): Promise<LoadResult> {
+    return withLoadTrust(this._trustSlot, options?.trust, () => this._loadModelInner(url, options));
+  }
+
+  private async _loadModelInner(url: string, options?: {
+    overlay?: RVExtrasOverlay;
+    data?: ArrayBuffer;
+    preserveHierarchy?: boolean;
+    modelName?: string;
+    trust?: LoadTrustContext;
+    provenance?: ModelProvenance;
+    identityUrl?: string;
   }): Promise<LoadResult> {
     // Load-generation guard (plan-240 F9) — any BVH build still running for a
     // previous model aborts on its next generation check. The async merge
@@ -3185,8 +3540,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Snapshot AFTER clearModel() — it bumps the generation once more; the
     // snapshot must reflect the generation THIS load runs under.
     const loadGeneration = this._loadGeneration;
-    this._currentModelUrl = url;
-    this._signatureModelName = resolveModelName(options?.modelName ?? url);
+    // `url` is where the bytes come from; `identityUrl` is what they ARE. They
+    // differ exactly when a scene resumes from a stored body — see the option's
+    // docs. Only `loadGLB` below gets the raw `url`.
+    const identity = options?.identityUrl ?? url;
+    this._currentModelUrl = identity;
+    this._signatureModelName = resolveModelName(options?.modelName ?? identity);
 
     // --- Pre-load phase: load model plugins BEFORE GLB so they can register capabilities ---
     // Capabilities must be registered before buildRaycastGeometries() in loadGLB().
@@ -3195,7 +3554,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Gated on appConfig.externalPlugins to avoid two 404s per model load on every other deploy
     // where no such bundle exists. The Vite-bundled ModelPluginManager below is the default path.
     if (getAppConfig().externalPlugins) {
-      const modelBaseName = url.replace(/^.*\//, '').replace(/\.glb$/i, '');
+      const modelBaseName = identity.replace(/^.*\//, '').replace(/\.glb$/i, '');
       const tryPreloadPlugin = async (pluginUrl: string): Promise<void> => {
         try {
           const resp = await fetch(pluginUrl, { method: 'HEAD' });
@@ -3208,7 +3567,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       await tryPreloadPlugin(`./models/${modelBaseName}/model-plugin.js`);
     }
     if (this.modelPluginManager) {
-      await this.modelPluginManager.onModelLoading(url, this);
+      await this.modelPluginManager.onModelLoading(identity, this);
     }
 
     // Wait for any load gate (e.g. login) before heavy GLB parsing
@@ -3219,9 +3578,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       muComputeRenderer: this._muComputeRenderer(),
       gizmoManager: this.gizmoManager,
       lampManager: this.lampManager,
+      sceneButtonManager: this.sceneButtonManager,
       energyChainManager: this.energyChainManager,
+      machiningManager: this.machiningManager,
       collisionManager: this.collisionManager,
       outlineManager: this.outlineManager,
+      reapply: this.signalReapply,
       errorStore: this.errorStore,
       instructionStore: this.instructionStore,
       events: this,
@@ -3294,6 +3656,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // transportManager on the next tick.
     this._kernel = null;
     this.signalStore = result.signalStore;
+    // MachiningVolume reads SignalSpindleOn/SignalReset and writes
+    // SignalMachiningActive through this host (plan-405 §2.5).
+    this.machiningManager.setSignalHost(result.signalStore);
     this.signalStore.signalWriteGate = this._signalWriteGate;
     // plan-394: (re)wire the collision manager to THIS model — its signals and
     // its MU spawn/remove stream. Reporting goes through the live card store;
@@ -3308,9 +3673,14 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Planner Signal Linking: (re)build the binding manager against the fresh
     // signalStore + registry. Gated by the feature flag — null otherwise so no
     // override path, badge, or guard ever runs.
+    // plan-386 F17 — see the sibling guard in _attachLogicSystems. The dispose()
+    // still runs unconditionally: the PREVIOUS model's manager must go away
+    // whatever the new model's provenance is.
     if (this._plannerSignalLinking && this.logicRunState === 'active') {
       this.signalBindingManager?.dispose();
-      this.signalBindingManager = new SignalBindingManager(this.signalStore, this.registry);
+      this.signalBindingManager = this._loadTrust.trusted
+        ? new SignalBindingManager(this.signalStore, this.registry)
+        : null;
     }
     // Collect robot IK paths (replay engine) from the registry for per-frame ticking.
     this.ikPaths = [];
@@ -3582,6 +3952,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     registerOverlayProducer('highlights'); // hover/selection highlight — any model
     if (this.drives.length > 0) registerOverlayProducer('gizmos'); // drive-axis gizmo
     if ((this.transportManager?.sources.length ?? 0) > 0) registerOverlayProducer('markers'); // source markers
+    // plan-423 F6: adopt the load's provenance now that it has actually
+    // arrived. Generation-guarded — a load overtaken by a newer one must not
+    // publish its own origin over the model the user is now looking at.
+    if (this._loadGeneration === loadGeneration) {
+      this._setModelProvenance(options?.provenance ?? LOCAL_PROVENANCE);
+    }
     this.emit('model-loaded', { result });
     this._publishSignatureUiState();
     this.emit('signature-state-changed', {
@@ -3662,6 +4038,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._signatureSignerOrganization = undefined;
     this._deferredLogic.length = 0;
     resetSignatureUiState();
+    // plan-423 F6: nothing foreign is on screen once the model is gone. Doing
+    // it HERE covers the failure path too — every load calls clearModel() first
+    // and only republishes at the end, so a load that throws cannot leave the
+    // previous model's trust record advertised for a scene that is no longer there.
+    this._setModelProvenance(LOCAL_PROVENANCE);
 
     // Plugin lifecycle: clear exactly the plugins that received this model,
     // including plugins disabled since their onModelLoaded delivery.
@@ -3747,11 +4128,23 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // plan-394 F12: drop the collision registry, highlight, signals and any
     // published cards BEFORE the geometry teardown.
     this.collisionManager.clear();
+    // plan-427: drop every re-apply slot BEFORE the components behind them are
+    // torn down, so a later reset/reconnect can never call a setter that closes
+    // over a disposed instance.
+    this.signalReapply.clear();
     // Restore Lamp-owned material clones before the generic material teardown.
     this.lampManager.clear();
+    // Same for the scene-button caps: dispose restores their authored material
+    // and drops the lit/unlit clone pair BEFORE those originals are freed.
+    this.sceneButtonManager.clear();
     // Same for EnergyChain rigs: dispose restores the original meshes and drops
     // the skinned sidecars BEFORE their shared geometry/materials are freed.
     this.energyChainManager.clear();
+    // plan-405: destroy the worker-side SDF grids (frees their WASM linear
+    // memory and unsubscribes every grid-bound listener) and dispose the chunk
+    // geometries — BEFORE the generic geometry teardown below, which would
+    // otherwise walk a subtree whose buffers the worker still writes into.
+    this.machiningManager.clear();
 
     // After material deduplication, multiple meshes share the same material
     // instance. Use a Set to avoid disposing the same material/texture twice
@@ -3865,6 +4258,19 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     return this._currentModelUrl;
   }
 
+  /**
+   * Result of the last successful model load, or null.
+   *
+   * Read-only exposure of what the viewer already keeps for retroactive
+   * `onModelLoaded` delivery. The scene write path needs one thing out of it —
+   * the composition frames, which are the only record of which reference node
+   * owns which grafted subtree, and therefore the only way a bake can route an
+   * override to the right file (plan-397 §2.6).
+   */
+  get lastLoadResult(): LoadResult | null {
+    return this._lastLoadResult;
+  }
+
   /** Override the stored model URL (e.g. to replace blob: URL with original for display). */
   set currentModelUrl(url: string | null) {
     this._currentModelUrl = url;
@@ -3925,7 +4331,19 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    * plugin, which subscribes to `scene-loaded`.
    * The BVH rebuild (after placements) is wired in PR 4.
    */
-  async loadScene(scene: RvScene): Promise<void> {
+  async loadScene(
+    scene: RvScene,
+    trust?: LoadTrustContext,
+    opts?: { identityUrl?: string; data?: ArrayBuffer },
+  ): Promise<void> {
+    return withLoadTrust(this._trustSlot, trust, () => this._loadSceneInner(scene, trust, opts));
+  }
+
+  private async _loadSceneInner(
+    scene: RvScene,
+    trust?: LoadTrustContext,
+    opts?: { identityUrl?: string; data?: ArrayBuffer },
+  ): Promise<void> {
     // Phase 0 — materialise edits (ops → overlay + placements + cameraStart).
     // The op log is the canonical store; existing engine subsystems
     // (rv-scene-loader.loadGLB, planner.applyPlacements, camera-startpos)
@@ -3939,6 +4357,17 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     if (scene.base.kind === 'empty') {
       const emptyGlb = await import('./hmi/scene/empty-glb');
       url = emptyGlb.getEmptyGlbUrl();
+    } else if (scene.base.kind === 'scene-glb') {
+      // Never reached in normal operation, and deliberately loud rather than
+      // guessed. A `scene-glb` base names a scene ID, not a URL: resolving it
+      // means asking the storage layer for bytes, which depends on whether a
+      // project is open. `SceneStore._loadIntoWorkspace` does that and hands
+      // this method a scene whose base is already a resolvable `builtin`.
+      // Inventing a URL here would put the knowledge of where scene bodies
+      // live into the viewer, which is exactly what phase 6 kept out of it.
+      throw new Error(
+        'loadScene received an unresolved scene-glb base — resolve it through SceneStore first.',
+      );
     } else {
       url = scene.base.url;
     }
@@ -3966,10 +4395,32 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     const overlay = Object.keys(materialised.overlay.nodes).length > 0
       ? materialised.overlay
       : undefined;
-    if (this.loadModelWithProgress) {
-      await this.loadModelWithProgress(url, { overlay });
+    // An untrusted scene load bypasses the main.ts progress hull on purpose:
+    // that hull writes LS_KEY_MODEL and calls sceneStore.markGlbActive(), both
+    // of which are exactly the receiver-side side effects F7 forbids.
+    // `opts.identityUrl` is set when SceneStore resolved the body from storage
+    // and `url` above is the resulting blob: — the workspace still knows which
+    // model this is, and that knowledge must not stop here (see loadModel).
+    // `opts.data` is set when SceneStore already holds the bytes and `url` is
+    // only the name of the thing they ARE (plan-709 §2.5) — a self-contained
+    // project asset, whose sentinel `rvproject:` URL is not fetchable and must
+    // not be fetched. Handing the bytes down is what makes the object URL that
+    // used to stand in for them unnecessary.
+    const identityUrl = opts?.identityUrl;
+    const data = opts?.data;
+    if (this.loadModelWithProgress && (trust?.trusted ?? true)) {
+      await this.loadModelWithProgress(url, {
+        overlay,
+        ...(identityUrl ? { identityUrl } : {}),
+        ...(data ? { data } : {}),
+      });
     } else {
-      await this.loadModel(url, { overlay });
+      await this.loadModel(url, {
+        overlay,
+        ...(identityUrl ? { identityUrl } : {}),
+        ...(data ? { data } : {}),
+        ...(trust ? { trust } : {}),
+      });
     }
 
     // Phase 4 — planner placements
@@ -4105,6 +4556,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // store subscription (per-model dispose deliberately keeps it alive).
     this.gizmoManager.destroy();
     this.collisionManager.dispose();
+    // plan-427: release the module slot so a disposed viewer's registry can
+    // never be handed to a later `processExtras` call. clearModel() above
+    // already emptied it.
+    if (getActiveSignalReapplyRegistry() === this.signalReapply) {
+      setActiveSignalReapplyRegistry(null);
+    }
+    // Terminates the machining worker + frees the WASM instance. clearModel()
+    // above already dropped the grids; this is the final teardown.
+    this.machiningManager.dispose();
     // BVH build port lives across model loads (one reused worker) — only the
     // final viewer teardown terminates it.
     this._bvhPort?.dispose();
@@ -4324,11 +4784,19 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    * Bounding box over visible scene content, excluding non-content scenery:
    * the ground fade disc, the reflection mirror, and the planner authoring
    * floor. Cameras and lights are skipped naturally (not meshes).
+   *
+   * `root` narrows the walk to one subtree (the model root, for the ground
+   * fit); it defaults to the whole scene. Everything else — above all the
+   * BatchedMesh rule below — stays in this ONE place, because a second
+   * hand-rolled `Box3.setFromObject` is exactly how the ground disc and the
+   * camera framing drifted apart: on a CAD import whose sources are scaled
+   * 0.001, an arena's raw buffer bbox reads ~1000x too large, which grew the
+   * floor to kilometres and threw the fit camera far outside the machine.
    */
-  private _computeContentBounds(): Box3 {
+  private _computeContentBounds(root?: Object3D): Box3 {
     const box = new Box3();
     const tmp = new Box3();
-    this.scene.traverse((obj) => {
+    (root ?? this.scene).traverse((obj) => {
       const m = obj as Mesh;
       if (!m.isMesh || !m.geometry || !m.visible) return;
       // BatchedMesh arenas: their geometry bbox ignores instance matrices —

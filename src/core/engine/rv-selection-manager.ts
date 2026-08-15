@@ -146,19 +146,58 @@ export class SelectionManager {
 
   // ─── Lifecycle ────────────────────────────────────────────────────
 
-  /** Bind to viewer: Escape key listener, etc. */
+  /** Bind to viewer: Escape and F key listeners.
+   *
+   *  F follows the Blender convention every CAD and DCC user already has in
+   *  their fingers: frame the selection, or the whole scene when nothing is
+   *  selected. Shift+F always frames everything. It is deliberately a global
+   *  binding rather than a toolbar button — the moment you need it is the
+   *  moment the camera is somewhere you cannot navigate back from. */
   init(viewer: ViewerHost): void {
     this._viewer = viewer;
     this._escapeHandler = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      // Don't steal Escape from focused inputs
+      // Don't steal keys from focused inputs
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (this._selected.length > 0) {
-        this.clear();
+      if ((e.target as HTMLElement)?.isContentEditable) return;
+
+      if (e.key === 'Escape') {
+        if (this._selected.length > 0) this.clear();
+        return;
+      }
+
+      if (e.key === 'f' || e.key === 'F') {
+        // Never fight a browser/OS accelerator (Ctrl+F, Cmd+F, Alt+F).
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        this.frameSelectionOrScene(e.shiftKey);
+        e.preventDefault();
       }
     };
     document.addEventListener('keydown', this._escapeHandler);
+  }
+
+  /**
+   * Frame the current selection, falling back to the whole scene.
+   *
+   * `all` (Shift+F) skips the selection entirely. Both paths are no-ops when
+   * the host does not implement the optional focus API.
+   */
+  frameSelectionOrScene(all = false): void {
+    const viewer = this._viewer;
+    if (!viewer) return;
+
+    if (!all && this._selected.length > 0 && viewer.registry && viewer.fitToNodes) {
+      const nodes: import('three').Object3D[] = [];
+      for (const path of this._selected) {
+        const node = viewer.registry.getNode(path);
+        if (node) nodes.push(node);
+      }
+      if (nodes.length > 0) {
+        viewer.fitToNodes(nodes);
+        return;
+      }
+    }
+    viewer.frameSceneContent?.(true);
   }
 
   /** Unbind everything. */

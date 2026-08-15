@@ -83,4 +83,17 @@ export class ProcessingUnitModePlugin implements RVViewerPlugin {
     const persisted = loadProcessingUnitModeEnabled();
     viewer.getPlugin<ProcessIndustryPlugin>('processindustry')?.setProcessingUnitModeEnabled(persisted);
   }
+
+  /** plan-435: the visible effect lives in the FOREIGN `processindustry`
+   *  plugin, so removing our own button is not enough — switch the processing
+   *  unit display off explicitly. The persisted preference is untouched. */
+  onDeactivate(viewer: RVViewer): void {
+    viewer.getPlugin<ProcessIndustryPlugin>('processindustry')?.setProcessingUnitModeEnabled(false);
+  }
+
+  /** Counterpart to {@link onDeactivate}: re-apply the user's stored choice. */
+  onActivate(viewer: RVViewer): void {
+    const persisted = loadProcessingUnitModeEnabled();
+    viewer.getPlugin<ProcessIndustryPlugin>('processindustry')?.setProcessingUnitModeEnabled(persisted);
+  }
 }

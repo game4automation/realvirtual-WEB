@@ -5,7 +5,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
-import { middleTruncate } from '../src/core/hmi/rv-middle-truncate';
 import {
   SignalSlotRow,
   type PickerSignal,
@@ -89,14 +88,15 @@ describe('SignalSlotRow linked-signal cell (User decision 30.07.)', () => {
     );
 
     const chip = assignmentChip();
-    expect(chip.textContent).toContain(middleTruncate(target, 24));
+    // Names travel WHOLE since plan-422 F4 — the chip elides in CSS, not in JS.
+    expect(chip.textContent).toContain(target);
     // The linked signal has left the chip — it must not read as one value.
-    expect(chip.textContent).not.toContain(middleTruncate(linked, 24));
+    expect(chip.textContent).not.toContain(linked);
     expect(screen.queryByTestId('slot-chain-chip')).toBeNull();
     expect(screen.queryByTestId('slot-chain-arrow')).toBeNull();
 
     const linkedCell = screen.getByTestId('slot-linked-Forward');
-    expect(linkedCell.textContent).toContain(middleTruncate(linked, 24));
+    expect(linkedCell.textContent).toContain(linked);
 
     // Reading order: slot name · internal signal · [link] · linked signal.
     const row = screen.getByTestId('slot-row-.-mapped-signal-Forward');
@@ -106,14 +106,15 @@ describe('SignalSlotRow linked-signal cell (User decision 30.07.)', () => {
     expect(within(row).getByTitle('Forward').textContent).toBe('Forward');
   });
 
-  it('keeps long signal suffixes distinguishable with middle truncation', () => {
-    const fuse = middleTruncate('MC00_Transformer_230V_Fuse', 18);
-    const fuse2 = middleTruncate('MC00_Transformer_230V_Fuse_2', 18);
-
-    expect(fuse).toMatch(/….*_Fuse$/);
-    expect(fuse2).toMatch(/….*_Fuse_2$/);
-    expect(fuse).not.toBe(fuse2);
-
+  /**
+   * plan-422 F4 removed the JS truncation from the HMI chip paths: a character
+   * cap guesses at a width CSS already knows, and in a roomy inspector column
+   * it guessed wrong. The PROPERTY that mattered — two names differing only in
+   * their suffix stay distinguishable — is now met the direct way, by showing
+   * both names in full and letting the ellipsis happen in CSS when it must.
+   * (`middleTruncate` itself is unchanged and still covered by its own tests.)
+   */
+  it('keeps long signal suffixes distinguishable', () => {
     render(
       <SignalSlotRow
         row={mappedRow({
@@ -128,10 +129,12 @@ describe('SignalSlotRow linked-signal cell (User decision 30.07.)', () => {
         onUnbind={vi.fn()}
       />,
     );
-    expect(assignmentChip().textContent).toContain('_Fuse');
+    // The assignment shows the base name in full and NOT the "_2" variant…
+    expect(assignmentChip().textContent).toContain('MC00_Transformer_230V_Fuse');
+    expect(assignmentChip().textContent).not.toContain('MC00_Transformer_230V_Fuse_2');
+    // …and the linked cell shows the one that differs only by its suffix.
     const linkedCell = screen.getByTestId('slot-linked-Forward');
-    expect(linkedCell.textContent).toContain('…');
-    expect(linkedCell.textContent).toContain('_Fuse_2');
+    expect(linkedCell.textContent).toContain('MC00_Transformer_230V_Fuse_2');
   });
 
   it('omits the linked cell when the assignment already IS the CONNECT signal', () => {

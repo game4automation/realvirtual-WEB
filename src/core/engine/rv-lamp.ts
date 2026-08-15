@@ -15,6 +15,7 @@ import {
   setComponentInstance,
 } from './rv-component-registry';
 import { parseColorToHex } from './rv-error-visual';
+import { wireValueSignal } from './rv-signal-wiring';
 import type { LampManager } from './rv-lamp-manager';
 
 const DEFAULT_ON_COLOR = 0xff0000;
@@ -38,6 +39,10 @@ export class RVLamp implements RVComponent {
   private _ctx?: ComponentContext;
   private _unsubOn?: () => void;
   private _unsubFlash?: () => void;
+  /** True only while `_rebind()` performs the initial signal reads — it applies
+   *  the combined LampOn/Flashing state itself afterwards, so the per-slot
+   *  writes must stay quiet until then (plan-427 migration). */
+  private _wiring = false;
   private _bound = false;
   private _mesh?: Mesh;
   private _originals?: Material | Material[];
@@ -134,22 +139,21 @@ export class RVLamp implements RVComponent {
     this._onColorHex = parseColorToHex(this._readOnColor(), DEFAULT_ON_COLOR);
     resolveComponentRefs(this as unknown as Record<string, unknown>, ctx.registry);
 
-    if (this.SignalLampOn) {
-      this._unsubOn = ctx.signalStore.subscribeByPath(this.SignalLampOn, (value) => {
-        this.LampOn = Boolean(value);
-        if (!this.Flashing) this._apply(this.LampOn);
-      });
-      const current = ctx.signalStore.getByPath(this.SignalLampOn);
-      if (current !== undefined) this.LampOn = Boolean(current);
-    }
-    if (this.SingalLampFlashing) {
-      this._unsubFlash = ctx.signalStore.subscribeByPath(this.SingalLampFlashing, (value) => {
-        this.Flashing = Boolean(value);
-        this._syncManager();
-      });
-      const current = ctx.signalStore.getByPath(this.SingalLampFlashing);
-      if (current !== undefined) this.Flashing = Boolean(current);
-    }
+    // plan-427: the helpers register a re-apply slot, so a lamp that is lit by a
+    // level held across a reset lights up again. Both setters are idempotent
+    // (`_displayedLit` guard in `_apply`), so a replay costs nothing. The
+    // initial call must NOT drive the optics yet — `_rebind()` applies the
+    // combined state itself at the end — hence the `_wiring` gate below.
+    this._wiring = true;
+    this._unsubOn = wireValueSignal(ctx.signalStore, this.SignalLampOn, (value) => {
+      this.LampOn = Boolean(value);
+      if (!this._wiring && !this.Flashing) this._apply(this.LampOn);
+    }, undefined, ctx.reapply).unsubscribe;
+    this._unsubFlash = wireValueSignal(ctx.signalStore, this.SingalLampFlashing, (value) => {
+      this.Flashing = Boolean(value);
+      if (!this._wiring) this._syncManager();
+    }, undefined, ctx.reapply).unsubscribe;
+    this._wiring = false;
     this._ensureBound();
     this._syncManager();
     const displayed = this.Flashing ? true : this.LampOn;

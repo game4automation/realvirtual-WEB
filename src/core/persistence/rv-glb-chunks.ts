@@ -138,3 +138,35 @@ export function defaultSceneExtras(json: Record<string, unknown>): Record<string
   if (!extras || typeof extras !== 'object' || Array.isArray(extras)) return null;
   return extras as Record<string, unknown>;
 }
+
+/**
+ * The same file-global extras object, created when it does not exist yet.
+ *
+ * {@link defaultSceneExtras} deliberately answers null for a file that has no
+ * usable default scene — a reader must not invent one. A WRITER has the opposite
+ * need: `SceneCamera` and the `Connections` block are file-level data (plan-397
+ * §2.6 categories 3, 6 and 7) and have to land somewhere even in a GLB whose
+ * default scene carries no extras yet. Missing `scenes` / `scene` entries are
+ * filled in with the glTF default (`scene: 0`), never guessed at.
+ */
+export function ensureDefaultSceneExtras(json: Record<string, unknown>): Record<string, unknown> {
+  let sceneIndex = (json.scene as number | undefined) ?? 0;
+  if (!Number.isInteger(sceneIndex) || sceneIndex < 0) sceneIndex = 0;
+
+  let scenes = json.scenes as Record<string, unknown>[] | undefined;
+  if (!Array.isArray(scenes)) {
+    scenes = [];
+    json.scenes = scenes;
+  }
+  while (scenes.length <= sceneIndex) scenes.push({});
+  if (json.scene === undefined && sceneIndex === 0) json.scene = 0;
+
+  const scene = scenes[sceneIndex];
+  const extras = scene.extras;
+  if (!extras || typeof extras !== 'object' || Array.isArray(extras)) {
+    const fresh: Record<string, unknown> = {};
+    scene.extras = fresh;
+    return fresh;
+  }
+  return extras as Record<string, unknown>;
+}

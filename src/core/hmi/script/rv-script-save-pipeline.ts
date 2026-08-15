@@ -28,8 +28,9 @@
 import { lintDesSafety, type DesLintDiagnostic } from '../../sdk/rv-des-lint';
 import { SDK_API_VERSION } from '../../sdk/rv-sdk-dts';
 import {
-  freshOpId, WEB_COMPONENT_CODE_FIELD, WEB_COMPONENT_TYPE, type PrimitiveEditOp,
+  freshOpId, WEB_COMPONENT_CODE_FIELD, WEB_COMPONENT_TYPE,
 } from '../scene/rv-scene-edits';
+import type { RvScenePrimitiveOp } from '../../ops/rv-unified-ops';
 
 // ─── Validation ─────────────────────────────────────────────────────────────
 
@@ -143,7 +144,7 @@ export function validateScriptForSave(
 
 /** Structural SceneStore slice (injectable for tests — PLC persist pattern). */
 export interface ScriptSceneStoreLike {
-  applyOp(op: PrimitiveEditOp): Promise<void>;
+  applyOp(op: RvScenePrimitiveOp): Promise<void>;
 }
 
 export interface ApplyScriptSaveArgs {

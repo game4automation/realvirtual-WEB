@@ -222,9 +222,40 @@ export function collectGltfNodeNames(gltfParser: GltfParserLike | undefined): (s
  * `registerPlaced`).
  */
 export async function parseGlbSubtree(bytes: ArrayBuffer): Promise<Object3D> {
+  return (await parseGlbSubtreeWithMeta(bytes)).root;
+}
+
+/** A parsed subtree together with everything the parser knew about its source file. */
+export interface ParsedGlbSubtree {
+  root: Object3D;
+  /** Nodes Three.js had to rename (genuine `_N` dedup) → their pre-dedup name. */
+  renamedNodes: Map<Object3D, string>;
+  /** node → index in THIS file's `nodes[]`. Meaningless against any other file. */
+  gltfNodeIndices: Map<Object3D, number>;
+  /** THIS file's raw glTF node names, indexed like its `nodes[]`. */
+  gltfNodeNames: (string | undefined)[];
+}
+
+/**
+ * {@link parseGlbSubtree}, but keeping the parser-derived metadata.
+ *
+ * Composition (plan-397 Phase 3) needs all three: the renamed-node map so
+ * referenced subtrees get the same aliases the root file gets, and the index map
+ * plus raw names so the write path can patch a referenced file with ITS OWN
+ * indices and prove — via `expectedNames` — that the bytes it re-fetched are
+ * still the ones those indices describe. One index map for the whole scene was
+ * exactly the bug: after composition the tree holds nodes from several files,
+ * each numbered from zero.
+ *
+ * The parser is dropped when this returns, which is why everything worth having
+ * is extracted here rather than handed out as a live object.
+ */
+export async function parseGlbSubtreeWithMeta(bytes: ArrayBuffer): Promise<ParsedGlbSubtree> {
   // Self-contained GLB (textures + buffers embedded) → empty resource path.
   const gltf = await gltfLoader.parseAsync(bytes, '');
   const parser = (gltf as unknown as { parser?: GltfParserLike }).parser;
-  detectRenamedNodes(parser);
-  return unwrapGltfRoot(gltf.scene as Group);
+  const renamedNodes = detectRenamedNodes(parser);
+  const gltfNodeIndices = collectGltfNodeIndices(parser);
+  const gltfNodeNames = collectGltfNodeNames(parser);
+  return { root: unwrapGltfRoot(gltf.scene as Group), renamedNodes, gltfNodeIndices, gltfNodeNames };
 }

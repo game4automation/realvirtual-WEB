@@ -17,12 +17,26 @@ export class DriveRecorderPlugin implements RVViewerPlugin {
   readonly id = 'drive-recorder';
   readonly recorder = new DriveDataRecorder(3000, 10);
 
+  /** Unsubscribe handle of the `drives-changed` subscription. */
+  private _off: (() => void) | null = null;
+
   onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
     this.recorder.setDrives(viewer.drives);
+    // plan-411 Phase 1: a drive created in the editor must appear in the chart
+    // without a reload, and a removed one must not keep a stale ring buffer.
+    this._off?.();
+    this._off = viewer.on('drives-changed', () => this.recorder.setDrives(viewer.drives));
   }
 
   onModelCleared(): void {
+    this._off?.();
+    this._off = null;
     this.recorder.clear();
+  }
+
+  dispose(): void {
+    this._off?.();
+    this._off = null;
   }
 
   onFixedUpdatePost(dt: number): void {

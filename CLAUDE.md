@@ -174,6 +174,20 @@ private-dependent test files (`tests/private-dependent-tests.json`, maintained b
 community edition (public mirror, no private sibling) must stay green on that view; the full
 dev check is `npm run typecheck` (tsconfig.full.json).
 
+**If you added, renamed or re-described an MCP tool, also run:**
+```bash
+npm run gen:mcp-docs   # regenerate the tool reference; commit the changed .md files
+```
+
+The tool tables in `webviewer.mcp.md` and `src/plugins/mcp-bridge/help/*.md` are generated
+from the `@McpTool` decorators into `<!-- BEGIN GENERATED: … -->` fences and checked in.
+`tests/rv-mcp-docs-drift.test.ts` fails in BOTH directions — a tool change without a
+regeneration run, and a hand-edited block — so `npm test` will tell you if you forget.
+Everything outside the fences is prose: edit it freely, the generator never touches it.
+Adding a tool also means adding its delegate instance to `tests/helpers/mcp-schemas.ts`
+(the ONE list that must mirror `_sendDiscover`) and bumping the count assertion in
+`tests/rv-mcp-tool-conventions.test.ts`.
+
 ## Debug API
 
 When the dev server is running (`npm run dev`), debug endpoints are available:
@@ -208,6 +222,7 @@ Tool ownership is strict: CONNECT owns the `web_*` browser tools, the Unity Pyth
 | `doc-node-paths.md` | **Node paths: how component/signal references are written by the exporter and resolved by NodeRegistry. The three naming layers (Unity / glTF / Three.js after sanitization + file-global dedup), alias mechanics, resolution order, known pitfalls. Read BEFORE changing anything that stores or resolves a path.** |
 | `doc-ui-visibility.md` | **UI visibility: the two independent axes — plugin runtime participation (`modes`/`core` → `pluginParticipatesInMode`) vs. element presentation (`visibilityRule`/`useUIVisible`), the bridge in `UIPluginRegistry.register`, the `shownOnlyInAny` overwrite, deploy overrides. Read BEFORE changing plugin `modes`/`core`, UI slots or anything gated by `useUIVisible`.** |
 | `doc-extending-webviewer.md` | Plugin system, custom components, UI slots, hooks |
+| `doc-path-fleet-control.md` | Path-based vehicles (AGV/FTS): task primitive (destination + service time + callbacks), fleet/dock/router seams for project logic (TS plugin or JS-in-GLB), traffic in both kernels incl. the DES segment-occupancy rule |
 | `doc-multiuser-system.md` | Multiuser sessions, relay server, shared views |
 | `doc-web-debugging.md` | Debugging tools and workflow |
 | `doc-webviewer-interface.md` | Industrial interfaces (WebSocket Realtime, ctrlX, MQTT) — protocol, signal flow, new-interface guide |

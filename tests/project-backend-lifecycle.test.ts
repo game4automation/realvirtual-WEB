@@ -22,6 +22,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { glbWriteFor } from './helpers/scene-write';
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 import { FolderBackend } from '../src/core/project/backends/folder-backend';
 import { BackendNotWritableError } from '../src/core/project/backends/project-backend';
@@ -29,7 +30,8 @@ import {
   clearSceneMutationListeners,
   emitSceneMutation,
 } from '../src/core/hmi/scene/rv-scene-mutations';
-import { sceneRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
+import { sceneGlbRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
+import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
@@ -41,7 +43,7 @@ const scene = (id: string, name: string): RvScene => ({
   name,
   createdAt: '2025-01-01T00:00:00.000Z',
   modifiedAt: '2025-01-01T00:00:00.000Z',
-  schemaVersion: 2,
+  schemaVersion: 3,
   base: { kind: 'empty' },
   edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
 });
@@ -50,8 +52,15 @@ interface Candidate {
   root: FakeDir;
   backend: FolderBackend;
   manifest: RvProject;
-  /** Scene file names present under `scenes/`, sorted. */
-  sceneFiles(): Promise<string[]>;
+  /**
+   * The scene PATHS the writer recorded in this folder's manifest.
+   *
+   * The writer stopped writing bodies in plan-413 phase 6 — the GLB goes
+   * through `backend.writeScene()` before the mutation is even emitted — so
+   * "did this folder receive the mutation?" is answered by its manifest, not by
+   * its `scenes/` directory. Same question, the surface that still answers it.
+   */
+  sceneRows(): string[];
 }
 
 /** Build a backend the way *discovery* does: read-only, no host — plus a host. */
@@ -59,7 +68,7 @@ function candidate(name: string, bodies: Map<string, RvScene>): Candidate {
   const root = new FakeDir(name);
   const c = {
     root,
-    manifest: { schemaVersion: 1, id: `prj_${name}`, name, scenes: [] } as RvProject,
+    manifest: { schemaVersion: 2, id: `prj_${name}`, name, documents: [] } as RvProject,
   } as Candidate;
   c.backend = new FolderBackend(asDirHandle(root), {
     writable: true,
@@ -72,10 +81,7 @@ function candidate(name: string, bodies: Map<string, RvScene>): Candidate {
     },
     debounceMs: DEBOUNCE,
   });
-  c.sceneFiles = async () => {
-    if (!root.has('scenes')) return [];
-    return (await root.getDirectoryHandle('scenes')).childNames();
-  };
+  c.sceneRows = () => sceneDocumentsOf(c.manifest).map(e => e.path.split('/')[1]!).sort();
   return c;
 }
 
@@ -108,9 +114,9 @@ describe('a discovered backend', () => {
   it('throws from every write method while inactive', async () => {
     const c = track(candidate('a', new Map()));
     const s = scene('scn_a', 'A');
-    await expect(c.backend.writeScene(sceneRelPathFor(s), s))
+    await expect(c.backend.writeScene(sceneGlbRelPathFor(s), glbWriteFor(s)))
       .rejects.toBeInstanceOf(BackendNotWritableError);
-    await expect(c.backend.deleteScene(sceneRelPathFor(s)))
+    await expect(c.backend.deleteScene(sceneGlbRelPathFor(s)))
       .rejects.toBeInstanceOf(BackendNotWritableError);
     await expect(c.backend.writeBlob('models/x.glb', new Blob(['x'])))
       .rejects.toBeInstanceOf(BackendNotWritableError);
@@ -127,7 +133,8 @@ describe('a discovered backend', () => {
     const c = track(candidate('a', bodies));
     emitSceneMutation({ type: 'upsert', id: 'scn_a', scene: bodies.get('scn_a')! });
     await c.backend.flush();
-    expect(await c.sceneFiles()).toEqual([]);
+    expect(c.sceneRows()).toEqual([]);
+    expect(c.root.has('project.json')).toBe(false);
   });
 });
 
@@ -161,7 +168,7 @@ describe('activate / deactivate', () => {
     emitSceneMutation({ type: 'upsert', id: 'scn_a', scene: s });
     // No explicit flush — deactivate() is the flush.
     await c.backend.deactivate();
-    expect(await c.sceneFiles()).toEqual([`${sceneRelPathFor(s).split('/')[1]}`]);
+    expect(c.sceneRows()).toEqual([sceneGlbRelPathFor(s).split('/')[1]]);
   });
 
   it('after deactivation the bus is silent again', async () => {
@@ -171,7 +178,7 @@ describe('activate / deactivate', () => {
     await c.backend.deactivate();
     emitSceneMutation({ type: 'upsert', id: 'scn_b', scene: s });
     await c.backend.flush();
-    expect(await c.sceneFiles()).toEqual([]);
+    expect(c.sceneRows()).toEqual([]);
   });
 
   it('refuses a host swap while active — that is how a write lands elsewhere', async () => {
@@ -199,12 +206,12 @@ describe('two discovered folders, one activated', () => {
     await other.backend.flush();
     await third.backend.flush();
 
-    expect(await open.sceneFiles()).toHaveLength(1);
-    expect(await other.sceneFiles()).toEqual([]);
-    expect(await third.sceneFiles()).toEqual([]);
-    // And the manifests of the untouched candidates never grew an entry.
-    expect(other.manifest.scenes).toEqual([]);
-    expect(third.manifest.scenes).toEqual([]);
+    expect(open.sceneRows()).toHaveLength(1);
+    expect(other.sceneRows()).toEqual([]);
+    expect(third.sceneRows()).toEqual([]);
+    // …and nothing reached the untouched folders on disk either.
+    expect(other.root.has('project.json')).toBe(false);
+    expect(third.root.has('project.json')).toBe(false);
   });
 
   it('a switch deactivates the old backend before activating the new', async () => {
@@ -225,8 +232,8 @@ describe('two discovered folders, one activated', () => {
     await second.backend.flush();
     await first.backend.flush();
 
-    expect(await first.sceneFiles()).toEqual([`${sceneRelPathFor(s1).split('/')[1]}`]);
-    expect(await second.sceneFiles()).toEqual([`${sceneRelPathFor(s2).split('/')[1]}`]);
+    expect(first.sceneRows()).toEqual([sceneGlbRelPathFor(s1).split('/')[1]]);
+    expect(second.sceneRows()).toEqual([sceneGlbRelPathFor(s2).split('/')[1]]);
   });
 
   it('activating both is what the store must never do — and it shows why', async () => {
@@ -243,8 +250,8 @@ describe('two discovered folders, one activated', () => {
 
     // Both folders got the write. This is the failure mode `activate()`
     // exists to make impossible, documented here so the rule has a witness.
-    expect(await a.sceneFiles()).toHaveLength(1);
-    expect(await b.sceneFiles()).toHaveLength(1);
+    expect(a.sceneRows()).toHaveLength(1);
+    expect(b.sceneRows()).toHaveLength(1);
   });
 });
 
@@ -255,14 +262,20 @@ describe('RR1 path ownership', () => {
     const mine = scene('scn_mine', 'Cell');
     const yours = scene('scn_yours', 'Cell');
     const c = track(candidate('a', new Map([['scn_mine', mine]])));
-    c.manifest = { ...c.manifest, scenes: [{ id: 'scn_yours', name: 'Cell', path: sceneRelPathFor(yours) }] };
+    c.manifest = {
+      ...c.manifest,
+      documents: [{
+        id: 'scn_yours', name: 'Cell',
+        path: sceneGlbRelPathFor(yours), section: 'scenes',
+      }],
+    };
     await c.backend.activate();
-    await expect(c.backend.writeScene(sceneRelPathFor(yours), mine)).rejects.toThrow(/belongs to scene/);
+    await expect(c.backend.writeScene(sceneGlbRelPathFor(yours), glbWriteFor(mine))).rejects.toThrow(/belongs to scene/);
   });
 
   it('refuses a delete for a path no manifest entry owns', async () => {
     const c = track(candidate('a', new Map()));
     await c.backend.activate();
-    await expect(c.backend.deleteScene('scenes/ghost.scene.json')).rejects.toThrow(/No manifest entry/);
+    await expect(c.backend.deleteScene('scenes/ghost.scene.glb')).rejects.toThrow(/No manifest entry/);
   });
 });

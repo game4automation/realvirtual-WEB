@@ -68,9 +68,11 @@ export class SimControllerPlugin implements RVViewerPlugin {
       component: SimControllerToolbar,
       order: 10,
       visibilityId: 'sim-controller-continuous',
-      // Also hidden in the Editor workspace — it edits raw CAD geometry and has
-      // no simulation to play/pause/reset — and in the Viewer (plan-387), which
-      // is a pure spectator: the kinematics run, but nobody drives them from here.
+      // Also hidden in the Editor workspace — its runtime is detached, so there
+      // is no continuous sim to hold; the AssetEditorPlugin owns this slot there
+      // and puts the in-place test run in it (reusing the segments below once a
+      // run is live) — and in the Viewer (plan-387), which is a pure spectator:
+      // the kinematics run, but nobody drives them from here.
       visibilityRule: {
         hiddenIn: [
           modeContext('des'), modeContext('hmi'),
@@ -107,15 +109,39 @@ export class SimControllerPlugin implements RVViewerPlugin {
     }
   }
 
+  /**
+   * plan-435: without this hook the keyboard shortcuts would keep firing after
+   * the user switched the plugin off, and a held `'user'` pause reason would
+   * freeze the simulation with no way left to release it. Releases exactly
+   * what {@link _installShortcuts} and the pause button own — no model state,
+   * so invariant 3 holds.
+   */
+  onDeactivate(): void {
+    this._removeShortcuts();
+    this._viewer?.setSimulationPaused(SIM_CONTROLLER_PAUSE_REASON, false);
+  }
+
+  /** Re-install the shortcuts torn down by {@link onDeactivate}. */
+  onActivate(viewer: RVViewer): void {
+    this._viewer = viewer;
+    if (this._shortcutsEnabled && !this._keyHandler) {
+      this._installShortcuts();
+    }
+  }
+
   /** Safety net: release `'user'` reason so a forgotten Pause does not leave
    *  the simulation frozen after the plugin tears down. */
   dispose(): void {
-    if (this._keyHandler) {
-      window.removeEventListener('keydown', this._keyHandler, true);
-      this._keyHandler = null;
-    }
+    this._removeShortcuts();
     this._viewer?.setSimulationPaused(SIM_CONTROLLER_PAUSE_REASON, false);
     this._viewer = null;
+  }
+
+  /** Idempotent removal of the global keydown listener. */
+  private _removeShortcuts(): void {
+    if (!this._keyHandler) return;
+    window.removeEventListener('keydown', this._keyHandler, true);
+    this._keyHandler = null;
   }
 
   // ── Keyboard shortcuts ──

@@ -25,7 +25,8 @@
 
 import { getProjectStore } from '../project/project-store';
 import type { ProjectBackend } from '../project/backends/project-backend';
-import type { RvProjectAssetEntry } from '../project/rv-project-types';
+import { documentOfAssetEntry } from '../project/rv-project-documents';
+import type { RvDocumentEntry } from '../project/rv-project-types';
 import type { LibraryCatalogEntry } from './library-types';
 import {
   registerLibrarySourceProvider,
@@ -45,29 +46,84 @@ export interface ProjectStoreLike {
   getProject(): { id: string; name: string } | null;
 }
 
-/** Derive a catalog entry from a manifest `library[]` record. */
-function toCatalogEntry(asset: RvProjectAssetEntry): LibraryCatalogEntry {
-  const path = String(asset.path ?? '');
+/**
+ * Derive a catalog entry from a project DOCUMENT (plan-716 §2.7 / F7).
+ *
+ * It used to take a manifest `library[]` record, and that was the whole limit:
+ * a document in `models/` or `scenes/` could not be placed because the catalog
+ * never listed it. Since plan-716 there is one kind of owned artefact and
+ * `library/` is an ordinary folder, so the feed is `listDocuments()` — every
+ * section — and placeability is decided by the cycle guard at insert time
+ * (`compose()` → `ReferenceCycleError`), not by which folder a file sits in.
+ */
+function toCatalogEntry(doc: RvDocumentEntry): LibraryCatalogEntry {
+  const path = String(doc.path ?? '');
   const filename = path.split('/').pop() ?? path;
-  const stem = filename.replace(/\.(glb|gltf|splat|ksplat|ply)$/i, '');
-  // Collections mirror the local-folder derivation: every parent directory
-  // under `library/` becomes a chip, so a project library and a local folder
-  // library facet identically.
+  const stem = filename.replace(/\.(scene\.)?(glb|gltf|splat|ksplat|ply)$/i, '');
+  // Collections are the UNION of two different things, and keeping them
+  // distinct in the head is what makes the union correct rather than muddled
+  // (plan-717 §2.6):
+  //
+  //  - **Folder chips** — every parent directory, cumulative. A *place*. They
+  //    mirror the local-folder derivation, so a project's documents and a
+  //    local folder library facet identically, and `scenes` / `models` /
+  //    `library` are among them because the folder is the only thing that ever
+  //    separated those.
+  //  - **Row collections** — what the user filed the document under. A
+  //    *filing*, typed in the Collections editor, and until plan-717 written
+  //    into a sidecar nothing read back.
+  //
+  // The row's come first: they are the answer to "why did I put this here",
+  // and the panel renders chips in order.
   const dirSegments = path.split('/').slice(0, -1).filter(Boolean);
   const collections: string[] = [];
-  for (let i = 0; i < dirSegments.length; i++) {
-    collections.push(dirSegments.slice(0, i + 1).join('/'));
+  for (const name of Array.isArray(doc.collections) ? doc.collections : []) {
+    if (typeof name === 'string' && name.trim() !== '') collections.push(name);
   }
+  for (let i = 0; i < dirSegments.length; i++) {
+    const chip = dirSegments.slice(0, i + 1).join('/');
+    if (!collections.includes(chip)) collections.push(chip);
+  }
+  const label = typeof doc.label === 'string' && doc.label.trim() !== '' ? doc.label.trim() : '';
+  // A document minted from a bare folder scan carries the raw stem as its
+  // `name`; anything else was authored and is used verbatim. Prettifying the
+  // former (and only the former) is what keeps `RollConveyor-1m.glb` reading as
+  // "RollConveyor 1m" the way the manifest-less library listing always did.
+  const authored = typeof doc.name === 'string' && doc.name !== '' && doc.name !== stem
+    ? doc.name
+    : '';
   return {
     id: `project:${path}`,
-    name: typeof asset.label === 'string' && asset.label ? asset.label : stem.replace(/[_-]/g, ' '),
+    name: label || authored || stem.replace(/[_-]/g, ' '),
     category: 'custom',
     glbUrl: '',
-    thumbnailUrl: typeof asset.thumbnail === 'string' ? asset.thumbnail : '',
+    thumbnailUrl: typeof doc.thumbnail === 'string' ? doc.thumbnail : '',
     pivotToFloor: true,
     localPath: path,
     collections: collections.length > 0 ? collections : undefined,
+    // The manifest id, when the entry has one — every migrated manifest does,
+    // because the documents migration mints one for each entry that arrives
+    // without. It is the second key this source answers to; see
+    // `LibraryCatalogEntry.documentId`.
+    documentId: typeof doc.id === 'string' && doc.id.trim() !== '' ? doc.id : undefined,
   };
+}
+
+/**
+ * Every document of a project backend — the catalog feed (F7).
+ *
+ * `listDocuments()` is the one list and the only call this needs. The
+ * `listLibrary()` fallback below is not politeness towards old backends: the
+ * test doubles in this repo implement the surface they exercise and nothing
+ * more, and a provider that hard-required the newer method would fail them for
+ * a reason that has nothing to do with what they test. A backend that answers
+ * only the older call still gets its `library/` half, which is exactly what it
+ * had before.
+ */
+async function listProjectDocuments(backend: ProjectBackend): Promise<RvDocumentEntry[]> {
+  if (typeof backend.listDocuments === 'function') return backend.listDocuments();
+  const legacy = await backend.listLibrary();
+  return legacy.map(e => documentOfAssetEntry(e, 'library'));
 }
 
 /**
@@ -125,14 +181,19 @@ class ProjectLibraryProvider implements LibrarySourceProvider {
     let entries: LibraryCatalogEntry[] = [];
     let error: string | null = null;
     try {
-      const assets = await backend.listLibrary();
-      entries = assets.map(toCatalogEntry);
+      entries = (await listProjectDocuments(backend)).map(toCatalogEntry);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
     if (generation !== this._generation) return;   // a newer refresh won
 
-    const byId = new Map(entries.map(e => [e.id, e]));
+    // Two keys per entry: the path-derived catalog id the panel selects with,
+    // and the manifest document id a reference survives a move by (§2.7). The
+    // catalog id is registered last so it wins any freak overlap — it is the
+    // one the UI hands back.
+    const byId = new Map<string, LibraryCatalogEntry>();
+    for (const e of entries) if (e.documentId) byId.set(e.documentId, e);
+    for (const e of entries) byId.set(e.id, e);
     const source: LibrarySource = {
       id: sourceId,
       label: project.name,

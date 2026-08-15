@@ -8,8 +8,12 @@
  * effects are validated separately by integration / manual smoke tests.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { deadSlotExists, seedDeadDraft, seedDeadSceneDraft } from './helpers/dead-draft-slots';
+import { Group } from 'three';
 import { SceneStore } from '../src/core/hmi/scene/scene-store';
+import { readSceneGlbPointer } from '../src/core/storage/rv-scene-glb-store';
+import { clearAllBlobs } from '../src/core/storage/rv-opfs-blobs';
 import {
   type SetFieldOp,
   type AddPlacementOp,
@@ -21,14 +25,22 @@ import {
 import {
   type RvScene,
   type SceneBase,
-  newSceneId,
+  baseKeyOf,
   makeDraftScene,
 } from '../src/core/hmi/scene/rv-scene-types';
-import {
-  writeScene, writeDraft, readDraft,
-  readSceneDraft, writeSceneDraft,
-} from '../src/core/hmi/scene/rv-scene-storage';
+import { writeScene, readScene } from '../src/core/hmi/scene/rv-scene-storage';
 import type { PlacedComponent } from '../src/plugins/layout-planner/rv-layout-store';
+// plan-716 Phase 3: `save()` writes a DOCUMENT FILE, so the three save cases
+// below need a project to write into. Everything else in this file — the op
+// pipeline, undo/redo, transactions, the queue, the history cap, the draft
+// slots — is untouched by the phase and untouched here.
+import { documentsOf } from '../src/core/project/rv-project-documents';
+import { resetProjectStore } from '../src/core/project/project-store';
+import {
+  installFakeDocumentProject,
+  type FakeDocumentProject,
+} from './helpers/fake-document-project';
+import { legacySceneId } from './helpers/legacy-scene-id';
 
 // ─── Fake viewer (matches the surface scene-store + executors touch) ────
 
@@ -40,9 +52,41 @@ interface FakeViewer {
   currentScene: RvScene | null;
   currentModelUrl: string | null;
   pendingModelUrl: string | null;
-  registry: { getNode: (path: string) => unknown; getComponentsAt: (path: string) => Array<[string, unknown]> } | null;
+  registry: {
+    getNode: (path: string) => unknown;
+    getComponentsAt: (path: string) => Array<[string, unknown]>;
+    getGltfNodeNames?: () => readonly (string | undefined)[];
+    getGltfLocation?: (path: string) => { sourceKey: string; index: number } | null;
+    getPathForNode?: (node: unknown) => string | null;
+  } | null;
   markRenderDirty: () => void;
   loadScenes: RvScene[];
+  currentModelRoot: unknown;
+  lastLoadResult: unknown;
+}
+
+/**
+ * The registry surface the phase-6 write path needs.
+ *
+ * Every path resolves to node 0 of the fixture. That is not a shortcut for
+ * "any node will do" — these tests pin WHICH SLOT a body lands in, not how an
+ * overlay is routed (`glb-bake-roundtrip` owns that, against a real loader).
+ * What matters here is that the bake gets a resolvable target and therefore
+ * actually produces bytes, instead of failing on a fake registry and leaving
+ * every slot assertion vacuously empty.
+ *
+ * Empty `getGltfNodeNames()` is equally deliberate: the bake reads it as
+ * "nothing was captured" and skips the identity check, which is precisely the
+ * state a viewer that never really loaded a file is in.
+ */
+function bakeableRegistry(): NonNullable<FakeViewer['registry']> {
+  return {
+    getNode: () => null,
+    getComponentsAt: () => [],
+    getGltfNodeNames: () => [],
+    getGltfLocation: () => ({ sourceKey: '', index: 0 }),
+    getPathForNode: () => null,
+  };
 }
 
 function makeViewer(): FakeViewer {
@@ -56,6 +100,8 @@ function makeViewer(): FakeViewer {
     currentModelUrl: null,
     pendingModelUrl: null,
     registry: null,
+    currentModelRoot: null,
+    lastLoadResult: null,
     markRenderDirty: vi.fn(),
     loadScene: vi.fn(async (s: RvScene) => {
       v.loadScenes.push(s);
@@ -110,15 +156,87 @@ function setCam(preset: SetCameraOp['preset'], prev: SetCameraOp['preset'] = nul
   return { id: freshOpId(), ts, schemaV: 1, kind: 'setCamera', preset, prev };
 }
 
+function setCamera(): SetCameraOp {
+  return setCam({ px: 1, py: 2, pz: 3, tx: 0, ty: 0, tz: 0 });
+}
+
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
 let viewer: FakeViewer;
 let store: SceneStore;
+/**
+ * Installed PER TEST, never globally (plan-716 Phase 3).
+ *
+ * A writable project changes where a GLB BODY goes: `rv-scene-glb-io` routes
+ * every body write through the backend when one is open, and the draft-slot
+ * cases in this file assert on the OPFS pointer. So only the cases that
+ * genuinely need somewhere to save — the ones that call `save()`/`saveAs()`,
+ * which since Phase 3 write a document file — install one.
+ */
+let project: FakeDocumentProject | null = null;
+/** Real GLB bytes the base URL resolves to — the bake needs a parsable source. */
+let demoGlb: ArrayBuffer;
+let realFetch: typeof fetch;
 
-beforeEach(() => {
+const DRAFT_AUTOSAVE_DEBOUNCE_MS = 2000;
+
+/**
+ * Wait for the debounced autosave to land a body in `slot`.
+ *
+ * Polling, not a fixed sleep, and not `vi.runAllTimers()` either: firing the
+ * timer only *starts* the write, which then bakes, hashes and puts into OPFS.
+ * A fixed delay tuned on a warm run is exactly the test that passes locally
+ * and fails in CI on the first, cold invocation.
+ */
+async function waitForBody(slot: string, timeoutMs = 8000): Promise<unknown> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const pointer = readSceneGlbPointer(slot);
+    if (pointer) return pointer;
+    if (Date.now() > deadline) return null;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+/** Let the debounce elapse plus a grace window, for "nothing was written" assertions. */
+async function flushAutosave(): Promise<void> {
+  await new Promise((r) => setTimeout(r, DRAFT_AUTOSAVE_DEBOUNCE_MS + 400));
+}
+
+beforeEach(async () => {
+  // A previous test's store may still hold a pending autosave. Since phase 6
+  // that timer writes a GLB body to a shared slot, so letting it fire into the
+  // next test is not noise — it is another test's data appearing in this one.
+  store?.dispose();
   localStorage.clear();
+  await clearAllBlobs();
+  resetProjectStore();
+  project = null;
   viewer = makeViewer();
+  viewer.registry = bakeableRegistry();
   store = new SceneStore(viewer as unknown as ConstructorParameters<typeof SceneStore>[0]);
+
+  if (!demoGlb) {
+    const { objectToGlb } = await import('../src/core/import/rv-import-object');
+    const group = new Group();
+    group.name = 'Demo';
+    demoGlb = await objectToGlb(group);
+  }
+  realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('.glb')) {
+      return new Response(demoGlb.slice(0), { status: 200 });
+    }
+    return realFetch(input, init);
+  }) as typeof fetch;
+});
+
+afterEach(() => {
+  store?.dispose();
+  project?.restore();
+  resetProjectStore();
+  globalThis.fetch = realFetch;
 });
 
 // ════════════════════════════════════════════════════════════════════════
@@ -139,7 +257,7 @@ describe('baseline dirty', () => {
   });
 
   it('newly opened saved scene is clean', async () => {
-    const seeded = writeScene({ ...makeDraftScene(builtin, 'Cell A'), id: newSceneId() });
+    const seeded = writeScene({ ...makeDraftScene(builtin, 'Cell A'), id: legacySceneId() });
     await store.openScene(seeded.id);
     expect(store.getSnapshot().dirty).toBe(false);
   });
@@ -161,6 +279,7 @@ describe('baseline dirty', () => {
   });
 
   it('save resets baseline → dirty becomes false', async () => {
+    project = installFakeDocumentProject();   // Phase 3: a save needs a document home
     await store.openBuiltin('/models/Demo.glb', 'Demo');
     await store.applyOp(setField(250, 100));
     await store.save();
@@ -169,10 +288,15 @@ describe('baseline dirty', () => {
   });
 
   it('saveAs creates a new id and resets baseline', async () => {
+    project = installFakeDocumentProject();
     await store.openBuiltin('/models/Demo.glb', 'Demo');
     await store.applyOp(setField(250, 100));
     const id = await store.saveAs('Cell A');
-    expect(id).toMatch(/^scn_/);
+    // RE-PINNED (plan-716 Phase 3, §9.0 "portieren"): the new id is a DOCUMENT
+    // id, not `scn_`. The baseline mechanics this case exists for are unchanged
+    // and still asserted below.
+    expect(id).toMatch(/^doc_/);
+    expect(documentsOf(project!.project()).some(d => d.id === id)).toBe(true);
     expect(store.getSnapshot().dirty).toBe(false);
     expect(store.getSnapshot().saved?.id).toBe(id);
   });
@@ -215,7 +339,7 @@ describe('undo / redo', () => {
     const op1 = setField(150, 100);
     const seeded = writeScene({
       ...makeDraftScene(builtin, 'Existing'),
-      id: newSceneId(),
+      id: legacySceneId(),
       edits: { ops: [op1], settings: { catalogUrls: [], gridSizeMm: 500 } },
     });
     await store.openScene(seeded.id);
@@ -353,7 +477,7 @@ describe('discard', () => {
   it('discard reverts to the saved state', async () => {
     const seeded = writeScene({
       ...makeDraftScene(builtin, 'A'),
-      id: newSceneId(),
+      id: legacySceneId(),
     });
     await store.openScene(seeded.id);
     await store.applyOp(setField(250, 100));
@@ -376,20 +500,15 @@ describe('discard', () => {
 // Restored draft semantics — built-in drafts are unsaved by definition
 // ════════════════════════════════════════════════════════════════════════
 
-describe('restored autosaved draft', () => {
-  it('restored built-in draft is dirty + undoable (unsaved relative to base GLB)', async () => {
-    const op = setField(999, 100);
-    writeDraft(builtin, {
-      ...makeDraftScene(builtin, 'Demo'),
-      edits: { ops: [op], settings: { catalogUrls: [], gridSizeMm: 500 } },
-    });
+describe('leftover op-log draft slots', () => {
+  it('a per-base slot is not restored — the workspace opens clean', async () => {
+    seedDeadDraft(builtin);
     await store.openBuiltin('/models/Demo.glb', 'Demo');
-    // The draft has no associated saved scene — its "clean baseline" is the
-    // unmodified built-in GLB (an empty op log). Any restored op makes the
-    // workspace dirty (UI shows "Unsaved") and undoable back to clean.
-    expect(store.getSnapshot().dirty).toBe(true);
-    expect(store.canUndo()).toBe(true);
-    expect(store.getSnapshot().draft?.edits.ops).toHaveLength(1);
+    // Since plan-413 phase 6 there is no reader for that slot. Opening a
+    // built-in is opening the built-in, with nothing layered on top.
+    expect(store.getSnapshot().dirty).toBe(false);
+    expect(store.canUndo()).toBe(false);
+    expect(store.getSnapshot().draft?.edits.ops).toEqual([]);
   });
 });
 
@@ -398,39 +517,28 @@ describe('restored autosaved draft', () => {
 // ════════════════════════════════════════════════════════════════════════
 
 describe('per-saved-scene drafts', () => {
-  it('openScene applies a saved-scene draft on top of the persisted baseline', async () => {
-    // Seed a saved scene with one op as its persisted baseline.
+  it('openScene ignores a leftover scene-draft slot and loads the saved row', async () => {
     const baselineOp = setField(100, 0, 1);
-    const savedId = newSceneId();
+    const savedId = legacySceneId();
     writeScene({
       ...makeDraftScene(builtin, 'My Layout'),
       id: savedId,
       edits: { ops: [baselineOp], settings: { catalogUrls: [], gridSizeMm: 500 } },
     });
-    // Seed a scene-draft with two extra ops (the user's unsaved edits).
-    const extraA = setField(200, 100, 2);
-    const extraB = setField(300, 200, 3);
-    writeSceneDraft(savedId, {
-      ...makeDraftScene(builtin, 'My Layout'),
-      id: savedId,
-      edits: { ops: [baselineOp, extraA, extraB], settings: { catalogUrls: [], gridSizeMm: 500 } },
-    });
+    // A previous release could have parked unsaved ops here. Nothing reads it.
+    seedDeadSceneDraft(savedId);
 
     await store.openScene(savedId);
 
     const snap = store.getSnapshot();
-    // Workspace currently shows draft ops (baseline + 2 extras).
-    expect(snap.draft?.edits.ops).toHaveLength(3);
-    // Baseline floor is the saved scene's single op → user can undo the
-    // 2 extras back to that floor, but not below.
-    expect(snap.dirty).toBe(true);
-    expect(store.canUndo()).toBe(true);
+    expect(snap.draft?.edits.ops).toHaveLength(1);
+    expect(snap.dirty).toBe(false);
     expect(snap.saved?.id).toBe(savedId);
   });
 
   it('openScene with no draft loads cleanly', async () => {
     const baselineOp = setField(100, 0, 1);
-    const savedId = newSceneId();
+    const savedId = legacySceneId();
     writeScene({
       ...makeDraftScene(builtin, 'My Layout'),
       id: savedId,
@@ -443,115 +551,101 @@ describe('per-saved-scene drafts', () => {
     expect(snap.draft?.edits.ops).toHaveLength(1);
   });
 
-  it('writes to scene-draft slot (not base slot) when applying ops to a saved scene', async () => {
-    vi.useFakeTimers();
-    try {
-      const savedId = newSceneId();
-      writeScene({
-        ...makeDraftScene(builtin, 'My Layout'),
-        id: savedId,
-        edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
-      });
-      await store.openScene(savedId);
-      await store.applyOp(setField(250, 100));
-      // Flush the debounced autosave timer.
-      vi.runAllTimers();
-
-      // Scene-draft slot has the new op.
-      const sceneDraft = readSceneDraft(savedId);
-      expect(sceneDraft?.edits.ops).toHaveLength(1);
-      // Base slot is NOT used for saved-scene edits — must remain empty.
-      const baseDraft = readDraft(builtin);
-      expect(baseDraft).toBeNull();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('writes to base slot (not scene-draft) when applying ops to a fresh built-in', async () => {
-    vi.useFakeTimers();
-    try {
-      await store.openBuiltin('/models/Demo.glb', 'Demo');
-      await store.applyOp(setField(250, 100));
-      vi.runAllTimers();
-
-      // Base slot has the op.
-      const baseDraft = readDraft(builtin);
-      expect(baseDraft?.edits.ops).toHaveLength(1);
-      // Scene-draft slot for the (non-existent) saved scene is irrelevant
-      // — assert at least that no orphaned key was written under the
-      // workspace's transient 'draft' id.
-      expect(readSceneDraft('draft')).toBeNull();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('save() clears the scene-draft slot for the persisted id', async () => {
-    vi.useFakeTimers();
-    try {
-      const savedId = newSceneId();
-      writeScene({
-        ...makeDraftScene(builtin, 'My Layout'),
-        id: savedId,
-        edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
-      });
-      await store.openScene(savedId);
-      await store.applyOp(setField(250, 100));
-      vi.runAllTimers();
-      expect(readSceneDraft(savedId)?.edits.ops).toHaveLength(1);
-
-      await store.save();
-      // Post-save the scene-draft must be gone — workspace is back to clean.
-      expect(readSceneDraft(savedId)).toBeNull();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('discard() on a saved scene clears its scene-draft and reloads clean', async () => {
-    vi.useFakeTimers();
-    try {
-      const savedId = newSceneId();
-      writeScene({
-        ...makeDraftScene(builtin, 'My Layout'),
-        id: savedId,
-        edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
-      });
-      await store.openScene(savedId);
-      await store.applyOp(setField(250, 100));
-      vi.runAllTimers();
-      expect(readSceneDraft(savedId)?.edits.ops).toHaveLength(1);
-
-      // Real timers for the discard re-open path (it awaits openScene).
-      vi.useRealTimers();
-      await store.discard();
-
-      expect(readSceneDraft(savedId)).toBeNull();
-      const snap = store.getSnapshot();
-      expect(snap.dirty).toBe(false);
-      expect(store.canUndo()).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('delete(id) clears the scene-draft slot for that id', async () => {
-    const savedId = newSceneId();
+  it('autosaves a saved scene into its own draft BODY, not the base slot', async () => {
+    const savedId = legacySceneId();
     writeScene({
       ...makeDraftScene(builtin, 'My Layout'),
       id: savedId,
       edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
     });
-    writeSceneDraft(savedId, {
+    await store.openScene(savedId);
+    await store.applyOp(setCamera());
+    expect(await waitForBody(`draft/${savedId}`)).not.toBeNull();
+
+    // Since phase 6 the autosave is a GLB body, not an op log.
+    // The base slot is NOT used for saved-scene edits.
+    expect(readSceneGlbPointer(`draft/${baseKeyOf(builtin)}`)).toBeNull();
+    // And the committed body is untouched — an autosave is not a save.
+    expect(readSceneGlbPointer(savedId)).toBeNull();
+  });
+
+  it('autosaves a fresh built-in into the base slot', async () => {
+    await store.openBuiltin('/models/Demo.glb', 'Demo');
+    await store.applyOp(setCamera());
+    expect(await waitForBody(`draft/${baseKeyOf(builtin)}`)).not.toBeNull();
+
+    // No orphaned body under the workspace's transient 'draft' id.
+    expect(readSceneGlbPointer('draft/draft')).toBeNull();
+  });
+
+  it('save() writes the document and drops the draft body', async () => {
+    // PORTED (plan-716 Phase 3, §9.0). The MECHANICS this case guards are
+    // unchanged and all four are still asserted: an edit autosaves into the
+    // per-workspace draft slot, a save clears that slot, the undo floor moves to
+    // the saved state, and the snapshot goes clean.
+    //
+    // What is re-pinned is the DESTINATION. There is no committed body slot and
+    // no catalogue row any more — `_save()`'s row path is deleted — so
+    // "the committed body now exists" becomes "the document file now exists".
+    const savedId = legacySceneId();
+    writeScene({
       ...makeDraftScene(builtin, 'My Layout'),
       id: savedId,
-      edits: { ops: [setField(99, 0)], settings: { catalogUrls: [], gridSizeMm: 500 } },
+      edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
     });
-    expect(readSceneDraft(savedId)).not.toBeNull();
+    await store.openScene(savedId);
+    await store.applyOp(setCamera());
+    expect(await waitForBody(`draft/${savedId}`)).not.toBeNull();
+
+    project = installFakeDocumentProject();
+    await store.save();
+
+    // The document file exists and the draft slot is gone.
+    const created = documentsOf(project.project())[0];
+    expect(created).toBeDefined();
+    expect(project.files.has(created.path)).toBe(true);
+    expect(readSceneGlbPointer(`draft/${savedId}`)).toBeNull();
+    // No committed body slot was ever written — the FILE is the persistence.
+    expect(readSceneGlbPointer(savedId)).toBeNull();
+    // The saved state is the undo floor, exactly as before phase 6 — the op
+    // log stays in memory (§2.10), but the baseline moves with the save.
+    expect(store.canUndo()).toBe(false);
+    expect(store.getSnapshot().dirty).toBe(false);
+  });
+
+  it('discard() on a saved scene drops its draft body and reloads clean', async () => {
+    const savedId = legacySceneId();
+    writeScene({
+      ...makeDraftScene(builtin, 'My Layout'),
+      id: savedId,
+      edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
+    });
+    await store.openScene(savedId);
+    await store.applyOp(setCamera());
+    expect(await waitForBody(`draft/${savedId}`)).not.toBeNull();
+
+    await store.discard();
+
+    expect(readSceneGlbPointer(`draft/${savedId}`)).toBeNull();
+    const snap = store.getSnapshot();
+    expect(snap.dirty).toBe(false);
+    expect(store.canUndo()).toBe(false);
+  });
+
+  it('delete(id) clears the scene-draft slot for that id', async () => {
+    // A DOCUMENT since plan-716 Phase 6 — `delete` refuses an id that names no
+    // manifest row. The property under test is unchanged and still worth
+    // pinning: whatever else deleting does, it takes the dead per-saved-scene
+    // slot of an earlier release with it, or a stale key outlives the thing it
+    // belonged to forever.
+    project = installFakeDocumentProject();
+    const savedId = await store.createEmpty('My Layout');
+    const key = seedDeadSceneDraft(savedId);
+    expect(deadSlotExists(key)).toBe(true);
 
     await store.delete(savedId);
-    expect(readSceneDraft(savedId)).toBeNull();
+    expect(deadSlotExists(key)).toBe(false);
+    expect(documentsOf(project.project())).toEqual([]);
   });
 });
 

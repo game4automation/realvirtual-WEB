@@ -12,7 +12,7 @@ import { Scene, Group, Object3D, Vector3, Quaternion, Euler } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
-import { groupIntoEmpty } from '../src/plugins/asset-editor/kinematics/create-actions';
+import { groupIntoEmpty } from '@rv-private/plugins/asset-editor/kinematics/create-actions';
 
 function makeMockViewer(rootName = 'Asset') {
   const scene = new Scene();

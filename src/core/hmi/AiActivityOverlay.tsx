@@ -29,7 +29,7 @@ export function AiActivityOverlay() {
 
   // Accent-colored pill beside the AI icon (accent = bridge active / AI working).
   // Uses the theme accent so custom branding recolors it too — matching the
-  // activity-bar AI button, which already turns `primary` while AI is working.
+  // activity-bar AI button, which carries the same accent while connected.
   const accent = theme.palette.primary.main;
 
   return (

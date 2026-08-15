@@ -86,6 +86,36 @@ describe('NodeRegistry.resolve — generic node references', () => {
     expect(signal.node).toBeUndefined();
   });
 
+  // plan-405 live finding F2: Unity writes componentType NAMESPACED
+  // (`realvirtual.MachiningTool`), the registry keys components by their bare name.
+  // The pass-through itself always worked — `resolveComponentRefs()` keeps the raw
+  // path — but every load logged "Unknown componentType" for a type that plainly
+  // existed in the scene.
+  it('recognises a NAMESPACED componentType of a registered component', () => {
+    const tool = { marker: true };
+    registry.register('MachiningTool', 'Root/Slide', tool);
+
+    const res = registry.resolve(ref('Root/Slide', 'realvirtual.MachiningTool'));
+    // plan-411 §2.2 turned the silent pass-through into a real resolution: a
+    // registered type at a resolvable path now comes back as the INSTANCE. The
+    // raw-path pass-through survives for a MISS, which is the case the late
+    // resolvers (MachiningVolume.Tools, DES refs) actually depend on — see
+    // node-registry-generic-resolve.test.ts.
+    expect(res.component).toBe(tool);
+    expect(warn).not.toHaveBeenCalled();
+
+    // The bare spelling behaves identically — stripping is the only difference.
+    registry.resolve(ref('Root/Slide', 'MachiningTool'));
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('still flags a namespaced componentType nothing in the scene carries', () => {
+    registry.resolve(ref('Root/Slide', 'realvirtual.SomeFutureComponent'));
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('Unknown componentType: "realvirtual.SomeFutureComponent"'),
+    );
+  });
+
   it('returns nothing at all for a ref without a path', () => {
     expect(registry.resolve(ref('', 'UnityEngine.Transform'))).toEqual({});
     expect(registry.resolve(null)).toEqual({});

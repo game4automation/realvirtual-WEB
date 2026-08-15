@@ -23,21 +23,51 @@
  * and the section grids must agree on it, and it must survive a view switch.
  */
 
-/** Which rail group the grid is showing (§3.2). */
+/**
+ * Which rail group the dashboard was aimed at (§3.2).
+ *
+ * `scenes` and `models` are **legacy kinds** since plan-413 phase 4: the two
+ * lists they named are one document list now. They are kept in the union rather
+ * than deleted because a group value outlives the render that set it — a deep
+ * link, a reopened dashboard, a caller in another plugin — and a kind that no
+ * longer parses would be a crash where a fold-back is the honest answer.
+ *
+ * Since plan-703 Phase 6 the group no longer selects a *tab*: the project screen
+ * is one tree, and the catalogs are roots of it rather than a second panel. What
+ * the group still decides is the one thing it always decided first — whether an
+ * open lands on the project list or inside the open project.
+ */
 export type ProjectsRailGroup =
   | { kind: 'projects' }
   | { kind: 'all' }
+  | { kind: 'documents' }
   | { kind: 'scenes' }
   | { kind: 'models' }
   | { kind: 'library'; sourceId?: string }
   | { kind: 'globalLibraries'; sourceId?: string };
 
-/** What the detail pane is describing (§3.6). */
+/**
+ * What the detail pane is describing (§3.6).
+ *
+ * The `folder` and `file` variants are plan-703 Phase 6: with a tree instead of
+ * a grid, a click can land on something that is not a document at all. Neither
+ * is folded into `model` — they have no document id, nothing opens them, and
+ * the verbs the pane offers for them are a different set. Their identity is the
+ * pair `(rootId, relPath)`, which is what the tree addresses every node by;
+ * `relPath` is empty for a root, so a root is a `folder` selection and needs no
+ * variant of its own.
+ *
+ * They are two variants rather than one with a flag because they answer to
+ * different verbs: a folder can be renamed and dropped into, a `file` is an
+ * attachment whose move rewrites `docs-index.json` (§2.6.5).
+ */
 export type ProjectsSelection =
   | { kind: 'none' }
   | { kind: 'project'; projectId: string }
   | { kind: 'scene'; sceneId: string }
   | { kind: 'model'; modelId: string }
+  | { kind: 'folder'; rootId: string; relPath: string }
+  | { kind: 'file'; rootId: string; relPath: string }
   | { kind: 'asset'; providerId: string; sourceId: string; assetId: string };
 
 /**
@@ -55,8 +85,17 @@ export interface ProjectsDashboardSnapshot {
   group: ProjectsRailGroup;
   selection: ProjectsSelection;
   search: string;
-  /** Selected filter chip in the grid, or null for "All". */
+  /**
+   * Selected classification chip of the document view, or null for "All"
+   * (plan-413 §3.1).
+   *
+   * Typed `string | null` rather than the chip union so an unknown value —
+   * a stale deep link, a future level — is a filter that matches nothing
+   * rather than a type error at the store boundary. The view resolves it.
+   */
   chip: string | null;
+  /** Selected tag of the document view, or null for "any tag". */
+  tag: string | null;
 }
 
 const NONE: ProjectsSelection = { kind: 'none' };
@@ -70,6 +109,7 @@ let _snapshot: ProjectsDashboardSnapshot = {
   selection: NONE,
   search: '',
   chip: null,
+  tag: null,
 };
 
 const _listeners = new Set<() => void>();
@@ -102,19 +142,38 @@ export function getProjectsDashboardSnapshot(): ProjectsDashboardSnapshot {
  *
  * A group other than `projects` is a deep link into project *contents* (the
  * planner's "browse global libraries", for instance), so it lands on the
- * project screen rather than the list. Without a group the list is the entry
- * point — the host still falls back to it if no project is actually open.
+ * project screen rather than the list. Without a group the dashboard simply
+ * resumes: {@link closeProjectsDashboard} keeps the whole state, so a plain
+ * open shows exactly what the user left — screen, selection, filters. Only
+ * the very FIRST plain open aims at the project screen, because there is
+ * nothing to resume yet and whoever is working inside a project should not
+ * re-enter it through the selection list. The host still falls back to the
+ * list when no project is actually open.
  */
+let _everOpened = false;
+
 export function openProjectsDashboard(group?: ProjectsRailGroup): void {
+  const first = !_everOpened;
+  _everOpened = true;
   publish({
     open: true,
-    ...(group ? { group, view: group.kind === 'projects' ? 'projects' : 'project' } : {}),
+    ...(group
+      ? { view: group.kind === 'projects' ? 'projects' : 'project', group }
+      : first ? { view: 'project' } : {}),
   });
 }
 
-/** Close and reset the transient view state, but keep the rail group. */
+/**
+ * Close, keeping everything else.
+ *
+ * The dashboard is a place the user returns to, and it used to forget itself
+ * on the way out — selection, screen, search, filters all reset. Reopening
+ * now resumes exactly where the user left; the resets stay with the actions
+ * that change what the state refers to ({@link setProjectsView},
+ * {@link setProjectsRailGroup}).
+ */
 export function closeProjectsDashboard(): void {
-  publish({ open: false, view: DEFAULT_VIEW, selection: NONE, search: '', chip: null });
+  publish({ open: false });
 }
 
 /**
@@ -125,7 +184,7 @@ export function closeProjectsDashboard(): void {
  * across would silently hide most of wherever the user just landed.
  */
 export function setProjectsView(view: ProjectsView): void {
-  publish({ view, selection: NONE, search: '', chip: null });
+  publish({ view, selection: NONE, search: '', chip: null, tag: null });
 }
 
 export function toggleProjectsDashboard(): void {
@@ -135,40 +194,7 @@ export function toggleProjectsDashboard(): void {
 
 /** Switching group clears the selection — it almost never survives the switch. */
 export function setProjectsRailGroup(group: ProjectsRailGroup): void {
-  publish({ group, selection: NONE, chip: null });
-}
-
-/**
- * The three tabs of the project screen.
- *
- * Deliberately derived from {@link ProjectsRailGroup} rather than stored beside
- * it. The group already carries exactly this information, already survives a
- * close, and is already what `openProjectsDashboard({kind:'globalLibraries'})`
- * sets — a second field would be a copy that can disagree with it, and the
- * planner's deep link would have to remember to set both.
- */
-export type ProjectTab = 'models' | 'scenes' | 'assets';
-
-/**
- * Which tab a group means. Both library kinds collapse onto Assets, because
- * the Assets tab shows project and global libraries together; `all` and
- * `projects` carry no tab of their own and land on Models, the tab a project
- * is most useful opening on.
- */
-export function projectTabOf(group: ProjectsRailGroup): ProjectTab {
-  switch (group.kind) {
-    case 'scenes': return 'scenes';
-    case 'library':
-    case 'globalLibraries': return 'assets';
-    default: return 'models';
-  }
-}
-
-/** Select a tab. Clears the selection, exactly as a group switch always has. */
-export function setProjectsTab(tab: ProjectTab): void {
-  setProjectsRailGroup(
-    tab === 'assets' ? { kind: 'library' } : { kind: tab },
-  );
+  publish({ group, selection: NONE, chip: null, tag: null });
 }
 
 export function setProjectsSelection(selection: ProjectsSelection): void {
@@ -183,10 +209,17 @@ export function setProjectsChip(chip: string | null): void {
   publish({ chip });
 }
 
+/** Select a tag to narrow the document view by, or null to stop narrowing. */
+export function setProjectsTag(tag: string | null): void {
+  publish({ tag });
+}
+
 /** Test seam: restore the module to its initial state. */
 export function resetProjectsDashboardForTests(): void {
   _snapshot = {
-    open: false, view: DEFAULT_VIEW, group: DEFAULT_GROUP, selection: NONE, search: '', chip: null,
+    open: false, view: DEFAULT_VIEW, group: DEFAULT_GROUP, selection: NONE,
+    search: '', chip: null, tag: null,
   };
+  _everOpened = false;
   _listeners.clear();
 }

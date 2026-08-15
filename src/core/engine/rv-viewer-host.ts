@@ -41,4 +41,10 @@ export interface ViewerHost {
   // Subsystem-Zugriff (Subsets)
   readonly registry: ViewerHostRegistry | null;
   readonly highlighter: ViewerHostHighlighter;
+
+  /** Frame these nodes (F key). Optional: test hosts and the embed viewer
+   *  may not provide it, and the shortcut simply does nothing then. */
+  fitToNodes?(nodes: Object3D[]): void;
+  /** Frame the whole scene (Shift+F, and F with an empty selection). */
+  frameSceneContent?(animate?: boolean): void;
 }

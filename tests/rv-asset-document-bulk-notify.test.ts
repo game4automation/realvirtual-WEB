@@ -20,21 +20,20 @@ import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
+import {
+  __clearDraftStoresForTests,
+  loadDocumentDraft,
+} from '../src/core/ops/rv-document-drafts';
 
 // The autosave assertion needs a call counter, and an ESM namespace cannot be
 // spied on in browser mode ("Module namespace is not configurable") — so the
 // module is replaced outright, keeping the rest of its exports real.
-const autosave = { calls: 0 };
-vi.mock('../src/core/editor/rv-asset-draft-storage', async (importOriginal) => {
-  const actual = await importOriginal<
-    typeof import('../src/core/editor/rv-asset-draft-storage')
-  >();
-  return {
-    ...actual,
-    saveAssetDraft: async () => { autosave.calls++; },
-    clearAssetDraft: async () => {},
-  };
-});
+// Observed through STORAGE rather than through a call counter: since plan-710
+// Phase 2 the writer is `RvDraftAutosave`, which calls `saveDocumentDraft` as a
+// module-local binding — a `vi.mock` of that export would never be consulted and
+// the counter would silently read zero forever. The slot itself cannot lie.
+const readDraft = async (doc: AssetDocument) =>
+  loadDocumentDraft(doc.draftFrame);
 
 interface StoreState { busy: boolean; dirty: boolean; canUndo: boolean }
 
@@ -87,8 +86,8 @@ function distinct(seq: StoreState[]): StoreState[] {
 }
 
 describe('bulk edit notifications', () => {
-  beforeEach(() => {
-    autosave.calls = 0;
+  beforeEach(async () => {
+    await __clearDraftStoresForTests();
     vi.useFakeTimers();
   });
 
@@ -124,11 +123,14 @@ describe('bulk edit notifications', () => {
       { busy: false, dirty: true, canUndo: true },   // queue drained
     ]);
 
-    // Draft autosave is debounced (DRAFT_AUTOSAVE_MS = 2000) — a bulk edit must
-    // write the draft ONCE, not once per op.
-    expect(autosave.calls).toBe(0);
+    // Draft autosave is debounced (2000 ms) — a bulk edit must reach storage
+    // ONCE, at the end, and carry the ONE composite rather than 100 records.
+    expect(await readDraft(doc)).toBeNull();
     await vi.advanceTimersByTimeAsync(2000);
-    expect(autosave.calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(0);
+    const written = await readDraft(doc);
+    expect(written).not.toBeNull();
+    expect(written!.ops).toHaveLength(1);
     doc.dispose();
   });
 

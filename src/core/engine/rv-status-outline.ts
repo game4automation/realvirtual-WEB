@@ -26,6 +26,7 @@
 import { Mesh, MeshBasicMaterial, Group } from 'three';
 import type { Object3D, Scene } from 'three';
 import type { OutlineStyle, RVOutlineManager } from './rv-outline-manager';
+import { ATTENTION_OUTLINE_GEOMETRY } from './rv-outline-manager';
 import { NO_AO_LAYER } from './rv-constants';
 
 // ─── Host surface ────────────────────────────────────────────────────────
@@ -122,15 +123,15 @@ export function darkenColor(color: number, factor: number): number {
   return (r << 16) | (g << 8) | b;
 }
 
-/** The standard alarm-outline style (identical parameters to the Toray
- *  severity pulse). `pulsePeriod` in seconds; 0 = static outline. */
+/** The standard alarm-outline style: the crisp selection-outline geometry
+ *  (ATTENTION_OUTLINE_GEOMETRY) in the status color, distinguished from a
+ *  selection by color and pulse alone. `pulsePeriod` in seconds; 0 = static
+ *  outline. */
 export function makeStatusOutlineStyle(color: number, pulsePeriod: number): OutlineStyle {
   return {
     visibleEdgeColor: color,
     hiddenEdgeColor: darkenColor(color, 0.55),
-    edgeStrength: 20,
-    edgeThickness: 10,
-    edgeGlow: 1.5,
+    ...ATTENTION_OUTLINE_GEOMETRY,
     pulsePeriod,
   };
 }

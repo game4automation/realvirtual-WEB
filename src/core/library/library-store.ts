@@ -26,23 +26,9 @@
  */
 
 import {
-  isSupported as isFsApiSupported,
-  selectWorkFolder,
-  getWorkFolder,
-  getWorkFolderMeta,
-  removeWorkFolder,
-  getSubfolder,
-  listFiles,
-  readFileAsUrl,
-  type LocalFileEntry,
-} from '../engine/rv-local-filesystem';
-import {
-  LOCAL_NEEDS_PERMISSION,
   LS_KEY_ACTIVE_TAB,
   LS_KEY_ORIGINS,
   LS_KEY_URLS,
-  SPLAT_EXTENSIONS,
-  THUMBNAILS_SUBFOLDER,
   isPersistedOrigin,
   promoteOrigin,
   type LibraryCatalog,
@@ -308,6 +294,12 @@ export class LibraryStore {
       this._restoreOrigins();
     } catch { /* ignore */ }
     this._snapshot = this._createSnapshot();
+    // Plan-921 added a prompt-free boot re-arm of the local working-folder
+    // catalog here so reloaded scenes could resolve placements by assetId.
+    // Plan-709 retired the local working folder entirely: placements resolve
+    // through the open project (manifest documents[] / project catalog), and
+    // legacy work-folder assets reach it via the one-time migration in
+    // Settings — so there is no local catalog left to re-arm.
   }
 
   // ─── useSyncExternalStore API ─────────────────────────────────────
@@ -367,6 +359,28 @@ export class LibraryStore {
     if (!this._activeTabUrl) this._activeTabUrl = url;
     this._notify();
 
+    await this._fetchCatalog(url);
+
+    this._persistUrls();
+  }
+
+  /**
+   * Re-fetch a subscribed catalog's manifest in place.
+   *
+   * `addCatalog` deliberately early-returns for a URL that is already in the
+   * tab list, so before this method a remote catalog could only be refreshed
+   * by removing and re-adding it. The stale entries stay visible while the
+   * fetch runs — a refresh that blanks the grid reads as data loss.
+   */
+  async refreshCatalog(url: string): Promise<void> {
+    if (!this._catalogUrls.includes(url)) return;
+    const existing = this._pendingFetches.get(url);
+    if (existing) { await existing; return; }
+    await this._fetchCatalog(url);
+  }
+
+  /** The one fetch path for a catalog URL. Registers itself as pending. */
+  private _fetchCatalog(url: string): Promise<void> {
     const fetchPromise = (async () => {
       try {
         // A GitHub repo / folder URL is scanned for .glb files (no catalog.json
@@ -414,9 +428,7 @@ export class LibraryStore {
     })();
 
     this._pendingFetches.set(url, fetchPromise);
-    await fetchPromise;
-
-    this._persistUrls();
+    return fetchPromise;
   }
 
   /** Inject a pre-built catalog without fetching (e.g. bundled library). */
@@ -515,252 +527,6 @@ export class LibraryStore {
       // GitHub stays opt-in even from a manifest — never auto-scan.
       if (isGitHubCatalogUrl(url)) continue;
       await this.addCatalog(url, 'projectManifest');
-    }
-  }
-
-  // ─── Local Working Folder support (File System Access API) ─────────
-
-  /** True if the browser supports the File System Access API. */
-  get isLocalFolderSupported(): boolean { return isFsApiSupported(); }
-
-  /**
-   * Add the working folder as a library catalog.
-   *
-   * If a working folder is already configured (handle in IndexedDB), reuse it —
-   * Chrome may show a brief re-grant prompt because this runs in a user-gesture
-   * context (button click). If no handle is stored, fall back to the native
-   * directory picker.
-   */
-  async addLocalFolder(): Promise<void> {
-    // Try to reuse an existing handle first (user-gesture context — safe to prompt).
-    let root = await getWorkFolder(true);
-    if (!root) {
-      // No stored handle, or user denied the re-grant — show the native picker.
-      root = await selectWorkFolder();
-    }
-    if (!root) return; // user cancelled or denied
-    await this._loadLibrarySubfolder(root);
-  }
-
-  /**
-   * Restore the library from a previously configured working folder.
-   *
-   * Called automatically at boot (no user gesture available) — must NOT call
-   * `requestPermission()`. Reads the handle from IndexedDB and proceeds in
-   * one of three ways:
-   *   - permission still granted     → load the library subfolder normally.
-   *   - handle stored, no permission → add a placeholder tab carrying the
-   *     `LOCAL_NEEDS_PERMISSION` sentinel so the UI can prompt the user to
-   *     re-grant access on the next click (a user-gesture context).
-   *   - no handle stored             → no-op.
-   */
-  async restoreLocalFolder(): Promise<void> {
-    const root = await getWorkFolder(false);
-    if (root) {
-      await this._loadLibrarySubfolder(root);
-      return;
-    }
-    // Permission has lapsed (or was never granted in this session). If a
-    // folder handle is still remembered, surface a placeholder tab so the
-    // user sees the previous selection and can re-grant access by clicking
-    // the tab — that click runs in a user-gesture context, which is the
-    // only place `requestPermission()` is allowed.
-    const meta = getWorkFolderMeta();
-    if (!meta) return;
-    this._addPendingLocalFolderTab(meta.displayName);
-  }
-
-  /** Insert a placeholder local-folder tab tagged with the
-   *  `LOCAL_NEEDS_PERMISSION` sentinel. No-op if already present. */
-  private _addPendingLocalFolderTab(folderName: string): void {
-    const key = `local:${folderName}/library`;
-    if (this._catalogUrls.includes(key)) return;
-    this._catalogUrls.push(key);
-    this._catalogs.set(key, {
-      version: '1.0',
-      name: `Local: ${folderName}/library`,
-      entries: [],
-    });
-    this._catalogErrors.set(key, LOCAL_NEEDS_PERMISSION);
-    this._bundledUrls.add(key); // never persist `local:` URLs into LS_KEY_URLS
-    if (!this._activeTabUrl) this._activeTabUrl = key;
-    this._notify();
-  }
-
-  /**
-   * User-gesture entry point: prompt for read permission on the stored
-   * working-folder handle and load the library subfolder. Call from a
-   * click handler — the browser blocks `requestPermission()` outside of
-   * user gestures. No-op if the user denies the prompt.
-   */
-  async activateLocalFolder(): Promise<void> {
-    const root = await getWorkFolder(true);
-    if (!root) return;
-    // Clear the placeholder sentinel before loading so the UI flips out of
-    // the "needs permission" state even if `_loadLibrarySubfolder` ends up
-    // setting a different error (e.g. missing `library/` subfolder). If the
-    // folder was renamed on disk since the placeholder was created, also
-    // drop the now-mismatched tab — the loader will add a fresh one.
-    const placeholderKey = this._catalogUrls.find(u => u.startsWith('local:'));
-    const newKey = `local:${root.name}/library`;
-    if (placeholderKey && placeholderKey !== newKey) {
-      this.removeCatalog(placeholderKey);
-    } else if (placeholderKey) {
-      this._catalogErrors.delete(placeholderKey);
-    }
-    await this._loadLibrarySubfolder(root);
-  }
-
-  /** Refresh the local library catalog (re-scan files).
-   *
-   * Always called from a user gesture (the panel's Refresh button), so it uses
-   * the prompting `getWorkFolder(true)` variant: if the persisted handle's read
-   * permission has lapsed back to `prompt` (Chrome does this across reloads /
-   * tab-backgrounding), this re-grants instead of silently no-opping — which
-   * would otherwise leave the stale catalog on screen and hide newly added
-   * files. When permission is already `granted`, no prompt is shown. */
-  async refreshLocalFolder(): Promise<void> {
-    const root = await getWorkFolder(true);
-    if (!root) return;
-    await this._loadLibrarySubfolder(root);
-  }
-
-  /** Remove working folder access and its catalog tab. */
-  async removeLocalFolder(): Promise<void> {
-    await removeWorkFolder();
-    const localUrl = this._catalogUrls.find(u => u.startsWith('local:'));
-    if (localUrl) this.removeCatalog(localUrl);
-  }
-
-  private async _loadLibrarySubfolder(root: FileSystemDirectoryHandle): Promise<void> {
-    const key = `local:${root.name}/library`;
-    try {
-      // Sources merged into the single local catalog:
-      //   - `library/` → all assets (GLB + Splats)
-      //   - `splats/`  → splats-only (the working folder's documented home
-      //                  for reality-capture point clouds). Files here are
-      //                  treated identically to splats under `library/` so
-      //                  the user can drop them into either location.
-      const libDir = await getSubfolder(root, 'library');
-      const splatsDir = await getSubfolder(root, 'splats');
-      if (!libDir && !splatsDir) {
-        this._catalogErrors.set(key, 'No "library/" or "splats/" subfolder found in working folder');
-        this._notify();
-        return;
-      }
-
-      type LocalLibrarySource = {
-        dir: FileSystemDirectoryHandle;
-        files: LocalFileEntry[];
-        source: 'library' | 'splats';
-      };
-      const sources: LocalLibrarySource[] = [];
-      if (libDir) {
-        sources.push({
-          dir: libDir,
-          files: await listFiles(libDir, ['.glb', '.splat', '.ksplat', '.ply']),
-          source: 'library',
-        });
-      }
-      if (splatsDir) {
-        sources.push({
-          dir: splatsDir,
-          files: await listFiles(splatsDir, ['.splat', '.ksplat', '.ply']),
-          source: 'splats',
-        });
-      }
-
-      // Persisted thumbnail map across both source `.thumbnails/` trees.
-      // Keys are namespaced by source so `splats/.thumbnails/scan.png`
-      // never collides with a hypothetical `library/.thumbnails/scan.png`.
-      const thumbsByKey = new Map<string, FileSystemFileHandle>();
-      for (const src of sources) {
-        try {
-          const thumbsDir = await src.dir.getDirectoryHandle(THUMBNAILS_SUBFOLDER);
-          const thumbFiles = await listFiles(thumbsDir, ['.png']);
-          for (const tf of thumbFiles) {
-            thumbsByKey.set(`${src.source}/${tf.path.toLowerCase()}`, tf.handle);
-          }
-        } catch { /* no thumbnails folder yet — fine */ }
-      }
-
-      const entryArrays = await Promise.all(
-        sources.map((src) => Promise.all(
-          src.files.map(async (f: LocalFileEntry) => {
-            const blobUrl = await readFileAsUrl(f.handle);
-            const ext = '.' + (f.name.split('.').pop()?.toLowerCase() ?? '');
-            const isSplat = SPLAT_EXTENSIONS.has(ext);
-            const stem = f.name.replace(/\.(glb|splat|ksplat|ply)$/i, '');
-            // Derive category from first subfolder, or 'custom' / 'splat'.
-            // `category` stays in the predefined enum so existing UIs and
-            // filters keep working; arbitrary subfolder names are exposed
-            // separately via `collections` (Asset-Manager-style chips).
-            const parts = f.path.split('/');
-            const folder = parts.length > 1 ? parts[0].toLowerCase() : '';
-            const category = isSplat
-              ? 'splat' as LibraryCatalogEntry['category']
-              : (['conveyor', 'robot', 'machine', 'fixture', 'des'].includes(folder)
-                ? folder
-                : 'custom') as LibraryCatalogEntry['category'];
-
-            // Collections: every parent directory inside the source becomes
-            // a chip. For `library/PalletHandling/RollConveyor2m.glb` →
-            // ["PalletHandling"]. For nested `splats/Hall1/Scan.splat` →
-            // ["Hall1"]. The source folder itself is not added as a chip —
-            // splat-category already groups `splats/` entries together.
-            const dirSegments = parts.slice(0, -1).filter(Boolean);
-            const collections: string[] = [];
-            for (let i = 0; i < dirSegments.length; i++) {
-              collections.push(dirSegments.slice(0, i + 1).join('/'));
-            }
-
-            // Look up persisted thumbnail by mirroring the source path
-            // (same subfolder structure, .png extension).
-            const thumbRelPath = f.path.replace(/\.(glb|splat|ksplat|ply)$/i, '.png').toLowerCase();
-            const thumbHandle = thumbsByKey.get(`${src.source}/${thumbRelPath}`);
-            const thumbnailUrl = thumbHandle ? await readFileAsUrl(thumbHandle) : '';
-
-            // Files from `splats/` use the source as a path prefix in
-            // `localPath` and `id` so they round-trip cleanly on layout
-            // restore and never collide with a same-name file under
-            // `library/`. Files from `library/` keep their unprefixed
-            // path → backwards-compatible with layouts saved before the
-            // splats/ source existed.
-            const prefixedPath = src.source === 'splats' ? `splats/${f.path}` : f.path;
-
-            const base: LibraryCatalogEntry = {
-              id: `local-${prefixedPath.replace(/[^a-z0-9]/gi, '-').toLowerCase()}`,
-              name: stem.replace(/[_-]/g, ' '),
-              category,
-              thumbnailUrl,
-              pivotToFloor: !isSplat,
-              localPath: prefixedPath,
-              collections: collections.length > 0 ? collections : undefined,
-            };
-            if (isSplat) {
-              base.splatUrl = blobUrl;
-            } else {
-              base.glbUrl = blobUrl;
-            }
-            return base;
-          }),
-        )),
-      );
-
-      const entries: LibraryCatalogEntry[] = entryArrays.flat();
-
-      const catalog: LibraryCatalog = {
-        version: '1.0',
-        name: `Local: ${root.name}/library`,
-        entries,
-      };
-
-      this.addCatalogDirect(key, catalog);
-      this._activeTabUrl = key;
-      this._notify();
-    } catch (e) {
-      this._catalogErrors.set(key, String(e));
-      this._notify();
     }
   }
 

@@ -16,12 +16,13 @@
  * subtree) in the automatic world-matrix update. A node is kept DYNAMIC iff it,
  * one of its ancestors, or one of its descendants carries a motion / MU-spawn
  * component (see {@link MOVER_KEY}): Drive(*), Kinematic, Grip, TransportSurface,
- * Source, Sink, MU, Cam. That closure keeps alive:
+ * Source, Sink, MU, Cam, SceneButtonMoveable. That closure keeps alive:
  *   - Drive-driven subtrees (the Drive node + everything under it),
  *   - the chain of ancestors above each Drive (needed so the recursion can reach
  *     it — including the always-dynamic model root, under which runtime MUs are
  *     spawned), and
- *   - kinematic chains and grippers.
+ *   - kinematic chains and grippers, and
+ *   - the animated caps of 3D scene buttons (plan-417).
  * Everything else — disconnected static structure and the hidden highlight
  * source meshes — is frozen.
  *
@@ -43,8 +44,17 @@ import type { Object3D } from 'three';
  * the START of the key, so `Drive_Cylinder`, `Drive_Gear`, `Drive_ErraticPosition`
  * etc. are all covered by `Drive`. Source/Sink/MU/TransportSurface are included
  * because they spawn or carry movable units at runtime.
+ *
+ * `SceneButtonMoveable` (plan-417) is a mover too: the cap of a 3D scene button
+ * translates or rotates on hover/click. It is listed here — and not left to the
+ * component's own thaw in `RVSceneButtonMoveable._bind()` — because ORDER made
+ * that thaw useless: components are constructed in Phase 8, this pass runs in
+ * Phase 11, so the freeze overwrote `matrixWorldAutoUpdate` again right after.
+ * Symptom: the signal toggles and the light switches, but the lever never
+ * visibly moves. Being on this list makes the cap dynamic regardless of when it
+ * is bound.
  */
-const MOVER_KEY = /^(Drive|Kinematic|Grip|TransportSurface|Source|Sink|MU|Cam)/i;
+const MOVER_KEY = /^(Drive|Kinematic|Grip|TransportSurface|Source|Sink|MU|Cam|SceneButtonMoveable)/i;
 
 export interface FreezeStaticResult {
   /** Nodes whose matrixWorldAutoUpdate was turned off. */
@@ -57,6 +67,10 @@ export interface FreezeStaticResult {
 
 /** True if the node itself carries a motion / MU-spawn component. */
 function isMoverNode(node: Object3D): boolean {
+  // Already-bound scene-button cap mesh: `RVSceneButtonMoveable._bind()` stamps
+  // this marker on the animated mesh even when the extras live on a parent node,
+  // and it survives a re-freeze after a runtime placement.
+  if (node.userData?._rvSceneButtonMesh === true) return true;
   const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
   if (!rv) return false;
   for (const key in rv) {

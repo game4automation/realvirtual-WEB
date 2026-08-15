@@ -9,6 +9,8 @@ import { useActiveContexts, isUIElementVisible, registerUIElement, useUIVisible 
 import { subscribeUIZoom, getUIZoom } from './visual-settings-store';
 import { getSceneStore } from './scene/scene-store-singleton';
 import { ForceConfirmDialog } from './ForceConfirmDialog';
+import { ProjectCodeConsentDialog } from './ProjectCodeConsentDialog';
+import { SceneTransitionOverlay } from './SceneTransitionOverlay';
 import { ProjectDialogHost } from '../project/rv-project-conflict-dialog';
 import { mountDragAnnouncer } from './drag-announcer';
 
@@ -146,8 +148,20 @@ export function HMIShell({ children }: HMIShellProps) {
       */}
       <div id="rv-floating-panel-root" style={{ pointerEvents: 'none' }} />
       {children}
+      {/* Scene-transition mask (plan-410 F4). Mounted unconditionally and NOT as
+          a plugin slot entry: the editor's exit overlay has to stay on screen
+          while `_restorePreviousScene` runs — by which time the editor plugin
+          and its slots are already gone. Renders null unless a transition is
+          holding it. */}
+      <SceneTransitionOverlay />
       {/* Signal forcing is an engineering action — no force dialog in the Viewer. */}
       {showForceConfirm && <ForceConfirmDialog />}
+      {/* Native project code needs this project's explicit consent before it
+          runs (plan-718 2b.3). Mounted UNCONDITIONALLY and in every mode: the
+          request denies when no host is mounted, so hiding the dialog would
+          silently disable a project's code rather than ask about it. Renders
+          null until a project actually carries runnable code. */}
+      <ProjectCodeConsentDialog />
       {/* Collision notices (plan-394) live as cards in the right-side messages
           slot (CollisionAlertPlugin) — no modal here anymore. */}
       {/* Project folder ↔ cache conflict prompt + the switch dirty guard (§4c/§4e).

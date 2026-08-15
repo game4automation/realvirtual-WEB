@@ -131,6 +131,6 @@ describe('delivery configuration', () => {
     const matrix = renderFeatureMatrix(loadTierManifest(root), configs, 'mauser-line2');
     expect(matrix).toContain('Mauser 3D HMI');
     expect(matrix).not.toContain('WMYB');
-    expect(matrix).toContain('| step-import | commercial | yes |');
+    expect(matrix).toContain('| step-import | commercial | stable | yes |');
   });
 });

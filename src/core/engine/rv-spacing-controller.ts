@@ -148,6 +148,20 @@ export class SpacingController {
     this.dirty = true;
   }
 
+  /**
+   * Number of travelers currently ON path `pathId`, excluding `excludeId`
+   * (plan-921 DES parity): the DES segment-occupancy rule reads the fleet's
+   * live path assignment here — allocation-free linear scan (fleet-sized).
+   */
+  occupantsOf(pathId: string, excludeId?: string): number {
+    let n = 0;
+    for (const e of this.entries) {
+      if (e.traveler.id === excludeId) continue;
+      if (e.traveler.path?.id === pathId) n++;
+    }
+    return n;
+  }
+
   /** Drop every traveler (model switch / test reset). */
   clear(): void {
     this.entries.length = 0;

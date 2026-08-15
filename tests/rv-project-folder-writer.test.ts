@@ -7,8 +7,11 @@
  * Four things are load-bearing and each has its own block:
  *  - every mutation seam reaches disk (§4d — a hook in save() alone missed
  *    five of them);
- *  - bodies are written before the manifest, so the manifest never points at
- *    a file that is not there;
+ *  - the writer records the manifest row and nothing else: since plan-413
+ *    phase 6 the body is a GLB written by `backend.writeScene()` *before* the
+ *    mutation is emitted, and the writer's old `.scene.json` copy was actively
+ *    harmful — the row it upserted named the JSON path, so the next save put
+ *    GLB bytes into a file called `.scene.json`;
  *  - the RR1 guard refuses a path that belongs to a different scene, rather
  *    than overwriting or deleting it;
  *  - a failed disk write leaves the project visibly unsaved (§4e) — the one
@@ -20,7 +23,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { FakeDir, FailureInjector, asDirHandle, namedError } from './helpers/fake-fs-handles';
 import { RVProjectFolderWriter } from '../src/core/project/rv-project-folder-writer';
 import { clearSceneMutationListeners, emitSceneMutation } from '../src/core/hmi/scene/rv-scene-mutations';
-import { sceneRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
+import { sceneGlbRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
+import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
@@ -30,7 +34,7 @@ const scene = (id: string, name: string): RvScene => ({
   name,
   createdAt: '2025-01-01T00:00:00.000Z',
   modifiedAt: '2025-01-01T00:00:00.000Z',
-  schemaVersion: 2,
+  schemaVersion: 3,
   base: { kind: 'empty' },
   edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
 });
@@ -54,7 +58,7 @@ function makeHarness(initial?: Partial<RvProject>, writable = true): Harness {
     root,
     failures,
     bodies,
-    manifest: { schemaVersion: 1, id: 'prj_1', name: 'Demo', scenes: [], ...initial } as RvProject,
+    manifest: { schemaVersion: 2, id: 'prj_1', name: 'Demo', documents: [], ...initial } as RvProject,
   } as Harness;
 
   h.writer = new RVProjectFolderWriter(
@@ -93,10 +97,20 @@ async function manifestOnDisk(root: FakeDir): Promise<RvProject> {
   return JSON.parse((await root.readText('project.json'))!);
 }
 
+/** The scene rows of the manifest on disk — the one list, filtered. */
+async function scenesOnDisk(root: FakeDir) {
+  return sceneDocumentsOf(await manifestOnDisk(root));
+}
+
+/** A scene document row, in the shape the manifest now stores. */
+function sceneDoc(id: string, name: string, path: string) {
+  return { id, name, path, section: 'scenes' as const };
+}
+
 // ─── All mutation seams reach disk (§4d) ────────────────────────────────
 
 describe('mutation seams', () => {
-  it('an upsert writes the body and registers it in the manifest', async () => {
+  it('an upsert registers the scene in the manifest under its GLB path', async () => {
     const h = track(makeHarness());
     const s = scene('scn_a', 'Cell A');
     h.bodies.set(s.id, s);
@@ -104,49 +118,60 @@ describe('mutation seams', () => {
     emitSceneMutation({ type: 'upsert', id: s.id, scene: s });
     await h.settle();
 
-    const path = sceneRelPathFor(s);
-    expect(await h.root.readTextAt('scenes', path.split('/')[1])).toContain('"scn_a"');
-    const m = await manifestOnDisk(h.root);
-    expect(m.scenes!.map(e => e.id)).toEqual(['scn_a']);
-    expect(m.scenes![0].path).toBe(path);
+    const rows = await scenesOnDisk(h.root);
+    expect(rows.map(e => e.id)).toEqual(['scn_a']);
+    expect(rows[0].path).toBe(sceneGlbRelPathFor(s));
   });
 
-  it('a rename writes the new file and retires the old one', async () => {
+  it('the writer does NOT write a body — that is the backend\'s job now', async () => {
+    const h = track(makeHarness());
+    const s = scene('scn_a', 'Cell A');
+    h.bodies.set(s.id, s);
+
+    emitSceneMutation({ type: 'upsert', id: s.id, scene: s });
+    await h.settle();
+
+    // No `scenes/` folder is created at all: the writer touches project.json
+    // and nothing else. A `.scene.json` here is the regression this removal is
+    // about — it would take the manifest row with it on the next save.
+    expect(h.root.has('scenes')).toBe(false);
+    expect(h.root.has('project.json')).toBe(true);
+  });
+
+  it('a rename updates the name and leaves the body where the bytes are', async () => {
     const h = track(makeHarness());
     const before = scene('scn_a', 'Cell A');
     h.bodies.set(before.id, before);
     emitSceneMutation({ type: 'upsert', id: before.id, scene: before });
     await h.settle();
-    const oldFile = sceneRelPathFor(before).split('/')[1];
-    expect(await h.root.readTextAt('scenes', oldFile)).not.toBeNull();
+    const path = (await scenesOnDisk(h.root))[0].path;
 
     const after = { ...before, name: 'Cell B' };
     h.bodies.set(after.id, after);
     emitSceneMutation({ type: 'rename', id: after.id, scene: after, prevName: 'Cell A' });
     await h.settle();
 
-    const newFile = sceneRelPathFor(after).split('/')[1];
-    expect(newFile).not.toBe(oldFile);
-    expect(await h.root.readTextAt('scenes', newFile)).not.toBeNull();
-    expect(await h.root.readTextAt('scenes', oldFile)).toBeNull();
-    const m = await manifestOnDisk(h.root);
-    expect(m.scenes!).toHaveLength(1);
-    expect(m.scenes![0].name).toBe('Cell B');
+    const rows = await scenesOnDisk(h.root);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].name).toBe('Cell B');
+    // The path does not move: `writeSceneGlbBody()` wrote the bytes to the
+    // recorded path, and renaming the file here would orphan them.
+    expect(rows[0].path).toBe(path);
   });
 
-  it('a duplicate (upsert of a second id) lands on disk as its own file', async () => {
+  it('a duplicate (upsert of a second id) gets its own path', async () => {
     const h = track(makeHarness());
     for (const s of [scene('scn_a', 'A'), scene('scn_b', 'A (copy)')]) {
       h.bodies.set(s.id, s);
       emitSceneMutation({ type: 'upsert', id: s.id, scene: s });
     }
     await h.settle();
-    const m = await manifestOnDisk(h.root);
-    expect(m.scenes!.map(e => e.id).sort()).toEqual(['scn_a', 'scn_b']);
-    expect(new Set(m.scenes!.map(e => e.path)).size).toBe(2);
+    const rows = await scenesOnDisk(h.root);
+    expect(rows.map(e => e.id).sort()).toEqual(['scn_a', 'scn_b']);
+    expect(new Set(rows.map(e => e.path)).size).toBe(2);
   });
 
-  it('a delete removes the file and the manifest entry', async () => {
+  it('a delete removes the manifest entry', async () => {
     const h = track(makeHarness());
     const s = scene('scn_a', 'A');
     h.bodies.set(s.id, s);
@@ -156,8 +181,7 @@ describe('mutation seams', () => {
     emitSceneMutation({ type: 'delete', id: s.id });
     await h.settle();
 
-    expect(await h.root.readTextAt('scenes', sceneRelPathFor(s).split('/')[1])).toBeNull();
-    expect((await manifestOnDisk(h.root)).scenes).toEqual([]);
+    expect(await scenesOnDisk(h.root)).toEqual([]);
   });
 
   it('an active-id change is mirrored into the manifest', async () => {
@@ -173,9 +197,8 @@ describe('mutation seams', () => {
     expect((await manifestOnDisk(h.root)).activeSceneId).toBeNull();
   });
 
-  it('the autosave draft tick never reaches disk (it emits no mutation)', async () => {
+  it('an idle writer touches nothing', async () => {
     const h = track(makeHarness());
-    // The draft path calls writeSceneDraft() and deliberately does NOT emit.
     // Nothing scheduled ⇒ nothing written.
     await h.settle();
     expect(await h.root.readText('project.json')).toBeNull();
@@ -194,7 +217,7 @@ describe('mutation seams', () => {
 // ─── Ordering + coalescing ──────────────────────────────────────────────
 
 describe('ordering and coalescing', () => {
-  it('writes bodies BEFORE the manifest', async () => {
+  it('writes the settings bundle BEFORE the manifest', async () => {
     const h = track(makeHarness());
     const s = scene('scn_a', 'A');
     h.bodies.set(s.id, s);
@@ -203,14 +226,17 @@ describe('ordering and coalescing', () => {
     const origin = h.failures.check.bind(h.failures);
     h.failures.check = (point, name) => { order.push(`${point}:${name}`); origin(point, name); };
 
+    h.writer.markSettingsDirty();
     emitSceneMutation({ type: 'upsert', id: s.id, scene: s });
     await h.settle();
 
-    const bodyIdx = order.findIndex(e => e.endsWith('.scene.json'));
-    const manifestIdx = order.findIndex(e => e.endsWith('project.json'));
-    expect(bodyIdx).toBeGreaterThanOrEqual(0);
+    // Manifest last is still the rule; what precedes it is now the settings
+    // bundle rather than a scene body.
+    const settingsIdx = order.findIndex(e => e.endsWith('project-settings.json'));
+    const manifestIdx = order.findIndex(e => e.endsWith('write:project.json'));
+    expect(settingsIdx).toBeGreaterThanOrEqual(0);
     expect(manifestIdx).toBeGreaterThanOrEqual(0);
-    expect(bodyIdx).toBeLessThan(manifestIdx);
+    expect(settingsIdx).toBeLessThan(manifestIdx);
   });
 
   it('coalesces a burst of mutations into a single manifest write', async () => {
@@ -230,7 +256,7 @@ describe('ordering and coalescing', () => {
     await h.settle();
 
     expect(spy).toHaveBeenCalledTimes(1);
-    expect((await manifestOnDisk(h.root)).scenes).toHaveLength(5);
+    expect(await scenesOnDisk(h.root)).toHaveLength(5);
   });
 
   it('flush() writes work that is still inside the debounce window', async () => {
@@ -241,7 +267,7 @@ describe('ordering and coalescing', () => {
 
     // No waiting for the timer — this is the tab-close path.
     await h.writer.flush();
-    expect((await manifestOnDisk(h.root)).scenes).toHaveLength(1);
+    expect(await scenesOnDisk(h.root)).toHaveLength(1);
   });
 
   it('flush() on an empty queue is a no-op', async () => {
@@ -263,7 +289,7 @@ describe('ordering and coalescing', () => {
 // ─── RR1 guard ──────────────────────────────────────────────────────────
 
 describe('RR1 — the writer refuses to touch a path it does not own', () => {
-  it('two identically-named scenes get two files, not one', async () => {
+  it('two identically-named scenes get two paths, not one', async () => {
     const h = track(makeHarness());
     const a = scene('scn_aaa', 'Cell');
     const b = scene('scn_bbb', 'Cell');
@@ -273,53 +299,55 @@ describe('RR1 — the writer refuses to touch a path it does not own', () => {
     emitSceneMutation({ type: 'upsert', id: b.id, scene: b });
     await h.settle();
 
-    const m = await manifestOnDisk(h.root);
-    expect(new Set(m.scenes!.map(e => e.path)).size).toBe(2);
-    expect(h.root.childNames()).toContain('scenes');
-    const scenesDir = await h.root.readTextAt('scenes', sceneRelPathFor(a).split('/')[1]);
-    expect(scenesDir).toContain('"scn_aaa"');
-    expect(await h.root.readTextAt('scenes', sceneRelPathFor(b).split('/')[1])).toContain('"scn_bbb"');
+    const rows = await scenesOnDisk(h.root);
+    expect(new Set(rows.map(e => e.path)).size).toBe(2);
+    expect(rows.find(e => e.id === 'scn_aaa')!.path).toBe(sceneGlbRelPathFor(a));
+    expect(rows.find(e => e.id === 'scn_bbb')!.path).toBe(sceneGlbRelPathFor(b));
   });
 
-  it('refuses a write onto a path another manifest entry claims', async () => {
-    const stolen = sceneRelPathFor({ id: 'scn_a', name: 'Cell' });
+  it('refuses a row onto a path another manifest entry claims', async () => {
+    const stolen = sceneGlbRelPathFor({ id: 'scn_a', name: 'Cell' });
     const h = track(makeHarness({
       // A hand-edited/corrupt manifest where scn_b already owns scn_a's path.
-      scenes: [{ id: 'scn_b', name: 'Other', path: stolen }],
+      documents: [sceneDoc('scn_b', 'Other', stolen)],
     }));
     const a = scene('scn_a', 'Cell');
     h.bodies.set(a.id, a);
-    h.root.seedDir('scenes').seedText(stolen.split('/')[1], '{"owner":"scn_b"}');
 
     emitSceneMutation({ type: 'upsert', id: a.id, scene: a });
     await h.settle();
 
-    // The other scene's file is untouched, and the failure is visible.
-    expect(await h.root.readTextAt('scenes', stolen.split('/')[1])).toBe('{"owner":"scn_b"}');
+    // Nothing was recorded at all — with the only upsert refused there is no
+    // manifest change to write — and the in-memory manifest still says scn_b.
+    expect(await h.root.readText('project.json')).toBeNull();
+    expect(sceneDocumentsOf(h.manifest).map(e => e.id)).toEqual(['scn_b']);
     expect(h.writer.getStatus().error).toContain('already belongs to scene scn_b');
   });
 
   it('refuses a delete of a path the manifest attributes to another scene', async () => {
-    const path = sceneRelPathFor({ id: 'scn_a', name: 'Cell' });
-    const h = track(makeHarness({ scenes: [{ id: 'scn_a', name: 'Cell', path }] }));
-    h.root.seedDir('scenes').seedText(path.split('/')[1], '{"owner":"scn_a"}');
+    const path = sceneGlbRelPathFor({ id: 'scn_a', name: 'Cell' });
+    const h = track(makeHarness({ documents: [sceneDoc('scn_a', 'Cell', path)] }));
+    h.root.seedDir('scenes').seedText(path.split('/')[1], 'body-a');
 
     // The manifest records a *different* path for scn_a than the writer holds.
-    h.manifest = { ...h.manifest, scenes: [{ id: 'scn_a', name: 'Cell', path: 'scenes/elsewhere.scene.json' }] };
+    h.manifest = {
+      ...h.manifest,
+      documents: [sceneDoc('scn_a', 'Cell', 'scenes/elsewhere.scene.glb')],
+    };
     emitSceneMutation({ type: 'delete', id: 'scn_a' });
     await h.settle();
 
-    expect(await h.root.readTextAt('scenes', path.split('/')[1])).toBe('{"owner":"scn_a"}');
+    expect(await h.root.readTextAt('scenes', path.split('/')[1])).toBe('body-a');
   });
 
   it('refuses a delete for a scene that is not in the manifest at all', async () => {
-    const path = sceneRelPathFor({ id: 'scn_x', name: 'X' });
-    const h = track(makeHarness({ scenes: [{ id: 'scn_x', name: 'X', path }] }));
+    const path = sceneGlbRelPathFor({ id: 'scn_x', name: 'X' });
+    const h = track(makeHarness({ documents: [sceneDoc('scn_x', 'X', path)] }));
     h.root.seedDir('scenes').seedText(path.split('/')[1], 'body');
 
     // Drop it from the manifest *after* the writer captured the path.
     emitSceneMutation({ type: 'delete', id: 'scn_x' });
-    h.manifest = { ...h.manifest, scenes: [] };
+    h.manifest = { ...h.manifest, documents: [] };
     await h.settle();
 
     expect(await h.root.readTextAt('scenes', path.split('/')[1])).toBe('body');
@@ -330,14 +358,14 @@ describe('RR1 — the writer refuses to touch a path it does not own', () => {
 // ─── §4e failure paths ──────────────────────────────────────────────────
 
 describe('§4e — a failed disk write is never reported as saved', () => {
-  it('a body write failure sets a persistent error and keeps the work queued', async () => {
+  it('a manifest write failure sets a persistent error and keeps the work queued', async () => {
     const h = track(makeHarness());
     const s = scene('scn_a', 'A');
     h.bodies.set(s.id, s);
     // Disk full: a plain I/O failure, NOT an invalidated handle.
     h.failures.fail({
       point: 'write',
-      name: sceneRelPathFor(s).split('/')[1],
+      name: 'project.json',
       error: namedError('QuotaExceededError', 'disk is full'),
     });
 
@@ -349,7 +377,9 @@ describe('§4e — a failed disk write is never reported as saved', () => {
     expect(status.handleInvalid).toBe(false);
     expect(status.pending).toBe(true);
     expect(h.writer.isDirty()).toBe(true);
-    expect(await h.root.readText('project.json')).toBeNull();  // manifest never written
+    // Nothing usable landed: the File System Access API materialises the file
+    // before the stream opens, so what is there is empty, not a half-manifest.
+    expect(await h.root.readText('project.json')).toBe('');
   });
 
   it('a retry after the failure clears succeeds and clears the error', async () => {
@@ -358,7 +388,7 @@ describe('§4e — a failed disk write is never reported as saved', () => {
     h.bodies.set(s.id, s);
     h.failures.fail({
       point: 'write',
-      name: sceneRelPathFor(s).split('/')[1],
+      name: 'project.json',
       error: namedError('QuotaExceededError', 'disk is full'),
       times: 1,
     });
@@ -370,14 +400,18 @@ describe('§4e — a failed disk write is never reported as saved', () => {
     await h.writer.flush();   // the queued work is retried
     expect(h.writer.getStatus().error).toBeNull();
     expect(h.writer.isDirty()).toBe(false);
-    expect((await manifestOnDisk(h.root)).scenes).toHaveLength(1);
+    expect(await scenesOnDisk(h.root)).toHaveLength(1);
   });
 
   it('an invalidated handle is reported as such, not looped on', async () => {
     const h = track(makeHarness());
     const s = scene('scn_a', 'A');
     h.bodies.set(s.id, s);
-    h.failures.fail({ point: 'getDirectory', name: 'scenes' });
+    h.failures.fail({
+      point: 'write',
+      name: 'project.json',
+      error: namedError('NotFoundError', 'the folder is gone'),
+    });
 
     emitSceneMutation({ type: 'upsert', id: s.id, scene: s });
     await h.settle();
@@ -408,7 +442,7 @@ describe('§4e — a failed disk write is never reported as saved', () => {
     h.bodies.set(s.id, s);
     h.failures.fail({
       point: 'write',
-      name: sceneRelPathFor(s).split('/')[1],
+      name: 'project.json',
       error: namedError('QuotaExceededError', 'disk is full'),
     });
 
@@ -418,11 +452,11 @@ describe('§4e — a failed disk write is never reported as saved', () => {
     expect(seen.some(e => e?.includes('Not saved to disk'))).toBe(true);
   });
 
-  it('a vanished body is skipped quietly rather than written truncated', async () => {
+  it('a vanished catalogue row is skipped quietly rather than half-recorded', async () => {
     const h = track(makeHarness());
     emitSceneMutation({ type: 'upsert', id: 'scn_gone', scene: scene('scn_gone', 'Gone') });
-    await h.settle();   // no body in the map
-    expect(h.root.has('scenes')).toBe(false);
+    await h.settle();   // no row in the map
+    expect(await h.root.readText('project.json')).toBeNull();
     expect(h.writer.getStatus().error).toBeNull();
   });
 });

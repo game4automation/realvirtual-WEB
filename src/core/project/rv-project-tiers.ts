@@ -21,7 +21,9 @@
  *
  *  1. Both tiers appear in **one** list, each entry knowing its `tier`.
  *  2. A bundled entry is read-only. The first edit **forks** it into the user
- *    tier — the same semantics `SceneStore.addPublishedToMyScenes` has today.
+ *    tier — the same semantics `SceneStore.addPublishedToMyScenes` has, which is
+ *    also why importing an example materialises a document rather than sharing
+ *    the bundled one (plan-716 F1).
  *  3. A fork records `forkedFrom`, so the UI can say "based on Sample/Demo".
  *  4. The tiers share no storage. Swapping the whole bundled tier touches not
  *    one user key.
@@ -31,16 +33,23 @@
  * their view). Deleting a fork removes the fork; the original comes back.
  */
 
-import type { RvProject, RvProjectAssetEntry, RvProjectSceneEntry } from './rv-project-types';
+import type {
+  RvDocumentEntry,
+  RvProject,
+  RvProjectAssetEntry,
+} from './rv-project-types';
 
 /** Which level an entry came from. */
 export type ProjectTier = 'bundled' | 'user';
 
-export type TieredSceneEntry = RvProjectSceneEntry & {
-  tier: ProjectTier;
-  /** Id of the bundled entry this user entry was forked from. */
-  forkedFrom?: string;
-};
+// `TieredSceneEntry`, `mergeSceneTiers` and `forkSceneEntry` are GONE
+// (plan-716 Phase 6). They were the scene-shaped third of a three-way merge that
+// has been one merge since plan-413: `mergeDocumentTiers` below does the same
+// job over `documents[]`, which is the only artefact list left. Nothing read the
+// scene half any more — the dashboard, the catalog feed and both MCP families
+// were moved off it in Phase 5 — so what remained was a second answer to a
+// question with one answer. `tests/document-tiers-scan.test.ts` covers the
+// surviving merge.
 
 export type TieredAssetEntry = RvProjectAssetEntry & {
   tier: ProjectTier;
@@ -57,22 +66,6 @@ export interface MergedTiers<T> {
 
 // ─── Merge ──────────────────────────────────────────────────────────────
 
-/**
- * Merge the bundled and user scene lists into one display list.
- *
- * A user entry shadows a bundled one when it either **is** that id (the same
- * scene, saved into the user tier) or was **forked from** it. Shadowing keeps
- * the bundled entry's slot in the order, so a fork does not jump to the end
- * of the list the moment it is edited.
- */
-export function mergeSceneTiers(
-  bundled: readonly RvProjectSceneEntry[],
-  user: readonly RvProjectSceneEntry[],
-  hidden: readonly string[] = [],
-): MergedTiers<TieredSceneEntry> {
-  return mergeTiers(bundled, user, hidden, e => e.id);
-}
-
 /** Same merge for `models[]` / `library[]`, keyed on `path`. */
 export function mergeAssetTiers(
   bundled: readonly RvProjectAssetEntry[],
@@ -87,6 +80,15 @@ function mergeTiers<E extends Record<string, unknown>>(
   user: readonly E[],
   hidden: readonly string[],
   keyOf: (e: E) => string,
+  /**
+   * Every string a fork's `forkedFrom` may name this bundled entry by.
+   *
+   * Scenes record the origin's **id**, assets its **path** — and a document is
+   * both at once, so keying a document merge on one of them alone would make
+   * exactly half the existing forks stop shadowing their originals. Defaults to
+   * the primary key, which is what the two legacy merges have always used.
+   */
+  aliasesOf: (e: E) => readonly string[] = e => [keyOf(e)],
 ): MergedTiers<E & { tier: ProjectTier; forkedFrom?: string }> {
   const hiddenSet = new Set(hidden);
   const ids = new Set<string>();
@@ -105,7 +107,14 @@ function mergeTiers<E extends Record<string, unknown>>(
   for (const b of bundled) {
     const key = keyOf(b);
     if (!key) continue;
-    const shadow = userByKey.get(key) ?? userByOrigin.get(key);
+    let shadow = userByKey.get(key);
+    if (!shadow) {
+      for (const alias of aliasesOf(b)) {
+        if (!alias) continue;
+        shadow = userByOrigin.get(alias);
+        if (shadow) break;
+      }
+    }
     if (shadow) {
       consumed.add(shadow);
       const shadowKey = keyOf(shadow);
@@ -134,25 +143,67 @@ function mergeTiers<E extends Record<string, unknown>>(
   return { entries: out, ids };
 }
 
-// ─── Fork ───────────────────────────────────────────────────────────────
+// ─── Documents (plan-413 §2.4) ──────────────────────────────────────────
+
+export type TieredDocumentEntry = RvDocumentEntry & {
+  tier: ProjectTier;
+  forkedFrom?: string;
+};
 
 /**
- * Fork a bundled scene entry into the user tier.
+ * The one merge. It replaced a scene-shaped and an asset-shaped variant; only
+ * {@link mergeAssetTiers} is still around, for the models list.
  *
- * The fork gets a **new id**: the bundled id must stay resolvable, because
- * the next release re-reads it and because `forkedFrom` points at it. Reusing
- * the id would make the original unreachable the moment someone edits it.
+ * Same algorithm, one key rule: `id` when the entry has one, `path` otherwise —
+ * `assetEntryKey()` semantics, which is what makes a document minted from an
+ * id-less asset entry keep answering to the path it was addressed by. A fork's
+ * `forkedFrom` is looked up under **both**, because the two legacy merges
+ * recorded two different things there and neither may stop working
+ * (`document-tiers-scan.test.ts` is the regression anchor).
+ *
+ * The section is deliberately NOT part of the key. Ids are unique across the
+ * project, and a document that changes section — a library asset promoted to a
+ * scene — is the same document, not a new one.
  */
-export function forkSceneEntry(
-  entry: RvProjectSceneEntry,
+export function mergeDocumentTiers(
+  bundled: readonly RvDocumentEntry[],
+  user: readonly RvDocumentEntry[],
+  hidden: readonly string[] = [],
+): MergedTiers<TieredDocumentEntry> {
+  return mergeTiers(bundled, user, hidden, documentTierKey, documentTierAliases);
+}
+
+/** `id` when present, `path` otherwise. */
+function documentTierKey(entry: RvDocumentEntry): string {
+  const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+  return id !== '' ? id : (typeof entry.path === 'string' ? entry.path : '');
+}
+
+function documentTierAliases(entry: RvDocumentEntry): string[] {
+  const out: string[] = [];
+  if (typeof entry.id === 'string' && entry.id.trim() !== '') out.push(entry.id.trim());
+  if (typeof entry.path === 'string' && entry.path !== '') out.push(entry.path);
+  return out;
+}
+
+/**
+ * Fork a bundled document into the user tier.
+ *
+ * The fork gets a
+ * **new id** so the bundled original stays resolvable — the next release
+ * re-reads it, and `forkedFrom` points back at it. Reusing the id would make the
+ * original unreachable the moment somebody edits it.
+ */
+export function forkDocumentEntry(
+  entry: RvDocumentEntry,
   newId: string,
-  overrides: Partial<RvProjectSceneEntry> = {},
-): TieredSceneEntry {
+  overrides: Partial<RvDocumentEntry> = {},
+): TieredDocumentEntry {
   return {
     ...entry,
     ...overrides,
     id: newId,
-    forkedFrom: entry.id,
+    forkedFrom: documentTierKey(entry),
     tier: 'user',
   };
 }

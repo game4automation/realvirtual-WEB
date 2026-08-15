@@ -260,10 +260,13 @@ describe('drag announcer — debounce and silence', () => {
     expect(say()).toContain('Over slot Flow.Run');
   });
 
-  it('the success sentence survives the leave the registry emits after the drop', () => {
-    // Regression: `dropAt()` emits `outcome:accepted` and only THEN clears the
-    // hover, so a naive listener treats that trailing `leave` as "drop the
-    // pending sentence" and the user hears nothing about the link they made.
+  it('the success sentence survives the leave that precedes the drop outcome', () => {
+    // Historic regression, now guarded from BOTH sides: the registry used to
+    // emit `outcome:accepted` and only THEN clear the hover, so a naive
+    // listener treated the trailing `leave` as "drop the pending sentence" and
+    // the user heard nothing about the link they made. Since plan-353 F1 the
+    // `leave` comes FIRST — the sentence must survive that ordering too,
+    // because `leave` calls dropPending() before the outcome is queued.
     const ok = makeTarget('slot:Flow.Run', 'Flow.Run', null, 100);
     startDrag();
     updateSignalDrag(ok.centre.x, ok.centre.y);
@@ -271,5 +274,39 @@ describe('drag announcer — debounce and silence', () => {
     endSignalDrag(ok.centre.x, ok.centre.y);
     settle();
     expect(say()).toBe('Signal MC07_Start linked to slot Flow.Run.');
+  });
+
+  it('the outcome is the LAST word of the drag and is not re-announced (plan-353 F1)', () => {
+    // With the plan-353 order (`enter → leave → outcome`) the `leave` arrives
+    // while the "over slot" sentence is still pending. The live region must end
+    // up holding the outcome sentence — and nothing may overwrite it
+    // afterwards, neither the dropped hover sentence nor a repeat.
+    const ok = makeTarget('slot:Flow.Run', 'Flow.Run', null, 100);
+    startDrag();
+    settle();                                     // "Grabbed …"
+    updateSignalDrag(ok.centre.x, ok.centre.y);
+    settle();                                     // "Over slot Flow.Run …"
+    expect(say()).toContain('Over slot Flow.Run');
+
+    endSignalDrag(ok.centre.x, ok.centre.y);
+    settle();
+    expect(say()).toBe('Signal MC07_Start linked to slot Flow.Run.');
+
+    // Nothing is queued behind it: further time passing changes nothing.
+    settle();
+    settle();
+    expect(say()).toBe('Signal MC07_Start linked to slot Flow.Run.');
+  });
+
+  it('a rejected drop is announced despite the preceding leave', () => {
+    // Same ordering guarantee on the reject branch (9.1 covers both branches at
+    // the registry; here the consequence for the spoken output is pinned).
+    const bad = makeTarget('slot:Speed', 'Speed', TYPE_REASON, 140);
+    startDrag();
+    updateSignalDrag(bad.centre.x, bad.centre.y);
+    settle();
+    endSignalDrag(bad.centre.x, bad.centre.y);
+    settle();
+    expect(say()).toBe(`Not linked — ${dropRejectText(TYPE_REASON)}`);
   });
 });

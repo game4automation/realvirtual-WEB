@@ -25,6 +25,7 @@ import {
   type ComponentContext,
 } from '../src/core/engine/rv-component-registry';
 import type { PhysicsAABB } from '../src/core/engine/rv-physics-registry';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
 // ─── Helpers (factory-driven construction, mirrors the scene loader) ────────
 
@@ -330,14 +331,14 @@ describe('physics-zone-test.glb fixture', () => {
   }
 
   it('loads and carries zone + conveyor + container extras', async () => {
-    const head = await fetch('/models/physics-zone-test.glb', { method: 'HEAD' });
+    const head = await fetch(DEV_GLB.physicsZone, { method: 'HEAD' });
     if (!head.ok) {
       throw new Error(
         'physics-zone-test.glb missing — run: node scripts/build-physics-test-glb.mjs',
       );
     }
 
-    const gltf = await new GLTFLoader().loadAsync('/models/physics-zone-test.glb');
+    const gltf = await new GLTFLoader().loadAsync(DEV_GLB.physicsZone);
 
     const byPath = new Map<string, Record<string, Record<string, unknown>>>();
     gltf.scene.traverse((node: Object3D) => {
@@ -374,7 +375,7 @@ describe('physics-zone-test.glb fixture', () => {
   }, 15000);
 
   it('zone volume built from the fixture covers the conveyor end (handover area)', async () => {
-    const gltf = await new GLTFLoader().loadAsync('/models/physics-zone-test.glb');
+    const gltf = await new GLTFLoader().loadAsync(DEV_GLB.physicsZone);
 
     let zoneNode: Object3D | null = null;
     gltf.scene.traverse((node: Object3D) => {

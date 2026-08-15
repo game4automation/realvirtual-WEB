@@ -26,12 +26,17 @@
  */
 
 import { writeFileSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DEV_GLB } from '../tests/fixtures/glb-paths.mjs';
 
-// The test fixtures live with every other bundled demo asset in public/models/.
-const outDir = join(dirname(fileURLToPath(import.meta.url)),
-  '..', 'public', 'models');
+// The output path is DERIVED from the one asset-path source of truth
+// (`tests/fixtures/glb-paths.mjs`) so generator and consumers cannot drift apart
+// (plan-395 §2.3, R3). In phase 1 that URL is still served straight out of
+// `public/`, so the URL path is also the path below `public/`.
+const outPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'public',
+  ...DEV_GLB.physicsZone.split('/').filter(Boolean));
+const outDir = dirname(outPath);
 mkdirSync(outDir, { recursive: true });
 
 // ─── Unit-cube geometry (centered at origin, size 1) ────────────────────────
@@ -170,6 +175,5 @@ binChunkHeader.writeUInt32LE(binChunk.length, 0);
 binChunkHeader.writeUInt32LE(0x004e4942, 4); // 'BIN\0'
 
 const glb = Buffer.concat([header, jsonChunkHeader, jsonChunk, binChunkHeader, binChunk]);
-const outPath = join(outDir, 'physics-zone-test.glb');
 writeFileSync(outPath, glb);
-console.log(`physics-zone-test.glb  (${glb.length} bytes) → ${outPath}`);
+console.log(`${basename(outPath)}  (${glb.length} bytes) → ${outPath}`);

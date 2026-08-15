@@ -11,7 +11,7 @@ import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { SelectionSnapshot } from '../src/core/engine/rv-selection-manager';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
-import { computeQuickEditContext } from '../src/plugins/asset-editor/kinematics/quick-edit-context';
+import { computeQuickEditContext } from '@rv-private/plugins/asset-editor/kinematics/quick-edit-context';
 
 function makeViewer() {
   const scene = new Scene();

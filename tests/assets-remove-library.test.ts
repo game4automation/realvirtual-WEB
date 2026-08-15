@@ -12,10 +12,7 @@
  *      detail pane keeps describing a source that no longer exists (R5).
  */
 import { describe, test, expect, beforeEach, afterEach } from 'vitest';
-import {
-  buildAssetGroups,
-  selectionPointsIntoGroup,
-} from '../src/core/hmi/projects/assets-library-groups';
+import { selectionPointsIntoGroup } from '../src/core/hmi/projects/assets-library-groups';
 import {
   listLibrarySources,
   resetLibrarySourceRegistryForTests,
@@ -42,8 +39,6 @@ class FakeLibraryStore implements LibraryStoreLike {
   subscribe(l: () => void) { this._listeners.add(l); return () => { this._listeners.delete(l); }; }
   getOrigin(url: string) { return this.origins.get(url) ?? null; }
   removeCatalog(url: string) { this.catalogUrls = this.catalogUrls.filter(u => u !== url); }
-  async removeLocalFolder() {}
-  async refreshLocalFolder() {}
 }
 
 /** Minimal project store whose backend lists an empty library folder. */
@@ -79,12 +74,13 @@ describe('removing a library', () => {
     // The project provider fills its source asynchronously.
     await new Promise(r => setTimeout(r, 0));
 
-    const groups = buildAssetGroups({
-      sources: listLibrarySources(),
-      searchTerm: '',
-      onSelect: () => {},
-    });
-    const byKind = Object.fromEntries(groups.map(g => [g.kind, g.removable]));
+    // Read the registry DIRECTLY. The grouping layer this used to go through
+    // was deleted with the Assets tab (plan-709 phase 6), and it only ever
+    // copied `typeof source.remove === 'function'` into a `removable` field —
+    // asking the source itself is the same rule with one fewer indirection.
+    const byKind = Object.fromEntries(
+      listLibrarySources().map(({ source }) => [source.kind, typeof source.remove === 'function']),
+    );
 
     expect(byKind.bundled).toBe(false);
     expect(byKind.project).toBe(false);

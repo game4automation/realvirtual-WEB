@@ -9,13 +9,16 @@
  * that decides whether a user's work survives is kept where a test can reach
  * all of it.
  *
- * ## There are TWO cache states per scene, not one (Blocker B3)
+ * ## There used to be TWO cache states per scene (Blocker B3)
  *
- * `rv-scenes/<id>` holds the last **saved** record; `rv-scenes/scene-draft/<id>`
- * holds the 2 s autosave of the **working** state. `openScene()` prefers the
- * draft (`readSceneDraft(id) ?? scene`). Comparing only the saved record
- * against the folder therefore has two failure modes, and both are fatal to
- * user data:
+ * `rv-scenes/<id>` holds the last **saved** record. A second slot,
+ * `rv-scenes/scene-draft/<id>`, held the autosave of the working state, and
+ * `openScene()` preferred it — so comparing only the saved record against the
+ * folder had two failure modes, both fatal to user data. Since plan-413 phase 6
+ * that slot has no writer and no reader (an autosave is a GLB body), so callers
+ * pass `draft: null` and only the first of the two remains reachable. The
+ * `draft` parameter stays because the comparison is still the honest place to
+ * express "there is unsaved work", should a future one arrive:
  *
  *  1. Someone who edits but never presses Save has their work *only* in the
  *     draft. The saved record still carries the old `modifiedAt`, the naive
@@ -71,6 +74,17 @@ export interface FolderSceneState {
   modifiedAt?: string | null;
   /** The parsed body, when the caller has already read it. */
   scene?: RvScene | null;
+  /**
+   * Content revision of the folder body (SHA-256), when known (plan-397 §2.8).
+   *
+   * From `RvProjectSceneEntry.revision` or from a `SceneRecord` that was read.
+   * It contributes **existence, not equality**: a manifest entry that carries
+   * a revision proves the folder has a body here even when it carries no
+   * `modifiedAt`, which is the shape a GLB entry has. What it is deliberately
+   * *not* compared against is the recorded cache revision — see step 4 of
+   * {@link resolveSceneConflict}.
+   */
+  revision?: string | null;
 }
 
 export interface SceneConflictInput {
@@ -118,6 +132,7 @@ export function compareTimestamps(a: string | null, b: string | null): number {
 function folderIsKnown(folder: FolderSceneState | null): boolean {
   if (!folder) return false;
   if (folder.scene) return true;
+  if (typeof folder.revision === 'string' && folder.revision.trim() !== '') return true;
   return typeof folder.modifiedAt === 'string' && folder.modifiedAt.trim() !== '';
 }
 
@@ -159,6 +174,16 @@ export function resolveSceneConflict(input: SceneConflictInput): SceneConflictRe
   // 4 — content decides over clocks. Hydration alone rewrites the cache's
   //     `modifiedAt` to "now", so a purely timestamp-based answer would
   //     report a conflict on every single re-open of an untouched project.
+  //
+  //
+  //     Note what is deliberately NOT done here (plan-397 §2.8): the recorded
+  //     `cachedRevision` is *not* compared against `folder.revision`. That
+  //     pairing looks like a free content check and is not one — the cached
+  //     revision says which folder body the cache was **filled from**, not
+  //     what the cache holds **now**. A user who saved a local edit still
+  //     matches it, and the comparison would answer "equal" over their work.
+  //     A revision is the precondition for a *write*; the open-time decision
+  //     stays content-based.
   if (folderScene && scenesEqual(folderScene, cacheScene)) return 'equal';
 
   const folderAt = typeof folder?.modifiedAt === 'string'

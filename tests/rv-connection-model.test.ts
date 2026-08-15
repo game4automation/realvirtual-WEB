@@ -18,7 +18,8 @@ import {
   validateConnectionParams,
   type RvConnection,
 } from '../src/core/engine/rv-connection-registry';
-import { materialise, inverseOp, describeOp, type AddConnectionOp, type RemoveConnectionOp, type SetConnectionTypeOp } from '../src/core/hmi/scene/rv-scene-edits';
+import { materialise, inverseOp, type AddConnectionOp, type RemoveConnectionOp, type SetConnectionTypeOp } from '../src/core/hmi/scene/rv-scene-edits';
+import { describeRvOp } from '../src/core/ops/rv-unified-ops';
 
 const edge = (id: string, source: string, target: string, type = 'StopOnExit'): RvConnection =>
   ({ id, source, target, type });
@@ -162,10 +163,10 @@ describe('persistence round-trip (op log → materialise)', () => {
     expect(invEdit.kind).toBe('setConnectionType');
   });
 
-  it('describeOp yields readable labels', () => {
+  it('describeRvOp yields readable labels', () => {
     const add: AddConnectionOp = { ...base, id: 'op1', kind: 'addConnection', connection: edge('c1', 'Line/Sensor', 'Cell/Scanner') };
-    expect(describeOp(add)).toContain('Sensor');
-    expect(describeOp(add)).toContain('Scanner');
-    expect(describeOp(add)).toContain('StopOnExit');
+    expect(describeRvOp(add)).toContain('Sensor');
+    expect(describeRvOp(add)).toContain('Scanner');
+    expect(describeRvOp(add)).toContain('StopOnExit');
   });
 });

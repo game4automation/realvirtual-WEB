@@ -13,11 +13,18 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { ThumbnailCache, THUMBNAIL_BUCKET_V2 } from '../src/core/thumbnails/thumbnail-cache';
+import { ThumbnailCache, THUMBNAIL_BUCKET_V4 } from '../src/core/thumbnails/thumbnail-cache';
 import { buildThumbnailKey, NO_PROJECT } from '../src/core/thumbnails/thumbnail-key';
 
+interface FakeCaches {
+  buckets: Map<string, Map<string, Response>>;
+  deleted: string[];
+  /** Pre-create a bucket so a purge has something real to delete. */
+  seed(name: string): void;
+}
+
 /** Minimal in-memory Cache API stub (keyed by request URL string). */
-function installFakeCaches(): { buckets: Map<string, Map<string, Response>>; deleted: string[] } {
+function installFakeCaches(): FakeCaches {
   const buckets = new Map<string, Map<string, Response>>();
   const deleted: string[] = [];
   const fake = {
@@ -32,7 +39,11 @@ function installFakeCaches(): { buckets: Map<string, Map<string, Response>>; del
     delete: async (name: string) => { deleted.push(name); return buckets.delete(name); },
   };
   vi.stubGlobal('caches', fake);
-  return { buckets, deleted };
+  return {
+    buckets,
+    deleted,
+    seed(name: string) { buckets.set(name, new Map()); },
+  };
 }
 
 const KEY_A = buildThumbnailKey({ projectId: 'p1', providerId: 'core', sourceId: 's', assetId: 'a' });
@@ -68,19 +79,37 @@ describe('ThumbnailCache', () => {
     expect(await cache.get(KEY_A)).toBeNull();
   });
 
-  it('purges the legacy glbUrl-keyed bucket once, and only for the default bucket', async () => {
-    const { deleted } = installFakeCaches();
+  /**
+   * One test for the whole purge behaviour on purpose: the `_purged` guard is
+   * module-scope, so whichever test ran first would consume the single purge
+   * and leave the other asserting nothing.
+   */
+  it('purges the v2 and legacy buckets once per session, only for the default bucket', async () => {
+    const fake = installFakeCaches();
+    fake.seed('rv-thumbnails-v2');        // pre-plan-712 256px previews
+    fake.seed('rv-planner-thumbnails');   // pre-plan-372 glbUrl-keyed previews
+
     // A test bucket must never delete a real user's cache.
     await new ThumbnailCache('test-bucket').get(KEY_A);
-    expect(deleted).not.toContain('rv-planner-thumbnails');
+    expect(fake.deleted).toEqual([]);
 
-    await new ThumbnailCache(THUMBNAIL_BUCKET_V2).get(KEY_A);
-    expect(deleted).toContain('rv-planner-thumbnails');
+    await new ThumbnailCache(THUMBNAIL_BUCKET_V4).get(KEY_A);
+    expect(fake.deleted).toEqual(
+      expect.arrayContaining(['rv-thumbnails-v2', 'rv-planner-thumbnails']),
+    );
 
     // Second instance must not purge again (module-scope guard).
-    const before = deleted.filter(d => d === 'rv-planner-thumbnails').length;
-    await new ThumbnailCache(THUMBNAIL_BUCKET_V2).get(KEY_B);
-    expect(deleted.filter(d => d === 'rv-planner-thumbnails').length).toBe(before);
+    const deletesAfterFirst = fake.deleted.length;
+    await new ThumbnailCache(THUMBNAIL_BUCKET_V4).get(KEY_B);
+    expect(fake.deleted.length).toBe(deletesAfterFirst);
+  });
+
+  it('serves the current generation from the v3 bucket', async () => {
+    const fake = installFakeCaches();
+    const cache = new ThumbnailCache();   // default bucket
+    await cache.put(KEY_A, new Blob(['png'], { type: 'image/png' }));
+    expect(fake.buckets.has(THUMBNAIL_BUCKET_V4)).toBe(true);
+    expect(THUMBNAIL_BUCKET_V4).toBe('rv-thumbnails-v4');
   });
 });
 

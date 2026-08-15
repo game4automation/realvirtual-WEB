@@ -52,6 +52,12 @@ import type { RVViewer } from '../rv-viewer';
 import type { LayoutPlannerPlugin } from '../../plugins/layout-planner';
 import type { SnapPointPlugin } from '../../plugins/snap-point';
 import { getOverriddenFields } from '../engine/rv-extras-overlay-store';
+import {
+  overrideTargetOf,
+  overriddenFieldsOf,
+  revertComponentOverride,
+  writeOverride,
+} from '../ops/rv-reference-guard';
 import { USER_PAUSE_REASON } from '../engine/rv-constants';
 import { LeftPanel } from './LeftPanel';
 import { AasDetailHeaderAction } from '../../plugins/aas-link-plugin';
@@ -72,12 +78,14 @@ import { BehaviorSignalSlots } from '../../plugins/signal-bind/InlineSignalSlots
 import { ConnectionsSection } from './rv-connections-section';
 import { findLayoutRoot } from './layout-root-utils';
 import { findPickOwner } from '../engine/rv-pick-owner';
+import { isModelRoot } from '../engine/rv-model-root';
 import { getCapabilities } from '../engine/rv-component-registry';
 import { Vector3Editor } from './rv-field-editors';
 import { InspectorRow } from './rv-inspector-row';
 import { StepState } from '../engine/rv-logic-step';
 import type { StepStateInfo } from '../engine/rv-logic-engine';
 import { STEP_STATE_COLORS, STEP_STATE_LABELS } from './rv-logic-step-colors';
+import { PROVENANCE_REFERENCED_TITLE } from './signal-vocabulary';
 
 // Re-export isHiddenComponentType for backward compatibility
 export { isHiddenComponentType } from './rv-inspector-helpers';
@@ -106,6 +114,55 @@ function loadDetached(): boolean {
 // Virtual (ephemeral) sections never edit/reset — pass shared frozen handlers
 // so they don't allocate a fresh closure per render.
 const EMPTY_OVERRIDES: Set<string> = new Set();
+const NO_FIELDS: readonly string[] = [];
+
+/**
+ * Fields of `componentType` that an enclosing `AssetReference` overrides for
+ * this node (plan-703 F7).
+ *
+ * Empty in `viewer` mode by decision 9 — not because the data is absent, but
+ * because the badge is an EDIT affordance: it is clickable and it reverts. A
+ * kiosk must not offer that, and hiding the control while leaving it reachable
+ * would be worse than not showing it.
+ */
+function referenceOverriddenFields(
+  viewer: RVViewer,
+  nodePath: string,
+  componentType: string,
+): readonly string[] {
+  if (viewer.modes.activeMode === 'viewer') return NO_FIELDS;
+  const node = viewer.registry?.getNode(nodePath);
+  if (!node) return NO_FIELDS;
+  const target = overrideTargetOf(node, viewer.currentModelRoot ?? null);
+  if (!target) return NO_FIELDS;
+  return overriddenFieldsOf(target.referenceNode, target.nodeId, componentType);
+}
+
+/**
+ * Drop the instance override for one field — or, with no field, for the whole
+ * component.
+ *
+ * A no-op when the node is not inside a reference, which is the common case;
+ * the caller does not branch, so a Revert always means the same thing.
+ */
+function revertReferenceOverride(
+  viewer: RVViewer,
+  nodePath: string,
+  componentType: string,
+  fieldName?: string,
+): void {
+  if (viewer.modes.activeMode === 'viewer') return;
+  const node = viewer.registry?.getNode(nodePath);
+  if (!node) return;
+  const target = overrideTargetOf(node, viewer.currentModelRoot ?? null);
+  if (!target) return;
+  if (fieldName === undefined) {
+    revertComponentOverride(target.referenceNode, target.nodeId, componentType);
+  } else {
+    writeOverride(target.referenceNode, target.nodeId, componentType, fieldName, undefined);
+  }
+  viewer.markRenderDirty();
+}
 const NOOP_FIELD_EDIT = (_fieldName: string, _value: unknown): void => { /* read-only */ };
 const NOOP_FIELD_RESET = (_fieldName: string): void => { /* read-only */ };
 const NOOP_RESET = (): void => { /* read-only */ };
@@ -364,6 +421,10 @@ interface LayoutTransformSectionProps {
   viewer: RVViewer;
   nodePath: string;
   locked: boolean;
+  /** The lock is a PROPERTY of the node, not a user setting — hide the toggle
+   *  entirely (the model root, plan-715). A disabled toggle would invite the
+   *  question "how do I unlock it", which has no answer. */
+  lockFixed?: boolean;
   onToggleLock?: () => void;
   /** Toggle for the universal Visible flag — rendered next to the lock
    *  icon in the section header. Receives the new desired value. */
@@ -377,7 +438,7 @@ interface LayoutTransformSectionProps {
   canReverse?: boolean;
 }
 
-function LayoutTransformSection({ viewer, nodePath, locked, onToggleLock, onToggleVisible, onReverseDirection, canReverse }: LayoutTransformSectionProps) {
+function LayoutTransformSection({ viewer, nodePath, locked, lockFixed, onToggleLock, onToggleVisible, onReverseDirection, canReverse }: LayoutTransformSectionProps) {
   const node = viewer.registry?.getNode(nodePath);
 
   // Poll position/rotation at 200 ms for live updates (e.g. during a
@@ -493,15 +554,21 @@ function LayoutTransformSection({ viewer, nodePath, locked, onToggleLock, onTogg
             </IconButton>
           </Tooltip>
         )}
-        <Tooltip title={locked ? 'Unlock object' : 'Lock object'}>
-          <IconButton
-            size="small"
-            onClick={onToggleLock}
-            sx={{ p: 0.25, color: locked ? '#ffa726' : 'text.secondary', '&:hover': { color: locked ? '#ffb74d' : 'text.primary' } }}
-          >
-            {locked ? <Lock sx={{ fontSize: 14 }} /> : <LockOpen sx={{ fontSize: 14 }} />}
-          </IconButton>
-        </Tooltip>
+        {lockFixed ? (
+          <Tooltip title="Model root — always at the asset origin, not editable">
+            <Lock sx={{ fontSize: 14, color: 'text.disabled', mx: 0.25 }} />
+          </Tooltip>
+        ) : (
+          <Tooltip title={locked ? 'Unlock object' : 'Lock object'}>
+            <IconButton
+              size="small"
+              onClick={onToggleLock}
+              sx={{ p: 0.25, color: locked ? '#ffa726' : 'text.secondary', '&:hover': { color: locked ? '#ffb74d' : 'text.primary' } }}
+            >
+              {locked ? <Lock sx={{ fontSize: 14 }} /> : <LockOpen sx={{ fontSize: 14 }} />}
+            </IconButton>
+          </Tooltip>
+        )}
       </Box>
       <Box sx={{ py: 0.5, opacity: locked ? 0.5 : 1, pointerEvents: locked ? 'none' : 'auto' }}>
         <InspectorRow
@@ -599,6 +666,22 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
     return !!(rv?.LayoutObject?.Locked);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedPath, viewer.registry, state]);
+
+  /**
+   * The selected node is the GLB root (plan-715).
+   *
+   * It gets the SAME Transform section as a placed LayoutObject, permanently
+   * locked: the numbers are worth reading (they are the asset's 0,0,0 promise)
+   * and must not be editable, because moving the root would move the whole file
+   * relative to its own origin. Only the transform is frozen — components and
+   * metadata below stay fully editable, which is the point of making the root
+   * addressable in the first place.
+   */
+  const isRootSelected = useMemo(
+    () => isModelRoot(selectedPath ? viewer.registry?.getNode(selectedPath) : null, viewer.currentModelRoot),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [selectedPath, viewer, state],
+  );
 
   // Check if the selected node has a LogicStep component
   const hasLogicStep = nodeData?.components.some(c => c.type.startsWith('LogicStep_')) ?? false;
@@ -735,17 +818,22 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   const handleFieldReset = useCallback(
     (componentType: string, fieldName: string) => {
       if (!selectedPath || !plugin) return;
+      // Revert the instance override first, then the overlay one. Both, not
+      // either: a field can legitimately carry one of each, and a Revert that
+      // cleared only the nearer of the two would look like it had failed.
+      revertReferenceOverride(viewer, selectedPath, componentType, fieldName);
       plugin.resetField(selectedPath, componentType, fieldName);
     },
-    [plugin, selectedPath],
+    [plugin, selectedPath, viewer],
   );
 
   const handleComponentReset = useCallback(
     (componentType: string) => {
       if (!selectedPath || !plugin) return;
+      revertReferenceOverride(viewer, selectedPath, componentType);
       plugin.resetComponent(selectedPath, componentType);
     },
-    [plugin, selectedPath],
+    [plugin, selectedPath, viewer],
   );
 
   const handleResetAll = useCallback(() => {
@@ -843,11 +931,13 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   // ── Shared footer ─────────────────────────────────────────────────────
   const footerContent = (
     <>
-      {/* Referenced by section */}
+      {/* Reverse references. Shares its title with the signal tooltip's incoming
+          block on purpose (plan-353 F4): same relation, same word — the title
+          comes from the vocabulary SSOT so they cannot drift apart. */}
       {referencedBy.length > 0 && (
         <Box sx={{ px: 1, py: 0.75, borderTop: '1px solid rgba(255,255,255,0.06)' }}>
           <Typography sx={{ fontSize: 9, color: 'text.disabled', mb: 0.5, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>
-            Referenced by
+            {PROVENANCE_REFERENCED_TITLE}
           </Typography>
           <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
             {referencedBy.map((ref, i) => {
@@ -1007,6 +1097,12 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
         />
       )}
 
+      {/* Model root: read-only Transform. No lock toggle and no visibility
+          toggle — those are not "off by default" here, they do not exist. */}
+      {!hasLayoutObject && isRootSelected && selectedPath && (
+        <LayoutTransformSection viewer={viewer} nodePath={selectedPath} locked lockFixed />
+      )}
+
       {/* Signal linking is INLINE since plan-325: every componentRef+signal
           schema field renders as a SignalSlotRow inside its component section
           (the former "Signals (CONNECT)" SignalBindSection was removed). */}
@@ -1028,9 +1124,15 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
         <Box sx={{ opacity: layoutLocked ? 0.5 : 1, pointerEvents: layoutLocked ? 'none' : 'auto' }}>
           {/* Real (editable) component sections FIRST. */}
           {nodeData.components.map(({ type, data }) => {
-            const overriddenFields = new Set(
-              state.overlay ? getOverriddenFields(selectedPath, type, state.overlay) : [],
-            );
+            // Two sources, one badge (plan-703 F7): the scene overlay's own
+            // overrides, and the `AssetOverrides` an enclosing reference node
+            // carries for this node. They are the same idea addressed two ways —
+            // "this file changes that value" — so showing them separately would
+            // make the user learn a distinction that only exists in storage.
+            const overriddenFields = new Set([
+              ...(state.overlay ? getOverriddenFields(selectedPath, type, state.overlay) : []),
+              ...referenceOverriddenFields(viewer, selectedPath, type),
+            ]);
             // Editable rows show CONFIG only (static + overlay) so the
             // override/save model stays coherent: what you see is what you
             // save. Live runtime state is shown read-only in the virtual

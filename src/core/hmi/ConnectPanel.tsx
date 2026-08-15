@@ -163,7 +163,6 @@ import {
 } from '../import/s7-tag-table';
 import { ISA_GREEN, ISA_RED, ISA_AMBER, connectionStateColor } from './isa-colors';
 import { SignalBadge } from './rv-signal-badge';
-import { middleTruncate } from './rv-middle-truncate';
 import { SignalEditDialog } from './SignalEditDialog';
 import {
   buildTopicTree,
@@ -172,6 +171,7 @@ import {
   type TopicTreeEntry,
 } from './build-topic-tree';
 import { armSignalDrag, consumeSignalDragClick } from './signal-drag-store';
+import { omitUndefined } from './rv-omit-undefined';
 import {
   applySelection,
   groupKeysByTopic,
@@ -736,7 +736,14 @@ export function ConnectPanel() {
    * Reuses an existing sink interface of that type when present, otherwise creates one with the
    * gateway catalog's defaults, then appends a `*` mirror rule. Direction-preserving.
    */
-  const handleOneClickMirror = useCallback(async (iface: ConnectInterface, targetType: 'MQTT' | 'SHM') => {
+  const handleOneClickMirror = useCallback(async (
+    iface: ConnectInterface,
+    targetType: 'MQTT' | 'SHM',
+    // plan-353 F10: supplied by the MQTT prefix popover. SHM passes nothing —
+    // the resolver hands the prefix through sink-independently, but only the
+    // MQTT worker evaluates it, so offering it for SHM would be a lie.
+    topicPrefix = '',
+  ) => {
     try {
       let target = snap.interfaces.find(i => i.type === targetType && i.id !== iface.id);
       if (!target) {
@@ -760,7 +767,7 @@ export function ConnectPanel() {
         sourceInterfaceId: iface.id,
         targetInterfaceId: target.id,
         signalPattern: '*',
-        topicPrefix: '',
+        topicPrefix: targetType === 'MQTT' ? topicPrefix : '',
       }]);
     } catch (err) {
       bridges.setError(err instanceof Error ? err.message : 'Failed to create mirror.');
@@ -1056,7 +1063,10 @@ export function ConnectPanel() {
                         onImport={() => handleOpenImport(iface.id)}
                         onEdit={() => setEditIface(iface)}
                         onDelete={() => handleRemoveInterface(iface)}
-                        onMirror={bridges.supported ? (t) => void handleOneClickMirror(iface, t) : undefined}
+                        onMirror={bridges.supported
+                          ? (t, prefix) => void handleOneClickMirror(iface, t, prefix)
+                          : undefined}
+                        mirrorRole={mirrorRoleFor(iface.id, bridges.mirrors)}
                       />
                     </Box>
                     {/* Signals shown inline whenever the interface is expanded — tree grows to fill space */}
@@ -1181,6 +1191,7 @@ function InterfaceCard({
   onEdit,
   onDelete,
   onMirror,
+  mirrorRole,
 }: {
   iface: ConnectInterface;
   status?: string;
@@ -1196,12 +1207,29 @@ function InterfaceCard({
   onImport: () => void;
   onEdit: () => void;
   onDelete: () => void;
-  /** One-click mirror to a sink type (plan-257) — undefined hides the button (older gateway). */
-  onMirror?: (targetType: 'MQTT' | 'SHM') => void;
+  /** One-click mirror to a sink type (plan-257) — undefined hides the button (older gateway).
+   *  `topicPrefix` is supplied for MQTT only (plan-353 F10); SHM ignores it. */
+  onMirror?: (targetType: 'MQTT' | 'SHM', topicPrefix?: string) => void;
+  /** Mirror rules referencing this interface (plan-353 F11) — drives the badges. */
+  mirrorRole?: { isSource: boolean; isTarget: boolean };
 }) {
   // All per-interface actions live in one "⋮" menu so the card stays a single line.
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
   const closeMenu = useCallback(() => setMenuAnchor(null), []);
+
+  // MQTT mirror prefix popover (plan-353 F10) — own state, unrelated to the
+  // Excel-import prefix elsewhere in this file.
+  const [prefixAnchor, setPrefixAnchor] = useState<HTMLElement | null>(null);
+  const [topicPrefix, setTopicPrefix] = useState('');
+  const closePrefix = useCallback(() => setPrefixAnchor(null), []);
+  const confirmPrefixMirror = useCallback(() => {
+    setPrefixAnchor(null);
+    onMirror?.('MQTT', topicPrefix);
+    setTopicPrefix('');
+  }, [onMirror, topicPrefix]);
+
+  /** A sink cannot mirror into itself, and an older gateway hides the action. */
+  const canMirror = !!onMirror && iface.type !== 'MQTT' && iface.type !== 'SHM';
   // Count ProcessImage topic signals + legacy signals (R19 — otherwise always 0 for ProcessImage).
   const signalCount = interfaceSignalCount(iface);
 
@@ -1287,6 +1315,30 @@ function InterfaceCard({
             {iface.id}{endpoint && endpoint !== iface.id ? ` · ${endpoint}` : ''}
           </Typography>
         </Tooltip>
+        {/* Mirror badges (plan-353 F11): a mirror rule is configured in the
+            Bridges section further down, so from the interface card alone there
+            was no way to see that this interface feeds — or is fed by — another
+            one. Both can be true at once, hence two independent badges. */}
+        {mirrorRole?.isSource && (
+          <Tooltip title="Mirror source — all signals of this interface are mirrored into a sink">
+            <Chip
+              size="small"
+              label="Mirror source"
+              data-testid="mirror-source-badge"
+              sx={MIRROR_BADGE_SX}
+            />
+          </Tooltip>
+        )}
+        {mirrorRole?.isTarget && (
+          <Tooltip title="Mirror target — this interface receives signals mirrored from another">
+            <Chip
+              size="small"
+              label="Mirror target"
+              data-testid="mirror-target-badge"
+              sx={MIRROR_BADGE_SX}
+            />
+          </Tooltip>
+        )}
         {/* Always-visible amber badge: N configured signals can never decode (details on click). */}
         {!!signalIssues?.length && <SignalIssueBadge issues={signalIssues} />}
         <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.6)', fontFamily: 'monospace', flexShrink: 0 }}>
@@ -1335,14 +1387,19 @@ function InterfaceCard({
           <Edit sx={{ fontSize: 14, color: 'rgba(255,255,255,0.6)' }} /> Edit…
         </MenuItem>
         {/* One-click bridge: mirror ALL signals of this interface into an MQTT/SHM sink,
-            direction-preserving (out stays out, in stays in). Sinks don't offer it. */}
-        {onMirror && iface.type !== 'MQTT' && iface.type !== 'SHM' && (
-          <MenuItem sx={{ fontSize: 12, gap: 1 }} onClick={() => { closeMenu(); onMirror('MQTT'); }}>
-            <SwapHoriz sx={{ fontSize: 14, color: 'rgba(255,255,255,0.6)' }} /> Mirror to MQTT
+            direction-preserving (out stays out, in stays in). Sinks don't offer it.
+            MQTT asks for a topic prefix first (plan-353 F10) — see the popover
+            below; SHM has no topics, so it stays a single-click action. */}
+        {canMirror && (
+          <MenuItem
+            sx={{ fontSize: 12, gap: 1 }}
+            onClick={(e) => { setMenuAnchor(null); setPrefixAnchor(e.currentTarget); }}
+          >
+            <SwapHoriz sx={{ fontSize: 14, color: 'rgba(255,255,255,0.6)' }} /> Mirror to MQTT…
           </MenuItem>
         )}
-        {onMirror && iface.type !== 'MQTT' && iface.type !== 'SHM' && (
-          <MenuItem sx={{ fontSize: 12, gap: 1 }} onClick={() => { closeMenu(); onMirror('SHM'); }}>
+        {canMirror && (
+          <MenuItem sx={{ fontSize: 12, gap: 1 }} onClick={() => { closeMenu(); onMirror!('SHM'); }}>
             <SwapHoriz sx={{ fontSize: 14, color: 'rgba(255,255,255,0.6)' }} /> Mirror to SHM (shared memory)
           </MenuItem>
         )}
@@ -1351,6 +1408,53 @@ function InterfaceCard({
           <Delete sx={{ fontSize: 14 }} /> Delete interface…
         </MenuItem>
       </Menu>
+
+      {/* MQTT topic-prefix popover (plan-353 F10). The prefix used to be written
+          as a hard-coded '' with no way to set it, so every mirrored signal
+          landed at the broker root — on a shared broker that is a collision
+          waiting to happen. Own state, deliberately NOT the Excel-import prefix
+          further down this file: same word, unrelated setting. An empty prefix
+          stays legal and reproduces the old behaviour. */}
+      <Popover
+        open={!!prefixAnchor}
+        anchorEl={prefixAnchor}
+        onClose={closePrefix}
+        onClick={(e) => e.stopPropagation()}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'left' }}
+      >
+        <Box sx={{ p: 1.25, display: 'flex', flexDirection: 'column', gap: 1, minWidth: 240 }}>
+          <Typography sx={{ fontSize: 11, color: 'text.secondary' }}>
+            Mirror all signals of <b>{iface.id}</b> to MQTT
+          </Typography>
+          <TextField
+            autoFocus
+            size="small"
+            label="Topic prefix"
+            placeholder="plant1/"
+            value={topicPrefix}
+            onChange={(e) => setTopicPrefix(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') confirmPrefixMirror(); }}
+            inputProps={{ 'aria-label': 'MQTT topic prefix' }}
+            sx={{ '& .MuiInputBase-input': { fontSize: 12 } }}
+          />
+          <Typography sx={{ fontSize: 10, color: 'text.disabled' }}>
+            Prepended to each signal name. Leave empty to publish at the root.
+          </Typography>
+          <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 0.5 }}>
+            <Button size="small" sx={{ fontSize: 11, textTransform: 'none' }} onClick={closePrefix}>
+              Cancel
+            </Button>
+            <Button
+              size="small"
+              variant="contained"
+              sx={{ fontSize: 11, textTransform: 'none' }}
+              onClick={confirmPrefixMirror}
+            >
+              Mirror
+            </Button>
+          </Box>
+        </Box>
+      </Popover>
 
     </Box>
   );
@@ -2291,8 +2395,8 @@ function EditInterfaceDialog({ iface, open, onClose }: { iface: ConnectInterface
 const EMPTY_LINKS: ReadonlyMap<string, { path: string; slot: string; placedId: string }[]> = new Map();
 
 const SIGNAL_ROW_HEIGHT = 34;
-const CONNECT_SIGNAL_NAME_MAX = 24;
-const CONNECT_SIGNAL_SUBTITLE_MAX = 32;
+// (plan-422 F4) The 24/32-character caps that used to sit here are gone: both
+// signal-row lines ellipsise in CSS against the column's real width.
 const GROUP_ROW_HEIGHT = 24;
 /** Touch press duration that stands in for a right-click on a signal row. */
 const LONG_PRESS_MS = 500;
@@ -2421,9 +2525,17 @@ const SignalRowItem = memo(function SignalRowItem({
   // Inactive state (stale / no-source) is shown as a bare icon only — the text
   // hint stays as a hover tooltip so the row stays compact (no inline label).
 
-  // The WHOLE row is a Shift+Drag source (plan-246 F8) — the chip alone is too
-  // small a grab handle. Same payload as the chip; Shift+Click without movement
-  // stays inert (the drag store suppresses the trailing click).
+  // The WHOLE row is a drag source (plan-246 F8) — the chip alone is too small
+  // a grab handle. Same payload as the chip.
+  //
+  // Since plan-422 F6 the mouse needs no Shift: a plain press arms the drag and
+  // the movement threshold decides, with `clickOnRelease` keeping a press that
+  // never moved as the ordinary row click (selection). Shift+press keeps its
+  // historical meaning — armed, and inert on release.
+  //
+  // TOUCH deliberately does NOT arm a drag here: the row's long press is
+  // already the context menu (below), and one hold cannot mean two things. The
+  // chip inside the row is the touch drag handle.
   // Long-press = the touch equivalent of right-click (there is no contextmenu event worth relying
   // on across mobile browsers). Armed on a touch/pen press and cancelled by movement, release or a
   // cancelled pointer, so a scroll fling never opens the menu.
@@ -2445,15 +2557,18 @@ const SignalRowItem = memo(function SignalRowItem({
         onContextMenu(sig, clientX, clientY, topic);
       }, LONG_PRESS_MS);
     }
-    if (!e.shiftKey || e.button !== 0) return;
-    e.preventDefault();
-    e.stopPropagation();
+    if (e.button !== 0 || e.pointerType === 'touch') return;
+    if (e.shiftKey) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     const source = viewer.signalStore?.getSignalMeta(sig.name)?.source;
     armSignalDrag(
       // A CONNECT row knows its own interface — origin is never guessed here.
-      { name: sig.name, direction, plcType, address: sig.protocolAddress, comment: sig.comment, source, interfaceId, topic, origin: 'connect' },
+      omitUndefined({ name: sig.name, direction, plcType, address: sig.protocolAddress, comment: sig.comment, source, interfaceId, topic, origin: 'connect' as const }),
       e.clientX,
       e.clientY,
+      e.shiftKey ? {} : { clickOnRelease: true },
     );
   }, [viewer, sig, sig.name, sig.protocolAddress, sig.comment, direction, plcType, interfaceId, topic,
       onContextMenu, cancelLongPress]);
@@ -2501,18 +2616,20 @@ const SignalRowItem = memo(function SignalRowItem({
         </Tooltip>
       )}
       <Box sx={{ flex: 1, minWidth: 0 }}>
-        <Typography sx={{ fontSize: 11, color: limitExceeded ? ISA_AMBER : 'rgba(255,255,255,0.85)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {middleTruncate(sig.name, CONNECT_SIGNAL_NAME_MAX)}
+        {/* plan-422 F4: both lines already ellipsise in CSS against the real
+            column width. The character pre-cut that used to run first simply
+            got there before CSS could and produced "PLC_ExitCon…" in a panel
+            with room to spare. The full text stays reachable via `title`. */}
+        <Typography title={sig.name} sx={{ fontSize: 11, color: limitExceeded ? ISA_AMBER : 'rgba(255,255,255,0.85)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {sig.name}
         </Typography>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0 }}>
           <Typography
             noWrap
+            title={`${sig.protocolAddress}${sig.dataType ? ` · ${sig.dataType}` : ''}${sig.comment ? ` · ${sig.comment}` : ''}`}
             sx={{ fontSize: 10, color: 'rgba(255,255,255,0.6)', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', flex: 1, minWidth: 0 }}
           >
-            {middleTruncate(
-              `${sig.protocolAddress}${sig.dataType ? ` · ${sig.dataType}` : ''}${sig.comment ? ` · ${sig.comment}` : ''}`,
-              CONNECT_SIGNAL_SUBTITLE_MAX,
-            )}
+            {`${sig.protocolAddress}${sig.dataType ? ` · ${sig.dataType}` : ''}${sig.comment ? ` · ${sig.comment}` : ''}`}
           </Typography>
           {StatusIcon && (
             <Tooltip title={hint} placement="left" disableInteractive>
@@ -4590,6 +4707,38 @@ function useBridges(isConnected: boolean): BridgesApi {
   }, []);
 
   return { mirrors, mappings, supported, error, setError, saveMirrors, saveMappings, reload };
+}
+
+/**
+ * Mirror badge styling (plan-353 F11) — quiet by design: this is a standing
+ * configuration fact, not a status, so it must not compete with the worker
+ * status dot or the amber signal-issue badge next to it.
+ */
+const MIRROR_BADGE_SX = {
+  height: 15,
+  fontSize: 9,
+  flexShrink: 0,
+  bgcolor: 'rgba(79,195,247,0.12)',
+  color: '#4fc3f7',
+  border: '1px solid rgba(79,195,247,0.28)',
+  '& .MuiChip-label': { px: 0.5 },
+} as const;
+
+/** Which side(s) of a mirror rule an interface is on (plan-353 F11). */
+export function mirrorRoleFor(
+  interfaceId: string,
+  mirrors: readonly ConnectMirrorRule[] | null | undefined,
+): { isSource: boolean; isTarget: boolean } {
+  let isSource = false;
+  let isTarget = false;
+  for (const rule of mirrors ?? []) {
+    // Disabled rules describe no live flow, so they raise no badge — the row is
+    // still visible in the Bridges list, which is where you go to re-enable it.
+    if (!rule.enabled) continue;
+    if (rule.sourceInterfaceId === interfaceId) isSource = true;
+    if (rule.targetInterfaceId === interfaceId) isTarget = true;
+  }
+  return { isSource, isTarget };
 }
 
 /** Sink interfaces (valid mirror targets): MQTT and SHM. */

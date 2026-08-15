@@ -7,6 +7,7 @@ import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { SignalBindingManager } from '../src/core/engine/rv-signal-binding-manager';
 import { GizmoOverlayManager } from '../src/core/engine/rv-gizmo-manager';
+import { ContextMenuStore } from '../src/core/hmi/context-menu-store';
 import type { ResolvedSlot } from '../src/core/engine/rv-binding-slot-resolver';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { LoadResult } from '../src/core/engine/rv-scene-loader';
@@ -97,6 +98,9 @@ function makeHarness(
     markRenderDirty: dirty,
     on: () => () => {},
     raycastManager: null,
+    // Real viewers always own one (rv-viewer.ts) — the plugin registers its
+    // "Link signal…" tree item against it in init() (plan-418).
+    contextMenu: new ContextMenuStore(),
   } as unknown as RVViewer;
   return {
     viewer, scene, gizmoManager, nodes, dirty,

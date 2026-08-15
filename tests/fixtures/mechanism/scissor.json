@@ -1,0 +1,19 @@
+{
+  "_generator": {
+    "format": "rv-kinematic-fixture/1",
+    "kind": "state-blob",
+    "plan": "plan-404 Phase 0",
+    "abi": "realvirtualReleaseDLLs/rv-kinematic-solver/ABI.md FormatVersion 2",
+    "solverSourcePath": "Packages/io.realvirtual.professional/Runtime/Kinematics/KinematicSolver.cs",
+    "solverSourceSha256": "3ffe08d09ee0e9f328f0def3737c21f9126f932f65f6949f9ddd4e28ad244da1",
+    "generatedUtc": "2026-08-07T21:35:56Z",
+    "controllerScale": 1000,
+    "regenerate": "Editor menu: realvirtual DEV/Testing/Kinematics/Dump Mechanism Golden Fixtures  |  Headless: Unity.exe -projectPath <project> -batchmode -quit -executeMethod realvirtual.KinematicFixtureDump.DumpFixturesBatch"
+  },
+  "mechanism": "scissor",
+  "formatVersion": 2,
+  "ints": [2, 2, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, -1, -1, -1, 0, 0, 0, 1, 0, 0, 0],
+  "floats": [0.001, 1000, 500, 0, 0, 0, 1, 0, 0, 0, -500, 0, 0, 0, 0, 0, 1, -180, 180, 0, 0],
+  "links": ["Base", "Arm"],
+  "joints": ["J_Hinge"]
+}

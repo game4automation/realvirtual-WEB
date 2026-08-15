@@ -433,6 +433,41 @@ export interface GatewayOriginLocation {
 }
 
 /**
+ * Name of the cookie CONNECT sets on every document it serves itself (plan-426).
+ *
+ * It carries no secret — the value is the constant `1` — and it is deliberately not httpOnly,
+ * because this code is its only consumer. Frozen together with the C# side
+ * (`RemoteHmiLink.OriginMarkerCookieName`): an older CONNECT simply never sets it, and an older
+ * viewer simply never looks, so both mixed combinations behave exactly like before this existed.
+ */
+export const ORIGIN_MARKER_COOKIE = 'rv_connect_origin';
+
+/** `document.cookie`, or an empty string wherever there is no document to ask. */
+function readDocumentCookie(): string {
+  try {
+    return typeof document === 'undefined' ? '' : document.cookie;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * True when this page was served BY a CONNECT gateway — which makes the page origin the gateway.
+ *
+ * Only CONNECT itself can set this marker, which is the whole point: "the page origin is the
+ * gateway" and "the page is hosted somewhere else and the gateway is elsewhere" are otherwise
+ * indistinguishable from inside the browser, and guessing wrong breaks one of the two groups.
+ *
+ * @param cookie Cookie string to read instead of `document.cookie` — for tests.
+ */
+export function isServedByConnectOrigin(cookie?: string): boolean {
+  const source = cookie ?? readDocumentCookie();
+  return source
+    .split(';')
+    .some((entry) => entry.trim() === `${ORIGIN_MARKER_COOKIE}=1`);
+}
+
+/**
  * Default gateway URL for a browser that has never been told one.
  *
  * Since plan-363 CONNECT is the only local web server: it either serves the HMI itself (embedded)
@@ -450,15 +485,25 @@ export interface GatewayOriginLocation {
  * HTML answer on `/health` is recognised as "no gateway here", CONNECT's default port is asked
  * once, and a healthy answer there is adopted and persisted. Only a URL the user typed is left
  * untouched — see {@link shouldAdoptFallbackGateway}.
+ *
+ * @param servedByConnect Whether CONNECT served this very page (plan-426). When it did, the page
+ *   origin IS the gateway whatever the hostname says — that is the second device on the LAN, which
+ *   reaches the gateway at `http://192.168.x.y:5100` and would otherwise look for it on its own
+ *   localhost. The parameter stays an argument rather than a DOM read so this function remains
+ *   pure; {@link defaultGatewayUrl} is the one place that consults the browser.
  */
-export function deriveDefaultGatewayUrl(loc: GatewayOriginLocation): string {
+export function deriveDefaultGatewayUrl(
+  loc: GatewayOriginLocation, servedByConnect: boolean,
+): string {
   if (!/^https?:$/.test(loc.protocol)) return FALLBACK_GATEWAY_URL;
+  if (servedByConnect) return loc.origin;
   return isLoopbackHostname(loc.hostname) ? loc.origin : FALLBACK_GATEWAY_URL;
 }
 
-function defaultGatewayUrl(): string {
+/** The gateway URL for this browser, marker cookie included. Never throws. */
+export function defaultGatewayUrl(): string {
   try {
-    return deriveDefaultGatewayUrl(window.location);
+    return deriveDefaultGatewayUrl(window.location, isServedByConnectOrigin());
   } catch {
     return FALLBACK_GATEWAY_URL;
   }
@@ -468,9 +513,23 @@ function defaultGatewayUrl(): string {
 
 type Listener = () => void;
 
+/**
+ * The gateway URL the store boots with: a remembered one wins, otherwise the derived default.
+ *
+ * Split out from {@link _readInitialUrl} so the bootstrap seam itself is testable (plan-426): the
+ * marker cookie only helps if it is consulted at THIS moment — module load — which is why the
+ * asynchronously delivered app config could not carry it.
+ */
+export function resolveInitialGatewayUrl(
+  stored: string | null, loc: GatewayOriginLocation, servedByConnect: boolean,
+): string {
+  return stored || deriveDefaultGatewayUrl(loc, servedByConnect);
+}
+
 function _readInitialUrl(): string {
   try {
-    return localStorage.getItem(LS_KEY_URL) || defaultGatewayUrl();
+    return resolveInitialGatewayUrl(
+      localStorage.getItem(LS_KEY_URL), window.location, isServedByConnectOrigin());
   } catch {
     return defaultGatewayUrl();
   }
@@ -844,6 +903,10 @@ function _friendlyError(err: unknown, serverUrl: string): string {
       + `CONNECT is probably running on a different port - enter its address under the settings gear, `
       + `for example ${FALLBACK_GATEWAY_URL}.`;
   }
+  if (err instanceof DOMException && err.name === 'AbortError') {
+    return `No gateway answered at ${serverUrl} within ${HEALTH_TIMEOUT_MS / 1000} s. `
+      + 'Start realvirtual CONNECT on that machine, then connect again.';
+  }
   if (err instanceof TypeError || /failed to fetch|networkerror|load failed/i.test(msg)) {
     return `No gateway answered at ${serverUrl}. Start realvirtual CONNECT on that machine, then connect again.`;
   }
@@ -865,9 +928,24 @@ interface GatewayHealth {
   updateReason?: string | null;
 }
 
+/**
+ * Abort a /health probe after this long. A silently dropped connection (firewall eats SYNs
+ * without RST) otherwise parks `connectToServer` in 'connecting' for the OS default timeout —
+ * and while the boot probe is in flight, `retryInFlight` blocks even the visibility/online
+ * wake trigger (debug-026).
+ */
+const HEALTH_TIMEOUT_MS = 5000;
+
 /** Read `/health` from one base URL and insist the answer is a healthy gateway's. */
 async function _fetchGatewayHealth(baseUrl: string): Promise<GatewayHealth> {
-  const resp = await connectRestFetch(`${baseUrl}/health`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await connectRestFetch(`${baseUrl}/health`, { signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
   if (!resp.ok) throw new Error(await _errorMessage(resp));
   const health = await _readGatewayJson<GatewayHealth>(resp, baseUrl);
   if (health.status !== 'ok') throw new Error(`Server reports status: ${health.status}`);
@@ -1937,15 +2015,53 @@ export async function putMappings(mappings: ConnectSignalMapping[]): Promise<voi
 /** Summary of one signal-config profile (full snapshots stay server-side). */
 export interface ConnectProfileInfo {
   name: string;
-  /** Optional GLB model binding — when this model becomes active, the profile activates automatically. */
+  /**
+   * plan-718: the project-relative path of the file this profile lives in — the value a
+   * `documents[].connectRef` points at. Absent for a gateway without a project root.
+   */
+  connectRef?: string | null;
+  /**
+   * plan-718: the manifest documents bound to this profile. More than one is the normal N:1 case
+   * (two models sharing one CONNECT configuration). Empty without a project root.
+   */
+  documents?: string[];
+  /**
+   * @deprecated plan-718 — the legacy GLB file-name binding. Still served for one release
+   * generation; use {@link connectRef}/{@link documents}, which survive renaming the model.
+   */
   model?: string | null;
   interfaceCount: number;
   mirrorCount: number;
   mappingCount: number;
 }
 
-export async function fetchProfiles(): Promise<{ active: string | null; profiles: ConnectProfileInfo[] }> {
-  return _fetchJson<{ active: string | null; profiles: ConnectProfileInfo[] }>('/config/profiles');
+/** What `GET /config/profiles` answers. `projectScoped` is absent on an older gateway. */
+export interface ConnectProfileList {
+  active: string | null;
+  projectScoped?: boolean;
+  profiles: ConnectProfileInfo[];
+}
+
+/**
+ * The binding to show for a profile, in the order the reference model prefers it: the bound
+ * documents first, then the connect file, then the deprecated model name — and nothing at all when
+ * the profile is unbound.
+ */
+export function describeProfileBinding(profile: ConnectProfileInfo): string | null {
+  if (profile.documents && profile.documents.length > 0) return profile.documents.join(', ');
+  if (profile.connectRef) return profile.connectRef;
+  return profile.model || null;
+}
+
+export async function fetchProfiles(): Promise<ConnectProfileList> {
+  const res = await _fetchJson<ConnectProfileList>('/config/profiles');
+  // An older gateway answers without the new fields; normalising here keeps every caller from
+  // having to know which generation it is talking to.
+  return {
+    active: res.active ?? null,
+    projectScoped: res.projectScoped ?? false,
+    profiles: (res.profiles ?? []).map((p) => ({ ...p, documents: p.documents ?? [] })),
+  };
 }
 
 /** Snapshot the CURRENT live config as a (new or overwritten) profile, optionally bound to a model. */

@@ -54,15 +54,14 @@ import {
   type SignalMapping,
 } from './rv-layout-store';
 import { getLibraryStore } from '../../core/library/library-store-singleton';
+// plan-410 F1: a tiny one-way registry module (same shape/direction as the
+// `pending-open-store` import in LayoutLibraryPanel) — the planner ANSWERS the
+// editor's question; it never imports the editor plugin itself.
+import { registerSelectionAssetResolver } from '@rv-private/plugins/asset-editor/selection-asset-resolver';
+import type { AssetBase } from '../../core/editor/rv-asset-document';
+import { libraryDocumentBase } from '../../core/editor/active-asset-store';
 import { getConnectSnapshot, subscribeConnectStore } from '../../core/hmi/connect-store';
 import { mergeWithAutoBinds, type AutoBindSignal } from '../signal-bind/auto-bind';
-import {
-  getWorkFolder,
-  requestWriteAccess,
-  getOrCreateSubfolder,
-  writeBlobFile,
-  readFileAsUrl,
-} from '../../core/engine/rv-local-filesystem';
 
 // PlacementsSnapshot moved to core/rv-shared-types to eliminate the previous
 // core → plugin layer violation. Re-exported here for backwards compatibility
@@ -75,6 +74,7 @@ import { FloorGizmo } from './floor-gizmo';
 import { markNoAO } from '../../core/engine/rv-group-registry';
 import {
   addPlacedToScene as smAddPlacedToScene,
+  adoptPlacedNode as smAdoptPlacedNode,
   addSplatPlacedToScene as smAddSplatPlacedToScene,
   removePlacedFromScene as smRemovePlacedFromScene,
   resolveUniqueName as smResolveUniqueName,
@@ -101,7 +101,6 @@ import { findBestGhostSnap, applyGhostSnapAlignment, type GhostSnapMatch } from 
 import { DEFAULT_MAGNET_RADIUS_M } from '../snap-point/snap-magnetic-controller';
 import { computeProximityPairings, type RebuildSnapInput } from '../snap-point/snap-pairing-rebuild';
 import {
-  loadBundledLibrary as plLoadBundledLibrary,
   findCatalogEntryById as plFindCatalogEntryById,
   resolvePlacementUrl as plResolvePlacementUrl,
   waitForCloudReady as plWaitForCloudReady,
@@ -127,7 +126,7 @@ import { SignalBadgeController } from '../signal-bind/SignalBadgeController';
 import { BboxSnapController } from './bbox-snap';
 import { showInfoOverlay, hideInfoOverlay } from '../../core/hmi/info-overlay-store';
 import { freshOpId as opId } from '../../core/hmi/scene/rv-scene-edits';
-import type { PrimitiveEditOp } from '../../core/hmi/scene/rv-scene-edits';
+import type { RvScenePrimitiveOp } from '../../core/ops/rv-unified-ops';
 import { getSceneStore } from '../../core/hmi/scene/scene-store-singleton';
 
 /**
@@ -137,7 +136,7 @@ import { getSceneStore } from '../../core/hmi/scene/scene-store-singleton';
  * SceneStore isn't available (boot/test), the op is dropped silently —
  * the visual state is still correct.
  */
-function emitPlannerOp(viewer: RVViewer | null, op: PrimitiveEditOp): void {
+function emitPlannerOp(viewer: RVViewer | null, op: RvScenePrimitiveOp): void {
   if (!viewer) return;
   const sceneStore = getSceneStore();
   if (!sceneStore) return;
@@ -428,6 +427,29 @@ import { showDocModeDatasheet, openDocModeDetailAtPoint } from '../aas-link-plug
 import type { ObjectHoverState } from '../../hooks/use-hover';
 import { tooltipStore } from '../../core/hmi/tooltip/tooltip-store';
 import type { RVMovingUnit } from '../../core/engine/rv-mu';
+import { referenceBoundsFromSubtree } from '../../core/engine/rv-missing-reference-placeholder';
+import type { RvReferenceBounds } from '../../core/engine/rv-asset-reference';
+
+// ─── Placement bounds (plan-703 §2.8) ───────────────────────────────────
+
+/**
+ * The `bounds` field of a fresh {@link PlacedComponent}, or `{}`.
+ *
+ * Spread rather than assigned so a node with no measurable geometry adds no
+ * key at all — an explicit `bounds: undefined` would serialise into the layout
+ * file as a null and read back as "measured, and the answer was nothing".
+ *
+ * Never throws: this runs on the drop path, and a placement must not fail
+ * because a placeholder could not be pre-sized.
+ */
+function boundsOfPlacedNode(node: Object3D): { bounds?: RvReferenceBounds } {
+  try {
+    const bounds = referenceBoundsFromSubtree(node, node);
+    return bounds ? { bounds } : {};
+  } catch {
+    return {};
+  }
+}
 
 // ─── Planner-mode highlight styles ─────────────────────────────────────
 // The planner's green hover/selection styles (overlay fallback + OutlinePass)
@@ -436,14 +458,11 @@ import type { RVMovingUnit } from '../../core/engine/rv-mu';
 
 // ─── Plugin ─────────────────────────────────────────────────────────────
 
-/** Extra default catalogs auto-loaded by `_loadCatalogs`, on top of the bundled
- *  library. The STANDARD parts library shipped with every build is the LOCAL
- *  `public/models/library/` tree (sub-foldered, e.g. `pallethandling/`), loaded
- *  via `loadBundledLibrary` and delivered with every publish — see
- *  `_loadCatalogs` and planner-persistence.ts. GitHub is intentionally NOT a
- *  default source (it caused 404s and could shadow the bundled assets with an
- *  out-of-date copy). A remote catalog can still be opted into per session via
- *  the constructor `catalogUrls` option or a `?library=<url>` URL parameter. */
+/** Extra default catalogs auto-loaded by `_loadCatalogs`. Kept EMPTY on
+ *  purpose: no library is ever loaded implicitly — not a bundled one, not a
+ *  remote one. Every catalog the planner shows was explicitly referenced by
+ *  the user, by the project manifest (`libraries[]`), by the constructor
+ *  `catalogUrls` option, or by a `?library=<url>` URL parameter. */
 const DEFAULT_LIBRARY_URLS: string[] = [];
 
 export interface LayoutPlannerOptions {
@@ -1014,8 +1033,40 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     }
   }
 
+  /**
+   * plan-435: the user switched the plugin off in the feature matrix. Without
+   * this hook the fallback would run `onModelCleared` — which cancels pending
+   * placeholder swaps and disposes the MU reconciler although the model is
+   * unchanged — while a pause held mid-gesture would freeze the simulation
+   * for good, because `LAYOUT_EDIT_PAUSE_REASON` is only ever released by a
+   * balanced `_endEditPause()`.
+   *
+   * So: release the edit pause unconditionally, then do exactly what leaving
+   * the planner mode does. Nothing model-owned is touched (invariant 3) —
+   * `onModelCleared` keeps that job.
+   */
+  onDeactivate(viewer: RVViewer): void {
+    // Force-release: an interrupted gesture can leave the refcount above 0,
+    // and nothing else would ever bring it back down.
+    if (this._editPauseDepth > 0) {
+      this._editPauseDepth = 0;
+      viewer.setSimulationPaused?.(LAYOUT_EDIT_PAUSE_REASON, false);
+    }
+    this.onModeDeactivate(null, viewer);
+  }
+
   private _attachToViewer(viewer: RVViewer): void {
     this._viewer = viewer;
+
+    // plan-410 F1: teach the asset editor how to read a planner selection.
+    // Registered here (idempotent attach point) rather than in a mode hook,
+    // because the resolver is asked on `mode-changing` — i.e. while the planner
+    // is still the active mode but already on its way out.
+    if (!this._unregisterAssetResolver) {
+      this._unregisterAssetResolver = registerSelectionAssetResolver(
+        (path) => this._resolveSelectionToAsset(path),
+      );
+    }
 
     // No preview sweep here any more (plan-372 §2.7). Previews used to be
     // enqueued from a store subscription that walked every catalog on every
@@ -1461,6 +1512,11 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   }
 
   dispose(): void {
+    // Selection→asset resolver first: it closes over `this`, so it must not
+    // outlive the plugin (plan-410 F1).
+    this._unregisterAssetResolver?.();
+    this._unregisterAssetResolver = null;
+
     // Box-select first — removes any active window/document listeners before
     // the canvas interaction manager tears down its own listeners.
     this._boxSelect?.dispose();
@@ -2269,6 +2325,11 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         MathUtils.radToDeg(node.rotation.z),
       ],
       scale: [node.scale.x, node.scale.y, node.scale.z],
+      // Measured once, here, while the geometry is provably in hand (plan-703
+      // §2.8). It becomes `AssetReference.bounds` and sizes the placeholder if
+      // the asset can no longer be resolved — at which point nothing else can
+      // answer how big the hole should be.
+      ...boundsOfPlacedNode(node),
     };
     this.store.addComponent(comp);
     this.store.autoSave();
@@ -2391,6 +2452,8 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       rotation: [0, 0, 0],
       scale: [1, 1, 1],
       ...(isSplat ? { splatUrl: entry.splatUrl } : {}),
+      // A splat gets no `AssetReference` at all, so there is nothing to size.
+      ...(isSplat ? {} : boundsOfPlacedNode(node)),
     };
     this.store.addComponent(comp);
     this.store.autoSave();
@@ -2612,6 +2675,10 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       // plan-376 F10: a manually bound signal link used to vanish on copy —
       // neither creation path carried the field, and nothing re-derived it.
       ...(comp.signalMappings ? { signalMappings: comp.signalMappings.map(m => ({ ...m })) } : {}),
+      // A copy inherits the original's measurement rather than re-measuring:
+      // both placements point at the same asset, so a second answer could only
+      // be noise from a subtree that is mid-load.
+      ...(comp.bounds ? { bounds: { min: [...comp.bounds.min], max: [...comp.bounds.max] } } : {}),
     };
     this.store.addComponent(newComp);
     // Bind the copy's slots to the inherited mappings (component instances were
@@ -2785,9 +2852,53 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     return this._restorePlacements(snap);
   }
 
+  /**
+   * Take ownership of placements that are already in the loaded tree.
+   *
+   * The GLB-scene counterpart of {@link applyPlacements}. A scene saved since
+   * plan-397 phase 6 carries its placements as `AssetReference` nodes in its
+   * own file, so by the time this runs the geometry is loaded, composed and
+   * fully registered — there is nothing to build and nothing to fetch. See
+   * `adoptPlacedNode` for why re-running the placement path would be wrong
+   * rather than merely wasteful.
+   *
+   * Synchronous on purpose: the async half of restoring a layout is resolving
+   * and downloading each asset, and that has already happened.
+   *
+   * @returns the number of placements adopted.
+   */
+  adoptPlacements(entries: readonly { node: Object3D; placement: PlacedComponent }[]): number {
+    if (!this._viewer) return 0;
+    this.ensureAttached(this._viewer);
+
+    const placements: PlacedComponent[] = [];
+    for (const { node, placement } of entries) {
+      // A placement id that is already mapped means this tree was adopted
+      // before (a second call for the same load). Re-stamping is harmless, but
+      // pushing the record twice would show the user a duplicate row.
+      smAdoptPlacedNode(this._sceneMutDeps, node, placement.id, placement.label, placement.catalogId);
+      // Plan-921: behaviors bind on 'model-loaded' — which fired BEFORE this
+      // adoption stamped the LayoutObject marker, so the placed subtrees were
+      // invisible to that dispatch. Re-dispatch now (idempotent per placement
+      // id via the manager's dedupe), exactly like a live placement does.
+      this._viewer.behaviors.dispatchPlaced(node);
+      placements.push(placement);
+    }
+
+    this.store.setComponents(placements);
+    // The floor tracks intent, not count — `loadScene` overrules it right
+    // after this anyway, and leaving it to the snapshot rule would flash the
+    // authoring floor on every GLB scene that happens to carry placements.
+    this.setLayoutFloorVisible(false);
+    this._scheduleSnapPairingRebuild();
+    this._refreshHierarchy();
+    this._viewer.markRenderDirty();
+    return placements.length;
+  }
+
   // ───────────────────────────────────────────────────────────────────
   // Op executor primitives — single placement add / remove / transform.
-  // Called by `rv-scene-executors.ts` when applying EditOp records to the
+  // Called by `rv-scene-executors.ts` when applying scene-lineage ops to the
   // live scene. Each one is idempotent: re-running the same forward op is
   // safe (no duplicate adds, no errors on missing ids).
   // ───────────────────────────────────────────────────────────────────
@@ -2917,6 +3028,13 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    * the same id already exists.
    */
   async placeFromRecord(p: PlacedComponent): Promise<void> {
+    // Serialize with the boot-time legacy autosave restore (_loadCatalogs),
+    // exactly as _restorePlacements does: the `_objectMap.has` guard below is
+    // not atomic across the build's awaits, so an op replay racing the boot
+    // loop can pass both guards and orphan a duplicate clone in the scene
+    // tree. Resolved long before the first user-driven op — this only ever
+    // costs a microtask outside the boot window.
+    await this._catalogsLoaded;
     if (this._objectMap.has(p.id)) return;
 
     const node = await this._buildPlacementFromRecord(p);
@@ -3232,7 +3350,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
    * Returns `null` under a WebGPURenderer (plan-271) — thumbnails need the
    * classic WebGLRenderer; the skip is warned once by ThumbnailRenderer.
    */
-  async generateThumbnail(glbUrl: string, size = 256): Promise<string | null> {
+  async generateThumbnail(glbUrl: string, size = 512): Promise<string | null> {
     const viewer = this._viewer;
     if (!viewer) return null;
     // Manual (button-triggered) generation deliberately bypasses the service
@@ -3247,12 +3365,11 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   /**
    * Generate and save a thumbnail.
    *
-   * - For Local-Folder entries (entry has `localPath`): persists the PNG
-   *   into `library/.thumbnails/<mirror-path>.png` inside the user's
-   *   working folder via the File System Access API. Survives reloads
-   *   and works without any dev server.
-   * - Otherwise: posts to the Vite dev-server middleware
-   *   (`POST /api/library-thumbnail`) which writes into `public/`.
+   * Posts to the Vite dev-server middleware (`POST /api/library-thumbnail`),
+   * which writes into `public/`. The other branch — a PNG written into a
+   * working folder's `library/.thumbnails/` over the File System Access API —
+   * went with the working folder itself (plan-709 §2.6); project-library
+   * thumbnails are written by the save path, not here.
    *
    * Returns the persisted URL on success, or `null` if only the
    * in-memory data URL could be set.
@@ -3264,49 +3381,6 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     // Immediately show the generated thumbnail as data URL — the user
     // gets feedback even if the persistence step fails or is skipped.
     this.store.setEntryThumbnail(entryId, dataUrl);
-
-    // Locate the entry across all catalogs to decide the persistence path.
-    let entry: LibraryCatalogEntry | undefined;
-    for (const catalog of this.store.getSnapshot().catalogs.values()) {
-      const found = catalog.entries.find(e => e.id === entryId);
-      if (found) { entry = found; break; }
-    }
-
-    // ── Local-folder branch ─────────────────────────────────────────
-    if (entry?.localPath) {
-      try {
-        const root = await getWorkFolder(false);
-        if (!root) return null;
-        const granted = await requestWriteAccess(root);
-        if (!granted) return null;
-
-        const libDir = await root.getDirectoryHandle('library');
-        const thumbsDir = await getOrCreateSubfolder(libDir, '.thumbnails');
-
-        // Mirror the source path under .thumbnails/ with .png extension.
-        // Ensure parent subfolders exist (e.g. conveyor/).
-        const segments = entry.localPath.split('/');
-        const fileName = (segments.pop() ?? entry.localPath).replace(/\.(glb|splat|ksplat|ply)$/i, '.png');
-        let dir = thumbsDir;
-        for (const seg of segments) {
-          if (!seg) continue;
-          dir = await getOrCreateSubfolder(dir, seg);
-        }
-
-        const blob = await (await fetch(dataUrl)).blob();
-        await writeBlobFile(dir, fileName, blob);
-
-        // Read back as a fresh blob URL so the UI keeps a stable handle
-        // after the data URL is dropped.
-        const fileHandle = await dir.getFileHandle(fileName);
-        const persistedUrl = await readFileAsUrl(fileHandle);
-        this.store.setEntryThumbnail(entryId, persistedUrl);
-        return persistedUrl;
-      } catch (e) {
-        console.warn('[layout-planner] saveThumbnail: local persistence failed', e);
-        return null;
-      }
-    }
 
     // ── Dev-server fallback (catalog/URL libraries) ────────────────
     try {
@@ -3482,6 +3556,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         MathUtils.radToDeg(node.rotation.z),
       ],
       scale: [node.scale.x, node.scale.y, node.scale.z],
+      ...boundsOfPlacedNode(node),
     };
     this.store.addComponent(comp);
     this.store.autoSave();
@@ -3740,6 +3815,49 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     return plFindCatalogEntryById(this.store, catalogId);
   }
 
+  /** Unregisters the selection→asset resolver (plan-410 F1). */
+  private _unregisterAssetResolver: (() => void) | null = null;
+
+  /**
+   * Resolve a selected scene path to the library asset its placement was made
+   * from (plan-410 F1) — the answer the asset editor asks for on
+   * `mode-changing`.
+   *
+   * Walks UP from the selected node: the user may have clicked a sub-mesh, but
+   * only the placement root carries the layout id. From there the placement's
+   * `catalogId` finds the catalog entry, and `localPath` is the same
+   * work-folder-relative path the library card's "Edit asset" action uses — so
+   * both entry points open byte-identical documents.
+   *
+   * Returns null (→ the editor falls back to its last-edited memory) for
+   * anything the editor cannot author: splats, virtual DES gizmos, and any
+   * asset without a local library path (cloud/provider assets keep their
+   * provenance outside `PlacedComponent` — deliberately out of scope, plan-410
+   * §7 alternative 3).
+   */
+  private _resolveSelectionToAsset(primaryPath: string): AssetBase | null {
+    const viewer = this._viewer;
+    const node = viewer?.registry?.getNode(primaryPath);
+    if (!node) return null;
+
+    let placementId: string | null = null;
+    for (let n: Object3D | null = node; n; n = n.parent) {
+      const id = this._idByObject.get(n);
+      if (id) { placementId = id; break; }
+    }
+    if (!placementId) return null;
+
+    const placed = this.store.placed.find((c) => c.id === placementId);
+    if (!placed || placed.splatUrl) return null;
+
+    const entry = this._findCatalogEntryById(placed.catalogId);
+    const localPath = entry?.localPath;
+    if (!entry || !localPath || !entry.glbUrl || entry.splatUrl) return null;
+    if (entry.virtual || localPath.startsWith('splats/')) return null;
+
+    return libraryDocumentBase(localPath);
+  }
+
   /**
    * Pick the freshest valid glbUrl for a placement during scene restore.
    * Thin wrapper over `./planner-persistence.resolvePlacementUrl`.
@@ -3769,8 +3887,6 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   // ─── Internal: Catalog Loading ──────────────────────────────────
 
   private async _loadCatalogs(): Promise<void> {
-    const bundledUrl = await plLoadBundledLibrary(this.store);
-
     const constructorUrls = this._options.catalogUrls ?? [];
     const params = new URLSearchParams(window.location.search);
     const paramUrls = params.getAll('library');
@@ -3787,16 +3903,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     }
 
     await this.store.restoreFromStorage();
-    await this.store.restoreLocalFolder();
     this.store.loadAutoSave();
-
-    // Always surface the bundled standard library when the planner opens. A
-    // persisted active tab restored above (e.g. a previously-default remote /
-    // GitHub catalog still saved in the user's storage) must not shadow the
-    // shipped library.
-    if (bundledUrl && this.store.getSnapshot().catalogUrls.includes(bundledUrl)) {
-      this.store.setActiveTab(bundledUrl);
-    }
 
     // Re-place auto-saved components under model root
     const saved = this.store.getSnapshot().placed;

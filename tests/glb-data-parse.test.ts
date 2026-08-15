@@ -17,8 +17,9 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { Scene, Object3D } from 'three';
 import { loadAndPrepareGLTF } from '../src/core/engine/rv-scene-loader';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
-const GLB_URL = '/models/tests.glb';
+const GLB_URL = DEV_GLB.tests;
 let available = false;
 let bytes: ArrayBuffer | null = null;
 

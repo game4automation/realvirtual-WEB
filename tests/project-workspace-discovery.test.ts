@@ -27,6 +27,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { glbWriteFor } from './helpers/scene-write';
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 import { discoverWorkspaceProjects } from '../src/core/project/rv-project-workspace';
 import { BackendNotWritableError } from '../src/core/project/backends/project-backend';
@@ -37,6 +38,7 @@ import {
   recordRecentProject,
 } from '../src/core/project/rv-project-recent';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
+import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -63,7 +65,7 @@ const scene = (id: string): RvScene => ({
   name: id,
   createdAt: '2025-01-01T00:00:00.000Z',
   modifiedAt: '2025-01-01T00:00:00.000Z',
-  schemaVersion: 2,
+  schemaVersion: 3,
   base: { kind: 'empty' },
   edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
 });
@@ -247,11 +249,11 @@ describe('discoverWorkspaceProjects — the backends it constructs', () => {
 
     const [entry] = (await discoverWorkspaceProjects(asDirHandle(root))).projects;
 
-    await expect(entry.backend.writeScene('scenes/x.scene.json', scene('scn_x')))
+    await expect(entry.backend.writeScene('scenes/x.scene.glb', glbWriteFor(scene('scn_x'))))
       .rejects.toBeInstanceOf(BackendNotWritableError);
     await expect(entry.backend.writeBlob('models/x.glb', new Blob(['x'])))
       .rejects.toBeInstanceOf(BackendNotWritableError);
-    await expect(entry.backend.deleteScene('scenes/x.scene.json'))
+    await expect(entry.backend.deleteScene('scenes/x.scene.glb'))
       .rejects.toBeInstanceOf(BackendNotWritableError);
   });
 
@@ -261,7 +263,7 @@ describe('discoverWorkspaceProjects — the backends it constructs', () => {
     const before = dir.childNames();
 
     const [entry] = (await discoverWorkspaceProjects(asDirHandle(root))).projects;
-    await entry.backend.writeScene('scenes/x.scene.json', scene('scn_x')).catch(() => {});
+    await entry.backend.writeScene('scenes/x.scene.glb', glbWriteFor(scene('scn_x'))).catch(() => {});
 
     expect(dir.childNames()).toEqual(before);
     expect(dir.has('scenes')).toBe(false);
@@ -274,7 +276,7 @@ describe('discoverWorkspaceProjects — the backends it constructs', () => {
     const [entry] = (await discoverWorkspaceProjects(asDirHandle(root))).projects;
 
     expect((await entry.backend.readManifest())?.id).toBe('prj_a');
-    expect(await entry.backend.listScenes()).toEqual([]);
+    expect(sceneDocumentsOf(await entry.backend.readManifest())).toEqual([]);
   });
 });
 

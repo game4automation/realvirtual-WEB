@@ -6,7 +6,7 @@ import type { ComponentSchema, ComponentContext, RVComponent } from './rv-compon
 import { registerComponentSchema, loadSchemaFromSpec } from './rv-component-registry';
 import { RVDrive } from './rv-drive';
 import { NodeRegistry } from './rv-node-registry';
-import { scaleFeedbackPosition } from './rv-signal-wiring';
+import { scaleFeedbackPosition, wireBoolSignal, wireNumberSignal } from './rv-signal-wiring';
 import { createSignalWriter } from './rv-signal-store';
 
 /**
@@ -66,6 +66,9 @@ export class RVDriveDestinationMotor implements RVComponent {
   private drive: RVDrive | null = null;
   private startDriveValue = false;
   private readonly feedbackListeners: (() => void)[] = [];
+  /** Store subscriptions + re-apply slots of the four input signals. Held so
+   *  `dispose()` can drop them — before plan-427 the handles were discarded (F6). */
+  private readonly inputUnsubs: (() => void)[] = [];
 
   constructor(node: Object3D) {
     this.node = node;
@@ -142,28 +145,21 @@ export class RVDriveDestinationMotor implements RVComponent {
     this.drive = drive;
 
     // ── Inputs (PLC → drive) ──
-    if (this.Destination) {
-      ctx.signalStore.subscribeByPath(this.Destination, (v) => {
-        this.commandDestination(v);
-      });
-    }
-    if (this.StartDrive) {
-      ctx.signalStore.subscribeByPath(this.StartDrive, (v) => {
-        // Web has no TargetStartMove flag — start on rising edge (the store only
-        // fires this subscription on value change, so true→startMove once).
-        this.commandStartDrive(v);
-      });
-    }
-    if (this.TargetSpeed) {
-      ctx.signalStore.subscribeByPath(this.TargetSpeed, (v) => {
-        this.commandTargetSpeed(v);
-      });
-    }
-    if (this.Acceleration) {
-      ctx.signalStore.subscribeByPath(this.Acceleration, (v) => {
-        this.commandAcceleration(v);
-      });
-    }
+    // Wired in slot order, which is also REPLAY order (plan-427): Destination
+    // before StartDrive, so a re-applied start command always sees the current
+    // target. The number slots skip an unresolved path rather than writing
+    // NaN into a drive target (F9); `commandStartDrive` keeps its own rising-
+    // edge guard, so a replayed held-true start is a no-op.
+    this.inputUnsubs.push(
+      wireNumberSignal(ctx.signalStore, this.Destination,
+        (v) => this.commandDestination(v), undefined, ctx.reapply).unsubscribe,
+      wireBoolSignal(ctx.signalStore, this.StartDrive,
+        (v) => this.commandStartDrive(v), undefined, ctx.reapply).unsubscribe,
+      wireNumberSignal(ctx.signalStore, this.TargetSpeed,
+        (v) => this.commandTargetSpeed(v), undefined, ctx.reapply).unsubscribe,
+      wireNumberSignal(ctx.signalStore, this.Acceleration,
+        (v) => this.commandAcceleration(v), undefined, ctx.reapply).unsubscribe,
+    );
 
     // ── Feedback (drive → PLC) — ALWAYS, also under liveControlled (F6) ──
     // Chained via addAfterUpdate so direct-feedback listeners can subscribe.
@@ -196,6 +192,8 @@ export class RVDriveDestinationMotor implements RVComponent {
     if (this.drive && this.feedbackCb) {
       this.drive.removeAfterUpdate(this.feedbackCb);
     }
+    for (const unsub of this.inputUnsubs) unsub();
+    this.inputUnsubs.length = 0;
     this.feedbackCb = null;
     this.drive = null;
     this.feedbackListeners.length = 0;

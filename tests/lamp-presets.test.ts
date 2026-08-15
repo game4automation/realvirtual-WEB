@@ -10,7 +10,7 @@ import {
   BUILTIN_MATERIAL_PRESETS,
   PRESET_CATEGORIES,
   swatchBackground,
-} from '../src/plugins/asset-editor/materials/material-presets';
+} from '@rv-private/plugins/asset-editor/materials/material-presets';
 
 describe('Lamp / Signal material presets', () => {
   const lamps = BUILTIN_MATERIAL_PRESETS.filter((preset) => preset.category === 'Lamp / Signal');

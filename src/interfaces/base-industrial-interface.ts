@@ -104,6 +104,19 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
   private _outgoingSubscriptions: (() => void)[] = [];
   private _providerProvenanceEnabled = true;
 
+  // ── Initial-sync marker (plan-427 F2) ──
+  //
+  // `setConnectionState('connected')` fires BEFORE discovery, and the values
+  // discovery brings in land in `pendingIncoming` — the SignalStore only sees
+  // them at the next flush. The moment a re-apply of signal LEVELS onto
+  // components is safe is therefore "first incoming snapshot committed", not
+  // "connected". This flag marks the window between the two.
+  private _awaitingInitialSync = false;
+  /** Covers a silent PLC that sends nothing at all after connecting. */
+  private _initialSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  /** How long to wait for a first message before declaring the store in sync. */
+  private static readonly INITIAL_SYNC_TIMEOUT_MS = 2000;
+
   // ── Incoming buffer (WS callback → Map → flush in onFixedUpdatePre) ──
 
   /**
@@ -204,6 +217,11 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
     }
     this.pendingIncoming.clear();
     this.signalWriter?.setMany(batch);
+
+    // plan-427 F2: this was the FIRST commit after a (re)connect — the store now
+    // holds the remote's current state, including anything that changed while we
+    // were away. Only now may the viewer re-apply signal levels onto components.
+    this.completeInitialSync();
   }
 
   /**
@@ -256,9 +274,15 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
         this._discoveredSignals = signals;
         this.registerDiscoveredSignals(signals);
         this.subscribeToOutgoingSignals(signals);
+        // plan-427 F2: discovery succeeded, so a first incoming snapshot is now
+        // expected. Arm the marker; the flush in onFixedUpdatePre resolves it.
+        this.beginInitialSync();
       } catch (discErr) {
         console.warn(`[${this.id}] Signal discovery failed:`, discErr);
-        // Connection succeeded even if discovery failed — user can retry
+        // Connection succeeded even if discovery failed — user can retry.
+        // Deliberately NO sync marker: without a signal list there is nothing
+        // trustworthy in the store, and replaying stale pre-disconnect levels
+        // onto the plant would be worse than doing nothing (behaviour as before).
       }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
@@ -276,6 +300,10 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
     this.unsubscribeFromOutgoingSignals();
     this.pendingIncoming.clear();
     this.dirtyOutgoing.clear();
+    // plan-427: a pending sync window dies with the connection — never emit a
+    // sync (and thus a level re-apply) for a link that is already gone.
+    this._awaitingInitialSync = false;
+    this.cancelInitialSyncTimer();
     this.setProviderConnectionState(false);
 
     try {
@@ -355,6 +383,44 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
    */
   getReconnectDelay(attempt: number): number {
     return reconnectDelay(attempt);
+  }
+
+  // ── Initial-sync marker (plan-427 F2) ──
+
+  /**
+   * Arm the "waiting for the first incoming snapshot" window. Called after a
+   * successful discovery; resolved by the first `pendingIncoming` flush.
+   *
+   * The timeout is the fallback for a silent endpoint (a PLC whose outputs
+   * simply do not change, an MQTT broker without retained messages): the store
+   * values are then unchanged and the re-apply is a harmless idempotent pass.
+   */
+  protected beginInitialSync(): void {
+    this.cancelInitialSyncTimer();
+    this._awaitingInitialSync = true;
+    this._initialSyncTimer = setTimeout(() => {
+      this._initialSyncTimer = null;
+      this.completeInitialSync();
+    }, BaseIndustrialInterface.INITIAL_SYNC_TIMEOUT_MS);
+  }
+
+  /**
+   * Resolve the sync window exactly once and tell the viewer. Idempotent: the
+   * flush path and the timeout race deliberately, and whoever wins clears the
+   * flag for the other.
+   */
+  protected completeInitialSync(): void {
+    if (!this._awaitingInitialSync) return;
+    this._awaitingInitialSync = false;
+    this.cancelInitialSyncTimer();
+    this.viewer?.emit('interface-signals-synced', { interfaceId: this.id });
+  }
+
+  private cancelInitialSyncTimer(): void {
+    if (this._initialSyncTimer !== null) {
+      clearTimeout(this._initialSyncTimer);
+      this._initialSyncTimer = null;
+    }
   }
 
   // ── Internal Helpers ──

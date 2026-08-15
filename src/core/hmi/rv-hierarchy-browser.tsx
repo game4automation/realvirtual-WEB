@@ -47,6 +47,9 @@ import type { ContextMenuTarget } from './context-menu-store';
 import { HIERARCHY_MIN_WIDTH, HIERARCHY_MAX_WIDTH } from './rv-extras-editor';
 import { LeftPanel } from './LeftPanel';
 import { getSceneStore } from './scene/scene-store-singleton';
+import { requestDescend } from '../editor/rv-descend-request';
+import { isInsideReference } from '../engine/rv-reference-scope';
+import { isModelRoot } from '../engine/rv-model-root';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import {
   applyLazyInjection,
@@ -64,15 +67,17 @@ import {
 import { FlatNodeRow, TreeNodeRow, rowDomId, type SelectMods, type DropZone } from './HierarchyNodeRow';
 import { usePointerRowHeight } from '../../hooks/use-pointer-row-height';
 import { getActiveEditTarget, subscribeEditTarget, getEditTargetVersion } from './rv-edit-target';
-import { getActiveAssetContext, subscribeActiveAsset, getActiveAssetVersion } from '../../plugins/asset-editor/active-asset-store';
+import { getActiveAssetContext, subscribeActiveAsset, getActiveAssetVersion } from '../editor/active-asset-store';
 import { NodeRegistry } from '../engine/rv-node-registry';
 import type { Object3D } from 'three';
 import { SignalBrowser } from './SignalBrowser';
+import { DocumentCard, DOCUMENT_CARD_UI_ID, DOCUMENT_CARD_VISIBILITY } from './scene/DocumentCard';
 import {
-  getHierarchyHeader,
-  subscribeHierarchyHeaders,
-  getHierarchyHeadersSnapshot,
-} from './hierarchy-header-registry';
+  getActiveDocumentViewVersion,
+  resolveActiveDocumentView,
+  subscribeActiveDocumentView,
+} from '../editor/active-document-view';
+import { useUIVisible } from './ui-context-store';
 
 // Re-exports for backwards compatibility — external callers (and tests) may
 // import these symbols from `rv-hierarchy-browser`.
@@ -186,11 +191,29 @@ export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
   );
   const modelName = sceneSnap?.draft?.name ?? 'Hierarchy';
 
-  // Mode-registered top-of-hierarchy card (e.g. the asset editor's document
-  // card in mode:editor). Reactive to both mode switches and registration.
+  // The document card, mounted DIRECTLY (plan-709 §2.1.2). It used to arrive
+  // through a mode-keyed registry, which was the vehicle for "one card per
+  // mode"; with one card for every mode the registry carried nothing, and with
+  // it goes the question of who registers before the first render.
+  //
+  // Whether it renders is the card's own answer (the view seam reports a
+  // document or it does not); whether it MAY render is the usual visibility
+  // axis — a kiosk/viewer deploy shows no document chrome at all.
   useSyncExternalStore(viewer.modes.subscribe, viewer.modes.getSnapshot);
-  useSyncExternalStore(subscribeHierarchyHeaders, getHierarchyHeadersSnapshot);
-  const HierarchyHeaderCard = getHierarchyHeader(viewer.modes.activeMode);
+  const showDocumentCard = useUIVisible(DOCUMENT_CARD_UI_ID, DOCUMENT_CARD_VISIBILITY as never);
+  const activeMode = viewer.modes.activeMode;
+  // The card owns the header row only when it has something to say — with no
+  // open document it renders nothing, and an empty header would be worse than
+  // the model name it replaced.
+  const documentViewVersion = useSyncExternalStore(
+    subscribeActiveDocumentView,
+    getActiveDocumentViewVersion,
+  );
+  const hasDocumentView = useMemo(
+    () => resolveActiveDocumentView(activeMode) !== null,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [documentViewVersion, activeMode],
+  );
 
   // Ensure pulse animation CSS is injected
   useEffect(() => { ensurePulseAnimation(); }, []);
@@ -378,10 +401,66 @@ export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
     }
   }, [searchTerm, plugin]);
 
+  /**
+   * The model root as path-space keys, or null when there is no row to lock
+   * (plan-715 §2.4.2). Resolved HERE because this is the layer that holds the
+   * real `Object3D` and can compare by identity; `buildStructureTree` only ever
+   * sees the derived keys.
+   *
+   * Two cases deliberately answer null:
+   * - no model loaded — there is no root row and nothing to label;
+   * - an active hierarchy root override ("Runtime view", plan-301) pointed at
+   *   something OTHER than the model root. That scan lists a preview subtree, so
+   *   the root of the tree on screen is not the model root and must not be
+   *   dressed up as it.
+   *
+   * The label follows the DOCUMENT (plan-709), not `Object3D.name`: renaming the
+   * root would rewrite the first segment of every node path (doc-node-paths.md).
+   * Fallback chain: document name → GLB file name without extension → the node's
+   * own name (which may carry a `_N` dedup suffix — accepted, it is the last resort).
+   */
+  const modelRootInfo = useMemo(() => {
+    const root = viewer.currentModelRoot;
+    if (!root) return null;
+    const override = plugin.hierarchyRootOverride;
+    if (override && override !== root) return null;
+    const rootPath = viewer.registry?.getPathForNode(root) ?? NodeRegistry.computeNodePath(root);
+    if (!rootPath) return null;
+    const fileName = viewer.currentModelUrl?.split('/').pop()?.replace(/\.[^.]+$/, '') ?? '';
+    return { rootPath, label: sceneSnap?.draft?.name || fileName || root.name || rootPath };
+    // `state.editableNodes` is the re-scan signal: every model load / structural
+    // change refreshes it, which is exactly when the root identity can change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewer, plugin, sceneSnap?.draft?.name, state.editableNodes]);
+
+  /**
+   * The root row starts EXPANDED — a hierarchy whose only visible row is a
+   * collapsed root would be a worse tree than the one before plan-715.
+   *
+   * Applied once per root path (`defaultedRootsRef`) rather than on every
+   * render: the expand set is localStorage-persisted, so re-asserting it would
+   * override a user who deliberately collapsed the root, and re-asserting it on
+   * a model swap that happens to reuse the root name is the one case where the
+   * persisted state is misleading anyway.
+   */
+  const defaultedRootsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const rootPath = modelRootInfo?.rootPath;
+    if (!rootPath || defaultedRootsRef.current.has(rootPath)) return;
+    defaultedRootsRef.current.add(rootPath);
+    setExpanded((prev) => {
+      if (prev.has(rootPath)) return prev;
+      const next = new Set(prev);
+      next.add(rootPath);
+      persistTreeExpandedSet(next);
+      return next;
+    });
+  }, [modelRootInfo?.rootPath]);
+
   // Build the expensive path structure independently from expansion changes.
   const structureTree = useMemo(
-    () => typeFilter === 'all' ? buildStructureTree(state.editableNodes, state.overlay) : [],
-    [state.editableNodes, state.overlay, typeFilter],
+    () => typeFilter === 'all' ? buildStructureTree(state.editableNodes, state.overlay, modelRootInfo) : [],
+    [state.editableNodes, state.overlay, typeFilter, modelRootInfo],
   );
 
   // Expanded LayoutObject/CADLink raw children are injected persistently so
@@ -457,18 +536,34 @@ export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
     [viewer],
   );
 
+  /**
+   * Should this row be dimmed? Two reasons, ONE styling (plan-703 §2.4.2).
+   *
+   * 1. Hidden — the node or an ancestor has `visible === false` (the eye).
+   * 2. Inside a reference — the node's structure lives in another file, so the
+   *    structural verbs do not reach it (F8). Its VALUES stay editable; the
+   *    dimming says "locked shape", not "read-only".
+   *
+   * Deliberately not two opacities, two colours or an icon: `2.4.2` says a
+   * second predicate, not a second visual. And deliberately not a 3D effect —
+   * decision 21 keeps the viewport untouched, which is also why this plan never
+   * comes near `BatchVisibilityService` (§5.1).
+   */
   const getEffectiveVisible = useCallback((path: string) => {
-    let cur = viewer.registry?.getNode(path) ?? null;
+    const node = viewer.registry?.getNode(path) ?? null;
+    if (!node) return true;
+    let cur: Object3D | null = node;
     while (cur && cur !== viewer.scene) {
       if (!cur.visible) return false;
       cur = cur.parent;
     }
-    return true;
+    // Inclusive: the reference row itself dims too, exactly as §3.3 draws it.
+    return !isInsideReference(node, viewer.currentModelRoot);
   }, [viewer]);
 
   const onToggleVisible = useCallback((path: string) => {
     const node = viewer.registry?.getNode(path);
-    if (!node || node === viewer.currentModelRoot) return; // asset root stays visible
+    if (!node || isModelRoot(node, viewer.currentModelRoot)) return; // asset root stays visible
     getActiveEditTarget().setNodeVisible?.(path, !node.visible);
   }, [viewer]);
 
@@ -525,6 +620,12 @@ export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
 
       if (zone === 'onto') {
         if (insideDragged(targetNode)) return null;
+        // Dropping ONTO the model root stays legal (it is the asset's own parent
+        // slot), but `reparentNodes` addresses that slot as `null` — the same
+        // convention the reorder branch below uses. Passing the root's PATH here
+        // would look equivalent and is not: it re-resolves through the registry
+        // and diverges the moment the root name is deduped.
+        if (isModelRoot(targetNode, viewer.currentModelRoot)) return { parentPath: null };
         return { parentPath: targetPath }; // target becomes the new parent (append)
       }
 
@@ -546,7 +647,7 @@ export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
         if (dn.parent === parent && parent.children.indexOf(dn) < rawInsert) excludedBefore++;
       }
       const index = Math.max(0, rawInsert - excludedBefore);
-      const parentPath = parent === viewer.currentModelRoot
+      const parentPath = isModelRoot(parent, viewer.currentModelRoot)
         ? null
         : NodeRegistry.computeNodePath(parent);
       return { parentPath, index };
@@ -722,6 +823,13 @@ export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
   );
 
   const handleRowDragStart = useCallback((path: string, e: React.DragEvent) => {
+    // The model root is not a draggable thing (plan-715 F4). The row already
+    // renders undraggable; this is the second lock, for the case where a drag
+    // reaches the handler anyway (a synthetic event, a future row variant).
+    if (isModelRoot(viewer.registry?.getNode(path), viewer.currentModelRoot)) {
+      e.preventDefault();
+      return;
+    }
     // Dragging a row that is part of a multi-selection moves the whole set;
     // dragging an unselected row moves (and selects) just that row.
     const sel = selectedPathsSet;
@@ -730,10 +838,18 @@ export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
     dragPathsRef.current = paths;
     e.dataTransfer.effectAllowed = 'move';
     try { e.dataTransfer.setData('text/plain', paths.join('\n')); } catch { /* jsdom */ }
-  }, [selectedPathsSet, selection.selectedPaths, handleSelect]);
+  }, [selectedPathsSet, selection.selectedPaths, handleSelect, viewer]);
 
   const handleDoubleClick = useCallback(
     (path: string) => {
+      // On a resolvable AssetReference the double-click is a DESCEND, not an
+      // inspector toggle (plan-703 §3.4): the reference node itself has almost
+      // nothing to inspect, and the gesture the user means is "open this".
+      // `requestDescend` answers false when there is no editor stack or the node
+      // is not descendable (an embedded reference, a placeholder), so the
+      // ordinary behaviour below stays the default rather than the exception.
+      if (requestDescend(path)) return;
+
       // Double click is the gesture that opens the property inspector. The node
       // is already selected by the preceding click of the double-click sequence,
       // so this just flips the inspector visible for it.
@@ -865,19 +981,27 @@ export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
   return (
     <LeftPanel
       title={
-        <Typography
-          variant="subtitle2"
-          sx={{
-            fontWeight: 600,
-            fontSize: '0.8rem',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}
-          title={modelName}
-        >
-          {modelName}
-        </Typography>
+        // ONE row for the open document: the card's breadcrumb ends in the
+        // document's own name, so a separate header title printing that name
+        // again was the same fact twice. Without a card (viewer deploys) the
+        // header falls back to the loaded model's name.
+        showDocumentCard && hasDocumentView ? (
+          <DocumentCard variant="compact" activeMode={activeMode} />
+        ) : (
+          <Typography
+            variant="subtitle2"
+            sx={{
+              fontWeight: 600,
+              fontSize: '0.8rem',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+            title={modelName}
+          >
+            {modelName}
+          </Typography>
+        )
       }
       onClose={handleClose}
       toolbar={
@@ -924,9 +1048,6 @@ export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
         </Box>
       }
     >
-      {/* Mode-registered header card (asset editor document card in editor mode) */}
-      {HierarchyHeaderCard && <HierarchyHeaderCard />}
-
       {/* Search + type filter — collapsed behind the header filter icon.
           Children stay mounted while collapsed so an active search/type filter
           keeps narrowing the tree (the badge dot on the icon signals this). */}
@@ -1046,7 +1167,7 @@ export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
                     logicEngine={logicEngine}
                     viewer={viewer}
                     getNodeVisible={canToggleVisibility ? getNodeVisible : undefined}
-                    getEffectiveVisible={canToggleVisibility ? getEffectiveVisible : undefined}
+                    getEffectiveVisible={getEffectiveVisible}
                     onToggleVisible={canToggleVisibility ? onToggleVisible : undefined}
                     depth={typeFilter === 'logic' ? (flatDepths.get(info.path) ?? 0) : 0}
                     rowHeight={rowHeight}
@@ -1095,7 +1216,7 @@ export function HierarchyBrowser({ viewer }: HierarchyBrowserProps) {
                       transform: `translateY(${virtualRow.start}px)`,
                     }}
                     getNodeVisible={canToggleVisibility ? getNodeVisible : undefined}
-                    getEffectiveVisible={canToggleVisibility ? getEffectiveVisible : undefined}
+                    getEffectiveVisible={getEffectiveVisible}
                     onToggleVisible={canToggleVisibility ? onToggleVisible : undefined}
                     dndEnabled={dndEnabled}
                     dropZone={dropTarget && dropTarget.path === row.node.path ? dropTarget.zone : null}

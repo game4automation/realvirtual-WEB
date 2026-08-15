@@ -327,17 +327,18 @@ describe('applyPublicScenePruning', () => {
   afterEach(() => { rmSync(work, { recursive: true, force: true }); });
 
   /** dist/scenes/ with a curated demo, two Test fixtures, and an index.json
-   *  listing all three (mirroring a real public build of public/scenes/). */
+   *  listing all three (mirroring a real public build of public/scenes/).
+   *  Examples are GLBs since plan-413 phase 3. */
   function makeDist(): string {
     const dist = join(work, 'dist');
     mkdirSync(join(dist, 'scenes'), { recursive: true });
-    writeFileSync(join(dist, 'scenes', 'DemoPlanner.scene.json'), '{}');
-    writeFileSync(join(dist, 'scenes', 'Test-DES-Turntable-Loop.scene.json'), '{}');
-    writeFileSync(join(dist, 'scenes', 'test-lowercase.scene.json'), '{}'); // case-insensitive
+    writeFileSync(join(dist, 'scenes', 'DemoPlanner.glb'), 'glTF');
+    writeFileSync(join(dist, 'scenes', 'Test-DES-Turntable-Loop.glb'), 'glTF');
+    writeFileSync(join(dist, 'scenes', 'test-lowercase.glb'), 'glTF'); // case-insensitive
     writeFileSync(join(dist, 'scenes', 'index.json'), JSON.stringify([
-      { file: 'DemoPlanner.scene.json', name: 'Planner Demo', mode: 'planner' },
-      { file: 'Test-DES-Turntable-Loop.scene.json', name: 'Test DES Turntable Loop', mode: 'des' },
-      { file: 'test-lowercase.scene.json', name: 'lc', mode: 'des' },
+      { file: 'DemoPlanner.glb', name: 'Planner Demo', mode: 'planner' },
+      { file: 'Test-DES-Turntable-Loop.glb', name: 'Test DES Turntable Loop', mode: 'des' },
+      { file: 'test-lowercase.glb', name: 'lc', mode: 'des' },
     ], null, 2));
     return dist;
   }
@@ -346,28 +347,41 @@ describe('applyPublicScenePruning', () => {
     const dist = makeDist();
     const res = applyPublicScenePruning(dist, { prefix: 'Test' });
 
-    expect(res.kept).toEqual(['DemoPlanner.scene.json']);
-    expect(res.dropped).toEqual(['Test-DES-Turntable-Loop.scene.json', 'test-lowercase.scene.json']);
+    expect(res.kept).toEqual(['DemoPlanner.glb']);
+    expect(res.dropped).toEqual(['Test-DES-Turntable-Loop.glb', 'test-lowercase.glb']);
 
+    expect(existsSync(join(dist, 'scenes', 'DemoPlanner.glb'))).toBe(true);
+    expect(existsSync(join(dist, 'scenes', 'Test-DES-Turntable-Loop.glb'))).toBe(false);
+    expect(existsSync(join(dist, 'scenes', 'test-lowercase.glb'))).toBe(false);
+  });
+
+  it('still prunes a legacy .scene.json example from an older dist', () => {
+    // Phase 6 deletes the JSON world; until then a dist built from an older
+    // source tree must not smuggle a test scene onto the public CDN.
+    const dist = join(work, 'legacy-dist');
+    mkdirSync(join(dist, 'scenes'), { recursive: true });
+    writeFileSync(join(dist, 'scenes', 'Test-Old.scene.json'), '{}');
+    writeFileSync(join(dist, 'scenes', 'DemoPlanner.scene.json'), '{}');
+    const res = applyPublicScenePruning(dist, { prefix: 'Test' });
+    expect(res.dropped).toEqual(['Test-Old.scene.json']);
+    expect(existsSync(join(dist, 'scenes', 'Test-Old.scene.json'))).toBe(false);
     expect(existsSync(join(dist, 'scenes', 'DemoPlanner.scene.json'))).toBe(true);
-    expect(existsSync(join(dist, 'scenes', 'Test-DES-Turntable-Loop.scene.json'))).toBe(false);
-    expect(existsSync(join(dist, 'scenes', 'test-lowercase.scene.json'))).toBe(false);
   });
 
   it('rewrites index.json to drop the Test* entries', () => {
     const dist = makeDist();
     applyPublicScenePruning(dist, { prefix: 'Test' });
     const idx = JSON.parse(readFileSync(join(dist, 'scenes', 'index.json'), 'utf8'));
-    expect(idx).toEqual([{ file: 'DemoPlanner.scene.json', name: 'Planner Demo', mode: 'planner' }]);
+    expect(idx).toEqual([{ file: 'DemoPlanner.glb', name: 'Planner Demo', mode: 'planner' }]);
   });
 
   it('dry-run reports without deleting or rewriting', () => {
     const dist = makeDist();
     const res = applyPublicScenePruning(dist, { prefix: 'Test', dryRun: true });
-    expect(res.dropped).toEqual(['Test-DES-Turntable-Loop.scene.json', 'test-lowercase.scene.json']);
-    expect(existsSync(join(dist, 'scenes', 'Test-DES-Turntable-Loop.scene.json'))).toBe(true); // not deleted
+    expect(res.dropped).toEqual(['Test-DES-Turntable-Loop.glb', 'test-lowercase.glb']);
+    expect(existsSync(join(dist, 'scenes', 'Test-DES-Turntable-Loop.glb'))).toBe(true); // not deleted
     const idx = JSON.parse(readFileSync(join(dist, 'scenes', 'index.json'), 'utf8'));
-    expect(idx).toHaveLength(3);                                                                // not rewritten
+    expect(idx).toHaveLength(3);                                                        // not rewritten
   });
 
   it('is idempotent and a no-op when there is no scenes/ dir', () => {
@@ -375,7 +389,7 @@ describe('applyPublicScenePruning', () => {
     applyPublicScenePruning(dist, { prefix: 'Test' });
     const res = applyPublicScenePruning(dist, { prefix: 'Test' });
     expect(res.dropped).toEqual([]);
-    expect(res.kept).toEqual(['DemoPlanner.scene.json']);
+    expect(res.kept).toEqual(['DemoPlanner.glb']);
 
     const empty = join(work, 'empty-dist');
     mkdirSync(empty, { recursive: true });

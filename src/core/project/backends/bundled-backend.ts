@@ -32,14 +32,31 @@ import {
   urlNameFromFile,
   type PublishedSceneEntry,
 } from '../../hmi/scene/rv-published-scenes';
-import type { RvScene } from '../../hmi/scene/rv-scene-types';
 import { migrateManifest } from '../rv-project-storage';
+import { assertReadableScenePath } from '../rv-legacy-format';
 import type {
   RvProject,
   RvProjectAssetEntry,
   RvProjectSceneEntry,
 } from '../rv-project-types';
-import { RV_PROJECT_SCHEMA_VERSION } from '../rv-project-types';
+import {
+  assetDocumentsOf,
+  documentsFromLists,
+  readDocuments,
+  sceneDocumentsOf,
+  sectionOfDocument,
+  withDerivedDocuments,
+  type DocumentSection,
+  type DocumentStat,
+} from '../rv-project-documents';
+import {
+  RV_PROJECT_SCHEMA_VERSION,
+  type RvDocumentEntry,
+} from '../rv-project-types';
+import {
+  glbSceneRecord,
+  type SceneRecord,
+} from '../rv-scene-record';
 import {
   BackendNotWritableError,
   type ProjectBackend,
@@ -67,7 +84,11 @@ export const DEMO_PROJECT_SLUG = 'demorealvirtual';
  * user's local File System Access workspace.
  */
 export const DEMO_PROJECT_FOLDER = 'demo-realvirtual';
-/** Catalog of the realvirtual component library, relative to the deploy root. */
+/**
+ * Catalog of the realvirtual component library, relative to the deploy root.
+ * NOT read by any boot path — a deploy manifest must reference it explicitly
+ * (`libraries[]`) for the library to exist at runtime.
+ */
 export const REALVIRTUAL_LIBRARY_PATH = 'library/catalog.json';
 
 /** @deprecated Use {@link DEMO_PROJECT_ID}. */
@@ -126,8 +147,6 @@ export class BundledBackend implements ProjectBackend {
   private _manifest: RvProject | null = null;
   private _manifestRead = false;
   private _hasDeployedManifest = false;
-  private _library: RvProjectAssetEntry[] = [];
-  private _libraryRead = false;
 
   constructor(opts: BundledBackendOptions = {}) {
     this._baseUrl = normaliseBase(opts.baseUrl ?? defaultBaseUrl());
@@ -160,7 +179,11 @@ export class BundledBackend implements ProjectBackend {
     this._manifestRead = true;
     await this._discoverSources();
     const deployed = await this._fetchJson('project.json');
-    const migrated = deployed ? migrateManifest(deployed) : null;
+    const parsed = deployed ? migrateManifest(deployed) : null;
+    // A deploy manifest is FOREIGN: nobody ran the folder conversion over it,
+    // so it may still carry only the legacy arrays. Derive its documents on the
+    // way in, or a customer deploy built before phase 6 would show nothing.
+    const migrated = parsed ? withDerivedDocuments(parsed) : null;
     this._hasDeployedManifest = !!migrated;
     this._manifest = migrated ? this._withBundledSections(migrated) : this._syntheticManifest();
     return this._manifest;
@@ -178,9 +201,24 @@ export class BundledBackend implements ProjectBackend {
    */
   hasDeployedManifest(): boolean { return this._hasDeployedManifest; }
 
-  async readScene(relPath: string): Promise<RvScene | null> {
-    const json = await this._fetchJson(relPath);
-    return isSceneLike(json) ? (json as RvScene) : null;
+  /**
+   * Read a shipped scene. GLB bytes, and nothing else (plan-413 phase 6).
+   *
+   * A deploy is read-only, so there is no precondition to honour here — but it
+   * still has to be able to *serve* a GLB scene, or a project published after
+   * the plan-397 migration would not open from its own deploy root.
+   *
+   * A foreign deploy built before phase 3 still publishes `.scene.json`
+   * examples. Those now get the F10 refusal instead of a JSON branch: the
+   * remedy is to rebuild that deploy, and saying so is more use than silently
+   * serving a format nothing downstream understands.
+   */
+  async readScene(relPath: string): Promise<SceneRecord | null> {
+    assertReadableScenePath(relPath);
+    const bytes = await this._fetchBytes(relPath);
+    if (!bytes) return null;
+    const meta = sceneDocumentsOf(await this.readManifest()).find(e => e.path === relPath);
+    return glbSceneRecord(bytes, { ...meta, path: relPath });
   }
 
   async readSettings(relPath?: string): Promise<unknown | null> {
@@ -189,36 +227,54 @@ export class BundledBackend implements ProjectBackend {
 
   // ─── Listing ──────────────────────────────────────────────────────────
 
-  async listScenes(): Promise<RvProjectSceneEntry[]> {
-    return (await this.readManifest())?.scenes ?? [];
-  }
-
   async listModels(): Promise<RvProjectAssetEntry[]> {
-    return (await this.readManifest())?.models ?? [];
+    return assetDocumentsOf(await this.readManifest(), 'models');
   }
 
   /**
-   * The library the deploy ships, read from its own catalog.
+   * Only what the manifest declares — nothing is discovered.
    *
-   * There is no folder to walk over HTTP, so where a folder project enumerates
-   * `library/`, this reads `library/catalog.json` — the file that enumerates it
-   * for the planner anyway. Without this the Assets tab was empty on every
-   * deploy and on the default boot, because the synthetic manifest declares
-   * `libraries[]` (the subscription) and never `library[]` (the contents).
-   *
-   * A manifest that declares its own `library[]` wins: a customer deploy that
-   * curated the list keeps it.
+   * The deploy catalog (`library/catalog.json`) is deliberately NOT read as a
+   * fallback anymore: a library exists only when it was explicitly referenced,
+   * either as `library[]` contents or as a `libraries[]` subscription in a
+   * deployed manifest. A deploy without such a declaration has no library.
    */
   async listLibrary(): Promise<RvProjectAssetEntry[]> {
-    const declared = (await this.readManifest())?.library;
-    if (Array.isArray(declared) && declared.length > 0) return declared;
-    if (this._libraryRead) return this._library;
-    this._libraryRead = true;
-    // One base: the library is bundled under `public/library/`, so the deploy
-    // root serves it in dev and in a build alike.
-    this._library = catalogAssets(await this._fetchJson(REALVIRTUAL_LIBRARY_PATH));
-    return this._library;
+    return assetDocumentsOf(await this.readManifest(), 'library');
   }
+
+  /**
+   * The one list (plan-413 §2.4), assembled from the three listings.
+   *
+   * Sequential, not `Promise.all`, and deliberately so: {@link readManifest}
+   * sets its `_manifestRead` latch *before* awaiting the fetch, so a second
+   * caller arriving while the first is still in flight is handed the field it
+   * has not filled in yet — an empty project. Awaiting the manifest once up
+   * front makes the three listings cache hits and side-steps it entirely. (The
+   * latch itself is a pre-existing sharp edge; caching the in-flight promise
+   * instead of the result would be the real fix, and belongs to whoever owns
+   * that file next.)
+   */
+  async listDocuments(): Promise<RvDocumentEntry[]> {
+    const manifest = await this.readManifest();
+    const declared = readDocuments(manifest) ?? [];
+    const scenes = sceneDocumentsOf(manifest);
+    const models = await this.listModels();
+    const library = await this.listLibrary();
+    return documentsFromLists({ scenes, models, library }, declared);
+  }
+
+  /**
+   * Never scanned — and that is a decision, not a gap (§2.5, SOL R1-7).
+   *
+   * Two reasons, either sufficient. `fetch` gives no `mtime` worth trusting
+   * (a CDN's `Last-Modified` describes the cache entry, not the artefact), so
+   * the pre-filter would never clear and every open would re-download every
+   * GLB. And there is nothing to reconcile: a bundled deploy is read-only, so
+   * its manifest cannot fall behind bytes that nobody can change. An empty
+   * stat list is how a backend says "my manifest is authoritative".
+   */
+  async statDocuments(): Promise<DocumentStat[]> { return []; }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────
 
@@ -228,14 +284,33 @@ export class BundledBackend implements ProjectBackend {
 
   // ─── Write — all of it refused ────────────────────────────────────────
 
-  async writeScene(): Promise<void> { throw new BackendNotWritableError(this.id, 'read-only'); }
+  async writeScene(): Promise<never> { throw new BackendNotWritableError(this.id, 'read-only'); }
   async deleteScene(): Promise<void> { throw new BackendNotWritableError(this.id, 'read-only'); }
+  /**
+   * Refused before the precondition is even looked at (plan-709 §2.3).
+   *
+   * The parameters are deliberately absent: "read-only" outranks every
+   * `expectedRevision`, so accepting them here would only invite a reader to
+   * think a `null` ("create only") might get through. It does not.
+   */
   async writeBlob(): Promise<void> { throw new BackendNotWritableError(this.id, 'read-only'); }
   async deleteBlob(): Promise<void> { throw new BackendNotWritableError(this.id, 'read-only'); }
 
   async readBlobUrl(relPath: string): Promise<ResolvedBackendBlob | null> {
     // Nothing to revoke: a deploy URL is already loadable as it stands.
     return { url: this._url(relPath), release: () => {} };
+  }
+
+  async readBlobBytes(relPath: string): Promise<ArrayBuffer | null> {
+    // No leak to close here — a deploy URL is not an object URL — but the
+    // contract is one method for every backend, so a caller never branches on
+    // `kind` to find out how to get bytes.
+    const bytes = await this._fetchBytes(relPath);
+    if (!bytes) return null;
+    return bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength,
+    ) as ArrayBuffer;
   }
 
   /** No queue, nothing to await. Present so callers need no `kind` check. */
@@ -247,9 +322,10 @@ export class BundledBackend implements ProjectBackend {
    * The demo project, assembled from what the deploy ships.
    *
    * It is the one project that legitimately carries the realvirtual demo
-   * scenes and models — every other project starts empty (§2.3). It is also
-   * the only one subscribed to the shipped realvirtual component library, so
-   * a customer's own project shows the customer's assets and nothing else.
+   * scenes and models — every other project starts empty (§2.3). It carries
+   * NO library subscription: libraries appear only when explicitly referenced
+   * (a deployed manifest's `libraries[]`, or one the user adds), never as a
+   * synthesized default.
    */
   private _syntheticManifest(): RvProject {
     return {
@@ -257,9 +333,7 @@ export class BundledBackend implements ProjectBackend {
       id: DEMO_PROJECT_ID,
       name: DEMO_PROJECT_NAME,
       canonicalName: DEMO_PROJECT_SLUG,
-      scenes: this._sceneEntries(),
-      models: this._modelEntries(),
-      libraries: [{ url: this._url(REALVIRTUAL_LIBRARY_PATH), label: 'realvirtual Library' }],
+      documents: this._bundledDocuments(),
       activeSceneId: null,
     };
   }
@@ -272,14 +346,26 @@ export class BundledBackend implements ProjectBackend {
    * its own `models[]` therefore keeps its own order and labels.
    */
   private _withBundledSections(project: RvProject): RvProject {
-    const merged: RvProject = { ...project };
-    if (!Array.isArray(merged.models) || merged.models.length === 0) {
-      merged.models = this._modelEntries();
+    const declared = readDocuments(project) ?? [];
+    const missing = (section: DocumentSection) =>
+      !declared.some(d => sectionOfDocument(d) === section);
+    const added: RvDocumentEntry[] = [];
+    if (missing('scenes')) {
+      added.push(...documentsFromLists({ scenes: this._publishedEntries() }));
     }
-    if (!Array.isArray(merged.scenes) || merged.scenes.length === 0) {
-      merged.scenes = this._sceneEntries();
+    if (missing('models')) {
+      added.push(...documentsFromLists({ models: this._modelEntries() }));
     }
-    return merged;
+    if (added.length === 0) return project;
+    return { ...project, documents: [...declared, ...added] };
+  }
+
+  /** The demo project's own documents: the shipped examples plus the models. */
+  private _bundledDocuments(): RvDocumentEntry[] {
+    return documentsFromLists({
+      scenes: this._publishedEntries(),
+      models: this._modelEntries(),
+    });
   }
 
   private _modelEntries(): RvProjectAssetEntry[] {
@@ -292,8 +378,14 @@ export class BundledBackend implements ProjectBackend {
    * The id is derived from the file name (`published:<urlName>`) rather than
    * minted: it has to be the same on every boot and in every tab, because
    * the two-tier merge and the `hidden` list key off it.
+   *
+   * The classification comes from the catalogue, not from the bytes, and that
+   * is the correct direction here: §2.5 says a bundled deploy is never scanned
+   * — it is read-only, so its manifest cannot go stale against files nobody can
+   * change — and reading the level out of the GLBs would mean downloading every
+   * example just to draw a list.
    */
-  private _sceneEntries(): RvProjectSceneEntry[] {
+  private _publishedEntries(): RvProjectSceneEntry[] {
     // `publishedScenePath` answers for the LOCAL deploy — in dev it re-roots
     // onto the private-assets mount. A discovering backend reads from a foreign
     // base, where `_url()` does the rooting, so its paths must stay plain
@@ -307,6 +399,7 @@ export class BundledBackend implements ProjectBackend {
       path: pathOf(e.file),
       baseKind: 'published',
       ...(e.mode ? { mode: e.mode } : {}),
+      ...(e.level ? { classification: { v: 1 as const, level: e.level } } : {}),
     }));
   }
 
@@ -347,6 +440,18 @@ export class BundledBackend implements ProjectBackend {
     return `${this._baseUrl}${relPath.replace(/^\/+/, '')}`;
   }
 
+  /** Same posture as {@link _fetchJson}, for a binary body. */
+  private async _fetchBytes(relPath: string): Promise<Uint8Array | null> {
+    if (!this._fetch) return null;
+    try {
+      const resp = await this._fetch(this._url(relPath), { cache: 'no-store' });
+      if (!resp.ok) return null;
+      return new Uint8Array(await resp.arrayBuffer());
+    } catch {
+      return null;
+    }
+  }
+
   private async _fetchJson(relPath: string): Promise<unknown | null> {
     if (!this._fetch) return null;
     try {
@@ -378,35 +483,3 @@ function normaliseBase(base: string): string {
   return b.endsWith('/') ? b : `${b}/`;
 }
 
-/** The folder the library catalog sits in — `library` for `library/catalog.json`. */
-const LIBRARY_ROOT = REALVIRTUAL_LIBRARY_PATH.replace(/\/[^/]*$/, '');
-
-/**
- * Library catalog → manifest asset entries.
- *
- * A catalog entry's `glbUrl` is relative to the catalog itself
- * (`PalletHandling/Turntable.glb`), so it becomes a project path by prefixing
- * the library folder. Absolute URLs are kept as they are — a catalog may point
- * at assets hosted elsewhere.
- */
-function catalogAssets(raw: unknown): RvProjectAssetEntry[] {
-  const entries = (raw as { entries?: unknown })?.entries;
-  if (!Array.isArray(entries)) return [];
-  const out: RvProjectAssetEntry[] = [];
-  for (const item of entries) {
-    if (!item || typeof item !== 'object') continue;
-    const rec = item as Record<string, unknown>;
-    const glbUrl = typeof rec.glbUrl === 'string' ? rec.glbUrl.trim() : '';
-    if (!glbUrl) continue;
-    const path = /^(https?:)?\/\//i.test(glbUrl) ? glbUrl : `${LIBRARY_ROOT}/${glbUrl}`;
-    const label = typeof rec.name === 'string' && rec.name ? rec.name : undefined;
-    out.push(label ? { path, label } : { path });
-  }
-  return out;
-}
-
-function isSceneLike(value: unknown): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const s = value as Record<string, unknown>;
-  return typeof s.id === 'string' && !!s.base;
-}

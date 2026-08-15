@@ -76,21 +76,21 @@ describe('deriveDefaultGatewayUrl (plan-363 Phase 7)', () => {
     // page origin is the only thing that knows where.
     expect(deriveDefaultGatewayUrl({
       protocol: 'http:', hostname: 'localhost', origin: 'http://localhost:15363',
-    })).toBe('http://localhost:15363');
+    }, false)).toBe('http://localhost:15363');
     expect(deriveDefaultGatewayUrl({
       protocol: 'http:', hostname: '127.0.0.1', origin: 'http://127.0.0.1:5100',
-    })).toBe('http://127.0.0.1:5100');
+    }, false)).toBe('http://127.0.0.1:5100');
   });
 
   it('falls back to localhost:5100 for a hosted origin — group 4 never talks to itself', () => {
     expect(deriveDefaultGatewayUrl({
       protocol: 'https:', hostname: 'web.realvirtual.io', origin: 'https://web.realvirtual.io',
-    })).toBe(FALLBACK_GATEWAY_URL);
+    }, false)).toBe(FALLBACK_GATEWAY_URL);
   });
 
   it('falls back for a non-http origin (file://, blob:) that names no reachable host', () => {
     expect(deriveDefaultGatewayUrl({
       protocol: 'file:', hostname: '', origin: 'null',
-    })).toBe(FALLBACK_GATEWAY_URL);
+    }, false)).toBe(FALLBACK_GATEWAY_URL);
   });
 });

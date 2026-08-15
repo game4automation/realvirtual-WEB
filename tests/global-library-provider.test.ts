@@ -5,7 +5,7 @@
  * plan-702 §9.1 — the bridge from `library-store` into the source registry.
  *
  * This provider is the reason the whole plan works: without it the global
- * catalogs (URL / GitHub / local folder / bundled) never reach a registry
+ * catalogs (URL / GitHub / bundled) never reach a registry
  * consumer, so the Assets tab could show the project's own library and nothing
  * else, and "Add library" would add something invisible.
  *
@@ -25,7 +25,7 @@ import {
   GLOBAL_LIBRARY_PROVIDER_ID,
   type LibraryStoreLike,
 } from '../src/core/library/global-library-provider';
-import { LOCAL_NEEDS_PERMISSION, type LibraryCatalogEntry } from '../src/core/library/library-types';
+import { type LibraryCatalogEntry } from '../src/core/library/library-types';
 
 function entry(id: string): LibraryCatalogEntry {
   return { id, name: id, category: 'custom', glbUrl: id + '.glb' };
@@ -38,8 +38,6 @@ class FakeLibraryStore implements LibraryStoreLike {
   catalogErrors = new Map<string, string>();
   origins = new Map<string, string>();
   removedCatalogs: string[] = [];
-  removedLocalFolders = 0;
-  refreshedLocalFolders = 0;
 
   private _listeners = new Set<() => void>();
 
@@ -58,8 +56,6 @@ class FakeLibraryStore implements LibraryStoreLike {
     this.notify();
   }
 
-  async removeLocalFolder(): Promise<void> { this.removedLocalFolders++; }
-  async refreshLocalFolder(): Promise<void> { this.refreshedLocalFolders++; }
 }
 
 let store: FakeLibraryStore;
@@ -119,21 +115,6 @@ describe('global-library-provider', () => {
     expect(store.removedCatalogs).toEqual([url]);
   });
 
-  test('routes a local folder to removeLocalFolder / refreshLocalFolder', async () => {
-    store.catalogUrls = ['local:Work/library'];
-    store.catalogs.set('local:Work/library', { name: 'Local: Work/library', entries: [] });
-    installGlobalLibraryProvider(store);
-
-    const source = globalSources()[0].source;
-    expect(source.kind).toBe('local');
-    expect(source.label).toBe('Work/library');
-    await source.remove!();
-    await source.refresh!();
-    expect(store.removedLocalFolders).toBe(1);
-    expect(store.refreshedLocalFolders).toBe(1);
-    expect(store.removedCatalogs).toEqual([]);
-  });
-
   test('returns [] from listEntries while the catalog is still loading', () => {
     const url = 'https://slow.example/catalog.json';
     store.catalogUrls = [url];
@@ -156,21 +137,24 @@ describe('global-library-provider', () => {
     const source = globalSources()[0].source;
     expect(source.error).toBe('HTTP 404');
     expect(source.loaded).toBe(false);
-    expect(source.needsPermission).toBe(false);
   });
 
-  test('splits the permission sentinel out of error into needsPermission', () => {
-    const url = 'local:Work/library';
+  // There used to be a third state between "loaded" and "error": a remembered
+  // local folder whose browser permission had lapsed. That source kind went
+  // with the working folder (plan-709 §2.6), and with it the sentinel that
+  // encoded the state inside `catalogErrors` — so an error here is now always
+  // an error.
+  test('has no permission limbo left between loaded and error', () => {
+    const url = 'https://c.example/catalog.json';
     store.catalogUrls = [url];
-    store.catalogs.set(url, { name: 'Local: Work/library', entries: [entry('a')] });
-    store.catalogErrors.set(url, LOCAL_NEEDS_PERMISSION);
+    store.origins.set(url, 'user');
+    store.catalogs.set(url, { name: 'C', entries: [entry('a')] });
     installGlobalLibraryProvider(store);
 
     const source = globalSources()[0].source;
-    expect(source.needsPermission).toBe(true);
-    // Not "failed to load" — the folder is fine, the browser just forgot.
     expect(source.error).toBeNull();
-    expect(source.listEntries()).toEqual([]);
+    expect(source.loaded).toBe(true);
+    expect(source.listEntries()).toHaveLength(1);
   });
 
   test('republishes when the store notifies', () => {

@@ -27,6 +27,7 @@ import type { ComponentContext, ComponentSchema, RVComponent } from './rv-compon
 import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import type { GizmoHandle } from './rv-gizmo-manager';
 import { NodeRegistry } from './rv-node-registry';
+import { wireValueSignal } from './rv-signal-wiring';
 import {
   ERROR_COLOR,
   ERROR_BLINK_HZ,
@@ -102,27 +103,28 @@ export class RVWebVisibility implements RVComponent {
     });
 
     // ── Visibility signal ──
+    // plan-427: via the helpers, so a visibility/error level held across a reset
+    // or restored on reconnect is re-applied. As before, the INITIAL call only
+    // captures the state — the meshes and gizmos are touched from
+    // `onSceneReady()` (no flicker) — hence the `deferInitial` gate.
+    this._visible = this.DefaultVisible;
     if (this.SignalVisible) {
-      this._unsubVisible = ctx.signalStore.subscribeByPath(
-        this.SignalVisible,
-        (v) => this._onVisibleChange(!!v),
-      );
-      const current = ctx.signalStore.getByPath(this.SignalVisible);
-      // Read initial value (no flicker). XOR with InvertSignal.
-      this._visible = current !== undefined ? (!!current !== this.InvertSignal) : this.DefaultVisible;
-    } else {
-      // No signal bound → apply the default once.
-      this._visible = this.DefaultVisible;
+      let deferInitial = true;
+      this._unsubVisible = wireValueSignal(ctx.signalStore, this.SignalVisible, (v) => {
+        if (deferInitial) { deferInitial = false; this._visible = !!v !== this.InvertSignal; return; }
+        this._onVisibleChange(!!v);
+      }, undefined, ctx.reapply).unsubscribe;
+      deferInitial = false;
     }
 
     // ── Error signal ──
     if (this.SignalError) {
-      this._unsubError = ctx.signalStore.subscribeByPath(
-        this.SignalError,
-        (v) => this._onErrorChange(!!v),
-      );
-      const current = ctx.signalStore.getByPath(this.SignalError);
-      if (current !== undefined) this._error = !!current;
+      let deferInitial = true;
+      this._unsubError = wireValueSignal(ctx.signalStore, this.SignalError, (v) => {
+        if (deferInitial) { deferInitial = false; this._error = !!v; return; }
+        this._onErrorChange(!!v);
+      }, undefined, ctx.reapply).unsubscribe;
+      deferInitial = false;
     }
   }
 

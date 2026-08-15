@@ -276,10 +276,14 @@ Two things happen before the panel appears:
 
 ## AI activity indicator
 
-While the assistant performs an action, a pill in the **accent color** appears next to
+The **AI Bridge button** itself carries the connection: its icon stands in the
+**accent color** for as long as the bridge is connected, and stays neutral when it is
+off or still reconnecting. Its tooltip names the state — *off*, *connecting…* or
+*connected (N tools)*, with the running operation appended while one is in flight.
+
+While the assistant performs an action, a pill in the accent color appears next to
 the AI Bridge button (over the 3D scene) showing the current operation, e.g.
-`AI · Drive list`. It auto-clears a few seconds after the last action. The AI Bridge
-button icon also turns the accent color while the assistant is working.
+`AI · Drive list`. It auto-clears a few seconds after the last action.
 
 ![The AI activity pill in the accent color, shown while the assistant is working](docs/images/screenshot-ai-activity-overlay.png)
 
@@ -303,9 +307,18 @@ The `web_*` tools fall into these groups (full reference in
   `web_layout_list`, `web_layout_snap_list`, `web_layout_snap_suggest`,
   `web_layout_snap_attach`, `web_component_set`, `web_scene_new`, `web_scene_save`,
   `web_scene_open`, `web_scene_list`, `web_scene_export`.
+- **Signal binding** (plan-425) — `web_signal_bindings_list`, `web_signal_sources_list`
+  (read-only) and `web_signal_bind`, `web_signal_unbind` (write). See *Autobinding a PLC*
+  below.
+- **Node knowledge** (plan-394) — `web_knowledge_get`, `web_knowledge_list` (read-only) and
+  `web_knowledge_set` (write): one overwritable Markdown note per scene node, stored in the
+  GLB, so what one session works out is available to the next. See *Node knowledge (agent
+  memory)* below.
 - **Help** — `web_help(topic)` serves the deep workflow guides
   (`src/plugins/mcp-bridge/help/*.md`) on demand; the always-loaded server
   instructions stay a compact map.
+- **Orient** (plan-707) — `web_describe` answers "where am I, what is blocked, what next"
+  in one read-only call. See *Orientation and effect verification* below.
 - **Perceive & navigate** (all modes) — `web_node_bounds`, `web_view_pick`,
   `web_view_gaze`, `web_view_isolate`, `web_screenshot_annotated`, `web_camera_get`,
   `web_camera_set`, `web_camera_focus`, `web_camera_orbit`, `web_select`,
@@ -325,6 +338,93 @@ The `web_*` tools fall into these groups (full reference in
   (pose-sweep montage with exact restore). Every tool calls the same action functions
   the Quick Edit / Materials panel buttons call, against the op-logged AssetDocument —
   agent edits are undoable and reflected live in the UI.
+
+## Orientation and effect verification
+
+Two questions the tool list has never been able to answer are *what is true right now* and
+*did that call actually do anything*. Since plan-707 both have an answer, and neither
+changed the wire protocol — `web_describe` is an ordinary tool, and the verification rides
+inside the result JSON.
+
+### `web_describe` — where am I, what next
+
+One read-only call replaces the `web_status` + `web_editor_status` + `web_selection_get`
+round trip and adds the two fields that make it actionable:
+
+```jsonc
+{
+  "mode": "editor",
+  "availableModes": ["hmi", "planner", "des", "editor"],
+  "document": { "name": "Robot", "baseKind": "libraryGlb", "dirty": true,
+                "busy": false, "opCount": 41, "nodeCount": 884, "canUndo": true },
+  "selection": { "count": 2, "firstPath": "Robot/Axis2/Arm" },
+  "runtime": { "connectionState": "Connected", "simRunning": false,
+               "modelUrl": null, "driveCount": 6, "signalCount": 18 },
+  "blocked": [{ "family": "web_layout_*",
+                "reason": "Needs planner mode — call web_mode_set(\"planner\")" }],
+  "next": "Verify the authored motion with web_editor_verify_drive before web_editor_save",
+  "guide": "web_help(\"editor\")"
+}
+```
+
+`next` comes from a declarative rule table (`NEXT_RULES` in `rv-mcp-describe-tool.ts`),
+first match wins — a recommendation that varied between calls would be worse than none.
+The first three rules encode known dead ends: a `busy` editor (poll, do not push another
+call), a `libraryGlb` document with `nodeCount <= 1` (it opened EMPTY — re-import), and a
+document nothing has been perceived in yet.
+
+It **complements `web_help`, it does not replace it**: `guide` names a topic, it never
+copies guide text. And it is `readOnly: true` in the strict sense — no selection, no panel,
+no camera move, unlike `web_node_bounds`.
+
+### `verified` — what the call actually did
+
+Every writing tool with persistent state now carries a `verified` block in its result.
+There is no opt-in and no parameter: the three dead ends this exists for are all cases
+where the agent did not know it needed to check.
+
+```jsonc
+{ "name": "StartSignal", "value": false, "previous": true,
+  "verified": { "changed": ["StartSignal.value: true→false"] } }
+
+{ "ok": true, "kinematicPath": "Robot/Axis2", "groupName": "Axis2",
+  "verified": { "changed": ["setField×1"] } }        // named, but nothing moved
+
+{ "ok": true,
+  "verified": { "noop": true, "why": "the tool reported success but appended no op" } }
+```
+
+- **`noop: true` is the valuable bit.** The tool reported success and the probe observed
+  no change. Treat it as a failure the tool did not notice.
+- **`changed` counts op KINDS for editor tools.** `setField×1` alone means a kinematic
+  group was *named*; `reparentNode×8` means its members actually moved under the axis.
+  That distinction is the difference between a working axis and a silent no-op.
+- **`ambiguous: true` means two calls overlapped on the same scope**, so the observed
+  change cannot be attributed to this one. `changed` is then withheld deliberately — a
+  wrongly attributed delta claims an effect the call did not have. `noop` stays valid
+  under overlap: "nothing happened" needs no attribution.
+- **A result carrying `error` never gets `verified`.** A failure is already the answer.
+- The delta is capped (`DELTA_MAX_ENTRIES` / `DELTA_MAX_BYTES` in
+  `rv-mcp-delta-probes.ts`, both with their measured provenance in a comment); overflow is
+  reported as `more: N`.
+
+Not every write is probed, and the gaps are decisions: `web_camera_*`, `web_view_*`,
+`web_select*` and `web_node_bounds` are classified as writes because a watching operator
+sees the view jump, but they persist nothing, so a delta over a camera matrix would be
+noise charged to the token budget. `web_editor_verify_drive` and
+`web_editor_mechanism_jog` are transient by design.
+
+### The generated tool reference
+
+The tool tables in `webviewer.mcp.md` and the five `help/*.md` guides are **generated from
+the decorators and checked in**, inside `<!-- BEGIN GENERATED: … -->` fences.
+`tests/rv-mcp-docs-drift.test.ts` fails in both directions — a new tool without a
+regeneration run, and a hand-edited block — so the reference cannot quietly fall behind
+the code. Regenerate with `npm run gen:mcp-docs`; everything outside the fences is prose
+and is never touched.
+
+> `webviewer.mcp.md` is an `EmbeddedResource` in `Connect.csproj`. A regenerated
+> instruction reaches CONNECT clients only after `realvirtual-Connect.exe` is rebuilt.
 
 ### Naming, description & response rules (enforced)
 
@@ -381,6 +481,133 @@ whole view. It can also crop to a sub-region:
 
 ![web_screenshot cropped to a single node's on-screen bounding box](docs/images/screenshot-web-screenshot-crop.png)
 
+## Autobinding a PLC to a shared model
+
+Connecting a customer's own PLC to a model somebody else built is the workflow plan-425
+exists for, and it is a LANGUAGE problem before it is a technical one: nothing in
+`MC04_01_Motor_Run` says it belongs on the slot called `Forward` of `Conveyor_03`. Matching
+those two vocabularies is what a language model is good at, which is why the viewer ships
+tools rather than a heuristic auto-map wizard.
+
+The loop is three calls:
+
+1. **`web_signal_bindings_list`** — every bindable slot with its canonical identity
+   (`targetId`, `componentPath`, `slot`), what is currently on it, its liveness, and the
+   slot signal's **comment**.
+2. **`web_signal_sources_list`** — every signal the connected interfaces offer, with
+   direction, data type, provider and again the **comment**.
+3. **`web_signal_bind`** per matched pair.
+
+The comments are the load-bearing part. They come from Unity's `Signal.Comment`, travel in
+the GLB, and are usually the only place a tag's *meaning* is written down — a symbol name
+alone rarely carries enough to match on.
+
+### What the tools refuse to do
+
+- **Guess a slot.** A Planner placement aggregates its whole subtree, so one target can
+  carry the same slot name on several components. `targetId + slot` is refused with the
+  candidate list; pass `componentPath` too.
+- **Bind something a manual drag would not.** Type, direction and provider identity run
+  through the same validation as drag-and-drop, and a refusal returns the same sentence a
+  user would read.
+- **Claim a success that will not survive.** Persistence is checked BEFORE the runtime
+  mutation, so a bind either sticks or does not happen. `persisted: true` in the answer is
+  a read-back, not an intention.
+- **Repair a broken link.** Orphans appear in the `orphans` section of
+  `web_signal_bindings_list`, with `candidateComponentPath` when the component merely
+  moved — but reconnecting stays a human click in the bindings overview panel. A repair
+  that picked the wrong component would silently rewire a machine.
+
+### Oversight
+
+Direct binding is deliberate: a confirmation prompt per link would undo the point of
+binding a hundred signals in one pass. The oversight is the **bindings overview panel**
+(activity bar, beside the signal-link toggle) — every link in one table, jump to any of
+them in the 3D scene, unlink with one click. Each successful bind also pulses its chip
+once, so a watching operator sees the agent working.
+
+Both mutating tools sit behind CONNECT's write switch (*Details ▸ MCP server ▸ Allow write
+access*). With it off they are not offered, and calling them by name is refused.
+
+## Node knowledge (agent memory)
+
+An agent that kinematizes, analyses or debugs a machine works out things the CAD never
+said: which axis carries which role, where the real limits are, which node is not the
+thing its name claims. Three tools let it keep that:
+
+| Tool | Purpose |
+|------|---------|
+| `web_knowledge_set(path, markdown, author?, confidence?)` | Store or replace the note on one node. Overwrites; never appends. Empty/whitespace deletes it. |
+| `web_knowledge_get(path)` | The note as raw Markdown plus `updatedAt` / `author` / `confidence`. |
+| `web_knowledge_list(query?, limit?)` | Every annotated node, newest first, with excerpts. Full-text `query` over note text and node path. |
+
+The note is stored as the `NodeKnowledge` rv_extras entry on the glTF node, so it travels
+inside the GLB — no sidecar file, consistent with *GLB is the single source of truth*.
+There is **no HMI panel** for it: this is agent memory and a prompt input, not a UI feature.
+
+`confidence` (`observed` | `inferred` | `unverified`) is the part worth insisting on. A
+hallucinated guess becomes an apparent fact simply by being written down, and the next
+session has no way to tell. `observed` means measured or seen; the other two mark a guess
+as a guess. `updatedAt` is stamped automatically and is the only staleness signal a reader
+gets — there is no automatic conflict resolution between a note and the scene.
+
+### `persistedTo` — read it, it is not decoration
+
+Every `set` reports where the write actually landed, and the three answers are genuinely
+different promises:
+
+| `persistedTo` | Meaning |
+|---------------|---------|
+| `asset` | In the AssetDocument. Call `web_editor_save` to write the asset GLB. |
+| `scene` | In the scene op log. **Optimistic:** the debounced draft autosave carries it, and a workspace teardown (a model switch) CANCELS that timer rather than flushing it — a note written seconds before a switch is lost despite this answer. |
+| `none` | Nothing is persisted. Either no edit target exists, or the workspace is **transient** (an Example model or a shared link, which persists nothing by design — see [`doc-persistence.md`](doc-persistence.md)). The note is gone on reload. |
+
+The distinction needs **two** signals, which is why it is not derived from
+`EditTarget.available`: a transient workspace reports `available: true`, accepts ops and
+supports undo, and persists nothing. `getActivePersistenceTarget()`
+(`src/core/hmi/rv-edit-target.ts`) combines `available` with `SceneStore.isTransient()`.
+
+### Prompt embedding
+
+A node's note is also fed into the Ask AI / diagnosis prompt (see *Model context in the
+answer* below), as its own block **after** the alarm lines, capped at 600 characters. Two
+properties matter and are pinned by tests:
+
+- **Every note line is given a code-generated `| ` prefix**, under a header naming the block
+  as author-written. Without it a note containing `Alarm: Safety light curtain fault` would
+  be indistinguishable from a real alarm line, and an agentic chain could act on it.
+- **Line breaks survive, but only LF.** `sanitizeKnowledgeText` neutralizes CR, VT, FF, NEL,
+  U+2028 and U+2029 — a renderer treats them as breaks while a split on LF does not see
+  them, which would put text into the prompt without the prefix. CONNECT cannot catch
+  U+2028/U+2029 (they are Unicode Zl/Zp, so .NET `char.IsControl` is false), so the client
+  sanitizer is the only guard. `[MACHINE_STATUS]` is neutralized too: CONNECT deletes
+  everything following a line that trims to exactly that.
+
+The block sits **last** on purpose. The node block is capped at 1500 characters, so whatever
+is at the end is lost first — a stale note losing its tail beats live signals or an active
+alarm being pushed out of the prompt by one.
+
+### Known limitations
+
+- **A Unity re-export of the model DROPS every note.** There is no Unity `WebKnowledge`
+  component, by decision, so Unity does not carry the entry and rewrites the GLB without it.
+- **A Unity re-import LOGS ONE CONSOLE ERROR PER ANNOTATED NODE.**
+  `GLBComponentDeserializer` cannot resolve the `NodeKnowledge` type and calls
+  `GLBDebugLogger.Error`, which is *always logged* regardless of verbosity. This is
+  accepted, permanent, and lives in the DATA rather than the code: reverting the feature
+  does not clean already-exported GLBs. Note that `/finaltest` ("fail on any realvirtual
+  package error") can trip on it and then needs judging by hand.
+- **Notes are invisible to `web_component_get` / `_get_all`.** `NodeKnowledge` registers no
+  create-factory, so no live instance exists and those tools (which serialize registry
+  instances) see nothing. Read notes with `web_knowledge_get`.
+- **Undo shares one stack with user edits.** A note goes through the same op log, so Ctrl+Z
+  can remove one. Same as `web_component_set`.
+- **No multiuser live sync.** Other participants see a note after save + reload.
+- **`NodeIdAtWrite` is blind across multiple references.** A NodeId is unique within a file,
+  not globally, so ten placements of one asset share it. `get` reports a mismatch for a
+  renumbering re-import, never for the wrong placement — absence of a mismatch is not proof
+  of identity.
+
 ## Operating with and without Unity
 
 - **Standalone** — run the WebViewer dev server (`npm run dev`, `localhost:5173`) or a
@@ -429,6 +656,76 @@ whole view. It can also crop to a sub-region:
 - **Wrong assistant is driving the browser.** Use **Connect to** in the AI Bridge
   panel to point the browser at the intended host (CONNECT / Node · Desktop / Node · Code).
 
+- **Every call times out after 15 s, but CONNECT is healthy.** The classic symptom is
+  `WebViewer tool call '…' timed out after 15 seconds (browserCallId=N, outcome=unknown)`
+  from every tool, while `curl http://127.0.0.1:5100/health` answers `status: ok` instantly.
+  That combination means the **browser tab is throttled**, not that anything is broken.
+
+  Call **`web_ping`** first — it is strictly synchronous (no timer, no frame, no import), and
+  because WebSocket `onmessage`/`send` are not throttled it still answers from a throttled tab
+  and reports `hidden: true` with a diagnosis line. One call separates *tab in the background*
+  from *browser gone* from *CONNECT down*.
+
+  Chrome throttles along two independent axes:
+
+  | Mechanism | Trigger | Effect |
+  |---|---|---|
+  | Timer throttling | page hidden | `setTimeout` clamped to ≥ 1 s; after ~5 min hidden, *intensive wake-up throttling* clamps to once per **minute** |
+  | Renderer backgrounding / native window occlusion | Chrome's window **covered** by another window | renderer deprioritised — hits even the ACTIVE tab of that window |
+
+  The second one is why this bites a normal session: working in the IDE with the viewer behind
+  it is enough. Every `sleep()` in the MCP path (choreography beat, camera settle, the
+  `verify_drive` glide) then takes a minute instead of 80 ms.
+
+  **Fix — launch Chrome with throttling disabled:**
+
+  ```bash
+  npm run viewer:chrome                                    # default http://localhost:5100/
+  npm run viewer:chrome -- --url "http://localhost:5100/?project=myproject"
+  ```
+
+  `scripts/launch-viewer-chrome.mjs` passes the Playwright/Puppeteer switch set
+  (`--disable-background-timer-throttling`, `--disable-backgrounding-occluded-windows`,
+  `--disable-renderer-backgrounding`, and one combined `--disable-features=` for
+  `CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,HighEfficiencyModeAvailable`). It uses
+  a **dedicated `--user-data-dir`** on purpose: starting a second `chrome.exe` against an
+  already-running profile just forwards the URL to the existing process and **drops the
+  switches**, which is the usual reason "I passed the flags and nothing changed".
+
+  What no flag fixes: a genuinely **background tab** (another tab selected in the same window)
+  gets no `requestAnimationFrame` at all, because the compositor produces no frames for it.
+  Keep the viewer the active tab of its window — the window may sit behind the IDE. MCP
+  screenshots survive even that, since `captureFrameCanvas()` drives `renderFrameForCapture()`
+  synchronously; only camera *animations* need live frames.
+
+- **A call hangs and a modal dialog is sitting on screen.** The editor's dialogs
+  (`draft-conflict`, `shelved-drafts`, `draft-recovery`, `unsaved`, `cad-missing`, …) settle on
+  a *click*. During an MCP call nobody clicks, so the call blocks until its timeout and the
+  dialog stays up, poisoning every call after it. The bridge now installs a policy
+  (`rv-mcp-dialog-policy.ts`) around every call: safe dialogs are answered automatically,
+  ambiguous ones are still left to the human, and whatever was answered comes back in the tool
+  result as `autoAnsweredDialogs` — including the detail of informational ones, so a
+  "CAD geometry missing" report is never silently swallowed. The defaults never destroy work:
+  `draft-conflict` → `open-requested` (keeps the draft), `draft-recovery` → `restore`,
+  `unsaved` → `cancel`.
+
+- **Chrome's "Reload site? Changes you made may not be saved" on every TS edit (dev).** That is
+  Vite doing a full reload for a module it cannot hot-patch, hitting the page's `beforeunload`
+  guard. It is a **native browser dialog**: nothing in the page and no MCP tool can dismiss it,
+  so an agent session stops dead behind it. `main.ts` now listens for Vite's
+  `vite:beforeFullReload` and stands the guard down for exactly that reload, so the page
+  reloads by itself. Dev-only (`import.meta.hot` does not exist in a production build), and
+  nothing is at risk because the draft autosave carries the document across the reload — the
+  same reason the guard asks `hasUnpersistedWork()` rather than `hasUnsavedWork()`.
+
+- **The agent is in the wrong project.** Use `web_project_list` / `web_project_open` — the
+  switch happens **in place**, so the bridge connection, the MCP session and the editor
+  document all survive it. Do **not** navigate to `?project=<slug>`: that reloads into a new
+  tab which immediately takes bridge ownership (`_active` is last-writer-wins and force-closes
+  the previous socket), costing the editor document and several seconds of boot during which
+  every call fails. `web_project_open` refuses when there is unsaved work unless `force=true`,
+  because the underlying switch would otherwise raise a modal dialog no agent can answer.
+
 ## Ask AI in the global search
 
 The global search bar (bottom center) can send the typed text as a free-text
@@ -476,6 +773,14 @@ live machine state:
   clearly delimited **data** block. A removable context chip in the dialog shows
   the included node; removing it re-runs the question without context. An
   expandable *Context sent* line shows exactly what travelled with the request.
+- **Node knowledge.** If an earlier session left a note on the selected node
+  (`web_knowledge_set`), it rides along as its own block after the alarm lines —
+  line-prefixed and capped at 600 characters, so the manual, the live state and what an
+  agent previously worked out all reach the model together. Notes are **not** inherited
+  from ancestors and are **not** included for unselected query hits: a root-level note
+  would otherwise be reported as knowledge about every node in the scene, and ten hits ×
+  600 characters would blow the 2600-character context budget on its own. See *Node
+  knowledge (agent memory)* above.
 - **Query→part matching (no selection needed).** Even without a selection, the
   docs of the top node search hits for the typed question are added as `docHints`,
   so a question that names a part still gets a part-specific answer.

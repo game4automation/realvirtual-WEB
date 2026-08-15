@@ -16,7 +16,7 @@
 import { useState, type ComponentType, type ReactElement } from 'react';
 import { Box, Menu, MenuItem, ListItemIcon, ListItemText, Typography, ButtonBase, Paper } from '@mui/material';
 import {
-  ArrowDropDown, Check, ViewQuilt, AccountTree, GridView, ViewInAr, Dashboard, Edit,
+  ArrowDropDown, Check, ViewQuilt, AccountTree, GridView, ViewInAr, Dashboard, Edit, Handyman,
 } from '@mui/icons-material';
 import { useMode } from '../../hooks/use-mode';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
@@ -33,7 +33,8 @@ const ICONS: Record<string, ComponentType<{ fontSize?: 'small' | 'medium' }>> = 
   des: AccountTree,
   planner: GridView,
   editor: Edit,
-  ViewQuilt, AccountTree, GridView, ViewInAr, Dashboard, Edit,
+  commissioning: Handyman,
+  ViewQuilt, AccountTree, GridView, ViewInAr, Dashboard, Edit, Handyman,
 };
 
 function iconFor(idOrName: string | undefined, fallback: string): ReactElement {

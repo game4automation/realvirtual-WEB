@@ -204,7 +204,7 @@ describe('shouldAdoptFallbackGateway', () => {
     // A hosted page derives the fallback already, so there is nothing else to try.
     const derived = deriveDefaultGatewayUrl({
       protocol: 'https:', hostname: 'web.realvirtual.io', origin: 'https://web.realvirtual.io',
-    });
+    }, false);
     expect(derived).toBe(FALLBACK_GATEWAY_URL);
     expect(shouldAdoptFallbackGateway(derived, derived, null)).toBe(false);
   });

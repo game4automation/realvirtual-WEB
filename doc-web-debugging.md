@@ -477,3 +477,49 @@ window.viewer  // Access viewer instance
 import { enableDebug } from './core/engine/rv-debug';
 enableDebug('transport');
 ```
+
+### Reading write-authority conflicts
+
+When a component's value "does not stick", the write gate has usually recorded
+why. It is on in every build — the default mode is `shadow`, which records but
+never rejects, so the log is populated even though nothing is being blocked.
+
+```js
+window.__rvViewer.signalStore.getWriteConflicts()
+// [{ slotId, writerId, writerKind, reason, writeCount }, …]
+```
+
+Entries are deduplicated per `(slot, writer, reason)`; `writeCount` is how often
+that same conflict recurred, so a four-digit count means "every tick", not "four
+times".
+
+Reading `reason`:
+
+| `reason` | What it means |
+|---|---|
+| `authority-forced` | An operator force pins the channel, or a slot on it is `forced`. The value is held. |
+| `authority-bound` | A live binding owns a **command** slot on the channel; the local write is displaced by the relay. |
+| `authority-remote` | A remote session owner pre-empts this writer (UI hint only; see the ranking section in `doc-signal-architecture.md`). |
+
+Two things changed with plan-353 and are worth knowing when comparing against
+older notes or screenshots:
+
+- **The reason now matches the authority that actually decided.** The old gate
+  returned at the first claimed slot it found on the channel and always logged
+  `authority-bound`, so a forced slot registered later was reported as bound —
+  or not reported at all. The channel is now ranked in full (`forced` >
+  `bound(control)` > `bound(feedback)`) and `slotId` names the deciding slot.
+- **A bound FEEDBACK slot is no longer a conflict.** Command authority belongs
+  to CONNECT, feedback authority to the component that produces the value, so a
+  local write to a channel whose bound slots are all `feedback` is permitted and
+  logs nothing. If you expected an entry and see none, check the role first:
+
+```js
+// The role the gate is using for a slot (default 'control' when unregistered):
+window.__rvViewer.signalStore   // …then compare with the binding's own role
+```
+
+A slot whose role reads `control` when you expect `feedback` usually means the
+slot signal's PLC type never arrived (`_deriveSlotRole` falls back to `unknown`,
+which the gate treats like `control`) — check that the gateway registered the
+type, not the binding.

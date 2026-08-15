@@ -25,15 +25,17 @@ import { describe, it, expect } from 'vitest';
 import { Object3D } from 'three';
 import {
   type AddNodeOp,
-  type PrimitiveEditOp,
   type SetFieldOp,
   COALESCE_WINDOW_MS,
   freshOpId,
   materialise,
-  canCoalesce,
-  mergeOps,
   inverseOp,
 } from '../src/core/hmi/scene/rv-scene-edits';
+import {
+  canCoalesceRvOps,
+  mergeRvOps,
+  type RvScenePrimitiveOp,
+} from '../src/core/ops/rv-unified-ops';
 import {
   ensurePlcProgramNode,
   findPlcProgramNode,
@@ -60,9 +62,9 @@ describe('PLC code persistence — setField coalescing', () => {
   it('two rapid Code ops coalesce into one entry keeping the original prev', () => {
     const a = codeOp('PROGRAM Main', '', 1000);
     const b = codeOp('PROGRAM Main\nEND_PROGRAM', 'PROGRAM Main', 1200);
-    expect(canCoalesce(a, b)).toBe(true);
+    expect(canCoalesceRvOps(a, b)).toBe(true);
 
-    const merged = mergeOps(a, b) as SetFieldOp;
+    const merged = mergeRvOps(a, b) as SetFieldOp;
     expect(merged.value).toBe('PROGRAM Main\nEND_PROGRAM');
     expect(merged.prev).toBe(''); // undo jumps back to the pre-burst source
     expect(merged.id).toBe(a.id); // ONE history entry
@@ -71,10 +73,10 @@ describe('PLC code persistence — setField coalescing', () => {
   it('does NOT coalesce outside the window or across fields', () => {
     const a = codeOp('x', '', 1000);
     const late = codeOp('y', 'x', 1000 + COALESCE_WINDOW_MS + 1);
-    expect(canCoalesce(a, late)).toBe(false);
+    expect(canCoalesceRvOps(a, late)).toBe(false);
 
     const otherField: SetFieldOp = { ...codeOp('y', 'x', 1100), fieldName: 'Name' };
-    expect(canCoalesce(a, otherField)).toBe(false);
+    expect(canCoalesceRvOps(a, otherField)).toBe(false);
   });
 });
 
@@ -159,7 +161,7 @@ function makeEnsureFixture(opts: { materialise?: boolean } = {}) {
   const created = new Object3D();
   created.name = 'PLC';
 
-  const ops: PrimitiveEditOp[] = [];
+  const ops: RvScenePrimitiveOp[] = [];
   let applied = false;
   const store: PlcSceneStoreLike = {
     applyOp: (op) => {

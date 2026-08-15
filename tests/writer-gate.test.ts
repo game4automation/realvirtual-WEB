@@ -18,6 +18,7 @@ import {
   makeSignalChannelId,
   makeSlotId,
   registerSlotChannel,
+  registerSlotWriteRole,
   resetSlotAuthority,
   setAuthorityRanking,
   setRemoteOwnershipActive,
@@ -151,6 +152,64 @@ describe('hot path steady state (9.5)', () => {
     expect(conflict.writeCount).toBeGreaterThan(1000);
   });
 
+  it('a role-resolved FAN-OUT channel stays steady and allocation-free (plan-353)', () => {
+    // plan-353 replaced the first-hit loop with a full pass over the channel's
+    // slots and added a role lookup per bound slot. Both are on the write path,
+    // so the two standing promises are re-measured with the new shape:
+    //   * no NEW telemetry entries on repeated writes (the dedup still holds
+    //     even though the deciding slot is now chosen, not stumbled upon), and
+    //   * the pass stays a bounded loop of Map lookups — no allocation, which
+    //     shows up as a stable entry count plus a sane wall time.
+    const store = new SignalStore();
+    store.register('Conv.Run', 'Conv/Run', false, 'PLCInputBool');
+
+    // Eight slots on ONE channel: seven feedback, one control — the worst case
+    // for the aggregation, because it can only answer after seeing them all.
+    const FAN_OUT = 8;
+    for (let i = 0; i < FAN_OUT; i++) {
+      const slotId = makeSlotId('el1', '.', 'Conveyor', `Slot${i}`);
+      registerSlotChannel(slotId, makeSignalChannelId('Conv.Run'));
+      registerSlotWriteRole(slotId, i === FAN_OUT - 1 ? 'control' : 'feedback');
+      claimBound(slotId);
+    }
+    const sim = store.createWriter('component:Conveyor:Conv', 'component');
+
+    sim.set('Conv.Run', true);   // warm-up creates the single entries
+    const inventoryBaseline = store.getWriterInventory().length;
+    const conflictBaseline = store.getWriteConflicts().length;
+    expect(conflictBaseline).toBe(1);
+
+    const started = performance.now();
+    for (let i = 0; i < 5000; i++) sim.set('Conv.Run', i % 2 === 0);
+    const elapsed = performance.now() - started;
+
+    expect(store.getWriterInventory().length).toBe(inventoryBaseline);
+    expect(store.getWriteConflicts().length).toBe(conflictBaseline);
+    expect(store.getWriteConflicts()[0].writeCount).toBeGreaterThan(5000);
+    // Generous bound — this is a regression guard against an accidental
+    // allocation or an O(n²) rescan, not a micro-benchmark.
+    expect(elapsed).toBeLessThan(200);
+  });
+
+  it('an all-FEEDBACK fan-out logs nothing — the allowed case is not a conflict', () => {
+    // The shadow log must not fill up with the case plan-353 F6 just declared
+    // correct, or the telemetry that is supposed to prepare the enforce rollout
+    // becomes unreadable.
+    const store = new SignalStore();
+    store.register('Conv.Run', 'Conv/Run', false, 'PLCInputBool');
+    for (let i = 0; i < 4; i++) {
+      const slotId = makeSlotId('el1', '.', 'Conveyor', `Fb${i}`);
+      registerSlotChannel(slotId, makeSignalChannelId('Conv.Run'));
+      registerSlotWriteRole(slotId, 'feedback');
+      claimBound(slotId);
+    }
+    const sim = store.createWriter('component:Conveyor:Conv', 'component');
+    for (let i = 0; i < 100; i++) sim.set('Conv.Run', i % 2 === 0);
+
+    expect(store.getWriteConflicts()).toHaveLength(0);
+    expect(store.get('Conv.Run')).toBe(false);
+  });
+
   it('telemetry reset mid-run restarts cleanly (9.13b counter consistency)', () => {
     const { store, sim } = fixture();
     sim.set('Conv.Run', true);
@@ -167,22 +226,56 @@ describe('hot path steady state (9.5)', () => {
   });
 });
 
-describe('enforce with unknown writer (9.13c)', () => {
-  it('a raw (unknown) write passes even in enforce mode and is only recorded', () => {
+describe('enforce with unknown writer (9.13c, corrected by plan-353 §9.6)', () => {
+  // Two DIFFERENT things used to be conflated here, and the old test proved
+  // neither: it called the raw API twice and credited the result to an
+  // "unknown-id writer classified as a sim kind", which never appeared. The
+  // raw fallback `UNKNOWN_WRITER` is kind 'plugin', so it leaves the gate at the
+  // very first line (`!isLocalSimKind`) — the id exception below it is never
+  // even consulted on that path. Both cases are now separated and each is
+  // asserted where it actually takes effect.
+
+  it('raw legacy write: never reaches the gate at all (kind plugin)', () => {
     const { store } = fixture();
     store.signalWriteGate = 'enforce';
 
-    // Raw legacy API — writer 'unknown'. The write must LAND despite the
-    // bound claim (policy: unknown is never rejected, only recorded).
     store.set('Conv.Run', true);
-    expect(store.get('Conv.Run')).toBe(true);
+    expect(store.get('Conv.Run')).toBe(true);      // lands
+    // …and no conflict is logged, because the gate returned before recording:
+    // this writer is not a local-simulation kind.
+    expect(store.getWriteConflicts()).toHaveLength(0);
 
-    const conflicts = store.getWriteConflicts();
-    expect(conflicts).toHaveLength(0); // unknown is kind 'plugin' — not a sim writer
-
-    // An unknown-id writer that IS classified as a sim kind is still recorded
-    // but never rejected either (writerId 'unknown' is the raw fallback).
     store.setMany({ 'Conv.Run': false });
     expect(store.get('Conv.Run')).toBe(false);
+    expect(store.getWriteConflicts()).toHaveLength(0);
+  });
+
+  it('classified writer carrying the legacy id: reaches the gate, is recorded, still lands', () => {
+    const { store } = fixture();
+    store.signalWriteGate = 'enforce';
+
+    // THIS is the case the id exception exists for: a writer that IS a sim kind
+    // (so the gate engages and records) but still carries the raw fallback id.
+    // Policy fixed by plan-353 F8: it is never rejected, so a legacy path can
+    // never disappear silently once enforce goes hot — but it IS visible in the
+    // conflict log, which is how such a path gets found and fixed.
+    const legacyId = store.createWriter('unknown', 'component');
+
+    store.set('Conv.Run', true, Date.now(), legacyId);
+    expect(store.get('Conv.Run')).toBe(true);      // lands despite enforce
+
+    const conflicts = store.getWriteConflicts();
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toMatchObject({
+      writerId: 'unknown',
+      writerKind: 'component',
+      reason: 'authority-bound',
+    });
+
+    // A classified writer with a REAL id is rejected in the same situation —
+    // the id is the only difference, which is what makes this an exception.
+    const classified = store.createWriter('component:Conveyor:Other', 'component');
+    classified.set('Conv.Run', false);
+    expect(store.get('Conv.Run')).toBe(true);      // rejected
   });
 });

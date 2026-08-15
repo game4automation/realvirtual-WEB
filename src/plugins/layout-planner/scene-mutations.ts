@@ -198,6 +198,53 @@ export function addPlacedToScene(
 }
 
 /**
+ * Adopt a node that is ALREADY in the scene as a layout placement.
+ *
+ * The GLB-scene counterpart of {@link addPlacedToScene}, and deliberately a
+ * fraction of it. Since plan-397 phase 6 a saved scene is a GLB whose
+ * placements are `AssetReference` nodes; by the time the planner sees them,
+ * composition has grafted their subtrees in and `loadGLB` has run the full
+ * loader over the result. So almost everything the placement path does has
+ * already happened — and doing it again would be actively wrong:
+ *
+ *  - {@link prepPlacedVisual} would `pivotToFloorCenter` / `alignToFloor` the
+ *    node, **moving** a placement that is already at its authored transform;
+ *  - it would `modelRoot.add()` a node that is already parented, re-hanging a
+ *    subtree of the loaded model under itself;
+ *  - {@link registerPlaced} would re-run `processExtras`, creating a second
+ *    set of drives, signals and components for geometry that already has them.
+ *
+ * What is genuinely missing is only the planner's own bookkeeping: the layout
+ * markers that make selection, box-select and the hierarchy panel treat the
+ * node as one unit, and the two id maps. Shadow flags are not applied either —
+ * `processMeshes` already did, with the same policy.
+ */
+export function adoptPlacedNode(
+  deps: SceneMutationDeps,
+  node: Object3D,
+  id: string,
+  label: string,
+  catalogId: string,
+): void {
+  node.userData._layoutObject = true;
+  node.userData._layoutId = id;
+  if (node.userData.realvirtual && typeof node.userData.realvirtual === 'object') {
+    (node.userData.realvirtual as Record<string, unknown>).LayoutObject =
+      { Label: label, CatalogId: catalogId, Locked: false };
+  } else {
+    node.userData.realvirtual = { LayoutObject: { Label: label, CatalogId: catalogId, Locked: false } };
+  }
+  node.traverse((child) => { child.userData._layoutObject = true; });
+  // `_originalName` is what RVSource's self-template detection compares
+  // against; the placement path captures it before its rename, and an adopted
+  // node is never renamed, so its current name IS the original.
+  node.userData._originalName ??= node.name;
+
+  deps.objectMap.set(id, node);
+  deps.idByObject.set(node, id);
+}
+
+/**
  * VISUAL-prep half of {@link addPlacedToScene}. Makes the node look exactly
  * like a placed object — layout markers, shadow flags, floor pivot/align,
  * parenting under the model root, and active render-mode conversion — WITHOUT
@@ -324,6 +371,7 @@ export function registerPlaced(
       viewer.outlineManager,
       viewer.lampManager,
       viewer.energyChainManager,
+      viewer.sceneButtonManager,
     );
     if (result.deferredLogic) viewer.registerDeferredLogic(result.deferredLogic);
 
@@ -719,6 +767,7 @@ export function registerPlacedAtSnap(
       viewer.outlineManager,
       viewer.lampManager,
       viewer.energyChainManager,
+      viewer.sceneButtonManager,
     );
     if (result.deferredLogic) viewer.registerDeferredLogic(result.deferredLogic);
     if (result.drives.length > 0) {

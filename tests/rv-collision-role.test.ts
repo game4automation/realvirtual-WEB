@@ -15,6 +15,14 @@ import { buildCrossPairs, type PairableBody } from '../src/core/engine/rv-collis
 describe('CollisionRole', () => {
   it('exposes exactly the agreed english role names with None first', () => {
     expect([...COLLISION_ROLES]).toEqual(
+      ['None', 'Tool', 'Workpiece', 'Machine', 'Robot', 'Environment', 'Cutter']);
+  });
+
+  // plan-409 F1: `Cutter` is APPENDED, so an old GLB authored against the
+  // six-role list keeps every index/serialization it had.
+  it('keeps Cutter last so the six original roles never shift', () => {
+    expect(COLLISION_ROLES[COLLISION_ROLES.length - 1]).toBe('Cutter');
+    expect(COLLISION_ROLES.slice(0, 6)).toEqual(
       ['None', 'Tool', 'Workpiece', 'Machine', 'Robot', 'Environment']);
   });
 
@@ -24,6 +32,11 @@ describe('CollisionRole', () => {
     expect(toCollisionRole('Nonsense')).toBe('None');
     expect(toCollisionRole(undefined)).toBe('None');
     expect(toCollisionRole(3)).toBe('None');
+  });
+
+  it('parses the new Cutter role and rejects its lowercase spelling', () => {
+    expect(toCollisionRole('Cutter')).toBe('Cutter');
+    expect(toCollisionRole('cutter')).toBe('None');
   });
 });
 
@@ -57,6 +70,24 @@ describe('buildCrossPairs', () => {
     expect(has(robot, tool)).toBe(false);     // design-inherent flange contact
     expect(has(robot, machine)).toBe(true);
     expect(has(tool, machine)).toBe(true);    // gripper stays checked
+  });
+
+  // plan-409 F1/F6: the Cutter role behaves like every other role in the pair
+  // rule — that is exactly what makes the tool-changer case checkable.
+  it('pairs Cutter against every other role but never against another Cutter', () => {
+    const bodies: PairableBody[] = [
+      { role: 'Cutter' }, { role: 'Cutter' }, { role: 'Workpiece' },
+      { role: 'Machine' }, { role: 'Tool' }, { role: 'None' },
+    ];
+    const pairs = buildCrossPairs(bodies);
+    const roles = pairs.map((p) => [bodies[p.i].role, bodies[p.j].role].sort().join('|'));
+    expect(roles).not.toContain('Cutter|Cutter');
+    expect(roles).toContain('Cutter|Workpiece');
+    expect(roles).toContain('Cutter|Machine');
+    // A tool changer's gripper (`Tool`) against the milling cutter — the reason
+    // `Cutter` is a role of its own instead of a second `Tool`.
+    expect(roles).toContain('Cutter|Tool');
+    expect(roles.some((r) => r.includes('None'))).toBe(false);
   });
 
   it('is symmetric — the skip works no matter which body is listed first', () => {

@@ -5,14 +5,12 @@ import { describe, test, expect } from 'vitest';
 import {
   assetOpHeader,
   dedupeComponentKey,
-  canCoalesceAssetOps,
-  mergeAssetOps,
-  describeAssetOp,
   type AssetSetFieldOp,
   type TransformNodeOp,
   type ImportCadOp,
   type SetNodeVisibleOp,
 } from '../src/core/editor/rv-asset-ops';
+import { canCoalesceRvOps, mergeRvOps, describeRvOp } from '../src/core/ops/rv-unified-ops';
 
 function setFieldOp(overrides: Partial<AssetSetFieldOp> = {}): AssetSetFieldOp {
   return {
@@ -44,8 +42,8 @@ describe('coalescing', () => {
   test('same-target setField ops coalesce; merged op keeps first prev, last value', () => {
     const a = setFieldOp({ value: 60 });
     const b = setFieldOp({ value: 70, ts: a.ts + 100 });
-    expect(canCoalesceAssetOps(a, b)).toBe(true);
-    const merged = mergeAssetOps(a, b) as AssetSetFieldOp;
+    expect(canCoalesceRvOps(a, b)).toBe(true);
+    const merged = mergeRvOps(a, b) as AssetSetFieldOp;
     expect(merged.id).toBe(a.id);
     expect(merged.prev).toBe(50);
     expect(merged.value).toBe(70);
@@ -53,9 +51,9 @@ describe('coalescing', () => {
 
   test('different field / node / outside window do not coalesce', () => {
     const a = setFieldOp();
-    expect(canCoalesceAssetOps(a, setFieldOp({ fieldName: 'Acceleration', ts: a.ts + 10 }))).toBe(false);
-    expect(canCoalesceAssetOps(a, setFieldOp({ nodePath: 'Root/Other', ts: a.ts + 10 }))).toBe(false);
-    expect(canCoalesceAssetOps(a, setFieldOp({ ts: a.ts + 10_000 }))).toBe(false);
+    expect(canCoalesceRvOps(a, setFieldOp({ fieldName: 'Acceleration', ts: a.ts + 10 }))).toBe(false);
+    expect(canCoalesceRvOps(a, setFieldOp({ nodePath: 'Root/Other', ts: a.ts + 10 }))).toBe(false);
+    expect(canCoalesceRvOps(a, setFieldOp({ ts: a.ts + 10_000 }))).toBe(false);
   });
 
   test('transformNode coalesces per node (drag stream)', () => {
@@ -67,8 +65,8 @@ describe('coalescing', () => {
     });
     const a = t(1000, 1);
     const b = t(1100, 2);
-    expect(canCoalesceAssetOps(a, b)).toBe(true);
-    const merged = mergeAssetOps(a, b) as TransformNodeOp;
+    expect(canCoalesceRvOps(a, b)).toBe(true);
+    const merged = mergeRvOps(a, b) as TransformNodeOp;
     expect(merged.transform.position[0]).toBe(2);
     expect(merged.prev.position[0]).toBe(0);
   });
@@ -80,7 +78,7 @@ describe('coalescing', () => {
       cadlink: { File: 'gearbox.step', Sha256: 'abc', Quality: 'standard', ImportScaleFactor: 0.001, ZIsUpVector: true },
       transform: { position: [0, 0, 0], quaternion: [0, 0, 0, 1], scale: [1, 1, 1] },
     };
-    expect(canCoalesceAssetOps(imp, { ...imp, ...assetOpHeader() })).toBe(false);
+    expect(canCoalesceRvOps(imp, { ...imp, ...assetOpHeader() })).toBe(false);
   });
 
   test('setNodeVisible never coalesces — each toggle is a discrete undo step', () => {
@@ -89,15 +87,15 @@ describe('coalescing', () => {
       kind: 'setNodeVisible', nodePath: 'Root/Node', visible, prev: !visible,
     });
     // Same node, well inside the coalesce window — still no merge.
-    expect(canCoalesceAssetOps(vis(false, 1000), vis(true, 1050))).toBe(false);
-    expect(canCoalesceAssetOps(vis(false, 1000), vis(false, 1050))).toBe(false);
+    expect(canCoalesceRvOps(vis(false, 1000), vis(true, 1050))).toBe(false);
+    expect(canCoalesceRvOps(vis(false, 1000), vis(false, 1050))).toBe(false);
   });
 });
 
-describe('describeAssetOp', () => {
+describe('describeRvOp', () => {
   test('produces readable labels', () => {
-    expect(describeAssetOp(setFieldOp())).toContain('Drive.TargetSpeed');
-    expect(describeAssetOp({
+    expect(describeRvOp(setFieldOp())).toContain('Drive.TargetSpeed');
+    expect(describeRvOp({
       ...assetOpHeader(), kind: 'addComponent', nodePath: 'Root/Node',
       componentType: 'Sensor', fields: {},
     })).toBe('Add Sensor to Node');
@@ -105,7 +103,7 @@ describe('describeAssetOp', () => {
 
   test('setNodeVisible labels reflect direction', () => {
     const base = { ...assetOpHeader(), kind: 'setNodeVisible' as const, nodePath: 'Root/Housing' };
-    expect(describeAssetOp({ ...base, visible: false, prev: true })).toBe('Hide Housing');
-    expect(describeAssetOp({ ...base, visible: true, prev: false })).toBe('Show Housing');
+    expect(describeRvOp({ ...base, visible: false, prev: true })).toBe('Hide Housing');
+    expect(describeRvOp({ ...base, visible: true, prev: false })).toBe('Show Housing');
   });
 });

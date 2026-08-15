@@ -26,7 +26,21 @@ import { join, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { walk } from './_rv-fs-utils.mjs';
-import { isSecretFileName, vendorGlobProblems } from './_rv-guards.mjs';
+import {
+  PROJECT_KINDS,
+  collectSecretRefKeys,
+  isProjectKind,
+  isSecretFileName,
+  plaintextSecretPaths,
+  vendorGlobProblems,
+} from './_rv-guards.mjs';
+import {
+  documentRefsOf,
+  documentsOf,
+  isContainedRef,
+  projectConnectRefs,
+  sectionOfDocument,
+} from './_rv-manifest.mjs';
 
 const MANIFEST = 'project.json';
 
@@ -34,6 +48,16 @@ const MANIFEST = 'project.json';
 const KNOWN_FOLDERS = new Set([
   'models', 'library', 'scenes', 'docs', 'aasx',
   'connect', 'settings', 'rag', 'thumbnails', 'splats',
+  // plan-718: a project's own code and its knowledge files. Neither is a
+  // reserved path — a reference may name anything inside the project — but
+  // these two are the spellings the docs use, so they are not 'unrecognised'.
+  'scripts', 'knowledge',
+  // plan-434 phase 2: material that stays on this machine. `projects/wmyb/local`
+  // is the real instance — NDA customer data that is neither delivered nor
+  // published. It is customer-owned by construction, since no vendor glob names
+  // it and unknown means zone C (`_vendor-merge.mjs`), so the only thing missing
+  // was the spelling being recognised here.
+  'local',
 ]);
 
 // The list of secret-bearing filenames lives in scripts/_rv-guards.mjs and
@@ -85,9 +109,21 @@ function validateManifest(root) {
   if (typeof manifest.name !== 'string' || !manifest.name.trim()) {
     fail(`${MANIFEST}: "name" is required and must be a non-empty string.`);
   }
-  for (const key of ['scenes', 'models', 'library', 'libraries']) {
+  // `documents` is the list since plan-413 phase 6; the other three are the
+  // pre-413 shape and are still *accepted* — a customer repository that has not
+  // been opened by a current client since the migration is not an invalid
+  // project, it is an unmigrated one, and this gate must not fail a delivery
+  // over that.
+  for (const key of ['documents', 'scenes', 'models', 'library', 'libraries']) {
     if (key in manifest && !Array.isArray(manifest[key])) {
       fail(`${MANIFEST}: "${key}" must be an array when present.`);
+    }
+  }
+  for (const entry of documentsOf(manifest)) {
+    if (typeof entry.id !== 'string' || !entry.id.trim()) {
+      // Mandatory since plan-413 F2, and the one field the whole identity model
+      // rests on: an id-less document cannot be referenced, moved or resolved.
+      fail(`${MANIFEST}: a documents[] entry ("${entry.path}") has no "id".`);
     }
   }
   return manifest;
@@ -114,9 +150,127 @@ function validateReferences(root, manifest) {
       }
     }
   };
+  // documents[] first — the list since plan-413 phase 6. Each entry is checked
+  // against the folder its section names, so a scene entry that lost its
+  // `scenes/` prefix is still found rather than reported as missing.
+  for (const entry of documentsOf(manifest)) {
+    check([entry], 'documents', sectionOfDocument(entry));
+  }
+  // The pre-413 arrays, for a manifest that still carries them.
   check(manifest.scenes, 'scenes', 'scenes');
   check(manifest.models, 'models', 'models');
   check(manifest.library, 'library', 'library');
+}
+
+/**
+ * The reference model's own gate (plan-718 §2.6, F7).
+ *
+ * Two failure modes, and they are not the same severity:
+ *
+ *  - a reference that LEAVES the project is an **error**. It cannot resolve on
+ *    another machine, so the project has stopped being copyable — which is the
+ *    single property the whole reference model exists to provide.
+ *  - a reference whose target is simply **missing** is a warning, the same
+ *    reading `validateReferences` already gives a manifest entry without a file:
+ *    a half-copied working tree is a state to report, not a build to fail.
+ */
+function validateDocumentRefs(root, manifest) {
+  if (!manifest) return;
+  for (const { documentPath, field, ref, contained } of documentRefsOf(manifest)) {
+    if (!contained) {
+      fail(`${MANIFEST}: ${field} "${ref}" on "${documentPath}" leaves the project — `
+        + 'references must be relative paths inside it.');
+      continue;
+    }
+    if (!existsSync(join(root, ref))) {
+      warn(`${MANIFEST}: ${field} "${ref}" on "${documentPath}" points at a file that is not there.`);
+    }
+  }
+  // The project-wide half. A missing secrets sidecar is NORMAL and deliberately
+  // silent: it is gitignored, so a fresh clone has none by construction.
+  const { agentsRef, ragRef } = projectConnectRefs(manifest);
+  if (typeof manifest.connect?.agentsRef === 'string' && agentsRef === null) {
+    fail(`${MANIFEST}: connect.agentsRef "${manifest.connect.agentsRef}" leaves the project.`);
+  } else if (agentsRef && !existsSync(join(root, agentsRef))) {
+    warn(`${MANIFEST}: connect.agentsRef "${agentsRef}" points at a file that is not there.`);
+  }
+  if (typeof manifest.connect?.secretsRef === 'string'
+    && !isContainedRef(manifest.connect.secretsRef)) {
+    fail(`${MANIFEST}: connect.secretsRef "${manifest.connect.secretsRef}" leaves the project.`);
+  }
+  // The RAG bundle is the project's artefact and is checked like any other
+  // reference. The generations CONNECT unpacks from it are host-local caches and
+  // are deliberately NOT looked for here (stage 3.3).
+  if (typeof manifest.connect?.ragRef === 'string' && ragRef === null) {
+    fail(`${MANIFEST}: connect.ragRef "${manifest.connect.ragRef}" leaves the project.`);
+  } else if (ragRef && !existsSync(join(root, ragRef))) {
+    warn(`${MANIFEST}: connect.ragRef "${ragRef}" points at a file that is not there.`);
+  }
+}
+
+/**
+ * Committed CONNECT config files: secrets as references, never as values
+ * (plan-718 F3, §2.6).
+ *
+ * The files checked are the ones the manifest NAMES — `connectRef` and
+ * `connect.agentsRef` — plus anything else under `connect/`, because a file that
+ * nothing references today is still a file that gets committed and mailed. The
+ * secrets sidecar is excluded: it is the one place a value legitimately lives,
+ * and it is gitignored and blocked by name (`isSecretFileName`) besides.
+ */
+function validateConnectSecrets(root, manifest) {
+  if (!manifest) return;
+  const { secretsRef } = projectConnectRefs(manifest);
+  const named = new Set(
+    documentRefsOf(manifest)
+      .filter(r => r.field === 'connectRef' && r.contained)
+      .map(r => r.ref),
+  );
+  const { agentsRef } = projectConnectRefs(manifest);
+  if (agentsRef) named.add(agentsRef);
+  const connectDir = join(root, 'connect');
+  if (existsSync(connectDir) && statSync(connectDir).isDirectory()) {
+    for (const entry of readdirSync(connectDir, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.toLowerCase().endsWith('.json')) {
+        named.add(`connect/${entry.name}`);
+      }
+    }
+  }
+
+  /** Which connect file each `$secretRef` key was seen in — the collision map. */
+  const keyOwners = new Map();
+
+  for (const rel of [...named].sort()) {
+    if (rel === secretsRef || isSecretFileName(basename(rel))) continue;
+    const abs = join(root, rel);
+    if (!existsSync(abs)) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(abs, 'utf8'));
+    } catch (e) {
+      fail(`${rel}: not valid JSON (${e.message}).`);
+      continue;
+    }
+    for (const path of plaintextSecretPaths(parsed)) {
+      fail(`${rel}: "${path}" holds a plaintext secret. Use {"$secretRef": "<key>"} `
+        + `or "\${env:VAR}" and keep the value in ${secretsRef}.`);
+    }
+    for (const key of collectSecretRefKeys(parsed)) {
+      const owners = keyOwners.get(key) ?? new Set();
+      owners.add(rel);
+      keyOwners.set(key, owners);
+    }
+  }
+
+  for (const [key, owners] of keyOwners) {
+    if (owners.size > 1) {
+      // Sharing a key across configs is legitimate (N:1 exists on purpose); a
+      // COLLISION is the same thing done by accident, and only the author can
+      // tell them apart. So it is said out loud rather than decided here.
+      warn(`Secret key "${key}" is referenced from more than one connect file `
+        + `(${[...owners].sort().join(', ')}) — they share one value.`);
+    }
+  }
 }
 
 function validateSecrets(root) {
@@ -125,6 +279,46 @@ function validateSecrets(root) {
       fail(`Possible secret committed into the project: ${rel}`);
     }
   });
+}
+
+/**
+ * The project's declared `kind` (plan-434 §2.6).
+ *
+ * Three severities, and the split is deliberate:
+ *
+ *  - **missing → warning.** Every project in our own tree has one, and the
+ *    doctor gates on that. But this validator also runs over an INCOMING
+ *    customer repository (`pull-customer-project.mjs`), and those were delivered
+ *    before the field existed. Failing there would block a pull over a field the
+ *    customer never had a chance to write — a migration note, not a defect.
+ *  - **outside the enum → error.** A typo (`"Customer"`, the retired `"seed"`)
+ *    silently turns off every rule keyed on `customer`, which is the failure
+ *    that must never pass quietly.
+ *  - **`customer` without a `vendor` block → error.** No `vendor` means the
+ *    whole project is customer-owned and no update can ever reach it (see
+ *    `_vendor-merge.mjs`: unknown is zone C). For a demo or a fixture that is a
+ *    fine default; for a project we deliver it is a delivery that silently
+ *    changes nothing, and it should be said before the delivery, not after.
+ */
+function validateKind(manifest) {
+  if (!manifest) return;
+  const kind = manifest.kind;
+  if (kind === undefined) {
+    warn(`${MANIFEST}: no "kind" — run scripts/migrate-project-manifest.mjs `
+      + `(one of ${PROJECT_KINDS.join(', ')}; plan-434 phase 2 migration pending).`);
+    return;
+  }
+  if (!isProjectKind(kind)) {
+    fail(`${MANIFEST}: "kind" is ${JSON.stringify(kind)} — must be one of ${PROJECT_KINDS.join(', ')}.`);
+    return;
+  }
+  if (kind !== 'customer') return;
+  const vendor = manifest.vendor;
+  const managed = Array.isArray(vendor?.managed) ? vendor.managed : [];
+  if (managed.length === 0) {
+    fail(`${MANIFEST}: "kind" is "customer" but there is no "vendor.managed" — `
+      + 'without it every path is customer-owned and no delivered update can ever reach this project.');
+  }
 }
 
 /**
@@ -155,8 +349,12 @@ function validateVendorBlock(manifest) {
  */
 function validateAssetHashes(root, manifest) {
   if (!manifest) return;
-  for (const [key, folder] of [['models', 'models'], ['library', 'library']]) {
-    const entries = manifest[key];
+  const groups = [
+    ...documentsOf(manifest).map(entry => ['documents', sectionOfDocument(entry), [entry]]),
+    ['models', 'models', manifest.models],
+    ['library', 'library', manifest.library],
+  ];
+  for (const [key, folder, entries] of groups) {
     if (!Array.isArray(entries)) continue;
     for (const entry of entries) {
       if (!entry || typeof entry !== 'object') continue;
@@ -270,7 +468,10 @@ export function validateProject(root) {
   }
   const manifest = validateManifest(root);
   validateReferences(root, manifest);
+  validateDocumentRefs(root, manifest);
+  validateConnectSecrets(root, manifest);
   validateVendorBlock(manifest);
+  validateKind(manifest);
   validateCanonicalName(root, manifest);
   validateAssetHashes(root, manifest);
   validateSecrets(root);

@@ -19,6 +19,19 @@ const PRIVATE_ROOT = PRIVATE_ROOT_CANDIDATES.find((candidate) => existsSync(reso
 const PRIVATE_DIR = resolve(PRIVATE_ROOT, 'src');
 const HAS_PRIVATE = existsSync(PRIVATE_DIR) && !process.env.VITE_PUBLIC_BUILD;
 console.log(`[rv-build] ${HAS_PRIVATE ? 'Private' : 'Public'} build${process.env.VITE_PUBLIC_BUILD ? ' (forced public via VITE_PUBLIC_BUILD)' : ''}`);
+// The generated list of tests that cannot resolve without the private sibling — see the
+// `test.exclude` block far below for what it is for. Read here, lazily and defensively, because
+// this config is ALSO loaded by the staged public build: stageFilteredSourceTree
+// (scripts/_workspace-lib.mjs) copies neither the private sibling nor `tests/`, so the file is
+// absent and an eager read turned every staged `vite build` into an ENOENT. Without `tests/`
+// there is nothing to run and therefore nothing to exclude, so an empty list is the honest
+// answer. With the file present the behaviour is unchanged.
+function privateDependentTestExcludes(): string[] {
+  if (existsSync(PRIVATE_DIR)) return [];
+  const list = resolve(__dirname, 'tests/private-dependent-tests.json');
+  if (!existsSync(list)) return [];
+  return JSON.parse(readFileSync(list, 'utf-8')) as string[];
+}
 import { exec, execSync } from 'node:child_process';
 
 // ─── HMR back-channel through the CONNECT proxy (plan-363 Phase 2) ──────
@@ -897,19 +910,43 @@ export default defineConfig(({ command }) => ({
     watch: {
       usePolling: true,
       interval: 100,
-      // The File System Access work folder (library/Custom saves, thumbnails,
-      // CAD cache) lives inside the project during development — asset-editor
-      // saves write files here and must NOT trigger a dev-server full reload.
-      ignored: ['**/LocalFolderTest/**', '**/public/models/library/**'],
+      // A folder-backed PROJECT can live inside the checkout during
+      // development — asset-editor saves write files there and must NOT trigger
+      // a dev-server full reload. (The `LocalFolderTest/` entry that used to
+      // sit here belonged to the retired work folder, plan-709 §2.6.)
+      ignored: ['**/public/models/library/**'],
     },
   },
   build: {
     target: 'esnext',
     outDir: 'dist',
-    sourcemap: true,
+    // OFF by default (plan-434 §2.7 / ADR-047). A map carries `sourcesContent`,
+    // i.e. the complete original TypeScript — and since the public demo ships the
+    // full COMMERCIAL scope (DES, PLC, physics, machining, IK solver, the CAD
+    // importers) as a compiled application, an emitted `.map` next to those chunks
+    // is the private source code itself, sitting in `dist/`.
+    //
+    // It was `'hidden'` before: maps emitted, no `//# sourceMappingURL=` comment.
+    // That relied on every consumer of `dist/` remembering to drop them — the
+    // Bunny upload skips `.map` (scripts/_bunny-lib.mjs) and the CONNECT bundler
+    // deletes them — so the protection lived outside the build, in each deploy
+    // path separately, and any path that ever forgot would publish the sources.
+    // Not emitting them removes the class of mistake instead of patching it.
+    //
+    // `RV_SOURCEMAP=1` re-enables hidden maps for local debugging. Never set it
+    // for a build whose `dist/` is deployed. Nothing requires maps: the tier scans
+    // in tests/mechanism-tier.node.test.ts search `.js` and `.map`, and the JS
+    // alone keeps them non-vacuous.
+    sourcemap: process.env.RV_SOURCEMAP === '1' ? 'hidden' : false,
     rollupOptions: {
       output: {
-        banner: '/* realvirtual WEB | AGPL-3.0-only | Copyright (C) 2025 realvirtual GmbH | https://realvirtual.io */',
+        // `/*!` + `@license` marks this as a LEGAL comment. Without those two
+        // markers esbuild's minifier drops it during renderChunk — for a long
+        // while every emitted chunk shipped without the AGPL header and nobody
+        // noticed, because the config still looked correct. Same fix, same
+        // reason as vite.embed.config.ts; keep the markers when editing.
+        banner: '/*! @license realvirtual WEB | AGPL-3.0-only | '
+          + 'Copyright (C) 2025 realvirtual GmbH | https://realvirtual.io */',
         // plan-344 Phase 4: `react-pdf` deliberately has NO manual entry.
         // `DocViewerOverlay` already imports it dynamically, so Rollup splits it
         // on its own. Naming it here did the opposite of what it looked like: the
@@ -940,15 +977,83 @@ export default defineConfig(({ command }) => ({
     // tests/private-test-excludes.node.test.ts.
     exclude: [
       'tests/**/*.node.test.ts',
-      ...(existsSync(PRIVATE_DIR)
-        ? []
-        : JSON.parse(readFileSync(resolve(__dirname, 'tests/private-dependent-tests.json'), 'utf-8')) as string[]),
+      // Same convention on the private side — and it has to be spelled out
+      // separately, because the include glob above reaches into that sibling
+      // and `*.node.test.ts` also matches `*.test.ts`. Without this line the
+      // private Node suites are dragged into the browser run, where the first
+      // `node:crypto` import fails them all ("externalized for browser
+      // compatibility"). They run, and pass, under `npm run test:node`.
+      '../realvirtual-WebViewer-Private~/tests/**/*.node.test.ts',
+      ...privateDependentTestExcludes(),
     ],
     browser: {
       enabled: true,
       provider: playwright(),
       instances: [{ browser: 'chromium' }],
       api: { port: 5177 },
+      /**
+       * plan-707 — the MCP documentation write path.
+       *
+       * The renderer runs in the BROWSER (the tool classes pull Three.js and
+       * the viewer, so there is no honest way to instantiate them in Node), but
+       * the files it writes are on disk. `browser.commands` is the documented
+       * bridge for exactly that: a Node-side function a browser test can call.
+       *
+       * It is a WRITE path, so it is deliberately narrow. It refuses unless
+       * `RV_UPDATE_MCP_DOCS=1` is set (which is all `npm run gen:mcp-docs`
+       * does), it only ever touches the six registered documentation files, and
+       * it replaces only the text between a matching marker pair — every byte
+       * of prose outside the fences is preserved by `replaceBlock`, and a
+       * missing marker throws instead of appending.
+       *
+       * The drift GATE does not depend on any of this. Without the flag the
+       * test only compares and prints the expected block; the convenience of
+       * writing it back is a nicety, the gate is the feature.
+       */
+      commands: {
+        writeMcpDocBlock(
+          _ctx: unknown,
+          relFile: string,
+          marker: string,
+          rendered: string,
+        ): { written: boolean; reason?: string } {
+          if (process.env.RV_UPDATE_MCP_DOCS !== '1') {
+            return { written: false, reason: 'RV_UPDATE_MCP_DOCS is not set' };
+          }
+          const allowed = new Set([
+            'webviewer.mcp.md',
+            'src/plugins/mcp-bridge/help/editor.md',
+            'src/plugins/mcp-bridge/help/layout.md',
+            'src/plugins/mcp-bridge/help/simulation.md',
+            'src/plugins/mcp-bridge/help/plc.md',
+            'src/plugins/mcp-bridge/help/des.md',
+          ]);
+          if (!allowed.has(relFile)) {
+            return { written: false, reason: `${relFile} is not a registered doc file` };
+          }
+          const abs = resolve(__dirname, relFile);
+          const source = readFileSync(abs, 'utf-8');
+          const beginPrefix = `<!-- BEGIN GENERATED: ${marker} `;
+          const end = `<!-- END GENERATED: ${marker} -->`;
+          const beginAt = source.indexOf(beginPrefix);
+          const beginEnd = beginAt === -1 ? -1 : source.indexOf('-->', beginAt);
+          const endAt = beginEnd === -1 ? -1 : source.indexOf(end, beginEnd);
+          if (beginAt === -1 || beginEnd === -1 || endAt === -1) {
+            return { written: false, reason: `no marker pair "${marker}" in ${relFile}` };
+          }
+          // Match the file's own line endings. On Windows these files are
+          // routinely CRLF (autocrlf, or any checkout / stash pop), and writing
+          // an LF block into a CRLF file turns a content change into a
+          // whole-file diff. The gate compares normalised content, so this is
+          // purely about keeping the diff honest.
+          const eol = source.includes('\r\n') ? '\r\n' : '\n';
+          const body = rendered.replace(/\r\n/g, '\n').split('\n').join(eol);
+          const next = `${source.slice(0, beginEnd + 3)}${eol}${body}${eol}${source.slice(endAt)}`;
+          if (next === source) return { written: false, reason: 'already up to date' };
+          writeFileSync(abs, next, 'utf-8');
+          return { written: true };
+        },
+      },
       // plan-375 phase 0a: pin headless instead of letting it follow
       // `process.env.CI` (vitest's default), which is unset locally and made
       // every local `npm test` pop a visible Chromium window. A visible window

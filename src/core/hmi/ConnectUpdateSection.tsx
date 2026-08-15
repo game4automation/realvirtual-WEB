@@ -63,7 +63,7 @@ export function buildUpdateRows(snap: ConnectUpdateSnapshot): UpdateRow[] {
       rows.push({
         key: 'stable',
         label: `Back to Stable ${stable.candidate.semver}`,
-        action: 'Switch',
+        action: 'Download',
         offer: stable,
         emphasis: false,
       });
@@ -71,7 +71,7 @@ export function buildUpdateRows(snap: ConnectUpdateSnapshot): UpdateRow[] {
       rows.push({
         key: 'stable',
         label: `Stable ${stable.candidate.semver} available`,
-        action: 'Update',
+        action: 'Download',
         offer: stable,
         emphasis: true,
       });
@@ -82,7 +82,7 @@ export function buildUpdateRows(snap: ConnectUpdateSnapshot): UpdateRow[] {
     rows.push({
       key: 'beta',
       label: `Beta ${beta.candidate.semver}`,
-      action: 'Install',
+      action: 'Download',
       offer: beta,
       emphasis: false,
     });
@@ -157,10 +157,14 @@ export function ConnectUpdateSection() {
   // failed attempt cannot permanently hide it. Gating this on the phase would silently swallow the
   // very sentence that explains why the previous attempt failed.
   const succeeded = snap.phase === 'succeeded';
+  const downloaded = snap.phase === 'downloaded';
   const rolledBack = snap.phase === 'rolled-back';
-  const outcome = succeeded
-    ? `Updated to ${snap.current?.semver ?? ''} (${channelLabel(snap.current?.channel ?? 'stable')})`
-    : updateReasonSentence(snap.jobReason);
+  const outcome = downloaded
+    ? `New version downloaded${snap.downloadedPath ? ` to ${snap.downloadedPath}` : ''}. `
+      + 'Stop CONNECT and start the downloaded file to install it.'
+    : succeeded
+      ? `Updated to ${snap.current?.semver ?? ''} (${channelLabel(snap.current?.channel ?? 'stable')})`
+      : updateReasonSentence(snap.jobReason);
 
   // A terminal job offers nothing further; anything else may still carry an open offer.
   const rows = isTerminalPhase(snap.phase) ? [] : buildUpdateRows(snap);
@@ -170,7 +174,7 @@ export function ConnectUpdateSection() {
   return (
     <Box sx={{ mt: 0.75, display: 'flex', flexDirection: 'column', gap: 0.25 }}>
       {outcome && (
-        <Typography sx={{ fontSize: 10, lineHeight: 1.5, color: succeeded ? ISA_GREEN : rolledBack ? ISA_AMBER : ISA_RED }}>
+        <Typography sx={{ fontSize: 10, lineHeight: 1.5, color: succeeded || downloaded ? ISA_GREEN : rolledBack ? ISA_AMBER : ISA_RED }}>
           {outcome}
         </Typography>
       )}
@@ -214,13 +218,13 @@ export function ConnectUpdateSection() {
 }
 
 /**
- * Confirmation before a program swap — a real dialog, never `window.confirm` (panel convention).
+ * Confirmation before the download — a real dialog, never `window.confirm` (panel convention).
  *
  * Names both versions with build and date, the channel, the download size (or "Size unknown", as
- * no manifest form carries one) and the fact that CONNECT restarts and the connection drops. A
- * beta is explicitly called a pre-release, the way back to stable explicitly an older version, and
- * a pin change explicitly a change to a project file. There is deliberately no change log and no
- * outbound link.
+ * no manifest form carries one) and the fact that installing is the operator's own move: CONNECT
+ * only downloads the new file beside the current installation; nothing restarts in the background.
+ * A beta is explicitly called a pre-release and the way back to stable explicitly an older
+ * version. There is deliberately no change log and no outbound link.
  */
 function UpdateConfirmDialog({
   row,
@@ -237,7 +241,7 @@ function UpdateConfirmDialog({
   const isBeta = offer.candidate.channel === 'beta';
   const isOlder = offer.isDowngrade;
 
-  const title = isBeta ? 'Install beta build' : isOlder ? 'Switch back to stable' : 'Update CONNECT';
+  const title = isBeta ? 'Download beta build' : isOlder ? 'Download stable build' : 'Download CONNECT update';
 
   return (
     <Dialog open onClose={onClose} maxWidth="xs" fullWidth>
@@ -249,7 +253,7 @@ function UpdateConfirmDialog({
                 /health the version line above already shows. */}
             {formatUpdateRelease(snap.current?.semver ?? '', snap.current?.build ?? null, getConnectSnapshot().serverBuildDate)} ({channelLabel(snap.current?.channel ?? 'stable')})
           </Row>
-          <Row label="Will be installed">
+          <Row label="Will be downloaded">
             {formatUpdateRelease(offer.candidate.semver, offer.candidate.build, offer.buildDate)} ({channelLabel(offer.candidate.channel)})
           </Row>
           <Row label="Download">{formatUpdateSize(offer.sizeBytes)}</Row>
@@ -262,12 +266,12 @@ function UpdateConfirmDialog({
         )}
         {isOlder && (
           <Typography sx={{ fontSize: 11, color: ISA_AMBER, mb: 0.75, lineHeight: 1.5 }}>
-            This installs an older version.
+            This is an older version than the one running.
           </Typography>
         )}
         <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.65)', lineHeight: 1.5 }}>
-          CONNECT restarts briefly during the update. The connection drops and is re-established
-          automatically.
+          CONNECT downloads the new version next to the current installation and keeps running
+          unchanged. To install it, stop CONNECT and start the downloaded file yourself.
         </Typography>
         {snap.pinWillChange && (
           <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.65)', mt: 0.75, lineHeight: 1.5 }}>

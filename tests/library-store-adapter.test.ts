@@ -77,14 +77,13 @@ describe('LayoutStore ↔ LibraryStore adapter', () => {
     expect(library.catalogUrls).toEqual([]);
   });
 
-  test('setActiveTab and isLocalFolderSupported delegate', () => {
+  test('setActiveTab delegates', () => {
     const library = new LibraryStore();
     const layout = new LayoutStore(library);
     layout.addCatalogDirect('a', CATALOG);
     layout.addCatalogDirect('b', CATALOG);
     layout.setActiveTab('b');
     expect(library.activeTabUrl).toBe('b');
-    expect(layout.isLocalFolderSupported).toBe(library.isLocalFolderSupported);
   });
 
   test('autoSave() serializes the DELEGATED catalog urls', async () => {

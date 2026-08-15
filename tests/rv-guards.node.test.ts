@@ -29,7 +29,13 @@ import {
   knownProjectKeys,
   assertNoSecrets,
   secretContentViolation,
+  containsHighEntropyFragment,
   vendorGlobProblems,
+  isAllowedSecretSchemaPath,
+  isCredentialPropertyName,
+  isSecretReferenceValue,
+  plaintextSecretPaths,
+  collectSecretRefKeys,
   CUSTOMER_OWNED_FOLDERS,
   DEFAULT_VENDOR_BLOCK,
 } from '../scripts/_rv-guards.mjs';
@@ -123,6 +129,39 @@ describe('knownProjectKeys', () => {
   it('returns an empty list rather than throwing when there is no projects/ folder', () => {
     expect(knownProjectKeys(root)).toEqual([]);
   });
+
+  /**
+   * plan-434 §2.6. The filter exists for one caller — the foreign-customer-name
+   * guard — and the property it needs is that a folder only counts as a customer
+   * name when it SAYS so. Anything else (no kind, a typo, an unreadable file)
+   * must fall out of the customer list rather than into it.
+   */
+  describe('kind filter', () => {
+    const write = (name: string, manifest: string) => {
+      mkdirSync(join(root, 'projects', name), { recursive: true });
+      writeFileSync(join(root, 'projects', name, 'project.json'), manifest);
+    };
+
+    it('narrows to the folders declaring that kind, and leaves the unfiltered call alone', () => {
+      write('acme', '{"kind":"customer"}');
+      write('showroom', '{"kind":"demo"}');
+      write('scratch', '{"kind":"internal"}');
+
+      expect(knownProjectKeys(root, { kind: 'customer' })).toEqual(['acme']);
+      expect(knownProjectKeys(root, { kind: 'demo' })).toEqual(['showroom']);
+      expect(knownProjectKeys(root)).toEqual(['acme', 'scratch', 'showroom']);
+    });
+
+    it('never counts an unmigrated, mistyped or unreadable manifest as a customer', () => {
+      write('legacy', '{}');                       // pre-migration: no kind at all
+      write('typo', '{"kind":"Customer"}');        // outside the enum
+      write('retired', '{"kind":"seed"}');         // the kind plan-434 removed
+      write('broken', '{ not json');
+
+      expect(knownProjectKeys(root, { kind: 'customer' })).toEqual([]);
+      expect(knownProjectKeys(root)).toEqual(['broken', 'legacy', 'retired', 'typo']);
+    });
+  });
 });
 
 describe('assertNoSecrets', () => {
@@ -148,6 +187,43 @@ describe('secretContentViolation', () => {
 
   it('leaves an ordinary source file alone', () => {
     expect(secretContentViolation('a.ts', '.ts', 'export const speed = 100; // mm/s')).toBeNull();
+  });
+
+  /**
+   * The identifier band, both edges of it.
+   *
+   * These two names aborted every customer delivery: their CamelCase middle runs 25-26 characters,
+   * over the old 24-character segment cap, so the separated-identifier exemption never applied and
+   * a contract-test name read as a leaked token. The cap moved to 30 — still under the 33 that the
+   * calibration comment claims for real token formats, which the second half asserts.
+   */
+  it('excuses long compound engineering identifiers', () => {
+    for (const name of ['myShares_DeleteRemovesAndReturns410', 'upload_CrossOwnerConfirmOrDelete_403']) {
+      expect(containsHighEntropyFragment(name), name).toBe(false);
+      expect(secretContentViolation('a.tsx', '.tsx', `// see \`${name}\``), name).toBeNull();
+    }
+  });
+
+  it('still catches a real token behind an identifier-shaped prefix', () => {
+    // One dense run and no separator inside it — the shape the raised cap must not excuse.
+    // Assembled at runtime so the literal never looks like a live Stripe key to
+    // GitHub push protection (it blocked the mirror snapshot on this fixture).
+    expect(containsHighEntropyFragment(['sk', 'live', '9dK2mQ7pXbR4tYw1LzA6vNc8HjE3sFgU'].join('_'))).toBe(true);
+    expect(containsHighEntropyFragment('aws_secret_wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY')).toBe(true);
+  });
+
+  /**
+   * The boundary itself, stated rather than implied — this is what raising the cap cost.
+   *
+   * A random run behind a separator prefix is detected from 30 characters up and excused below.
+   * The previous edge was 24, so what opened is the 24..29 band. Every token format named in the
+   * calibration comment keeps a run of 33+, which is why the band is believed to hold false
+   * positives only; if a real format ever lands in it, this test is the place that has to change.
+   */
+  it('detects a random run from 30 characters and excuses shorter ones', () => {
+    const random = 'A7bK9mQ2xR4tY6wL1zN8vC3hJ5sF0pT1uV2';
+    expect(containsHighEntropyFragment(`prefix_${random.slice(0, 30)}`)).toBe(true);
+    expect(containsHighEntropyFragment(`prefix_${random.slice(0, 29)}`)).toBe(false);
   });
 });
 
@@ -238,7 +314,78 @@ describe('no guard drift', () => {
 
   it('the generator reads the project keys from disk instead of hardcoding them (B4)', () => {
     const source = readFileSync(join(SCRIPTS, 'generate-customer-workspace.mjs'), 'utf8');
-    expect(source).toMatch(/knownProjectKeys\(privateRoot\)/);
+    // Narrowed to customer projects in plan-434 §2.6 — still read from disk.
+    expect(source).toMatch(/knownProjectKeys\(privateRoot, \{ kind: 'customer' \}\)/);
     expect(source).not.toMatch(/'mauser3dhmi',\s*'Toray'/);
+  });
+});
+
+/**
+ * plan-718 §2.6 / §9.4 — secrets as REFERENCES.
+ *
+ * The allowlist gains one entry and the module gains one concept; both live
+ * here, in the single home, so `validate-project.mjs` can keep having no list of
+ * its own (the drift test above is what enforces that).
+ */
+describe('secret references (plan-718)', () => {
+  it('allows a $secretRef leaf in a connect config, and nothing beside it', () => {
+    expect(isAllowedSecretSchemaPath(
+      'connect/linie-1.connect.json',
+      ['Interfaces', 0, 'Settings', 'Password', '$secretRef'],
+    )).toBe(true);
+    // The value the reference replaces is still scanned.
+    expect(isAllowedSecretSchemaPath(
+      'connect/linie-1.connect.json',
+      ['Interfaces', 0, 'Settings', 'Password'],
+    )).toBe(false);
+    // And the allowance does not leak out of connect/.
+    expect(isAllowedSecretSchemaPath('settings/x.json', ['A', '$secretRef'])).toBe(false);
+  });
+
+  it('keeps the three pre-718 allowances exactly as they were', () => {
+    expect(isAllowedSecretSchemaPath('connect/project-config.json', ['Diagnosis', 'RequestyApiKey'])).toBe(true);
+    expect(isAllowedSecretSchemaPath('connect/project-config.json', ['Agents', 'DeliveredApiKeys', 'acme'])).toBe(true);
+    expect(isAllowedSecretSchemaPath('realvirtual-web/public/settings.json', ['connectLicensePrefill'])).toBe(true);
+    expect(isAllowedSecretSchemaPath('connect/project-config.json', ['Diagnosis', 'Something'])).toBe(false);
+  });
+
+  it('knows a credential-named property from an innocent one', () => {
+    for (const name of ['Password', 'password', 'ApiKey', 'clientSecret', 'AccessKey', 'Passphrase']) {
+      expect(isCredentialPropertyName(name), name).toBe(true);
+    }
+    for (const name of ['KeyFile', 'Keyword', 'Monkey', 'Name', 'Host', 'Port']) {
+      expect(isCredentialPropertyName(name), name).toBe(false);
+    }
+  });
+
+  it('accepts only the two reference forms as "not a value"', () => {
+    expect(isSecretReferenceValue({ $secretRef: 'plc.pw' })).toBe(true);
+    expect(isSecretReferenceValue('${env:RV_PLC_PW}')).toBe(true);
+    expect(isSecretReferenceValue('')).toBe(true);
+    expect(isSecretReferenceValue(null)).toBe(true);
+    expect(isSecretReferenceValue('hunter2')).toBe(false);
+    expect(isSecretReferenceValue({ $secretRef: '' })).toBe(false);
+    expect(isSecretReferenceValue({ ref: 'plc.pw' })).toBe(false);
+    // Not a substitution, just a string that starts like one.
+    expect(isSecretReferenceValue('${env:A} and more')).toBe(false);
+  });
+
+  it('finds a plaintext secret wherever it is nested, and only there', () => {
+    expect(plaintextSecretPaths({
+      Interfaces: [
+        { Settings: { Password: 'hunter2', Host: '10.0.0.1' } },
+        { Settings: { Password: { $secretRef: 'plc.pw' } } },
+      ],
+      KeyFile: 'certs/plc.pem',
+    })).toEqual(['Interfaces.0.Settings.Password']);
+    expect(plaintextSecretPaths({})).toEqual([]);
+  });
+
+  it('collects every $secretRef key, for the collision warning', () => {
+    expect(collectSecretRefKeys({
+      A: { Password: { $secretRef: 'plc.pw' } },
+      B: [{ Token: { $secretRef: 'mqtt.token' } }],
+      C: { $secretRef: '   ' },
+    }).sort()).toEqual(['mqtt.token', 'plc.pw']);
   });
 });

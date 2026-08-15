@@ -46,12 +46,89 @@ document then explains in prose:
 5. **Consumer fallbacks** — permitted, in a fixed order, and never allowed to guess between two
    candidates (section 4).
 
-The schema is written so a future stable node-id field can sit **beside** `path` additively:
-`path` stays valid, and a consumer prefers the id when both are present.
+The schema is written so a stable node-id field can sit **beside** `path` additively: `path`
+stays valid, and a consumer prefers the id when both are present.
+
+**That field now exists: `NodeId`** (plan-397, rv-ODT specification §5a). It is a plain string
+directly under `extras.realvirtual` — not a component object — and it is the second addressing
+axis, used wherever an address has to survive somebody renaming a node in a file we do not own:
+
+- A file **we write** gets a random id per node on save, carried through unchanged on every
+  later save. Regenerating it would orphan every override written against the file.
+- A file **we only read** — the whole pre-existing export corpus, and every library asset that
+  must stay byte-identical — gets ids **derived**, `first 16 hex of SHA-256(<file sha256> ':'
+  <glTF node index>)`. Nothing random is involved, so the same bytes yield the same ids in every
+  session. Stamping random ids there would be unfixable: they could never be written back.
+- `NodeId` is unique **within its file**, never globally. Reference one asset ten times and all
+  ten subtrees carry the same ids. The full address is therefore the pair
+  `(occurrence, NodeId)`, where the occurrence is the chain of the reference nodes' ids above
+  the node — computed while composing, never written into a file.
+- The id carries **no `_` prefix**, deliberately: `sanitizeUserDataForExport` strips
+  `_`-prefixed keys as runtime bookkeeping, and an id that does not survive an export is worse
+  than none.
+
+Implementation: [`rv-node-id.ts`](src/core/engine/rv-node-id.ts); the composite runtime index
+lives in `NodeRegistry` (`registerNodeId` / `getNodeByAddress`).
+
+### 1a. The occurrence chain is also the breadcrumb address
+
+`childOccurrence(parent, referenceNodeId)` appends one reference node's id per
+level, `fullNodeAddress` joins the pair as `<occurrence>#<nodeId>`, and
+`parseNodeAddress` splits it again at the **last** separator. `ROOT_OCCURRENCE`
+is the empty string, so a node in the file you actually opened has the address
+`#<nodeId>` and `occurrenceDepth` 0.
+
+Because a reference node lives in exactly one file, where its id *is* unique,
+the chain is globally unique without any file knowing where it is installed.
+That single property is why the same chain carries three jobs:
+
+| Job | Who reads it |
+|---|---|
+| **Address** of a node inside a referenced subtree | `NodeRegistry.getNodeByAddress`; the override router when a field edit inside a reference is written to the outermost reference node's `AssetOverrides.byNodeId` |
+| **Breadcrumb** of the document stack — descending into a referenced asset pushes a frame whose occurrence is the parent's plus the reference node id | `RvDocumentStack.breadcrumb()`, which is literally `occurrenceSegments(occurrence)`; the chain is asserted to stay a prefix chain on every push |
+| **Draft key**, as `<projectId>:<rootDocumentId>:<occurrence>` with each segment percent-encoded | `rv-document-drafts.ts` |
+
+The draft key is namespaced rather than being the bare chain for two reasons
+that neither the chain nor IndexedDB can fix on its own: reference node ids are
+persisted UUIDs *inside* the GLB, so copying a project folder yields two copies
+with byte-identical chains; and IndexedDB is scoped to the origin, not to the
+project. A bare chain would therefore not merely risk an overwrite — a descend
+in project B could load project A's draft and present it as the open document.
+
+Two things the chain is **not**: it is never written into a file (it is a
+property of *where an asset is installed*, which the asset itself must not
+know), and it is not a node path — `/` separates reference-node ids here, not
+node names. See [doc-persistence.md](doc-persistence.md) §2.1b.
 
 `componentType` decides how `NodeRegistry.resolve()` interprets the path — as a Drive, a
 Sensor, a signal address, or (for `UnityEngine.Transform` and for legacy entries with no
 `componentType` at all) as a plain scene node.
+
+### 1a. The model root is visible — and that changes no path
+
+Since plan-715 the loaded model's root (`viewer.currentModelRoot`) is the **top row of the
+hierarchy panel** and the default start node of `web_node_tree`, instead of being folded away.
+This is a presentation and addressing change only. **No path moved.** The root was always
+registered under its bare name and was always the first segment of every child path (rule 1
+above); making it visible only surfaced the row that already existed in the path space.
+
+Two consequences worth stating explicitly, because they are what keeps rule 1 true:
+
+- **The root's `Object3D.name` is never renamed.** The hierarchy shows the *document* name
+  (`sceneSnap.draft.name`, falling back to the GLB file name), which is a display label in the
+  same sense as the snap and LayoutObject labels — the node keeps its own name, so the first
+  segment of every stored reference keeps resolving. `AssetDocument.renameNode` refuses the root
+  outright for the same reason.
+- **The root is structurally frozen.** Rename, transform, delete, reparent and visibility are
+  all rejected centrally (`isModelRoot`, `src/core/engine/rv-model-root.ts`), in
+  `AssetDocument` rather than per caller, so MCP tools and UI actions inherit the rule. The
+  op-log REPLAY path is the one exception: it *skips* a historical root op with a warning
+  instead of throwing, because crash recovery must never fail on a draft written before the
+  guards existed.
+
+Root-level `userData.realvirtual` round-trips through `scenes[0].extras` (the only round-trip
+capable place for file-level data in glTF), which is what makes the root usable as the anchor
+for asset metadata.
 
 ---
 

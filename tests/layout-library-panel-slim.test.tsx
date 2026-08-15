@@ -24,22 +24,20 @@ import selectorSource from '../src/plugins/layout-planner/LibrarySelector.tsx?ra
 
 afterEach(() => cleanup());
 
-const LOCAL_ITEM: LibraryItem = { id: 'local:Work/library', label: 'Work/library', kind: 'local' };
+const URL_ITEM: LibraryItem = { id: 'https://c.example/catalog.json', label: 'Work/library', kind: 'url' };
 
 function renderSelector(over: Partial<React.ComponentProps<typeof LibrarySelector>> = {}) {
   const onManage = vi.fn();
-  const onRefresh = vi.fn();
   const utils = render(
     <LibrarySelector
-      items={[LOCAL_ITEM]}
-      activeId={LOCAL_ITEM.id}
+      items={[URL_ITEM]}
+      activeId={URL_ITEM.id}
       onSelect={() => {}}
-      onRefresh={onRefresh}
       onManage={onManage}
       {...over}
     />,
   );
-  return { ...utils, onManage, onRefresh };
+  return { ...utils, onManage };
 }
 
 describe('LibrarySelector after the plan-702 slimming', () => {
@@ -54,11 +52,11 @@ describe('LibrarySelector after the plan-702 slimming', () => {
     expect(screen.queryByText('Edit Connection')).toBeNull();
   });
 
-  test('STILL offers "Refresh folder" for a local folder library', () => {
-    const { onRefresh } = renderSelector();
-    const refresh = screen.getByLabelText('Refresh folder');
-    fireEvent.click(refresh);
-    expect(onRefresh).toHaveBeenCalledWith(LOCAL_ITEM.id);
+  // "Refresh folder" and "Re-grant access" existed for exactly one source
+  // kind — a local working folder — and went with it (plan-709 §2.6).
+  test('no longer offers the local-folder refresh', () => {
+    renderSelector();
+    expect(screen.queryByLabelText('Refresh folder')).toBeNull();
   });
 
   test('offers exactly one management route: Manage libraries…', () => {
@@ -86,6 +84,10 @@ describe('LayoutLibraryPanel source contract', () => {
       'handleAddGitHub',
       'handleAddAssetManager',
       'handleAddLocalFolder',
+      // Gone with the working folder (plan-709 §2.6).
+      'handleRefreshLocalFolder',
+      'activateLocalFolder',
+      'Re-grant access',
       'handleEditAmConnection',
       'handleSaveAmEdit',
       'handleRemoveLibrary',
@@ -104,14 +106,12 @@ describe('LayoutLibraryPanel source contract', () => {
   });
 
   test('the BROWSING affordances the user decided to keep are still there', () => {
-    // The binding decision from the grill phase: refresh and re-grant are what
-    // browsing a local folder needs, so they stay in the planner (R1).
-    expect(panelSource).toContain('handleRefreshLocalFolder');
-    expect(panelSource).toContain('Refresh folder');
-    expect(panelSource).toContain('Re-grant access');
-    expect(panelSource).toContain('activateLocalFolder');
-    expect(panelSource).toContain('LOCAL_NEEDS_PERMISSION');
+    // The binding decision from the grill phase was that BROWSING stays in the
+    // planner while managing moves out. What browsing needs is the library
+    // list itself; the folder-specific half of that decision (refresh,
+    // re-grant) lost its subject when the working folder went (plan-709 §2.6).
     expect(panelSource).toContain('libraryItems');
+    expect(panelSource).toContain('CatalogBrowser');
   });
 
   test('the panel keeps exactly one management route', () => {

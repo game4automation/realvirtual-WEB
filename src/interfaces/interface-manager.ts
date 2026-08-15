@@ -107,6 +107,14 @@ export class InterfaceManager implements RVViewerPlugin {
   onModelLoaded(result: LoadResult, viewer: RVViewer): void {
     this.viewer = viewer;
 
+    // plan-386 F17: a model that arrived through a shared link is never wired
+    // to a PLC by itself — neither by opening a connection nor by handing its
+    // signals to one that is already open. The user's stored autoConnect
+    // preference is consent for HIS models; it is not consent for someone
+    // else's file to reach his plant. Explicit Connect from the Interfaces tab
+    // is unaffected — that is a decision, not a side effect of a URL.
+    if (!viewer.loadTrust.trusted) return;
+
     // Forward to active interface
     const active = this.getActive();
     if (active) {

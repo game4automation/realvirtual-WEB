@@ -25,7 +25,7 @@ import {
   putHandle,
 } from '../src/core/engine/rv-local-filesystem';
 import { clearAllScenes, readScene, writeScene } from '../src/core/hmi/scene/rv-scene-storage';
-import { sceneRelPathFor } from '../src/core/project/rv-project-types';
+import { sceneGlbRelPathFor } from '../src/core/project/rv-project-types';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ const scene = (id: string, name: string): RvScene => ({
   name,
   createdAt: '2025-01-01T00:00:00.000Z',
   modifiedAt: '2025-01-01T00:00:00.000Z',
-  schemaVersion: 2,
+  schemaVersion: 3,
   base: { kind: 'empty' },
   edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
 });

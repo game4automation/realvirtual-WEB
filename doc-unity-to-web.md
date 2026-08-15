@@ -101,6 +101,32 @@ codebase.** Adding more Unity components for things in the lower half of
 this table is not on the roadmap — the limitations of expressing browser
 UI inside Unity make that the wrong place for them.
 
+### 0.1 `NodeId` and the Unity → WEB → Unity round-trip
+
+WEB addresses nodes by a stable `NodeId` in `extras.realvirtual` (plan-397,
+rv-ODT §5a) as well as by path. It matters to a Unity user in exactly one
+situation: a **round-trip**, where a GLB exported from Unity is edited in WEB
+and comes back.
+
+- **Unity does not have to produce `NodeId`s.** A file without them loads
+  unchanged — that is the entire existing Unity export corpus. For such a file
+  WEB *derives* the id deterministically from the file's own hash plus the glTF
+  node index, so the same bytes always yield the same ids and an override
+  written against them survives a reload.
+- **Unity must not strip them.** If a GLB that already carries `NodeId` is
+  re-imported and re-exported by Unity, dropping the field silently orphans
+  every override a referencing file holds against it. `NodeId` deliberately has
+  no `_` prefix so WEB's own export sanitiser keeps it; the Unity side needs the
+  same care.
+- **`NodeId` is unique within its file, never globally.** Reference one asset
+  ten times and all ten occurrences carry identical ids — occurrences are told
+  apart at runtime by the chain of reference-node ids above them, which is never
+  written into any file.
+
+See [`doc-node-paths.md`](doc-node-paths.md) for the addressing model and
+[`schema/v1/specification.md`](schema/v1/specification.md) §5a for the
+normative derivation.
+
 ---
 
 ## 1. Two layers, one runtime

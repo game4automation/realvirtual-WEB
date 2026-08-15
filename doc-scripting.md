@@ -25,7 +25,36 @@ realvirtual WEB gives you two different ways to add custom logic, and they are n
 | Authoring | JS or TypeScript in the built-in Monaco editor, hot-reloaded live | TypeScript in the project source tree, requires a build |
 | Custom HMI UI | Not available from the script itself | Full React UI slots (KPI cards, panels, overlays) |
 
-If your logic belongs to the model, script it in the GLB. If you are extending the viewer application itself, use the native TypeScript plugin/behavior path.
+**3. Project code (`documents[].scriptRef`).** A third way exists for code that belongs to neither the model nor the viewer, but to a **project**: a `.ts` module inside the project folder, bound to a document by a reference on its manifest row (`documents[].scriptRef` in `project.json`). It is the same native TypeScript plugin as path 2 — same API, same lack of a sandbox — with a different *binding*: which documents get it is stated in the manifest rather than in the module, so several documents can share one module (N:1) and renaming a GLB cannot break the binding. It replaces the module's own `models: string[]` self-declaration, which bound code to a file name. See [Extending realvirtual WEB](doc-extending-webviewer.md) for the authoring rules.
+
+| | In-GLB scripting | Native TypeScript extension | Project code (`scriptRef`) |
+|---|---|---|---|
+| Belongs to | the model | the viewer application | the project folder |
+| Binding | the node it is attached to | every model in the build | the document row that names it |
+| Distribution | inside the GLB | the viewer build | the project directory (copy the folder, the code comes along) |
+| Sandbox / limits | QuickJS VM, trust gate | None — native JS execution | None — native JS execution |
+
+### How project code is loaded — two modes, one reference
+
+The same `scriptRef` is resolved two ways, in this order:
+
+1. **Build mode.** The module was part of the viewer build (`import.meta.glob` found it). Nothing extra is needed; the reference only says *which* bundled module belongs to *which* document.
+2. **Runtime mode.** The module is **not** in the build — a project folder copied onto a machine whose viewer was built without it. The viewer then looks for the compiled **`.js` sibling** next to the referenced `.ts` (`scripts/a.ts` → `scripts/a.js`), reads it out of the project and imports it dynamically.
+
+A `scriptRef` that resolves to neither loads **no** plugins. There is deliberately no fallback to the old name-based match: binding the wrong code is worse than binding none.
+
+**Producing the sibling.** Compilation happens on the dev/delivery path, not in the browser:
+
+```bash
+npm run build:project-scripts -- <projectDir>          # build the .js siblings
+npm run build:project-scripts -- <projectDir> --check  # CI gate: exit 3 if missing/stale
+```
+
+The artefact is a **self-contained ES module** (esbuild, `bundle: true`, `format: esm`): it is imported from a Blob URL, which has no directory, so a relative `import './util'` inside it could not resolve. Bare package imports (`three`, `react`, `@mui/material`) stay external and resolve against the viewer's copies.
+
+**Consent.** Runtime-mode code is unsandboxed JavaScript that arrived with a project folder, so the first time a project wants to run some, the viewer asks once and remembers the answer **per project id**. Without consent the project still opens — only its own code stays off. The global scripting gate (the QuickJS trust gate above) is *not* a permission for this: it governs a different execution path. Build-mode code is not gated — it was compiled into this build from the repository and is as reviewable as the viewer around it.
+
+If your logic belongs to the model, script it in the GLB. If you are extending the viewer application itself, use the native TypeScript plugin/behavior path. If it belongs to one customer's project, put it in the project folder and reference it from the manifest.
 
 ## The WebComponent data model
 

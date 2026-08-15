@@ -14,25 +14,17 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// A minimal in-memory File System Access implementation. Only `getWorkFolder`
-// and `requestWriteAccess` are stubbed — `getOrCreateSubfolder`, `writeBlobFile`
-// and `listFiles` stay REAL, so this exercises the code under test.
-const state = vi.hoisted(() => ({ workFolder: null as unknown, opfsAvailable: true }));
+// The cache has two tiers: the OPFS blob store and a Cache-API fallback. The
+// work-folder tier it once had is gone (plan-709 §2.6), so nothing about the
+// File System Access API is stubbed any more — `listFiles` below runs for real
+// against the in-memory handles, which is what the last two tests need.
+const state = vi.hoisted(() => ({ opfsAvailable: true }));
 
 // OPFS itself stays REAL (the browser runner provides it); only the
 // availability probe is stubbed so the Cache-API fallback stays reachable.
 vi.mock('../src/core/storage/rv-opfs-blobs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/storage/rv-opfs-blobs')>();
   return { ...actual, isOpfsSupported: () => state.opfsAvailable };
-});
-
-vi.mock('../src/core/engine/rv-local-filesystem', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/core/engine/rv-local-filesystem')>();
-  return {
-    ...actual,
-    getWorkFolder: async () => state.workFolder,
-    requestWriteAccess: async () => true,
-  };
 });
 
 import {
@@ -92,7 +84,6 @@ const bytesOf = (s: string) => new TextEncoder().encode(s).buffer as ArrayBuffer
 const textOf = async (b: ArrayBuffer | null) => (b ? new TextDecoder().decode(b) : null);
 
 beforeEach(async () => {
-  state.workFolder = null;
   state.opfsAvailable = true;
   await clearCadGlbCache();
 });

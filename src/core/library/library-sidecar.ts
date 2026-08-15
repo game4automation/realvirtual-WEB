@@ -2,29 +2,40 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * library-sidecar — per-asset metadata beside a writable library root
- * (plan-372 §2.6.5, Phase 9).
+ * library-sidecar — READING the legacy `library.json` (plan-717 §2.4, Phase 4).
  *
- * Collections and display names have to live *somewhere*. `project.json` is a
- * manifest of artefacts and deliberately gets no per-asset metadata, and the
- * GLB itself cannot carry it (renaming would mean rewriting the binary). So
- * each writable library root gets one `library.json` next to its assets:
- * `<project>/library/library.json`, and the same file in a local folder
- * library for as long as those exist.
+ * Collections and display names used to live here, in one file next to a
+ * writable library's assets. Since plan-717 they live on the manifest ROW, and
+ * this module is what is left: **a reader, and only a reader**.
  *
- * ## Defensive parsing, modelled on `isValidSceneV2`
+ * ## Why anything is left at all
+ *
+ * Because the file still exists on every project that predates the change. The
+ * adopt verb ingests it once into the rows and then deletes it
+ * (`library-sidecar-ingest.ts`, §2.4), and `legacyCollectionsFor` answers for
+ * the one release generation in which a project may not have been through that
+ * ingestion yet. Both need to parse the file; neither may produce one.
+ *
+ * ## The write API is deleted, on purpose
+ *
+ * `withAssetMeta`, `withRenamedAsset`, `serialiseSidecar` and the
+ * `writeSidecarAt` that used them are gone (plan-717 F9). Two homes for one
+ * piece of metadata is the failure this plan removes, and a sidecar that a
+ * newer build keeps refreshing is exactly how the old values "resurrect"
+ * themselves after an external copy. `registration-removal-guard.test.ts`
+ * keeps them gone.
+ *
+ * `resolveAssetMeta` went with them, for a different reason: it was the READ
+ * half, and it had zero production callers from plan-413 until its deletion —
+ * the write-only loop the plan closed.
+ *
+ * ## Defensive parsing
  *
  * A sidecar is *derived convenience*, never the source of truth — the assets
- * on disk are. So a broken or future-versioned file is **ignored, not thrown**
- * and, critically, **never overwritten**:
- *
- * - Throwing would make one bad character take a whole library offline.
- * - Overwriting would silently destroy the collections of a user who opened
- *   their project in a newer build. A file we cannot parse is far more likely
- *   to be from a version we do not know than to be garbage.
- *
- * When no entry exists for an asset, the caller falls back to the historical
- * behaviour of deriving the collection from the parent folder name.
+ * on disk are. So a broken or future-versioned file is **ignored, not thrown**:
+ * throwing would make one bad character take a whole library offline. It is
+ * also never rewritten, which since Phase 4 is a property of the module rather
+ * than a rule inside it — there is no write left to refuse.
  */
 
 /** Current schema version. Bump only for a breaking shape change. */
@@ -103,65 +114,10 @@ export function parseSidecar(text: string): LibrarySidecarV1 | null {
   return { schemaVersion: SIDECAR_SCHEMA_VERSION, assets };
 }
 
-/** Serialise for writing. Stable key order keeps git diffs readable. */
-export function serialiseSidecar(sidecar: LibrarySidecarV1): string {
-  const assets: Record<string, LibrarySidecarAsset> = {};
-  for (const key of Object.keys(sidecar.assets).sort()) {
-    assets[key] = sidecar.assets[key];
-  }
-  return JSON.stringify({ schemaVersion: SIDECAR_SCHEMA_VERSION, assets }, null, 2) + '\n';
-}
-
-/**
- * Metadata for one asset, with the folder-derived fallback applied.
- *
- * The fallback is the pre-sidecar behaviour: an asset at `conveyor/belt.glb`
- * belongs to the "conveyor" collection. It stays in place because most
- * libraries have no sidecar at all and must keep working unchanged.
- */
-export function resolveAssetMeta(
-  sidecar: LibrarySidecarV1 | null,
-  relPath: string,
-): Required<LibrarySidecarAsset> {
-  const entry = sidecar?.assets[relPath];
-  const segments = relPath.split('/').filter(Boolean);
-  const fileName = segments[segments.length - 1] ?? relPath;
-  const parent = segments.length > 1 ? segments[segments.length - 2] : null;
-
-  return {
-    displayName: entry?.displayName ?? fileName.replace(/\.[^.]+$/, ''),
-    // An explicit empty array in the sidecar means "no collections" and must
-    // not silently fall back to the folder name.
-    collections: entry?.collections ?? (parent ? [parent] : []),
-    tags: entry?.tags ?? [],
-  };
-}
-
-/** Return a copy with one asset's metadata replaced (or removed when empty). */
-export function withAssetMeta(
-  sidecar: LibrarySidecarV1,
-  relPath: string,
-  meta: LibrarySidecarAsset,
-): LibrarySidecarV1 {
-  const assets = { ...sidecar.assets };
-  const hasContent =
-    meta.displayName !== undefined
-    || (meta.collections?.length ?? 0) > 0
-    || (meta.tags?.length ?? 0) > 0;
-  if (hasContent) assets[relPath] = meta;
-  else delete assets[relPath];         // don't persist empty records
-  return { schemaVersion: SIDECAR_SCHEMA_VERSION, assets };
-}
-
-/** Return a copy with an asset's record moved to a new path (rename/duplicate). */
-export function withRenamedAsset(
-  sidecar: LibrarySidecarV1,
-  fromPath: string,
-  toPath: string,
-): LibrarySidecarV1 {
-  const entry = sidecar.assets[fromPath];
-  const assets = { ...sidecar.assets };
-  delete assets[fromPath];
-  if (entry) assets[toPath] = entry;
-  return { schemaVersion: SIDECAR_SCHEMA_VERSION, assets };
-}
+// ─── Deleted in plan-717 Phase 4 (F9) ───────────────────────────────────
+//
+// `serialiseSidecar`, `withAssetMeta`, `withRenamedAsset` — the write API, and
+// `resolveAssetMeta` — the read half nothing ever called. Collections are a row
+// field now (§2.4); the folder-derived fallback `resolveAssetMeta` applied lives
+// on as the catalog's folder CHIPS (`toCatalogEntry`, §2.6), which is where a
+// user could always see it. Nothing in this build may produce a `library.json`.

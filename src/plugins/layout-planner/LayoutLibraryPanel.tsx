@@ -46,10 +46,11 @@ import { LeftPanel, WINDOW_DARK_BG } from '../../core/hmi/LeftPanel';
 import { RV_SCROLL_CLASS } from '../../core/hmi/shared-sx';
 import { LAYOUT_PANEL_WIDTH, LEFT_PANEL_ZINDEX } from '../../core/hmi/layout-constants';
 import { showInfoOverlay } from '../../core/hmi/info-overlay-store';
-import { setPendingAssetOpen } from '../asset-editor/pending-open-store';
+import { setPendingAssetOpen } from '@rv-private/plugins/asset-editor/pending-open-store';
+import { libraryDocumentBase } from '../../core/editor/active-asset-store';
 import type { LayoutPlannerPlugin } from './index';
 import type { LibraryCatalogEntry, LayoutSnapshot } from './rv-layout-store';
-import { LOCAL_NEEDS_PERMISSION, isGitHubRepoScanUrl } from './rv-layout-store';
+import { isGitHubRepoScanUrl } from './rv-layout-store';
 import { setLayoutDragData, suppressDragImage } from './drag-types';
 import { matchMaterialFlows } from '../../core/material-flow/registry';
 
@@ -175,16 +176,11 @@ export function LayoutLibraryPanel() {
     if (!id.startsWith('am:')) store?.setActiveTab(id);
   }, [store]);
 
-  const handleRefreshLocalFolder = useCallback(async () => {
-    if (!store) return;
-    await store.refreshLocalFolder();
-  }, [store]);
-
   /**
    * The panel's single management route (plan-702 F8).
    *
-   * Everything that used to live here — add URL / GitHub / Asset Manager /
-   * local folder, remove, edit connection — is now one door into the Projects
+   * Everything that used to live here — add URL / GitHub / Asset Manager,
+   * remove, edit connection — is now one door into the Projects
    * dashboard's Assets tab, which groups the same libraries by source and can
    * attach new ones.
    */
@@ -222,11 +218,10 @@ export function LayoutLibraryPanel() {
       ? snapshot.activeTabUrl
       : allTabIds[0] ?? null;
   const isAmTab = resolvedActiveTabId?.startsWith('am:') ?? false;
-  const isLocalTab = resolvedActiveTabId?.startsWith('local:') ?? false;
 
   // Active (non-AM) catalog + the shared chip/filter pipeline. Every public
-  // tab — remote URL, GitHub scan, Local Folder — now runs through the same
-  // CatalogBrowser shell driven by these values.
+  // tab — remote URL, GitHub scan — now runs through the same CatalogBrowser
+  // shell driven by these values.
   const activeError = resolvedActiveTabId ? snapshot.catalogErrors.get(resolvedActiveTabId) : null;
   const activeCatalog = !isAmTab && resolvedActiveTabId ? snapshot.catalogs.get(resolvedActiveTabId) : null;
   const fullEntries = activeCatalog?.entries ?? [];
@@ -245,26 +240,18 @@ export function LayoutLibraryPanel() {
     : fullEntries;
   const displayedEntries = filterByChip(searchedEntries, selectedChip);
 
-  // Local-folder permission state (drives the in-grid re-grant prompt).
-  const localNeedsPermission =
-    isLocalTab && snapshot.catalogErrors.get(resolvedActiveTabId ?? '') === LOCAL_NEEDS_PERMISSION;
-
-  // Library dropdown items — catalog URLs (url / github / local) + Asset
+  // Library dropdown items — catalog URLs (url / github) + Asset
   // Manager connections, each carrying the kind/status the selector needs to
   // render its icon and per-row remove/refresh actions.
   const libraryItems: LibraryItem[] = [
     ...visibleCatalogUrls.map((url): LibraryItem => {
       const catalog = snapshot.catalogs.get(url);
       const err = snapshot.catalogErrors.get(url);
-      const local = url.startsWith('local:');
       return {
         id: url,
-        label: local
-          ? (catalog?.name?.replace(/^Local:\s*/, '') ?? 'Local folder')
-          : (catalog?.name ?? (err ? 'Error' : 'Loading…')),
-        kind: local ? 'local' : isGitHubRepoScanUrl(url) ? 'github' : 'url',
-        needsPermission: err === LOCAL_NEEDS_PERMISSION,
-        error: !!err && err !== LOCAL_NEEDS_PERMISSION,
+        label: catalog?.name ?? (err ? 'Error' : 'Loading…'),
+        kind: isGitHubRepoScanUrl(url) ? 'github' : 'url',
+        error: !!err,
       };
     }),
     ...amConnections.map((cs): LibraryItem => ({
@@ -277,11 +264,6 @@ export function LayoutLibraryPanel() {
 
   const handleSelectLibrary = (id: string): void => {
     switchToLibrary(id);
-    // Local folder whose permission lapsed: this click is a user gesture, so
-    // `requestPermission()` is allowed — re-grant + load.
-    if (id.startsWith('local:') && snapshot.catalogErrors.get(id) === LOCAL_NEEDS_PERMISSION) {
-      void store.activateLocalFolder();
-    }
   };
 
   // Chip row is redundant when a single facet already covers every entry
@@ -289,9 +271,7 @@ export function LayoutLibraryPanel() {
   const showChips = chips.length > 1 || (chips.length === 1 && chips[0].count < fullEntries.length);
 
   // Resolve the single "empty" state shown instead of the card grid (null =>
-  // render the grid). Order: no libraries → permission re-grant → load error →
-  // no results.
-  const nonPermissionError = activeError && activeError !== LOCAL_NEEDS_PERMISSION ? activeError : null;
+  // render the grid). Order: no libraries → load error → no results.
   let emptyContent: ReactNode = null;
   if (allTabIds.length === 0) {
     emptyContent = (
@@ -301,31 +281,11 @@ export function LayoutLibraryPanel() {
         </Typography>
       </Box>
     );
-  } else if (localNeedsPermission) {
-    // Browser dropped the File System Access permission between sessions — the
-    // folder is still remembered, we just need read access re-granted. One
-    // click here runs `requestPermission()` inside a user gesture.
-    emptyContent = (
-      <Box sx={{ p: 2, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1.25 }}>
-        <Typography variant="caption" sx={{ color: 'text.secondary', textAlign: 'center', fontSize: 11 }}>
-          Browser permission for this folder has expired. Grant read access again to load the local library.
-        </Typography>
-        <Button
-          size="small"
-          variant="contained"
-          startIcon={<FolderOpen sx={{ fontSize: 14 }} />}
-          onClick={() => { void store.activateLocalFolder(); }}
-          sx={{ textTransform: 'none', fontSize: 11 }}
-        >
-          Re-grant access
-        </Button>
-      </Box>
-    );
-  } else if (nonPermissionError) {
+  } else if (activeError) {
     emptyContent = (
       <Box sx={{ p: 2, textAlign: 'center' }}>
         <Typography variant="caption" sx={{ color: '#ef5350' }}>
-          Library unavailable: {nonPermissionError}
+          Library unavailable: {activeError}
         </Typography>
       </Box>
     );
@@ -334,7 +294,7 @@ export function LayoutLibraryPanel() {
     emptyContent = (
       <Box sx={{ p: 2, textAlign: 'center' }}>
         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-          {filtering ? 'No matching components' : isLocalTab ? 'No assets in folder' : 'Loading...'}
+          {filtering ? 'No matching components' : 'Loading...'}
         </Typography>
       </Box>
     );
@@ -343,7 +303,7 @@ export function LayoutLibraryPanel() {
   // Small count caption — only when the grid is showing AND the chip row is
   // hidden (otherwise the "All (N)" chip already carries the count).
   const countLabel = emptyContent === null && !showChips && fullEntries.length > 0
-    ? `${fullEntries.length} ${isLocalTab ? 'asset' : 'component'}${fullEntries.length !== 1 ? 's' : ''}`
+    ? `${fullEntries.length} component${fullEntries.length !== 1 ? 's' : ''}`
     : undefined;
 
   return (
@@ -359,7 +319,6 @@ export function LayoutLibraryPanel() {
           libraryItems={libraryItems}
           activeId={resolvedActiveTabId}
           onSelect={handleSelectLibrary}
-          onRefreshLocal={handleRefreshLocalFolder}
           onManage={handleManageLibraries}
           onClose={handleClose}
         />
@@ -393,7 +352,6 @@ export function LayoutLibraryPanel() {
           items={libraryItems}
           activeId={resolvedActiveTabId}
           onSelect={handleSelectLibrary}
-          onRefresh={(id) => { if (id.startsWith('local:')) void handleRefreshLocalFolder(); }}
           onManage={handleManageLibraries}
         />
 
@@ -405,7 +363,7 @@ export function LayoutLibraryPanel() {
           headerText={countLabel}
           searchText={searchText}
           onSearchChange={setSearchText}
-          searchPlaceholder={isLocalTab ? 'Search assets...' : 'Search...'}
+          searchPlaceholder="Search..."
           chips={showChips ? chips : []}
           totalCount={fullEntries.length}
           selectedChip={selectedChip}
@@ -439,7 +397,6 @@ interface MobileLibraryStripProps {
   libraryItems: LibraryItem[];
   activeId: string | null;
   onSelect: (id: string) => void;
-  onRefreshLocal: () => void | Promise<void>;
   /** Open the Projects dashboard's Assets tab — the one management route. */
   onManage: () => void;
   onClose: () => void;
@@ -450,7 +407,7 @@ interface MobileLibraryStripProps {
  *  fullscreen panel) — tap a card to enter placement mode, then tap the scene. */
 function MobileLibraryStrip({
   entries, plugin, snapshot, isAmTab, libraryItems, activeId,
-  onSelect, onRefreshLocal, onManage, onClose,
+  onSelect, onManage, onClose,
 }: MobileLibraryStripProps) {
   // Single combined menu (library switch + manage) opened from the floating ⋮.
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
@@ -558,12 +515,6 @@ function MobileLibraryStrip({
             </MenuItem>
           ))}
           {libraryItems.length > 0 && <Divider />}
-          {activeItem?.kind === 'local' && (
-            <MenuItem onClick={() => { onRefreshLocal(); closeMenu(); }} sx={{ fontSize: 12 }}>
-              <ListItemIcon sx={{ minWidth: 26 }}><Refresh sx={{ fontSize: 16 }} /></ListItemIcon>
-              Refresh folder
-            </MenuItem>
-          )}
           {/* Full library management lives in the Projects dashboard
               (plan-372 Phase 8, sole route since plan-702). This panel keeps
               the fast path — pick a library, search, filter, drag — and hands
@@ -836,8 +787,7 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
         <MenuItem
           onClick={() => {
             setCtxPos(null);
-            const fileName = entry.localPath!.split('/').pop() ?? entry.localPath!;
-            setPendingAssetOpen({ kind: 'libraryGlb', fileName, relPath: entry.localPath! });
+            setPendingAssetOpen(libraryDocumentBase(entry.localPath!));
             void viewer.modes.requestMode('editor');
           }}
           sx={{ fontSize: 12 }}

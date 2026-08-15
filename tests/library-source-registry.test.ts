@@ -247,7 +247,7 @@ describe('active project as a library source', () => {
 // ─── Real backend, real folder shape (the DemoRealvirtual regression) ──────
 
 describe('a real FolderBackend feeds the project library source', () => {
-  test('lists the project library/ tree, not the manifest', async () => {
+  test('lists every document the folder holds, not just library/ (plan-716 F7)', async () => {
     const root = new FakeDir('demo-realvirtual');
     root.seedText('project.json', JSON.stringify({
       schemaVersion: 1, id: 'prj_sample', name: 'DemoRealvirtual',
@@ -277,7 +277,16 @@ describe('a real FolderBackend feeds the project library source', () => {
 
     const sources = listLibrarySources();
     expect(sources).toHaveLength(1);
+    // The base model under `models/` is in the catalog too since plan-716 §2.7:
+    // every document is placeable, and `library/` is only a folder. The
+    // dash-to-space prettifying of a folder-scanned name still holds — that is
+    // the DemoRealvirtual regression this test was written for.
     expect(sources[0].source.listEntries().map(e => e.name).sort())
-      .toEqual(['RollConveyor 1m', 'Turntable']);
+      .toEqual(['DemoRealvirtualWeb', 'RollConveyor 1m', 'Turntable']);
+    // …and the section a document came from survives as a collection chip, so
+    // the panel can still facet by folder without a second list.
+    const chips = sources[0].source.listEntries().flatMap(e => e.collections ?? []);
+    expect(chips).toContain('models');
+    expect(chips).toContain('library/PalletHandling');
   });
 });

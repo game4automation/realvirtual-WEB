@@ -7,6 +7,7 @@ import { createTestViewer, type TestViewerHandle } from './helpers/create-test-v
 import type { ResolvedSlot } from '../src/core/engine/rv-binding-slot-resolver';
 import { armSignalDrag, cancelSignalDrag, updateSignalDrag } from '../src/core/hmi/signal-drag-store';
 import { DropTargetOverlayController } from '../src/plugins/signal-bind/drop-target-overlay';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
 const VIEWER_TEST_TIMEOUT = 60_000;
 const SLOT: ResolvedSlot = {
@@ -24,7 +25,7 @@ describe('drop target overlay on webgpu renderer', () => {
   it('builds, renders and disposes on a webgpu-gl viewer', async () => {
     handle = await createTestViewer('webgpu-gl', { plannerSignalLinking: true });
     const viewer = handle.viewer;
-    await viewer.loadModel('/models/EuropalletEmpty.glb');
+    await viewer.loadModel(DEV_GLB.europalletEmpty);
     expect(viewer.isWebGPU).toBe(true);
     expect(viewer.signalBindingManager).not.toBeNull();
     expect(viewer.registry).not.toBeNull();

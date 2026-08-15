@@ -2,9 +2,10 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-scene-executors — Apply EditOps to the live RVViewer scene.
+ * rv-scene-executors — Apply SCENE-lineage ops to the live RVViewer scene.
  *
- * For every primitive `EditOp.kind`, this module provides:
+ * For every kind in `RvScenePrimitiveOp` (the origin-filtered view of the ONE
+ * op union — `core/ops/rv-unified-ops.ts`), this module provides:
  *   - applyForward(op):  mutate the live scene to reflect the op
  *   - applyInverse(op):  reverse the op using its `prev` payload
  *
@@ -21,14 +22,11 @@
 import type { RVViewer } from '../../rv-viewer';
 import type { LayoutPlannerPlugin } from '../../../plugins/layout-planner';
 import type {
-  EditOp,
-  PrimitiveEditOp,
   SetFieldOp,
   UnsetFieldOp,
   AddPlacementOp,
   RemovePlacementOp,
   TransformPlacementOp,
-  SetNodeTransformOp,
   SetCameraOp,
   SetCodeOp,
   AddNodeOp,
@@ -38,11 +36,17 @@ import type {
   SetConnectionTypeOp,
   RemoveConnectionTypeOp,
 } from './rv-scene-edits';
+import type {
+  RvSceneOp,
+  RvScenePrimitiveOp,
+  RvTransformNodeOp,
+} from '../../ops/rv-unified-ops';
 import { WEB_COMPONENT_TYPE, WEB_COMPONENT_CODE_FIELD } from './rv-scene-edits';
 import { getConnectionSystem } from '../../engine/rv-connection-registry';
 import { saveStartPos, clearStartPos } from '../camera-startpos-store';
 import { deriveModelKey } from '../../../plugins/camera-startpos-plugin';
-import { applySchema, getRegisteredFactories } from '../../engine/rv-component-registry';
+import { applySchema, getRegisteredFactories, resolveComponentRefs } from '../../engine/rv-component-registry';
+import type { NodeRegistry } from '../../engine/rv-node-registry';
 import { applyLocalPose } from '../../engine/rv-node-transform';
 import type { SignalMapping } from '../../../plugins/layout-planner/rv-layout-store';
 import { syncNodeSignalBindingPersistence } from '../../../plugins/signal-bind/signal-binding-persistence';
@@ -53,9 +57,13 @@ export interface ExecutorContext {
 
 // ─── Public entry points ────────────────────────────────────────────────
 
-export async function applyForward(op: EditOp, ctx: ExecutorContext): Promise<void> {
+export async function applyForward(op: RvSceneOp, ctx: ExecutorContext): Promise<void> {
   if (op.kind === 'composite') {
-    for (const child of op.ops) await applyForward(child, ctx);
+    // The cast is the composite's one soft spot, and it is deliberate:
+    // `RvCompositeOp.ops` is not origin-restricted (see the constructor helpers
+    // in `rv-unified-ops.ts`). A stray asset-lineage child lands in the
+    // primitive switch's `default`, which is a documented no-op, not a crash.
+    for (const child of op.ops) await applyForward(child as RvScenePrimitiveOp, ctx);
     return;
   }
   try {
@@ -65,10 +73,10 @@ export async function applyForward(op: EditOp, ctx: ExecutorContext): Promise<vo
   }
 }
 
-export async function applyInverse(op: EditOp, ctx: ExecutorContext): Promise<void> {
+export async function applyInverse(op: RvSceneOp, ctx: ExecutorContext): Promise<void> {
   if (op.kind === 'composite') {
     for (let i = op.ops.length - 1; i >= 0; i--) {
-      await applyInverse(op.ops[i], ctx);
+      await applyInverse(op.ops[i] as RvScenePrimitiveOp, ctx);
     }
     return;
   }
@@ -79,14 +87,14 @@ export async function applyInverse(op: EditOp, ctx: ExecutorContext): Promise<vo
   }
 }
 
-async function applyPrimitiveForward(op: PrimitiveEditOp, ctx: ExecutorContext): Promise<void> {
+async function applyPrimitiveForward(op: RvScenePrimitiveOp, ctx: ExecutorContext): Promise<void> {
   switch (op.kind) {
     case 'setField':           return setFieldForward(op, ctx);
     case 'unsetField':         return unsetFieldForward(op, ctx);
     case 'addPlacement':       return addPlacementForward(op, ctx);
     case 'removePlacement':    return removePlacementForward(op, ctx);
     case 'transformPlacement': return transformPlacementForward(op, ctx);
-    case 'setNodeTransform':   return setNodeTransformForward(op, ctx);
+    case 'transformNode':      return transformNodeForward(op, ctx);
     case 'setCamera':          return setCameraForward(op, ctx);
     case 'setCode':            return setCodeForward(op, ctx);
     case 'addNode':            return addNodeForward(op, ctx);
@@ -98,14 +106,14 @@ async function applyPrimitiveForward(op: PrimitiveEditOp, ctx: ExecutorContext):
   }
 }
 
-async function applyPrimitiveInverse(op: PrimitiveEditOp, ctx: ExecutorContext): Promise<void> {
+async function applyPrimitiveInverse(op: RvScenePrimitiveOp, ctx: ExecutorContext): Promise<void> {
   switch (op.kind) {
     case 'setField':           return setFieldInverse(op, ctx);
     case 'unsetField':         return unsetFieldInverse(op, ctx);
     case 'addPlacement':       return addPlacementInverse(op, ctx);
     case 'removePlacement':    return removePlacementInverse(op, ctx);
     case 'transformPlacement': return transformPlacementInverse(op, ctx);
-    case 'setNodeTransform':   return setNodeTransformInverse(op, ctx);
+    case 'transformNode':      return transformNodeInverse(op, ctx);
     case 'setCamera':          return setCameraInverse(op, ctx);
     case 'setCode':            return setCodeInverse(op, ctx);
     case 'addNode':            return addNodeInverse(op, ctx);
@@ -180,16 +188,25 @@ function removeNodeInverse(op: RemoveNodeOp, ctx: ExecutorContext): void {
   ctx.viewer.markRenderDirty?.();
 }
 
-// ─── setNodeTransform ───────────────────────────────────────────────────
+// ─── transformNode ──────────────────────────────────────────────────────
+//
+// `transform.scale` is read by NEITHER function, and that is the whole scene
+// lineage in one sentence: the base GLB owns scale, and a Unity-exported mirror
+// node (`IKTarget` ships `(-1,1,1)`) must survive every move and every undo.
+// `applyLocalPose` writes position and quaternion only.
+//
+// Routing keeps scale-bearing transforms away from here in the first place
+// (`resolveOpTarget` decides by payload, not by mode), so this is a second line
+// of defence rather than the only one.
 
-function setNodeTransformForward(op: SetNodeTransformOp, ctx: ExecutorContext): void {
+function transformNodeForward(op: RvTransformNodeOp, ctx: ExecutorContext): void {
   const node = ctx.viewer.registry?.getNode(op.nodePath);
   if (!node) return; // tolerate — base GLB may have changed
-  applyLocalPose(node, op.position, op.quaternion);
+  applyLocalPose(node, op.transform.position, op.transform.quaternion);
   ctx.viewer.markRenderDirty?.();
 }
 
-function setNodeTransformInverse(op: SetNodeTransformOp, ctx: ExecutorContext): void {
+function transformNodeInverse(op: RvTransformNodeOp, ctx: ExecutorContext): void {
   const node = ctx.viewer.registry?.getNode(op.nodePath);
   if (!node) return;
   applyLocalPose(node, op.prev.position, op.prev.quaternion);
@@ -309,6 +326,7 @@ export function reapplySchemaForComponent(viewer: RVViewer, nodePath: string, co
   const factory = getRegisteredFactories().get(componentType);
   if (factory) {
     applySchema(instance as unknown as Record<string, unknown>, factory.schema, data);
+    resolveRefs(instance, reg);
     reapplyConfig(instance);
     return;
   }
@@ -316,7 +334,25 @@ export function reapplySchemaForComponent(viewer: RVViewer, nodePath: string, co
   const ctor = (instance as object).constructor as { schema?: Record<string, unknown> } | undefined;
   if (ctor?.schema) {
     applySchema(instance as unknown as Record<string, unknown>, ctor.schema as never, data);
+    resolveRefs(instance, reg);
     reapplyConfig(instance);
+  }
+}
+
+/**
+ * `applySchema` writes a `componentRef` field back as the RAW `ComponentReference`
+ * record from the extras — the same two-phase state the loader's STEP 1 leaves
+ * behind. Without STEP 2 the instance would then hold `{type,path,componentType}`
+ * where the component expects a resolved instance or an address string, and an
+ * edited reference (DrivenBy, TargetLink, a signal slot) would silently stop
+ * working until the next reload (plan-411 §2.1). Same call, same order as
+ * rv-scene-loader's `constructComponentOnNode`.
+ */
+function resolveRefs(instance: unknown, registry: NodeRegistry): void {
+  try {
+    resolveComponentRefs(instance as Record<string, unknown>, registry);
+  } catch (e) {
+    console.warn('[scene-exec] component ref resolution failed after reapplySchema:', e);
   }
 }
 

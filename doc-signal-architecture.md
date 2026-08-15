@@ -118,19 +118,43 @@ The signal-badge tooltip answers "who uses this signal?" in **two separate
 blocks**, because the two answers come from unrelated mechanisms and a merged
 list would imply an equivalence that does not exist:
 
-- **Drives** — manual `SignalMapping` records: an operator explicitly linked
-  this signal onto those slots. Source: `SignalBindingManager.getLinksForSource()`,
-  a reverse index over the persisted mappings. Each row reads
-  `<leaf node> · <slot>`.
+- **Drives these slots** — manual `SignalMapping` records: an operator
+  explicitly linked this signal onto those slots. Source:
+  `SignalBindingManager.getLinksForSource()`, a reverse index over the persisted
+  mappings. Each row reads `<componentType> · <slot label>`, with the leaf node
+  name as a dim right-hand qualifier.
 - **Referenced by** — GLB name coupling: a component's `componentRef` field
   resolves to this signal because the authored model says so. Source:
   `NodeRegistry.getComponentsForSignal()`. Each row reads
   `<componentType> · <short node path>`.
 
-Unlinking a signal removes a **Drives** entry and cannot touch a
+Unlinking a signal removes a **Drives these slots** entry and cannot touch a
 **Referenced by** entry — the latter lives in the GLB and is not editable from
-the viewer. The blocks also differ in gating: `Drives` is structural and always
-rendered, `Referenced by` follows the optional `fields.binding` tooltip setting.
+the viewer. The blocks also differ in gating: the driven-slots block is
+structural and always rendered, `Referenced by` follows the optional
+`fields.binding` tooltip setting.
+
+**Why those two titles** (plan-353 F4). The outgoing block used to be called
+just `Drives`, which is too short to read as a direction — next to `Referenced
+by` it looked like a variant of the same list rather than its opposite. The
+titles now name the direction, and both come from `signal-vocabulary.ts`
+(`PROVENANCE_DRIVES_TITLE` / `PROVENANCE_REFERENCED_TITLE`) rather than from
+string literals at the render sites.
+
+`Referenced by` is deliberately the **same** word as the property inspector's
+footer: both list reverse references to the selected object
+(`getComponentsForSignal` vs. `getReferencesTo`), so one term for one relation
+is the rule being followed, not a collision. What was ambiguous was the pairing
+inside the tooltip, and that is what the rename fixed.
+
+**Row text is the display pair, not the raw key.** `getLinksForSource()` returns
+`componentType` and `label` alongside the identity `slot`, both taken from the
+binding's already-resolved slot (`resolved.componentType` / `resolved.label`,
+the label SSOT from plan-341 Phase 4) — no second lookup, no second
+humanisation. Component types are printed verbatim (`Drive_DestinationMotor`,
+not "Drive"). Both fields are optional: a binding without a `componentType`
+renders the bare label rather than inventing a placeholder like "Component", and
+a binding without a `label` falls back to the raw slot key.
 
 Both are resolved **lazily, only while the tooltip is open** (`tipOpen` gate in
 `SignalBadge`): the registry walk, the reverse-index lookup and the activity
@@ -222,6 +246,17 @@ inspects `R`.
   an outcome already went out, `disposeDrag()` is the teardown path (plugin
   unload, model switch) and emits **nothing** by contract. `subscribe(cb)`
   returns the unsubscribe.
+- **`dropAt()` ordering — a registry guarantee, not a consumer's job**
+  (plan-341 §2.3 invariants 2+3, completed by plan-353 F1). The drop first
+  EVALUATES the target (the outcome must carry an identity that clearing the
+  hover would erase), then CLEARS the hover, and only then emits. The observable
+  contract for any subscriber: when `outcome` arrives, no element carries a
+  hover value in `data-rv-drop-state` — a still-registered target shows its drag
+  BASE state (`candidate`, or no attribute for a non-candidate), because
+  `clearHover()` restores the base rather than blanking it. The emitted order on
+  a hovered drop is therefore `enter → leave → outcome`. Previously the emit
+  came first and the announcer's `settled` latch papered over the trailing
+  `leave`; that latch is still there but is now redundant by design (see below).
 - Performance: `reject()` is called at most once per hover **transition**, never
   per `pointermove`. `__rvDropDiag.rejectCalls` counts the calls for the
   benchmark assertion.
@@ -241,9 +276,16 @@ drag store's `armed → dragging` promotion instead.
 A 100 ms debounce covers a pointer sweeping across rows on its way elsewhere; a
 `leave` DROPS the pending sentence rather than replacing it, and identical
 consecutive sentences are not repeated. The first `outcome` of a drag latches the
-listener shut, because `dropAt()` emits the outcome and clears the hover
-afterwards — without the latch the trailing `leave` would swallow the success
-sentence inside the debounce window.
+listener shut.
+
+That latch used to be load-bearing: `dropAt()` emitted the outcome and cleared
+the hover afterwards, so the trailing `leave` would swallow the success sentence
+inside the debounce window. Since plan-353 F1 the registry clears first and the
+`leave` arrives BEFORE the outcome, so the sentence survives on ordering alone.
+The latch is kept as a **redundant-by-design** second line of defence — it costs
+one boolean and still mutes a `leave` from a foreign emitter (a target
+unmounting, an overlay tearing down) after the drag has been decided. Do not
+read its presence as evidence that the registry still misbehaves.
 
 Rejection sentences quote `dropRejectText()` **verbatim**, so the row tooltip,
 the picker's `aria-disabled` option and the announcer say literally the same
@@ -693,20 +735,72 @@ The gate mode is `RVViewerOptions.signalWriteGate` / the per-model
 `SignalStore.signalWriteGate` property:
 
 - `shadow` (default) — conflicts are recorded, **nothing is rejected**.
-- `enforce` — prepared but not part of the plan-320 rollout: classified
+- `enforce` — prepared but still not part of any rollout: classified
   writers whose write contradicts the slot authority are dropped. `unknown`
   writers (raw legacy `set`/`setMany` calls) are NEVER rejected, only
   recorded — the raw store API stays legacy-compatible.
 
-**Fan-out conflict rule:** a raw channel write that maps to several slots is
-in conflict as soon as ANY slot indexed against the channel carries a
-`bound`/`forced` claim (most-restrictive-wins); the recorded conflict names
-the first conflicting SlotId.
+Two different things hide behind that last sentence, and they take effect at
+different lines:
 
-`SignalStore.canWriteSlot(slotId, writer)` is the synchronous UI companion
-(separate from the allocation-free internal path): it returns
-`{ allowed, reason }` where `allowed` states whether a write by this writer
-reaches the store now and `reason` names the dominating authority —
+- a **raw** legacy write uses the `UNKNOWN_WRITER` fallback, whose kind is
+  `plugin`. It is not a local-simulation kind, so it leaves the gate on the very
+  first check and is never even recorded;
+- a **classified** writer that happens to carry the id `unknown` (kind
+  `component`) does reach the gate, IS recorded as a conflict, and is still not
+  rejected. That exception is what keeps a legacy path from disappearing
+  silently once `enforce` goes hot — while leaving it visible in the conflict
+  log, which is how such a path gets found and fixed.
+
+#### Slot write roles — command authority vs. feedback authority
+
+A bound slot does not automatically mean "the component must keep its hands
+off". Two kinds of slot are bound for opposite reasons:
+
+- a **control** slot is commanded by the PLC (`PLCOutput…` → drive, conveyor),
+  so a local write really would fight the binding;
+- a **feedback** slot reports model state back (`PLCInput…` ← sensor, position).
+  The component is the *producer* of that value; the binding only forwards it.
+  Rejecting the component here would empty the very signal being mirrored.
+
+The role is derived in exactly one place, `SignalBindingManager._deriveSlotRole()`
+(four stages: direct slot kind → providerless legacy mode → registered store
+type → descriptor fallback; otherwise `unknown`). Since plan-353 it is
+**mirrored** into the authority service — `registerSlotWriteRole()` on bind and
+on every role change, `clearSlotWriteRole()` on unbind, and the whole map is
+dropped by `resetSlotAuthority()` on a model switch. The mirror is a
+publication, never a second derivation.
+
+`getSlotWriteRole()` defaults to **`control`** for anything unregistered, which
+is the conservative direction: a forgotten mirror can only ever be too strict
+(the pre-plan-353 behaviour), never grant a right by accident. `unknown` behaves
+like `control` for the same reason.
+
+**Fan-out conflict rule (channel-wide, order-independent):** a channel write is
+ranked over ALL slots indexed against the channel in a single pass — there is no
+early return, because returning at the first claimed slot let a `bound` slot
+registered earlier hide a `forced` slot registered later, and mislabelled the
+conflict as `authority-bound` either way. The rule:
+
+1. any `forced` slot — or a channel-level operator force — decides
+   `authority-forced`, whatever the roles are;
+2. otherwise, with at least one `bound` slot and a local-sim writer: every
+   `control`/`unknown` bound slot rejects. The write is allowed only when **all**
+   bound slots on the channel are `feedback`;
+3. otherwise nothing claims the channel → `ok`.
+
+The recorded conflict names the slot of the **deciding** authority, not the
+first one seen. The all-feedback case is not logged at all: it is permitted
+behaviour, and filling the shadow log with it would bury the conflicts the log
+exists to surface.
+
+`SignalStore.canWriteSlot(slotId, writer)` is the synchronous UI companion. Both
+it and the write path go through **one** internal decider that returns a scalar
+reason code; the `{ allowed, reason }` object is allocated only in
+`canWriteSlot()`, at the UI boundary, so the hot path stays allocation-free and
+the answer the operator reads cannot drift from the one the store acts on.
+`allowed` states whether a write by this writer reaches the store now and
+`reason` names the dominating authority —
 `authority-forced`, `authority-bound`, `authority-remote`, or `ok`. These
 reasons are deliberately distinct from the plan-317 slot-availability reasons
 ("no model signal"). Three surfaces render them: the inline signal-slot rows of

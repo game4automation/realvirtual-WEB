@@ -7,9 +7,10 @@
  * Validates plugin lifecycle: onModelLoaded collects nodes,
  * selectNode/clearSelection state updates, and onModelCleared reset.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { RvExtrasEditorPlugin, type EditableNodeInfo } from '../src/core/hmi/rv-extras-editor';
 import { LeftPanelManager } from '../src/core/hmi/left-panel-manager';
+import { setActiveEditTarget, type EditTarget } from '../src/core/hmi/rv-edit-target';
 
 // ─── Minimal mocks ──────────────────────────────────────────────────────
 
@@ -271,5 +272,110 @@ describe('RvExtrasEditorPlugin', () => {
     const state = plugin.getSnapshot();
     expect(state.overlay).not.toBeNull();
     expect(state.overlay!.nodes['DemoCell/Conveyor1']['Drive']['TargetSpeed']).toBe(999);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// The optimistic overlay has to shrink as well as grow (plan-703, Lauf 12).
+//
+// `updateOverlayField` writes the entry synchronously so the inspector marks
+// the field immediately; the op it queues is deferred. On the SceneStore path a
+// later subscription re-materialises the truth, but inside the asset editor the
+// document is an `AssetDocument` and nothing re-materialises — so before this,
+// the cache only ever GREW: a reverted field stayed marked as overridden until
+// the next model load, and the descend hint (which now counts the same entries)
+// announced suppressions that were no longer there.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('RvExtrasEditorPlugin — optimistischer Overlay-Eintrag verschwindet beim Revert', () => {
+  /** One node with a Drive, plus a registry that can resolve it by path. */
+  function makeEditableViewer() {
+    const node: any = { name: 'Widget', parent: null, children: [], userData: {} };
+    node.userData.realvirtual = { Drive: { TargetSpeed: 100, Acceleration: 50 } };
+    const registry = { getNode: (p: string) => (p === 'Cell/Widget' ? node : null) };
+    return { viewer: { registry, scene: { children: [node] } }, node };
+  }
+
+  /** An EditTarget that only records — the op queue is not what is under test. */
+  function recordingTarget(): { target: EditTarget; unset: string[] } {
+    const unset: string[] = [];
+    return {
+      unset,
+      target: {
+        available: true,
+        setField: () => {},
+        unsetField: (nodePath, componentType, fieldName) => {
+          unset.push(`${nodePath}/${componentType}/${fieldName}`);
+        },
+        async withTransaction(_label, fn) { await fn(); },
+      },
+    };
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    setActiveEditTarget(null);
+  });
+
+  it('resetField loescht den Eintrag, den updateOverlayField optimistisch schrieb', () => {
+    const plugin = new RvExtrasEditorPlugin();
+    const { viewer } = makeEditableViewer();
+    (plugin as unknown as { _viewer: unknown })._viewer = viewer;
+    const { target, unset } = recordingTarget();
+    setActiveEditTarget(target);
+
+    plugin.updateOverlayField('Cell/Widget', 'Drive', 'TargetSpeed', 999);
+    expect(plugin.getSnapshot().overlay!.nodes['Cell/Widget'].Drive.TargetSpeed).toBe(999);
+
+    plugin.resetField('Cell/Widget', 'Drive', 'TargetSpeed');
+
+    // The op still goes out — the prune is a cache correction, not a substitute.
+    expect(unset).toEqual(['Cell/Widget/Drive/TargetSpeed']);
+    expect(plugin.getSnapshot().overlay!.nodes['Cell/Widget']).toBeUndefined();
+  });
+
+  it('ein zweites ueberschriebenes Feld derselben Komponente bleibt stehen', () => {
+    const plugin = new RvExtrasEditorPlugin();
+    const { viewer } = makeEditableViewer();
+    (plugin as unknown as { _viewer: unknown })._viewer = viewer;
+    setActiveEditTarget(recordingTarget().target);
+
+    plugin.updateOverlayField('Cell/Widget', 'Drive', 'TargetSpeed', 999);
+    plugin.updateOverlayField('Cell/Widget', 'Drive', 'Acceleration', 7);
+    plugin.resetField('Cell/Widget', 'Drive', 'TargetSpeed');
+
+    const drive = plugin.getSnapshot().overlay!.nodes['Cell/Widget'].Drive;
+    expect(drive.TargetSpeed).toBeUndefined();
+    expect(drive.Acceleration).toBe(7);
+  });
+
+  it('resetComponent raeumt die ganze Komponente ab', () => {
+    const plugin = new RvExtrasEditorPlugin();
+    const { viewer } = makeEditableViewer();
+    (plugin as unknown as { _viewer: unknown })._viewer = viewer;
+    const { target, unset } = recordingTarget();
+    setActiveEditTarget(target);
+
+    plugin.updateOverlayField('Cell/Widget', 'Drive', 'TargetSpeed', 999);
+    plugin.updateOverlayField('Cell/Widget', 'Drive', 'Acceleration', 7);
+    plugin.resetComponent('Cell/Widget', 'Drive');
+
+    expect(unset).toHaveLength(2);
+    expect(plugin.getSnapshot().overlay!.nodes['Cell/Widget']).toBeUndefined();
+  });
+
+  it('resetNode raeumt den ganzen Knoten ab', () => {
+    const plugin = new RvExtrasEditorPlugin();
+    const { viewer } = makeEditableViewer();
+    (plugin as unknown as { _viewer: unknown })._viewer = viewer;
+    setActiveEditTarget(recordingTarget().target);
+
+    plugin.updateOverlayField('Cell/Widget', 'Drive', 'TargetSpeed', 999);
+    plugin.resetNode('Cell/Widget');
+
+    expect(plugin.getSnapshot().overlay!.nodes['Cell/Widget']).toBeUndefined();
   });
 });

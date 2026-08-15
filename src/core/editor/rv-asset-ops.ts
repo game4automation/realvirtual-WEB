@@ -2,26 +2,37 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-asset-ops — Operation log for the Asset editor document.
+ * rv-asset-ops — the ASSET-lineage op payloads and their classifiers.
  *
  * The asset editor (workspace mode `editor`) authors a GLB asset: import CAD
  * subtrees, transform/rename/delete nodes, add/remove rv_extras components,
- * edit fields. Every edit is an immutable `AssetOp` carrying its own inverse
- * payload — the same command-pattern the Scene op log uses, but a DELIBERATELY
- * SEPARATE document (a Scene is a layout/session over a base model; an Asset
- * is the GLB itself being authored — see doc-persistence.md).
+ * edit fields. Every edit is an immutable {@link RvAssetOp} carrying its own
+ * inverse payload — the same command-pattern the Scene op log uses, over the
+ * same ONE vocabulary (`core/ops/rv-unified-ops.ts`), but a different TARGET
+ * (a Scene is a layout/session over a base model; an Asset is the GLB itself
+ * being authored — see doc-persistence.md).
  *
- * This module is **pure** (no Three.js / DOM / storage): op taxonomy,
- * coalescing, inverse and description helpers. Application to the live scene
- * lives in `rv-asset-executors.ts`; the queue/undo machinery in
- * `rv-asset-document.ts`.
+ * plan-710 removed this module's second op union (`AssetOp` /
+ * `AssetPrimitiveOp` / `AssetCompositeOp`) and its hand-maintained twins of the
+ * unified coalescing and description helpers. What remains is what has no
+ * counterpart in the union: the per-kind PAYLOAD interfaces and the two
+ * asset-specific classifiers (`assetOpTouchesHierarchy`,
+ * `classifyAssetOpRaycastImpact`).
+ *
+ * This module is **pure** (no Three.js / DOM / storage). Application to the live
+ * scene lives in `rv-asset-executors.ts`; the queue/undo machinery in
+ * `core/ops/rv-document.ts`.
  *
  * Ops are JSON-safe by construction — CAD geometry is never inlined, only
  * referenced by content hash (`CADLinkExtras.Sha256`) and re-materialised via
  * the `CadGeometryProvider` on draft replay.
  */
 
-import { freshOpId, COALESCE_WINDOW_MS, deepCloneJSON } from '../ops/rv-op-utils';
+import { freshOpId } from '../ops/rv-op-utils';
+// Type-only, and the cycle is deliberate: the union imports these PAYLOADS and
+// this module imports the origin-filtered VIEW of the union back. One
+// vocabulary, described where each half belongs.
+import type { RvAssetOp, RvAssetPrimitiveOp } from '../ops/rv-unified-ops';
 
 // ─── CADLink ────────────────────────────────────────────────────────────
 
@@ -332,30 +343,10 @@ export interface MergeMeshOp extends AssetOpBase {
   kept: MergeKeptNodeSpec[];
 }
 
-/** Composite (transaction) — multiple primitives as one undo unit. */
-export interface AssetCompositeOp extends AssetOpBase {
-  kind: 'composite';
-  label: string;
-  ops: AssetPrimitiveOp[];
-}
-
-export type AssetPrimitiveOp =
-  | ImportCadOp
-  | TransformNodeOp
-  | RenameNodeOp
-  | DeleteNodeOp
-  | SetNodeVisibleOp
-  | CreateNodeOp
-  | ReparentNodeOp
-  | AddComponentOp
-  | RemoveComponentOp
-  | AssetSetFieldOp
-  | AssetUnsetFieldOp
-  | SetMaterialOp
-  | SeparateMeshOp
-  | MergeMeshOp;
-
-export type AssetOp = AssetPrimitiveOp | AssetCompositeOp;
+// The composite (transaction) op and the union over these payloads live in
+// `core/ops/rv-unified-ops.ts` — `RvCompositeOp`, `RvAssetOp` /
+// `RvAssetPrimitiveOp`. There is exactly one union, derived from the origin
+// table, so a payload declared here reaches the asset executor by construction.
 
 // ─── Op construction helpers ────────────────────────────────────────────
 
@@ -381,74 +372,6 @@ export function dedupeComponentKey(
   }
 }
 
-// ─── Coalescing ─────────────────────────────────────────────────────────
-
-/** Same-target adjacent ops within the window merge (typing / gizmo drags). */
-export function canCoalesceAssetOps(last: AssetOp, next: AssetOp): boolean {
-  if (last.kind !== next.kind) return false;
-  if (last.kind === 'composite' || next.kind === 'composite') return false;
-  if (next.ts - last.ts > COALESCE_WINDOW_MS) return false;
-  if (next.ts < last.ts) return false;
-  switch (next.kind) {
-    case 'setField':
-    case 'unsetField': {
-      const a = last as AssetSetFieldOp | AssetUnsetFieldOp;
-      return a.nodePath === next.nodePath
-        && a.componentType === next.componentType
-        && a.fieldName === next.fieldName;
-    }
-    case 'transformNode':
-      return (last as TransformNodeOp).nodePath === next.nodePath;
-    case 'renameNode':
-      return (last as RenameNodeOp).nodePath === next.nodePath;
-    // Dragging a roughness/metalness slider fires a value per pointermove.
-    // Same selection within the window = one undo step (mirrors transformNode).
-    case 'setMaterial': {
-      const a = last as SetMaterialOp;
-      return a.nodePaths.length === next.nodePaths.length
-        && a.nodePaths.every((p, i) => p === next.nodePaths[i]);
-    }
-    // Structural ops are discrete user actions — never coalesce.
-    // setNodeVisible: each toggle is a discrete undo step by design.
-    case 'importCad':
-    case 'deleteNode':
-    case 'setNodeVisible':
-    case 'createNode':
-    case 'reparentNode':
-    case 'addComponent':
-    case 'removeComponent':
-    // separateMesh / mergeMesh rebuild a subtree — one deliberate action, one undo step.
-    case 'separateMesh':
-    case 'mergeMesh':
-      return false;
-  }
-}
-
-/** Merge `next` into `last` (caller verified canCoalesceAssetOps). Keeps
- *  `last.id/ts/prev`, takes `next`'s forward payload — one undo reverts the
- *  whole run. */
-export function mergeAssetOps(last: AssetOp, next: AssetOp): AssetOp {
-  if (last.kind !== next.kind || last.kind === 'composite' || next.kind === 'composite') {
-    throw new Error('mergeAssetOps: precondition violated — call canCoalesceAssetOps first');
-  }
-  switch (next.kind) {
-    case 'setField':
-      return { ...(last as AssetSetFieldOp), value: next.value };
-    case 'unsetField':
-      return last;
-    case 'transformNode':
-      return { ...(last as TransformNodeOp), transform: deepCloneJSON(next.transform) };
-    case 'renameNode':
-      return { ...(last as RenameNodeOp), name: next.name };
-    // Keep `last.prev` — it holds the per-mesh state from BEFORE the drag began,
-    // which is exactly what one undo must restore.
-    case 'setMaterial':
-      return { ...(last as SetMaterialOp), material: deepCloneJSON(next.material) };
-    default:
-      throw new Error('mergeAssetOps: structural ops never coalesce');
-  }
-}
-
 // ─── Structural classification ──────────────────────────────────────────
 
 /**
@@ -456,8 +379,8 @@ export function mergeAssetOps(last: AssetOp, next: AssetOp): AssetOp {
  * shows: nodes added/removed/renamed or component badges changed. Transform
  * and field edits don't move nodes in or out of the tree.
  */
-export function assetOpTouchesHierarchy(op: AssetOp): boolean {
-  if (op.kind === 'composite') return op.ops.some(assetOpTouchesHierarchy);
+export function assetOpTouchesHierarchy(op: RvAssetOp): boolean {
+  if (op.kind === 'composite') return (op.ops as RvAssetPrimitiveOp[]).some(assetOpTouchesHierarchy);
   return op.kind === 'importCad'
     || op.kind === 'deleteNode'
     || op.kind === 'setNodeVisible' // eye-icon state lives on the live node
@@ -495,17 +418,17 @@ export interface AssetOpRaycastImpact {
  *     build EXCLUDES on), path strings change (rename/reparent), or the
  *     static/kinematic partition flips (add/remove Drive) — full rebuild.
  */
-export function classifyAssetOpRaycastImpact(op: AssetOp): AssetOpRaycastImpact {
+export function classifyAssetOpRaycastImpact(op: RvAssetOp): AssetOpRaycastImpact {
   const impact: AssetOpRaycastImpact = { rebuild: false, refitPaths: [] };
   collectRaycastImpact(op, impact);
   if (impact.rebuild) impact.refitPaths.length = 0; // the rebuild covers them
   return impact;
 }
 
-function collectRaycastImpact(op: AssetOp, into: AssetOpRaycastImpact): void {
+function collectRaycastImpact(op: RvAssetOp, into: AssetOpRaycastImpact): void {
   switch (op.kind) {
     case 'composite':
-      for (const child of op.ops) collectRaycastImpact(child, into);
+      for (const child of op.ops) collectRaycastImpact(child as RvAssetPrimitiveOp, into);
       return;
     case 'transformNode':
       into.refitPaths.push(op.nodePath);
@@ -530,29 +453,3 @@ function collectRaycastImpact(op: AssetOp, into: AssetOpRaycastImpact): void {
   }
 }
 
-// ─── Description (undo/redo labels, history UI) ─────────────────────────
-
-export function describeAssetOp(op: AssetOp): string {
-  switch (op.kind) {
-    case 'importCad':      return `Import ${op.cadlink.File}`;
-    case 'transformNode':  return `Transform ${leaf(op.nodePath)}`;
-    case 'renameNode':     return `Rename ${op.prevName} → ${op.name}`;
-    case 'deleteNode':     return `Delete ${leaf(op.nodePath)}`;
-    case 'setNodeVisible': return op.visible ? `Show ${leaf(op.nodePath)}` : `Hide ${leaf(op.nodePath)}`;
-    case 'createNode':     return `Create ${leaf(op.nodePath)}`;
-    case 'reparentNode':   return `Move ${leaf(op.nodePath)}`;
-    case 'addComponent':   return `Add ${op.componentType} to ${leaf(op.nodePath)}`;
-    case 'removeComponent':return `Remove ${op.componentType} from ${leaf(op.nodePath)}`;
-    case 'setField':       return `Set ${op.componentType}.${op.fieldName} on ${leaf(op.nodePath)}`;
-    case 'unsetField':     return `Reset ${op.componentType}.${op.fieldName} on ${leaf(op.nodePath)}`;
-    case 'setMaterial':    return `Material ${op.material.name} (${op.prev.length} mesh${op.prev.length === 1 ? '' : 'es'})`;
-    case 'separateMesh':   return `Separate ${leaf(op.sourcePath)} (${op.childNames.length} parts)`;
-    case 'mergeMesh':      return `Merge ${leaf(op.rootPath)} (${op.sourcePaths.length} → ${op.outputs.length} mesh${op.outputs.length === 1 ? '' : 'es'})`;
-    case 'composite':      return op.label;
-  }
-}
-
-function leaf(path: string): string {
-  const parts = path.split('/');
-  return parts[parts.length - 1] || path;
-}

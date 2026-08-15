@@ -2,9 +2,15 @@
  * webtest.mjs — Launch a visible Playwright browser, load the WebViewer with debug=all,
  * and capture console output for a configurable duration.
  *
+ * `--model` takes a URL PATH, not a bare file name (plan-395 §2.3): the default
+ * comes from the one asset-path source of truth in
+ * `tests/fixtures/glb-paths.mjs`, so this script has no `/models/…` literal of
+ * its own. A bare file name still works for convenience and is resolved below.
+ *
  * Usage:
- *   node scripts/webtest.mjs                          # defaults: tests.glb, 10s
- *   node scripts/webtest.mjs --model demo.glb         # specific model
+ *   node scripts/webtest.mjs                          # defaults: DEV_GLB.tests, 10s
+ *   node scripts/webtest.mjs --model /models/demo.glb # specific model (URL path)
+ *   node scripts/webtest.mjs --model demo.glb         # bare name → /models/demo.glb
  *   node scripts/webtest.mjs --duration 20            # run for 20 seconds
  *   node scripts/webtest.mjs --debug playback,loader  # specific debug categories
  *   node scripts/webtest.mjs --headless               # headless mode (no visible window)
@@ -13,6 +19,7 @@
  */
 
 import { chromium } from 'playwright';
+import { DEV_GLB } from '../tests/fixtures/glb-paths.mjs';
 
 // --- Parse CLI args ---
 const args = process.argv.slice(2);
@@ -26,7 +33,12 @@ function hasFlag(name) {
   return args.includes(`--${name}`);
 }
 
-const model = getArg('model', 'tests.glb');
+// The contract is the URL, not the file name (plan-395 §2.3). A bare file name
+// passed on the command line is lifted to a `/models/<name>` URL path so the old
+// `--model demo.glb` invocation keeps working.
+const modelArg = getArg('model', DEV_GLB.tests);
+const model = modelArg.includes('/') ? modelArg : `/models/${modelArg}`;
+const modelFileName = model.split('/').pop();
 const duration = parseInt(getArg('duration', '10'), 10) * 1000;
 const debugCategories = getArg('debug', 'all');
 const headless = hasFlag('headless');
@@ -121,10 +133,10 @@ page.on('pageerror', (err) => {
   console.log(line);
 });
 
-// Navigate with debug params
-// Entry URLs use ./models/filename.glb format (from Vite glob)
-const modelPath = model.startsWith('./') ? model : `./models/${model.replace(/^\/models\//, '')}`;
-const url = `${baseUrl}/?debug=${debugCategories}&model=${encodeURIComponent(modelPath)}`;
+// Navigate with debug params. `?model=` is handed to the viewer verbatim
+// (`src/main.ts` → `params.get('model')`), so the URL path from the SSOT goes
+// through unchanged — no second place composes an asset path.
+const url = `${baseUrl}/?debug=${debugCategories}&model=${encodeURIComponent(model)}`;
 console.log(`${DIM}Navigating to: ${url}${RESET}\n`);
 
 await page.goto(url, { timeout: 30000 });
@@ -138,14 +150,14 @@ if (!loadComplete) {
     const sel = document.querySelector('#modelSelect');
     if (!sel) return null;
     const options = Array.from(sel.options);
-    const match = options.find(o => o.value.includes(modelName.replace('.glb', '')));
+    const match = options.find(o => o.value.includes(modelName.replace(/\.glb$/, '')));
     if (match) {
       sel.value = match.value;
       sel.dispatchEvent(new Event('change'));
       return match.value;
     }
     return options.map(o => o.value).join(', ');
-  }, model);
+  }, modelFileName);
 
   if (selected) {
     console.log(`${DIM}Selected model via dropdown: ${selected}${RESET}\n`);

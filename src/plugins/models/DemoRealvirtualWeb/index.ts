@@ -80,6 +80,10 @@ const MOTOR_SUPPLIER_AAS = [
  * Re-points every servo motor's AAS to the chosen supplier — the Festo pneumatic
  * cylinder (a separate AAS) is left untouched. Add more commands per option here
  * (e.g. setComponentField) to manipulate any rv_extras property.
+ *
+ * No option (or an unknown one) means the FESTO STANDARD: motors hard-wired to
+ * another supplier in the exported GLB are normalized back to the Festo motor AAS,
+ * so the base demo is single-supplier and SEW/Bosch appear only via `?option=`.
  */
 function applyModelOption(viewer: RVViewer, option: string | null): void {
   // No option (or an unknown one) means the FESTO STANDARD: motors hard-wired to

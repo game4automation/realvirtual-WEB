@@ -99,3 +99,40 @@ export const AUTHORITY_CONSEQUENCE = {
 export function authorityExplanation(key: keyof typeof AUTHORITY_CONSEQUENCE): string {
   return `${AUTHORITY_SENTENCE[key]} — ${AUTHORITY_CONSEQUENCE[key]}`;
 }
+
+// ── Provenance block titles: which DIRECTION is being listed ────────────────
+//
+// The signal tooltip shows both directions at once, and until plan-353 the
+// outgoing one was called "Drives" while the incoming one and the property
+// inspector's footer both said "Referenced by". "Drives" was too short to be
+// read as a direction, so the two blocks looked like variants of one list.
+//
+// The rule now: the title names the DIRECTION, and the same relation keeps the
+// same word wherever it appears.
+//
+//  - OUTGOING — slots this signal writes → `PROVENANCE_DRIVES_TITLE`.
+//    Rows read `componentType · label` (display pair from the binding, see
+//    `signalLinkedSlotLabel`) with the node name as a dim qualifier.
+//  - INCOMING — components pointing at this object → `PROVENANCE_REFERENCED_TITLE`.
+//    Deliberately IDENTICAL in the signal tooltip and the property-inspector
+//    footer: both list reverse references, so one term is correct and two would
+//    be the drift this module exists to prevent.
+
+/** Title of the outgoing block: slots this signal drives. */
+export const PROVENANCE_DRIVES_TITLE = 'Drives these slots';
+
+/** Title of the incoming block: what references this object (tooltip + inspector). */
+export const PROVENANCE_REFERENCED_TITLE = 'Referenced by';
+
+// ── Signal level: liveness wording ─────────────────────────────────────────
+//
+// `activityLabel()` (rv-signal-badge.tsx) and `activityStatusHint()`
+// (rv-signal-activity.ts) are two REGISTERS of one taxonomy, not two taxonomies:
+//
+//  - `activityLabel`      — compact, line 2 of the signal tooltip, with the age
+//                           baked in ("live", "stale 45s", "no source").
+//  - `activityStatusHint` — the roomier sentence in the signal LIST.
+//
+// Since plan-353 F5 the compact one is actually rendered; before that it was
+// computed, carried in the tooltip model and dropped, which is why a stale value
+// could be shown with no indication that it was stale.

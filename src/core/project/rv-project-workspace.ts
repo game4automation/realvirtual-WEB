@@ -48,6 +48,7 @@ import {
   deleteStoredHandle,
   getFolderHandle,
   getHandle,
+  putHandle,
   readTextFile,
   selectFolderForKey,
 } from '../engine/rv-local-filesystem';
@@ -154,8 +155,22 @@ export async function hasWorkspace(): Promise<boolean> {
 export async function pickWorkspace(): Promise<FileSystemDirectoryHandle | null> {
   const dir = await selectFolderForKey(HANDLE_KEY_WORKSPACE, WORKSPACE_PICKER_ID);
   if (!dir) return null;
-  writeMeta({ folderName: dir.name ?? '', lastScannedAt: new Date().toISOString() });
+  await adoptWorkspace(dir);
   return dir;
+}
+
+/**
+ * Make an ALREADY PICKED folder the workspace.
+ *
+ * The half of {@link pickWorkspace} that is not the picker, split out for the
+ * single "Open…" of plan-703 §2.6.3: that button shows one picker, probes what
+ * it got, and only then knows whether the folder is a project or a workspace.
+ * Calling `pickWorkspace()` at that point would show a second picker for a
+ * folder the user has already chosen.
+ */
+export async function adoptWorkspace(dir: FileSystemDirectoryHandle): Promise<void> {
+  await putHandle(dir, HANDLE_KEY_WORKSPACE);
+  writeMeta({ folderName: dir.name ?? '', lastScannedAt: new Date().toISOString() });
 }
 
 /**
@@ -272,6 +287,37 @@ export async function discoverWorkspaceProjects(
     lastScannedAt: new Date().toISOString(),
   });
   return { projects, warnings };
+}
+
+/**
+ * List what {@link detectOpenTarget} needs to classify a picked folder
+ * (plan-703 §2.6.3, decisions 1 and 2).
+ *
+ * One directory listing, no manifest parse: the question is only "is there a
+ * `project.json` here, and do any direct subfolders have one". Parsing would
+ * make a folder with a broken manifest look like "not a project", which is the
+ * wrong answer — it IS a project, and the open path is where that failure
+ * belongs.
+ *
+ * Never throws. An unreadable folder answers "no manifest, no children", which
+ * the detection turns into the create-a-project offer — the same thing the user
+ * would be shown for an empty folder, and the only thing they can act on.
+ */
+export async function probeOpenFolder(
+  dir: FileSystemDirectoryHandle,
+): Promise<{ hasManifest: boolean; childProjectFolders: string[] }> {
+  const hasManifest = await hasManifestFile(dir);
+  const childProjectFolders: string[] = [];
+  try {
+    for await (const [name, handle] of dir.entries()) {
+      if (handle.kind !== 'directory') continue;
+      if (await hasManifestFile(handle as FileSystemDirectoryHandle)) childProjectFolders.push(name);
+    }
+  } catch {
+    // Unreadable root — see the header. The manifest answer already stands.
+  }
+  childProjectFolders.sort();
+  return { hasManifest, childProjectFolders };
 }
 
 /**

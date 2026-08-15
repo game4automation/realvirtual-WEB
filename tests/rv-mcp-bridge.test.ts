@@ -14,6 +14,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { McpBridgePlugin } from '../src/plugins/mcp-bridge-plugin';
 import { buildMultiDispatcher } from '../src/core/engine/rv-mcp-tools';
+import {
+  DELTA_PROBES,
+  _resetInFlightForTest,
+} from '../src/plugins/mcp-bridge/rv-mcp-delta-probes';
 
 // ── Minimal mock viewer ──
 
@@ -102,6 +106,17 @@ function createMockViewer() {
     // no geometry, so traversal visits nothing and every count stays 0 — the
     // fields these tests assert on (fps, drive/signal counts) are unaffected.
     scene: { traverse: () => {} },
+    // plan-707: web_describe reads the workspace and the selection. Both are
+    // viewer-lifetime objects on the real thing, so a mock without them would
+    // only be testing the tool's null handling.
+    modes: {
+      activeMode: 'hmi',
+      list: () => [{ id: 'hmi' }, { id: 'planner' }, { id: 'des' }],
+      has: (id: string) => ['hmi', 'planner', 'des'].includes(id),
+    },
+    selectionManager: { getSnapshot: () => ({ selectedPaths: [] as string[] }) },
+    currentModelRoot: null,
+    isSimulationPaused: false,
     emit: vi.fn(),
     on: vi.fn(() => () => {}),
   };
@@ -126,7 +141,8 @@ function setupPlugin() {
   // Dispatching over the plugin alone would silently lose every delegated tool.
   // Mirrors mcp-bridge-plugin.ts::_sendDiscover — keep the list in step with it.
   const delegates = plugin as unknown as {
-    _viewTools: object; _observeTools: object; _editorTools: object; _helpTool: object;
+    _viewTools: object; _observeTools: object; _editorTools: object;
+    _knowledgeTools: object; _describeTool: object; _helpTool: object;
   };
   (plugin as unknown as { _dispatcher: ReturnType<typeof buildMultiDispatcher> })._dispatcher =
     buildMultiDispatcher([
@@ -134,6 +150,10 @@ function setupPlugin() {
       delegates._viewTools,
       delegates._observeTools,
       delegates._editorTools,
+      // `_signalBindTools` is absent here, and was absent before plan-394 too —
+      // pre-existing drift, deliberately not extended to the new delegate.
+      delegates._knowledgeTools,
+      delegates._describeTool,
       delegates._helpTool,
     ]);
 
@@ -504,5 +524,232 @@ describe('McpBridgePlugin - Transport and Logic tools', () => {
     const payload = JSON.parse(result.result);
     expect(payload.roots).toEqual([]);
     expect(payload.stats).toBeDefined();
+  });
+});
+
+/**
+ * plan-707 T1 (end-to-end half) — the effect delta through the REAL dispatch path.
+ *
+ * `tests/rv-mcp-delta-probes.test.ts` proves the probes and `mergeDelta` in
+ * isolation. That is not enough on its own: the delta wrapper was classified as
+ * a critical risk BECAUSE it sits inside `_handleCall`, and a test that only
+ * exercises pure functions cannot support that classification. These cases go
+ * in through `_handleMessage` and read the frame that was actually sent.
+ */
+describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
+  /** The parsed tool payload of the n-th sent frame. */
+  function payloadOf(sent: string[], n = 0): Record<string, unknown> {
+    const frame = JSON.parse(sent[n]);
+    expect(frame.error, `frame ${n} carried a transport error`).toBeUndefined();
+    return JSON.parse(frame.result);
+  }
+
+  it('a real write call carries `verified` in the sent frame, alongside its own fields', async () => {
+    const { plugin } = setupPlugin();
+    const { handleMessage, sent } = createMessageHandler(plugin);
+
+    await handleMessage(JSON.stringify({
+      type: 'call', id: 700, tool: 'web_signal_set_bool',
+      arguments: { name: 'StartSignal', value: false },
+    }));
+
+    const payload = payloadOf(sent);
+    // The tool's own contract is untouched…
+    expect(payload.name).toBe('StartSignal');
+    expect(payload.value).toBe(false);
+    expect(payload.previous).toBe(true);
+    // …and the wrapper added what actually happened.
+    const verified = payload.verified as { changed: string[]; noop?: true };
+    expect(verified).toBeTruthy();
+    expect(verified.changed).toEqual(['StartSignal.value: true→false']);
+    expect(verified.noop).toBeUndefined();
+  });
+
+  it('a write that changed nothing reports noop through the same path', async () => {
+    const { plugin } = setupPlugin();
+    const { handleMessage, sent } = createMessageHandler(plugin);
+
+    // StartSignal is already true — setting it to true is a successful no-change.
+    await handleMessage(JSON.stringify({
+      type: 'call', id: 701, tool: 'web_signal_set_bool',
+      arguments: { name: 'StartSignal', value: true },
+    }));
+
+    const verified = payloadOf(sent).verified as { noop?: true; why?: string };
+    expect(verified.noop).toBe(true);
+    expect(verified.why).toBeTruthy();
+  });
+
+  it('a failing tool result gets NO verified field (R9)', async () => {
+    const { plugin } = setupPlugin();
+    const { handleMessage, sent } = createMessageHandler(plugin);
+
+    await handleMessage(JSON.stringify({
+      type: 'call', id: 702, tool: 'web_signal_set_bool',
+      arguments: { name: 'NoSuchSignal', value: true },
+    }));
+
+    const payload = payloadOf(sent);
+    expect(payload.error).toContain('not found');
+    expect(payload.verified).toBeUndefined();
+  });
+
+  it('a read-only tool gets no verified field', async () => {
+    const { plugin } = setupPlugin();
+    const { handleMessage, sent } = createMessageHandler(plugin);
+
+    await handleMessage(JSON.stringify({
+      type: 'call', id: 703, tool: 'web_status', arguments: {},
+    }));
+
+    expect(payloadOf(sent).verified).toBeUndefined();
+  });
+
+  it('a probe that throws does not damage the call', async () => {
+    const { plugin } = setupPlugin();
+    const { handleMessage, sent } = createMessageHandler(plugin);
+    const probe = DELTA_PROBES['web_signal_set_bool'];
+    const originalBefore = probe.before;
+    const originalAfter = probe.after;
+    probe.before = () => { throw new Error('before exploded'); };
+    probe.after = () => { throw new Error('after exploded'); };
+    try {
+      await handleMessage(JSON.stringify({
+        type: 'call', id: 704, tool: 'web_signal_set_bool',
+        arguments: { name: 'StartSignal', value: false },
+      }));
+      const payload = payloadOf(sent);
+      // The call succeeded and its own answer is intact; only the delta is gone.
+      expect(payload.name).toBe('StartSignal');
+      expect(payload.previous).toBe(true);
+      expect(payload.verified).toBeUndefined();
+    } finally {
+      probe.before = originalBefore;
+      probe.after = originalAfter;
+    }
+  });
+
+  /**
+   * Force a genuine nesting of two calls.
+   *
+   * `Promise.all` over two `handleMessage` calls alone does not guarantee it —
+   * whether the probe windows overlap then depends on how many microtask
+   * boundaries each tool body happens to cross, which is not something a test
+   * about overlap should be at the mercy of. Instead the FIRST call parks
+   * inside its own probe window until the second has finished, which is
+   * exactly the shape the unawaited `onmessage` handler makes possible.
+   */
+  type ToolKey = 'webSignalSetBool' | 'webSignalSetFloat';
+
+  function nestCalls(plugin: McpBridgePlugin, outerKey: ToolKey, innerKey: ToolKey = outerKey) {
+    const target = plugin as unknown as Record<string, (...a: unknown[]) => Promise<string>>;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+
+    if (outerKey === innerKey) {
+      // Same tool twice: the roles are told apart by invocation order.
+      const original = target[outerKey].bind(plugin);
+      let seen = 0;
+      target[outerKey] = async (...args: unknown[]) => {
+        if (++seen === 1) {
+          await gate;               // call #1 waits for call #2 to complete
+          return original(...args);
+        }
+        const out = await original(...args);
+        release();                  // call #2 done — let #1 through
+        return out;
+      };
+      return;
+    }
+
+    const outer = target[outerKey].bind(plugin);
+    const inner = target[innerKey].bind(plugin);
+    target[outerKey] = async (...args: unknown[]) => { await gate; return outer(...args); };
+    target[innerKey] = async (...args: unknown[]) => {
+      const out = await inner(...args);
+      release();
+      return out;
+    };
+  }
+
+  it('two nested writes on the SAME scope: neither claims the other\'s effect (R13)', async () => {
+    const { plugin } = setupPlugin();
+    const { handleMessage, sent } = createMessageHandler(plugin);
+    _resetInFlightForTest();
+    nestCalls(plugin, 'webSignalSetBool');
+
+    // Both drive StartSignal (true) to false, so a change genuinely happens
+    // inside the shared window and the two calls cannot be told apart.
+    await Promise.all([
+      handleMessage(JSON.stringify({
+        type: 'call', id: 710, tool: 'web_signal_set_bool',
+        arguments: { name: 'StartSignal', value: false },
+      })),
+      handleMessage(JSON.stringify({
+        type: 'call', id: 711, tool: 'web_signal_set_bool',
+        arguments: { name: 'StartSignal', value: false },
+      })),
+    ]);
+
+    expect(sent).toHaveLength(2);
+    const deltas = sent.map((_, i) => payloadOf(sent, i).verified as
+      { changed?: string[]; ambiguous?: true; noop?: true; why?: string });
+
+    for (const d of deltas) {
+      expect(d).toBeTruthy();
+      // The one that observed a change must ADMIT it cannot attribute it; the
+      // one that observed none may still say `noop` — "nothing happened" needs
+      // no attribution. What is forbidden is an attributed `changed` list.
+      if (d.ambiguous) {
+        expect(d.changed).toEqual([]);
+        expect(d.why).toContain('overlapping call');
+      } else {
+        expect(d.noop, 'an unattributed change was reported as this call\'s effect').toBe(true);
+      }
+    }
+    expect(deltas.some((d) => d.ambiguous === true)).toBe(true);
+  });
+
+  it('a nested write on a DIFFERENT scope stays unambiguous', async () => {
+    const { plugin } = setupPlugin();
+    const { handleMessage, sent } = createMessageHandler(plugin);
+    _resetInFlightForTest();
+    nestCalls(plugin, 'webSignalSetBool', 'webSignalSetFloat');
+
+    // Same nesting, different signals — the scopes do not touch, so both
+    // deltas stay attributable. Overlap must cost precision only where it
+    // genuinely exists.
+    await Promise.all([
+      handleMessage(JSON.stringify({
+        type: 'call', id: 720, tool: 'web_signal_set_bool',
+        arguments: { name: 'StartSignal', value: false },
+      })),
+      handleMessage(JSON.stringify({
+        type: 'call', id: 721, tool: 'web_signal_set_float',
+        arguments: { name: 'SpeedSignal', value: 9.5 },
+      })),
+    ]);
+
+    for (let i = 0; i < 2; i++) {
+      const v = payloadOf(sent, i).verified as { ambiguous?: true; changed: string[] };
+      expect(v.ambiguous, `frame ${i} should be attributable`).toBeUndefined();
+      expect(v.changed).toHaveLength(1);
+    }
+  });
+
+  it('web_describe is dispatchable and reports the mock viewer\'s state', async () => {
+    const { plugin } = setupPlugin();
+    const { handleMessage, sent } = createMessageHandler(plugin);
+
+    await handleMessage(JSON.stringify({
+      type: 'call', id: 730, tool: 'web_describe', arguments: {},
+    }));
+
+    const payload = payloadOf(sent);
+    expect((payload.runtime as { driveCount: number }).driveCount).toBe(1);
+    expect((payload.runtime as { signalCount: number }).signalCount).toBe(2);
+    expect(payload.next).toBeTruthy();
+    // read-only: no delta of its own
+    expect(payload.verified).toBeUndefined();
   });
 });

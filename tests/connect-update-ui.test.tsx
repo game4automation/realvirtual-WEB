@@ -173,8 +173,8 @@ describe('the offer rows follow section 3.2', () => {
     }));
 
     expect(rows.map((r) => [r.label, r.action, r.emphasis])).toEqual([
-      ['Stable 0.3.0 available', 'Update', true],
-      ['Beta 0.4.0-beta2', 'Install', false],
+      ['Stable 0.3.0 available', 'Download', true],
+      ['Beta 0.4.0-beta2', 'Download', false],
     ]);
   });
 
@@ -189,7 +189,7 @@ describe('the offer rows follow section 3.2', () => {
 
     expect(rows).toHaveLength(1);
     expect(rows[0].label).toBe('Back to Stable 0.3.0');
-    expect(rows[0].action).toBe('Switch');
+    expect(rows[0].action).toBe('Download');
     expect(rows[0].emphasis).toBe(false);
   });
 
@@ -232,7 +232,7 @@ describe('a failed attempt keeps both its reason and the still-standing offer', 
     // Both, not one or the other: what went wrong, and the offer to try again.
     await screen.findByText(/did not start/i);
     await screen.findByText('Stable 0.3.0 available');
-    expect(screen.getByRole('button', { name: 'Update' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Download' })).toBeTruthy();
   });
 });
 

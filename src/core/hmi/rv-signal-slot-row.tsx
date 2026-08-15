@@ -33,6 +33,7 @@
  */
 
 import type { KeyboardEvent, ReactNode } from 'react';
+import { useCallback, useSyncExternalStore } from 'react';
 import { Box, IconButton, Tooltip, Typography } from '@mui/material';
 import LinkIcon from '@mui/icons-material/Link';
 import LinkOffIcon from '@mui/icons-material/LinkOff';
@@ -48,11 +49,17 @@ import {
   type SignalLinkDirection,
   type SignalMapping,
 } from '../../plugins/layout-planner/rv-layout-store';
+import {
+  isBindingPulsing,
+  pulseKey,
+  subscribeBindingPulse,
+} from '../../plugins/signal-bind/binding-applied-pulse';
 import type { SlotLiveness } from '../engine/rv-signal-binding-manager';
 import { SignalBadge, type SignalDirection } from './rv-signal-badge';
 import { InspectorRow } from './rv-inspector-row';
 import { useSignalDropTarget, SIGNAL_DROP_SX } from './signal-drop-target';
 import { useSignalDropHover } from './signal-drop-hover-store';
+import { omitUndefined } from './rv-omit-undefined';
 import { dropRejectText, slotRejectReason } from '../../plugins/signal-bind/drop-accept';
 import {
   AUTHORITY_SENTENCE,
@@ -182,6 +189,50 @@ const HIT_MIN = 24;
  * middle truncation keeps the distinguishing suffix visible.
  */
 const SHRINKABLE_CELL = { display: 'flex', minWidth: 0, overflow: 'hidden' } as const;
+
+/**
+ * The success pulse (plan-425 F8): one ~600 ms instrument-blue glow, then gone.
+ *
+ * A chip that goes from "not linked" to a name and a `false` looks much as it
+ * did, which in a table of thirty slots makes a successful drop easy to doubt.
+ * The pulse is the acknowledgement; it is emphatically not a status — nothing
+ * here loops, and `prefers-reduced-motion` gets the same glow held briefly
+ * rather than a movement, so the feedback survives for people who switch
+ * animation off.
+ */
+function pulseSx(active: boolean): Record<string, unknown> {
+  if (!active) return {};
+  return {
+    borderRadius: 0.5,
+    animation: 'rv-binding-pulse 600ms ease-out 1',
+    '@keyframes rv-binding-pulse': {
+      '0%': { boxShadow: '0 0 0 0 rgba(79,195,247,0.85)', backgroundColor: 'rgba(79,195,247,0.28)' },
+      '100%': { boxShadow: '0 0 0 6px rgba(79,195,247,0)', backgroundColor: 'transparent' },
+    },
+    '@media (prefers-reduced-motion: reduce)': {
+      animation: 'none',
+      backgroundColor: 'rgba(79,195,247,0.28)',
+    },
+  };
+}
+
+/** Subscribe to the pulse for one slot. `undefined` target ⇒ never pulses. */
+function useBindingPulse(
+  targetId: string | undefined,
+  componentPath: string | undefined,
+  slot: string,
+): boolean {
+  const key = targetId !== undefined
+    ? pulseKey(targetId, componentPath ?? '', slot)
+    : null;
+  return useSyncExternalStore(
+    useCallback(
+      (listener: () => void) => (key ? subscribeBindingPulse(key, listener) : () => {}),
+      [key],
+    ),
+    useCallback(() => (key ? isBindingPulsing(key) : false), [key]),
+  );
+}
 
 /**
  * Human-readable `canWriteSlot()` reasons — distinct from the plan-317
@@ -356,12 +407,23 @@ export interface SignalSlotRowProps {
    * name repeats within the surface (see {@link computeRowQualifiers}).
    */
   qualifier?: string;
+  /**
+   * Bind target this row belongs to. Only used to recognise the success pulse
+   * addressed to this slot (plan-425 F8) — omitted, the row simply never pulses,
+   * which is the right behaviour for a surface that cannot bind anything.
+   */
+  targetId?: string;
 }
 
 export function SignalSlotRow({
   row, viewer, signals, readOnly, disabledReason, onOpenPicker, onUnbind, onDropSignal, qualifier,
+  targetId,
 }: SignalSlotRowProps) {
   const interactive = !readOnly && !disabledReason;
+  // One short flash when THIS slot was just linked. The subscription is keyed by
+  // the slot's full identity, so a second target that happens to share a
+  // component path and slot name does not borrow the acknowledgement.
+  const pulse = useBindingPulse(targetId, row.componentPath, row.slot);
   // Display name vs. identity (plan-341 Phase 4): everything a human reads uses
   // `displayLabel`, everything that identifies the row keeps using `row.slot`.
   const displayLabel = row.label ?? row.slot;
@@ -387,7 +449,9 @@ export function SignalSlotRow({
       // Guaranteed inert on a reject-only row: the registry only calls onDrop
       // after `reject()` returned null, and unavailableReason never does.
       if (!onDropSignal) return;
-      onDropSignal(row, {
+      // omitUndefined: an absent optional must stay ABSENT, not become a present
+      // `undefined` the GLB bake has to refuse (plan-422 F1).
+      onDropSignal(row, omitUndefined({
         name: p.name,
         interfaceId: p.interfaceId,
         topic: p.topic,
@@ -396,7 +460,7 @@ export function SignalSlotRow({
         address: p.address,
         comment: p.comment,
         origin: p.origin,
-      });
+      }));
     },
   });
 
@@ -593,12 +657,13 @@ export function SignalSlotRow({
               minHeight: HIT_MIN,
               cursor: 'pointer',
               '&:focus-visible': { outline: '1px solid #4fc3f7', outlineOffset: 1, borderRadius: 0.5 },
+              ...pulseSx(pulse),
             }}
           >
             {assignment}
           </Box>
         ) : (
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0, ...pulseSx(pulse) }}>
             {assignment}
           </Box>
         )}

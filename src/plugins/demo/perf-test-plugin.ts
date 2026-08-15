@@ -37,12 +37,51 @@ export class PerfTestPlugin implements RVViewerPlugin {
   readonly id = 'perf-test';
   readonly order = 9999; // run last
 
+  /** plan-435 §2.10 abort generation — bumped by `onDeactivate`. */
+  private _generation = 0;
+  /** Cancel handles for the two timers the run owns. */
+  private _startTimer: ReturnType<typeof setTimeout> | null = null;
+  private _sampleTimer: ReturnType<typeof setInterval> | null = null;
+  /** The body-level results overlay, so it can be taken down again. */
+  private _overlay: HTMLElement | null = null;
+
   onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
     // Small delay to let first frames settle (JIT, shader compile, etc.)
-    setTimeout(() => this.run(viewer), 1000);
+    if (this._startTimer !== null) clearTimeout(this._startTimer);
+    this._startTimer = setTimeout(() => {
+      this._startTimer = null;
+      void this.run(viewer);
+    }, 1000);
+  }
+
+  /**
+   * plan-435: the run owns a `setTimeout`, a `setInterval` and a body-level
+   * overlay — none of which the fallback could reach, since this plugin has no
+   * `onModelCleared` and no `slots`. Cancel all three; the generation bump
+   * stops the async run at its next checkpoint (§2.10). No model state is
+   * involved (invariant 3).
+   */
+  onDeactivate(): void {
+    this._generation++;
+    if (this._startTimer !== null) { clearTimeout(this._startTimer); this._startTimer = null; }
+    if (this._sampleTimer !== null) { clearInterval(this._sampleTimer); this._sampleTimer = null; }
+    this._overlay?.remove();
+    this._overlay = null;
+  }
+
+  /** Re-arm the measurement for the model that is still loaded. */
+  onActivate(viewer: RVViewer): void {
+    if (!viewer.lastLoadResult) return;
+    this.onModelLoaded(viewer.lastLoadResult, viewer);
+  }
+
+  dispose(): void {
+    this.onDeactivate();
   }
 
   private async run(viewer: RVViewer): Promise<void> {
+    const generation = this._generation;
+    const aborted = () => generation !== this._generation;
     const modelUrl = viewer.currentModelUrl ?? 'unknown';
     // Blob URLs (from streaming download) have no meaningful filename — derive from title or localStorage
     let modelName: string;
@@ -58,6 +97,7 @@ export class PerfTestPlugin implements RVViewerPlugin {
     viewer.toggleDriveChart(true);
     // Let React re-render and chart animate in before sampling
     await new Promise((r) => setTimeout(r, 500));
+    if (aborted()) { viewer.toggleDriveChart(false); return; }
 
     debug('render', `[perf] Starting ${TEST_DURATION_S}s FPS sampling (drives chart open)...`);
 
@@ -68,12 +108,16 @@ export class PerfTestPlugin implements RVViewerPlugin {
 
     await new Promise<void>((resolve) => {
       let count = 0;
-      const interval = setInterval(() => {
+      this._sampleTimer = setInterval(() => {
+        // A toggle-off clears the handle and bumps the generation; stop here
+        // rather than sampling into a plugin that is no longer running.
+        if (aborted()) { resolve(); return; }
         fpsSamples.push(viewer.currentFps);
         ftSamples.push(viewer.currentFrameTime);
         count++;
         if (count >= totalSamples) {
-          clearInterval(interval);
+          if (this._sampleTimer !== null) clearInterval(this._sampleTimer);
+          this._sampleTimer = null;
           resolve();
         }
       }, SAMPLE_INTERVAL_MS);
@@ -81,10 +125,12 @@ export class PerfTestPlugin implements RVViewerPlugin {
 
     // Close chart before GPU benchmark (benchmark = raw render perf)
     viewer.toggleDriveChart(false);
+    if (aborted()) return;
 
     // --- GPU Benchmark ---
     debug('render', '[perf] Running GPU benchmark...');
     const benchmark = await viewer.runBenchmark(120);
+    if (aborted()) return;
 
     // --- Renderer info ---
     const rendererInfo = viewer.getRendererInfo();
@@ -126,6 +172,7 @@ export class PerfTestPlugin implements RVViewerPlugin {
   }
 
   private showOverlay(r: PerfResults): void {
+    this._overlay?.remove();   // a re-armed run replaces its predecessor
     const el = document.createElement('div');
     const pass = r.pass;
     el.style.cssText = `
@@ -149,5 +196,6 @@ export class PerfTestPlugin implements RVViewerPlugin {
       </div>
     `;
     document.body.appendChild(el);
+    this._overlay = el;
   }
 }

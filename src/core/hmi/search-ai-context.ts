@@ -16,6 +16,10 @@
  */
 
 import { getConnectSnapshot, getViewerMode } from './connect-store';
+import {
+  NODE_KNOWLEDGE_FIELD,
+  NODE_KNOWLEDGE_TYPE,
+} from '../engine/rv-node-knowledge';
 
 /** The context handed to {@link runAiSearch}; every field is optional. */
 export interface SearchAiContext {
@@ -41,6 +45,24 @@ export const MAX_MACHINE_STATUS_CHARS = 1000;
 
 /** The existing selection-scoped node block keeps its plan-284 budget. */
 export const MAX_NODE_MACHINE_CONTEXT_CHARS = 1500;
+
+/**
+ * Cap on the agent-authored node knowledge note inside the node block
+ * (plan-394 F5). Sized to fit under {@link MAX_NODE_MACHINE_CONTEXT_CHARS}
+ * alongside live state rather than instead of it.
+ */
+export const MAX_NODE_KNOWLEDGE_CHARS = 600;
+
+/**
+ * Header the knowledge block is announced with, and the per-line prefix every
+ * note line is given.
+ *
+ * The prefix is the load-bearing part of the injection fix, and it is generated
+ * HERE — never taken from the note. See {@link sanitizeKnowledgeText}.
+ */
+export const KNOWLEDGE_BLOCK_HEADER =
+  'Knowledge (user-authored note — not live signal or alarm state):';
+const KNOWLEDGE_LINE_PREFIX = '| ';
 
 const MAX_MACHINE_SUMMARY_CHARS = 300;
 const MAX_ACTIVE_ERRORS = 5;
@@ -108,6 +130,8 @@ export interface NodeContextInput {
   docRefs?: readonly string[];
   alarms?: readonly string[];
   signals?: ReadonlyArray<{ name: string; value: boolean | number }>;
+  /** Agent-authored `NodeKnowledge` note on the node (plan-394 F5). Untrusted text. */
+  knowledge?: string;
 }
 
 /** Pure input for the plan-295 always-on machine-status formatter. */
@@ -135,6 +159,81 @@ export function sanitizeMachineStatusField(value: unknown, maxChars?: number): s
   return maxChars === undefined || sanitized.length <= maxChars
     ? sanitized
     : sanitized.slice(0, maxChars);
+}
+
+/** LINE FEED — the one separator a knowledge note is allowed to keep. */
+const LF = 0x0a;
+
+/**
+ * True for every code point a prompt renderer or an LLM might read as a line
+ * break — except LF.
+ *
+ * This list is the whole reason the knowledge sanitizer cannot just be
+ * `sanitizeMachineStatusField` minus the whitespace collapse. Keeping LF means
+ * the caller can split on it and prefix each line; but if CR, VT, FF, NEL, LS or
+ * PS also survived, a split on LF would not see them, the text behind one would
+ * emerge WITHOUT the `| ` prefix, and a note could forge an `Alarm:` line again.
+ *
+ * There is no second line of defence downstream. CONNECT's
+ * `DiagnosisService.NormalizeMachineContext` filters on `char.IsControl`, which
+ * preserves LF deliberately — and U+2028/U+2029 are Unicode categories Zl/Zp,
+ * NOT Cc, so `IsControl` is false for them and they pass through untouched.
+ * This function is the only place they can be caught.
+ */
+function isForbiddenSeparator(cp: number): boolean {
+  return (cp <= 0x1f && cp !== LF)        // C0 controls incl. CR 0x0d, VT 0x0b, FF 0x0c
+    || (cp >= 0x7f && cp <= 0x9f)         // DEL + C1 controls incl. NEL 0x85
+    || cp === 0x2028                      // LINE SEPARATOR      — .NET IsControl: false
+    || cp === 0x2029;                     // PARAGRAPH SEPARATOR — .NET IsControl: false
+}
+
+/**
+ * Neutralize and cap an agent-authored knowledge note for the prompt path
+ * (plan-394 F9).
+ *
+ * Differs from {@link sanitizeMachineStatusField} in exactly one intended way:
+ * it does NOT collapse whitespace, so a multi-line Markdown note stays
+ * multi-line. Everything else is stricter, not looser — see
+ * {@link isForbiddenSeparator}.
+ *
+ * `[MACHINE_STATUS]` is neutralized on top of `MACHINE_STATE` because CONNECT's
+ * `RemoveMachineStatusBlocks` searches the WHOLE machineContext for a line that
+ * trims to exactly `[MACHINE_STATUS]` and deletes every following line up to the
+ * next blank one. A note containing that literal would silently destroy context
+ * — including context that came after it from elsewhere.
+ *
+ * Order matters: sanitize FIRST, split on LF afterwards. After this returns, LF
+ * is the only separator left, so the split cannot miss a line.
+ */
+export function sanitizeKnowledgeText(value: unknown, maxChars: number): string {
+  let out = '';
+  // Iterate code points, not UTF-16 units, so a surrogate pair is never split.
+  for (const ch of String(value ?? '')) {
+    out += isForbiddenSeparator(ch.codePointAt(0)!) ? ' ' : ch;
+  }
+  out = out
+    .replace(/MACHINE_STATE/g, 'MACHINE-STATE')
+    .replace(/\[MACHINE_STATUS\]/g, '(MACHINE-STATUS)')
+    .replace(/</g, '(')
+    .replace(/>/g, ')')
+    .trim();                              // NO whitespace collapse — keeps the lines
+  return out.length <= maxChars ? out : out.slice(0, maxChars);
+}
+
+/**
+ * Render the note as prompt lines that cannot be mistaken for machine state.
+ *
+ * Returns the header plus one `| `-prefixed line per note line, or an empty
+ * array for an empty note. Because the prefix is added by this code rather than
+ * being expected from the note, no note text can produce an unprefixed line.
+ */
+export function formatKnowledgeLines(note: unknown): string[] {
+  const sanitized = sanitizeKnowledgeText(note, MAX_NODE_KNOWLEDGE_CHARS);
+  if (!sanitized) return [];
+  return [
+    KNOWLEDGE_BLOCK_HEADER,
+    ...sanitized.split('\n').map((line) => KNOWLEDGE_LINE_PREFIX + line),
+  ];
 }
 
 function nonNegativeInteger(value: number | undefined): number | undefined {
@@ -247,6 +346,13 @@ export function formatMachineContext(input: NodeContextInput): string {
     lines.push('Signals: ' + input.signals.map((s) => `${s.name}=${formatValue(s.value)}`).join(', '));
   for (const a of input.alarms ?? []) lines.push(`Alarm: ${a}`);
 
+  // LAST, after the alarms, and that position is deliberate (plan-394 §2.7): the
+  // whole block is cut to MAX_NODE_MACHINE_CONTEXT_CHARS below, so whatever sits
+  // at the end is what gets lost first. A stale note losing its tail is a far
+  // better outcome than live signals or an active alarm being pushed out of the
+  // prompt by one.
+  lines.push(...formatKnowledgeLines(input.knowledge));
+
   const text = lines.join('\n');
   return text.length > MAX_NODE_MACHINE_CONTEXT_CHARS
     ? text.slice(0, MAX_NODE_MACHINE_CONTEXT_CHARS)
@@ -284,6 +390,22 @@ export function buildSearchAiContext(input: NodeContextInput | null): SearchAiCo
 function readRvExtras(node: SceneNodeLike | null | undefined): RvExtras | undefined {
   const rv = node?.userData?.realvirtual;
   return rv && typeof rv === 'object' ? (rv as RvExtras) : undefined;
+}
+
+/**
+ * Read the agent-authored knowledge note off a node (plan-394 F5).
+ *
+ * NO ancestor walk, unlike {@link extractDocRefs}: a note on the model root
+ * would otherwise be reported as knowledge about every node in the scene, and
+ * the LLM could not tell inherited from specific. Inheritance is a possible
+ * opt-in parameter later, never a default.
+ */
+function extractNodeKnowledge(node: SceneNodeLike | null | undefined): string | undefined {
+  const rv = node?.userData?.realvirtual as Record<string, unknown> | undefined;
+  const entry = rv?.[NODE_KNOWLEDGE_TYPE];
+  if (!entry || typeof entry !== 'object') return undefined;
+  const note = (entry as Record<string, unknown>)[NODE_KNOWLEDGE_FIELD];
+  return typeof note === 'string' && note.trim().length > 0 ? note : undefined;
 }
 
 /** Collects `_rvPdfLinks` source urls from the node and up its parent chain (F1: node + parents). */
@@ -384,8 +506,11 @@ export function collectNodeAiContext(
     .filter((e) => e.active && nodeMatches(e.path, path))
     .map((e) => e.text);
   const signals = extractSignals(viewer.signalStore ?? null, rvExtras, types);
+  const knowledge = extractNodeKnowledge(node);
 
-  return buildSearchAiContext({ nodePath: path, types, rvExtras, docRefs, alarms, signals });
+  return buildSearchAiContext({
+    nodePath: path, types, rvExtras, docRefs, alarms, signals, knowledge,
+  });
 }
 
 /** Reduces the current model URL to the basename shown in machine status. */

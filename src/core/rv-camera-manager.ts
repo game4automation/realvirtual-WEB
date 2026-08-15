@@ -488,13 +488,20 @@ export class CameraManager {
 
   // ─── Focus & Fit ──────────────────────────────────────────────────
 
-  /** Compute bounding box for a set of nodes. */
+  /** Compute bounding box for a set of nodes.
+   *
+   *  BatchedMesh arenas are skipped: their geometry bbox is the raw source
+   *  buffer and ignores the per-instance matrices that place the copies, so on
+   *  a CAD import scaled 0.001 it reads ~1000x too large and the fit camera
+   *  ends up far outside the part. The source meshes stay in the graph and
+   *  carry the true bounds. Same rule as RVViewer._computeContentBounds(). */
   computeNodeBounds(nodes: Object3D[]): Box3 {
     const box = new Box3();
     for (const node of nodes) {
       node.updateWorldMatrix(true, true);
       node.traverse((child) => {
         const m = child as Mesh;
+        if ((m as unknown as { isBatchedMesh?: boolean }).isBatchedMesh) return;
         if (m.isMesh && m.geometry) {
           m.geometry.computeBoundingBox();
           if (m.geometry.boundingBox) {

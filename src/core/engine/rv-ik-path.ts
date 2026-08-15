@@ -206,10 +206,22 @@ export class RVIKPath implements RVComponent {
     this._signalStartAddr = typeof this.SignalStart === 'string' ? this.SignalStart : null;
 
     // Subscribe to SignalStart (PLCOutputBool: PLC writes, viewer reads).
+    //
+    // plan-427 F10 — the one slot that must distinguish a replay from a change.
+    // `SignalStart` is edge-detected in fixedUpdate (`_startBefore`), and
+    // `reset()` clears `_startBefore`. Re-applying a level that has been held
+    // `true` since before the reset would therefore look like a fresh rising
+    // edge and start the robot program by itself. On a replay we only
+    // re-synchronise the edge BASELINE — the same value the next tick would
+    // have computed — so a genuine false→true afterwards still starts the path.
     this._unsubStart = wireBoolSignal(
       context.signalStore, this._signalStartAddr,
-      (v) => { this._startSignalValue = v; },
+      (v, ctx) => {
+        this._startSignalValue = v;
+        if (ctx?.replay) this._startBefore = this.StartPath || v;
+      },
       `IKPath "${this.node.name}": SignalStart`,
+      context.reapply,
     ).unsubscribe;
 
     debug('loader',

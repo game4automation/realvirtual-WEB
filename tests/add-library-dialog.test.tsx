@@ -17,15 +17,11 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/re
 
 const h = vi.hoisted(() => ({
   addCatalog: vi.fn(async (_url: string, _origin?: string) => {}),
-  addLocalFolder: vi.fn(async () => {}),
-  localFolderSupported: true,
 }));
 
 vi.mock('../src/core/library/library-store-singleton', () => ({
   getLibraryStore: () => ({
     addCatalog: h.addCatalog,
-    addLocalFolder: h.addLocalFolder,
-    get isLocalFolderSupported() { return h.localFolderSupported; },
   }),
 }));
 
@@ -34,9 +30,6 @@ import { AddLibraryDialog } from '../src/core/library/AddLibraryDialog';
 beforeEach(() => {
   h.addCatalog.mockReset();
   h.addCatalog.mockResolvedValue(undefined);
-  h.addLocalFolder.mockReset();
-  h.addLocalFolder.mockResolvedValue(undefined);
-  h.localFolderSupported = true;
 });
 afterEach(() => cleanup());
 
@@ -51,9 +44,10 @@ describe('tabs on offer', () => {
     expect(screen.getByRole('tab', { name: /asset manager/i })).toBeTruthy();
   });
 
-  it('hides the Local Folder tab where the API is unavailable', () => {
-    h.localFolderSupported = false;
-    render(<AddLibraryDialog open onClose={() => {}} />);
+  // The Local Folder tab went with the working folder (plan-709 §2.6): a
+  // library on this machine is a PROJECT now, opened from Projects.
+  it('offers no Local Folder tab any more', () => {
+    render(<AddLibraryDialog open onClose={() => {}} onConnectAssetManager={() => 'id'} />);
     expect(screen.queryByRole('tab', { name: /local folder/i })).toBeNull();
   });
 });

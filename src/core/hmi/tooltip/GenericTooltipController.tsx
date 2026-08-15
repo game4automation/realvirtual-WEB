@@ -20,10 +20,14 @@
  * The distinction is `selectionManager.lastHitPoint`, which only the 3D click
  * path sets.
  *
+ * While signal-linking mode is active this controller produces nothing at all:
+ * the mode is exclusive, and the only card allowed on screen is the one for the
+ * plug badge under the cursor.
+ *
  * Renders null — purely a state bridge, no UI.
  */
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { useHoveredObject } from '../../../hooks/use-hover';
 import { useFocusedDrive } from '../../../hooks/use-drives';
 import { useSelection } from '../../../hooks/use-selection';
@@ -34,6 +38,10 @@ import { worldToLocal } from './tooltip-utils';
 import { getCapabilities } from '../../engine/rv-component-registry';
 import type { TooltipData } from './tooltip-store';
 import type { PdfLink } from '../pdf-viewer-store';
+import {
+  getSignalLinkModeSnapshot,
+  subscribeSignalLinkMode,
+} from '../../../plugins/signal-bind/signal-link-mode-store';
 
 /** How long a 3D-click pinned tooltip stays before auto-hiding (ms). Long
  *  enough to move the mouse over and click a PDF/document link. */
@@ -54,11 +62,20 @@ export function GenericTooltipController() {
   const prevPinnedIds = useRef<Set<string>>(new Set());
   const pinAutohideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Signal linking is an EXCLUSIVE mode: while it is on, the only thing the
+  // user is asking about is the plug under the cursor, so every object card
+  // this controller would produce stands down and leaves the field to the
+  // badge hover card (BadgeTooltipController).
+  const linkModeActive = useSyncExternalStore(
+    subscribeSignalLinkMode,
+    () => getSignalLinkModeSnapshot().active,
+  );
+
   // ── Hover: check ALL rv_extras keys on the resolved node ──
   useEffect(() => {
     const newHoverIds: string[] = [];
 
-    if (hover) {
+    if (hover && !linkModeActive) {
       const node = hover.node;
       const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
       const targetPath = hover.nodePath;
@@ -117,11 +134,11 @@ export function GenericTooltipController() {
       if (!newHoverIds.includes(oldId)) tooltipStore.hide(oldId);
     }
     prevHoverIds.current = newHoverIds;
-  }, [hover?.nodePath, hover?.pointer?.x, hover?.pointer?.y, viewer]);
+  }, [hover?.nodePath, hover?.pointer?.x, hover?.pointer?.y, viewer, linkModeActive]);
 
   // ── Drive focus tooltip (unique to Drive — no other type has this concept) ──
   useEffect(() => {
-    if (focus.drive && focus.node) {
+    if (focus.drive && focus.node && !linkModeActive) {
       const nodePath = viewer.registry?.getPathForNode(focus.node) ?? undefined;
       const path = nodePath ?? focus.drive.name;
       tooltipStore.show({
@@ -136,7 +153,7 @@ export function GenericTooltipController() {
     } else {
       tooltipStore.hide('drive-focus');
     }
-  }, [focus.drive, focus.node, viewer]);
+  }, [focus.drive, focus.node, viewer, linkModeActive]);
 
   // ── 3D-click selection: temporarily pinned tooltips ──
   // Only selections made by clicking in the 3D scene pin tooltips (so PDF /
@@ -148,7 +165,7 @@ export function GenericTooltipController() {
     const newPinnedIds = new Set<string>();
     const clickedIn3D = viewer.selectionManager?.lastHitPoint != null;
 
-    if (clickedIn3D) {
+    if (clickedIn3D && !linkModeActive) {
       for (const path of selection.selectedPaths) {
         const node = viewer.registry?.getNode(path);
         if (!node) continue;
@@ -223,7 +240,7 @@ export function GenericTooltipController() {
         prevPinnedIds.current = new Set();
       }, PIN_AUTOHIDE_MS);
     }
-  }, [selection.selectedPaths, viewer]);
+  }, [selection.selectedPaths, viewer, linkModeActive]);
 
   // ── Camera interaction dismisses pins ──
   // As soon as the user starts orbiting/panning/zooming (controls 'start',

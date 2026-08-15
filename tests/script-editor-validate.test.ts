@@ -19,14 +19,15 @@ import {
   applyScriptSave, readWebComponentCode, validateScriptForSave, SCRIPT_TEMPLATE,
   type ScriptSceneStoreLike,
 } from '../src/core/hmi/script/rv-script-save-pipeline';
-import type { PrimitiveEditOp, SetCodeOp } from '../src/core/hmi/scene/rv-scene-edits';
+import type { SetCodeOp } from '../src/core/hmi/scene/rv-scene-edits';
+import type { RvScenePrimitiveOp } from '../src/core/ops/rv-unified-ops';
 
 const VALID = `function setup(self) {
   return { continuous: { fixedUpdate(dt) { /* noop */ } } };
 }`;
 
-function recordingStore(): { store: ScriptSceneStoreLike; ops: PrimitiveEditOp[] } {
-  const ops: PrimitiveEditOp[] = [];
+function recordingStore(): { store: ScriptSceneStoreLike; ops: RvScenePrimitiveOp[] } {
+  const ops: RvScenePrimitiveOp[] = [];
   return {
     ops,
     store: {

@@ -57,6 +57,18 @@ export interface LibraryCatalogEntry {
    *  the Local-Folder tab. For local libraries, derived from the
    *  immediate parent subfolder under `library/` (case preserved). */
   collections?: string[];
+  /**
+   * Manifest document id, for entries that ARE a project document
+   * (plan-413 §2.7).
+   *
+   * A project-library entry's `id` is path-derived (`project:<path>`), which is
+   * the right key for the panel and the wrong one for a reference: move the
+   * document to another project and the path — and with it that key — changes,
+   * while the document id does not. A source that carries this field answers to
+   * both, which is what makes "a placement still resolves after a move" true
+   * rather than aspirational.
+   */
+  documentId?: string;
 }
 
 // ─── Origin policy (§2.6.3) ─────────────────────────────────────────────
@@ -112,14 +124,6 @@ export const LS_KEY_ORIGINS = 'rv-layout-library-origins';
 
 /** Subfolder holding persisted preview PNGs next to a local library. */
 export const THUMBNAILS_SUBFOLDER = '.thumbnails';
-
-/**
- * Sentinel catalogError value used for a local-folder tab whose handle is
- * still saved but whose browser permission has lapsed (the default state
- * after closing the browser). The Planner UI treats this as a "click to
- * re-grant" prompt instead of a real error.
- */
-export const LOCAL_NEEDS_PERMISSION = '__needs_permission__';
 
 /** File extensions recognized as Gaussian Splat formats. */
 export const SPLAT_EXTENSIONS = new Set(['.splat', '.ksplat', '.ply']);

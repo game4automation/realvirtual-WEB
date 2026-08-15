@@ -482,37 +482,3 @@ export async function listSubfolderFiles(
   return listFiles(sub, extensions);
 }
 
-/**
- * Write a Blob to a work-folder-relative path, creating intermediate directories.
- *
- * The work folder is picked read-only (see `selectWorkFolder`), so the first write in a session
- * asks the user to upgrade the permission. A denied prompt is reported, never swallowed: a caller
- * that believes it persisted a file it did not would leave a dangling reference behind.
- *
- * `relPath` is normalised and must stay inside the work folder — `..` segments are rejected rather
- * than resolved, so a caller-supplied path cannot escape the folder the user actually granted.
- */
-export async function writeWorkfolderBlob(
-  relPath: string,
-  blob: Blob,
-): Promise<{ savedPath: string } | { error: string }> {
-  const segments = (relPath ?? '').trim().replace(/\\/g, '/').split('/').filter(Boolean);
-  if (segments.length === 0) return { error: 'savePath is empty' };
-  if (segments.some((s) => s === '.' || s === '..')) {
-    return { error: 'savePath must stay inside the work folder (no ".." segments)' };
-  }
-  const filename = segments.pop()!;
-  const root = await getWorkFolder(true);
-  if (!root) return { error: 'No work folder configured (Settings → Local Folder)' };
-  if (!(await requestWriteAccess(root))) {
-    return { error: 'Write permission to the work folder was denied' };
-  }
-  try {
-    let dir = root;
-    for (const segment of segments) dir = await getOrCreateSubfolder(dir, segment);
-    await writeBlobFile(dir, filename, blob);
-    return { savedPath: [...segments, filename].join('/') };
-  } catch (e) {
-    return { error: `Could not write "${relPath}": ${String(e)}` };
-  }
-}

@@ -57,6 +57,7 @@ import { TransportStatsPlugin } from './plugins/transport-stats-plugin';
 import { CameraEventsPlugin } from './plugins/camera-events-plugin';
 import { DriveOrderPlugin } from './plugins/drive-order-plugin';
 import { IKPathVisualizerPlugin } from './plugins/ik-path-visualizer-plugin';
+import { PathVisualizerPlugin } from './plugins/path-visualizer-plugin';
 import { IKTargetEditPlugin } from './plugins/ik-target-edit-plugin';
 import { DriveAxisGizmoPlugin } from './plugins/drive-axis-gizmo-plugin';
 import { CameraStartPosPlugin } from './plugins/camera-startpos-plugin';
@@ -99,6 +100,7 @@ import { migrateLegacyAutosave } from './core/hmi/scene/layout-registry';
 import {
   parsePublishedIndex,
   publishedSceneUrl,
+  resolvePublishedDeepLink,
   type PublishedSceneEntry,
 } from './core/hmi/scene/rv-published-scenes';
 import { readActiveId, listMetas } from './core/hmi/scene/rv-scene-storage';
@@ -107,6 +109,23 @@ import { readActiveId, listMetas } from './core/hmi/scene/rv-scene-storage';
 // store-internal notifier could not reach it (plan-370 RR3).
 import { setActiveSceneId } from './core/hmi/scene/rv-scene-mutations';
 import { getProjectStore } from './core/project/project-store';
+import { scriptRefForModelUrl } from './core/project/rv-project-refs';
+import { requestProjectCodeConsent } from './core/project/rv-project-code-consent';
+
+import {
+  clearAllOverrides as clearAllPluginOverrides,
+  loadOverrides as loadPluginOverrides,
+  overrideScopeKey,
+  saveOverrides as savePluginOverrides,
+} from './core/plugin-overrides/rv-plugin-override-store';
+// plan-716 §2.4 — an old `?scene=scn_…` link resolves through the alias map onto
+// the document it became, and the address bar is normalised to `?doc=`.
+import { resolveSceneRoute, sceneUrlToDocumentUrl } from './core/project/rv-doc-alias';
+import { documentsOf } from './core/project/rv-project-documents';
+import { resolveResumeTarget } from './core/project/rv-project-open';
+import { forgetRememberedSession, readRememberedSession } from './core/project/rv-project-resume-store';
+import { reportMissingDocument } from './core/hmi/scene/rv-scene-live-sync';
+import { openProjectsDashboard } from './core/hmi/projects/projects-dashboard-store';
 import { DEMO_PROJECT_FOLDER } from './core/project/backends/bundled-backend';
 import { getLibraryStore } from './core/library/library-store-singleton';
 import { installProjectLibraryProvider } from './core/library/project-library-provider';
@@ -126,6 +145,12 @@ import {
 } from './plugins/connect-embed/connect-embed-store';
 import { HistorianTrendPlugin } from './plugins/historian-trend-plugin';
 import { SignalBindPlugin } from './plugins/signal-bind/SignalBindPlugin';
+
+// Shared asset links — `?glb=<url>` / `?glb=s:<id>` (plan-386).
+import { SharePlugin, setSharedBookmarkHost } from './core/share/share-plugin';
+import { bootSharedGlb } from './core/share/rv-share-boot';
+import { installShareIdResolver } from './core/share/rv-share-upload';
+import { consumeMagicLinkFromUrl } from './core/share/rv-share-session';
 
 // Industrial interface plugins (WebSocket Realtime, ctrlX, etc.)
 import { InterfaceManager } from './interfaces/interface-manager';
@@ -295,13 +320,16 @@ function askRestoreChoice(sceneName: string, sizeMB: number): Promise<'open' | '
  * from the URL so a reload/bookmark does not immediately reload the heavy scene,
  * and returns false so the caller falls through to the light default boot.
  */
-async function guardHeavyRestore(sceneId: string): Promise<boolean> {
+async function guardHeavyRestore(sceneId: string, displayName?: string): Promise<boolean> {
   const HEAVY_CAD_BYTES = 40 * 1024 * 1024;
   let bytes = 0;
   try { bytes = await getCadGlbCacheSize(); } catch { return true; }
   if (bytes <= HEAVY_CAD_BYTES) return true;
 
-  const name = listMetas().find(m => m.id === sceneId)?.name ?? 'The last scene';
+  // `displayName` is for a caller whose document is NOT a saved scene — the
+  // project-resume path restores manifest documents too, and asking about "the
+  // last scene" when the user left off in a model names the wrong thing.
+  const name = displayName ?? listMetas().find(m => m.id === sceneId)?.name ?? 'The last scene';
   hideLoadingOverlay(); // don't leave the loading bar behind the dialog
   const choice = await askRestoreChoice(name, Math.round(bytes / 1048576));
   if (choice === 'open') return true;
@@ -659,6 +687,10 @@ async function init() {
     .use(new CustomRuntimeInstructionPlugin(), 'core')
     .use(new RvExtrasEditorPlugin(), 'core')
     .use(new ConnectPlugin(), 'core')
+    // plan-386 R13: the shared-link info card only ever appears because of this
+    // line. It is listed as its own roadmap step and covered by
+    // `share_PluginRegistered` for exactly that reason.
+    .use(new SharePlugin(), 'core')
     .use(new HistorianTrendPlugin(), 'core')
     .use(new OrientationGizmoPlugin(), 'core')
     .use(new LayoutPlannerPlugin(), 'core')
@@ -667,6 +699,7 @@ async function init() {
     .use(new SnapFlipIconOverlay(), 'core')
     .use(new SimControllerPlugin(), 'core')
     .use(new IKPathVisualizerPlugin(), 'core')
+    .use(new PathVisualizerPlugin(), 'core')
     .use(new IKTargetEditPlugin(), 'core')
     .use(new DriveAxisGizmoPlugin(), 'core')
     .use(new DESWorkspacePlugin(), 'core')
@@ -685,7 +718,31 @@ async function init() {
   );
 
   // --- Per-model plugin manager (loads model-specific plugins on model switch) ---
-  viewer.modelPluginManager = new ModelPluginManager();
+  // The manifest is the binding (plan-718 §2.6): the document row being loaded
+  // names its own code. The lookup is injected rather than imported by the
+  // manager, so the manager stays free of the project store — and so a test can
+  // state the binding without one.
+  viewer.modelPluginManager = new ModelPluginManager({
+    scriptRefProvider: ({ modelUrl }) =>
+      scriptRefForModelUrl(getProjectStore().getProject(), modelUrl),
+    // Stage 2b: a project may carry its own compiled code. The source is the
+    // ACTIVE backend of the moment (the open project changes under a long-lived
+    // manager), and reading a file is all the manager is given — no write side.
+    runtimeScriptSource: () => {
+      const backend = getProjectStore().getBackend();
+      return backend ? { readBytes: (rel: string) => backend.readBlobBytes(rel) } : null;
+    },
+    // …and it runs only with this project's persisted consent (2b.3, R8).
+    runtimeScriptConsent: ({ scriptRef }) => {
+      const project = getProjectStore().getProject();
+      if (!project?.id) return false;
+      return requestProjectCodeConsent({
+        projectId: project.id,
+        projectName: String(project.name ?? project.id),
+        scriptRef,
+      });
+    },
+  });
 
   // --- Performance test plugin (activated via ?perf URL param) ---
   if (params.has('perf')) {
@@ -693,10 +750,15 @@ async function init() {
     viewer.use(new PerfTestPlugin(), 'core');
   }
 
-  // --- Asset editor (public shell — GLB asset authoring in the Editor mode).
-  // CAD/STEP import stays private (step-import plugin) and lights it up further.
-  const { AssetEditorPlugin } = await import('./plugins/asset-editor');
-  viewer.use(new AssetEditorPlugin(), 'core');
+  // --- Asset editor: NOT registered here (plan-434).
+  // The GLB asset authoring UI is a COMMERCIAL feature living in the private
+  // sibling (`@rv-private/plugins/asset-editor`). It registers itself — plugin
+  // AND the Editor mode — through the `asset-editor` feature adapter, exactly
+  // like every other licensed subsystem: customer tier in private-plugins.ts on
+  // our machines, and the manifest-generated registration in a customer
+  // workspace. Registering it from here as well would double-register it.
+  // A community clone has no private sibling, so there is no editor and no
+  // Editor mode entry — see the modes block below.
 
   // --- Unified CAD import (plan-238): "Import" button + provider registry.
   // Registers the core GLB-file provider; private providers (STEP, Asset
@@ -710,7 +772,7 @@ async function init() {
   // registration below and the mode-boot block later in this function.
   await registerPrivatePlugins(viewer);
 
-  // --- Workspace modes (plan-198): Viewer / HMI / DES / Planner / Editor ---
+  // --- Workspace modes (plan-198): Viewer / HMI / DES / Planner / Commissioning / Editor ---
   // Registered after all plugins so the dropdown reflects the full set. The
   // active mode is applied AFTER the model loads (see mode-boot block below).
   // The Editor is `runtime: 'detached'`: the SimulationRuntime performs NO
@@ -723,12 +785,23 @@ async function init() {
   // it is the simplest view and belongs at the top of the dropdown. The icon
   // name must exist in ModeDropdown's ICONS map or it silently falls back to the
   // generic Dashboard icon; `ViewInAr` is registered there.
+  //
+  // Commissioning (plan-423) is the Viewer's counterpart for virtual
+  // commissioning: the same lean surface WITHOUT the operator HMI (no KPI
+  // cards, no message stack, no views), but WITH the tools an integrator needs
+  // to put a shared machine into operation — Inspector, Hierarchy, CONNECT and
+  // the AI bridge. It keeps the default `runtime: 'simulation'` for the same
+  // reason the Viewer does. `order: 35` places it between Planner (30) and
+  // Editor (40) — a user decision, not a technical one.
   viewer.modes
     .register({ id: 'viewer', label: 'Viewer', icon: 'ViewInAr', order: 5 })
     .register({ id: 'hmi', label: 'HMI', icon: 'ViewQuilt', order: 10 })
     .register({ id: 'des', label: 'DES', icon: 'AccountTree', order: 20 })
     .register({ id: 'planner', label: 'Planner', icon: 'GridView', order: 30 })
-    .register({ id: 'editor', label: 'Editor', icon: 'Edit', order: 40, runtime: 'detached' });
+    .register({ id: 'commissioning', label: 'Commissioning', icon: 'Handyman', order: 35 });
+  // The Editor mode is registered by the asset-editor feature adapter (plan-434),
+  // which runs inside registerPrivatePlugins above. A community build has no
+  // editor, so the dropdown must not offer a mode that would open an empty shell.
   if (connectEmbedEnabled) attachConnectEmbedModeManager(viewer.modes);
 
   // --- Mode-driven highlight profiles (single policy point) ---
@@ -818,6 +891,19 @@ async function init() {
   // the browser was closed, or while the WebSocket was down, is picked up here on
   // the next load. A gateway-less deploy answers 404 and the catch below keeps the
   // boot silent, exactly as the `models.json` probe above already does.
+  //
+  // ## `manifest.models` is a FOREIGN catalogue, not a project manifest (plan-413 §2.6)
+  //
+  // plan-413 replaced `models[]`/`scenes[]`/`library[]` with one `documents[]`
+  // list — in the manifests realvirtual WEB itself writes. This one it does not
+  // write: `/model/manifest` is produced by the CONNECT gateway, a separate
+  // program with its own release cycle, and the shape below is its published
+  // contract. Renaming the field here would only mean reading a key nobody
+  // sends. So this stays a compatibility ADAPTER: CONNECT's `models[]` is
+  // translated into viewer catalogue entries at this boundary and the document
+  // model begins on the other side of it. Same decision plan-397 took for the
+  // plan-700/701 delivery manifests. If CONNECT ever speaks `documents[]`, the
+  // change belongs here and nowhere else.
   try {
     const resp = await fetch('/model/manifest', { cache: 'no-store' });
     if (resp.ok) {
@@ -935,6 +1021,77 @@ async function init() {
   migrateLegacyAutosave();
   const sceneStore = initSceneStore(viewer);
 
+  // Attach here, not inside the project-restore branch below. Two of the three
+  // boot paths (the CONNECT-only entry and the Firebase demo) never reach that
+  // branch, and an unattached store makes `ProjectStore.hasUnsavedWork()` — now
+  // the ONE answer to "is there unsaved work", including the unload guard's —
+  // silently blind to the scene on exactly those paths. Attaching is two
+  // assignments plus the hydrator; `hydrateScene()` with no project open reads
+  // the cache or returns false, and writes nothing. What genuinely needs the
+  // project is `hydrateProjectScenes()`, which stays where it was.
+  getProjectStore().attachToSceneStore(sceneStore);
+
+  // ── User plugin overrides: restore what the user switched off (plan-435) ──
+  // Placed after the last `viewer.use()` and after project resolution, but
+  // BEFORE any model load: a plugin the user switched off must never receive
+  // an `onModelLoaded` it would immediately have to undo. Overrides for
+  // plugins registered later (model plugins, DebugEndpoint, McpBridge) are
+  // remembered by the viewer and applied in `use()`.
+  {
+    const resetPlugins = new URLSearchParams(window.location.search).get('resetPlugins');
+    if (resetPlugins === '1') clearAllPluginOverrides();
+    const scope = overrideScopeKey(
+      getProjectStore().getProject()?.id ?? null,
+      // No model is loaded yet, so the last-model key is the best stand-in for
+      // "which model is about to open" when no project is active.
+      (() => { try { return localStorage.getItem('rv-webviewer-last-model'); } catch { return null; } })(),
+    );
+    if (scope !== null) {
+      viewer.applyPersistedPluginOverrides(loadPluginOverrides(scope));
+      viewer.on('plugins-changed', (data: unknown) => {
+        const kind = (data as { kind?: string } | null)?.kind;
+        if (kind !== 'user-disabled' && kind !== 'user-enabled') return;
+        savePluginOverrides(scope, viewer.getPersistedPluginOverrideIds());
+      });
+    }
+  }
+
+  // The ONE unload guard for the page. It replaces the asset editor's own,
+  // which was installed in `_activate` and torn down in `_deactivate` — so it
+  // asked in editor mode and nowhere else, and the case that loses the most
+  // work went unasked: a shared link opens a TRANSIENT workspace, which by
+  // design never autosaves, in viewer or planner mode. Someone who bound their
+  // PLC signals to a shared demo and pressed F5 lost all of it in silence.
+  //
+  // Asks `hasUnpersistedWork()`, never `hasUnsavedWork()`: a normal workspace is
+  // dirty most of the time and its autosave already carried it across the
+  // reload. A dialog that appears when nothing is at stake is one the user
+  // learns to click away, which is how a guard stops working.
+  // DEV ONLY: a Vite full reload is not the user leaving the page. Editing a
+  // .ts file that cannot be hot-patched makes Vite call location.reload(), the
+  // guard below turns that into Chrome's "Reload site? Changes you made may not
+  // be saved" modal, and the dev loop stops dead until a human clicks it — on
+  // every such edit. Worse for an agent session: the modal is a NATIVE browser
+  // dialog, so nothing in the page (and no MCP tool) can dismiss it, and every
+  // web_* call blocks behind it until it times out.
+  //
+  // Vite announces the reload first, so the guard can stand down for exactly
+  // that case. Nothing is risked: `import.meta.hot` exists only in dev, and the
+  // draft autosave carries the document across the reload anyway — which is the
+  // same reason this guard asks `hasUnpersistedWork()` and not `hasUnsavedWork()`.
+  let viteFullReload = false;
+  if (import.meta.hot) {
+    import.meta.hot.on('vite:beforeFullReload', () => { viteFullReload = true; });
+    // A failed/aborted reload must not leave the guard disarmed for good.
+    import.meta.hot.on('vite:error', () => { viteFullReload = false; });
+  }
+
+  window.addEventListener('beforeunload', (e) => {
+    if (viteFullReload) return;
+    if (!getProjectStore().hasUnpersistedWork()) return;
+    e.preventDefault();
+  });
+
   // --- Load model helper ---
   // `options.overlay` carries the materialised rv-extras overrides from
   // loadScene(); it MUST be forwarded to viewer.loadModel so overrides are
@@ -944,15 +1101,25 @@ async function init() {
   // re-run it after a failure.
   let lastLoadRequest: { url: string; options?: { overlay?: RVExtrasOverlay } } | null = null;
 
-  async function loadModel(url: string, options?: { overlay?: RVExtrasOverlay }) {
-    const matchedEntry = entries.find((entry) => entry.url === url);
-    const modelIdentity = matchedEntry?.filename ?? url;
+  async function loadModel(
+    url: string,
+    options?: { overlay?: RVExtrasOverlay; identityUrl?: string; data?: ArrayBuffer },
+  ) {
+    // `url` is where the bytes come from; `identityUrl` (set by loadScene when a
+    // workspace resumed from a stored body) is which model they ARE. They differ
+    // only on that path, where `url` is a `blob:` with a random UUID. Deriving
+    // identity from it put that UUID in the loading overlay, in LS_KEY_MODEL and
+    // — the visible damage — into the model-plugin lookup, so a drafted demo
+    // scene reloaded without a single one of its HMI plugins.
+    const identityUrl = options?.identityUrl ?? url;
+    const matchedEntry = entries.find((entry) => entry.url === identityUrl);
+    const modelIdentity = matchedEntry?.filename ?? identityUrl;
     const modelName = matchedEntry?.filename.replace(/\.glb$/i, '')
-      ?? (url.split('/').pop() ?? url).split('?')[0].replace(/\.glb$/i, '');
+      ?? (identityUrl.split('/').pop() ?? identityUrl).split('?')[0].replace(/\.glb$/i, '');
     lastLoadRequest = { url, options };
     if (!connectEmbedEnabled) {
       showLoadingOverlay(modelName);
-      localStorage.setItem(LS_KEY_MODEL, url);
+      localStorage.setItem(LS_KEY_MODEL, identityUrl);
     }
 
     try {
@@ -968,7 +1135,10 @@ async function init() {
       // — while `url` itself stays the model's identity everywhere else (the
       // catalogue key, the localStorage entry and the scene-draft key are all this
       // one string, and a `?v=` in it would match none of them again).
-      let data = await downloadGlb(modelFetchUrl(url), {
+      // Bytes handed in by the caller skip the download entirely (plan-709
+      // §2.5): a project asset resolved straight out of the backend has nothing
+      // to fetch, and its `rvproject:` name is not a fetchable URL at all.
+      let data = options?.data ?? await downloadGlb(modelFetchUrl(url), {
         attempts: 3,
         timeoutMs: 90_000,
         onRetry: setLoadingRetrying,
@@ -984,16 +1154,16 @@ async function init() {
 
       const sizeMB = (data.byteLength / (1024 * 1024)).toFixed(1) + ' MB';
 
-      viewer.pendingModelUrl = url;
+      viewer.pendingModelUrl = identityUrl;
 
       // Download done — the parse + scene build below is the long pole with no
       // byte progress. Show the preparing state.
       if (!connectEmbedEnabled) setLoadingPreparing();
 
-      const result = await viewer.loadModel(url, { ...options, data, modelName: modelIdentity });
+      const result = await viewer.loadModel(url, { ...options, data, modelName: modelIdentity, identityUrl });
 
       // Keep the original URL (model selector matches against it).
-      viewer.currentModelUrl = url;
+      viewer.currentModelUrl = identityUrl;
 
       // Mark GLB scene active in the scene store (for the Scene window).
       // We re-derive the label so saved-from-localStorage entries stay
@@ -1001,7 +1171,7 @@ async function init() {
       const label = matchedEntry ? matchedEntry.filename.replace(/\.glb$/i, '') : modelName;
       // markGlbActive synthesizes a fresh draft RvScene on the new base —
       // viewer.currentScene is updated via that call.
-      if (!connectEmbedEnabled) sceneStore.markGlbActive(url, label);
+      if (!connectEmbedEnabled) sceneStore.markGlbActive(identityUrl, label);
 
       const loadTime = ((performance.now() - loadStart) / 1000).toFixed(1) + 's';
       viewer.lastLoadInfo = { glbSize: sizeMB, loadTime };
@@ -1035,12 +1205,18 @@ async function init() {
 
   const MODEL_UPDATE_HINT_ID = 'rv-model-updated';
 
-  /** Whether anything unsaved would be lost by reloading the model (F5). */
+  /**
+   * Whether anything unsaved would be lost by reloading the model (F5).
+   *
+   * Delegates rather than deciding: this used to ask the scene store and the
+   * asset editor's single document, which quietly under-reported once a
+   * document STACK could be three frames deep with two of them dirty (and never
+   * saw a queued folder write at all). `ProjectStore.hasUnsavedWork()` is the
+   * one aggregation of those terms; a second, thinner copy of the same question
+   * is how the two answers drift apart.
+   */
   function hasUnsavedWork(): boolean {
-    if (sceneStore.getSnapshot().dirty) return true;
-    const editor = viewer.getPlugin('asset-editor') as
-      { document?: { dirty?: boolean } | null } | undefined;
-    return editor?.document?.dirty === true;
+    return getProjectStore().hasUnsavedWork();
   }
 
   /**
@@ -1137,6 +1313,13 @@ async function init() {
   // without relying on the URL carrying ?mode= or on localStorage persistence.
   let publishedBootMode: string | null = null;
 
+  // The mode half of the resumed session (plan-703 decision 24) — set by the
+  // resume block below and applied in the same mode-boot chain. The mode
+  // follows the SESSION, and the session is per project, so this beats the
+  // globally persisted `modes.restore()` answer: reopening project A must not
+  // land in the mode project B was last edited in.
+  let resumeBootMode: string | null = null;
+
   // The active project is a library source, on every boot path (plan-372 §2.6.4).
   //
   // Installed HERE — before the branch below and before any `await` — rather
@@ -1153,6 +1336,12 @@ async function init() {
   // `LibraryStore` and never reach the registry, which is what left the
   // Assets tab able to show the project's own library and nothing else.
   installGlobalLibraryProvider(getLibraryStore());
+
+  // "Shared with me" — the bookmarks a visitor kept from shared links, shown as
+  // one library tab (plan-386 §2.9). Installed unconditionally because the tab
+  // has to be there on the NEXT visit too, when nothing was shared this session
+  // but the bookmarks from last time still exist (F13).
+  setSharedBookmarkHost(getLibraryStore());
 
   // --- Firebase demo mode: /demo/webviewer/{demoName} ---
   const pathParts = window.location.pathname.split('/').filter(p => p);
@@ -1183,7 +1372,7 @@ async function init() {
     // non-project boot path is bit-for-bit what it was.
     try {
       const projectStore = getProjectStore();
-      projectStore.attachToSceneStore(sceneStore);
+      // (The store is attached at construction now — see there for why.)
       // Half two (plan-372 §2.10): reconciliation, the conflict prompt, the
       // dirty guard, lazy hydration — and `activate()`, the first point in
       // the whole boot at which anything may be written to disk. It needs the
@@ -1194,6 +1383,11 @@ async function init() {
       // provider installed above — and needs nothing here.
       await getLibraryStore()
         .applyProjectLibraries(readProjectLibraries(projectStore.getProject()));
+
+      // The plan-397 phase-7 op-log→GLB conversion used to run here. It is gone
+      // with the rest of the JSON scene reader (plan-413 phase 6): a stored
+      // op-log record now gets the F10 error from `rv-scene-storage.readScene`,
+      // naming the release that can still convert it.
     } catch (e) {
       console.warn('[main] Project restore skipped:', e);
     }
@@ -1202,12 +1396,37 @@ async function init() {
     // ?scene=<id>             → open a saved scene by id (highest priority)
     // ?scene=builtin:<file>   → open a built-in by filename match
     // ?scene=empty            → fresh empty scene
+    // ?glb=<url> | ?glb=s:<id> → shared, untrusted GLB (plan-386)
     // ?model=<url>            → legacy alias (handled below)
+    // A sender coming back from the share sign-in mail arrives with
+    // `?sharetoken=<one-time token>` (plan-386 §2.6). Redeem it and take it out
+    // of the address bar — a one-time token that stays in a URL gets copied,
+    // bookmarked and forwarded, and it is a credential. Deliberately not
+    // awaited: without the parameter it makes no request at all, and the boot
+    // has no business waiting on mail infrastructure.
+    void consumeMagicLinkFromUrl();
+
     let sceneRouted = false;
+    const urlGlb = params.get('glb');
+    // ?doc=<documentId> — the one open verb (plan-716 §2.5, F5).
+    //
+    // Read here and routed AFTER `?scene=`, which is not an accident: the alias
+    // redirect below rewrites an old `?scene=scn_…` to `?doc=` and opens it in
+    // the same turn, so letting `?doc=` win first would make an old bookmark
+    // resolve against a parameter that is not there yet. Both end in the same
+    // `openDocument` call.
+    const urlDoc = params.get('doc');
     // ?mode=planner boots a fresh empty scene (unless an explicit ?scene/?model
     // is given) so a published link drops the user straight into layout authoring.
+    //
+    // plan-386 Finding 15: `?glb=` has to be in that exclusion list too. It was
+    // not, and the consequence was silent — `?glb=…&mode=planner` synthesised
+    // `scene=empty`, the empty scene won on precedence, and the shared content
+    // the whole link existed for never arrived. Covered by
+    // `share_GlbWithPlannerMode_NotOverriddenByEmpty`.
     const plannerMode = params.get('mode') === 'planner';
-    const urlScene = params.get('scene') ?? (plannerMode && !params.get('model') ? 'empty' : null);
+    const urlScene = params.get('scene')
+      ?? (plannerMode && !params.get('model') && !urlGlb ? 'empty' : null);
     if (urlScene) {
       try {
         if (urlScene === 'empty') {
@@ -1232,23 +1451,67 @@ async function init() {
           }
           // No match — fall through to default model resolution below.
         } else if (urlScene.startsWith('published:')) {
-          // ?scene=published:<name> → fetch a static, read-only scene shipped
-          // with the DemoRealvirtual project (scenes/<name>.scene.json) and load it
-          // transiently. Lets a saved scene (GLB + edits) be shared by URL
-          // without server-side scene storage and without touching localStorage.
+          // ?scene=published:<name> → load a static, read-only scene shipped with
+          // the DemoRealvirtual project (scenes/<name>.glb) transiently. Lets a
+          // saved scene be shared by URL without server-side scene storage and
+          // without touching localStorage.
+          //
+          // Since plan-413 phase 3 the examples are GLBs, and this path stops
+          // downloading them twice: it used to fetch the `.scene.json` here and
+          // hand the parsed object on.
+          //
+          // The CATALOGUE decides, and nothing else. A probe was tried and
+          // discarded: a Vite dev server — and any host with an SPA
+          // history-fallback — answers 200 with index.html for
+          // `scenes/Whatever.glb`, so "does the file exist" cannot be asked over
+          // HTTP at all. `scenes/index.json` and the files beside it come out of
+          // the same deploy step, so an example that exists is an example that is
+          // listed; anything else falls through to the default boot chain.
           const name = decodeURIComponent(urlScene.slice('published:'.length));
-          const resp = await fetch(publishedSceneUrl(`${name}.scene.json`), { cache: 'no-store' });
-          if (resp.ok) {
-            await sceneStore.openPublished(await resp.json(), name);
+          const link = resolvePublishedDeepLink(name, viewer.availablePublishedScenes);
+          if (link.catalogued) {
+            await sceneStore.openPublished(publishedSceneUrl(link.file), name, link.label);
             // Restore the example's preferred workspace mode (e.g. planner) from the
             // catalogue, so a shared/reloaded ?scene=published:<name> lands in the right
             // mode even without ?mode= in the URL. An explicit ?mode= still wins.
-            const entry = viewer.availablePublishedScenes.find(e => e.urlName === name);
-            if (entry?.mode) publishedBootMode = entry.mode;
+            if (link.mode) publishedBootMode = link.mode;
             hideLoadingOverlay();
             sceneRouted = true;
           }
-          // Not found / fetch failed — fall through to default model resolution below.
+          // Not found — fall through to default model resolution below.
+        } else if (resolveSceneRoute(urlScene, documentsOf(getProjectStore().getProject()))) {
+          // ── An old ?scene=scn_… link for a converted scene (plan-716 §2.4) ──
+          //
+          // The alias map is guaranteed to exist here: the migration runs awaited
+          // inside `resolveActiveProject()`, which is above this line by the §2.3
+          // boot anchor. The address bar is normalised to `?doc=` so a re-share,
+          // a bookmark or a reload carries the new identity — and `replaceState`,
+          // not `pushState`, because the old URL is not a place the Back button
+          // should return to.
+          //
+          // Phase 3 (§2.5): what opens it is now the open VERB itself. The
+          // redirect above is unchanged — the address bar is normalised first —
+          // and `openDocument` is what the normalised URL would have reached on
+          // the next reload anyway, so a converted link and a fresh `?doc=` link
+          // are the same code path from here on.
+          const route = resolveSceneRoute(urlScene, documentsOf(getProjectStore().getProject()))!;
+          window.history.replaceState(
+            {}, '', sceneUrlToDocumentUrl(window.location.href, route.documentId),
+          );
+          if (route.kind === 'document') {
+            await sceneStore.openDocument(route.documentId, { name: route.name });
+            hideLoadingOverlay();
+            sceneRouted = true;
+          } else {
+            // Aliased, but the row is gone. Falling through to `openScene` would
+            // open nothing at all (the body was retired with the row), so say so
+            // and put the user somewhere they can act: their document list.
+            console.warn(`[main] ${urlScene} was converted to ${route.documentId}, which no longer exists.`);
+            hideLoadingOverlay();
+            reportMissingDocument(route.documentId);
+            openProjectsDashboard();
+            sceneRouted = true;
+          }
         } else {
           // Treat as a saved scene id. Guard against a huge auto-loaded part.
           if (await guardHeavyRestore(urlScene)) {
@@ -1261,6 +1524,59 @@ async function init() {
       } catch (e) {
         console.warn(`[main] Failed to open ?scene=${urlScene}:`, e);
         // Fall through to default model resolution.
+      }
+    }
+
+    // ── ?doc=<documentId> — the one open verb (plan-716 §2.5, F5) ─────────
+    //
+    // Every owned artefact is a document, so this is what a shared link, a
+    // bookmark and a reload all carry from Phase 3 onwards. It is alias-tolerant
+    // through `openDocument`, so even a `?doc=scn_…` — which nothing writes, but
+    // which a hand-edited URL can produce — lands on the right row.
+    //
+    // A document id the manifest does not list is NOT a fall-through: the boot
+    // has a project open and that project says the row is gone, so the honest
+    // answer is to say so and show the list, exactly as the alias `missing`
+    // branch above does. Falling through would silently boot the demo instead.
+    if (!sceneRouted && urlDoc) {
+      try {
+        await sceneStore.openDocument(urlDoc);
+        hideLoadingOverlay();
+        sceneRouted = true;
+      } catch (e) {
+        console.warn(`[main] Failed to open ?doc=${urlDoc}:`, e);
+        hideLoadingOverlay();
+        reportMissingDocument(urlDoc);
+        openProjectsDashboard();
+        sceneRouted = true;
+      }
+    }
+
+    // ── ?glb= — a shared GLB from a host we do not control (plan-386 §2.5b) ──
+    //
+    // Precedence: `?scene=` > `?glb=` > `?model=`. Setting `sceneRouted` here
+    // is what skips BOTH the legacy model resolution below AND the
+    // active-saved-scene resume — a link somebody sent must not open in the
+    // visitor's last scene.
+    //
+    // Note what this branch does NOT call: `loadModel()` (the hull above, which
+    // writes LS_KEY_MODEL and marks a GLB active) and `sceneStore.openBuiltin()`
+    // (which persists a draft). It goes through `viewer.loadModel()` directly —
+    // see rv-share-boot.ts for why that is the binding architecture, not taste.
+    if (!sceneRouted && urlGlb) {
+      // Fill the Phase-1 resolver seam: `?glb=s:<id>` is answered by the share
+      // backend (plan-386 §2.6). Installed here rather than at module scope so
+      // a build that never sees a shared link never registers anything.
+      installShareIdResolver();
+      const outcome = await bootSharedGlb(viewer, urlGlb);
+      hideLoadingOverlay();
+      if (outcome.ok) {
+        sceneRouted = true;
+      } else {
+        // The card carries the sentence; the console line is for us. A failed
+        // shared link still falls through to the normal boot so the visitor
+        // lands in a working viewer rather than on a blank page.
+        console.warn(`[main] Shared link could not be opened: ${outcome.error}`);
       }
     }
 
@@ -1336,6 +1652,81 @@ async function init() {
       }
     }
 
+    // ── Resume the document this project was left on (plan-703 §2.6.3, F15) ──
+    //
+    // The `(asset, mode)` pair per project id has been written on every open
+    // since plan-703 and, until now, read in exactly ONE situation: the effect
+    // that fires when the user opens a project BY HAND (`pendingResumeRef` in
+    // ProjectsDashboardHost). A reload does not open the project, it RESTORES
+    // it — so that effect stays disarmed and the boot fell through to
+    // `settings.json`'s `defaultModel`, i.e. the demo model, however far away
+    // the user had actually navigated.
+    //
+    // Since plan-716 Phase 3 a document DOES have an address — `openDocument`
+    // writes `?doc=<id>` — so the URL now carries the common case and this block
+    // is the second line of defence, not the only one: a reload with a cleared
+    // address bar, a fresh tab, a crash before the first `replaceState`, or the
+    // `updateUrl: false` boot. It stays because the URL is a statement about ONE
+    // load, and the remembered pair is a statement about the SESSION.
+    //
+    // Precedence is `resolveResumeTarget`'s, not this file's, and this block
+    // sits BELOW the URL routing and the active-scene pointer because both are
+    // more specific statements about this particular load. Only the
+    // `remembered` source is acted on here: `url` was routed above and
+    // `defaultModel` is the fallback the block below already owns.
+    if (!sceneRouted) {
+      try {
+        const project = getProjectStore().getProject();
+        const projectId = project?.id;
+        if (projectId) {
+          const target = resolveResumeTarget({
+            search: window.location.search,
+            remembered: readRememberedSession(projectId),
+            defaultModel: appConfig.defaultModel,
+            // A kiosk takes `defaultModel` whatever is remembered (decision 3):
+            // a locked deployment must come up in its machine, not in whatever
+            // somebody last looked at on that tablet.
+            modeLocked: viewer.modes.lockedMode !== null,
+          });
+          if (target.source === 'remembered' && target.asset) {
+            // Addressed by path or by id: a stored pair may hold either, and
+            // refusing one of the two would make the rule depend on which
+            // spelling happened to be written.
+            const doc = documentsOf(project).find(
+              d => d.path === target.asset || d.id === target.asset);
+            if (!doc) {
+              // Renamed, deleted or from another project's manifest. Drop the
+              // hint rather than re-resolving a dead path on every reload.
+              forgetRememberedSession(projectId);
+            } else if (!await guardHeavyRestore(doc.id, doc.name)) {
+              // The same heavy-CAD escape hatch the other two restore paths use,
+              // and for the same reason: an auto-restore must not be the thing
+              // that makes a phone run out of memory on every visit. Declining
+              // also forgets the pair — otherwise the dialog would come back on
+              // every single reload, which is the opposite of an escape hatch.
+              forgetRememberedSession(projectId);
+            } else {
+              // THE open verb (plan-716 §2.5), for both sections — a scene and a
+              // model are the same thing since plan-413, and `openDocument` is
+              // where that stopped being a claim. It also supplies the two
+              // things this block used to hand-roll: `?doc=<id>` in the address
+              // bar, so the NEXT reload does not need the remembered pair at
+              // all, and the cross-mode document identity the asset editor reads
+              // to decide what to bind to when the restored mode takes over.
+              await sceneStore.openDocument(doc.id, { name: doc.name });
+              hideLoadingOverlay();
+              sceneRouted = true;
+            }
+            // The mode comes from the remembered pair only — `resolveResumeTarget`
+            // guarantees a URL and a `defaultModel` both return `mode: null`.
+            if (sceneRouted && target.mode) resumeBootMode = target.mode;
+          }
+        }
+      } catch (e) {
+        console.warn('[main] Failed to resume the last document:', e);
+      }
+    }
+
     if (sceneRouted) {
       // ?scene=… or active id already loaded — skip legacy model resolution.
     } else {
@@ -1351,7 +1742,12 @@ async function init() {
           ? matched.filename.replace(/\.glb$/i, '')
           : (finalUrl.split('/').pop() ?? finalUrl).split('?')[0].replace(/\.glb$/i, '');
         try {
-          await sceneStore.openBuiltin(finalUrl, label);
+          // updateUrl:false — the visitor arrived without an explicit scene
+          // route, so the address bar stays exactly as typed. A bare `/` must
+          // NOT be rewritten to `?scene=builtin:<default>.glb` (project-based
+          // routing: `/` is the canonical entry). Reload re-resolves the same
+          // default via localStorage/settings.json anyway.
+          await sceneStore.openBuiltin(finalUrl, label, { updateUrl: false });
           hideLoadingOverlay();
         } catch (e) {
           // Defence-in-depth: corrupted draft or transient error → fall back
@@ -1366,8 +1762,9 @@ async function init() {
   }
 
   // Workspace mode boot (plan-198). Precedence: ?mode= URL param (if a
-  // registered mode) > opened published example's catalogue mode > persisted
-  // localStorage > 'hmi'. Applied AFTER the model/scene has loaded so mode plugins
+  // registered mode) > opened published example's catalogue mode > the resumed
+  // project session's mode > persisted localStorage > 'hmi'. Applied AFTER the
+  // model/scene has loaded so mode plugins
   // (e.g. Planner) see live model state in their onModeActivate hook. The legacy
   // ?mode=planner empty-scene routing above is unchanged; entering Planner mode
   // now runs through the mode system.
@@ -1377,6 +1774,11 @@ async function init() {
       viewer.modes.setMode(urlMode);
     } else if (publishedBootMode && viewer.modes.has(publishedBootMode)) {
       viewer.modes.setMode(publishedBootMode);
+    } else if (resumeBootMode && viewer.modes.has(resumeBootMode)) {
+      // The resumed session's own mode (decision 24). Above `restore()` because
+      // that answer is global, and the pair is per project — but below the two
+      // above, which are statements about THIS load.
+      viewer.modes.setMode(resumeBootMode);
     } else {
       viewer.modes.restore('hmi');
     }

@@ -76,8 +76,15 @@ export interface PrivateProject {
   lastPublished?: string;
   settings?: { defaultModel?: string };
   folderName?: string;
-  /** Manifest scene entries — the source of the published Examples catalogue. */
-  scenes?: Array<Record<string, unknown>>;
+  /**
+   * The manifest's one document list — the source of the published Examples
+   * catalogue. Always present on a value that came out of `loadProject()`,
+   * which derives it from the pre-phase-6 arrays when the file on disk still
+   * carries those, and drops them (plan-703 phase 9). `scenes`/`models`/
+   * `library` are deliberately NOT declared here: nothing downstream of that
+   * boundary may read them, and a declaration is an invitation to.
+   */
+  documents?: Array<Record<string, unknown>>;
   [key: string]: unknown;
 }
 
@@ -111,8 +118,10 @@ export interface PublishedSceneIndexEntry {
   file: string;
   name?: string;
   mode?: string;
+  /** Classification level cache, so a bundled deploy needs no scan (plan-413). */
+  level?: string;
 }
-/** The Examples catalogue derived from `scenes[]`, or null when none apply. */
+/** The Examples catalogue derived from `documents[]`, or null when none apply. */
 export function publishedSceneIndex(project: PrivateProjectLike | null): PublishedSceneIndexEntry[] | null;
 
 /** The GLBs a project publishes — folder-derived, never manifest-derived (P0-3). */

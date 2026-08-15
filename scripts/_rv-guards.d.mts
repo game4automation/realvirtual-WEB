@@ -35,9 +35,15 @@ export function containsHighEntropyFragment(value: string): boolean;
 export function isHttpUrlLiteral(value: string): boolean;
 export function isTestFile(relativePath: string): boolean;
 export function secretContentViolation(relLower: string, extension: string, text: string): string | null;
+export const CONNECT_LICENSE_KEY_PATTERN: RegExp;
+export function looksLikeSecretValue(value: unknown): boolean;
 export function assertNoSecrets(root: string, options?: { skipDirs?: string[] }): void;
 
-export function knownProjectKeys(privateRoot: string): string[];
+export type ProjectKind = 'customer' | 'demo' | 'internal';
+export const PROJECT_KINDS: readonly ProjectKind[];
+export function isProjectKind(value: unknown): value is ProjectKind;
+export function projectKindOf(projectsDir: string, name: string): ProjectKind | null;
+export function knownProjectKeys(privateRoot: string, options?: { kind?: ProjectKind }): string[];
 
 export const CUSTOMER_OWNED_FOLDERS: readonly string[];
 export const DEFAULT_VENDOR_BLOCK: { readonly managed: readonly string[]; readonly handover: readonly string[] };
@@ -47,3 +53,11 @@ export function assertVendorGlobs(vendor: unknown, label?: string): void;
 export const MAX_DELIVERY_FILE_BYTES: number;
 export function isOversizedDeliveryFile(absolutePath: string): boolean;
 export function fileNameOf(path: string): string;
+
+// ─── Secrets as references (plan-718) ───────────────────────────────────
+
+export const CREDENTIAL_PROPERTY_NAMES: readonly string[];
+export function isCredentialPropertyName(name: unknown): boolean;
+export function isSecretReferenceValue(value: unknown): boolean;
+export function collectSecretRefKeys(value: unknown, keys?: string[]): string[];
+export function plaintextSecretPaths(value: unknown, path?: Array<string | number>, out?: string[]): string[];

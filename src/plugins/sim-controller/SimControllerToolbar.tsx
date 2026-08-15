@@ -101,8 +101,11 @@ export function ResetSegment({ viewer }: UISlotProps) {
  * continuous fixed-step accumulator) so the planner shows the running sim clock
  * during Play — the continuous parallel to the DES toolbar clock. Holds while
  * paused, returns to 0 on Reset.
+ *
+ * Exported for the same reason as the segments above: the editor's test-run
+ * toolbar shows the identical clock while a run is live.
  */
-function SimClockSegment({ viewer }: UISlotProps) {
+export function SimClockSegment({ viewer }: UISlotProps) {
   const [t, setT] = useState(0);
   useEffect(() => {
     const id = setInterval(() => setT(viewer.simTime ?? 0), 200);
@@ -146,7 +149,8 @@ export function SimControllerToolbar({ viewer }: UISlotProps) {
 // can tunnel past sensors in the fixed 60 Hz step — fine for large parts / big zones.
 const SPEED_OPTIONS = [0.25, 0.5, 1, 2, 5, 10, 25, 50, 100];
 
-function SpeedSelector() {
+/** Exported for reuse by the editor's test-run toolbar (same override store). */
+export function SpeedSelector() {
   const factor = useSyncExternalStore(subscribeDriveSpeedOverride, getDriveSpeedOverride, getDriveSpeedOverride);
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   return (

@@ -2,15 +2,33 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * signal-drag-store.ts — global Shift+Drag state for signal chips (plan-246 F4/F8/F11).
+ * signal-drag-store.ts — global drag state for signal chips (plan-246 F4/F8/F11,
+ * plan-422 F6).
  *
  * A tiny module-level state machine (no React state on the hot path):
  *
- *   idle ──armSignalDrag (pointerdown+shift on a chip)──▶ armed
+ *   idle ──armSignalDrag (pointerdown on a chip)──▶ armed
  *   armed ──move ≥ 4 px──▶ dragging ──pointerup over target──▶ drop → idle
- *   armed ──pointerup without movement──▶ idle   (NO force click, NO drag)
+ *   armed ──pointerup without movement──▶ idle   (click, or nothing — see below)
  *   dragging ──pointerup without target──▶ cancel → idle
  *   dragging ──ESC──▶ cancel → idle
+ *
+ * ## Shift is no longer the gate (plan-422 F6)
+ *
+ * Requiring Shift made the drag undiscoverable — the one gesture nobody tries
+ * first. It is not needed: the machine ALREADY separates a press from a drag by
+ * movement, so a plain pointerdown can arm too, and the release decides. Under
+ * the threshold it is a click; past it, a drag.
+ *
+ * The only thing that had to change is what happens to that trailing click.
+ * Shift+Click meant nothing and was swallowed; a plain click is the force
+ * gesture and must survive. That is {@link ArmSignalDragOptions.clickOnRelease},
+ * and the Shift path keeps the old behaviour untouched.
+ *
+ * On touch there is no Shift and no hover, and a press that becomes a drag
+ * competes with scrolling — so the chip arms on LONG PRESS and a move before it
+ * fires stays a scroll. A tap never arms at all and reaches the chip as a
+ * normal click.
  *
  * While `dragging`:
  *  - `document.body` gets the `rv-signal-dragging` class + a grabbing cursor,
@@ -87,6 +105,8 @@ let curY = 0;
 let suppressClickUntil = 0;
 let lastResult: SignalDragResult | null = null;
 let prevBodyCursor = '';
+/** Set by {@link armSignalDrag}; see {@link ArmSignalDragOptions.clickOnRelease}. */
+let clickOnRelease = false;
 
 const listeners = new Set<() => void>();
 const posListeners = new Set<(x: number, y: number) => void>();
@@ -127,13 +147,36 @@ function detachWindowListeners(): void {
 
 // ── State machine ─────────────────────────────────────────────────────
 
-/** Arm a potential drag (pointerdown with Shift on a signal chip). */
-export function armSignalDrag(p: SignalDragPayload, x: number, y: number): void {
+export interface ArmSignalDragOptions {
+  /**
+   * What a release BELOW the movement threshold means (plan-422 F6).
+   *
+   * The Shift gesture answers "nothing": Shift+Click was never a force, so the
+   * trailing click is swallowed. Dropping the Shift requirement makes the same
+   * pointerdown the beginning of BOTH gestures, and then the release is the
+   * only thing that tells them apart — under the threshold it is the plain
+   * click the user has always used to force, and it must reach the chip
+   * untouched.
+   *
+   * `true` therefore leaves the click alone. Default `false` keeps the Shift
+   * behaviour byte for byte, which is what the regression suite pins.
+   */
+  clickOnRelease?: boolean;
+}
+
+/** Arm a potential drag (pointerdown on a signal chip). */
+export function armSignalDrag(
+  p: SignalDragPayload,
+  x: number,
+  y: number,
+  options: ArmSignalDragOptions = {},
+): void {
   if (phase !== 'idle') cancelSignalDrag();
   phase = 'armed';
   payload = p;
   startX = x; startY = y;
   curX = x; curY = y;
+  clickOnRelease = options.clickOnRelease === true;
   attachWindowListeners();
   notify();
 }
@@ -163,14 +206,20 @@ export function updateSignalDrag(x: number, y: number): void {
 
 /**
  * Pointer released. From `dragging` this attempts a drop at (x, y) via the
- * drop-target registry; from `armed` it is a plain Shift+Click — which neither
- * forces nor drags (the click is suppressed). Returns what happened.
+ * drop-target registry; from `armed` it is a press that never became a drag.
+ *
+ * What that press MEANT depends on how it was armed (plan-422 F6): a Shift
+ * press means nothing and its click is swallowed; a plain press is the force
+ * click, and `clickOnRelease` lets it through. A completed DRAG always
+ * suppresses — the release landed on a drop target, not on the source chip.
  */
 export function endSignalDrag(x: number, y: number): SignalDragResult | 'noop' {
   if (phase === 'idle') return 'noop';
   const wasDragging = phase === 'dragging';
   const p = payload;
-  suppressClickUntil = performance.now() + CLICK_SUPPRESS_WINDOW_MS;
+  if (wasDragging || !clickOnRelease) {
+    suppressClickUntil = performance.now() + CLICK_SUPPRESS_WINDOW_MS;
+  }
   let result: SignalDragResult;
   if (wasDragging && p) {
     result = dropSignalAt(x, y, p) ? 'dropped' : 'cancelled';
@@ -206,6 +255,7 @@ export function disposeSignalDrag(): void {
 function reset(silent = false): void {
   phase = 'idle';
   payload = null;
+  clickOnRelease = false;
   detachWindowListeners();
   document.body.classList.remove(BODY_DRAG_CLASS);
   document.body.style.cursor = prevBodyCursor;

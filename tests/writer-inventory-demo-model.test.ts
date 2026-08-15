@@ -20,8 +20,9 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Scene } from 'three';
 import { loadGLB, type LoadResult } from '../src/core/engine/rv-scene-loader';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
-const GLB_URL = '/models/tests.glb';
+const GLB_URL = DEV_GLB.tests;
 const DT = 1 / 60;
 const SIM_SECONDS = 3;
 

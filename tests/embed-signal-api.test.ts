@@ -8,6 +8,7 @@ import {
   type RVEmbedReadyDetail,
 } from '../src/embed/rv-embed-element';
 import { installEmbedBrowserMocks, type EmbedBrowserMocks } from './embed-test-kit';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
 let mocks: EmbedBrowserMocks;
 let element: RVEmbedElement | null = null;
@@ -26,7 +27,7 @@ afterEach(() => {
 describe('rv-embed signal API', () => {
   it('round-trips subscribe/write through the loaded SignalStore', async () => {
     element = document.createElement('rv-embed') as RVEmbedElement;
-    element.setAttribute('src', '/models/physics-zone-test.glb');
+    element.setAttribute('src', DEV_GLB.physicsZone);
     element.setAttribute('run', 'manual');
     element.style.width = '320px';
     element.style.height = '200px';

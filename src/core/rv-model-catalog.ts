@@ -55,6 +55,23 @@ export function bumpModelCatalog(): void {
   }
 }
 
+/**
+ * The read-only built-in SOURCES this viewer can open (plan-716 §2.7, Phase 6).
+ *
+ * `SceneStore.listBuiltins()` used to answer this, and it read
+ * `viewer.availableModels` to do it. That indirection only existed because
+ * built-ins were shelved next to the scene CATALOGUE and the catalogue was the
+ * store's job; with the catalogue gone the store has no claim on them. A source
+ * is not a document — nothing owns its bytes, opening one and saving
+ * materialises a document — so it is read here, from the catalogue signal that
+ * actually holds it, by whoever needs it.
+ */
+export function builtinSources(
+  viewer: { availableModels?: readonly ModelCatalogEntry[] | null } | null | undefined,
+): ModelCatalogEntry[] {
+  return (viewer?.availableModels ?? []).map((m) => ({ url: m.url, label: m.label }));
+}
+
 // ── Identity helpers ───────────────────────────────────────────────────────
 
 /** The URL without query and fragment — the part that identifies the model. */

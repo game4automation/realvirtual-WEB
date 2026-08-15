@@ -10,8 +10,8 @@ import { describe, it, expect } from 'vitest';
 import { Group, Mesh, BoxGeometry, Object3D, Vector3, Quaternion, Euler } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { GroupRegistry } from '../src/core/engine/rv-group-registry';
-import { DriveDragPreview } from '../src/plugins/asset-editor/drive-drag-preview';
-import { resolveEditorDriveGizmoSource } from '../src/plugins/asset-editor/editor-drive-gizmo-source';
+import { DriveDragPreview } from '@rv-private/plugins/asset-editor/drive-drag-preview';
+import { resolveEditorDriveGizmoSource } from '@rv-private/plugins/asset-editor/editor-drive-gizmo-source';
 
 function makeEnv() {
   const scene = new Group(); // model root

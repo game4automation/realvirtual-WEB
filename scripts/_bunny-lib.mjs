@@ -33,6 +33,7 @@ import { signGlbBytes } from './rv-sign-glb.mjs';
 import { join, extname, basename, dirname, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { hasDeliveryConfig, loadDeliveryConfig } from './_workspace-lib.mjs';
+import { documentsInSection, withDerivedDocuments } from './_rv-manifest.mjs';
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
@@ -180,6 +181,16 @@ export function buildEnvForMode(mode, opts = {}) {
   if (mode === 'public') {
     env.VITE_PUBLIC_BUILD = '1';
     delete env.VITE_PRIVATE_BUILD;
+  } else if (mode === 'demo') {
+    // Hosted demo (bunny-deploy --demo): commercial code, public demo content. Neither
+    // switch — VITE_PUBLIC_BUILD would stub out the private code, VITE_PRIVATE_BUILD would
+    // hide the bundled example scenes. Kept in step with runBuild() in _workspace-lib.mjs,
+    // which is the copy the deploy actually runs.
+    delete env.VITE_PUBLIC_BUILD;
+    delete env.VITE_PRIVATE_BUILD;
+    delete env.RV_INTERNAL;
+    delete env.RV_SOURCEMAP;
+    env.RV_COMMERCIAL = '1';
   } else {
     // Private build: ensure VITE_PUBLIC_BUILD is NOT inherited from a prior public run.
     // VITE_PRIVATE_BUILD gates customer-facing pruning (e.g. no bundled example scenes).
@@ -447,6 +458,15 @@ export class BunnyClient {
 
 //! Loads + validates a project.json. Throws (with filename) when missing or
 //! when `code` / `name` are absent — so a deploy never lands under `undefined/`.
+//!
+//! **This is the one read boundary of the publish path**, so it is where the
+//! manifest gets its `documents[]` (plan-703 phase 9). `withDerivedDocuments()`
+//! lifts a genuinely unmigrated customer's `scenes[]` / `models[]` / `library[]`
+//! into the one list and drops the arrays — in memory only, nothing is written,
+//! no marker is minted. Consumers downstream therefore never have to ask which
+//! shape they were handed, and no consumer needs a legacy fallback of its own:
+//! `publishedSceneIndex()` carried one until this line existed, and a fallback
+//! per consumer is how two readers of the same file drift apart.
 // SOURCE: WebViewerToolbar.cs:1135 (LoadProject) + R6 validation — keep in sync
 export function loadProject(projectDir) {
   const jsonPath = join(projectDir, 'project.json');
@@ -455,7 +475,7 @@ export function loadProject(projectDir) {
   }
   let project;
   try {
-    project = JSON.parse(readFileSync(jsonPath, 'utf8'));
+    project = withDerivedDocuments(JSON.parse(readFileSync(jsonPath, 'utf8')));
   } catch (ex) {
     throw new Error(`Failed to parse ${jsonPath}: ${ex?.message ?? ex}`);
   }
@@ -566,27 +586,47 @@ export function readProjectSettingsFile(projectDir) {
   }
 }
 
-//! The curated Examples manifest (`scenes/index.json`, `[{file,name,mode}]`)
-//! derived from the manifest's `scenes[]` — plan-700 Phase 6.
+//! The curated Examples manifest (`scenes/index.json`, `[{file,name,mode,level}]`)
+//! derived from the manifest's scene documents — plan-700 Phase 6, moved onto
+//! `documents[]` by plan-413 phase 6.
 //!
 //! Only `baseKind: 'published'` entries whose `path` points into `scenes/`
 //! qualify: a customer's own scenes are Zone C and are not published Examples.
 //! Returns null when the manifest declares none, in which case the folder's own
 //! `index.json` (if any) is left exactly as it was — the folder stays SSOT for
 //! everything the manifest does not speak about (P0-3).
+//!
+//! The file must be a `.glb`. Since plan-413 phase 3 an example scene is a GLB
+//! like every other scene, and phase 6 removed the reader for anything else —
+//! publishing a `.scene.json` entry would deploy a catalogue row pointing at a
+//! format the viewer can no longer open.
+//!
+//! **No `scenes[]` fallback** (removed in plan-703 phase 9). It used to sit here
+//! for the customer nobody has opened in a current client; that case is now
+//! answered once, upstream, by `withDerivedDocuments()` in `loadProject()`, so
+//! by the time a manifest reaches this function it has a document list whatever
+//! shape it had on disk. Measured before deleting: of the eight real projects
+//! exactly one still carried a legacy `scenes[]` (`demo-realvirtual`), and both
+//! of its entries are `.scene.json`, which the `.glb` gate below rejects anyway
+//! — so the fallback published nothing on any input that exists.
 export function publishedSceneIndex(project) {
-  const scenes = Array.isArray(project?.scenes) ? project.scenes : [];
   const out = [];
-  for (const scene of scenes) {
-    if (!scene || typeof scene !== 'object') continue;
+  for (const scene of documentsInSection(project, 'scenes')) {
     if (scene.baseKind !== 'published') continue;
     const path = typeof scene.path === 'string' ? scene.path.replace(/^\.?\//, '') : '';
     if (!path.startsWith('scenes/')) continue;
     const file = path.slice('scenes/'.length);
-    if (!file || file.includes('/') || !file.endsWith('.scene.json')) continue;
+    if (!file || file.includes('/') || !file.toLowerCase().endsWith('.glb')) continue;
     const entry = { file };
     if (typeof scene.name === 'string' && scene.name) entry.name = scene.name;
     if (typeof scene.mode === 'string' && scene.mode) entry.mode = scene.mode;
+    // The classification cache travels into the catalogue so the dashboard can
+    // draw a bundled deploy's chips without downloading every example to read
+    // its bytes (plan-413 §2.5: a bundled source is never scanned).
+    const level = scene.classification && typeof scene.classification.level === 'string'
+      ? scene.classification.level
+      : null;
+    if (level) entry.level = level;
     out.push(entry);
   }
   return out.length > 0 ? out : null;
@@ -845,8 +885,12 @@ export function applyPublicModelAllowlist(distDir, { prefix = PUBLIC_MODEL_PREFI
 //! Prunes TEST example scenes from a freshly built public `dist/` so they never
 //! reach the public CDN (they stay in the repo + the dev Examples list):
 //!
-//!  1. `dist/scenes/<prefix>*.scene.json` — DELETE every example scene whose
-//!     filename starts with `prefix` (case-insensitive; default "Test").
+//!  1. `dist/scenes/<prefix>*.{glb,scene.json}` — DELETE every example scene
+//!     whose filename starts with `prefix` (case-insensitive; default "Test").
+//!     Examples are GLBs since plan-413 phase 3; `.scene.json` is still matched
+//!     because a dist built from an older source tree may still contain one, and
+//!     a pruner that silently stops pruning is how a test scene reaches the
+//!     public CDN.
 //!  2. `dist/scenes/index.json` — rewrite the curated Examples manifest to DROP
 //!     the entries that point at the deleted files, so the public demo's Examples
 //!     list never references (or 404s on) a test scene.
@@ -862,10 +906,10 @@ export function applyPublicScenePruning(distDir, { prefix = PUBLIC_TEST_SCENE_PR
 
   const pfx = String(prefix || PUBLIC_TEST_SCENE_PREFIX).toLowerCase();
 
-  // Step 1: delete test scene files (matched by name prefix + .scene.json).
+  // Step 1: delete test scene files (matched by name prefix + a scene extension).
   for (const entry of readdirSync(scenesDir, { withFileTypes: true })) {
     if (!entry.isFile()) continue;
-    if (!/\.scene\.json$/i.test(entry.name)) continue;
+    if (!/\.(glb|scene\.json)$/i.test(entry.name)) continue;
     if (entry.name.toLowerCase().startsWith(pfx)) {
       dropped.push(entry.name);
       if (!dryRun) rmSync(join(scenesDir, entry.name), { force: true });

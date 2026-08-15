@@ -17,7 +17,7 @@
  * library, and "Add library" would have been a button that adds something the
  * user never sees. This provider is that bridge.
  *
- * ## Three rules the mapping follows
+ * ## Two rules the mapping follows
  *
  * 1. **`remove?()` carries removability, not the UI.** A bundled catalog gets no
  *    `remove`, so a consumer derives `removable` from
@@ -25,15 +25,16 @@
  *    means. `_bundledUrls` is private to the store; the observable proxy is that
  *    a catalog injected via `addCatalogDirect` never records an origin.
  * 2. **`listEntries()` returns `[]`, it never throws.** A catalog that is still
- *    loading, errored, or waiting for a folder permission is an empty source,
- *    not an exception — one bad library must not take the whole tab with it.
- * 3. **`needsPermission` is a state, not an error.** The store encodes it as the
- *    `LOCAL_NEEDS_PERMISSION` sentinel inside `catalogErrors`; here the two are
- *    split again so the UI can offer "re-grant" instead of "failed to load".
+ *    loading or errored is an empty source, not an exception — one bad library
+ *    must not take the whole tab with it.
+ *
+ * The third rule used to be about `needsPermission`: a local working folder
+ * could be remembered but not yet re-granted, which is a state and not a
+ * failure. That whole source kind went with the work folder (plan-709 §2.6);
+ * a project folder handles its own permission at the project level.
  */
 
 import type { LibraryCatalogEntry } from './library-types';
-import { LOCAL_NEEDS_PERMISSION } from './library-types';
 import { isGitHubCatalogUrl, isGitHubRepoScanUrl } from './library-store';
 import { getLibraryStore } from './library-store-singleton';
 import {
@@ -61,15 +62,12 @@ export interface LibraryStoreLike {
   readonly catalogErrors: Map<string, string>;
   getOrigin(url: string): string | null;
   removeCatalog(url: string): void;
-  removeLocalFolder(): Promise<void>;
-  refreshLocalFolder(): Promise<void>;
+  /** Optional so long-standing test doubles keep compiling. */
+  refreshCatalog?(url: string): Promise<void>;
 }
 
 /** Human-readable fallback for a catalog whose manifest has not landed yet. */
 function fallbackLabel(url: string): string {
-  if (url.startsWith('local:')) {
-    return url.slice('local:'.length).replace(/\/library$/, '') || 'Local folder';
-  }
   try {
     const parsed = new URL(url);
     const last = parsed.pathname.split('/').filter(Boolean).pop();
@@ -81,7 +79,6 @@ function fallbackLabel(url: string): string {
 
 /** Which badge a catalog wears. `bundled` is "shipped, not subscribed". */
 function kindOf(url: string, origin: string | null): LibrarySource['kind'] {
-  if (url.startsWith('local:')) return 'local';
   if (isGitHubRepoScanUrl(url) || isGitHubCatalogUrl(url)) return 'github';
   // Injected via `addCatalogDirect` — no origin was ever recorded for it.
   if (origin === null) return 'bundled';
@@ -132,20 +129,14 @@ class GlobalLibraryProvider implements LibrarySourceProvider {
   private _toSource(url: string): LibrarySource {
     const store = this._store;
     const catalog = store.catalogs.get(url);
-    const rawError = store.catalogErrors.get(url) ?? null;
-    const needsPermission = rawError === LOCAL_NEEDS_PERMISSION;
-    // The permission sentinel is a state, not a failure — surfacing it as
-    // `error` would show "failed to load" where "re-grant access" belongs.
-    const error = needsPermission ? null : rawError;
+    const error = store.catalogErrors.get(url) ?? null;
     const origin = store.getOrigin(url);
     const kind = kindOf(url, origin);
 
-    const entries: LibraryCatalogEntry[] = needsPermission ? [] : (catalog?.entries ?? []);
+    const entries: LibraryCatalogEntry[] = catalog?.entries ?? [];
     const byId = new Map(entries.map(e => [e.id, e]));
 
-    const label = kind === 'local'
-      ? (catalog?.name?.replace(/^Local:\s*/, '') ?? fallbackLabel(url))
-      : (catalog?.name ?? fallbackLabel(url));
+    const label = catalog?.name ?? fallbackLabel(url);
 
     const source: LibrarySource = {
       id: url,
@@ -154,8 +145,7 @@ class GlobalLibraryProvider implements LibrarySourceProvider {
       // Global catalogs are read-only: they are fetched over HTTP or scanned
       // off disk, and nothing here can write back to either.
       writable: false,
-      loaded: catalog !== undefined && error === null && !needsPermission,
-      needsPermission,
+      loaded: catalog !== undefined && error === null,
       error,
       listEntries: () => entries,
       getEntry: (assetId: string) => byId.get(assetId) ?? null,
@@ -169,13 +159,14 @@ class GlobalLibraryProvider implements LibrarySourceProvider {
       },
     };
 
-    if (kind === 'local') {
-      source.refresh = () => store.refreshLocalFolder();
-      source.remove = () => store.removeLocalFolder();
-    } else if (kind !== 'bundled') {
+    if (kind !== 'bundled') {
       // A bundled catalog was shipped with the deploy, not subscribed to — it
-      // deliberately gets NO remove, which is what F6 reads off the source.
+      // deliberately gets NO remove and NO refresh, which is what F6 reads off
+      // the source. Every subscribed catalog (url/github/cloud) re-fetches.
       source.remove = async () => { store.removeCatalog(url); };
+      if (store.refreshCatalog) {
+        source.refresh = () => store.refreshCatalog!(url);
+      }
     }
 
     return source;

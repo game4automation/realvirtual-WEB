@@ -45,9 +45,10 @@
  *    read solely when the metadata answer is something other than "equal" —
  *    i.e. only when the body is needed either to confirm the divergence or to
  *    apply the folder version.
- *  - **"Folder wins" clears the per-scene draft.** Overwriting only
- *    `rv-scenes/<id>` would be undone by the next `openScene()`, which prefers
- *    `readSceneDraft(id)`. See {@link ProjectStore._applyFolderScene}.
+ *  - **"Folder wins" sweeps the dead per-scene draft slot.** Nothing reads it
+ *    since plan-413 phase 6, but leaving a key behind after the row it belonged
+ *    to was replaced is how stale state outlives its owner. See
+ *    {@link ProjectStore._applyFolderScene}.
  *
  * ## Cache provenance (plan-373)
  *
@@ -85,16 +86,41 @@ import {
   clearSceneDraft,
   getDraftScope,
   readScene,
-  readSceneDraft,
   setDraftScope,
   writeScene,
 } from '../hmi/scene/rv-scene-storage';
 import { setActiveSceneId } from '../hmi/scene/rv-scene-mutations';
-import type { RvScene } from '../hmi/scene/rv-scene-types';
+import { glbSceneShell, type RvScene } from '../hmi/scene/rv-scene-types';
 import { applySettingsBundle, type RVSettingsBundle } from '../hmi/rv-settings-bundle';
 import {
+  readSettingsFile,
+  updateManifestCas,
   writeManifest,
 } from './rv-project-storage';
+import {
+  migrateProjectScriptRefs,
+  readScriptRefMigrationMarker,
+} from './rv-project-refs-migration';
+import { knowledgeForDocument, type RvKnowledge } from './rv-project-knowledge';
+import {
+  CONNECT_MIGRATION_HANDOFF,
+  migrateConnectRefs,
+  parseConnectMigrationHandoff,
+  readConnectRefMigrationMarker,
+} from './rv-project-connect-ref-migration';
+import { discoverDeclaredScriptRefs } from '../rv-model-plugin-manager';
+import {
+  adoptDiscoveredDocuments as adoptScan,
+  applyAdoptDelta,
+  isSidecarMigrated,
+  mintReferencedAssets,
+  mintableReferences,
+  type AdoptLogEntry,
+  type AdoptSidecarIngestion,
+  type WrittenGlbReference,
+} from './rv-asset-identity';
+import { ingestionFromSidecar, SIDECAR_PATH } from '../library/library-sidecar-ingest';
+import { parseSidecar } from '../library/library-sidecar';
 import type { FolderWriterHost, FolderWriterStatus } from './rv-project-folder-writer';
 import {
   BundledBackend,
@@ -104,12 +130,34 @@ import {
 } from './backends/bundled-backend';
 import { FolderBackend } from './backends/folder-backend';
 import type { ProjectBackend, ProjectReadProvider } from './backends/project-backend';
+import { isSelfContainedGlb, type ProjectAssetSource } from './rv-project-asset-source';
+import { revisionOfBytes, type SceneRecord } from './rv-scene-record';
 import {
-  hiddenIdsOf, mergeAssetTiers, mergeSceneTiers,
-  type TieredAssetEntry, type TieredSceneEntry,
+  hiddenIdsOf, mergeAssetTiers, mergeDocumentTiers,
+  type TieredAssetEntry, type TieredDocumentEntry,
 } from './rv-project-tiers';
+import {
+  classificationEquals,
+  type DocumentClassification,
+} from './rv-document-classification';
+import { writeDocumentClassification } from './rv-document-classify';
+import {
+  classificationOfGlbBlob,
+  documentKeyOf,
+  documentOfSceneEntry,
+  assetDocumentsOf,
+  reconcileClassificationCache,
+  sceneDocumentsOf,
+  sectionOfDocument,
+  type DocumentStat,
+} from './rv-project-documents';
 import { readRecentProjects, recordRecentProject } from './rv-project-recent';
 import { getWorkspaceHandle } from './rv-project-workspace';
+import {
+  ensureWorkspaceDefaultManifest,
+  isWorkspaceDefaultBackend,
+  openWorkspaceDefaultBackend,
+} from './rv-workspace-default';
 import {
   cachedFromProject,
   isCacheFromOtherProject,
@@ -124,6 +172,7 @@ import {
 } from './rv-project-conflict';
 import {
   newProject,
+  type RvDocumentEntry,
   type RvProject,
   type RvProjectAssetEntry,
   type RvProjectSceneEntry,
@@ -161,13 +210,7 @@ export interface ProjectSnapshot {
   /** Where the open project's bytes live. Null when nothing is open. */
   backendKind: 'bundled' | 'browser' | 'folder' | null;
   /**
-   * The two tiers merged into one display list (§2.3), each entry tagged.
-   *
-   * Computed once per publish rather than per read — see {@link sceneIds}.
-   */
-  scenes: TieredSceneEntry[];
-  /**
-   * The project's own base models, tier-tagged like {@link scenes} (§2.3).
+   * The project's own base models, tier-tagged (§2.3).
    *
    * Manifest-driven, exactly like the scene list — which is what keeps another
    * project's models out of this one. The deploy-wide `viewer.availableModels`
@@ -176,14 +219,14 @@ export interface ProjectSnapshot {
    */
   models: TieredAssetEntry[];
   /**
-   * Ids the project owns across both tiers.
+   * **The one list** (plan-413 §2.4) — every scene, model and library asset of
+   * the open project, tier-tagged.
    *
-   * **Cached deliberately.** `getProjectSceneIds()` used to mint a fresh
-   * `Set` on every call, which is fine for a plain call and fatal under
-   * `useSyncExternalStore`: a new object identity on every read is a
-   * permanent "the store changed" signal and React re-renders forever.
+   * It was published beside a `scenes` mirror and a `sceneIds` set while the UI
+   * was moved over; both are gone with the scene catalogue (plan-716 Phase 6),
+   * and this is now the only artefact list the snapshot carries.
    */
-  sceneIds: Set<string>;
+  documents: TieredDocumentEntry[];
 }
 
 export interface OpenProjectOptions {
@@ -219,6 +262,29 @@ export interface ResolveProjectOptions {
    * never writable, so nothing can be written back to someone else's host.
    */
   remoteBaseUrl?: string;
+  /**
+   * Open "My Workspace" when nothing else resolved (plan-716 §2.2 / F2).
+   * Defaults to **true** — that branch is the boot default now.
+   *
+   * `false` restores the pre-716 resolution, in which the read-only bundled
+   * demo answered "no folder project". It exists for the nets that pin the
+   * BUNDLED TIER itself (project-two-tier, the bundled half of boot-order):
+   * those ask what a bundled project resolves to, not what a boot with no
+   * project should open, and F2 keeps the bundled demo reachable on purpose.
+   * Production never passes it.
+   */
+  workspaceDefault?: boolean;
+  /**
+   * Run the eager scene→document migration inside the workspace branch
+   * (plan-716 §2.3 / F3). Defaults to **true** — it is the boot behaviour.
+   *
+   * `false` is for the nets that pin the RESOLUTION and nothing else. The
+   * migration writes, so leaving it on would make every boot-order assertion
+   * about "nothing reached storage yet" depend on whether the fixture happened
+   * to seed a catalogue. Production never passes it; the migration's own net
+   * calls {@link runWorkspaceScenesMigration} directly.
+   */
+  migrateScenes?: boolean;
 }
 
 /** What boot needs before the `SceneStore` exists. */
@@ -235,9 +301,10 @@ export interface ResolvedActiveProject {
 /** Minimal view of SceneStore that this store needs. Keeps the import one-way. */
 export interface SceneStoreLike {
   setSceneHydrator(fn: ((id: string) => Promise<boolean>) | null): void;
-  refreshScenesFromStorage?(): void;
   /** Used by the dirty guard to see whether the workspace has unsaved edits. */
   getSnapshot?(): { dirty?: boolean; draft?: { name?: string } | null };
+  /** Used by the unload guard: edits a reload would actually destroy. */
+  hasUnpersistedWork?(): boolean;
 }
 
 // ─── Conflict prompt (§4c) ──────────────────────────────────────────────
@@ -284,6 +351,41 @@ export type SceneConflictPrompt = (
 
 // ─── Dirty guard (§4e) ──────────────────────────────────────────────────
 
+/** One open document with unsaved work, as the exit guard names it. */
+export interface ProjectDirtyDocument {
+  name: string;
+  /** Position in the document stack; 0 is the root document (plan-703 §2.7.1). */
+  depth: number;
+}
+
+/**
+ * What the open document stack reports to the project-level exit guard.
+ *
+ * A **probe**, not a subscription: the guard asks once, at the moment of the
+ * switch, and a stale cached answer there would be the difference between
+ * losing work and not. Returning `[]` (or installing nothing) means "no open
+ * document has unsaved work", which is also the correct answer for every
+ * headless caller.
+ *
+ * plan-703 §2.7.3 is explicit that this spans the WHOLE stack and not only the
+ * top frame: with N draft slots a user can be three levels deep with two of them
+ * dirty, and a guard that asked about the top one would discard the other.
+ */
+export type ProjectDirtyDocumentsProbe = () => readonly ProjectDirtyDocument[];
+
+/**
+ * Whether any open document would lose work to a PAGE RELOAD (plan-710 F7).
+ *
+ * A second, deliberately separate probe rather than a flag on
+ * {@link ProjectDirtyDocument}. The dirty-documents probe feeds
+ * {@link ProjectStore.hasUnsavedWork} and through it the project switch/close
+ * dialog, which asks a different question ("is anything unsaved") and must keep
+ * answering it exactly as before. Widening that list to include documents that
+ * are merely mid-write would have changed the switch dialog as a side effect of
+ * fixing the unload guard — so the two questions get two probes.
+ */
+export type ProjectUnpersistedWorkProbe = () => boolean;
+
 export interface ProjectDirtyContext {
   reason: 'switch' | 'close';
   /** Project being left. */
@@ -294,6 +396,13 @@ export interface ProjectDirtyContext {
   sceneDirty: boolean;
   /** A folder write is still queued or has failed. */
   diskPending: boolean;
+  /**
+   * Open documents with unsaved work, bottom frame first (plan-703 §2.7.3).
+   *
+   * Empty on every path that has no editor open, which is why it is safe for the
+   * dialog to render it unconditionally.
+   */
+  dirtyDocuments: readonly ProjectDirtyDocument[];
 }
 
 /**
@@ -308,6 +417,73 @@ export interface ProjectDirtyContext {
 export type ProjectDirtyGuard = (
   context: ProjectDirtyContext,
 ) => Promise<'proceed' | 'cancel'> | 'proceed' | 'cancel';
+
+// ─── Adopt (plan-717 §2.2) ──────────────────────────────────────────────
+
+/** What one adopt run did. Zeroes throughout mean "nothing to do". */
+export interface AdoptRunSummary {
+  adopted: number;
+  moved: number;
+  quarantined: number;
+  restored: number;
+  removed: number;
+  /** Files whose bytes were hashed — the first-run cost of §2.2 step 2. */
+  hashed: number;
+  /** Row fields filled from `library.json`, plus the marker itself (§2.4). */
+  ingested: number;
+  /** True when the sidecar file was removed after a successful commit (R1-S3). */
+  sidecarRemoved: boolean;
+  /** True when a sidecar exists that this build cannot parse — reported, never touched. */
+  sidecarUnreadable: boolean;
+  durationMs: number;
+}
+
+/** Injectables the adopt verb takes from the store. Tests only. */
+export interface AdoptStoreOptions {
+  now?: () => number;
+  quarantineMs?: number;
+  log?: (entry: AdoptLogEntry) => void;
+}
+
+/** The browser backend's durable manifest half, duck-typed like `rv-document-ops` does. */
+type ManifestWritingBackend = { writeManifest(project: RvProject): Promise<void> };
+
+/** The audit trail. One line per write the adopt verb makes — never silent (§2.2). */
+function defaultAdoptLog(entry: AdoptLogEntry): void {
+  const where = entry.from ? `${entry.from} → ${entry.path}` : entry.path;
+  const detail = entry.detail ? ` (${entry.detail})` : '';
+  console.info(`[project-store] adopt ${entry.kind}: ${where}${entry.id ? ` [${entry.id}]` : ''}${detail}`);
+}
+
+/**
+ * Point the scan-derived display rows at the authored rows the adopt just wrote.
+ *
+ * Without this the listing would keep showing the transient path-id for the
+ * rest of the session, because the two halves are keyed differently: the folder
+ * backend re-attaches manifest rows BY PATH before `documentsFromLists` sees
+ * them (that pre-merge is the only reason an authored id survives a folder
+ * listing at all), while the in-memory `_userDocuments` came from the listing
+ * before the rows existed. Merging by path here is the same join, one layer up.
+ *
+ * The manifest row wins on every field it has — that is what "the row is the
+ * truth" means — except the classification, which the scan may have read out of
+ * the file just now and a freshly adopted row does not carry yet.
+ */
+function repointToManifestRows(
+  documents: readonly RvDocumentEntry[],
+  project: RvProject,
+): RvDocumentEntry[] {
+  const rows = new Map<string, RvDocumentEntry>();
+  for (const row of project.documents ?? []) {
+    if (typeof row?.path === 'string') rows.set(row.path.replace(/\\/g, '/'), row);
+  }
+  if (rows.size === 0) return [...documents];
+  return documents.map((doc) => {
+    const row = rows.get((doc.path ?? '').replace(/\\/g, '/'));
+    if (!row || row === doc) return doc;
+    return { ...doc, ...row, classification: row.classification ?? doc.classification };
+  });
+}
 
 // ─── Store ──────────────────────────────────────────────────────────────
 
@@ -326,16 +502,24 @@ export class ProjectStore {
   private _resolved: { backend: ProjectBackend; project: RvProject } | null = null;
   /** Folder handle of a resolved-but-not-yet-hydrated project. */
   private _pendingDir: FileSystemDirectoryHandle | null = null;
-  /** Bundled-tier scene entries of the open project, for the two-tier merge. */
-  private _bundledScenes: RvProjectSceneEntry[] = [];
   private _bundledModels: RvProjectAssetEntry[] = [];
   private _userModels: RvProjectAssetEntry[] = [];
+  /** Backend document listing of the open project, split by tier like the models. */
+  private _bundledDocuments: RvDocumentEntry[] = [];
+  private _userDocuments: RvDocumentEntry[] = [];
   private _sceneStore: SceneStoreLike | null = null;
   private _warnings: string[] = [];
   private _unloadHandler: (() => void) | null = null;
   private _conflictPrompt: SceneConflictPrompt | null = null;
   private _dirtyGuard: ProjectDirtyGuard | null = null;
+  /** plan-703 §2.7.3 — unsaved work in open documents, across the whole stack. */
+  private _dirtyDocuments: ProjectDirtyDocumentsProbe | null = null;
+  private _unpersistedDocuments: ProjectUnpersistedWorkProbe | null = null;
   private _lastConflicts: SceneConflictPromptItem[] = [];
+  /** The single adopt run in flight, or null (plan-717 §2.2, R1-A2). */
+  private _adoptRun: Promise<AdoptRunSummary> | null = null;
+  /** Test seams for the adopt verb — clock, quarantine window, audit sink. */
+  private _adoptOptions: AdoptStoreOptions = {};
 
   private _listeners = new Set<() => void>();
   private _snapshot: ProjectSnapshot = emptySnapshot();
@@ -354,22 +538,6 @@ export class ProjectStore {
 
   /** True when a project is open AND the folder accepted a readwrite grant. */
   isWritable(): boolean { return this._writable; }
-
-  /**
-   * Ids of the scenes this project owns — the basis for Models-panel scoping.
-   *
-   * The union of both tiers (§2.3.1 rule 5), and the **same `Set` instance**
-   * until something actually changes. Returning a fresh one per call spins
-   * `useSyncExternalStore` forever.
-   */
-  getProjectSceneIds(): Set<string> {
-    return this._snapshot.sceneIds;
-  }
-
-  /** The two tiers merged into one display list, each entry tagged (§2.3). */
-  getProjectScenes(): TieredSceneEntry[] {
-    return this._snapshot.scenes;
-  }
 
   /** The backend backing the open project, or null. */
   getBackend(): ProjectBackend | null { return this._backend; }
@@ -461,6 +629,27 @@ export class ProjectStore {
     this._dirtyGuard = guard;
   }
 
+  /**
+   * Install the probe that reports unsaved OPEN DOCUMENTS (plan-703 §2.7.3).
+   *
+   * The asset editor installs it for the whole app lifetime, not per mode: the
+   * question "does anything unsaved exist" is asked from a *different* surface
+   * (the projects dashboard), and a probe that only existed while editor mode
+   * was active would answer "no" precisely when it matters.
+   */
+  setDirtyDocumentsProbe(probe: ProjectDirtyDocumentsProbe | null): void {
+    this._dirtyDocuments = probe;
+  }
+
+  /**
+   * Install the probe that reports open documents with an ARMED draft write
+   * (plan-710 F7). Installed alongside the dirty probe, for the same lifetime
+   * and the same reason — see {@link setDirtyDocumentsProbe}.
+   */
+  setUnpersistedWorkProbe(probe: ProjectUnpersistedWorkProbe | null): void {
+    this._unpersistedDocuments = probe;
+  }
+
   /** Conflicts raised by the most recent open. Diagnostics and tests. */
   getLastConflicts(): SceneConflictPromptItem[] {
     return [...this._lastConflicts];
@@ -478,7 +667,14 @@ export class ProjectStore {
    */
   async openDemoProject(): Promise<boolean> {
     const backend = this.getBundledBackend();
-    if (this._backend === backend) return true;
+    // "Already open" must mean OPEN AND PUBLISHED. A half-adopted state
+    // (backend set, adoption aborted before publish) used to satisfy the bare
+    // identity check, so every click reported success and rendered nothing.
+    // Re-publishing here is what heals that state instead of preserving it.
+    if (this._backend === backend && this._project) {
+      this._publish();
+      return true;
+    }
     if (this._backend && await this._runDirtyGuard('switch') === 'cancel') return false;
     if (this._backend) await this.closeProject();
     const project = await backend.readManifest();
@@ -581,7 +777,6 @@ export class ProjectStore {
     this._provider = backend;
     this._project = project;
     this._writable = backend.writable;
-    this._bundledScenes = await this._readBundledTier(backend, project);
     // Both halves come from the BACKEND, not from the manifest field: a folder
     // project enumerates its models/ folder (every GLB in it belongs to the
     // project), while the read-only HTTP project has only what the manifest
@@ -591,6 +786,15 @@ export class ProjectStore {
     const isBundledBackend = backend.kind === 'bundled';
     this._bundledModels = isBundledBackend ? backendModels : [];
     this._userModels = isBundledBackend ? [] : backendModels;
+
+    // The one list, split by the same tier rule and reconciled against the
+    // files before anybody sees it (§2.5). Failure is non-fatal by design: an
+    // out-of-date classification cache is a display detail, and letting it take
+    // a project open down would be the worst possible trade.
+    const documents = await backend.listDocuments().catch(() => []);
+    const scanned = await this._scanClassifications(backend, documents);
+    this._bundledDocuments = isBundledBackend ? scanned : [];
+    this._userDocuments = isBundledBackend ? [] : scanned;
 
     // RR4 — isolate this project's per-base drafts from every other context.
     //
@@ -602,31 +806,40 @@ export class ProjectStore {
     // `closeProject()` would `clearDraftsForScope()` them away. The unscoped
     // keyspace *is* Sample's keyspace (§2.4); that is what "the loose scenes
     // belong to Sample" means in storage terms.
-    setDraftScope(backend.kind === 'bundled' ? null : project.id);
+    //
+    // "My Workspace" inherits that exception verbatim (plan-716 §2.2, Risiko 4).
+    // It is now the project adopted on every boot without a folder — the exact
+    // role the comment above describes — so the unscoped keyspace is ITS
+    // keyspace. Scoping it to `workspace-default:<baseKey>` would hide every
+    // pre-716 draft and then have `closeProject()` clear them away, which is the
+    // draft loss the plan forbids. The scoped/unscoped rename of the draft slots
+    // is Phase 2's job (§2.3e), not a side effect of wiring the project up.
+    const unscoped = backend.kind === 'bundled' || isWorkspaceDefaultBackend(backend);
+    setDraftScope(unscoped ? null : project.id);
 
     await this._reconcileScenes(project);
     await this._seedSceneMetas(project);
     await this._applySettings(project);
 
     await backend.activate();
+    // The one write that "creates" My Workspace, and the first legal moment for
+    // it: `writeManifest()` refuses on an inactive backend. Idempotent on the
+    // fixed key, so a second boot writes nothing (Risiko 7).
+    await ensureWorkspaceDefaultManifest(backend, project);
     if (backend instanceof FolderBackend) backend.onStatus(() => this._publish());
     this._installUnloadFlush();
-  }
 
-  /**
-   * The bundled tier of the project being opened (§2.3).
-   *
-   * For a bundled backend the manifest *is* the bundled tier. For a folder
-   * project there is no bundled tier at all — its content is what the folder
-   * holds, full stop; the shipped demos belong to the Sample project, not to
-   * a customer's git repo.
-   */
-  private async _readBundledTier(
-    backend: ProjectBackend,
-    project: RvProject,
-  ): Promise<RvProjectSceneEntry[]> {
-    if (backend.kind !== 'bundled') return [];
-    return project.scenes ?? [];
+    // plan-717 §2.2 — the adopt verb, at the END of the open and never before
+    // `activate()`: the folder writer does not exist until then, and the adopt
+    // works on `this._project`, which the steps above may have replaced. Every
+    // caller of this method publishes right after it, so the run defers its own
+    // publish and the whole open stays at one (R1-A3b).
+    await this._adoptQuietly();
+    // plan-718 §2.7 — AFTER adopt, and it has to be: the migration binds
+    // document ROWS, and on a folder project the rows for `models/**` do not
+    // exist until the adopt run has created them.
+    await this._migrateScriptRefsQuietly();
+    await this._adoptConnectHandoffQuietly();
   }
 
   /** Callbacks the folder writer needs from this store. */
@@ -765,6 +978,65 @@ export class ProjectStore {
       }
     }
 
+    // A deploy that publishes its own `project.json` keeps winning over the
+    // implicit workspace below (plan-716 §2.2). Hoisted above the new branch
+    // rather than folded into it: a delivered Bunny/CONNECT build IS a project,
+    // named by whoever published it, and answering that visitor with an empty
+    // local "My Workspace" would hide the very thing they opened. Behaviour for
+    // such a root is unchanged — it resolved to `bundled` before too, just from
+    // the fallback below. `readManifest()` is memoised, so asking here costs the
+    // one fetch the fallback would have made anyway.
+    if (!backend) {
+      const deployed = await bundled.readManifest();
+      if (deployed && bundled.hasDeployedManifest()) {
+        backend = bundled;
+        project = deployed;
+      }
+    }
+
+    // "My Workspace" — the writable home every document has (plan-716 F2/§2.2).
+    //
+    // Before the bundled fallback and after every explicit project, so the
+    // read-only demo stops being the answer to "no folder project" and becomes
+    // what it is: a source, opened on purpose (`?scene=builtin:`, `openBuiltin`,
+    // the demo entry in the dashboard — all unchanged).
+    //
+    // The fixed id is the entire duplicate guard (Risiko 7): opening is the only
+    // operation, and it always addresses the same project. Nothing is written
+    // here — the manifest row is a marker written later from `_adoptProject()`,
+    // because this function's contract is that it opens the backend read-only.
+    //
+    // ── Phase 2 (§2.3) DOCKED HERE ─────────────────────────────────────────
+    // The eager scene→document migration runs AWAITED at this point, inside
+    // this branch and before the resolve returns: `main.ts` already awaits
+    // `resolveActiveProject()`, which puts the migration structurally before
+    // `initSceneStore()` and before the `?scene=` routing that needs the alias
+    // map. Do not move it into `hydrateProjectScenes()` — that runs after both.
+    //
+    // The migration WRITES, and this function promises it does not
+    // (boot-order.test.ts: `resolved.backend.isActive === false`). Both stay
+    // true because the migration opens and activates its OWN backend instance
+    // for the workspace project and deactivates it again — `BrowserBackend`
+    // keys every byte off the project id, so a second instance addresses
+    // exactly the same storage while the instance handed back from here is
+    // never touched. The manifest is read AFTER the migration, so the returned
+    // project already lists the converted documents.
+    if (!backend && opts.workspaceDefault !== false) {
+      try {
+        const workspace = openWorkspaceDefaultBackend();
+        if (opts.migrateScenes !== false) await this._migrateWorkspaceScenes();
+        const manifest = await workspace.readManifest();
+        if (manifest) {
+          backend = workspace;
+          project = manifest;
+        }
+      } catch (e) {
+        // Storage disabled (private mode, a hostile embedder) — the bundled
+        // fallback below is still a valid answer, and boot must not die here.
+        console.warn('[project] My Workspace unavailable, falling back:', e);
+      }
+    }
+
     if (!backend) {
       backend = bundled;
       project = await bundled.readManifest();
@@ -773,8 +1045,12 @@ export class ProjectStore {
     this._resolved = project ? { backend, project } : null;
     this._pendingDir = dir;
 
-    const models = project?.models ?? (await backend.listModels());
-    const scenes = project?.scenes ?? (await backend.listScenes());
+    // The manifest first, the folder scan second — same order the pre-413 code
+    // had. A discovered folder whose `models/` has not been scanned yet still
+    // has to show what its manifest declares.
+    const declaredModels = assetDocumentsOf(project, 'models');
+    const models = declaredModels.length > 0 ? declaredModels : await backend.listModels();
+    const scenes = sceneDocumentsOf(project);
     return {
       project,
       backend,
@@ -782,6 +1058,40 @@ export class ProjectStore {
       scenes,
       kind: backend.kind,
     };
+  }
+
+  /**
+   * Run the eager scene→document migration, reporting progress on the existing
+   * info overlay (plan-716 §2.3, Risiko 10).
+   *
+   * Lazily imported so a boot that resolves a folder project never pulls the
+   * migration — or the overlay — into its critical path. Never throws: the
+   * migration already swallows its own failures, and this wrapper adds the
+   * overlay's teardown to the same guarantee.
+   */
+  private async _migrateWorkspaceScenes(): Promise<void> {
+    const [{ runWorkspaceScenesMigration }, overlay] = await Promise.all([
+      import('./rv-workspace-migration'),
+      import('../hmi/info-overlay-store'),
+    ]);
+    // The overlay is driven by `onProgress`, which fires only when there is a
+    // row to convert. A profile with no catalogue — every boot after the first
+    // — therefore shows nothing at all, rather than flashing a box for the two
+    // `getItem`s the migration costs it.
+    let shown = false;
+    try {
+      const result = await runWorkspaceScenesMigration({
+        onProgress: (done, total) => {
+          shown = true;
+          overlay.showInfoOverlay(`Converting ${done} of ${total}…`);
+        },
+      });
+      if (result.skipped.some(s => s.reason === 'alias-failed' || s.reason === 'write-failed')) {
+        console.warn('[project] some scenes could not be converted:', result.skipped);
+      }
+    } finally {
+      if (shown) overlay.hideInfoOverlay();
+    }
   }
 
   /**
@@ -830,7 +1140,16 @@ export class ProjectStore {
     this._dir = this._pendingDir;
     this._pendingDir = null;
 
-    await this._adoptProject(resolved.backend, resolved.project);
+    // Publish whatever was adopted even when a later step throws. Before this
+    // guard, a throw out of `_adoptProject` left `_backend`/`_project` set but
+    // NEVER published — the dashboard then rendered "no project" while
+    // `openDemoProject()`'s identity shortcut kept answering "already open",
+    // a permanently wedged first screen with no visible error.
+    try {
+      await this._adoptProject(resolved.backend, resolved.project);
+    } finally {
+      this._publish();
+    }
 
     if (resolved.backend.kind === 'folder' && this._dir) {
       const dir = this._dir;
@@ -855,11 +1174,40 @@ export class ProjectStore {
    * anyway — either to confirm a real divergence or to apply the folder
    * version.
    */
+  /**
+   * `readScene`, but a cached record this build can no longer parse reads as
+   * ABSENT instead of throwing.
+   *
+   * One legacy record used to abort the whole adoption: `readScene` throws
+   * `LegacyFormatError`, `_reconcileScenes` let it out, and `main.ts` answered
+   * with "Project restore skipped" — the user's project did not open because
+   * of one stale CACHE row, with an error telling them to install the previous
+   * release. The cache is never authoritative (the project file is), so the
+   * only honest reading of an unreadable cache row is "nothing cached": the
+   * reconcile skips it, and a hydrate falls through to the folder read, which
+   * overwrites the row in the current format — the cache heals itself.
+   */
+  private _readCachedScene(id: string, label?: string): RvScene | null {
+    try {
+      return readScene(id);
+    } catch (e) {
+      this._warnings.push(
+        `The cached copy of "${label ?? id}" is in an old format and was ignored — the project file stays authoritative.`,
+      );
+      console.warn('[project] legacy cached scene ignored:', id, e);
+      return null;
+    }
+  }
+
   private async _reconcileScenes(project: RvProject): Promise<void> {
-    const entries = project.scenes ?? [];
+    const entries = sceneDocumentsOf(project);
     if (entries.length === 0) return;
 
-    const conflicts: Array<{ item: SceneConflictPromptItem; entry: RvProjectSceneEntry; body: RvScene | null }> = [];
+    const conflicts: Array<{
+      item: SceneConflictPromptItem;
+      entry: RvProjectSceneEntry;
+      body: { scene: RvScene; revision: string } | null;
+    }> = [];
 
     for (const entry of entries) {
       if (!entry?.id) continue;
@@ -867,15 +1215,21 @@ export class ProjectStore {
       // cached. Cheap: the marker only writes when something actually changes.
       noteSceneMembership(entry.id, project.id);
 
-      const saved = readScene(entry.id);
-      const draft = readSceneDraft(entry.id);
-      if (!saved && !draft) continue;   // nothing cached — nothing to reconcile
+      const saved = this._readCachedScene(
+        entry.id,
+        typeof entry.name === 'string' ? entry.name : undefined,
+      );
+      if (!saved) continue;   // nothing cached (or nothing readable) — nothing to reconcile
 
       const folderModifiedAt = typeof entry.modifiedAt === 'string' ? entry.modifiedAt : null;
+      const folderRevision = typeof entry.revision === 'string' ? entry.revision : null;
+      // `draft: null` throughout: the op-log draft slot is gone (plan-413
+      // phase 6), an autosave has been a GLB body since plan-397, and the
+      // conflict question is now about the saved catalogue row alone.
       const byMeta = resolveSceneConflict({
         saved,
-        draft,
-        folder: { modifiedAt: folderModifiedAt },
+        draft: null,
+        folder: { modifiedAt: folderModifiedAt, revision: folderRevision },
       });
       if (byMeta === 'equal' || byMeta === 'cache-wins') continue;
 
@@ -885,11 +1239,11 @@ export class ProjectStore {
 
       const item: SceneConflictPromptItem = {
         id: entry.id,
-        name: saved?.name ?? draft?.name ?? entry.name ?? entry.id,
+        name: saved.name || entry.name || entry.id,
         folderName: typeof entry.name === 'string' ? entry.name : undefined,
-        cacheModifiedAt: cacheModifiedAt(saved, draft),
+        cacheModifiedAt: cacheModifiedAt(saved, null),
         folderModifiedAt,
-        hasUnsavedDraft: hasUnsavedDraft(saved, draft),
+        hasUnsavedDraft: hasUnsavedDraft(saved, null),
         ...(foreignFrom
           ? {
               cachedFromProjectId: foreignFrom,
@@ -910,8 +1264,8 @@ export class ProjectStore {
 
       const decided: SceneConflictResolution = resolveSceneConflict({
         saved,
-        draft,
-        folder: { modifiedAt: folderModifiedAt, scene: body },
+        draft: null,
+        folder: { modifiedAt: folderModifiedAt, revision: folderRevision ?? body.revision, scene: body.scene },
       });
       if (decided === 'folder-wins') this._applyFolderScene(entry.id, body, project.id);
       else if (decided === 'prompt') conflicts.push({ item, entry, body });
@@ -946,9 +1300,9 @@ export class ProjectStore {
         setCachedFrom(item.id, project.id);
         continue;
       }
-      const scene = body ?? await this._readSceneBody(entry);
-      if (!scene) continue;
-      this._applyFolderScene(item.id, scene, project.id);
+      const chosen = body ?? await this._readSceneBody(entry);
+      if (!chosen) continue;
+      this._applyFolderScene(item.id, chosen, project.id);
     }
   }
 
@@ -964,35 +1318,81 @@ export class ProjectStore {
     }
   }
 
-  private async _readSceneBody(entry: RvProjectSceneEntry): Promise<RvScene | null> {
+  /**
+   * Read one scene body as an `RvScene`.
+   *
+   * ## Why a GLB body can be an `RvScene` after all
+   *
+   * Phase 5 left this branch as a deliberate dead end, because everything
+   * downstream (hydration into `rv-scenes/<id>`, the draft machinery,
+   * conflict resolution via `scenesEqual`/`modifiedAt`) is written against
+   * `RvScene` and cannot be handed bytes — and half-converting that chain
+   * would have lost the six categories the op log never carried.
+   *
+   * Phase 6 resolves it without converting the chain at all. A baked scene
+   * **is** a base plus an empty op log, which is an `RvScene` in good
+   * standing — its base simply names the scene id rather than a URL
+   * ({@link glbSceneShell}). Every consumer below keeps working unchanged;
+   * only `SceneStore` has to know that such a base needs resolving to bytes
+   * before it can be loaded, and it is the one component that already talks
+   * to the storage layer.
+   *
+   * There is no second branch any more: a record is bytes (plan-413 phase 6),
+   * and a stored JSON body is refused by the backend with the F10 error rather
+   * than handed back here as something to convert.
+   */
+  private async _readSceneBody(
+    entry: RvProjectSceneEntry,
+  ): Promise<{ scene: RvScene; revision: string } | null> {
     if (!this._provider || typeof entry.path !== 'string') return null;
+    let record: SceneRecord | null;
     try {
-      const scene = await this._provider.readScene(entry.path);
-      if (!scene) {
-        this._warnings.push(`"${entry.path}" is missing or not a valid scene.`);
-        return null;
-      }
-      return scene;
+      record = await this._provider.readScene(entry.path);
     } catch {
       this._warnings.push(`Could not read "${entry.path}".`);
       return null;
     }
+    if (!record) {
+      this._warnings.push(`"${entry.path}" is missing or not a valid scene.`);
+      return null;
+    }
+    // The body itself is not cached here — only the shell that points at it.
+    // Putting megabytes of GLB into localStorage is what plan-397 phase 6 exists
+    // to stop; the bytes stay in the project folder / OPFS and are fetched at
+    // load time through `rv-scene-glb-io`. The revision travels with the shell so
+    // the caller can record what the cache was filled from — without it, every
+    // later write would have to be unconditional and §2.8's compare-and-swap
+    // would never have a baseline.
+    return {
+      scene: glbSceneShell({
+        id: entry.id,
+        name: entry.name || entry.id,
+        revision: record.revision,
+        createdAt: typeof entry.createdAt === 'string' ? entry.createdAt : undefined,
+        modifiedAt: typeof entry.modifiedAt === 'string' ? entry.modifiedAt : undefined,
+      }),
+      revision: record.revision,
+    };
   }
 
   /**
    * Let the folder version win for one scene.
    *
-   * The `clearSceneDraft` is not housekeeping — `openScene()` loads
-   * `readSceneDraft(id) ?? scene`, so a surviving draft would put the losing
-   * version straight back on top and make the resolution a lie.
+   * The `clearSceneDraft` is belt and braces since the draft reader went: it
+   * removes a slot nothing consults any more, so a later build cannot resurrect
+   * the losing version out of it.
    */
-  private _applyFolderScene(id: string, scene: RvScene, projectId: string): void {
-    writeScene({ ...scene, id });
+  private _applyFolderScene(
+    id: string,
+    body: { scene: RvScene; revision: string },
+    projectId: string,
+  ): void {
+    writeScene({ ...body.scene, id });
     clearSceneDraft(id);
     // The cache now demonstrably holds this project's body — recording it is
-    // what lets a later open of the *other* owner detect the divergence.
-    setCachedFrom(id, projectId);
-    this._sceneStore?.refreshScenesFromStorage?.();
+    // what lets a later open of the *other* owner detect the divergence. The
+    // revision goes with it: it is what the next write compares against.
+    setCachedFrom(id, projectId, body.revision);
   }
 
   // ─── Hydration (lazy, §4b) ────────────────────────────────────────────
@@ -1005,7 +1405,7 @@ export class ProjectStore {
    * only way to notice is to read it back.
    */
   private async _seedSceneMetas(project: RvProject): Promise<void> {
-    const entries = project.scenes ?? [];
+    const entries = sceneDocumentsOf(project);
     if (entries.length === 0) return;
 
     const activeId = typeof project.activeSceneId === 'string' ? project.activeSceneId : null;
@@ -1032,7 +1432,10 @@ export class ProjectStore {
   async hydrateScene(id: string): Promise<boolean> {
     const activeProjectId = this._project?.id ?? null;
     const foreign = isCacheFromOtherProject(id, activeProjectId);
-    if (readScene(id) && !foreign) {
+    // Tolerant read: a legacy-format cache row counts as "not cached", so the
+    // hydrate falls through to the folder read below and `writeScene`
+    // replaces the row in the current format.
+    if (this._readCachedScene(id) && !foreign) {
       // Claim an unknown-origin cache for the open project: from here on the
       // question "whose body is this?" has an answer, so the *other* owner
       // will see the divergence instead of silently inheriting it.
@@ -1045,24 +1448,19 @@ export class ProjectStore {
     // save path would then write it into this project's folder.
     if (!entry || !this._provider) return false;
 
-    let scene: RvScene | null;
-    try {
-      scene = await this._provider.readScene(entry.path);
-    } catch {
-      this._warnings.push(`Could not read "${entry.path}".`);
+    // One reader, one set of warnings — see `_readSceneBody` for why a GLB
+    // body stops here instead of being half-converted into an op-log record.
+    const body = await this._readSceneBody(entry);
+    if (!body) {
       this._publish();
       return false;
     }
-    if (!scene) {
-      this._warnings.push(`"${entry.path}" is missing or not a valid scene.`);
-      this._publish();
-      return false;
-    }
+    const scene = body.scene;
 
     // Keep the folder's id — a folder scene is the same scene, not a copy.
     // (Only a zip import mints a fresh id.)
     writeScene({ ...scene, id: entry.id });
-    if (activeProjectId) setCachedFrom(entry.id, activeProjectId);
+    if (activeProjectId) setCachedFrom(entry.id, activeProjectId, body.revision);
     if (!readScene(entry.id)) {
       this._warnings.push(
         `Browser storage is full — "${scene.name}" could not be cached. Free space and retry.`,
@@ -1070,12 +1468,11 @@ export class ProjectStore {
       this._publish();
       return false;
     }
-    this._sceneStore?.refreshScenesFromStorage?.();
     return true;
   }
 
   private _sceneEntry(id: string): RvProjectSceneEntry | undefined {
-    return (this._project?.scenes ?? []).find(e => e.id === id);
+    return sceneDocumentsOf(this._project).find(e => e.id === id);
   }
 
   // ─── Settings ─────────────────────────────────────────────────────────
@@ -1097,6 +1494,28 @@ export class ProjectStore {
     } catch (e) {
       this._warnings.push(`Project settings could not be applied: ${String(e)}`);
     }
+  }
+
+  // ─── Knowledge ────────────────────────────────────────────────────────
+
+  /**
+   * The knowledge file bound to a document through `knowledgeRef`, or null
+   * (plan-718 stage 3.1).
+   *
+   * Deliberately a pull, not an `_applyKnowledge` that runs on open: knowledge
+   * is per DOCUMENT and only matters once one is shown, while settings are
+   * project-wide and have to be in place before anything renders. Reading every
+   * document's file on open would be work for documents nobody opens.
+   *
+   * Warnings land in the store's own list, so a dead reference surfaces where
+   * every other project complaint already does.
+   */
+  async readKnowledge(documentId: string): Promise<RvKnowledge | null> {
+    const knowledge = await knowledgeForDocument(
+      this._project, documentId, this._provider, message => this._warnings.push(message),
+    );
+    this._publish();
+    return knowledge;
   }
 
   // ─── Writer ───────────────────────────────────────────────────────────
@@ -1126,12 +1545,76 @@ export class ProjectStore {
 
   // ─── Dirty guard (§4e) ────────────────────────────────────────────────
 
-  /** True when unsaved scene edits or an unwritten folder change exist. */
+  /**
+   * True when unsaved scene edits, an unwritten folder change, or an unsaved
+   * OPEN DOCUMENT exist.
+   *
+   * The third term is plan-703 §2.7.3, and it closes a hole that predates the
+   * stack: `main.ts`'s own `hasUnsavedWork()` has always counted the open asset
+   * document, but the project switch never did — so switching projects with a
+   * dirty editor open asked nothing and discarded it. The probe reports every
+   * frame, so the same call answers correctly once a stack of N is open.
+   */
   hasUnsavedWork(): boolean {
     const snap = this._sceneStore?.getSnapshot?.();
     const sceneDirty = snap?.dirty === true;
     const status = this._writerStatus();
-    return sceneDirty || status?.pending === true || status?.error != null;
+    return sceneDirty
+      || status?.pending === true
+      || status?.error != null
+      || this._readDirtyDocuments().length > 0;
+  }
+
+  /**
+   * True when leaving the PAGE would destroy work — the unload guard's question,
+   * and deliberately not the same one as {@link hasUnsavedWork}.
+   *
+   * The two differ because a save is not the only thing that keeps work alive.
+   * A normal workspace is `dirty` for most of its life and loses nothing to an
+   * F5, because the body autosave already wrote it; warning there would be the
+   * dialog everyone learns to dismiss. What survives nothing is a transient
+   * workspace (a shared link, an Example — never autosaved by design) and a
+   * write still sitting on the debounce timer. Open documents count too: the
+   * editor's own `beforeunload` used to ask this for itself, in editor mode
+   * only, which left every other mode unguarded.
+   *
+   * The last term is plan-710 F7 and closes the same asymmetry one level down:
+   * an open document's DRAFT TIMER is unpersisted work by exactly the argument
+   * that made the scene's timer count, and until now only the scene's did. It
+   * is asked in every mode, so an asset document left mid-write behind the
+   * planner or the HMI is covered too.
+   */
+  hasUnpersistedWork(): boolean {
+    const status = this._writerStatus();
+    return this._sceneStore?.hasUnpersistedWork?.() === true
+      || status?.pending === true
+      || status?.error != null
+      || this._readDirtyDocuments().length > 0
+      || this._readUnpersistedDocuments();
+  }
+
+  /** The probe's answer, never throwing — a broken probe must not block a switch. */
+  private _readDirtyDocuments(): readonly ProjectDirtyDocument[] {
+    try {
+      return this._dirtyDocuments?.() ?? [];
+    } catch (e) {
+      console.warn('[project-store] dirty-documents probe failed:', e);
+      return [];
+    }
+  }
+
+  /**
+   * Same contract as {@link _readDirtyDocuments}, opposite default: a probe that
+   * throws answers "nothing outstanding" rather than blocking the page, because
+   * a beforeunload dialog nobody can explain is worse than the missed warning.
+   */
+  private _readUnpersistedDocuments(): boolean {
+    try {
+      return this._unpersistedDocuments?.() === true;
+    } catch (e) {
+      console.warn('[project-store] unpersisted-work probe failed:', e);
+      return false;
+    }
   }
 
   /**
@@ -1159,6 +1642,7 @@ export class ProjectStore {
         sceneName: snap?.draft?.name ?? null,
         sceneDirty: snap?.dirty === true,
         diskPending: status?.pending === true || status?.error != null,
+        dirtyDocuments: this._readDirtyDocuments(),
       });
     } catch {
       // A guard that blows up must not silently discard the user's work.
@@ -1184,7 +1668,8 @@ export class ProjectStore {
     } catch { /* status already carries the failure */ }
     this._backend = null;
     this._resolved = null;
-    this._bundledScenes = [];
+    this._bundledDocuments = [];
+    this._userDocuments = [];
 
     // RR4 — an unsaved per-base draft made inside this project must not
     // resurrect in the next one. Scope goes first so the clears below hit
@@ -1236,37 +1721,10 @@ export class ProjectStore {
   }
 
   /**
-   * Merge the tiers once per publish.
+   * The model list, merged from the two tiers once per publish.
    *
-   * For a bundled backend the manifest *is* the bundled tier, so the user
-   * side is empty until the browser backend lands (Phase 2). For a folder
-   * project there is no bundled tier: a customer's git repo holds what it
-   * holds, and the shipped demos belong to Sample, not to it.
-   */
-  private _mergeTiers(): { scenes: TieredSceneEntry[]; ids: Set<string> } {
-    const isBundled = this._backend?.kind === 'bundled';
-    const user = isBundled ? [] : (this._project?.scenes ?? []);
-    if (this._bundledScenes.length === 0 && user.length === 0) {
-      return { scenes: NO_SCENES, ids: NO_SCENE_IDS as Set<string> };
-    }
-    const merged = mergeSceneTiers(this._bundledScenes, user, hiddenIdsOf(this._project));
-    // Keep the previous instances when nothing actually changed. A writer
-    // status tick publishes too, and a fresh `Set` on each of those would be
-    // an endless "changed" signal to `useSyncExternalStore`.
-    const prev = this._snapshot;
-    const ids = sameIds(prev.sceneIds, merged.ids) ? prev.sceneIds : merged.ids;
-    const scenes = ids === prev.sceneIds && sameEntries(prev.scenes, merged.entries)
-      ? prev.scenes
-      : merged.entries;
-    return { scenes, ids };
-  }
-
-  /**
-   * The model list, merged the same way the scenes are.
-   *
-   * Cheaper than {@link _mergeTiers} because nothing caches an id set off it,
-   * but it keeps the same identity discipline: an unchanged list must return
-   * the *previous* array, or `useSyncExternalStore` sees a change every tick.
+   * Identity discipline: an unchanged list must come back as the *previous*
+   * array, or `useSyncExternalStore` sees a change every writer-status tick.
    */
   private _mergeModelTiers(): TieredAssetEntry[] {
     const user = this._userModels;
@@ -1274,6 +1732,128 @@ export class ProjectStore {
     const merged = mergeAssetTiers(this._bundledModels, user, hiddenIdsOf(this._project));
     const prev = this._snapshot.models;
     return sameAssets(prev, merged.entries) ? prev : merged.entries;
+  }
+
+  /**
+   * The document list, merged the same way the scenes and the models are.
+   *
+   * Same identity discipline for the same `useSyncExternalStore` reason: an
+   * unchanged list has to come back as the *previous* array, or every writer
+   * status tick reads as a change.
+   */
+  /**
+   * Re-run the open backend's document scan and republish.
+   *
+   * `listDocuments()` deliberately runs once at open — a folder scan must not
+   * hide behind every publish. But an EXPLICIT create ("New asset" writes a
+   * blob straight into `library/`) puts a file on disk that no manifest row
+   * announces, and without a rescan its card would not exist until the project
+   * is reopened. One scan per user action is exactly the right price.
+   *
+   * Since plan-717 the scan is followed by the adopt verb, which is what turns
+   * that file into a row instead of a card that disappears again on the next
+   * listing. The scan itself still writes nothing — see
+   * {@link ProjectStore.adoptDiscoveredDocuments} and rv-asset-identity rule 1.
+   * Both halves publish once, together, at the end.
+   */
+  async rescanDocuments(): Promise<void> {
+    const backend = this._backend;
+    if (!backend || backend.kind === 'bundled') return;
+    const documents = await backend.listDocuments().catch(() => null);
+    if (!documents) return;
+    this._userDocuments = await this._scanClassifications(backend, documents);
+    await this._adoptQuietly();
+    this._publish();
+  }
+
+  private _mergeDocumentTiers(): TieredDocumentEntry[] {
+    const user = this._liveUserDocuments();
+    if (this._bundledDocuments.length === 0 && user.length === 0) return NO_DOCUMENTS;
+    const merged = mergeDocumentTiers(this._bundledDocuments, user, hiddenIdsOf(this._project));
+    const prev = this._snapshot.documents;
+    return sameDocuments(prev, merged.entries) ? prev : merged.entries;
+  }
+
+  /**
+   * The user tier's documents, with the scene half taken from the LIVE manifest.
+   *
+   * `listDocuments()` runs once, when the project opens — it is a folder scan,
+   * and re-running it on every publish would put disk IO behind a synchronous
+   * render. That is right for models and library assets, which change only by
+   * somebody putting a file in a folder, and wrong for scenes, which the user
+   * creates, renames and deletes from this very screen. So the scene half is
+   * re-derived from the manifest's own scene documents, the same list
+   * `_mergeTiers()` reads, which the folder writer keeps current through
+   * `setManifest`.
+   *
+   * The classification is merged rather than overwritten: a manifest row that
+   * has not been through a scan carries none, and the cached document is then
+   * the only place it exists between one open and the next.
+   */
+  private _liveUserDocuments(): RvDocumentEntry[] {
+    const captured = this._userDocuments;
+    // A bundled project has no user tier at all, and nothing in it can change.
+    if (this._backend?.kind === 'bundled') return captured;
+    const manifestScenes = sceneDocumentsOf(this._project);
+    const cached = new Map(captured.map(d => [documentKeyOf(d), d]));
+    const out: RvDocumentEntry[] = [];
+    for (const entry of manifestScenes) {
+      if (!entry || typeof entry.path !== 'string') continue;
+      const doc = documentOfSceneEntry(entry);
+      const known = cached.get(documentKeyOf(doc));
+      out.push(known
+        ? { ...known, ...doc, classification: doc.classification ?? known.classification }
+        : doc);
+    }
+    for (const doc of captured) {
+      if (sectionOfDocument(doc) !== 'scenes') out.push(doc);
+    }
+    return out;
+  }
+
+  /**
+   * Bring the classification cache back in line with the files (§2.5).
+   *
+   * Runs on open, behind the `(size, mtime, sha)` pre-filter — a project whose
+   * hundred documents are unchanged performs zero GLB reads, which is the only
+   * reason this can sit in the open path at all. A bundled backend returns no
+   * stats and is therefore skipped entirely: read-only bytes cannot drift from
+   * the manifest that describes them.
+   *
+   * The result is **not** written back here. Persisting it belongs to the next
+   * normal manifest write, so opening a project stays a read.
+   */
+  private async _scanClassifications(
+    backend: ProjectBackend,
+    documents: readonly RvDocumentEntry[],
+  ): Promise<RvDocumentEntry[]> {
+    if (documents.length === 0) return [...documents];
+    let stats: DocumentStat[] = [];
+    try {
+      stats = await backend.statDocuments();
+    } catch {
+      return [...documents];
+    }
+    if (stats.length === 0) return [...documents];
+
+    try {
+      const scanned = await reconcileClassificationCache(documents, {
+        stats,
+        readClassification: async path => {
+          const resolved = await backend.readBlobUrl(path);
+          if (!resolved) return null;
+          try {
+            const blob = await (await fetch(resolved.url)).blob();
+            return await classificationOfGlbBlob(blob);
+          } finally {
+            resolved.release();
+          }
+        },
+      });
+      return scanned.documents;
+    } catch {
+      return [...documents];
+    }
   }
 
   /**
@@ -1290,11 +1870,498 @@ export class ProjectStore {
     return resolved?.url ?? null;
   }
 
+  /**
+   * Resolve a manifest asset path to loadable bytes, or to a URL with an owner
+   * (plan-709 §2.5, phase 4).
+   *
+   * This is what {@link resolveAssetUrl} should have been. It never produces an
+   * unowned object URL: a self-contained GLB — the normal shape here — comes
+   * back as bytes and needs no resource at all, and anything with external
+   * buffers or textures comes back as a URL *together with* the `release` that
+   * frees it, which the caller is then obliged to hold and call.
+   *
+   * `resolveAssetUrl` survives for the callers that only ever want a string and
+   * whose lifetime is a single awaited operation.
+   */
+  async resolveAssetSource(relPath: string): Promise<ProjectAssetSource | null> {
+    const backend = this._backend;
+    if (!backend) return null;
+    const bytes = await backend.readBlobBytes(relPath);
+    if (bytes && isSelfContainedGlb(bytes)) return { kind: 'bytes', bytes };
+    // Either nothing is stored, or the bytes name sibling files. Falling
+    // through to the URL — rather than returning the bytes we already hold —
+    // is deliberate: without a base URL the loader cannot fetch those
+    // siblings, and a model missing its textures is worse than one more
+    // owned object URL.
+    const resolved = await backend.readBlobUrl(relPath);
+    if (!resolved) return null;
+    return { kind: 'url', url: resolved.url, release: resolved.release };
+  }
+
+  /**
+   * Change what a document says it is (plan-413 §2.5, phase 4).
+   *
+   * Bytes first, cache second — see `rv-document-classify`. The manifest half
+   * is deliberately best-effort *in ordering only*, never in truth: it is a
+   * cache of what the file now says, so a failure to persist it costs one scan,
+   * while writing it before the bytes would cost a manifest that describes a
+   * file that does not exist.
+   *
+   * Persisted where there is a manifest file to persist into — a folder
+   * project. A browser project derives its scene rows from the scene index (the
+   * SceneStore owns that row and writes the same field), and a bundled project
+   * is read-only and never gets here. In every case the in-memory list is
+   * updated so the dashboard redraws immediately, and the open-time scan is the
+   * backstop that makes the file authoritative again.
+   *
+   * @returns the classification the file now carries.
+   */
+  async setDocumentClassification(
+    documentId: string,
+    classification: DocumentClassification | null,
+  ): Promise<DocumentClassification | null> {
+    const backend = this._backend;
+    if (!backend) throw new Error('No project is open.');
+    const doc = this._snapshot.documents.find(d => d.id === documentId);
+    if (!doc) throw new Error('That document is no longer part of this project.');
+    if (doc.tier === 'bundled') {
+      throw new Error(`"${doc.name}" is read-only — duplicate it into this project first.`);
+    }
+
+    const result = await writeDocumentClassification(backend, doc, classification);
+    const next = result.classification ?? undefined;
+
+    // In-memory first so the grid and the detail pane agree before the disk
+    // write is awaited; the manifest is the cache, not the display source.
+    const key = documentKeyOf(doc);
+    const apply = (list: RvDocumentEntry[]) => list.map(
+      e => documentKeyOf(e) === key ? { ...e, classification: next } : e);
+    this._userDocuments = apply(this._userDocuments);
+    this._bundledDocuments = apply(this._bundledDocuments);
+    this._publish();
+
+    const dir = this._dir;
+    if (dir) {
+      await updateManifestCas(dir, current => {
+        const base = current ?? this._project;
+        if (!base) throw new Error('This project has no manifest to update.');
+        const documents = (base.documents ?? []).map(
+          e => documentKeyOf(e) === key ? { ...e, classification: next } : e);
+        return { ...base, documents };
+      });
+    }
+    return result.classification;
+  }
+
+  /**
+   * Adopt a manifest a caller derived from {@link getProject} (plan-703 Phase 6).
+   *
+   * The tree's move is the caller: it has already run `moveDocumentPath` for
+   * every row it touched — the function that rewrites `path` and leaves the id
+   * alone — and needs the result to become the manifest, in memory and on disk.
+   * Handing the finished object over is what keeps the move rules in
+   * `rv-project-tree-move.ts` instead of growing a second copy of them here.
+   *
+   * In-memory first, then disk, exactly like {@link setDocumentClassification}:
+   * the tree must redraw at the new path before the write is awaited, or a slow
+   * folder makes a drag look like it did nothing.
+   *
+   * The tier lists are re-pointed **by id**, which is the whole reason a move is
+   * safe: the id is what did not change, so it is the only thing that can carry
+   * a row from before the move to after it.
+   */
+  async replaceManifest(next: RvProject): Promise<void> {
+    const pathById = new Map<string, string>();
+    for (const doc of next.documents ?? []) {
+      if (typeof doc.id === 'string' && doc.id !== '') pathById.set(doc.id, doc.path);
+    }
+    const apply = (list: RvDocumentEntry[]): RvDocumentEntry[] => list.map((e) => {
+      const path = e.id ? pathById.get(e.id) : undefined;
+      return path !== undefined && path !== e.path ? { ...e, path } : e;
+    });
+
+    this._project = next;
+    this._userDocuments = apply(this._userDocuments);
+    this._bundledDocuments = apply(this._bundledDocuments);
+    this._publish();
+
+    const dir = this._dir;
+    // `() => next` on purpose: the caller derived this manifest from the one
+    // currently open and is stating it as the new truth. The CAS wrapper is
+    // still what serialises the write against the folder writer's own queue.
+    if (dir) await updateManifestCas(dir, () => next);
+  }
+
+  // ─── Adopt (plan-717 §2.2) ────────────────────────────────────────────
+
+  /**
+   * Apply a DELTA to the manifest — merged into the current state, written
+   * before anything on screen moves (plan-717 §2.2 step 5).
+   *
+   * Two deliberate differences from every other writer in this class, and both
+   * of them are the reason this method exists rather than another
+   * `replaceManifest` caller:
+   *
+   *  1. **A real apply function, not a captured snapshot.** `replaceManifest`
+   *     hands `updateManifestCas` a constant `() => next` (see its comment):
+   *     correct for a user verb that states a new truth, wrong for a background
+   *     step, because a CAS retry then re-writes the stale snapshot and a second
+   *     tab's rows vanish. Here `apply` runs again on each attempt, against what
+   *     was just read from disk.
+   *  2. **Durable first.** The store's idiom is in-memory-then-disk, so the UI
+   *     never waits for a folder. An adopt that fails must leave nothing behind
+   *     — a boot adopt that hits a revoked grant would otherwise show rows that
+   *     do not exist anywhere (Risiko 11) — so the order is inverted here, on
+   *     purpose, and only here.
+   *
+   * @returns the manifest that was written, or null when there was nothing to
+   *   write it to. Throws whatever the write threw, with the store unchanged.
+   */
+  async applyManifestDelta(
+    apply: (current: RvProject) => RvProject,
+    opts: { publish?: boolean } = {},
+  ): Promise<RvProject | null> {
+    const backend = this._backend;
+    const base = this._project;
+    if (!base || !backend?.writable) return null;
+
+    let next: RvProject;
+    const dir = this._dir;
+    if (dir) {
+      next = (await updateManifestCas(dir, current => apply(current ?? base))).project;
+    } else {
+      const writing = backend as ProjectBackend & Partial<ManifestWritingBackend>;
+      if (typeof writing.writeManifest !== 'function') return null;
+      const current = await backend.readManifest().catch(() => null);
+      next = apply(current ?? base);
+      await writing.writeManifest(next);
+    }
+
+    // Only now — the write survived, so the rows are real.
+    this._project = next;
+    this._userDocuments = repointToManifestRows(this._userDocuments, next);
+    if (opts.publish !== false) this._publish();
+    return next;
+  }
+
+  /** Test seam: the clock, the quarantine window and the audit sink of the adopt verb. */
+  setAdoptOptions(options: AdoptStoreOptions): void {
+    this._adoptOptions = { ...options };
+  }
+
+  /**
+   * Turn what the scan found into authored rows — the write half of §2.2.
+   *
+   * Runs after `_adoptProject()` and after every `rescanDocuments()`, on a
+   * WRITABLE backend and nowhere else. Single-flight: the save cascade fires
+   * `void rescanDocuments()` twice a second, and an overlapping call joins the
+   * run already going rather than starting a second one (R1-A2).
+   *
+   * An empty delta means no commit at all — not a commit of an unchanged
+   * manifest (R1-I1). That is what keeps a customer's `project.json` untouched
+   * on every run after the first.
+   */
+  async adoptDiscoveredDocuments(opts: { publish?: boolean } = {}): Promise<AdoptRunSummary> {
+    if (this._adoptRun) return this._adoptRun;
+    const run = this._runAdopt(opts).finally(() => { this._adoptRun = null; });
+    this._adoptRun = run;
+    return run;
+  }
+
+  private async _runAdopt(opts: { publish?: boolean }): Promise<AdoptRunSummary> {
+    const started = Date.now();
+    const nothing = (): AdoptRunSummary => ({
+      adopted: 0, moved: 0, quarantined: 0, restored: 0, removed: 0, hashed: 0,
+      ingested: 0, sidecarRemoved: false, sidecarUnreadable: false,
+      durationMs: Date.now() - started,
+    });
+    const backend = this._backend;
+    const project = this._project;
+    if (!backend?.writable || !project) return nothing();
+
+    let stats: DocumentStat[];
+    try {
+      stats = await backend.statDocuments();
+    } catch {
+      return nothing();                  // a scan that failed learnt nothing
+    }
+
+    const sidecar = await this._readSidecarForIngestion(backend, project);
+
+    const scan = await adoptScan(project, {
+      stats,
+      now: this._adoptOptions.now,
+      quarantineMs: this._adoptOptions.quarantineMs,
+      sidecar: sidecar.ingestion ?? undefined,
+      hashOf: async path => {
+        const bytes = await backend.readBlobBytes(path).catch(() => null);
+        return bytes ? await revisionOfBytes(bytes) : null;
+      },
+    });
+
+    const base = (): AdoptRunSummary => ({
+      ...nothing(), hashed: scan.hashed.length, sidecarUnreadable: sidecar.unreadable,
+    });
+    if (scan.delta.length === 0) {
+      // Nothing to write — but a sidecar may still be lying there from a run
+      // that committed and then died before the delete. The marker says the
+      // rows already won, so finishing the job is safe and idempotent (R1-S3).
+      return { ...base(), sidecarRemoved: await this._removeIngestedSidecar(backend, sidecar) };
+    }
+
+    // Re-checked here rather than trusted from the top: a folder grant can be
+    // revoked while the hashes are being computed (Risiko 11).
+    if (!backend.writable) return base();
+
+    let log: AdoptLogEntry[] = [];
+    // Throws on a failed write, and that is the point of the ordering: the
+    // sidecar delete below is unreachable unless the rows are durable.
+    await this.applyManifestDelta(current => {
+      const applied = applyAdoptDelta(current, scan.delta);
+      log = applied.log;
+      return applied.project;
+    }, { publish: opts.publish });
+
+    const sink = this._adoptOptions.log ?? defaultAdoptLog;
+    for (const line of log) sink(line);
+    const count = (kind: AdoptLogEntry['kind']) => log.filter(l => l.kind === kind).length;
+    return {
+      ...base(),
+      adopted: count('adopt'),
+      moved: count('move'),
+      quarantined: count('quarantine'),
+      restored: count('restore'),
+      removed: count('remove'),
+      ingested: count('ingest'),
+      sidecarRemoved: await this._removeIngestedSidecar(backend, sidecar),
+      durationMs: Date.now() - started,
+    };
+  }
+
+  /**
+   * Read `library/library.json` for the ingestion, tolerating every way it can
+   * be absent (§2.4).
+   *
+   * Three outcomes and they are genuinely different: no file (nothing to do),
+   * a parsed file (ingest it), and a file this build cannot parse. The third is
+   * the one with a rule attached — **never overwritten, never deleted, always
+   * reported** — because a file we cannot read is far more likely to come from
+   * a version we do not know than to be garbage, and deleting it would destroy
+   * collections we could not even see.
+   */
+  private async _readSidecarForIngestion(
+    backend: ProjectBackend,
+    project: RvProject,
+  ): Promise<{ ingestion: AdoptSidecarIngestion | null; unreadable: boolean }> {
+    let text: string | null = null;
+    try {
+      const bytes = await backend.readBlobBytes(SIDECAR_PATH);
+      if (bytes) text = new TextDecoder().decode(bytes);
+    } catch {
+      return { ingestion: null, unreadable: false };   // unreadable BYTES, not a bad shape
+    }
+    if (text === null) return { ingestion: null, unreadable: false };
+
+    const parsed = parseSidecar(text);
+    if (!parsed) {
+      const notice =
+        `"${SIDECAR_PATH}" was written by a newer version and was left untouched — `
+        + 'the collections in it are not shown.';
+      if (!this._warnings.includes(notice)) this._warnings.push(notice);
+      console.warn(`[project-store] ${notice}`);
+      return { ingestion: null, unreadable: true };
+    }
+    return { ingestion: ingestionFromSidecar(parsed, project), unreadable: false };
+  }
+
+  /**
+   * Delete the sidecar — and only ever AFTER the marker is durable (R1-S3).
+   *
+   * The order is the whole safety property. Deleting first would open a window
+   * in which a crash costs the collections outright: the file gone, the rows
+   * never written, the fallback with no source. Deleting second costs at worst
+   * a repeat, which the marker makes a no-op.
+   */
+  private async _removeIngestedSidecar(
+    backend: ProjectBackend,
+    sidecar: { ingestion: AdoptSidecarIngestion | null; unreadable: boolean },
+  ): Promise<boolean> {
+    if (!sidecar.ingestion || sidecar.unreadable) return false;
+    // The marker is read back off the manifest the commit actually produced,
+    // not off the delta we hoped to write.
+    if (!isSidecarMigrated(this._project)) return false;
+    if (!backend.writable) return false;
+    try {
+      await backend.deleteBlob(SIDECAR_PATH);
+      return true;
+    } catch (e) {
+      // A sidecar that outlives its ingestion is harmless — the row wins and
+      // the next run tries again. Failing the adopt over it would not be.
+      console.warn(`[project-store] ${SIDECAR_PATH} could not be removed after ingestion:`, e);
+      return false;
+    }
+  }
+
+  /**
+   * The adopt run wired into an open/rescan, with its failure contained.
+   *
+   * A project that cannot adopt still opens (Risiko 11). The user is told
+   * through the warnings channel rather than a thrown boot.
+   */
+  private async _adoptQuietly(): Promise<void> {
+    try {
+      await this.adoptDiscoveredDocuments({ publish: false });
+    } catch (e) {
+      console.warn('[project-store] adopt failed — the project keeps its scan-derived rows:', e);
+      const notice =
+        'Some files in this project could not be registered — they are shown but not saved to project.json.';
+      // Deduped: the save cascade rescans every few seconds, and a folder whose
+      // grant is gone would otherwise grow the warning list without bound.
+      if (!this._warnings.includes(notice)) this._warnings.push(notice);
+    }
+  }
+
+  /**
+   * `models[] → scriptRef`, once per project, at open (plan-718 §2.7).
+   *
+   * Three deliberate restraints, and each is a rule from somewhere else:
+   *
+   *  - **writable backends only** (plan-717 §9.0). A deployed or bundled project
+   *    cannot save what it migrates, so it would re-run on every open; it reads
+   *    its bindings through the `models[]` compatibility path instead.
+   *  - **the declaration is read, never executed.** `discoverDeclaredScriptRefs`
+   *    pulls the module's SOURCE, so opening a project does not run every
+   *    project's plugin code to find out what it claims.
+   *  - **best-effort.** A migration that cannot run costs a binding the
+   *    compatibility path still provides; letting it take down a project open
+   *    would cost the project.
+   */
+  private async _migrateScriptRefsQuietly(): Promise<void> {
+    const project = this._project;
+    const dir = this._dir;
+    if (!project || !dir || !this._backend?.writable) return;
+    if (readScriptRefMigrationMarker(project)) return;
+    try {
+      const folder = String(project.canonicalName ?? project.name ?? '');
+      const modules = await discoverDeclaredScriptRefs(folder);
+      if (modules.length === 0) return;
+      const dry = migrateProjectScriptRefs(project, { modules });
+      if (dry.outcome !== 'migrated') return;
+
+      // Durable first, then in-memory (plan-717 R2-F3), and re-derived inside the
+      // CAS callback so a retry runs against what is actually on disk.
+      const written = await updateManifestCas(dir, current =>
+        migrateProjectScriptRefs(current ?? project, { modules }).project);
+      this._project = written.project;
+      this._publish();
+      if (dry.caseMismatches.length > 0) {
+        for (const miss of dry.caseMismatches) {
+          console.warn(
+            `[project-store] plugin declares model "${miss.declared}" but the document is `
+            + `"${miss.documentPath}" — the case differs, so nothing was bound. `
+            + 'Fix one of the two by hand.');
+        }
+      }
+    } catch (e) {
+      console.warn('[project-store] scriptRef migration skipped:', e);
+    }
+  }
+
+  /**
+   * Adopt CONNECT's migration handoff → `documents[].connectRef` (plan-718 §1.6b).
+   *
+   * The second half of a migration whose first half ran in another process. It
+   * carries the same three restraints as the scriptRef migration above — writable
+   * backends only, best-effort, marker-guarded — plus one that belongs to it
+   * alone: **it never touches the handoff file**. Clearing it is CONNECT's job,
+   * and CONNECT only does it after reading this manifest and finding every
+   * binding here. That is what makes the whole thing repeatable instead of
+   * merely hopeful.
+   */
+  private async _adoptConnectHandoffQuietly(): Promise<void> {
+    const project = this._project;
+    const dir = this._dir;
+    if (!project || !dir || !this._backend?.writable) return;
+    if (readConnectRefMigrationMarker(project)) return;
+    try {
+      const bindings = parseConnectMigrationHandoff(
+        (await readSettingsFile(dir, CONNECT_MIGRATION_HANDOFF)) as object | null);
+      if (bindings.length === 0) return;
+      if (migrateConnectRefs(project, bindings).outcome !== 'migrated') return;
+
+      const written = await updateManifestCas(dir, current =>
+        migrateConnectRefs(current ?? project, bindings).project);
+      this._project = written.project;
+      this._publish();
+
+      const result = migrateConnectRefs(project, bindings);
+      for (const model of result.unmatched) {
+        console.warn(
+          `[project-store] CONNECT had a configuration bound to model "${model}", but no document `
+          + 'row matches that name — the binding was not adopted. Set connectRef by hand.');
+      }
+    } catch (e) {
+      console.warn('[project-store] CONNECT handoff adoption skipped:', e);
+    }
+  }
+
+  /**
+   * The plan-703 §2.5 mint, at the persistence step and nowhere else.
+   *
+   * Called by whoever just wrote GLB bytes containing references — today
+   * `SceneStore._writeBody`, after the body has landed. Everything that decides
+   * *whether* a row is due lives in `rv-asset-identity`; what is here is the two
+   * things only the store can do: hold the manifest, and write it.
+   *
+   * Deliberately best-effort. A failed imprint costs a document its durable id
+   * until the next save, which is recoverable; letting it take down a save whose
+   * bytes are already on disk is not. It is also a no-op — not even a manifest
+   * read — when the bytes carry no mintable reference, which is the overwhelming
+   * majority of saves.
+   *
+   * @returns the rows that were added, empty when nothing was due.
+   */
+  async mintReferencedAssetIdentities(
+    references: readonly WrittenGlbReference[],
+  ): Promise<RvDocumentEntry[]> {
+    const project = this._project;
+    if (!project || references.length === 0) return [];
+    const due = mintableReferences(project, references);
+    if (due.length === 0) return [];
+
+    try {
+      const result = mintReferencedAssets(project, due);
+      if (result.minted.length === 0) return [];
+
+      // In-memory first, exactly like `setDocumentClassification`: the dashboard
+      // must show the new rows even on a backend that has no manifest file.
+      this._project = result.project;
+      this._userDocuments = [...this._userDocuments, ...result.minted];
+      this._publish();
+
+      const dir = this._dir;
+      if (dir) {
+        await updateManifestCas(dir, current => {
+          const base = current ?? result.project;
+          // Re-run against what is actually on disk: another writer may have
+          // added rows since, and re-deriving is what keeps the CAS retry loop
+          // from writing a manifest built on a stale read.
+          return mintReferencedAssets(base, due).project;
+        });
+      }
+      return result.minted;
+    } catch (e) {
+      console.warn('[project-store] could not imprint referenced asset ids:', e);
+      return [];
+    }
+  }
+
   private _publish(): void {
     const status = this._writerStatus();
-    const { scenes, ids } = this._mergeTiers();
     const models = this._mergeModelTiers();
+    const documents = this._mergeDocumentTiers();
     this._snapshot = {
+      documents,
       project: this._project,
       folderName: this._dir?.name ?? null,
       writable: this._writable,
@@ -1302,8 +2369,6 @@ export class ProjectStore {
       diskPending: status?.pending ?? false,
       warnings: [...this._warnings],
       backendKind: this._backend?.kind ?? null,
-      scenes,
-      sceneIds: ids,
       models,
     };
     for (const l of [...this._listeners]) {
@@ -1329,31 +2394,34 @@ function projectNameOf(projectId: string): string | undefined {
 }
 
 /**
- * The one empty `Set` every snapshot without a project shares.
+ * The one empty array every snapshot without a project shares.
  *
- * Same reason as {@link ProjectSnapshot.sceneIds}: a fresh instance per
- * publish is a fresh identity, and a fresh identity is a change signal.
+ * A fresh instance per publish is a fresh identity, and a fresh identity is a
+ * change signal `useSyncExternalStore` never stops reacting to.
  */
-const NO_SCENE_IDS: ReadonlySet<string> = new Set<string>();
-const NO_SCENES: TieredSceneEntry[] = [];
 const NO_MODELS: TieredAssetEntry[] = [];
+const NO_DOCUMENTS: TieredDocumentEntry[] = [];
 
-function sameIds(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
-  if (a === b) return true;
-  if (a.size !== b.size) return false;
-  for (const v of b) if (!a.has(v)) return false;
-  return true;
-}
-
-/** Shallow field-wise comparison — enough to spot a rename or a re-tier. */
-function sameEntries(a: readonly TieredSceneEntry[], b: readonly TieredSceneEntry[]): boolean {
+/**
+ * Same shallow comparison for the document list.
+ *
+ * The classification is compared by value rather than by reference — a scan
+ * that read the same answer out of the file must not look like a change, or the
+ * open path would publish twice on every project that has any documents at all.
+ */
+function sameDocuments(
+  a: readonly TieredDocumentEntry[],
+  b: readonly TieredDocumentEntry[],
+): boolean {
   if (a === b) return true;
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
     const x = a[i]!;
     const y = b[i]!;
     if (x.id !== y.id || x.name !== y.name || x.path !== y.path
-      || x.tier !== y.tier || x.modifiedAt !== y.modifiedAt) return false;
+      || x.tier !== y.tier || x.modifiedAt !== y.modifiedAt
+      || x.section !== y.section
+      || !classificationEquals(x.classification, y.classification)) return false;
   }
   return true;
 }
@@ -1388,9 +2456,8 @@ function emptySnapshot(): ProjectSnapshot {
     diskPending: false,
     warnings: [],
     backendKind: null,
-    scenes: NO_SCENES,
-    sceneIds: NO_SCENE_IDS as Set<string>,
     models: NO_MODELS,
+    documents: NO_DOCUMENTS,
   };
 }
 

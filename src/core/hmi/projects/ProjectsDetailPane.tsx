@@ -21,7 +21,8 @@
  * badge on the card.
  */
 
-import { Box, Button, Divider, Stack, Typography } from '@mui/material';
+import { useEffect, useState, type ReactNode } from 'react';
+import { Box, Button, Divider, Stack, TextField, Typography } from '@mui/material';
 import { RV_SCROLL_CLASS } from '../shared-sx';
 import { SectionHeader } from '../shared-components';
 
@@ -53,10 +54,42 @@ export interface ProjectsDetailPaneProps {
   thumbnailUrl?: string | null;
   /** Badge text, e.g. "Sample" for bundled entries. */
   badge?: string | null;
+  /**
+   * Further badges, rendered after {@link badge} in the order given.
+   *
+   * The role badge of plan-716 F8 (`Scenes` / `Models` / `Library` — the PLACE
+   * a document's bytes live) is the first inhabitant, and it has to coexist
+   * with "Sample" rather than replace it: read-only-ness and location are two
+   * independent facts about the same row, and a single slot would have made
+   * one of them invisible whenever the other applied.
+   *
+   * Empty strings are dropped, so a caller may pass a derived value straight
+   * through without guarding it.
+   */
+  badges?: readonly string[];
   fields?: DetailField[];
   actions?: DetailAction[];
   /** Free-form description (a component's behaviour text, for instance). */
   description?: string | null;
+  /**
+   * Extra controls between the metadata and the verbs — the classification
+   * editor, as it stands (plan-413 phase 4).
+   *
+   * A slot rather than a `classification` prop: this pane describes projects,
+   * scenes, documents and library assets alike, and only some of those have a
+   * classification. Teaching it about one selection's field would put the
+   * union of every selection's fields in here eventually.
+   */
+  extra?: ReactNode;
+  /**
+   * Commit a new name for the selection, making the title editable in place.
+   *
+   * Supplied only for selections that CAN be renamed — a bundled sample or a
+   * read-only catalog asset simply shows no pencil. The pane owns the editing
+   * chrome; what a rename means (file, scene row, tree node) stays with the
+   * caller, which is also where refusals surface.
+   */
+  onRename?: (next: string) => void;
 }
 
 export function ProjectsDetailPane({
@@ -64,10 +97,24 @@ export function ProjectsDetailPane({
   subtitle,
   thumbnailUrl,
   badge,
+  badges = [],
   fields = [],
   actions = [],
   description,
+  extra,
+  onRename,
 }: ProjectsDetailPaneProps) {
+  const [editValue, setEditValue] = useState<string | null>(null);
+  // A different selection means a different name — never carry a half-typed
+  // rename from one asset onto the next.
+  useEffect(() => { setEditValue(null); }, [title]);
+
+  const commitRename = () => {
+    const next = editValue?.trim();
+    setEditValue(null);
+    if (next && next !== title) onRename?.(next);
+  };
+
   return (
     <Box
       className={RV_SCROLL_CLASS}
@@ -80,8 +127,8 @@ export function ProjectsDetailPane({
       }}
     >
       {!title ? (
-        <Typography sx={{ fontSize: 12, color: 'text.disabled' }}>
-          Select an item to see its details.
+        <Typography data-testid="projects-detail-empty" sx={{ fontSize: 12, color: 'text.disabled' }}>
+          Nothing selected
         </Typography>
       ) : (
         <>
@@ -102,27 +149,61 @@ export function ProjectsDetailPane({
           )}
 
           <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.75 }}>
-            <Typography sx={{ fontSize: 14, fontWeight: 600, wordBreak: 'break-word' }}>
-              {title}
-            </Typography>
-            {badge && (
+            {editValue !== null ? (
+              <TextField
+                autoFocus
+                fullWidth
+                size="small"
+                value={editValue}
+                onChange={(e) => setEditValue(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commitRename();
+                  if (e.key === 'Escape') setEditValue(null);
+                }}
+                // Blur cancels rather than commits: a stray click elsewhere
+                // must never rename a file as a side effect.
+                onBlur={() => setEditValue(null)}
+                slotProps={{ input: { sx: { fontSize: 14, fontWeight: 600, height: 30 } } }}
+                inputProps={{ 'aria-label': 'Rename' }}
+              />
+            ) : (
               <Typography
-                component="span"
+                // A CLICK edits — the name IS the field, not a label with a
+                // verb somewhere else. No pencil beside it: the text cursor
+                // is the affordance, and an icon would restate the offer.
+                onClick={onRename ? () => setEditValue(title!) : undefined}
                 sx={{
-                  fontSize: 9,
-                  px: 0.5,
-                  py: 0.125,
-                  borderRadius: 0.5,
-                  bgcolor: 'rgba(0,0,0,0.55)',
-                  color: 'text.secondary',
-                  textTransform: 'uppercase',
-                  letterSpacing: 0.5,
-                  flexShrink: 0,
+                  fontSize: 14,
+                  fontWeight: 600,
+                  wordBreak: 'break-word',
+                  ...(onRename ? { cursor: 'text' } : {}),
                 }}
               >
-                {badge}
+                {title}
               </Typography>
             )}
+            {editValue === null && [badge, ...badges]
+              .filter((b): b is string => typeof b === 'string' && b !== '')
+              .map(text => (
+                <Typography
+                  key={text}
+                  component="span"
+                  data-testid={`projects-detail-badge-${text.toLowerCase().replace(/[^a-z0-9]+/g, '')}`}
+                  sx={{
+                    fontSize: 9,
+                    px: 0.5,
+                    py: 0.125,
+                    borderRadius: 0.5,
+                    bgcolor: 'rgba(0,0,0,0.55)',
+                    color: 'text.secondary',
+                    textTransform: 'uppercase',
+                    letterSpacing: 0.5,
+                    flexShrink: 0,
+                  }}
+                >
+                  {text}
+                </Typography>
+              ))}
           </Box>
 
           {subtitle && (
@@ -155,6 +236,8 @@ export function ProjectsDetailPane({
               </Stack>
             </>
           )}
+
+          {extra}
 
           {actions.length > 0 && (
             <>

@@ -85,6 +85,9 @@ export class WebXRPlugin implements RVViewerPlugin {
   /** Cached WebGLRenderer cast — only set when XR is supported (not WebGPU). */
   private glRenderer: WebGLRenderer | null = null;
   private initialized = false;
+  /** plan-435 §2.10 abort generation — bumped by `onDeactivate`, checked by
+   *  every async continuation before its first side effect. */
+  private _generation = 0;
   private presenting = false;
   private sessionMode: SessionMode = 'none';
 
@@ -162,6 +165,28 @@ export class WebXRPlugin implements RVViewerPlugin {
     }
   }
 
+  /**
+   * plan-435: this plugin has neither `onModelCleared` nor `slots`, and its
+   * whole setup hides behind `if (!this.initialized)` — which only `dispose()`
+   * ever resets. Without this hook switching it off would be completely
+   * without effect. The teardown is `dispose()`, which owns nothing
+   * model-scoped (invariant 3) and is idempotent.
+   *
+   * The generation bump is the async half (plan-435 §2.10): `initXR()` is
+   * fire-and-forget and awaits `_supportReady`, so a promise in flight would
+   * otherwise build dolly, controllers and listeners AFTER the teardown.
+   */
+  onDeactivate(): void {
+    this._generation++;
+    this.dispose();
+  }
+
+  /** Rebuild the XR rig for the model that is still loaded. */
+  onActivate(viewer: RVViewer): void {
+    const result = viewer.lastLoadResult;
+    if (result) this.onModelLoaded(result, viewer);
+  }
+
   onRender(frameDt: number): void {
     if (!this.viewer || !this.dolly || !this.presenting) return;
     this.updateInfoPanel();
@@ -180,8 +205,12 @@ export class WebXRPlugin implements RVViewerPlugin {
   }
 
   private async initXR(viewer: RVViewer): Promise<void> {
+    // Abort guard (plan-435 §2.10): a user toggle during the support check
+    // bumps `_generation`, and everything below must then stay unbuilt.
+    const generation = this._generation;
     // Await eagerly-started support check (already running from constructor)
     await this._supportReady;
+    if (generation !== this._generation) return;
 
     if (viewer.isWebGPU || !RVXRManager.isXRCapable(viewer.renderer)) {
       console.warn('[WebXR] Renderer does not support WebXR');

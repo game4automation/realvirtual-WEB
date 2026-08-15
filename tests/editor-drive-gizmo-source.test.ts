@@ -9,7 +9,7 @@ import { describe, it, expect } from 'vitest';
 import { Object3D, Vector3, Quaternion, Euler } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { MM_TO_METERS } from '../src/core/engine/rv-constants';
-import { resolveEditorDriveGizmoSource } from '../src/plugins/asset-editor/editor-drive-gizmo-source';
+import { resolveEditorDriveGizmoSource } from '@rv-private/plugins/asset-editor/editor-drive-gizmo-source';
 
 function viewerWith(nodes: Record<string, Object3D>): RVViewer {
   return { registry: { getNode: (p: string) => nodes[p] ?? null } } as unknown as RVViewer;

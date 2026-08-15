@@ -19,6 +19,9 @@ import { describe, it, expect } from 'vitest';
 import { BundledBackend } from '../src/core/project/backends/bundled-backend';
 import { BackendNotWritableError } from '../src/core/project/backends/project-backend';
 import { ProjectStore } from '../src/core/project/project-store';
+import { assetDocumentsOf } from '../src/core/project/rv-project-documents';
+import { WORKSPACE_DEFAULT_PROJECT_ID } from '../src/core/project/rv-workspace-default';
+import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
 
 const REMOTE = 'https://cdn.example.test/customer/';
 
@@ -69,13 +72,14 @@ describe('BundledBackend against a foreign baseUrl', () => {
   it('discovers the Examples catalogue from scenes/index.json', async () => {
     const backend = remoteBackend({
       [`${REMOTE}project.json`]: DEPLOYED_MANIFEST,
-      [`${REMOTE}scenes/index.json`]: [{ file: 'A.scene.json', name: 'Line A', mode: 'planner' }],
+      // Examples are GLBs since plan-413 phase 3.
+      [`${REMOTE}scenes/index.json`]: [{ file: 'A.glb', name: 'Line A', mode: 'planner' }],
     });
-    const scenes = await backend.listScenes();
+    const scenes = sceneDocumentsOf(await backend.readManifest());
     expect(scenes).toHaveLength(1);
     // Plain `scenes/<file>` — `_url()` roots it on the remote base, so a local
     // dev mount must never leak into the path.
-    expect(scenes[0]!.path).toBe('scenes/A.scene.json');
+    expect(scenes[0]!.path).toBe('scenes/A.glb');
     expect(scenes[0]!.name).toBe('Line A');
     expect(scenes[0]!.id).toBe('published:A');
   });
@@ -132,7 +136,7 @@ describe('without the option, nothing changes', () => {
       fetchImpl: (async () => new Response('', { status: 404 })) as typeof fetch,
     });
     const project = await backend.readManifest();
-    expect(project?.models?.map(m => m.path)).toEqual(['/models/Demo.glb']);
+    expect(assetDocumentsOf(project, 'models').map(m => m.path)).toEqual(['/models/Demo.glb']);
   });
 });
 
@@ -163,7 +167,13 @@ describe('ProjectStore registers it as a second read-only backend', () => {
       remoteBaseUrl: REMOTE,
       bundled: { fetchImpl: fakeFetch({}) },
     });
-    // The always-available bundled backend, not the unreachable remote one.
-    expect(resolved.backend).toBe(store.getBundledBackend());
+    // Not the unreachable remote one — that is the invariant, and it holds.
+    expect(resolved.backend).not.toBe(store.getRemoteBackend(REMOTE));
+    // plan-716 Phase 1 — RE-PINNED. "The normal resolution" was the bundled
+    // backend; since §2.2 it is the writable "My Workspace" browser project. A
+    // `?projectUrl=` typo therefore lands the visitor in their own workspace
+    // instead of a read-only demo, which is the better of the two answers.
+    expect(resolved.backend.kind).toBe('browser');
+    expect(resolved.project?.id).toBe(WORKSPACE_DEFAULT_PROJECT_ID);
   });
 });

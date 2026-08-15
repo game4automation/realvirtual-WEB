@@ -44,6 +44,18 @@ import plannerIndexSource from '../src/plugins/layout-planner/index.ts?raw';
 
 const LAYOUT_PANEL_ID = 'layout-planner';
 
+// The resource timeline is this file's only witness, and it is a FIXED-SIZE
+// buffer: browsers keep 250 entries by default and then silently drop every
+// later one. This file's own module graph (the DES toolbar, the planner, three
+// `?raw` sources and their transitive imports) already costs ~250 entries, so
+// the lazy chunk's entry — recorded last, at the moment that actually matters —
+// fell off the end. The panel opened and the chunk loaded exactly as specified;
+// `moduleRequested` just never saw it, and the waits below burned their full
+// budget waiting for evidence that had been discarded on arrival.
+// A raised ceiling, not a longer timeout, is the fix: the reported symptom was
+// a timeout, but nothing was ever slow.
+performance.setResourceTimingBufferSize(20_000);
+
 /**
  * How often the browser fetched a module whose URL matches `pattern`.
  *

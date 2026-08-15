@@ -43,6 +43,9 @@ import {
 } from '../src/core/hmi/scene/rv-scene-storage';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
 import { clearAllBlobs, sha256OfBlob } from '../src/core/storage/rv-opfs-blobs';
+import { listSceneGlbIds, readSceneGlbPointer } from '../src/core/storage/rv-scene-glb-store';
+import { glbWrite } from './helpers/scene-write';
+import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -55,7 +58,7 @@ function scene(id: string, name = id): RvScene {
     name,
     createdAt: '2025-01-01T00:00:00.000Z',
     modifiedAt: '2025-01-01T00:00:00.000Z',
-    schemaVersion: 2,
+    schemaVersion: 3,
     base: { kind: 'empty' },
     edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
   };
@@ -97,7 +100,7 @@ describe('BrowserBackend — identity', () => {
   it('is inert until activated (§2.2.1b)', async () => {
     const backend = new BrowserBackend(P1, { requestPersistence: false });
     expect(backend.isActive).toBe(false);
-    await expect(backend.writeScene('scn_x', scene('scn_x'))).rejects.toBeInstanceOf(
+    await expect(backend.writeScene('scn_x', glbWrite('scn_x'))).rejects.toBeInstanceOf(
       BackendNotWritableError,
     );
     await expect(backend.deleteScene('scn_x')).rejects.toBeInstanceOf(BackendNotWritableError);
@@ -111,8 +114,10 @@ describe('BrowserBackend — identity', () => {
     noteSceneMembership('scn_r', P1);
     const backend = new BrowserBackend(P1, { requestPersistence: false });
 
-    expect((await backend.listScenes()).map(e => e.id)).toEqual(['scn_r']);
-    expect((await backend.readScene('scn_r'))?.id).toBe('scn_r');
+    expect(await backend.listDocuments()).toEqual([]);
+    // A row with no GLB body has no body at all since plan-413 phase 6: the
+    // op-log fallback is gone, and `readScene` says so by answering null.
+    expect(await backend.readScene('scn_r')).toBeNull();
   });
 
   it('deactivate closes the gate again and is idempotent', async () => {
@@ -120,43 +125,72 @@ describe('BrowserBackend — identity', () => {
     await backend.deactivate();
     await backend.deactivate();
     expect(backend.isActive).toBe(false);
-    await expect(backend.writeScene('scn_x', scene('scn_x'))).rejects.toBeInstanceOf(
+    await expect(backend.writeScene('scn_x', glbWrite('scn_x'))).rejects.toBeInstanceOf(
       BackendNotWritableError,
     );
   });
 
-  it('addresses a scene by id, `scenes/<id>` or `<id>.scene.json` alike', () => {
+  it('addresses a scene by id, `scenes/<id>` or `<id>.scene.glb` alike', () => {
     expect(sceneIdOfPath('scn_a')).toBe('scn_a');
     expect(sceneIdOfPath('scenes/scn_a')).toBe('scn_a');
-    expect(sceneIdOfPath('scenes/scn_a.scene.json')).toBe('scn_a');
+    expect(sceneIdOfPath('scenes/scn_a.scene.glb')).toBe('scn_a');
     expect(sceneIdOfPath('')).toBe('');
   });
 
   it('refuses a path that addresses a different scene', async () => {
     const backend = await open(P1);
-    await expect(backend.writeScene('scn_other', scene('scn_a'))).rejects.toThrow(/scn_a/);
+    await expect(backend.writeScene('scn_other', glbWrite('scn_a'))).rejects.toThrow(/scn_a/);
   });
 });
 
 // ─── The keyspace is not migrated (§2.5) ────────────────────────────────
 
 describe('BrowserBackend — the scene keyspace is untouched', () => {
-  it('writes exactly the bytes the storage module writes, at the same key', async () => {
-    const backend = await open(P1);
-    await backend.writeScene('scn_a', scene('scn_a', 'Cell 1'));
+  it('leaves a pre-397 body at its historic key untouched (plan-397 phase 5)', async () => {
+    // The scene as an older build wrote it.
+    writeSceneBody(scene('scn_a', 'Cell 1'));
+    const before = localStorage.getItem('rv-scenes/scn_a');
 
-    // The historic key, with no project prefix anywhere.
-    const raw = localStorage.getItem('rv-scenes/scn_a');
-    expect(raw).not.toBeNull();
-    expect(JSON.parse(raw!).name).toBe('Cell 1');
+    const backend = await open(P1);
+    await backend.writeScene('scn_a', glbWrite('scn_a', 'Cell 1'));
+
+    // The GLB write goes to OPFS + its own pointer. The op-log record is not
+    // rewritten, not deleted and not migrated — phase 7 owns that decision,
+    // and until then it is the fallback a rollback depends on.
+    expect(localStorage.getItem('rv-scenes/scn_a')).toBe(before);
     expect(readScene('scn_a')?.name).toBe('Cell 1');
-    // And the index the old build reads is updated the same way.
     expect(listMetas().map(m => m.id)).toEqual(['scn_a']);
+  });
+
+  it('stores the GLB body in OPFS and keeps only a pointer in localStorage', async () => {
+    const backend = await open(P1);
+    const revision = await backend.writeScene('scn_a', glbWrite('scn_a', 'Cell 1'));
+
+    const pointer = readSceneGlbPointer('scn_a');
+    expect(pointer?.sha).toBe(revision);
+    // The pointer is metadata; nothing that could pass for a body is in
+    // localStorage under it.
+    expect(pointer?.size).toBeGreaterThan(0);
+
+    const record = await backend.readScene('scn_a');
+    expect(record?.revision).toBe(revision);
+    expect(new TextDecoder().decode(record!.glb)).toContain('scn_a');
+  });
+
+  it('a GLB write leaves the body and the marker, and no index row', async () => {
+    const backend = await open(P1);
+    await backend.writeScene('scn_glb_only', glbWrite('scn_glb_only'));
+    // `writeScene` puts bytes in OPFS and a membership marker beside them; it
+    // never touched `rv-scenes-index`, and since Phase 6 nothing derives a
+    // listing from that index either.
+    expect(listMetas()).toEqual([]);
+    expect(readSceneGlbPointer('scn_glb_only')).not.toBeNull();
+    expect(readSceneOwner('scn_glb_only')?.projectIds).toEqual([P1]);
   });
 
   it('introduces no key outside its own additive namespace', async () => {
     const backend = await open(P1);
-    await backend.writeScene('scn_a', scene('scn_a'));
+    await backend.writeScene('scn_a', glbWrite('scn_a'));
     await backend.writeManifest({
       schemaVersion: 1,
       id: P1,
@@ -168,6 +202,7 @@ describe('BrowserBackend — the scene keyspace is untouched', () => {
       const key = localStorage.key(i)!;
       const known =
         key.startsWith('rv-scenes') ||
+        key.startsWith('rv-scene-glb/') ||
         key.startsWith('rv-scene-owner/') ||
         key.startsWith('rv-project/browser/');
       expect(known, `unexpected key "${key}"`).toBe(true);
@@ -177,7 +212,7 @@ describe('BrowserBackend — the scene keyspace is untouched', () => {
 
   it('records membership but never provenance', async () => {
     const backend = await open(P1);
-    await backend.writeScene('scn_a', scene('scn_a'));
+    await backend.writeScene('scn_a', glbWrite('scn_a'));
 
     const owner = readSceneOwner('scn_a');
     expect(owner?.projectIds).toEqual([P1]);
@@ -190,62 +225,59 @@ describe('BrowserBackend — the scene keyspace is untouched', () => {
 // ─── Several browser projects, one flat keyspace (§5.1 M2) ──────────────
 
 describe('BrowserBackend — two browser projects share the keyspace safely', () => {
-  it('each project lists only its own scenes', async () => {
+  it('each body carries its own project marker', async () => {
     const one = await open(P1);
     const two = await open(P2);
-    await one.writeScene('scn_1', scene('scn_1', 'Line A'));
-    await two.writeScene('scn_2', scene('scn_2', 'Line B'));
+    await one.writeScene('scn_1', glbWrite('scn_1', 'Line A'));
+    await two.writeScene('scn_2', glbWrite('scn_2', 'Line B'));
 
-    expect((await one.listScenes()).map(e => e.id)).toEqual(['scn_1']);
-    expect((await two.listScenes()).map(e => e.id)).toEqual(['scn_2']);
-    // Both bodies are in the one index — the separation is the marker, not
+    // Both bodies are in the one store — the separation is the marker, not
     // the keyspace.
-    expect(listMetas().map(m => m.id).sort()).toEqual(['scn_1', 'scn_2']);
+    expect(listSceneGlbIds().sort()).toEqual(['scn_1', 'scn_2']);
+    expect(readSceneOwner('scn_1')?.projectIds).toEqual([P1]);
+    expect(readSceneOwner('scn_2')?.projectIds).toEqual([P2]);
   });
 
   it('neither can overwrite the other: distinct ids are distinct bodies', async () => {
     const one = await open(P1);
     const two = await open(P2);
-    await one.writeScene('scn_1', scene('scn_1', 'Line A'));
-    await two.writeScene('scn_2', scene('scn_2', 'Line B'));
+    await one.writeScene('scn_1', glbWrite('scn_1', 'Line A'));
+    await two.writeScene('scn_2', glbWrite('scn_2', 'Line B'));
 
-    expect(readScene('scn_1')?.name).toBe('Line A');
-    expect(readScene('scn_2')?.name).toBe('Line B');
+    expect(new TextDecoder().decode((await one.readScene('scn_1'))!.glb!)).toContain('Line A');
+    expect(new TextDecoder().decode((await two.readScene('scn_2'))!.glb!)).toContain('Line B');
   });
 
   it('a shared scene id is sharing, and both projects list it', async () => {
     const one = await open(P1);
     const two = await open(P2);
-    await one.writeScene('scn_shared', scene('scn_shared'));
+    await one.writeScene('scn_shared', glbWrite('scn_shared'));
     // What `createProjectFromScenes()` does: the same id in two manifests.
-    await two.writeScene('scn_shared', scene('scn_shared'));
+    await two.writeScene('scn_shared', glbWrite('scn_shared'));
 
     expect(readSceneOwner('scn_shared')?.projectIds).toEqual([P1, P2]);
-    expect((await one.listScenes()).map(e => e.id)).toEqual(['scn_shared']);
-    expect((await two.listScenes()).map(e => e.id)).toEqual(['scn_shared']);
   });
 
   it('deleting a shared scene drops only the caller’s claim', async () => {
     const one = await open(P1);
     const two = await open(P2);
-    await one.writeScene('scn_shared', scene('scn_shared'));
-    await two.writeScene('scn_shared', scene('scn_shared'));
+    await one.writeScene('scn_shared', glbWrite('scn_shared'));
+    await two.writeScene('scn_shared', glbWrite('scn_shared'));
 
     await one.deleteScene('scn_shared');
 
     // The other owner still has it — and the body is still there.
     expect(readSceneOwner('scn_shared')?.projectIds).toEqual([P2]);
-    expect(readScene('scn_shared')).not.toBeNull();
-    expect((await one.listScenes())).toEqual([]);
-    expect((await two.listScenes()).map(e => e.id)).toEqual(['scn_shared']);
+    expect(readSceneGlbPointer('scn_shared')).not.toBeNull();
   });
 
   it('the last owner deleting takes the body and the marker with it', async () => {
     const one = await open(P1);
-    await one.writeScene('scn_only', scene('scn_only'));
+    await one.writeScene('scn_only', glbWrite('scn_only'));
 
     await one.deleteScene('scn_only');
 
+    expect(readSceneGlbPointer('scn_only')).toBeNull();
     expect(readScene('scn_only')).toBeNull();
     expect(readSceneOwner('scn_only')).toBeNull();
     expect(listMetas()).toEqual([]);
@@ -262,38 +294,32 @@ describe('BrowserBackend — two browser projects share the keyspace safely', ()
   });
 });
 
-// ─── The Sample exception (§2.4) ────────────────────────────────────────
+// ─── No catalogue is derived any more (plan-716 Phase 6) ────────────────
+//
+// The `adoptsUnowned` describe block stood here. It pinned which backend
+// adopted an owner-less `rv-scenes-index` row into its listing — a rule that
+// only meant anything while a listing was DERIVED from that index. Nothing
+// derives one now, so the three cases had no behaviour left to assert; the
+// eager migration converts those rows into documents of "My Workspace" before
+// any backend is asked what it holds (workspace-migration.test.ts).
 
-describe('BrowserBackend — adoptsUnowned', () => {
-  it('the Sample tier lists marker-less scenes; a normal project does not', async () => {
-    writeSceneBody(scene('scn_legacy'));            // pre-plan, no marker
-
-    const sample = await open('prj_sample', { adoptsUnowned: true });
-    const other = await open(P2);
-
-    expect((await sample.listScenes()).map(e => e.id)).toEqual(['scn_legacy']);
-    expect(await other.listScenes()).toEqual([]);
+describe('BrowserBackend — the index is not a listing', () => {
+  it('an index row with no manifest entry is invisible to the backend', async () => {
+    writeSceneBody(scene('scn_legacy'));            // pre-migration, no marker
+    const backend = await open(P1);
+    expect(await backend.listDocuments()).toEqual([]);
+    // Untouched, though: retiring it is the migration's job, not the backend's.
+    expect(readScene('scn_legacy')?.name).toBe('scn_legacy');
   });
 
-  it('once a scene is marked, only its owner lists it', async () => {
+  it('a marker alone does not make a row a document either', async () => {
     writeSceneBody(scene('scn_legacy'));
     noteSceneMembership('scn_legacy', P2);
+    setCachedFrom('scn_legacy', P2);
 
-    const sample = await open('prj_sample', { adoptsUnowned: true });
-    const other = await open(P2);
-
-    // Adoption is for *unowned* entries only — it never overrides evidence.
-    expect(await sample.listScenes()).toEqual([]);
-    expect((await other.listScenes()).map(e => e.id)).toEqual(['scn_legacy']);
-  });
-
-  it('a foreign cachedFrom does not make a scene unowned', async () => {
-    writeSceneBody(scene('scn_x'));
-    noteSceneMembership('scn_x', P2);
-    setCachedFrom('scn_x', P2);
-
-    const sample = await open('prj_sample', { adoptsUnowned: true });
-    expect(await sample.listScenes()).toEqual([]);
+    const backend = await open(P2);
+    expect(await backend.listDocuments()).toEqual([]);
+    expect(readSceneOwner('scn_legacy')?.cachedFrom).toBe(P2);
   });
 });
 
@@ -305,21 +331,24 @@ describe('BrowserBackend — manifest', () => {
     const manifest = await backend.readManifest();
     expect(manifest?.id).toBe(P1);
     expect(manifest?.name).toBe('My scenes');
-    expect(manifest?.scenes).toEqual([]);
+    expect(sceneDocumentsOf(manifest)).toEqual([]);
   });
 
-  it('derives the scene list rather than trusting the stored copy', async () => {
+  it('stores every document row it is given, and reads them all back', async () => {
+    // The mirror image of what this file used to assert. The manifest was the
+    // untrusted half — a `scn_` scene row was dropped on write and re-derived
+    // from the index on read — and since plan-716 Phase 6 it is the ONLY half,
+    // so a row that goes in has to come back out.
     const backend = await open(P1);
     await backend.writeManifest({
       schemaVersion: 1,
       id: P1,
       name: 'One',
-      // A stale list, of the kind a save through SceneStore would leave behind.
-      scenes: [{ id: 'scn_ghost', name: 'ghost', path: 'scn_ghost' }],
+      documents: [{ id: 'doc_real', name: 'Real', path: 'scenes/Real.glb', section: 'scenes' }],
     });
-    await backend.writeScene('scn_real', scene('scn_real'));
 
-    expect((await backend.readManifest())?.scenes?.map(e => e.id)).toEqual(['scn_real']);
+    expect(sceneDocumentsOf(await backend.readManifest()).map(e => e.id)).toEqual(['doc_real']);
+    expect((await backend.listDocuments()).map(d => d.id)).toEqual(['doc_real']);
   });
 
   it('keeps what the index cannot express', async () => {
@@ -330,15 +359,17 @@ describe('BrowserBackend — manifest', () => {
       name: 'One',
       hidden: ['published:demo'],
       activeSceneId: 'scn_real',
-      models: [{ path: 'models/a.glb', label: 'A' }],
-      library: [{ path: 'library/b.glb' }],
+      documents: [
+        { id: 'doc_a', name: 'A', path: 'models/a.glb', label: 'A', section: 'models' },
+        { id: 'doc_b', name: 'b', path: 'library/b.glb', section: 'library' },
+      ],
     });
 
     const manifest = await backend.readManifest();
     expect(manifest?.hidden).toEqual(['published:demo']);
     expect(manifest?.activeSceneId).toBe('scn_real');
-    expect(await backend.listModels()).toEqual([{ path: 'models/a.glb', label: 'A' }]);
-    expect(await backend.listLibrary()).toEqual([{ path: 'library/b.glb' }]);
+    expect(await backend.listModels()).toMatchObject([{ path: 'models/a.glb', label: 'A' }]);
+    expect(await backend.listLibrary()).toMatchObject([{ path: 'library/b.glb' }]);
   });
 
   it('a corrupt manifest reads as absent, not as a throw', async () => {

@@ -22,8 +22,9 @@ import { computeBVHAsync } from '../src/core/engine/rv-scene-loader';
 import { createInlineBVHPort } from '../src/core/engine/rv-bvh-build-port';
 import { FakeHighlightHost } from './collision-fixture';
 import type { CollisionRoleName } from '../src/core/engine/rv-collision-role';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
-const MODEL = '/models/DemoRobotIK.glb';
+const MODEL = DEV_GLB.robotIK;
 const TICKS = 600;
 const BUDGET_MS = 2;
 

@@ -75,6 +75,9 @@ export class RVGrip implements RVComponent {
   // Currently gripped MUs
   readonly grippedMUs: RVMovingUnit[] = [];
 
+  /** SignalPick/SignalPlace store subscriptions + re-apply slots (plan-427 F6). */
+  private readonly signalUnsubs: (() => void)[] = [];
+
   constructor(node: Object3D) {
     this.node = node;
   }
@@ -94,11 +97,21 @@ export class RVGrip implements RVComponent {
     this.allGripTargets = () => context.transportManager.gripTargets;
     this.collisionRegistrar = context.collisionManager ?? null;
 
-    // Wire signal subscriptions
-    this.signalPickAddr = wireBoolSignal(context.signalStore, this.SignalPick,
-      (v) => { this.pickObjects = v; }, `Grip "${this.node.name}": SignalPick`).addr;
-    this.signalPlaceAddr = wireBoolSignal(context.signalStore, this.SignalPlace,
-      (v) => { this.placeObjects = v; }, `Grip "${this.node.name}": SignalPlace`).addr;
+    // Wire signal subscriptions. Both are LEVEL setters — the pick/place flank
+    // detection lives in `update()` (`_pickObjectsBefore`), so a replayed held
+    // `true` only re-confirms the state and never re-grips (plan-427).
+    const pick = wireBoolSignal(context.signalStore, this.SignalPick,
+      (v) => { this.pickObjects = v; }, `Grip "${this.node.name}": SignalPick`,
+      context.reapply);
+    const place = wireBoolSignal(context.signalStore, this.SignalPlace,
+      (v) => { this.placeObjects = v; }, `Grip "${this.node.name}": SignalPlace`,
+      context.reapply);
+    this.signalPickAddr = pick.addr;
+    this.signalPlaceAddr = place.addr;
+    // Keep the handles: a Grip removed on its own (subtree removal calls only an
+    // EXISTING optional dispose(), rv-scene-loader) previously left both store
+    // subscriptions — and now a registry slot — alive on a dead instance (F6).
+    this.signalUnsubs.push(pick.unsubscribe, place.unsubscribe);
 
     // Wire PartToGrip sensor reference (already resolved by resolveComponentRefs)
     if (this.PartToGrip) {
@@ -379,6 +392,26 @@ export class RVGrip implements RVComponent {
     this.placeObjects = false;
     this._pickObjectsBefore = false;
     this._placeObjectsBefore = false;
+  }
+
+  /**
+   * Release the signal wiring (plan-427 F6).
+   *
+   * Subtree removal and `removeRuntimeNode` call only an EXISTING optional
+   * `dispose()`, so until this method existed a Grip removed on its own kept
+   * both store subscriptions — and, since plan-427, a re-apply slot — alive on
+   * a dead instance: `reapplyAll()` would drive `pickObjects` on a gripper that
+   * is no longer part of the scene.
+   */
+  dispose(): void {
+    for (const unsub of this.signalUnsubs) unsub();
+    this.signalUnsubs.length = 0;
+    this.signalPickAddr = null;
+    this.signalPlaceAddr = null;
+    this.signalStore = null;
+    this.allMUs = null;
+    this.allGripTargets = null;
+    this.collisionRegistrar = null;
   }
 }
 

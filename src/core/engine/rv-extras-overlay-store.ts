@@ -16,6 +16,9 @@
  */
 
 import type { Object3D } from 'three';
+import { applyComponentPatch } from './rv-asset-reference';
+import type { ComponentPatch, OrphanedOverride } from './rv-asset-reference';
+import { ROOT_OCCURRENCE } from './rv-node-id';
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -88,40 +91,53 @@ export function applyOverlayToNode(
 ): boolean {
   const nodeOverrides = overlay.nodes[nodePath];
   if (!nodeOverrides) return false;
+  // The merge itself lives in rv-asset-reference: the path-keyed overlay and the
+  // NodeId-keyed asset overrides must mean the SAME thing by `null`, and two
+  // copies of that rule is precisely how they would come to disagree.
+  return applyComponentPatch(node, nodeOverrides as ComponentPatch);
+}
 
-  // Ensure userData.realvirtual exists
-  const userData = node.userData as Record<string, unknown>;
-  let rv = userData['realvirtual'] as Record<string, Record<string, unknown>> | undefined;
-  if (!rv) {
-    rv = {};
-    userData['realvirtual'] = rv;
+/**
+ * Apply an overlay whose keys are `NodeId`s rather than node paths (plan-397).
+ *
+ * The second addressing axis: a path breaks the moment somebody renames a node
+ * in a referenced asset, a `NodeId` does not. Same RFC 7396 semantics, same
+ * merge implementation — only the lookup differs.
+ *
+ * Resolution order per plan Phase 1: `NodeId` first, then whatever fallback the
+ * caller's resolver implements, then ORPHANED. An override that finds no target
+ * is returned, never dropped: the user's decision was that a verwaister Override
+ * is reported, and a function that swallows it makes reporting impossible
+ * upstream.
+ *
+ * @param byNodeId NodeId → merge patch.
+ * @param resolve  Looks a NodeId up in the frame the overlay belongs to.
+ * @param context  Occurrence/asset labels carried into the orphan report.
+ */
+export function applyOverlayByNodeId(
+  byNodeId: Record<string, ComponentPatch>,
+  resolve: (nodeId: string) => Object3D | null,
+  context: { occurrence?: string; assetId?: string } = {},
+): { applied: number; orphaned: OrphanedOverride[] } {
+  const orphaned: OrphanedOverride[] = [];
+  let applied = 0;
+
+  for (const [nodeId, patch] of Object.entries(byNodeId)) {
+    const target = resolve(nodeId);
+    if (!target) {
+      orphaned.push({
+        addressing: 'nodeId',
+        key: nodeId,
+        occurrence: context.occurrence ?? ROOT_OCCURRENCE,
+        assetId: context.assetId ?? '',
+        componentTypes: Object.keys(patch ?? {}),
+      });
+      continue;
+    }
+    if (applyComponentPatch(target, patch)) applied++;
   }
 
-  let changed = false;
-
-  for (const [componentType, fields] of Object.entries(nodeOverrides)) {
-    if (!rv[componentType]) {
-      rv[componentType] = {};
-    }
-    const target = rv[componentType];
-
-    for (const [fieldName, value] of Object.entries(fields)) {
-      if (value === null) {
-        // RFC 7396: null means delete
-        if (fieldName in target) {
-          delete target[fieldName];
-          changed = true;
-        }
-      } else {
-        if (target[fieldName] !== value) {
-          target[fieldName] = value;
-          changed = true;
-        }
-      }
-    }
-  }
-
-  return changed;
+  return { applied, orphaned };
 }
 
 // ─── Originals Sidecar (persist original GLB values for reset after reload) ──

@@ -240,20 +240,10 @@ export class DriveAxisGizmoPlugin implements RVViewerPlugin {
 
   init(viewer: RVViewer): void {
     this.viewer = viewer;
-    this.unsub = viewer.on('selection-changed', (s) => this.onSelection(s));
-    // Overlay-visibility gate (plan-250): react to the 'gizmos' category being
-    // switched off in the Display panel. onRender's change-detection then
-    // clears/rebuilds the current selection's gizmos.
-    this._catHidden = !isOverlayVisible('gizmos');
-    this.offOverlay = subscribeOverlayVisibility(() => {
-      this._catHidden = !isOverlayVisible('gizmos');
-      viewer.markRenderDirty?.();
-    });
     // Own raycaster must have the overlay layer enabled or pickHandle misses.
+    // Permanent (no listener, no scene object) — set up once, never in attach.
     this._raycaster.layers.enable(HIGHLIGHT_OVERLAY_LAYER);
-    // Attach drag listeners only while a drag driver is registered (editor mode).
-    this._syncDragListeners();
-    this._dragUnsub = subscribeDriveDragDriver(() => this._syncDragListeners());
+    this.attachRuntime();
   }
 
   onModelCleared(): void {
@@ -261,16 +251,40 @@ export class DriveAxisGizmoPlugin implements RVViewerPlugin {
     this.clearAll();
   }
 
+  /**
+   * User switched the plugin off (plan-436). Everything `init()` installed goes
+   * — a running drag, the global pointer/keyboard listeners, the drag-driver
+   * and overlay-visibility subscriptions, the selection subscription and the
+   * gizmos themselves.
+   *
+   * `this.shared` deliberately survives: those geometries/materials are freed
+   * in `dispose()` and ONLY there (plan-249 §10.2). Disposing them here would
+   * leave every gizmo rebuilt after a switch-on pointing at dead GPU buffers.
+   */
+  onDeactivate(): void {
+    this.detachRuntime();
+  }
+
+  /**
+   * User switched the plugin back on (plan-436). With `onActivate` present the
+   * host replays NO `onModelLoaded` (plan-435 invariant 2), and a
+   * `selection-changed` event does not repeat itself for an unchanged
+   * selection — so the visible state has to be PULLED.
+   *
+   * It goes through `onSelection`, not `applySelection`: only `onSelection`
+   * re-evaluates the visibility gates (`showDriveAxisGizmo`, `_catHidden`), and
+   * `_lastSnap` is unusable as a source because the subscription was off while
+   * the selection may well have changed (plan-436 §2.2).
+   */
+  onActivate(viewer: RVViewer): void {
+    this.viewer = viewer;
+    this.attachRuntime();
+    const snap = viewer.selectionManager?.getSnapshot();
+    if (snap) this.onSelection(snap);
+  }
+
   dispose(): void {
-    this._cancelDrag();
-    this._teardownDragListeners();
-    this._dragUnsub?.();
-    this._dragUnsub = null;
-    this.clearAll();
-    this.unsub?.();
-    this.unsub = null;
-    this.offOverlay?.();
-    this.offOverlay = null;
+    this.detachRuntime();
     if (this.shared) {
       // Shared resources are freed here and ONLY here (plan-249 §10.2).
       this.shared.shaftGeo.dispose();
@@ -667,6 +681,54 @@ export class DriveAxisGizmoPlugin implements RVViewerPlugin {
   private clearAll(): void {
     for (const entry of this.entries.values()) this.removeEntry(entry);
     this.entries.clear();
+  }
+
+  // ── Attach / detach (ONE path, shared by init/dispose and the toggle) ──
+
+  /**
+   * Install every subscription and listener the plugin runs on. Idempotent —
+   * each existing handle is released before it is replaced, so repeated
+   * off/on cycles can never double a subscription (plan-436 F5).
+   *
+   * `ensureShared()` is deliberately NOT called here: the shared geometries
+   * survive a deactivation and are (re)created lazily by `buildEntry()`.
+   */
+  private attachRuntime(): void {
+    const viewer = this.viewer;
+    if (!viewer) return;
+    this.unsub?.();
+    this.unsub = viewer.on('selection-changed', (s) => this.onSelection(s));
+    // Overlay-visibility gate (plan-250): react to the 'gizmos' category being
+    // switched off in the Display panel. onRender's change-detection then
+    // clears/rebuilds the current selection's gizmos. The cached flag is
+    // re-read here because the store can have moved while we were off.
+    this._catHidden = !isOverlayVisible('gizmos');
+    this.offOverlay?.();
+    this.offOverlay = subscribeOverlayVisibility(() => {
+      this._catHidden = !isOverlayVisible('gizmos');
+      viewer.markRenderDirty?.();
+    });
+    // Attach drag listeners only while a drag driver is registered (editor mode).
+    this._syncDragListeners();
+    this._dragUnsub?.();
+    this._dragUnsub = subscribeDriveDragDriver(() => this._syncDragListeners());
+  }
+
+  /**
+   * Release everything {@link attachRuntime} installed, plus the gizmos in the
+   * scene. Shared by `dispose()` and the user toggle. It does NOT touch
+   * `this.shared` — see the note on {@link onDeactivate}.
+   */
+  private detachRuntime(): void {
+    this._cancelDrag();
+    this._teardownDragListeners();
+    this._dragUnsub?.();
+    this._dragUnsub = null;
+    this.clearAll();
+    this.unsub?.();
+    this.unsub = null;
+    this.offOverlay?.();
+    this.offOverlay = null;
   }
 
   // ── Drag interaction (editor drive-motion preview) ─────────────────────

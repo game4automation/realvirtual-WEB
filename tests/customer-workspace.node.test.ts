@@ -4,11 +4,12 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   applyMergedSnapshot,
   assertNoCrossTierLeak,
   assertWorkspaceGuards,
+  collectPrivateSourceInventory,
   createDeliveryManifest,
   deliveryChangelog,
   gitProvenance,
@@ -17,6 +18,7 @@ import {
   runBuild,
   stageFilteredSourceTree,
 } from '../scripts/_workspace-lib.mjs';
+import { knownProjectKeys } from '../scripts/_rv-guards.mjs';
 
 const temporary: string[] = [];
 afterEach(() => temporary.splice(0).forEach(path => rmSync(path, { recursive: true, force: true })));
@@ -44,6 +46,9 @@ const alwaysDeliveredDocs = [
   // Same case again: README.md is a CORE_FILE, always delivered, and its documentation index
   // links here.
   'doc-signal-connection-logic.md',
+  // And again, from the 6.3.19 release branch: doc-webviewer.md sends the reader here for the
+  // path/AGV task primitive, so the delivered guide links a file the staged workspace must carry.
+  'doc-path-fleet-control.md',
 ];
 const workspaceRecipes = [
   'README.md', 'replace-machine-model.md', 'kinematize-cad-import.md', 'connect-live-signals.md',
@@ -132,6 +137,16 @@ function fixture() {
   // The shared launcher functions are delivered from the installer payload into the workspace, so
   // the fixture has to carry the same layout the private repository has.
   write(join(privateRoot, 'installer', 'payload', 'rv-launcher.ps1'), 'function Get-RvWorkspaceId { }\n');
+  // The optional on-premise appliance ships as a top-level folder from the commercial tier. The
+  // fixture carries the runtime artefacts that must NOT travel with it, so the exclusions are
+  // covered by every staging test rather than only by the dedicated one.
+  write(join(privateRoot, 'appliance', 'install.sh'), '#!/usr/bin/env bash\nset -euo pipefail\n');
+  write(join(privateRoot, 'appliance', 'setup-appliance.ps1'), '# appliance bootstrap fixture\n');
+  write(join(privateRoot, 'appliance', 'env.sample'), 'RV_APPLIANCE_HOST=<host>\n');
+  write(join(privateRoot, 'appliance', 'lib', 'decide.sh'), '# decide fixture\n');
+  write(join(privateRoot, 'appliance', '.env'), 'RV_ADMIN_PASSWORD=must-not-ship\n');
+  write(join(privateRoot, 'appliance', 'state', 'resume.json'), '{"phase":"E"}');
+  write(join(privateRoot, 'appliance', 'tests', 'node_modules', 'vitest', 'index.js'), 'module.exports = {};');
   const referencedImages = [
     'realvirtual-web-demo.jpg', 'screenshot-hmi-overview.png', 'screenshot-layout-planner.jpg',
     'screenshot-drive-chart.png', 'screenshot-hierarchy.png', 'screenshot-settings.png',
@@ -162,7 +177,36 @@ function fixture() {
     "    && !normalizedImporter.includes('realvirtual-web-pro')) return null;",
   ].join('\n'));
   write(join(privateRoot, 'package.json'), '{"name":"private","version":"1.0.0","dependencies":{"safe":"1","@nvidia/test":"1"}}');
-  write(join(privateRoot, 'package-lock.json'), '{"packages":{"node_modules/@nvidia/test":{"version":"1"}}}');
+  // Shaped like the real private lockfile: one dependency that survives the @nvidia pruning, one
+  // that does not, and a transitive package only the pruned one reaches. `npm ci` in the delivered
+  // workspace verifies each package against `resolved`/`integrity` from here, so the delivered
+  // lockfile must be this file minus @nvidia - not a synthesized stand-in (plan-434 phase 2b).
+  write(join(privateRoot, 'package-lock.json'), JSON.stringify({
+    name: 'private',
+    version: '1.0.0',
+    lockfileVersion: 3,
+    requires: true,
+    packages: {
+      '': { name: 'private', version: '1.0.0', dependencies: { safe: '1', '@nvidia/test': '1' } },
+      'node_modules/safe': {
+        version: '1.0.0',
+        resolved: 'https://registry.npmjs.org/safe/-/safe-1.0.0.tgz',
+        integrity: 'sha512-safeintegrity==',
+        license: 'MIT',
+      },
+      'node_modules/@nvidia/test': {
+        version: '1.0.0',
+        resolved: 'https://edge.urm.nvidia.com/artifactory/api/npm/@nvidia/test/-/test-1.0.0.tgz',
+        integrity: 'sha512-nvidiaintegrity==',
+        dependencies: { 'nvidia-only': '^1.0.0' },
+      },
+      'node_modules/nvidia-only': {
+        version: '1.0.0',
+        resolved: 'https://registry.npmjs.org/nvidia-only/-/nvidia-only-1.0.0.tgz',
+        integrity: 'sha512-nvidiaonlyintegrity==',
+      },
+    },
+  }));
   write(join(privateRoot, 'LICENSE-commercial.md'), 'PLACEHOLDER - pending legal review');
   write(join(privateRoot, 'tier-manifest.json'), JSON.stringify({
     defaults: 'internal',
@@ -209,6 +253,13 @@ function trackPublicModels(core: string, tracked: string[], untracked: string[] 
   execFileSync('git', ['add', '--', ...tracked], { cwd: core });
   for (const rel of untracked) write(join(core, rel), `fixture:${rel}`);
 }
+
+// Every test in this file stages one or two complete workspaces on disk and
+// several of them shell out to git. That does not fit vitest's 5 s default while
+// the rest of the node suite runs beside it, so the tests here used to fail by
+// schedule rather than by behaviour — reliably enough that the failure was read
+// as a known one. The budget is a load allowance, not a performance target.
+vi.setConfig({ testTimeout: 120_000, hookTimeout: 120_000 });
 
 describe('customer workspace generator', () => {
   it('populates the tier-profile dependency cache after a fast cache miss', () => {
@@ -277,6 +328,41 @@ describe('customer workspace generator', () => {
     expect(JSON.parse(readFileSync(join(coreRoot, 'dist', '.rv-build-provenance.json'), 'utf8')).fast).toBe(false);
   });
 
+  // The delivered workspace installs realvirtual-web-pro with `npm ci`, which rejects any lockfile
+  // that does not describe the tree package.json asks for. The generator used to synthesize a
+  // root-only lockfile; that passed unnoticed only as long as the @nvidia pruning left no
+  // dependency behind at all. Since @dimforge/rapier3d-compat is a regular private dependency the
+  // installer really runs `npm ci` there, and a synthetic lockfile kills the delivery (EUSAGE).
+  it('delivers a real pruned lockfile for the private package, not a synthetic one', () => {
+    const { core, privateRoot, delivery } = fixture();
+    const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
+    temporary.push(staged.workspaceRoot);
+
+    const raw = readFileSync(join(staged.privateRoot!, 'package-lock.json'), 'utf8');
+    const lock = JSON.parse(raw);
+    const manifest = JSON.parse(readFileSync(join(staged.privateRoot!, 'package.json'), 'utf8'));
+
+    // (a) Surviving dependencies keep their own entry, with the integrity hash npm ci verifies.
+    expect(lock.packages['node_modules/safe']).toMatchObject({
+      version: '1.0.0',
+      resolved: 'https://registry.npmjs.org/safe/-/safe-1.0.0.tgz',
+      integrity: 'sha512-safeintegrity==',
+    });
+    // (b) Nothing @nvidia survives - neither the entry, nor the root edge, nor the private
+    // registry URL, which a customer could not reach anyway.
+    expect(raw).not.toContain('@nvidia');
+    expect(raw).not.toContain('nvidia.com');
+    expect(Object.keys(lock.packages).some((key) => key.toLowerCase().includes('@nvidia'))).toBe(false);
+    // Transitively reachable only through @nvidia, so it goes with it.
+    expect(lock.packages['node_modules/nvidia-only']).toBeUndefined();
+    // (c) The root entry states exactly the pruned manifest dependencies; npm ci compares the two.
+    expect(lock.packages[''].dependencies).toEqual(manifest.dependencies);
+    expect(lock.packages[''].dependencies).toEqual({ safe: '1' });
+    expect(lock.lockfileVersion).toBe(3);
+    expect(lock.name).toBe(manifest.name);
+    expect(lock.version).toBe(manifest.version);
+  });
+
   it('physically excludes internal/restricted source and emits deterministic customer settings', () => {
     const { core, privateRoot, delivery } = fixture();
     const first = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
@@ -301,8 +387,10 @@ describe('customer workspace generator', () => {
         existsSync(join(first.coreRoot, 'src', 'plugins', 'mcp-bridge', 'help', name)), name).toBe(true);
     }
     for (const name of alwaysDeliveredDocs) expect(existsSync(join(first.coreRoot, name)), name).toBe(true);
-    expect(existsSync(join(first.coreRoot, 'DESIGN.md'))).toBe(true);
-    for (const name of ['doc-deploy.md', 'doc-plc-programming.md', 'doc-render-picking.md', 'PRODUCT.md']) {
+    // DESIGN.md joined PRODUCT.md on the not-from-here list: brand and strategy live in the
+    // private sibling and are not published on the public mirror, so this tree cannot deliver
+    // them. The customer's authority for the visual system is the code (src/core/hmi/theme.ts).
+    for (const name of ['DESIGN.md', 'doc-deploy.md', 'doc-plc-programming.md', 'doc-render-picking.md', 'PRODUCT.md']) {
       expect(existsSync(join(first.coreRoot, name)), name).toBe(false);
     }
     for (const name of [
@@ -318,14 +406,21 @@ describe('customer workspace generator', () => {
     // A missing Node.js is the most common first-start failure: the README must name the
     // required major version, the PATH refresh, and where start.ps1 actually lives.
     expect(readme).toContain('Node.js 22 LTS (required');
-    // The installer is the low-friction route on Windows and must be named before the
-    // manual prerequisites, which it makes unnecessary.
-    expect(readme).toContain('realvirtual WEB dev');
-    expect(readme.indexOf('## Quick start (Windows)')).toBeGreaterThan(-1);
-    expect(readme.indexOf('## Quick start (Windows)')).toBeLessThan(readme.indexOf('## Quick start (manual'));
+    // The one-click installer is switched off and must not be advertised anywhere in a
+    // delivered README - not as the main route and not as an alternative. A download link
+    // to something we do not currently support is worse than no link at all.
+    expect(readme).not.toContain('setup.exe');
+    expect(readme).not.toContain('realvirtual-WEB-dev-setup');
+    expect(readme).not.toContain('realvirtual WEB dev');
+    // Git is THE documented route, and its prerequisites are stated because nothing
+    // brings them along any more.
+    expect(readme.indexOf('## How to get started')).toBeGreaterThan(-1);
+    expect(readme.indexOf('## How to get started')).toBeLessThan(readme.indexOf('### Set the workspace up'));
+    expect(readme).toContain('### What you need installed');
+    expect(readme).toContain('**Git and Git LFS:**');
     // The first executable instruction comes before the reference material, not after it.
-    expect(readme.indexOf('## Quick start (Windows)')).toBeLessThan(readme.indexOf('## Reference'));
-    expect(readme.indexOf('## Quick start (Windows)')).toBeLessThan(readme.indexOf('### Your private workspace'));
+    expect(readme.indexOf('## How to get started')).toBeLessThan(readme.indexOf('## Reference'));
+    expect(readme.indexOf('## How to get started')).toBeLessThan(readme.indexOf('### Your private workspace'));
     expect(readme).toContain('close the terminal and open a new one');
     expect(readme).toContain('from the repository root');
     expect(readme).toContain('is not recognized as a command');
@@ -382,7 +477,20 @@ describe('customer workspace generator', () => {
     expect(featuresMatrix).toContain('## Licensed features');
     expect(featuresMatrix).toContain('## Your project');
     expect(featuresMatrix).toContain('- Drives (linear and rotational motion)');
-    expect(featuresMatrix).toContain('| commercial-feature | commercial | yes |');
+    // The layout planner lives in the AGPL core and is registered from src/main.ts, so it
+    // ships with every delivery. The asset editor does NOT belong in this list: it is a
+    // commercial feature and moves into the private repository.
+    expect(featuresMatrix).toContain('- Layout planner');
+    expect(featuresMatrix).not.toContain('- Asset editor');
+    // In an own repository the delivery is named by its display name - that is the case the
+    // shared repository deliberately departs from.
+    expect(featuresMatrix).toContain('| Feature | Tier | Status | ACME |');
+    expect(readme.startsWith('# ACME\n')).toBe(true);
+    expect(featuresMatrix).toContain('| commercial-feature | commercial | stable | yes |');
+    // A customer matrix lists only that customer's entitled features, so the unassigned
+    // restricted ones do not appear at all - not even as a "no" row (plan-434 Phase 2b).
+    expect(featuresMatrix).not.toContain('| premium |');
+    expect(featuresMatrix).not.toContain('| layout-planner |');
     expect(featuresMatrix).toContain('- `chart` (chart.tsx)');
     expect(featuresMatrix).toContain('- `energy-chart` (energy-chart.tsx)');
     expect(featuresMatrix).not.toContain('- `index` (index.ts)');
@@ -436,7 +544,11 @@ describe('customer workspace generator', () => {
     }
     expect(() => assertWorkspaceGuards(first.workspaceRoot)).not.toThrow();
     expect(hashTree(first.workspaceRoot)).toBe(hashTree(second.workspaceRoot));
-  });
+    // Explicit timeout: this test stages two full workspaces and hashes both
+    // trees. It fits into the 5 s default on an idle machine and does not when
+    // the rest of the suite is running beside it, which made it fail by
+    // schedule rather than by behaviour.
+  }, 60000);
 
   // Customers need a reference model next to their own machine, and the planner needs its
   // component library. Both come from the DemoRealvirtual project; whatever is still lying
@@ -754,7 +866,9 @@ describe('customer workspace generator', () => {
     expect(existsSync(join(clone, 'realvirtual-web', 'node_modules'))).toBe(false);
     expect(existsSync(join(clone, 'realvirtual-web', 'dist'))).toBe(false);
     expect(existsSync(join(clone, 'realvirtual-web', 'package.json'))).toBe(true);
-  });
+    // Same reason as above: staging plus two `git init`/`git add` subprocesses
+    // does not fit the 5 s default while the suite runs in parallel.
+  }, 60000);
 
   it('still rejects a link inside delivered project content', () => {
     const { core, privateRoot, delivery } = fixture();
@@ -854,7 +968,10 @@ describe('customer workspace generator', () => {
     const blob = execFileSync('git', ['-C', bare, 'cat-file', 'blob', 'main:projects/acme/models/machine.glb'], { encoding: 'utf8' });
     expect(blob.startsWith('version https://git-lfs.github.com/spec/v1\n')).toBe(true);
     expect(blob).toMatch(/oid sha256:[0-9a-f]{64}/);
-  }, 60000);
+    // 60 s was already too tight: this drives git init, add, commit, an LFS
+    // upload, a clone and a second delivery, and it exceeded the budget once
+    // the suite grew. The number is a load allowance, not a performance target.
+  }, 180000);
 
   it('summarises feat/fix changes since the previously delivered core commit', () => {
     const core = mkdtempSync(join(tmpdir(), 'rv-changelog-core-'));
@@ -1093,6 +1210,48 @@ describe('customer workspace generator', () => {
   });
 
   /**
+   * The appliance folder. Before this staging path existed, the generated README and
+   * `recipes/setup-appliance.md` both pointed at `appliance/` while nothing ever copied it — the
+   * customer got a runbook for a folder that was not in the delivery.
+   *
+   * The exclusions matter more than the inclusion: `.env` carries every generated secret and
+   * would additionally trip the secret-bearing-file guard, `state/` is the resume marker of an
+   * installation in progress on a DIFFERENT machine, and `tests/node_modules/` is build output.
+   */
+  it('stages the appliance installer and never its runtime state', () => {
+    const { core, privateRoot, delivery } = fixture();
+    const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
+    temporary.push(staged.workspaceRoot);
+    const appliance = join(staged.workspaceRoot, 'appliance');
+    expect(existsSync(join(appliance, 'install.sh'))).toBe(true);
+    expect(existsSync(join(appliance, 'setup-appliance.ps1'))).toBe(true);
+    expect(existsSync(join(appliance, 'lib', 'decide.sh'))).toBe(true);
+    // env.sample is the delivered template; it has no leading dot precisely so it may ship.
+    expect(readFileSync(join(appliance, 'env.sample'), 'utf8')).toContain('RV_APPLIANCE_HOST');
+
+    expect(existsSync(join(appliance, '.env'))).toBe(false);
+    expect(existsSync(join(appliance, 'state'))).toBe(false);
+    expect(existsSync(join(appliance, 'tests', 'node_modules'))).toBe(false);
+
+    // The recipe that walks the customer through it has to be reachable from the index, or the
+    // broken-link guard is the only thing that would ever notice.
+    expect(readFileSync(join(staged.workspaceRoot, 'recipes', 'README.md'), 'utf8'))
+      .toContain('setup-appliance.md');
+    expect(existsSync(join(staged.workspaceRoot, 'recipes', 'setup-appliance.md'))).toBe(true);
+  });
+
+  /**
+   * A commercial delivery without the appliance is a defect, not a variant: the README promises
+   * the folder. Failing loudly here is the only thing that keeps the two in step.
+   */
+  it('refuses a commercial delivery whose appliance folder is missing', () => {
+    const { core, privateRoot, delivery } = fixture();
+    rmSync(join(privateRoot, 'appliance'), { recursive: true, force: true });
+    expect(() => stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery }))
+      .toThrow(/Appliance installer not found/);
+  });
+
+  /**
    * The generated PowerShell has to PARSE. It is assembled from template strings full of `$`, `\`
    * and nested quotes, and nothing else in this repository would notice a typo — the first reader
    * would be a customer, whose workspace then does not start for a reason no message explains.
@@ -1139,5 +1298,406 @@ describe('customer workspace generator', () => {
     // A separator prefix must not launder a dense random run.
     write(join(root, 'leak.md'), tick + 'sk_live_' + '51H8xQ2eZvKYlo2CkYbGvXqRt9pLmNwZa' + tick);
     expect(() => assertWorkspaceGuards(root)).toThrow(/High-entropy string literal/);
+  });
+});
+
+/**
+ * plan-434 §2.6 — the foreign-customer-name guard now asks the project's `kind`.
+ *
+ * The guard aborts a delivery when another project's NAME appears anywhere in
+ * the staged tree, because a customer's name in another customer's repository is
+ * a leak. Fed with every folder under `projects/`, it also aborted on `festo`,
+ * `new-project` and `demo-realvirtual` — words a demo scene or a fixture path
+ * legitimately contains, and none of them anybody's secret.
+ */
+describe('foreign-customer-name guard against project kinds', () => {
+  const projectsFixture = () => {
+    const privateRoot = mkdtempSync(join(tmpdir(), 'rv-kind-private-'));
+    temporary.push(privateRoot);
+    write(join(privateRoot, 'projects', 'acme', 'project.json'), '{"kind":"customer"}');
+    write(join(privateRoot, 'projects', 'festo', 'project.json'), '{"kind":"internal"}');
+    return privateRoot;
+  };
+
+  it('ignores an internal project name and still refuses a customer one', () => {
+    const privateRoot = projectsFixture();
+    const customerKeys = knownProjectKeys(privateRoot, { kind: 'customer' });
+    expect(customerKeys).toEqual(['acme']);
+
+    const tree = mkdtempSync(join(tmpdir(), 'rv-kind-tree-'));
+    temporary.push(tree);
+    write(join(tree, 'models', 'festo-cell.txt'), 'a fixture named after the internal playground');
+
+    expect(() => assertWorkspaceGuards(tree, { projectKey: 'other', knownProjectKeys: customerKeys })).not.toThrow();
+    // ...and the unfiltered list is exactly the false positive the filter removes.
+    expect(() => assertWorkspaceGuards(tree, { projectKey: 'other', knownProjectKeys: knownProjectKeys(privateRoot) }))
+      .toThrow(/Foreign customer name found in models\/festo-cell\.txt/);
+
+    write(join(tree, 'docs', 'acme-layout.md'), 'no links here');
+    expect(() => assertWorkspaceGuards(tree, { projectKey: 'other', knownProjectKeys: customerKeys }))
+      .toThrow(/Foreign customer name found in docs\/acme-layout\.md/);
+  });
+
+  it('never treats the project being delivered as foreign to itself', () => {
+    const privateRoot = projectsFixture();
+    const tree = mkdtempSync(join(tmpdir(), 'rv-kind-own-'));
+    temporary.push(tree);
+    write(join(tree, 'projects', 'acme', 'notes.txt'), 'the customer we are delivering to');
+
+    expect(() => assertWorkspaceGuards(tree, {
+      projectKey: 'acme',
+      knownProjectKeys: knownProjectKeys(privateRoot, { kind: 'customer' }),
+    })).not.toThrow();
+  });
+});
+
+/**
+ * The projectless (standard) delivery — plan-434 Phase 4.
+ *
+ * A `standard` customer buys the product, not a project: their repository ships
+ * the viewer, CONNECT and the demo model, and `projects/` arrives empty for them
+ * to fill. Everything below asserts one half of that sentence — what is NOT
+ * delivered (no project folder, no diagnosis package, no default model, no PR
+ * workflow), and what the customer keeps forever (everything under `projects/`).
+ */
+describe('projectless customer workspace', () => {
+  //! The delivery config a standard customer translates to: an empty `projects[]`
+  //! and a null primary key. Shaped exactly like loadDeliveryConfigByCustomer's result.
+  const standardDelivery = {
+    project: 'Hochschule Beispiel',
+    customer: 'beispiel',
+    projects: [] as string[],
+    kind: 'standard' as const,
+    tier: 'commercial' as const,
+    restrictedFeatures: [] as string[],
+    remote: 'git@example.invalid:beispiel.git',
+    mirror: null,
+    connectChannel: 'stable' as const,
+    connectLicenseKey: 'RVC1-PLACEHOLDER',
+    projectKey: null,
+  };
+
+  function stageProjectless(overrides: Record<string, unknown> = {}) {
+    const { core, privateRoot } = fixture();
+    const staged = stageFilteredSourceTree({
+      coreRoot: core,
+      privateRoot,
+      projectKeys: [],
+      profile: standardDelivery,
+      delivery: standardDelivery,
+      // A projectless delivery never carries a diagnosis package; the generator
+      // reaches the same branch as --no-rag, by what the customer is.
+      hasDiagnosis: false,
+      ...overrides,
+    });
+    temporary.push(staged.workspaceRoot);
+    return { core, privateRoot, staged };
+  }
+
+  it('delivers an empty projects/ folder and no project material at all', () => {
+    const { staged } = stageProjectless();
+
+    // The folder exists — Git cannot carry an empty directory, so `.gitkeep` is
+    // the one vendor file under `projects/` — and it holds nothing else.
+    expect(readdirSync(join(staged.workspaceRoot, 'projects'))).toEqual(['.gitkeep']);
+    expect(readFileSync(join(staged.workspaceRoot, 'projects', '.gitkeep'), 'utf8')).toBe('');
+    // The private repo's own `acme` project must not have followed along.
+    expect(existsSync(join(staged.workspaceRoot, 'projects', 'acme'))).toBe(false);
+    expect(staged.projectKey).toBeNull();
+    expect(staged.projectKeys).toEqual([]);
+    expect(staged.project).toBeNull();
+
+    // No diagnosis payload: no connect/ folder, no rag.zip.
+    expect(existsSync(join(staged.workspaceRoot, 'connect'))).toBe(false);
+
+    // The product itself IS delivered — the customer has something to open.
+    expect(existsSync(join(staged.coreRoot, 'public', 'models', 'DemoRealvirtualWeb.glb'))).toBe(true);
+    expect(existsSync(join(staged.privateRoot!, 'src', 'commercial', 'safe.ts'))).toBe(true);
+  });
+
+  it('generates settings without a default model, and keeps the rest of the profile', () => {
+    const { staged } = stageProjectless({
+      connectPin: {
+        channel: 'stable', version: '1.2.3',
+        url: 'https://example.invalid/versions/x.exe', sha256: 'a'.repeat(64),
+      },
+    });
+    const settings = JSON.parse(readFileSync(join(staged.coreRoot, 'public', 'settings.json'), 'utf8'));
+
+    // Empty, not absent and not invented: there is no project, so there is no
+    // model to open by default — the viewer offers the selector instead.
+    expect(settings.defaultModel).toBe('');
+    expect(settings.connectChannel).toBe('stable');
+    expect(settings.connectLicensePrefill).toBe('RVC1-PLACEHOLDER');
+    expect(settings.connectDownload).toMatchObject({ channel: 'stable', version: '1.2.3' });
+  });
+
+  /**
+   * The shared commercial repository (plan-434 §2.7) — the measured leak.
+   *
+   * `settings.json` is a delivered file. In a repository every standard customer
+   * can read, one customer's `connectLicensePrefill` is every customer's licence
+   * key. The guard is on the channel and not on the value, so a delivery whose
+   * key happens to resolve still writes nothing; and the key is left OUT rather
+   * than blanked, because an empty string reads as "no licence" to CONNECT while
+   * an absent one lets it ask.
+   */
+  it('writes no licence prefill into the shared repository, even when a key resolves', () => {
+    const { staged } = stageProjectless({
+      profile: { ...standardDelivery, sharedRepo: true },
+      delivery: { ...standardDelivery, sharedRepo: true },
+    });
+    const settings = JSON.parse(readFileSync(join(staged.coreRoot, 'public', 'settings.json'), 'utf8'));
+
+    expect('connectLicensePrefill' in settings).toBe(false);
+    // Everything else about the delivery is unchanged — it is the same
+    // projectless workspace, only the destination is shared.
+    expect(settings.defaultModel).toBe('');
+    expect(settings.connectChannel).toBe('stable');
+
+    const readme = readFileSync(join(staged.workspaceRoot, 'README.md'), 'utf8');
+    expect(readme).toContain('Enter your licence key on first start');
+    expect(readme).not.toContain('already filled in');
+  });
+
+  /**
+   * The second measured leak in the shared repository: the customer's IDENTITY.
+   *
+   * One delivery run produces the push that every standard customer then pulls, so
+   * whichever customer happened to trigger it must not be named in the result. It
+   * was: the README title carried the display name, the clone-folder suggestion the
+   * slug, and the feature matrix used the display name as its column head — which is
+   * how "Hochschule Heilbronn" and `D:\git\hs-heilbronn` reached delivery/6.3.24 of a
+   * repository shared by everyone.
+   *
+   * The remote is overridden here to the real shared one. In the default fixture it
+   * carries the slug, which would be a false positive: a shared delivery's remote
+   * genuinely is `rv-commercial/realvirtual-commercial`.
+   */
+  const sharedDelivery = {
+    ...standardDelivery,
+    sharedRepo: true,
+    remote: 'https://git.example.invalid/rv-commercial/realvirtual-commercial.git',
+  };
+
+  //! Every generated text file in the workspace, as [relative path, content].
+  //! The staged product tree is skipped: it is core source, identical for everyone.
+  function generatedTexts(root: string): Array<[string, string]> {
+    const out: Array<[string, string]> = [];
+    const walk = (dir: string, prefix: string) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          if (['realvirtual-web', 'realvirtual-web-pro', 'node_modules', '.git'].includes(entry.name)) continue;
+          walk(join(dir, entry.name), rel);
+        } else if (/\.(md|json|ps1|sh|txt|ts|nvmrc|gitattributes|gitignore)$/.test(entry.name)
+          || entry.name.startsWith('.git')) {
+          out.push([rel, readFileSync(join(dir, entry.name), 'utf8')]);
+        }
+      }
+    };
+    walk(root, '');
+    return out;
+  }
+
+  it('names no customer anywhere in the shared repository, and calls the product by its own name', () => {
+    const { staged } = stageProjectless({ profile: sharedDelivery, delivery: sharedDelivery });
+
+    // Not one generated file may carry the display name or the slug of the customer
+    // whose run produced the push — README, FEATURES, CONTRIBUTING, CLAUDE/AGENTS,
+    // recipes, scripts, settings, all of them.
+    for (const [rel, text] of generatedTexts(staged.workspaceRoot)) {
+      expect(text, `${rel} names the display name`).not.toContain('Hochschule Beispiel');
+      expect(text, `${rel} names the slug`).not.toContain('beispiel');
+    }
+
+    const readme = readFileSync(join(staged.workspaceRoot, 'README.md'), 'utf8');
+    const features = readFileSync(join(staged.workspaceRoot, 'FEATURES.md'), 'utf8');
+    expect(readme.startsWith('# realvirtual Commercial\n')).toBe(true);
+    expect(features).toContain('| Feature | Tier | Status | realvirtual Commercial |');
+    // The suggested folder is the repository's own name, which is also what the
+    // clone in the step above actually produces.
+    expect(readme).toContain('D:\\git\\realvirtual-commercial');
+  });
+
+  it('leads the shared README with git clone and mentions no installer at all', () => {
+    const { staged } = stageProjectless({ profile: sharedDelivery, delivery: sharedDelivery });
+    const readme = readFileSync(join(staged.workspaceRoot, 'README.md'), 'utf8');
+
+    // Git is the documented route: clone, start, `git pull`.
+    expect(readme).toContain('## How to get started');
+    expect(readme).toContain('git clone https://git.example.invalid/rv-commercial/realvirtual-commercial.git');
+    expect(readme).toContain('.\\start.ps1');
+    expect(readme).toContain('git pull');
+    // ...and its prerequisites are named, because nothing brings them along any more.
+    expect(readme).toContain('### What you need installed');
+    expect(readme).toContain('Node.js 22 LTS (required)');
+    expect(readme).toContain('**Git and Git LFS:**');
+    // The one-click installer is switched off and appears nowhere — not as the main
+    // route, not as a fallback, and above all not as a download link.
+    expect(readme).not.toContain('setup.exe');
+    expect(readme).not.toContain('realvirtual-WEB-dev-setup');
+    expect(readme).not.toContain('realvirtual WEB dev');
+    expect(readme.indexOf('git clone')).toBeLessThan(readme.indexOf('## Reference'));
+  });
+
+  it('lists the layout planner as a core feature, and never the asset editor', () => {
+    const { staged } = stageProjectless({ profile: sharedDelivery, delivery: sharedDelivery });
+    const features = readFileSync(join(staged.workspaceRoot, 'FEATURES.md'), 'utf8');
+    const readme = readFileSync(join(staged.workspaceRoot, 'README.md'), 'utf8');
+
+    // The planner ships with every delivery: AGPL core, statically imported by main.ts.
+    // Its tier registration only gates the DOCUMENT, not the code.
+    expect(features).toContain('## Core (AGPL) - always included');
+    expect(features).toContain('- Layout planner');
+    // The asset editor is commercial as of this decision and its future versions move
+    // into the private repository, so the core list must not promise it.
+    expect(features).not.toContain('- Asset editor');
+    // The README's inline enumeration is the same list in prose and must agree with it.
+    expect(readme).toContain('and the layout planner)');
+    expect(readme).toMatch(/AGPL core \(10 capabilities/);
+  });
+
+  it('writes a README that tells the customer to create a project, and never to open a pull request', () => {
+    const { staged } = stageProjectless();
+    const readme = readFileSync(join(staged.workspaceRoot, 'README.md'), 'utf8');
+
+    expect(readme).toContain('Create your first project');
+    // The delivery channel decision (§2.2): read-only repository, updates by pull.
+    expect(readme).toContain('read-only for you');
+    expect(readme).toContain('git pull');
+    expect(readme).not.toMatch(/open a pull request/i);
+    expect(readme).not.toContain('### Submit changes');
+    // No diagnosis promise, because no diagnosis package was delivered.
+    expect(readme).toContain('contains no AI diagnosis package');
+    // And no path into a project folder that does not exist — as a link OR as text.
+    expect(readme).not.toContain('projects/acme');
+    expect(readme).not.toMatch(/\]\(\.\.?\/?projects\//);
+  });
+
+  it('writes a CONTRIBUTING that states the repository is read-only, with no CLA', () => {
+    const { staged } = stageProjectless();
+    const contributing = readFileSync(join(staged.workspaceRoot, 'CONTRIBUTING.md'), 'utf8');
+
+    expect(contributing).toContain('read-only for you');
+    expect(contributing).toContain('no pull request to open');
+    // No contribution route, therefore no instruction to take one and no CLA.
+    expect(contributing).not.toMatch(/open a pull request|reviewed pull request/i);
+    expect(contributing).not.toMatch(/grant realvirtual GmbH the rights/i);
+    expect(contributing).toContain('projects/');
+  });
+
+  it('keeps the feature matrix customer-scoped and drops the "Your project" section', () => {
+    const { staged } = stageProjectless();
+    const features = readFileSync(join(staged.workspaceRoot, 'FEATURES.md'), 'utf8');
+
+    expect(features).toContain('## Licensed features');
+    expect(features).not.toContain('## Your project');
+    // Customer-scoped means the customer's entitlements, not the internal
+    // registration list: `premium` is restricted and was never granted here.
+    expect(features).toContain('commercial-feature');
+    expect(features).not.toMatch(/^\| premium \|/m);
+  });
+
+  it('records an empty project set in the delivery manifest, and still the private-source inventory', () => {
+    const { staged } = stageProjectless();
+    const inventory = collectPrivateSourceInventory(staged.workspaceRoot);
+    const manifest = createDeliveryManifest({
+      core: { commit: 'c'.repeat(40) },
+      privateRepo: { commit: 'p'.repeat(40) },
+      profile: { tier: 'commercial', restrictedFeatures: [] },
+      connect: { channel: 'stable', version: '1.2.3' },
+      // There is no project tree to hash.
+      projectRoot: null,
+      viewerVersion: '9.9.9',
+      plasticChangeset: 4711,
+      projects: {},
+      privateSources: inventory,
+    });
+
+    expect(manifest.projects).toEqual({});
+    expect(manifest.projectTreeSha256).toBeNull();
+    expect(manifest.baselineTag).toBeTruthy();
+    // The tier diff gate keeps working: the next delivery still has an inventory
+    // to compare against, project or no project (§2.4).
+    expect(manifest.privateSources.paths.length).toBeGreaterThan(0);
+    expect(manifest.privateSources.paths.every((path: string) => path.startsWith('realvirtual-web-pro/src'))).toBe(true);
+  });
+
+  it('passes the workspace guards with an empty project set, foreign-name check still armed', () => {
+    const { staged } = stageProjectless();
+    const foreignRoot = mkdtempSync(join(tmpdir(), 'rv-projectless-foreign-'));
+    temporary.push(foreignRoot);
+    write(join(foreignRoot, 'projects', 'rivalcorp', 'project.json'), '{"kind":"customer"}');
+    const foreign = knownProjectKeys(foreignRoot, { kind: 'customer' });
+    expect(foreign).toEqual(['rivalcorp']);
+
+    // Nothing is "own" here, so every known customer name is foreign — and none
+    // of them appears in a workspace that carries no project material.
+    expect(() => assertWorkspaceGuards(staged.workspaceRoot, {
+      projectKey: null, projectKeys: [], knownProjectKeys: foreign,
+    })).not.toThrow();
+
+    // The guard is armed, not merely quiet.
+    write(join(staged.workspaceRoot, 'projects', 'rivalcorp-notes.txt'), 'leaked');
+    expect(() => assertWorkspaceGuards(staged.workspaceRoot, {
+      projectKey: null, projectKeys: [], knownProjectKeys: foreign,
+    })).toThrow(/Foreign customer name found in projects\/rivalcorp-notes\.txt/);
+  });
+
+  /**
+   * The §6.7 zone-C proof, as a unit test.
+   *
+   * A projectless delivery delivers nothing under `projects/`, so nothing there is
+   * vendor-managed — and the merge must therefore leave the customer's own project
+   * exactly as it found it. This follows from the existing logic without a special
+   * case (the per-project loop has nothing to iterate), which is precisely what
+   * makes it worth pinning: a future "seed the folder" convenience would break it.
+   */
+  it('leaves a customer-created project under projects/ byte-identical across an update', () => {
+    const { staged } = stageProjectless();
+    execFileSync('git', ['init', '-b', 'main'], { cwd: staged.workspaceRoot, stdio: 'ignore' });
+    execFileSync('git', ['add', '-A'], { cwd: staged.workspaceRoot, stdio: 'ignore' });
+
+    const clone = mkdtempSync(join(tmpdir(), 'rv-projectless-clone-'));
+    temporary.push(clone);
+    execFileSync('git', ['init', '-b', 'main'], { cwd: clone, stdio: 'ignore' });
+    // A previous delivery, plus the project the customer built themselves.
+    write(join(clone, 'README.md'), '# an older delivery\n');
+    write(join(clone, 'realvirtual-web', 'main.ts'), 'export const old = true;');
+    const own: Record<string, string> = {
+      'projects/mymachine/project.json': '{"canonicalName":"mymachine"}\n',
+      'projects/mymachine/models/mine.glb': 'binary-ish content the delivery must never touch',
+      'projects/mymachine/plugins/index.ts': 'export const mine = 1;\n',
+      'projects/mymachine/notes.md': '# my notes\n',
+    };
+    for (const [rel, content] of Object.entries(own)) write(join(clone, rel), content);
+    execFileSync('git', ['add', '-A'], { cwd: clone, stdio: 'ignore' });
+    execFileSync('git', ['-c', 'user.email=t@example.invalid', '-c', 'user.name=t',
+      'commit', '-m', 'customer state'], { cwd: clone, stdio: 'ignore' });
+
+    const snapshot = applyMergedSnapshot(staged.workspaceRoot, clone, { projects: [], version: '9.9.9' });
+
+    // Nothing was reported for any project, because nothing was delivered into one.
+    expect(snapshot.projects).toEqual({});
+    // Every one of the customer's files is still there, byte for byte.
+    for (const [rel, content] of Object.entries(own)) {
+      expect(readFileSync(join(clone, rel), 'utf8'), rel).toBe(content);
+    }
+    // Git agrees: not one path under projects/ is modified or deleted.
+    //
+    // The GLB is excluded from this Git-level check on purpose. The delivered
+    // `.gitattributes` puts `projects/*/models/*.glb` under the LFS filter, so a
+    // GLB the customer committed BEFORE that attribute reached their repository
+    // re-reads as "modified" the first time — an attribute effect on their own
+    // file, not a change the merge made to it. The byte comparison above is the
+    // claim that matters, and it covers the GLB too.
+    const status = execFileSync('git', ['status', '--porcelain', '--', 'projects'],
+      { cwd: clone, encoding: 'utf8' })
+      .split('\n')
+      .filter(line => line.trim() && !line.includes('.gitkeep') && !line.endsWith('.glb'));
+    expect(status).toEqual([]);
+    // And zone A did happen: the delivered README replaced the old one.
+    expect(readFileSync(join(clone, 'README.md'), 'utf8')).toContain('Create your first project');
   });
 });

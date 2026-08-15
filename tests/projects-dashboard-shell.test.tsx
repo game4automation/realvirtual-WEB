@@ -39,9 +39,13 @@ function renderShell(props: { onBack?: () => void } = {}) {
 }
 
 describe('ProjectsDashboard shell', () => {
-  it('renders nothing while the store says closed', () => {
+  it('is hidden — not unmounted — while the store says closed', () => {
     renderShell();
-    expect(screen.queryByTestId('body')).toBeNull();
+    // Kept in the DOM so reopening is instant and resumes the exact view
+    // (tree expansion, scroll, selection); `display: none` keeps it out of
+    // the accessibility tree and the tab order all the same.
+    expect(screen.getByTestId('body')).not.toBeVisible();
+    expect(screen.queryByRole('region', { name: 'Projects' })).toBeNull();
   });
 
   it('renders its body and title once opened', () => {

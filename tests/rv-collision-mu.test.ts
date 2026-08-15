@@ -138,6 +138,72 @@ describe('spawned MUs', () => {
     expect(body?.meshes.map((m) => m.mesh.name)).toEqual(['PartMesh']);
   });
 
+  // ── plan-409 §9.3 — the Cutter role on the MU path (F2). ──────────────
+  //
+  // A cutter can arrive as an MU (a tool magazine spawning inserts), so the
+  // role must survive the whole spawn path. The MACHINING suppression
+  // deliberately does NOT cover MU cutters in v1 — MachiningVolume.tools are
+  // scene components, never MUs — so an MU cutter is simply always checked.
+
+  it('registers a spawned MU with CollisionRoleForMUs = Cutter', () => {
+    const s = machineScene();
+    const mu = new FakeMU(1, new Object3D(), HALF, true);
+    mu.moveTo(0, 0, 0);
+    s.manager.onMUSpawned(mu as unknown as CollisionMU, 'Cutter');
+    s.manager.rebuild();
+    const body = s.manager.bodies.find((b) => b.kind === 'mu');
+    expect(body?.role).toBe('Cutter');
+    expect(s.manager.pairs).toHaveLength(1);      // Cutter ↔ Machine
+  });
+
+  it('pairs an MU cutter against Workpiece and Machine but never against another cutter', () => {
+    const s = machineScene();
+    // A second node body, role Workpiece, next to the machine.
+    const workpiece = new Object3D();
+    workpiece.name = 'Workpiece';
+    workpiece.add(boxMesh({ name: 'Stock', size: [2, 2, 2] }));
+    s.scene.add(workpiece);
+    s.scene.updateMatrixWorld(true);
+    s.manager.register(workpiece, 'Workpiece');
+
+    const cutterA = new FakeMU(1, new Object3D(), HALF, true);
+    const cutterB = new FakeMU(2, new Object3D(), HALF, true);
+    cutterA.moveTo(0, 0, 0);
+    cutterB.moveTo(0, 0, 0);
+    s.manager.onMUSpawned(cutterA as unknown as CollisionMU, 'Cutter');
+    s.manager.onMUSpawned(cutterB as unknown as CollisionMU, 'Cutter');
+    s.manager.rebuild();
+
+    const roles = s.manager.pairs.map((p) =>
+      [s.manager.bodies[p.i].role, s.manager.bodies[p.j].role].sort().join('|'));
+    expect(roles).not.toContain('Cutter|Cutter');
+    expect(roles.filter((r) => r === 'Cutter|Machine')).toHaveLength(2);
+    expect(roles.filter((r) => r === 'Cutter|Workpiece')).toHaveLength(2);
+  });
+
+  it('reports and then cleanly removes an MU cutter that touches the machine', () => {
+    const s = machineScene();
+    const node = new Object3D();
+    node.name = 'Insert';
+    node.position.set(1.4, 0, 0);
+    node.add(boxMesh({ name: 'InsertMesh' }));
+    s.scene.add(node);
+    s.scene.updateMatrixWorld(true);
+
+    // Partially overlapping, NOT contained: the narrowphase is an exact
+    // triangle-against-triangle test, and a box fully inside another box has no
+    // triangle crossing at all.
+    const mu = new FakeMU(9, node, HALF, false);
+    mu.moveTo(1.4, 0, 0);
+    s.manager.onMUSpawned(mu as unknown as CollisionMU, 'Cutter');
+    s.manager.update(DT);
+    expect(s.manager.activePairs.some((p) => p.aRole === 'Cutter' || p.bRole === 'Cutter')).toBe(true);
+
+    s.manager.onMURemoved(mu as unknown as CollisionMU);
+    s.manager.update(DT);
+    expect(s.manager.bodies.filter((b) => b.kind === 'mu')).toHaveLength(0);
+  });
+
   it('drops every MU body on clear (model change)', () => {
     const s = machineScene();
     const mu = new FakeMU(1, new Object3D(), HALF, true);

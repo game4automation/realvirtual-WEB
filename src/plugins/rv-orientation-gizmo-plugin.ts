@@ -213,6 +213,26 @@ export class OrientationGizmoPlugin implements RVViewerPlugin {
   // ─── Lifecycle ─────────────────────────────────────────────────────
 
   onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
+    this._build(viewer);
+  }
+
+  /**
+   * plan-435: the gizmo has no `onModelCleared` and no `slots`, so without
+   * this hook switching the plugin off would leave the cube on screen. The
+   * teardown is exactly {@link dispose}'s body — the gizmo owns no
+   * model-scoped resources, so invariant 3 is trivially satisfied.
+   */
+  onDeactivate(): void {
+    this.dispose();
+  }
+
+  /** Rebuild what {@link onDeactivate} removed. */
+  onActivate(viewer: RVViewer): void {
+    this._build(viewer);
+  }
+
+  /** Idempotent build — bails out when already up or disabled by app config. */
+  private _build(viewer: RVViewer): void {
     if (this._enabled) return;
     const cfg = getAppConfig().pluginConfig?.['orientationGizmo'] as
       | { enabled?: boolean }

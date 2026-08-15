@@ -35,11 +35,27 @@ import { fixedPrefix, globRegex, patternsOverlap, readJson, toPosix, walk } from
 // _rv-guards.mjs (plan-700 §2.9 / B10). Do not reintroduce a local array here —
 // tests/rv-guards.node.test.ts fails the build if one appears.
 import {
+  CONNECT_LICENSE_KEY_PATTERN,
   MAX_DELIVERY_FILE_BYTES,
   SECRET_SCAN_EXTENSIONS,
   isSecretPath,
   secretContentViolation,
 } from './_rv-guards.mjs';
+// The customer register (plan-434 §2.1) is the primary source for everything the
+// four `*DeliveryConfig*` functions below answer; `delivery/*.json` is the
+// deprecated fallback. Cycle note: `_rv-customers.mjs` imports `resolveTier` and
+// `loadTierManifest` from this file — see the header there.
+import {
+  SHARED_ORG,
+  SHARED_REPO,
+  customerRegistryPath,
+  customerRemoteUrl,
+  isSharedForgejo,
+  listCustomers,
+  loadCustomer,
+  resolveCustomerForProject,
+  resolveCustomerSecrets,
+} from './_rv-customers.mjs';
 // The three-way decision layer (plan-700 §2.5). It is pure — maps in, actions out —
 // and this file supplies the I/O around it: the Git blob maps, the copying, the
 // sidecars and the report. _vendor-merge.mjs imports nothing from here.
@@ -69,7 +85,16 @@ export const DELIVERY_TIERS = Object.freeze(['core', 'commercial', 'restricted',
 // re-interpreted as a key; `customer` is the new repository-level identity and
 // `projects[]` the list of project folders that repository carries.
 const DELIVERY_CONFIG_KEYS = new Set([
-  'project', 'customer', 'projects',
+  // `kind` mirrors the register's relationship kind (`development` | `standard`).
+  // It is carried, never decided here: the pipeline branches on `projects.length`
+  // — a delivery with no project folders is projectless whatever it is called —
+  // and `kind` only says out loud WHY the list is empty (plan-434 Phase 4).
+  'project', 'customer', 'projects', 'kind',
+  // True when this delivery goes into the ONE repository all shared standard
+  // customers receive (plan-434 §2.7). It is the reason a generated file may
+  // NOT carry anything customer-specific — first of all the licence key, which
+  // would otherwise be readable by every other team in that repository.
+  'sharedRepo',
   'tier', 'restrictedFeatures', 'remote', 'mirror', 'connectChannel', 'connectLicenseKey',
   // The diagnosis credentials, alongside connectLicenseKey and for the same reason: a delivery must
   // be reproducible from the config alone. They used to live only in the operator's environment, so
@@ -78,7 +103,11 @@ const DELIVERY_CONFIG_KEYS = new Set([
   // repository back, since bundle-rag embeds them into the delivered project-config.json anyway.
   'requestyApiKey', 'requestyBaseUrl',
 ]);
-const REGISTRATION_KEYS = new Set(['adapter', 'requires']);
+const REGISTRATION_KEYS = new Set(['adapter', 'requires', 'status']);
+// Maturity of a delivered feature, independent of its tier. A feature can be fully entitled
+// and still be young; `beta` says so to the customer without withholding it. Absent means
+// `stable`, so every existing registration keeps its meaning unchanged.
+const REGISTRATION_STATUSES = Object.freeze(['stable', 'beta']);
 const GENERATED_GIT_ATTRIBUTES = [
   'connect/rag.zip filter=lfs diff=lfs merge=lfs -text',
   'projects/*/models/*.glb filter=lfs diff=lfs merge=lfs -text',
@@ -107,6 +136,11 @@ const ALWAYS_DELIVERED_DOCS = [
   // Same case again: README.md is a CORE_FILE and therefore always delivered, and it links here
   // from the documentation index.
   'doc-signal-connection-logic.md',
+  // And again: doc-webviewer.md sends the reader here for the path/AGV task primitive (plan-921),
+  // so leaving it out breaks that link and fails the delivery link check. The feature is core —
+  // rv-path.ts lives in src/core/engine and `Path` is a normative component in rv-odt.json — so
+  // it ships unconditionally rather than behind an entitlement.
+  'doc-path-fleet-control.md',
 ];
 // DESIGN.md and PRODUCT.md used to be delivered from here. They now live in the private sibling
 // (brand and strategy are not published on the public mirror), so this tree cannot deliver them;
@@ -165,8 +199,13 @@ const STATIC_CORE_RECIPES = ['kinematize-cad-import.md'];
 const PRIVATE_STUB_ROOT = 'src/private-stubs';
 // Curated AGPL-core capabilities included in every delivery, independent of tier or
 // project. Kept honest and stable; it is the SSOT for the "Core (AGPL)" block in the
-// generated FEATURES.md and README. Layout planner is a restricted feature, so it is
-// intentionally excluded here.
+// generated FEATURES.md and README.
+//
+// The layout planner used to be left out here as "a restricted feature". That was only ever
+// true of its DOCUMENT: `layout-planner` is a tier registration so `doc-layout-planner.md` can
+// be gated (CONDITIONAL_DELIVERED_DOCS), while the planner code itself sits in the AGPL core
+// and is statically imported by `src/main.ts` — see LIBRARY_CONSUMER_DIR above. Every customer
+// therefore receives it, and the core list now says so.
 const CORE_FEATURES = Object.freeze([
   'Drives (linear and rotational motion)',
   'Sensors',
@@ -177,7 +216,35 @@ const CORE_FEATURES = Object.freeze([
   'HMI panels and overlays',
   'Camera presets and views',
   'PDF document linking',
+  // `src/plugins/layout-planner/` lives in the AGPL core and is registered from
+  // `src/main.ts`, so it ships with EVERY delivery. Leaving it out understated what a
+  // core delivery contains.
+  //
+  // The ASSET EDITOR is deliberately NOT listed here. It ships from the core tree today,
+  // but it is a commercial feature as of this decision and its future versions move into
+  // the private repository — so promising it as part of the AGPL core would be a promise
+  // the next release does not keep.
+  'Layout planner',
 ]);
+
+// The neutral identity of the ONE shared commercial repository (plan-434 §2.7).
+//
+// Every standard customer reads that repository, so NOTHING generated into it may name
+// the customer whose delivery run happened to produce the push. Until this existed, the
+// README title, the clone-folder suggestion and the feature-matrix column head all carried
+// the display name and slug of whoever triggered the run — which is how "Hochschule
+// Heilbronn" and `D:\git\hs-heilbronn` reached a repository shared by everybody.
+//
+// `SHARED_REPO` is the repository name itself, so the suggested folder matches what a
+// `git clone` produces instead of inventing a second name for the same thing.
+const SHARED_DISPLAY_NAME = 'realvirtual Commercial';
+const SHARED_CLONE_FOLDER = SHARED_REPO;
+
+//! The name a delivery may be called BY in generated, delivered text. It is the customer's
+//! display name in their own repository, and the neutral product name in the shared one.
+function deliveryDisplayName(delivery) {
+  return delivery?.sharedRepo === true ? SHARED_DISPLAY_NAME : delivery.project;
+}
 
 function isWithin(root, candidate) {
   const rel = relative(resolve(root), resolve(candidate));
@@ -276,7 +343,11 @@ export function loadTierManifest(manifestPathOrPrivateRoot) {
     if (!Array.isArray(requires) || requires.some((item) => typeof item !== 'string')) {
       throw new Error(`${feature}.requires must be an array of feature keys.`);
     }
-    registrations[feature] = { adapter: registration.adapter, requires: [...requires] };
+    const status = registration.status ?? 'stable';
+    if (!REGISTRATION_STATUSES.includes(status)) {
+      throw new Error(`${feature}.status must be one of ${REGISTRATION_STATUSES.join(', ')}.`);
+    }
+    registrations[feature] = { adapter: registration.adapter, requires: [...requires], status };
   }
 
   const rules = manifest.rules.map((rule, index) => {
@@ -358,27 +429,238 @@ function readDeliveryConfigFile(privateRoot, configName, manifest) {
     throw new Error(`delivery/${configName}.json: "customer" must be a slug like the file name.`);
   }
   const projects = deliveryConfigProjects(config, configName);
-  return assertDeliveryFields(config, manifest, { customer: config.customer ?? configName, projects, configName, path });
+  // A legacy file always carries at least one project (deliveryConfigProjects
+  // rejects an empty list), so it is a `development` relationship by definition.
+  return assertDeliveryFields(config, manifest, {
+    customer: config.customer ?? configName, projects, kind: config.kind ?? 'development', configName, path,
+  });
 }
 
-//! Lists every delivery config in the private repository, sorted by file name.
-export function listDeliveryConfigs(privateRoot, manifest = loadTierManifest(privateRoot)) {
-  const deliveryRoot = join(privateRoot, 'delivery');
-  if (!existsSync(deliveryRoot)) return [];
-  return readdirSync(deliveryRoot).filter((name) => name.endsWith('.json')).sort()
-    .map((name) => readDeliveryConfigFile(privateRoot, name.slice(0, -5), manifest));
+// ─── The customer register is read first (plan-434 §2.1) ─────────────────
+
+/**
+ * One deprecation warning per process, not per config read.
+ *
+ * `delivery/*.json` stays readable for exactly one transition version so a
+ * checkout that has not run the migrator yet still delivers. Warning once keeps
+ * the notice visible without burying the build log — several of these functions
+ * are called per project in a loop.
+ */
+let legacyDeliveryWarned = false;
+function warnLegacyDeliveryConfig(configName) {
+  if (legacyDeliveryWarned) return;
+  legacyDeliveryWarned = true;
+  console.warn(`[delivery] delivery/${configName}.json is deprecated (plan-434 §2.1). `
+    + 'Migrate it with `node scripts/migrate-delivery-config.mjs --apply`; '
+    + 'delivery/*.json is read for one transition version only.');
 }
 
 /**
- * True when some delivery config claims this project key.
+ * Base URL of the git hub, resolved without a host name in this repository.
+ *
+ * `assert-public-safe.mjs` runs over this file before every mirror push, so the
+ * hub host is never typed here. Order: an explicit environment override, then
+ * the host of the legacy `delivery/*.json` remote of this very customer — which
+ * is where the URL came from before the register existed and is therefore
+ * provably the right one. Neither available is a clear error, not a guess.
+ */
+function hubBaseUrl(privateRoot, customer) {
+  const override = process.env.RV_FORGEJO_HUB_URL;
+  if (typeof override === 'string' && /^https?:\/\//i.test(override.trim())) return override.trim();
+  for (const name of [...customer.delivery.projects, customer.customer]) {
+    const legacy = join(privateRoot, 'delivery', `${name}.json`);
+    if (!existsSync(legacy)) continue;
+    const remote = readJson(legacy, `delivery/${name}.json`)?.remote;
+    if (typeof remote !== 'string' || !/^https?:\/\//i.test(remote)) continue;
+    try {
+      return new URL(remote).origin;
+    } catch { /* an unparsable legacy remote is no source of truth */ }
+  }
+  throw new Error(`Cannot build the git remote of customer "${customer.customer}": no hub base URL. `
+    + 'Set RV_FORGEJO_HUB_URL, or keep the legacy delivery config until the host is configured elsewhere.');
+}
+
+/**
+ * Why this register entry has no git delivery config today, or `null` when it
+ * has one. The ONLY place that decision is made.
+ *
+ * It is asked before anything is translated, because the translation resolves a
+ * licence key and a hub URL that an undeliverable customer legitimately does not
+ * have: a `standard` customer has no CONNECT licence and no seed project, so
+ * running it through {@link assertDeliveryFields} reports a missing licence key
+ * where the truth is "this customer is not deliverable yet". Order of checks is
+ * the fix — the checks themselves are unchanged.
+ *
+ * One reason today, a normal state of the register rather than a defect: a
+ * non-git channel (`hosted-link`), published to the CDN like an internal
+ * project, exactly as it was before the register existed.
+ *
+ * `kind: "standard"` used to be a second reason. Since plan-434 Phase 4 it is
+ * not: a standard customer has an empty `delivery.projects` (the register
+ * enforces that emptiness) and receives a PROJECTLESS workspace — the product
+ * with an empty `projects/` folder they fill themselves. The ordering above
+ * still matters, because a `hosted-link` customer has neither a licence key nor
+ * a hub URL and must not be blamed for missing either.
+ */
+function undeliverableReason(customer) {
+  if (customer.delivery.channel !== 'git-workspace') {
+    return `Customer "${customer.customer}" is a "${customer.delivery.channel}" customer, `
+      + `no git delivery. See customers/${customer.customer}.json.`;
+  }
+  return null;
+}
+
+/**
+ * Translates one register entry into the internal delivery-config shape every
+ * caller of this module already consumes, then runs it through the unchanged
+ * {@link assertDeliveryFields}.
+ *
+ * Nothing downstream learns that the register exists — that is the point. The
+ * only visible change is `customer`, which is now the customer slug rather than
+ * the config file name (§6.2: a wanted identity change, asserted separately).
+ */
+function deliveryConfigFromCustomer(privateRoot, customer, manifest) {
+  // Deliverability first: see undeliverableReason. Nothing below this line may
+  // touch secrets or the hub URL before the answer is known.
+  const undeliverable = undeliverableReason(customer);
+  if (undeliverable) throw new Error(undeliverable);
+  // The shared commercial repository (plan-434 §2.7). Its consequence is carried
+  // as a field rather than re-derived downstream: the generators must not have to
+  // know what a Forgejo org is to know that nothing customer-specific may be
+  // written. A missing licence value stops being fatal here because the shared
+  // channel does not ship the key at all — the customer activates it themselves.
+  const sharedRepo = isSharedForgejo(customer);
+  const secrets = resolveCustomerSecrets(privateRoot, customer, { requireLicenseKey: !sharedRepo });
+  const config = {
+    project: customer.displayName,
+    customer: customer.customer,
+    projects: [...customer.delivery.projects],
+    sharedRepo,
+    // An empty `projects` IS the projectless delivery (plan-434 Phase 4); `kind`
+    // travels with it so a log line, a report or a generated file can name the
+    // relationship instead of inferring it from a length.
+    kind: customer.kind,
+    tier: customer.delivery.tier,
+    restrictedFeatures: [...customer.delivery.restrictedFeatures],
+    remote: customerRemoteUrl(customer, hubBaseUrl(privateRoot, customer)),
+    mirror: customer.delivery.mirror,
+    connectChannel: customer.delivery.connectChannel,
+    connectLicenseKey: secrets.connectLicenseKey,
+  };
+  if (secrets.requestyApiKey !== undefined) config.requestyApiKey = secrets.requestyApiKey;
+  if (secrets.requestyBaseUrl !== undefined) config.requestyBaseUrl = secrets.requestyBaseUrl;
+  return assertDeliveryFields(config, manifest, {
+    customer: customer.customer,
+    projects: config.projects,
+    kind: customer.kind,
+    configName: customer.customer,
+    path: customerRegistryPath(privateRoot, customer.customer),
+  });
+}
+
+/**
+ * Lists every delivery configuration: register entries first, then the legacy
+ * configs the register does not already cover.
+ *
+ * Customers with no git delivery are skipped here — today only a non-git
+ * channel (`hosted-link`), see {@link undeliverableReason}. This list feeds the
+ * delivery pipeline and the feature matrix, and a customer without a git
+ * workspace has no entry to contribute. `loadDeliveryConfig` still reports them
+ * by name, with the reason.
+ *
+ * A `standard` customer IS listed, with `projects: []`: the feature matrix has
+ * to be able to answer "what is in the standard product" from the same source
+ * the delivery uses (plan-434 Phase 4).
+ *
+ * Several entries may share ONE remote since §2.7 — every shared standard
+ * customer points at `rv-commercial/realvirtual-commercial`. That is not a
+ * conflict and is not reported as one; {@link sharedDeliveryTarget} is the
+ * function that collapses them into a single target.
+ *
+ * Their slugs and project keys are `claimed` regardless, so a legacy
+ * `delivery/*.json` of the same name is not picked up behind the register's back.
+ */
+export function listDeliveryConfigs(privateRoot, manifest = loadTierManifest(privateRoot)) {
+  const configs = [];
+  const claimed = new Set();
+  for (const customer of listCustomers(privateRoot, { manifest })) {
+    claimed.add(customer.customer);
+    for (const key of customer.delivery.projects) claimed.add(key);
+    if (undeliverableReason(customer)) continue;
+    configs.push(deliveryConfigFromCustomer(privateRoot, customer, manifest));
+  }
+  const deliveryRoot = join(privateRoot, 'delivery');
+  if (existsSync(deliveryRoot)) {
+    for (const name of readdirSync(deliveryRoot).filter((entry) => entry.endsWith('.json')).sort()) {
+      const configName = name.slice(0, -5);
+      if (claimed.has(configName)) continue;
+      const config = readDeliveryConfigFile(privateRoot, configName, manifest);
+      if (claimed.has(config.customer) || config.projects.some((key) => claimed.has(key))) continue;
+      warnLegacyDeliveryConfig(configName);
+      configs.push(config);
+    }
+  }
+  return configs.sort((a, b) => (a.configName < b.configName ? -1 : a.configName > b.configName ? 1 : 0));
+}
+
+/**
+ * The ONE shared commercial repository and everybody who receives it, or `null`
+ * when no customer is on the shared channel.
+ *
+ * Several customers legitimately resolve to the same remote here — that is the
+ * whole point of §2.7 — so a caller that iterates deliveries must not read two
+ * identical remotes as a conflict. This function is the honest form of that
+ * question: it answers with the target once and names every participant, which
+ * is what a release run needs to push the product to all of them in a single
+ * pass (`/deliver-release`, coming).
+ *
+ * A per-customer delivery is unaffected: `deliver.mjs --customer <slug>` still
+ * produces exactly ONE projectless delivery, with the same mechanics as before.
+ * Only its destination happens to be shared.
+ */
+export function sharedDeliveryTarget(privateRoot, manifest = loadTierManifest(privateRoot)) {
+  const shared = listCustomers(privateRoot, { manifest })
+    .filter((customer) => isSharedForgejo(customer) && !undeliverableReason(customer));
+  if (shared.length === 0) return null;
+  return {
+    org: SHARED_ORG,
+    repo: SHARED_REPO,
+    remote: customerRemoteUrl(shared[0], hubBaseUrl(privateRoot, shared[0])),
+    customers: shared.map((customer) => customer.customer).sort(),
+  };
+}
+
+/**
+ * True when some delivery config claims this key — a project key or, since
+ * plan-434 Phase 4, a customer slug.
  *
  * A pure existence probe: it neither validates the config nor needs the tier
  * manifest, because it replaces an `existsSync` at call sites where "no config"
  * is a perfectly normal state (an internal-only project being deployed to Bunny).
  * Validation is `loadDeliveryConfig`'s job and happens when the config is used.
+ *
+ * The slug arm exists because a projectless customer has NO project key to ask
+ * about: `hasDeliveryConfig(root, 'hs-heilbronn')` is the only question that can
+ * be asked about them, and answering `false` would say "no git delivery" about a
+ * customer who has one.
  */
 export function hasDeliveryConfig(privateRoot, projectKey) {
   if (!DELIVERY_KEY_PATTERN.test(projectKey)) return false;
+  // The register answers first, and answers `false` for any customer without a
+  // git delivery: the question here is "is there a git delivery for this
+  // project", and a `hosted-link` customer is published to the CDN exactly as
+  // an internal project is. Toray therefore keeps behaving as it does today.
+  const owner = resolveCustomerForProject(privateRoot, projectKey);
+  if (owner) return undeliverableReason(owner) === null;
+  if (/^[a-z0-9][a-z0-9-]*$/.test(projectKey) && existsSync(customerRegistryPath(privateRoot, projectKey))) {
+    // A probe never throws: an invalid entry is `loadDeliveryConfigByCustomer`'s
+    // problem to report, at the moment the config is actually used.
+    try {
+      return undeliverableReason(loadCustomer(privateRoot, projectKey)) === null;
+    } catch {
+      return false;
+    }
+  }
   const deliveryRoot = join(privateRoot, 'delivery');
   if (existsSync(join(deliveryRoot, `${projectKey}.json`))) return true;
   if (!existsSync(deliveryRoot)) return false;
@@ -404,9 +686,14 @@ export function hasDeliveryConfig(privateRoot, projectKey) {
  */
 export function loadDeliveryConfig(privateRoot, projectKey, manifest = loadTierManifest(privateRoot)) {
   if (!DELIVERY_KEY_PATTERN.test(projectKey)) throw new Error(`Invalid project key ${projectKey}.`);
+  // Register first. A hosted-link customer resolves here and then throws with
+  // the reason, rather than falling through to "delivery config not found".
+  const owner = resolveCustomerForProject(privateRoot, projectKey, { manifest });
+  if (owner) return { ...deliveryConfigFromCustomer(privateRoot, owner, manifest), projectKey };
   const direct = join(privateRoot, 'delivery', `${projectKey}.json`);
   if (existsSync(direct)) {
     const config = readDeliveryConfigFile(privateRoot, projectKey, manifest);
+    warnLegacyDeliveryConfig(projectKey);
     if (config.projects.includes(projectKey)) return { ...config, projectKey };
     throw new Error(`delivery/${projectKey}.json does not list "${projectKey}" in its projects [${config.projects.join(', ')}]. `
       + `Deliver one of those keys, or the whole customer with --customer ${config.customer}.`);
@@ -421,9 +708,18 @@ export function loadDeliveryConfig(privateRoot, projectKey, manifest = loadTierM
 }
 
 //! Loads the delivery configuration of one customer, i.e. of one customer repository.
-//! `projectKey` is set to the first project so single-project call sites keep working.
+//! `projectKey` is set to the first project so single-project call sites keep working,
+//! and to `null` for a projectless (`standard`) customer — the whole pipeline reads it
+//! as "this delivery has no primary project" (plan-434 Phase 4).
 export function loadDeliveryConfigByCustomer(privateRoot, customer, manifest = loadTierManifest(privateRoot)) {
   if (!DELIVERY_KEY_PATTERN.test(customer)) throw new Error(`Invalid customer ${customer}.`);
+  // Register first, by slug — including customers with no git delivery, which
+  // resolve here and then throw with the reason instead of "not found".
+  if (/^[a-z0-9][a-z0-9-]*$/.test(customer) && existsSync(customerRegistryPath(privateRoot, customer))) {
+    const entry = loadCustomer(privateRoot, customer, { manifest });
+    const config = deliveryConfigFromCustomer(privateRoot, entry, manifest);
+    return { ...config, projectKey: config.projects[0] ?? null };
+  }
   const matches = listDeliveryConfigs(privateRoot, manifest)
     .filter((config) => config.customer === customer || config.configName === customer);
   if (matches.length === 0) throw new Error(`No delivery config for customer "${customer}" in ${join(privateRoot, 'delivery')}.`);
@@ -431,7 +727,7 @@ export function loadDeliveryConfigByCustomer(privateRoot, customer, manifest = l
     throw new Error(`Customer "${customer}" is claimed by more than one delivery config: `
       + `${matches.map((config) => `delivery/${config.configName}.json`).join(', ')}.`);
   }
-  return { ...matches[0], projectKey: matches[0].projects[0] };
+  return { ...matches[0], projectKey: matches[0].projects[0] ?? null };
 }
 
 function assertDeliveryFields(config, manifest, extra) {
@@ -450,12 +746,22 @@ function assertDeliveryFields(config, manifest, extra) {
   // check demanded an "RVC1-" prefix that no real key carries, so a delivery could only pass it
   // with a made-up value — which is how RVC1-PLACEHOLDER reached a customer and left their
   // gateway unlicensed until someone typed a key by hand.
-  if (typeof config.connectLicenseKey !== 'string'
-      || !/^LIC(-[A-Z0-9]{4}){3}$/i.test(config.connectLicenseKey.trim())) {
-    throw new Error('delivery.connectLicenseKey must be a CONNECT key in the form LIC-XXXX-XXXX-XXXX.');
-  }
-  if (/placeholder|example|dummy|xxxx/i.test(config.connectLicenseKey)) {
-    throw new Error('delivery.connectLicenseKey looks like a placeholder; deliver the customer\'s real key.');
+  // The pattern itself now lives in _rv-guards.mjs, so the customer register can
+  // recognise the same shape without a second copy of it (plan-434 §2.3).
+  //
+  // A shared-repo delivery may have no key at all: it does not ship one (§2.7),
+  // so demanding one would block a delivery over a value that is never written.
+  // A key that IS present is still checked — a wrong-shaped one means the
+  // register or the secrets file is wrong, and that is worth saying either way.
+  const licenceOptional = config.sharedRepo === true && config.connectLicenseKey === undefined;
+  if (!licenceOptional) {
+    if (typeof config.connectLicenseKey !== 'string'
+        || !CONNECT_LICENSE_KEY_PATTERN.test(config.connectLicenseKey.trim())) {
+      throw new Error('delivery.connectLicenseKey must be a CONNECT key in the form LIC-XXXX-XXXX-XXXX.');
+    }
+    if (/placeholder|example|dummy|xxxx/i.test(config.connectLicenseKey)) {
+      throw new Error('delivery.connectLicenseKey looks like a placeholder; deliver the customer\'s real key.');
+    }
   }
   // Both optional: a --no-rag delivery needs neither, and REQUESTY_API_KEY in the environment still
   // wins over the config for a one-off run against another gateway.
@@ -532,6 +838,9 @@ export function generateCustomerPrivatePlugins(manifest, profile) {
 //! Returns `{ file, name }` for every `*.ts`/`*.tsx` except the `index.ts` entry point,
 //! where `name` is the file name without its extension (a readable label).
 function listProjectPluginNames(workspaceRoot, projectKey) {
+  // A projectless delivery has no plugin folder to look in, and no `projects/<key>`
+  // path to build one from (plan-434 Phase 4).
+  if (!projectKey) return [];
   const pluginsDir = join(workspaceRoot, 'projects', projectKey, 'plugins');
   if (!existsSync(pluginsDir)) return [];
   return readdirSync(pluginsDir, { withFileTypes: true })
@@ -543,10 +852,16 @@ function listProjectPluginNames(workspaceRoot, projectKey) {
 }
 
 //! Renders the feature matrix used internally and in customer workspaces.
-//! For a single customer (customerProjectKey set) it produces three clearly separated
-//! categories: the always-included AGPL core, the tier-gated licensed features, and the
-//! customer's own project plugins. `projectPlugins` is the list from listProjectPluginNames.
-export function renderFeatureMatrix(manifest, deliveries, customerProjectKey = null, projectPlugins = null) {
+//! For a single customer (customerProjectKey set, or `customerScoped`) it produces the
+//! clearly separated categories: the always-included AGPL core, the tier-gated licensed
+//! features, and — only where there is a project — the customer's own project plugins.
+//! `projectPlugins` is the list from listProjectPluginNames.
+//!
+//! `customerScoped` exists for the projectless delivery: a standard customer must see
+//! THEIR entitlements, not the internal registration list, and has no project key to be
+//! recognised by (plan-434 Phase 4).
+export function renderFeatureMatrix(manifest, deliveries, customerProjectKey = null, projectPlugins = null,
+  { customerScoped = customerProjectKey !== null } = {}) {
   // A config may now carry several projects, so membership decides — not the
   // single `projectKey` a resolving load happened to attach.
   const configs = customerProjectKey
@@ -561,18 +876,28 @@ export function renderFeatureMatrix(manifest, deliveries, customerProjectKey = n
 
   lines.push('## Licensed features', '');
   lines.push('Tier-gated commercial and restricted features; enabled per your licence.', '');
-  const headers = ['Feature', 'Tier', ...configs.map((delivery) => delivery.project)];
+  // The column head names the delivery. In the shared repository that must not be the
+  // display name of one customer, because every other one reads the same file (§2.7).
+  const headers = ['Feature', 'Tier', 'Status', ...configs.map((delivery) => deliveryDisplayName(delivery))];
   lines.push(`| ${headers.join(' | ')} |`);
   lines.push(`| ${headers.map(() => '---').join(' | ')} |`);
-  for (const feature of Object.keys(manifest.registrations).sort()) {
+  // A customer must not read about features they were never given. For a single customer the
+  // rows are exactly that customer's entitled set, so a restricted feature nobody assigned
+  // (agents, omniverse) does not appear at all - not even as a "no". The internal report
+  // (customerScoped === false) still lists every registration.
+  const rows = customerScoped
+    ? [...new Set(configs.flatMap((delivery) => selectedFeatures(manifest, delivery)))].sort()
+    : Object.keys(manifest.registrations).sort();
+  for (const feature of rows) {
     const tier = featureTier(manifest, feature);
+    const status = manifest.registrations[feature].status ?? 'stable';
     const cells = configs.map((delivery) => {
       const enabled = tier === 'commercial'
         ? delivery.tier === 'commercial'
         : tier === 'restricted' && delivery.restrictedFeatures.includes(feature);
       return enabled ? 'yes' : 'no';
     });
-    lines.push(`| ${feature} | ${tier} | ${cells.join(' | ')} |`);
+    lines.push(`| ${feature} | ${tier} | ${status} | ${cells.join(' | ')} |`);
   }
   lines.push('');
 
@@ -742,6 +1067,16 @@ function copyCore(coreRoot, outputRoot, deliveredDocs, publicModels = new Set(),
   }
   copyReferencedDocImages(coreRoot, outputRoot, ['README.md', ...deliveredDocs]);
   copyTree(join(coreRoot, 'src'), join(outputRoot, 'src'));
+  // The MCP help tool imports these recipes with `?raw`, so they are BUILD INPUT of the core tree,
+  // not just reading material. They are staged into the workspace-level recipes/ as well (that copy
+  // is what the customer reads); leaving them out here resolved to nothing and failed `vite build`
+  // with "Could not resolve ../../../recipes/…" after the whole workspace had already been staged.
+  mkdirSync(join(outputRoot, 'recipes'), { recursive: true });
+  for (const name of STATIC_CORE_RECIPES) {
+    const source = join(coreRoot, 'recipes', name);
+    if (!existsSync(source)) throw new Error(`Static recipe missing from the core repo: ${source}`);
+    copyFileSync(source, join(outputRoot, 'recipes', name));
+  }
   // Directories on the path to a delivered model; a models/ directory outside this set is never
   // entered, so no empty placeholder folders reach the workspace.
   const modelDirectories = new Set();
@@ -781,18 +1116,127 @@ function sourceAllowed(resolved, profile) {
   return false;
 }
 
+// The private package pulls NVIDIA's Omniverse library from NVIDIA's own registry. A customer has
+// neither the entitlement nor the registry credentials, so every trace of it is pruned out of the
+// delivered manifest and lockfile.
+const PRUNED_PRIVATE_SCOPE = '@nvidia/';
+const LOCK_DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+
+function prunedDependencyMap(map) {
+  return Object.fromEntries(Object.entries(map ?? {})
+    .filter(([name]) => !name.toLowerCase().startsWith(PRUNED_PRIVATE_SCOPE)));
+}
+
+//! The package name a lockfile v2/v3 `packages` key installs, e.g. `a/node_modules/@scope/b` -> `@scope/b`.
+function lockEntryName(key) {
+  const marker = key.lastIndexOf('node_modules/');
+  return marker === -1 ? '' : key.slice(marker + 'node_modules/'.length);
+}
+
+//! Resolves one dependency edge the way node does: the requesting package's own node_modules
+//! first, then every enclosing one, ending at the workspace root. Returns null when the edge has
+//! no entry in this lockfile (an optional dependency npm skipped, or a name pruned away).
+function resolveLockKey(packages, fromKey, dependencyName) {
+  const scopes = [fromKey];
+  let scope = fromKey;
+  while (scope.includes('node_modules/')) {
+    scope = scope.slice(0, scope.lastIndexOf('node_modules/')).replace(/\/+$/, '');
+    scopes.push(scope);
+  }
+  if (!scopes.includes('')) scopes.push('');
+  for (const candidate of scopes) {
+    const key = candidate ? `${candidate}/node_modules/${dependencyName}` : `node_modules/${dependencyName}`;
+    if (Object.prototype.hasOwnProperty.call(packages, key)) return key;
+  }
+  return null;
+}
+
+//! Prunes @nvidia out of the REAL private lockfile instead of synthesizing a new one.
+//!
+//! `npm ci` refuses a lockfile whose `packages` map does not describe the tree it has to install -
+//! it needs `resolved` and `integrity` per package - and answers a synthetic root-only lockfile
+//! with the EUSAGE help dump. That stayed invisible while @nvidia was the only dependency and the
+//! pruned manifest came out empty; the first dependency that survives the pruning
+//! (@dimforge/rapier3d-compat) turns it into a hard delivery failure. So every surviving entry is
+//! carried over unchanged - integrity, resolved, engines, licence, transitive edges - and only
+//! what is reachable exclusively through @nvidia is dropped. Nothing is resolved online: the
+//! result is a pure function of the lockfile that is already checked in.
+function prunePrivateLockfile(lock, manifest) {
+  const packages = lock.packages ?? {};
+  const pruned = { ...lock, name: manifest.name, version: manifest.version };
+  const roots = Object.keys(packages).filter((key) => !key.includes('node_modules/'));
+  const entries = { ...packages };
+  for (const key of roots) {
+    const entry = { ...entries[key] };
+    for (const field of LOCK_DEPENDENCY_FIELDS) {
+      if (entry[field]) entry[field] = prunedDependencyMap(entry[field]);
+    }
+    if (key === '') {
+      if (entry.name) entry.name = manifest.name;
+      if (entry.version) entry.version = manifest.version;
+    }
+    entries[key] = entry;
+  }
+  // Reachability from the pruned roots. A package the delivery still needs is kept even when
+  // @nvidia happened to depend on it as well; only what nothing else can reach disappears. An
+  // unresolvable edge is simply skipped - keeping one entry too many costs a download, dropping
+  // one breaks `npm ci`.
+  const reachable = new Set(roots);
+  const queue = [...roots];
+  while (queue.length) {
+    const key = queue.shift();
+    const entry = entries[key];
+    if (!entry) continue;
+    const edges = [];
+    for (const field of LOCK_DEPENDENCY_FIELDS) edges.push(...Object.keys(entry[field] ?? {}));
+    // A `link: true` entry is only a pointer; the real tree hangs off its target.
+    if (entry.link && typeof entry.resolved === 'string' && !reachable.has(entry.resolved)
+      && Object.prototype.hasOwnProperty.call(entries, entry.resolved)) {
+      reachable.add(entry.resolved);
+      queue.push(entry.resolved);
+    }
+    for (const name of edges) {
+      if (name.toLowerCase().startsWith(PRUNED_PRIVATE_SCOPE)) continue;
+      const resolved = resolveLockKey(entries, key, name);
+      if (!resolved || reachable.has(resolved)) continue;
+      if (lockEntryName(resolved).toLowerCase().startsWith(PRUNED_PRIVATE_SCOPE)) continue;
+      reachable.add(resolved);
+      queue.push(resolved);
+    }
+  }
+  pruned.packages = Object.fromEntries(Object.entries(entries).filter(([key]) => reachable.has(key)));
+  // lockfileVersion 1/2 carry a second, legacy tree. It is advisory next to `packages`, but a
+  // delivered file must not name the private registry anywhere, so the same names go from it.
+  if (lock.dependencies) pruned.dependencies = pruneLegacyLockTree(lock.dependencies);
+  return pruned;
+}
+
+function pruneLegacyLockTree(tree) {
+  return Object.fromEntries(Object.entries(tree)
+    .filter(([name]) => !name.toLowerCase().startsWith(PRUNED_PRIVATE_SCOPE))
+    .map(([name, entry]) => {
+      if (!entry || typeof entry !== 'object') return [name, entry];
+      const next = { ...entry };
+      if (next.dependencies) next.dependencies = pruneLegacyLockTree(next.dependencies);
+      if (next.requires) next.requires = prunedDependencyMap(next.requires);
+      return [name, next];
+    }));
+}
+
 function writePrunedPrivatePackage(privateRoot, destination) {
   const manifest = readJson(join(privateRoot, 'package.json'));
-  manifest.dependencies = Object.fromEntries(Object.entries(manifest.dependencies ?? {})
-    .filter(([name]) => !name.toLowerCase().startsWith('@nvidia/')));
+  for (const field of LOCK_DEPENDENCY_FIELDS) {
+    if (manifest[field]) manifest[field] = prunedDependencyMap(manifest[field]);
+  }
   writeFileSync(join(destination, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
-  writeFileSync(join(destination, 'package-lock.json'), JSON.stringify({
-    name: manifest.name,
-    version: manifest.version,
-    lockfileVersion: 3,
-    requires: true,
-    packages: { '': { name: manifest.name, version: manifest.version, dependencies: manifest.dependencies } },
-  }, null, 2) + '\n');
+  const lockPath = join(privateRoot, 'package-lock.json');
+  if (!existsSync(lockPath)) {
+    throw new Error(`The private package has no package-lock.json (${lockPath}). The delivered workspace `
+      + 'installs it with `npm ci`, which needs the real, resolved lockfile - run `npm install` in the '
+      + 'private package and commit the result.');
+  }
+  const lock = prunePrivateLockfile(readJson(lockPath), manifest);
+  writeFileSync(join(destination, 'package-lock.json'), JSON.stringify(lock, null, 2) + '\n');
 }
 
 function writeWorkspaceTsconfig(coreOutput) {
@@ -812,99 +1256,160 @@ function generatedSettings(project, delivery, connectPin) {
   const settings = {
     defaultModel: bareDefaultModel(project),
     connectChannel: delivery.connectChannel,
-    connectLicensePrefill: delivery.connectLicenseKey,
-    analytics: { googleAnalyticsId: '' },
   };
+  // NO prefill in the shared repository (plan-434 §2.7): settings.json is a
+  // delivered file, and in a repository every standard customer can read, one
+  // customer's licence key would be visible to all of them. It is left out
+  // entirely rather than blanked — an empty string reads as "no licence", while
+  // an absent key lets CONNECT ask for one. The guard is on `sharedRepo` and not
+  // on the value, so a key that happens to be resolvable still is not written.
+  if (delivery.sharedRepo !== true) settings.connectLicensePrefill = delivery.connectLicenseKey;
+  settings.analytics = { googleAnalyticsId: '' };
   if (connectPin) settings.connectDownload = { channel: delivery.connectChannel, ...connectPin };
   return settings;
 }
 
 function generateReadme(delivery, projectKey, model, features, projectPlugins = null, hasDiagnosis = true) {
   const plugins = projectPlugins ?? [];
+  // The projectless (standard) delivery: the product with an empty `projects/`
+  // folder. Every sentence that names a delivered project folder has to say
+  // something true here — which is "you create one", not "yours is at …".
+  const projectless = !projectKey;
+  const projectPath = projectless ? 'projects/<your-project>' : `projects/${projectKey}`;
+  // The suggested local folder. In the shared repository it must not be a customer slug
+  // (§2.7) — it is the repository's own name, which is also what `git clone` produces.
+  const shared = delivery.sharedRepo === true;
+  const cloneFolder = shared ? SHARED_CLONE_FOLDER
+    : (projectKey ?? (typeof delivery.customer === 'string' && delivery.customer.trim()
+      ? delivery.customer.trim() : 'realvirtual-web'));
   const licensedBlock = features.length
     ? features.map((feature) => `- \`${feature}\``).join('\n')
     : '- None enabled for this profile.';
   const projectBlock = plugins.length
     ? plugins.map((plugin) => `- \`${plugin.name}\` (${plugin.file})`).join('\n')
-    : `- No project plugins yet - add your first one under \`projects/${projectKey}/plugins/\` (see [create-custom-plugin.md](recipes/create-custom-plugin.md)).`;
+    : `- No project plugins yet - add your first one under \`${projectPath}/plugins/\` (see [create-custom-plugin.md](recipes/create-custom-plugin.md)).`;
   const remote = typeof delivery.remote === 'string' && delivery.remote.trim()
     ? delivery.remote.trim()
     : '<REMOTE-URL>';
-  const customerModel = model || 'the configured customer model';
-  return `# ${delivery.project}\n\n` +
-    `This repository is your ready-to-run realvirtual WEB workspace for \`${customerModel}\`.\n\n` +
-    `Data protection, hosting, and access control are described under [Your private workspace](#your-private-workspace) in the reference section below.\n\n` +
-    `## Quick start (Windows)\n\n` +
-    `1. Download **realvirtual WEB dev** from [web.realvirtual.io/download/dev/realvirtual-WEB-dev-setup.exe](https://web.realvirtual.io/download/dev/realvirtual-WEB-dev-setup.exe) and run it. It installs into your user profile, so no administrator rights are needed, and it brings its own Node.js and Git along with the dependency archive. Nothing is installed system-wide and nothing else has to be prepared.\n` +
-    `2. Give the installer the repository address \`${remote}\` and a folder. Choose a short local folder such as \`D:\\git\\${projectKey}\`, not one inside OneDrive: the sync client would try to upload every one of the tens of thousands of files in the workspace. If the folder you pick still holds files from an earlier attempt, the setup offers to empty it before cloning, because deleting such a folder in Explorer usually stops halfway through \`node_modules\`. The installer then clones this workspace, restores the dependencies from the bundled archive and downloads realvirtual CONNECT.\n` +
-    `3. Start **realvirtual WEB dev** from the Start menu. It starts CONNECT and the viewer and opens your browser.\n\n` +
-    `## Quick start (manual, Linux, macOS)\n\n` +
-    `The installer above is the short way on Windows 10/11, the recommended operating system. Linux and macOS are supported through the manual route described here, which also works on Windows if you prefer to install the parts yourself. This route needs the following prepared by hand; with the installer, the first two come along with it:\n\n` +
-    `- **Node.js ${REQUIRED_NODE_MAJOR} LTS (required for this route):** The workspace does not run without it. Download the Windows Installer (.msi, LTS ${REQUIRED_NODE_MAJOR}) from [nodejs.org](https://nodejs.org/) and keep the "Add to PATH" option enabled, or run \`winget install OpenJS.NodeJS.LTS\`. On Linux and macOS, use your package manager or [nvm](https://github.com/nvm-sh/nvm). **After installing, close the terminal and open a new one** - in an IDE such as VS Code, close the IDE itself - because a running terminal keeps the old PATH. Then verify with \`node --version\` and \`npm --version\`; \`node --version\` must report v${REQUIRED_NODE_MAJOR} or newer (the delivered version is pinned in \`.nvmrc\`).\n` +
+  const customerModel = model || (projectless ? 'the bundled demo model' : 'the configured customer model');
+  // The three prerequisites. They are stated as requirements rather than as "what the
+  // installer would have brought along", because there is no installer route any more.
+  const prerequisiteBullets =
+    `- **Node.js ${REQUIRED_NODE_MAJOR} LTS (required):** The workspace does not run without it. Download the Windows Installer (.msi, LTS ${REQUIRED_NODE_MAJOR}) from [nodejs.org](https://nodejs.org/) and keep the "Add to PATH" option enabled, or run \`winget install OpenJS.NodeJS.LTS\`. On Linux and macOS, use your package manager or [nvm](https://github.com/nvm-sh/nvm). **After installing, close the terminal and open a new one** - in an IDE such as VS Code, close the IDE itself - because a running terminal keeps the old PATH. Then verify with \`node --version\` and \`npm --version\`; \`node --version\` must report v${REQUIRED_NODE_MAJOR} or newer (the delivered version is pinned in \`.nvmrc\`).\n` +
     (hasDiagnosis
       ? `- **Git and Git LFS:** Install both, then check them with \`git --version\` and \`git lfs version\`. Run \`git lfs install\` once on your computer. Git LFS is critical because \`connect/rag.zip\` is an LFS object; without Git LFS, Git downloads only a small pointer file and the diagnosis function cannot start.\n`
       : `- **Git and Git LFS:** Install both, then check them with \`git --version\` and \`git lfs version\`. Run \`git lfs install\` once on your computer. Git LFS is critical because the delivered models are LFS objects; without Git LFS, Git downloads only small pointer files and the models cannot load.\n`) +
-    `- **Disk and network:** Keep about 2 GB of free disk space and allow network access to \`git.realvirtual.io\` and \`web.realvirtual.io\` for the CONNECT download.\n\n` +
-    `Then set the workspace up:\n\n` +
+    `- **Disk and network:** Keep about 2 GB of free disk space and allow network access to \`git.realvirtual.io\` and \`web.realvirtual.io\` for the CONNECT download.\n\n`;
+  // ONE documented route, and it is plain Git. The "realvirtual WEB dev" one-click installer
+  // used to lead this section and bring Node.js and Git along; it is switched off for now and
+  // is therefore not mentioned at all — not even as an alternative, because a download link to
+  // something we do not currently support is worse than no link. Anyone working in this
+  // workspace develops in it, and can install Git and Node.js.
+  //
+  // Consequence, accepted deliberately: the generated README of an own-repo delivery changes
+  // too. This section is identical for every delivery; only `remote` and the suggested folder
+  // differ, and the folder is neutral in the shared repository (see cloneFolder above).
+  const gettingStarted =
+    `## How to get started\n\n` +
+    `This workspace is an ordinary Git repository: clone it, start it once, and take updates with \`git pull\`.\n\n` +
+    `### What you need installed\n\n` +
+    prerequisiteBullets +
+    `### Set the workspace up\n\n` +
     `1. Open PowerShell on Windows, or a terminal on Linux/macOS.\n` +
-    `2. Clone this repository and open the cloned folder:\n\n` +
+    `2. Clone this repository into a short local folder such as \`D:\\git\\${cloneFolder}\`, not one inside OneDrive: the sync client would try to upload every one of the tens of thousands of files in the workspace. Then open the cloned folder.\n\n` +
     `   \`git clone ${remote}\`\n\n` +
     `3. Start the workspace **from the repository root**, the folder that contains \`start.ps1\` next to \`realvirtual-web/\`. Do not run the start script from inside \`realvirtual-web/\`:\n\n` +
     `   - **Windows:** Run \`powershell -NoProfile -ExecutionPolicy Bypass -File .\\start.ps1\`. The \`-ExecutionPolicy Bypass\` option avoids the common local-script policy error. Alternatively, right-click \`start.ps1\` and select **Run with PowerShell**.\n` +
-    `   - **Linux:** Run \`./start.sh\`.\n\n` +
+    `   - **Linux and macOS:** Run \`./start.sh\`.\n\n` +
     `   \`start.ps1\` prepares the workspace by calling \`setup.ps1\` and then starts realvirtual CONNECT, which serves the viewer itself. \`setup.ps1\` can also be run on its own after a \`git pull\`; it starts nothing.\n\n` +
+    `4. Take updates with \`git pull\` in the workspace folder and start again the same way. If the pull changed the dependencies, run \`setup.ps1\` (Linux: \`setup.sh\`) once before starting.\n\n`;
+  return `# ${deliveryDisplayName(delivery)}\n\n` +
+    (projectless
+      ? `This repository is your ready-to-run realvirtual WEB workspace. It ships the viewer, realvirtual CONNECT and the demo model; your own machine models and code go into \`projects/\`, which starts out empty. See [Create your first project](#create-your-first-project) below.\n\n`
+      : `This repository is your ready-to-run realvirtual WEB workspace for \`${customerModel}\`.\n\n`) +
+    `Data protection, hosting, and access control are described under [Your private workspace](#your-private-workspace) in the reference section below.\n\n` +
+    gettingStarted +
     `## The first start\n\n` +
     `Wait for the first start to finish. It installs the npm dependencies, downloads realvirtual CONNECT (about 225 MB) from \`web.realvirtual.io\`, verifies its SHA-256 checksum, and opens your browser with \`${customerModel}\`.\n\n` +
     `The preparation reports its stages, shows the CONNECT download progress in MB, and the browser only opens once the viewer actually answers. On a first start, the dependency installation and the download each take several minutes; as long as steps or progress keep appearing, it is working. If progress stops entirely, read [If the start hangs while installing the dependencies](#if-the-start-hangs-while-installing-the-dependencies) in the reference section.\n\n` +
     `### Licence activation\n\n` +
-    `On the first start, the activation dialog appears with your licence key already filled in. Click **Activate** and accept the Terms once. Activation needs Internet access to the realvirtual portal. Without activation, the viewer still runs, but CONNECT functions are limited.\n\n` +
+    // Two truths, and which one applies is decided by the channel, not by taste:
+    // a shared repository carries no licence key (plan-434 §2.7), so promising a
+    // pre-filled dialog there would send the reader looking for something that
+    // is deliberately not in their workspace.
+    (delivery.sharedRepo
+      ? `On the first start, the activation dialog appears. Enter your licence key on first start - realvirtual sends it to you separately, it is not part of this repository - then click **Activate** and accept the Terms once. Activation needs Internet access to the realvirtual portal. Without activation, the viewer still runs, but CONNECT functions are limited.\n\n`
+      : `On the first start, the activation dialog appears with your licence key already filled in. Click **Activate** and accept the Terms once. Activation needs Internet access to the realvirtual portal. Without activation, the viewer still runs, but CONNECT functions are limited.\n\n`) +
     `## Daily operation\n\n` +
     `### One address, whichever way the workspace runs\n\n` +
     `realvirtual CONNECT is the only thing you start. It works out how this workspace is set up, starts the development server for you when the sources are present, and serves the Viewer at **http://localhost:5100** either way. Hot reload works there as usual: save a file and the browser updates.\n\n` +
     `To use other ports, pass them to the start script: \`powershell -NoProfile -ExecutionPolicy Bypass -File .\\start.ps1 -ConnectPort 5101 -WebPort 5174\`.\n\n` +
     `The realvirtual CONNECT tray icon shows which mode this instance runs in and which folders it uses, and lets you stop, start or restart the development server from **realvirtual WEB**.\n\n` +
     `### Updates\n\n` +
-    `Updates stay in Git: run \`git pull\` in the workspace folder, then start again the way you started before - from the Start-menu entry **realvirtual WEB dev** after an installer setup, or with the same start script otherwise. Nothing else is required. Your own changes under \`projects/${projectKey}/\` remain untouched.\n\n` +
+    `Updates stay in Git: run \`git pull\` in the workspace folder, then start again with the same start script as before. Nothing else is required. Your own changes under \`${projectPath}/\` remain untouched.\n\n` +
     `### After a \`git pull\` that changes the dependencies\n\n` +
     `Run \`setup.ps1\` (Linux: \`setup.sh\`) once. It reinstalls only what changed and records the new state. If you start without doing so, CONNECT reports that the dependencies have moved on and lets you either update or keep working with what you have.\n\n` +
     `## Working with the workspace\n\n` +
-    `Your editable files are under \`projects/${projectKey}/\`: \`models/\` contains the machine models, \`plugins/\` contains project-specific viewer code, and \`docs/\` contains project documentation. Edit only this project directory; everything outside it - \`realvirtual-web/\`, \`realvirtual-web-pro/\`, \`connect/\` - is replaced by every delivery update. See \`CONTRIBUTING.md\` before making changes, and "Receiving an update" below for what an update does inside your project directory.\n\n` +
-    `The [workspace recipes](recipes/README.md) are the canonical, vendor-neutral runbooks for common model, CONNECT, historian, plugin, troubleshooting, and deployment tasks. They can be followed by a person or any AI assistant.\n\n` +
-    `### Use your own machine model\n\n` +
-    `Export the machine as a GLB file from Unity with the GLB export in realvirtual Professional, then place it in \`projects/${projectKey}/models/\`. If the new file has the same name as the existing model, no configuration change is required. If it has a different name, update \`defaultModel\` in \`realvirtual-web/public/settings.json\`. GLB models are tracked with Git LFS.\n\n` +
-    `### Custom development\n\n` +
-    `Create project-specific Viewer code only in \`projects/${projectKey}/plugins/\`. Add a plugin file there, export and register it from \`projects/${projectKey}/plugins/index.ts\`, then restart the development server so Vite discovers the changed project entry point. See [Extending realvirtual WEB](realvirtual-web/doc-extending-webviewer.md) and [Scripting](realvirtual-web/doc-scripting.md). Before opening a pull request, run \`npx tsc --noEmit\` and \`npm run build\` from \`realvirtual-web/\`.\n\n` +
+    (projectless
+      ? `### Create your first project\n\n`
+        + `\`projects/\` is yours and starts out empty. A project is a folder in it - \`projects/<your-project>/\` - with \`models/\` for the machine models, \`plugins/\` for project-specific viewer code, and \`docs/\` for project documentation. Nothing outside \`projects/\` is yours to edit; it is replaced by every delivery update.\n\n`
+        + `The quickest way to start is in the browser: open the workspace, use the asset editor to import a CAD assembly or a GLB, and save it into a new project folder. Everything you create there stays yours - an update never touches \`projects/\`, in either direction.\n\n`
+        + `To set one up by hand, create \`projects/<your-project>/models/\` and put your GLB there, then set \`defaultModel\` in \`realvirtual-web/public/settings.json\` to its bare file name. For project-specific code, add \`projects/<your-project>/plugins/index.ts\` and register your plugins from it, then restart the development server so Vite discovers the new entry point. GLB models are tracked with Git LFS; the delivered \`.gitattributes\` already covers \`projects/*/models/*.glb\`.\n\n`
+        + `The [workspace recipes](recipes/README.md) are the canonical, vendor-neutral runbooks for common model, CONNECT, historian, plugin, troubleshooting, and deployment tasks. They can be followed by a person or any AI assistant.\n\n`
+      : ``) +
+      (projectless ? `` : `Your editable files are under \`${projectPath}/\`: \`models/\` contains the machine models, \`plugins/\` contains project-specific viewer code, and \`docs/\` contains project documentation. Edit only this project directory; everything outside it - \`realvirtual-web/\`, \`realvirtual-web-pro/\`, \`connect/\` - is replaced by every delivery update. See \`CONTRIBUTING.md\` before making changes, and "Receiving an update" below for what an update does inside your project directory.\n\n` +
+      `The [workspace recipes](recipes/README.md) are the canonical, vendor-neutral runbooks for common model, CONNECT, historian, plugin, troubleshooting, and deployment tasks. They can be followed by a person or any AI assistant.\n\n` +
+      `### Use your own machine model\n\n` +
+      `Export the machine as a GLB file from Unity with the GLB export in realvirtual Professional, then place it in \`${projectPath}/models/\`. If the new file has the same name as the existing model, no configuration change is required. If it has a different name, update \`defaultModel\` in \`realvirtual-web/public/settings.json\`. GLB models are tracked with Git LFS.\n\n` +
+      `### Custom development\n\n` +
+      `Create project-specific Viewer code only in \`${projectPath}/plugins/\`. Add a plugin file there, export and register it from \`${projectPath}/plugins/index.ts\`, then restart the development server so Vite discovers the changed project entry point. See [Extending realvirtual WEB](realvirtual-web/doc-extending-webviewer.md) and [Scripting](realvirtual-web/doc-scripting.md). Before opening a pull request, run \`npx tsc --noEmit\` and \`npm run build\` from \`realvirtual-web/\`.\n\n`) +
     `### AI-assisted development (optional)\n\n` +
     `The workspace includes \`CLAUDE.md\` and an MCP bridge. If you start Claude Code, or another MCP-capable assistant, in the workspace folder, it can inspect and modify the running scene through the \`web_*\` MCP tools. This requires your own subscription with the respective provider; realvirtual supplies the integration, not an assistant licence.\n\n` +
-    `### Submit changes\n\n` +
-    `Create a branch, commit your changes, and open a pull request in this repository. realvirtual reviews the pull request. See \`CONTRIBUTING.md\` for details.\n\n` +
+    // The delivery channel, stated once and differently for the two relationships (§2.2).
+    // A development customer develops WITH us and submits through review; a standard
+    // customer receives the product read-only and versions their own work themselves.
+    // Telling a standard customer to open a pull request would send them at a repository
+    // they have read access to.
+    (projectless
+      ? `### How you receive this workspace\n\n`
+        + `This repository is **read-only for you**: realvirtual publishes the product into it, and you take updates with \`git pull\`. There is no pull request to open here and no review step - nothing you write is expected to travel back to us.\n\n`
+        + `Your own work is versioned on your side. Keep your projects under \`projects/\` in this clone and commit them to your own branch, remote, or backup as your organisation prefers; \`projects/\` is never touched by an update, in either direction. If you want us to look at something, send it to [professional@realvirtual.io](mailto:professional@realvirtual.io).\n\n`
+      : `### Submit changes\n\n`
+        + `Create a branch, commit your changes, and open a pull request in this repository. realvirtual reviews the pull request. See \`CONTRIBUTING.md\` for details.\n\n`) +
     `### Receiving an update\n\n` +
-    `An update arrives as a commit pushed to this repository by realvirtual. It touches three kinds of file, and the rule differs for each:\n\n` +
-    `| What | What an update does |\n` +
+    (projectless
+      ? `An update arrives as a commit pushed to this repository by realvirtual. Take it with \`git pull\`. It replaces everything outside \`projects/\` - \`realvirtual-web/\`, \`realvirtual-web-pro/\`, the scripts and the manifests - and it never touches anything inside \`projects/\`. Your projects are yours: they are neither updated, nor merged, nor removed by a delivery.\n\n`
+        + `After every update, read \`DELIVERY-REPORT.md\` in the repository root. It is regenerated each time and lists, in German, what was updated, added and removed, and any changes of yours outside \`projects/\` that the update overwrote.\n\n`
+      : `An update arrives as a commit pushed to this repository by realvirtual. It touches three kinds of file, and the rule differs for each:\n\n`) +
+    (projectless ? `` : `| What | What an update does |\n` +
     `| --- | --- |\n` +
-    `| \`realvirtual-web/\`, \`realvirtual-web-pro/\`, \`connect/\` and everything else outside \`projects/\` | **Replaced.** Do not edit these; changes here are overwritten. If you did change something, the update lists it in the report so you can see what was lost. |\n` +
-    `| Parts of \`projects/${projectKey}/\` that realvirtual maintains - typically \`models/\`, \`docs/\`, \`connect/\`, \`plugins/\`, \`rag/\` | **Merged.** If you did not change a file, it is updated. If you did, **your version stays** and ours is put beside it (see below). |\n` +
-    `| Everything else in \`projects/${projectKey}/\` - \`scenes/\`, \`settings/\`, \`layouts/\`, and anything not listed above | **Never touched.** This is yours. |\n\n` +
-    `After every update, read \`DELIVERY-REPORT.md\` in the repository root. It is regenerated each time and lists, in German, what was updated, added and removed, which of your files were kept, and any changes of yours outside \`projects/\` that the update overwrote.\n\n` +
-    `**When your version was kept.** The report names a file such as \`projects/${projectKey}/connect/project-config.json\` and, next to it, a second file with \`.vendor-<version>\` in its name - for example \`project-config.vendor-6.3.0.json\`. That is our new version, parked there unopened. Nothing about your file changed. To resolve it:\n\n` +
-    `1. Compare the two files (\`git diff --no-index <yours> <the .vendor- one>\`).\n` +
-    `2. Decide what to keep. Usually you want your change plus whatever we changed - merge by hand.\n` +
-    `3. Delete the \`.vendor-<version>\` file and commit.\n\n` +
-    `Leaving it in place is safe: later updates never overwrite or remove a \`.vendor-\` file, so nothing is lost if you get to it next week. But each conflicting update adds another one, so they accumulate until you clear them.\n\n` +
-    `**A file you deleted on purpose is not restored.** If you removed one of our files, the update reports it and leaves it removed. Ask us if you want it back.\n\n` +
-    `**The first update after August 2026 is a special case.** It establishes the baseline that all later updates compare against, so it deliberately changes nothing inside \`projects/${projectKey}/\` and instead reports which of our files are missing on your side. The update after it carries the actual changes. If you would rather not wait, tell us after reading that report and we will send the missing files immediately.\n\n` +
+      `| \`realvirtual-web/\`, \`realvirtual-web-pro/\`, \`connect/\` and everything else outside \`projects/\` | **Replaced.** Do not edit these; changes here are overwritten. If you did change something, the update lists it in the report so you can see what was lost. |\n` +
+      `| Parts of \`${projectPath}/\` that realvirtual maintains - typically \`models/\`, \`docs/\`, \`connect/\`, \`plugins/\`, \`rag/\` | **Merged.** If you did not change a file, it is updated. If you did, **your version stays** and ours is put beside it (see below). |\n` +
+      `| Everything else in \`${projectPath}/\` - \`scenes/\`, \`settings/\`, \`layouts/\`, and anything not listed above | **Never touched.** This is yours. |\n\n` +
+      `After every update, read \`DELIVERY-REPORT.md\` in the repository root. It is regenerated each time and lists, in German, what was updated, added and removed, which of your files were kept, and any changes of yours outside \`projects/\` that the update overwrote.\n\n` +
+      `**When your version was kept.** The report names a file such as \`${projectPath}/connect/project-config.json\` and, next to it, a second file with \`.vendor-<version>\` in its name - for example \`project-config.vendor-6.3.0.json\`. That is our new version, parked there unopened. Nothing about your file changed. To resolve it:\n\n` +
+      `1. Compare the two files (\`git diff --no-index <yours> <the .vendor- one>\`).\n` +
+      `2. Decide what to keep. Usually you want your change plus whatever we changed - merge by hand.\n` +
+      `3. Delete the \`.vendor-<version>\` file and commit.\n\n` +
+      `Leaving it in place is safe: later updates never overwrite or remove a \`.vendor-\` file, so nothing is lost if you get to it next week. But each conflicting update adds another one, so they accumulate until you clear them.\n\n` +
+      `**A file you deleted on purpose is not restored.** If you removed one of our files, the update reports it and leaves it removed. Ask us if you want it back.\n\n` +
+      `**The first update after August 2026 is a special case.** It establishes the baseline that all later updates compare against, so it deliberately changes nothing inside \`${projectPath}/\` and instead reports which of our files are missing on your side. The update after it carries the actual changes. If you would rather not wait, tell us after reading that report and we will send the missing files immediately.\n\n`) +
     `## Reference\n\n` +
     `### Features\n\n` +
-    `Every delivery includes the AGPL core (${CORE_FEATURES.length} capabilities: drives, sensors, transport surfaces, sources and sinks, grippers, signals and PLC connectivity, HMI panels, camera presets, and PDF document linking). The categories below add to that core; they do not replace it.\n\n` +
+    `Every delivery includes the AGPL core (${CORE_FEATURES.length} capabilities: drives, sensors, transport surfaces, sources and sinks, grippers, signals and PLC connectivity, HMI panels, camera presets, PDF document linking, and the layout planner). The categories below add to that core; they do not replace it.\n\n` +
     `**Licensed features** - tier-gated commercial and restricted features, enabled per your licence:\n\n` +
     `${licensedBlock}\n\n` +
-    `**Your project** - your own code under \`projects/${projectKey}/plugins/\`, developed together with realvirtual:\n\n` +
-    `${projectBlock}\n\n` +
+    (projectless
+      ? `**Your project** - anything you create under \`projects/\`. That folder is empty in a standard delivery and is never touched by an update; see [Create your first project](#create-your-first-project).\n\n`
+      : `**Your project** - your own code under \`${projectPath}/plugins/\`, developed together with realvirtual:\n\n`
+        + `${projectBlock}\n\n`) +
     `See [FEATURES.md](FEATURES.md) for the detailed feature matrix and tier assignment.\n\n` +
     `### Editions\n\n` +
     `- **Community:** \`realvirtual-web/\` is the AGPL-licensed core, using the same licence and codebase as the public Community version. Release schedules are independent, so the public Community version can be newer or older than this delivered snapshot. For this delivery, \`delivery-manifest.json\` is authoritative for the version, commit, and changeset.\n` +
     `- **Professional/Commercial:** Additional commercial extensions in \`realvirtual-web-pro/\`. Their use requires a commercial licence.\n` +
-    `- **Customer-specific development:** All code below \`projects/${projectKey}/\`. It is developed together with realvirtual; ownership and usage rights are governed by the customer contract.\n\n` +
+    (projectless
+      ? `- **Your own projects:** Everything below \`projects/\`. It is yours; realvirtual neither delivers nor modifies anything in that folder.\n\n`
+      : `- **Customer-specific development:** All code below \`${projectPath}/\`. It is developed together with realvirtual; ownership and usage rights are governed by the customer contract.\n\n`) +
     `### Your private workspace\n\n` +
     `This repository is a private repository in your organisation on \`git.realvirtual.io\`. Access is limited to invited accounts in your organisation, sign-in is required, and there is no anonymous read access. Other customers use separate organisations and cannot access this repository.\n\n` +
     `realvirtual operates the server on its own infrastructure in the EU, in a Hetzner data centre in Helsinki, rather than on US cloud services. Machine geometry, documentation, and project-specific code are stored in this private repository.\n\n` +
@@ -963,6 +1468,23 @@ function writeWorkspaceRecipes(root, projectKey, model, coreRoot) {
   const recipesRoot = join(root, 'recipes');
   const customerModel = model || '<your-model>.glb';
   const modelStem = customerModel.replace(/\.glb$/i, '');
+  // The projectless (standard) delivery has no `projects/<key>` folder to point
+  // at. Two consequences, and both matter:
+  //   - the placeholder path is written as CODE, never as a Markdown link — a
+  //     link would resolve to a folder that does not exist and
+  //     assertNoBrokenDocLinks would (correctly) abort the delivery;
+  //   - `projectKey` itself is only ever interpolated through `projectPath`.
+  const projectless = !projectKey;
+  const projectPath = projectless ? 'projects/<your-project>' : `projects/${projectKey}`;
+  // Names the project in prose (bucket names, CLI arguments). A generic word
+  // reads better than a fake key in a command the reader has to adapt anyway.
+  const projectArg = projectless ? '<your-project>' : projectKey;
+  //! A link into the customer's project tree, degraded to code text when there is no
+  //! project. It supplies its own article, because "the <link>" and "the `path`" do
+  //! not both read well — the caller writes "Copy it into ${projectDirLink(…)}".
+  const projectDirLink = (label, relative) => (projectless
+    ? `\`${projectPath}/${relative}\``
+    : `the [${label}](../${projectPath}/${relative})`);
   mkdirSync(recipesRoot, { recursive: true });
 
   for (const name of STATIC_CORE_RECIPES) {
@@ -985,12 +1507,12 @@ function writeWorkspaceRecipes(root, projectKey, model, coreRoot) {
       `8. [Set up the appliance](setup-appliance.md) - install the optional on-premise box that serves the HMI, the project Git repository, the signal history, and the gateway from one secured address in the plant network.\n`,
 
     'replace-machine-model.md': `# Replace the machine model\n\n` +
-      `## Goal and outcome\n\nReplace the current \`${customerModel}\` model for project \`${projectKey}\` with a GLB exported from Unity. The result loads in the development server with the intended axes, units, and startup camera and without browser console errors.\n\n` +
+      `## Goal and outcome\n\nReplace the current \`${customerModel}\` model for project \`${projectArg}\` with a GLB exported from Unity. The result loads in the development server with the intended axes, units, and startup camera and without browser console errors.\n\n` +
       `## When to use\n\nUse this recipe after changing the machine in Unity or when introducing a different customer model.\n\n` +
       `## Prerequisites\n\n- realvirtual Professional in Unity with GLB export available.\n- Git and Git LFS installed; run \`git lfs install\` once per computer.\n- A clean export that includes the required realvirtual metadata.\n\n` +
-      `## Steps\n\n1. In Unity, export the machine with the realvirtual Professional GLB export.\n2. Copy the GLB into the [project model directory](../projects/${projectKey}/models/). The generated \`.gitattributes\` tracks \`projects/*/models/*.glb\` with Git LFS.\n3. To replace \`${customerModel}\` without a configuration change, keep exactly the same filename.\n4. If the filename changes, set \`defaultModel\` to the new bare filename in [settings.json](../realvirtual-web/public/settings.json); do not add a directory prefix.\n5. Start the workspace with \`start.ps1\` (Linux: \`./start.sh\`) or the **realvirtual WEB dev** Start-menu entry, and open http://localhost:5100. Hard-reload the browser and confirm that the requested GLB, rather than a cached previous file, loads.\n6. Check the machine's X/Y/Z orientation, physical scale and units, and the initial camera framing. Correct the Unity export or startup-camera data if any of them are wrong.\n7. Review \`git status\` and confirm that the GLB is handled by Git LFS before committing it.\n\n` +
+      `## Steps\n\n1. In Unity, export the machine with the realvirtual Professional GLB export.\n2. Copy the GLB into ${projectDirLink('project model directory', 'models/')}. The generated \`.gitattributes\` tracks \`projects/*/models/*.glb\` with Git LFS.\n3. To replace \`${customerModel}\` without a configuration change, keep exactly the same filename.\n4. If the filename changes, set \`defaultModel\` to the new bare filename in [settings.json](../realvirtual-web/public/settings.json); do not add a directory prefix.\n5. Start the workspace with \`start.ps1\` (Linux: \`./start.sh\`) and open http://localhost:5100. Hard-reload the browser and confirm that the requested GLB, rather than a cached previous file, loads.\n6. Check the machine's X/Y/Z orientation, physical scale and units, and the initial camera framing. Correct the Unity export or startup-camera data if any of them are wrong.\n7. Review \`git status\` and confirm that the GLB is handled by Git LFS before committing it.\n\n` +
       `## Acceptance criteria\n\n- The model loads in the development server without browser console errors.\n- Axes, units, scale, and the startup camera are correct.\n- Git LFS tracks the GLB, and \`defaultModel\` is the bare filename of the delivered model.\n\n` +
-      `## Rollback\n\nRestore the previous tracked file with \`git checkout -- projects/${projectKey}/models/${customerModel}\`. If you changed \`defaultModel\`, also restore \`realvirtual-web/public/settings.json\`, then restart the development server.\n\n` +
+      `## Rollback\n\nRestore the previous tracked file with \`git checkout -- ${projectPath}/models/${customerModel}\`. If you changed \`defaultModel\`, also restore \`realvirtual-web/public/settings.json\`, then restart the development server.\n\n` +
       `## Common problems\n\n- **404 for the GLB:** the filename or \`defaultModel\` does not match, including letter case.\n- **Only a small text pointer is present:** run \`git lfs pull\`.\n- **Wrong size or orientation:** fix the Unity unit/axis export settings and export again.\n- **Old geometry remains:** hard-reload and verify the requested model URL in the browser Network panel.\n\n` +
       `## Security and version notes\n\nA GLB shipped to an authorized browser user can be downloaded by that user. Do not include geometry or metadata that the recipient is not permitted to receive. Version meaningful model changes in Git; for deployments that cache models, prefer a new filename when cache invalidation must be explicit.\n\n` +
       `## Further reading\n\n- [Unity-to-WEB workflow](../realvirtual-web/doc-unity-to-web.md)\n- [realvirtual WEB overview](../realvirtual-web/doc-webviewer.md)\n`,
@@ -1007,8 +1529,8 @@ function writeWorkspaceRecipes(root, projectKey, model, coreRoot) {
       `## Further reading\n\n- [Industrial interfaces and signal flow](../realvirtual-web/doc-webviewer-interface.md)\n- [Signal architecture](../realvirtual-web/doc-signal-architecture.md)\n`,
 
     'setup-influxdb-historian.md': `# Set up the InfluxDB historian\n\n` +
-      `## Goal and outcome\n\nInstall a customer-owned InfluxDB OSS v2 instance, create isolated resources for project \`${projectKey}\`, connect realvirtual CONNECT with a least-privilege token, and prove that selected signal history appears in the Viewer.\n\n` +
-      `CONNECT derives the bucket names from the project. There is no free-form Bucket field: project \`${projectKey}\` uses \`${projectKey}_raw\`, \`${projectKey}_1m\`, and \`${projectKey}_1h\`.\n\n` +
+      `## Goal and outcome\n\nInstall a customer-owned InfluxDB OSS v2 instance, create isolated resources for project \`${projectArg}\`, connect realvirtual CONNECT with a least-privilege token, and prove that selected signal history appears in the Viewer.\n\n` +
+      `CONNECT derives the bucket names from the project. There is no free-form Bucket field: project \`${projectArg}\` uses \`${projectArg}_raw\`, \`${projectArg}_1m\`, and \`${projectArg}_1h\`.\n\n` +
       `## When to use\n\nUse this recipe when a customer wants persistent signal trends on infrastructure they operate. It applies to local machines, an OT server, a customer VM, or a customer-approved private cloud. It does not depend on realvirtual infrastructure.\n\n` +
       `## Prerequisites\n\n- An x64 Windows or Linux host with persistent storage and an approved backup location.\n- Network approval between CONNECT and TCP port 8086 on the InfluxDB host. Do not expose port 8086 to the public Internet.\n- An InfluxDB OSS v2 operator token for one-time provisioning. Store it outside this Git workspace.\n- Node.js 18 or newer for the supplied provisioning helper.\n- A running workspace and at least one CONNECT signal that can be safely marked for recording.\n\n` +
       `## 1. Install InfluxDB OSS v2\n\n` +
@@ -1026,19 +1548,19 @@ function writeWorkspaceRecipes(root, projectKey, model, coreRoot) {
       `Official setup reference: [Install InfluxDB OSS v2](https://docs.influxdata.com/influxdb/v2/install/).\n\n` +
       `## 2. Provision project buckets, tasks, and token\n\n` +
       `The supplied [provisioning helper](../tools/provision-influx.mjs) has no customer, organization, project, URL, or credential defaults. It creates the organization when absent, these fixed-retention buckets, a CONNECT token scoped to write raw data and read all three buckets, and dedicated downsampling tasks:\n\n` +
-      `| Bucket | Retention | Purpose |\n| --- | ---: | --- |\n| \`${projectKey}_raw\` | 7 days | Deadband- and interval-filtered CONNECT samples |\n| \`${projectKey}_1m\` | 365 days | One-minute means |\n| \`${projectKey}_1h\` | 3650 days | One-hour means |\n\n` +
+      `| Bucket | Retention | Purpose |\n| --- | ---: | --- |\n| \`${projectArg}_raw\` | 7 days | Deadband- and interval-filtered CONNECT samples |\n| \`${projectArg}_1m\` | 365 days | One-minute means |\n| \`${projectArg}_1h\` | 3650 days | One-hour means |\n\n` +
       `Run from the workspace root. The operator token is read only from the process environment so it does not appear in the command line:\n\n` +
-      `\`\`\`powershell\n$env:RV_INFLUX_ADMIN_TOKEN = '<operator-token-from-secret-vault>'\nnode tools/provision-influx.mjs --url 'http://<influx-host>:8086' --org '<customer-org>' --project '${projectKey}'\nRemove-Item Env:RV_INFLUX_ADMIN_TOKEN\n\`\`\`\n\n` +
+      `\`\`\`powershell\n$env:RV_INFLUX_ADMIN_TOKEN = '<operator-token-from-secret-vault>'\nnode tools/provision-influx.mjs --url 'http://<influx-host>:8086' --org '<customer-org>' --project '${projectArg}'\nRemove-Item Env:RV_INFLUX_ADMIN_TOKEN\n\`\`\`\n\n` +
       `On Linux or macOS, set the same environment variable only for the command process:\n\n` +
-      `\`\`\`bash\nRV_INFLUX_ADMIN_TOKEN='<operator-token-from-secret-vault>' node tools/provision-influx.mjs \\\n  --url 'http://<influx-host>:8086' --org '<customer-org>' --project '${projectKey}'\n\`\`\`\n\n` +
+      `\`\`\`bash\nRV_INFLUX_ADMIN_TOKEN='<operator-token-from-secret-vault>' node tools/provision-influx.mjs \\\n  --url 'http://<influx-host>:8086' --org '<customer-org>' --project '${projectArg}'\n\`\`\`\n\n` +
       `Copy the returned \`connectToken\` directly into the CONNECT settings, store it in the customer secret vault, and clear the terminal when required by local policy. Never use the operator token in CONNECT. InfluxDB returns a token value only when it is created. A repeat run keeps existing resources and cannot recover their token. Use \`--rotate-token\` only for an intentional revocation and replacement; update CONNECT immediately afterward.\n\n` +
       `## 3. Configure CONNECT\n\n` +
-      `1. Start the workspace and connect the Viewer to its workspace-owned CONNECT gateway.\n2. Open **CONNECT Settings -> Historian (InfluxDB)** in the Viewer.\n3. Enter the exact \`URL\`, \`Org\`, and lowercase \`Project\` used above, paste the returned project-scoped token, enable **Record flagged signals to InfluxDB**, and select **Save**.\n4. Confirm the status changes to **Recording to ${projectKey}_raw**. The token is write-only: CONNECT stores it server-side and never returns it through \`GET /config\`. Leaving the token field empty on a later save keeps the stored token.\n\n` +
+      `1. Start the workspace and connect the Viewer to its workspace-owned CONNECT gateway.\n2. Open **CONNECT Settings -> Historian (InfluxDB)** in the Viewer.\n3. Enter the exact \`URL\`, \`Org\`, and lowercase \`Project\` used above, paste the returned project-scoped token, enable **Record flagged signals to InfluxDB**, and select **Save**.\n4. Confirm the status changes to **Recording to ${projectArg}_raw**. The token is write-only: CONNECT stores it server-side and never returns it through \`GET /config\`. Leaving the token field empty on a later save keeps the stored token.\n\n` +
       `For unattended configuration, the equivalent CONNECT block is shown below. It belongs to CONNECT's persisted \`connect-config.json\`, not to the browser's \`settings.json\` and not to \`connect/project-config.json\`:\n\n` +
-      `\`\`\`json\n{\n  "InfluxDb": {\n    "Enabled": true,\n    "Url": "http://<influx-host>:8086",\n    "Org": "<customer-org>",\n    "Project": "${projectKey}",\n    "Token": "<project-scoped-connect-token>"\n  }\n}\n\`\`\`\n\n` +
+      `\`\`\`json\n{\n  "InfluxDb": {\n    "Enabled": true,\n    "Url": "http://<influx-host>:8086",\n    "Org": "<customer-org>",\n    "Project": "${projectArg}",\n    "Token": "<project-scoped-connect-token>"\n  }\n}\n\`\`\`\n\n` +
       `On Windows the default file is \`C:\\ProgramData\\realvirtual\\CONNECT\\connect-config.json\`; on Linux it is \`$XDG_CONFIG_HOME/realvirtual/CONNECT/connect-config.json\` or \`~/.config/realvirtual/CONNECT/connect-config.json\`. Stop CONNECT before hand-editing the file, preserve all existing top-level fields, make a backup, and restart CONNECT afterward. Prefer the Viewer settings UI for a running gateway.\n\n` +
       `## 4. Select signals and verify data\n\n` +
-      `1. In the CONNECT signal list, use the record action on one safe numeric or Boolean signal. Only signals with persisted \`Record: true\` are written. Non-numeric/string signals are skipped.\n2. Change the signal safely or wait for the default unchanged-value heartbeat.\n3. Open \`http://127.0.0.1:5100/history/status\` (adjust the CONNECT host/port) and verify \`enabled: true\`, \`connected: true\`, bucket \`${projectKey}_raw\`, a non-null \`lastWriteUtc\`, and \`authError: false\`. If CONNECT uses an API key, send the same \`X-API-Key\` header rather than placing the key in a URL.\n4. Open the Viewer **Historian** panel, select the recorded signal, choose **1h**, and confirm that samples appear.\n5. Optionally verify in the InfluxDB Data Explorer: measurement \`plc_signals\`, field \`value\`, project tag \`${projectKey}\`, and the exact signal-name tag. Use CONNECT for normal Viewer queries; never put an InfluxDB token in browser code or \`settings.json\`.\n\n` +
+      `1. In the CONNECT signal list, use the record action on one safe numeric or Boolean signal. Only signals with persisted \`Record: true\` are written. Non-numeric/string signals are skipped.\n2. Change the signal safely or wait for the default unchanged-value heartbeat.\n3. Open \`http://127.0.0.1:5100/history/status\` (adjust the CONNECT host/port) and verify \`enabled: true\`, \`connected: true\`, bucket \`${projectArg}_raw\`, a non-null \`lastWriteUtc\`, and \`authError: false\`. If CONNECT uses an API key, send the same \`X-API-Key\` header rather than placing the key in a URL.\n4. Open the Viewer **Historian** panel, select the recorded signal, choose **1h**, and confirm that samples appear.\n5. Optionally verify in the InfluxDB Data Explorer: measurement \`plc_signals\`, field \`value\`, project tag \`${projectArg}\`, and the exact signal-name tag. Use CONNECT for normal Viewer queries; never put an InfluxDB token in browser code or \`settings.json\`.\n\n` +
       `## Acceptance criteria\n\n- The three project buckets have exactly 7-day, 365-day, and 3650-day retention.\n- CONNECT uses the project-scoped token, reports connected status, and writes only signals with \`Record: true\`.\n- \`lastWriteUtc\` advances and \`droppedPoints\` does not grow during normal operation.\n- The Viewer Historian panel displays the selected signal without a token in browser storage or requests.\n- Firewall, backup, retention, monitoring, and token custody are recorded in the customer deployment documentation.\n\n` +
       `## Retention, disk, and backup\n\n` +
       `Retention limits data lifetime but does not replace capacity planning or backup. Actual disk usage depends on the number of recorded signals, change rate, deadband, compression, and tag values. Measure the volume after a representative production week, project peak growth, keep customer-defined reserve space, and alert before the volume is close to full. Review CONNECT's \`MinIntervalMs\`, \`MaxIntervalMs\`, and \`FloatDeadbandPercent\` only from measured requirements; reducing intervals can multiply write volume.\n\n` +
@@ -1060,14 +1582,14 @@ function writeWorkspaceRecipes(root, projectKey, model, coreRoot) {
       `## Further reading\n\n- [Workspace settings](../realvirtual-web/public/settings.json)\n- [Runtime debugging](troubleshoot-runtime.md)\n`,
 
     'create-custom-plugin.md': `# Create a custom plugin\n\n` +
-      `## Goal and outcome\n\nAdd customer-owned behavior for \`${modelStem}\` under \`projects/${projectKey}/plugins/\`, with a minimal \`init\`/\`dispose\` lifecycle and a visible result in the Viewer.\n\n` +
+      `## Goal and outcome\n\nAdd customer-owned behavior for \`${modelStem}\` under \`${projectPath}/plugins/\`, with a minimal \`init\`/\`dispose\` lifecycle and a visible result in the Viewer.\n\n` +
       `## When to use\n\nUse this recipe for project-specific UI, behavior, event handling, or visualization that should travel with the customer project.\n\n` +
       `## Prerequisites\n\n- The model loads in the running workspace at http://localhost:5100.\n- Read the plugin lifecycle and model-specific registration sections linked below.\n- Decide what visible, reversible behavior proves that the plugin is active.\n\n` +
-      `## Steps\n\n1. Create a TypeScript or TSX plugin file in the [project plugin directory](../projects/${projectKey}/plugins/). Keep the plugin small and give it a unique \`id\`.\n2. Implement the minimum lifecycle: use \`init(viewer, context)\` to register visible UI/behavior or subscriptions, and \`dispose()\` to unregister listeners and release every resource created by the plugin.\n3. Add or update \`projects/${projectKey}/plugins/index.ts\`: list the matching model name \`${modelStem}\`, create the plugin in \`registerModelPlugins\`, and remove it by ID in \`unregisterModelPlugins\`.\n4. Restart the development server. Project plugin entry points are discovered through a Vite auto-discovery glob, so adding or renaming an entry file is not reliably picked up without a restart.\n5. Confirm the plugin's visible UI, marker, or behavior appears only for the intended model and disappears cleanly after model switch/unload.\n6. From \`realvirtual-web/\`, run \`npx tsc --noEmit\`, then \`npm run build\`.\n\n` +
+      `## Steps\n\n1. Create a TypeScript or TSX plugin file in ${projectDirLink('project plugin directory', 'plugins/')}. Keep the plugin small and give it a unique \`id\`.\n2. Implement the minimum lifecycle: use \`init(viewer, context)\` to register visible UI/behavior or subscriptions, and \`dispose()\` to unregister listeners and release every resource created by the plugin.\n3. Add or update \`${projectPath}/plugins/index.ts\`: list the matching model name \`${modelStem}\`, create the plugin in \`registerModelPlugins\`, and remove it by ID in \`unregisterModelPlugins\`.\n4. Restart the development server. Project plugin entry points are discovered through a Vite auto-discovery glob, so adding or renaming an entry file is not reliably picked up without a restart.\n5. Confirm the plugin's visible UI, marker, or behavior appears only for the intended model and disappears cleanly after model switch/unload.\n6. From \`realvirtual-web/\`, run \`npx tsc --noEmit\`, then \`npm run build\`.\n\n` +
       `## Acceptance criteria\n\n- \`npx tsc --noEmit\` and \`npm run build\` both succeed.\n- The plugin has a visible intended effect for \`${modelStem}\`.\n- Repeated model load/unload does not duplicate UI, listeners, or scene objects.\n\n` +
-      `## Rollback\n\nRemove the plugin registration first, restart the development server, then delete the plugin file. Use Git to restore the previous \`projects/${projectKey}/plugins/\` state if necessary.\n\n` +
+      `## Rollback\n\nRemove the plugin registration first, restart the development server, then delete the plugin file. Use Git to restore the previous \`${projectPath}/plugins/\` state if necessary.\n\n` +
       `## Common problems\n\n- **Plugin never appears:** restart the dev server and verify the model name exported by \`models\` matches the GLB filename without \`.glb\`.\n- **TypeScript import errors:** use paths relative to the customer workspace layout and follow existing project plugins.\n- **Duplicate behavior after reload:** ensure \`unregisterModelPlugins\` removes the plugin and \`dispose()\` releases subscriptions/resources.\n- **Build passes but nothing is visible:** add a bounded visible acceptance signal such as a UI slot, then verify it in the intended model.\n\n` +
-      `## Security and version notes\n\nDo not add AGPL headers to code under \`projects/${projectKey}/\`; customer code is governed by the customer contract. Do not put credentials, tokens, or private endpoints in browser plugin source. Treat plugin API changes as versioned workspace changes and re-run both checks after delivery updates.\n\n` +
+      `## Security and version notes\n\nDo not add AGPL headers to code under \`${projectPath}/\`; customer code is governed by the customer contract. Do not put credentials, tokens, or private endpoints in browser plugin source. Treat plugin API changes as versioned workspace changes and re-run both checks after delivery updates.\n\n` +
       `## Further reading\n\n- [Extending realvirtual WEB](../realvirtual-web/doc-extending-webviewer.md)\n- [Scripting](../realvirtual-web/doc-scripting.md)\n`,
 
     'troubleshoot-runtime.md': `# Troubleshoot the runtime\n\n` +
@@ -1088,7 +1610,7 @@ function writeWorkspaceRecipes(root, projectKey, model, coreRoot) {
     // delivery, which is more useful than a silently missing runbook.
     'setup-appliance.md': `# Set up the appliance\n\n` +
       `## Goal and outcome\n\nThis recipe requires the \`appliance/\` folder, which ships from the commercial tier. If it is not in your workspace, this recipe does not apply to your delivery; ask realvirtual whether the appliance is part of your contract.\n\n` +
-      `Install the appliance on one dedicated box in the plant network so that project \`${projectKey}\` is served from a single secured HTTPS address: the HMI with \`${customerModel}\`, the project Git repository, the recorded signal history, and the realvirtual CONNECT gateway. Any panel PC or tablet on the same network reaches all of it through that one address, without Internet access.\n\n` +
+      `Install the appliance on one dedicated box in the plant network so that project \`${projectArg}\` is served from a single secured HTTPS address: the HMI with \`${customerModel}\`, the project Git repository, the recorded signal history, and the realvirtual CONNECT gateway. Any panel PC or tablet on the same network reaches all of it through that one address, without Internet access.\n\n` +
       `**The appliance is still in development and is not released for production use.** Backup and restore do not exist yet, and the complete Windows installation run has not been performed on a fresh machine. Treat an installation as a pilot on hardware you are able to rebuild.\n\n` +
       `## When to use\n\nUse this recipe when the machine has to carry its own HMI at the plant: no Internet, no engineering workstation in the loop, and the project repository plus the signal history stay on customer premises for the life of the machine. Do not use it for a developer workstation; there the normal workspace start scripts are the right tool.\n\n` +
       `## Prerequisites\n\n` +
@@ -1101,8 +1623,8 @@ function writeWorkspaceRecipes(root, projectKey, model, coreRoot) {
       `- Customer IT/OT approval for the network paths, for the certificate route, and for who is given the sign-in.\n\n` +
       `## Steps\n\n` +
       `1. Copy the \`appliance/\` folder and \`dist.zip\` to the box, for example to \`C:\\rv-appliance\` on Windows or \`/opt/rv-appliance\` on Linux. Keep the folder together; the scripts expect their neighbours.\n` +
-      `2. Run the preflight first. It changes nothing and reports every blocker at once. On Windows: \`powershell -NoProfile -ExecutionPolicy Bypass -File .\\setup-appliance.ps1 -ApplianceHost <host> -Project ${projectKey} -PreflightOnly\`. On Linux: \`sudo ./install.sh --host <host> --project ${projectKey} --preflight-only\`. Clear every finding before continuing.\n` +
-      `3. Install. On Windows, from an administrator PowerShell: \`powershell -NoProfile -ExecutionPolicy Bypass -File .\\setup-appliance.ps1 -ApplianceHost <host> -Project ${projectKey} -SeedRelease <path-to-dist.zip>\`. If it ends with exit code 3010, restart the machine and repeat the same call with \`-Resume\` added. On Linux: \`sudo ./install.sh --host <host> --project ${projectKey} --seed-release <path-to-dist.zip>\`. Both routes are repeatable: a second run changes nothing that is already correct, and an existing configuration file with the generated secrets is never overwritten.\n` +
+      `2. Run the preflight first. It changes nothing and reports every blocker at once. On Windows: \`powershell -NoProfile -ExecutionPolicy Bypass -File .\\setup-appliance.ps1 -ApplianceHost <host> -Project ${projectArg} -PreflightOnly\`. On Linux: \`sudo ./install.sh --host <host> --project ${projectArg} --preflight-only\`. Clear every finding before continuing.\n` +
+      `3. Install. On Windows, from an administrator PowerShell: \`powershell -NoProfile -ExecutionPolicy Bypass -File .\\setup-appliance.ps1 -ApplianceHost <host> -Project ${projectArg} -SeedRelease <path-to-dist.zip>\`. If it ends with exit code 3010, restart the machine and repeat the same call with \`-Resume\` added. On Linux: \`sudo ./install.sh --host <host> --project ${projectArg} --seed-release <path-to-dist.zip>\`. Both routes are repeatable: a second run changes nothing that is already correct, and an existing configuration file with the generated secrets is never overwritten.\n` +
       `4. **Write down the operator password.** The installer prints it once, at the end, and stores it nowhere. There is a second, non-interactive account for the health checks; you do not need it for daily use.\n` +
       `5. Make the operator devices trust the certificate. If the customer has its own certificate authority, install a certificate from that authority instead and skip the rest of this step - then no device needs any change at all. Otherwise take the root certificate from the installer output, a USB stick, or a group policy, compare the fingerprint printed by the installer, and install it per device. The download link in the appliance dashboard is a convenience for a device that already trusts the appliance, not the way to establish that trust. Firefox keeps its own certificate store, and iPadOS additionally requires **Settings > General > About > Certificate Trust Settings**.\n` +
       `6. Publish both names, the appliance host name and \`influx.<host>\`, in the customer DNS or in the hosts files of the operator devices.\n` +
@@ -1138,10 +1660,19 @@ function writeWorkspaceRecipes(root, projectKey, model, coreRoot) {
 }
 
 function deliveryName(projectKey) {
-  return `project \`${projectKey}\``;
+  return projectKey ? `project \`${projectKey}\`` : 'your project';
 }
 
+//! `projectKey === null` is the projectless (standard) delivery: the repository is
+//! read-only for the customer, so there is no contribution route to describe and no
+//! CLA to state. Saying so is the point — an unchanged PR text would send a customer
+//! with read permission at a review process that does not exist for them (§2.2).
 function generateContributing(projectKey) {
+  if (!projectKey) {
+    return `# Contributing\n\nThis repository is published by realvirtual and is **read-only for you**. There is no pull request to open here and no review step; take updates with \`git pull\`.\n\n` +
+      `Everything under \`projects/\` is yours. Version it on your side - your own branch, remote, or backup - as your organisation prefers; a delivery never reads, changes or removes anything in that folder.\n\n` +
+      `If you want realvirtual to look at something you built, or you would like a project developed together with us, contact [professional@realvirtual.io](mailto:professional@realvirtual.io).\n`;
+  }
   return `# Contributing\n\nCustomer changes belong only in \`projects/${projectKey}/\` and are submitted through a reviewed pull request.\n\n` +
     `By submitting a contribution, you confirm that you may provide it and grant realvirtual GmbH the rights required to maintain, merge, license, and redistribute it as part of the delivered product. This clause is a placeholder pending legal review and must be replaced before the first customer contribution.\n`;
 }
@@ -1159,8 +1690,8 @@ function generateContributing(projectKey) {
 function generateSetupPowerShell(hasDiagnosis = true) {
   return `# Prepares this workspace: Node check, dependencies, realvirtual CONNECT.\n` +
     `#\n` +
-    `# It deliberately starts NOTHING. Use start.ps1, or the "realvirtual WEB dev" entry in the Start\n` +
-    `# menu, to run the workspace. realvirtual CONNECT points here when the dependencies have moved on,\n` +
+    `# It deliberately starts NOTHING. Use start.ps1 to run the workspace.\n` +
+    `# realvirtual CONNECT points here when the dependencies have moved on,\n` +
     `# so a preparation that also started CONNECT would call itself.\n` +
     `$ErrorActionPreference = 'Stop'\n$workspace = Split-Path -Parent $MyInvocation.MyCommand.Path\n` +
     // Preflight: without Node.js the script would fail deep inside `npm ci` with a bare
@@ -1248,12 +1779,11 @@ function generateSetupPowerShell(hasDiagnosis = true) {
     `  Write-Host 'for the current values, or run: node tools/get-connect.mjs . --latest'\n` +
     `  exit 1\n}\n` +
     `Write-Host ''\nWrite-Host 'The workspace is prepared.' -ForegroundColor Green\n` +
-    `Write-Host 'Start it from the Start menu ("realvirtual WEB dev"), or with: powershell -NoProfile -ExecutionPolicy Bypass -File .\\start.ps1'\n`;
+    `Write-Host 'Start it with: powershell -NoProfile -ExecutionPolicy Bypass -File .\\start.ps1'\n`;
 }
 
-// The shim. It exists for the installed base: existing shortcuts, older documentation, and the
-// muscle memory of every customer who has typed `.\start.ps1` for a year. New documentation names
-// the Start-menu entry only.
+// The shim over setup.ps1 + CONNECT. It is what the generated README documents, and it is also
+// what existing shortcuts, older documentation and a year of muscle memory point at.
 function generateStartPowerShell() {
   return `# Starts this workspace. A thin shim over two steps that are documented separately:\n` +
     `#   setup.ps1  prepares the workspace (Node, dependencies, realvirtual CONNECT)\n` +
@@ -1385,11 +1915,16 @@ function generateWorkspaceGuide(projectKey, deliveredDocs) {
     .filter((name) => name.startsWith('doc-'))
     .map((name) => `- [${name}](realvirtual-web/${name})`)
     .join('\n');
+  // Projectless: `projects/` exists and is empty, so the guide names the folder
+  // rather than a project inside it (plan-434 Phase 4).
+  const projectPath = projectKey ? `projects/${projectKey}` : 'projects/<your-project>';
   return `# Customer workspace development guide\n\n` +
     `## Structure and ownership\n\n` +
-    `- \`projects/${projectKey}/\` is the customer-owned development area. Edit project models, documentation, and plugins only there.\n` +
+    (projectKey
+      ? `- \`projects/${projectKey}/\` is the customer-owned development area. Edit project models, documentation, and plugins only there.\n`
+      : `- \`projects/\` is the customer-owned development area and starts out empty. Create \`projects/<your-project>/\` and edit models, documentation, and plugins only there.\n`) +
     `- \`realvirtual-web/\`, \`realvirtual-web-pro/\`, \`connect/\`, and delivery manifests are delivery-managed and are replaced by the next delivery.\n\n` +
-    `The project plugin entry point is \`projects/${projectKey}/plugins/index.ts\`. Put new plugin files in the same directory and register them from that entry point. Restart the development server after changing registration.\n\n` +
+    `The project plugin entry point is \`${projectPath}/plugins/index.ts\`. Put new plugin files in the same directory and register them from that entry point. Restart the development server after changing registration.\n\n` +
     `## Commands\n\n` +
     `Start the workspace from its root. realvirtual CONNECT serves the Viewer at http://localhost:5100 and starts the development server itself, so there is one address in every setup:\n\n` +
     `\`\`\`bash\npowershell -NoProfile -ExecutionPolicy Bypass -File .\\start.ps1\n\`\`\`\n\n` +
@@ -1404,7 +1939,7 @@ function generateWorkspaceGuide(projectKey, deliveredDocs) {
     `## Verification\n\nBefore submitting a change, run both \`npx tsc --noEmit\` and \`npm run build\` from \`realvirtual-web/\`.\n\n` +
     `## Data protection and licensing\n\n` +
     `Source code, GLB models, and PDF documents can be processed by the selected AI provider when supplied to an assistant. Share only data that the provider is permitted to process.\n\n` +
-    `Never add AGPL licence headers automatically to files under \`projects/${projectKey}/\`. Customer project code is commercial code and its ownership and usage are governed by the customer contract.\n`;
+    `Never add AGPL licence headers automatically to files under \`${projectPath}/\`. Customer project code is commercial code and its ownership and usage are governed by the customer contract.\n`;
 }
 
 // The subagent carries no `model:` field on purpose: it then inherits the customer's own session
@@ -1460,7 +1995,11 @@ function writeWorkspaceFiles(root, coreRoot, privateRoot, project, projectKey, d
   writeFileSync(join(root, 'start.ps1'), generateStartPowerShell());
   writeFileSync(join(root, 'setup.sh'), generateSetupShell());
   writeFileSync(join(root, 'start.sh'), generateStartShell());
-  writeFileSync(join(root, 'FEATURES.md'), renderFeatureMatrix(manifest, [delivery], projectKey, projectPlugins));
+  // `customerScoped` is what makes the projectless matrix a CUSTOMER matrix: without it a
+  // null project key would fall back to the internal report and list every registration in
+  // the manifest — including features this customer was never given (plan-434 Phase 4).
+  writeFileSync(join(root, 'FEATURES.md'),
+    renderFeatureMatrix(manifest, [delivery], projectKey, projectPlugins, { customerScoped: true }));
   // Internal ops helpers live in the private repo (never on the public AGPL
   // remote) but are still delivered into the customer workspace under tools/.
   const getConnectSource = join(privateRoot, 'scripts', 'get-connect.mjs');
@@ -1489,6 +2028,36 @@ function writeWorkspaceFiles(root, coreRoot, privateRoot, project, projectKey, d
   }
   mkdirSync(join(root, 'tools'), { recursive: true });
   copyFileSync(provisionInfluxSource, join(root, 'tools', 'provision-influx.mjs'));
+  stageAppliance(privateRoot, root);
+}
+
+// Runtime state the appliance creates ON the box, which must never travel with a delivery:
+// `.env` holds every generated secret, `state/` the resume markers of an installation in
+// progress. Both are written by install.sh, and `.env*` would additionally trip the
+// secret-bearing-file guard. `env.sample` (no leading dot) is the delivered template.
+const APPLIANCE_RUNTIME_DIRS = new Set(['state']);
+
+//! Stages the optional on-premise appliance installer into the customer workspace.
+//
+// The appliance is additive (plan-372 E11): `setup.ps1`/`start.ps1` never reference it, so a
+// customer who does not want it just has one folder more. It is copied byte for byte — every
+// runtime value (secrets, host address, measured IPs, certificates) is produced by `install.sh`
+// on the box and never at staging time, which is what keeps the delivery deterministic.
+//
+// It ships from the commercial tier upward; this function is only reached from that path,
+// because `writeWorkspaceFiles` itself is never called for a core-tier delivery.
+function stageAppliance(privateRoot, root) {
+  const source = join(privateRoot, 'appliance');
+  // The generated README and recipes/setup-appliance.md both point at `appliance/`. A commercial
+  // delivery that silently omitted it would ship a runbook for a folder that is not there - which
+  // is exactly the defect this staging path was added to fix, so it fails loudly instead.
+  if (!existsSync(source)) throw new Error(`Appliance installer not found: ${source}`);
+  copyTree(source, join(root, 'appliance'), (rel, entry) => {
+    if (isNonDeliveredBuildDir(entry)) return false;
+    const name = entry.name.toLowerCase();
+    if (entry.isDirectory() && APPLIANCE_RUNTIME_DIRS.has(name)) return false;
+    return !name.startsWith('.env');
+  });
 }
 
 //! Rewrites a public `@rv-private` stub so its relative core imports resolve from
@@ -1599,6 +2168,11 @@ export function assertNoBrokenDocLinks(stagingRoot) {
   const root = resolve(stagingRoot);
   walk(root, (absolute, rel, entry) => {
     if (isNonDeliveredBuildDir(entry)) return false;
+    // realvirtual-web/recipes/ is the bundler's copy, imported with `?raw` by the MCP help tool.
+    // Its links are authored for the workspace-level recipes/ — the copy the customer actually
+    // reads, and the one this walk still checks. Checking the build-input copy would demand two
+    // incompatible sets of relative paths in one file.
+    if (entry.isDirectory() && toPosix(rel) === 'realvirtual-web/recipes') return false;
     if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) return;
     for (const { target } of markdownLinks(readFileSync(absolute, 'utf8'))) {
       const destination = resolve(dirname(absolute), target);
@@ -1618,9 +2192,13 @@ export function stageFilteredSourceTree(options) {
   // customer repository carries (§2.10); a single-project delivery is simply the
   // case where the two agree. The primary always comes first.
   const projectKey = options.projectKey ?? options.projectKeys?.[0] ?? null;
-  const projectKeys = options.projectKeys
-    ? [projectKey, ...options.projectKeys.filter((key) => key !== projectKey)]
-    : (projectKey ? [projectKey] : []);
+  // No primary key means no projects at all (plan-434 Phase 4). Deriving the list
+  // from `projectKeys` first would produce `[null]` for an empty array, and that
+  // null would then be joined into a path.
+  const projectKeys = !projectKey ? []
+    : options.projectKeys
+      ? [projectKey, ...options.projectKeys.filter((key) => key !== projectKey)]
+      : [projectKey];
   const profile = options.profile ?? { tier: 'core', restrictedFeatures: [] };
   const manifestPath = join(privateRoot, 'tier-manifest.json');
   const manifest = existsSync(manifestPath)
@@ -1636,24 +2214,48 @@ export function stageFilteredSourceTree(options) {
   const coreOutput = join(destinationRoot, 'realvirtual-web');
   mkdirSync(coreOutput, { recursive: true });
   const deliveredDocs = selectedDocumentation(manifest, profile);
+  // The public demo content (scenes/ + aasx/) belongs to the hosted demo site, not to the
+  // product: a customer delivery never receives it. The tier alone cannot decide that any
+  // more, because the demo site is now ALSO built from the commercial tier
+  // (`bunny-deploy --demo`: commercial code, public demo content). `includePublicDemoContent`
+  // is the caller's explicit statement of which of the two this staging is; the default is
+  // the previous rule and keeps every existing caller unchanged.
+  const includePublicDemoContent = options.includePublicDemoContent
+    ?? (profile.tier === 'core' && !projectKey);
   copyCore(coreRoot, coreOutput, deliveredDocs, deliveredPublicModels(coreRoot), {
-    // Only the PUBLIC demo deploy (core tier, no project) ships scenes/ + aasx/.
-    includePublicDemoContent: profile.tier === 'core' && !projectKey,
+    includePublicDemoContent,
   });
   copyDemoAssetsIntoCore(coreRoot, coreOutput);
 
   let delivery = options.delivery ?? null;
   let project = options.project ?? null;
   let privateOutput = null;
+  // The projectless (standard) delivery: the product, with an empty `projects/`
+  // folder the customer fills themselves (plan-434 Phase 4). It has no primary
+  // project, so it has no project.json, no models, no CONNECT payload and no
+  // delivery config to look up BY project — the caller must hand one over,
+  // because `loadDeliveryConfig` resolves through a project key that is not there.
+  const projectless = projectKeys.length === 0;
+  // A CDN deploy stages CODE, not a repository. It needs the filtered private tree and the
+  // generated `private-plugins.ts`, but none of the customer workspace files — README,
+  // setup/start scripts, recipes, FEATURES.md, the CONNECT helpers — and it has no delivery
+  // config to write them from. `writeWorkspaceFiles` would additionally overwrite the core
+  // `public/settings.json` with a generated customer settings file, which is exactly the
+  // artifact the hosted deploy then injects GA/news into. `workspaceFiles: false` is that
+  // case (`bunny-deploy --demo`); every other caller keeps the workspace files.
+  const workspaceFiles = options.workspaceFiles !== false;
   if (profile.tier !== 'core') {
-    if (!projectKey) throw new Error('A projectKey is required for non-core staging.');
-    delivery ??= loadDeliveryConfig(privateRoot, projectKey, manifest);
+    if (projectless && !delivery && workspaceFiles) {
+      throw new Error('Projectless staging needs an explicit delivery config (a standard customer). '
+        + 'Load it with loadDeliveryConfigByCustomer() and pass it as options.delivery.');
+    }
+    if (!projectless) delivery ??= loadDeliveryConfig(privateRoot, projectKey, manifest);
     for (const key of projectKeys) {
       if (!existsSync(join(privateRoot, 'projects', key))) {
         throw new Error(`Project not found: ${join(privateRoot, 'projects', key)}`);
       }
     }
-    project ??= readJson(join(privateRoot, 'projects', projectKey, 'project.json'));
+    if (!projectless) project ??= readJson(join(privateRoot, 'projects', projectKey, 'project.json'));
     privateOutput = join(destinationRoot, 'realvirtual-web-pro');
     mkdirSync(join(privateOutput, 'src'), { recursive: true });
     walk(join(privateRoot, 'src'), (absolute, rel, entry) => {
@@ -1682,6 +2284,17 @@ export function stageFilteredSourceTree(options) {
     // seed; staging it would push the whole index into the customer repo and trip the
     // oversized-file guard, which is exactly how this was noticed.
     const projectExcluded = new Set(['.git', 'rag']);
+    // Nothing is delivered into `projects/` here, but the folder itself is: it is
+    // the one place in the workspace that belongs to the customer, and an empty
+    // directory does not survive Git. `.gitkeep` is the only vendor file that ever
+    // lands under `projects/`, and the merge treats everything there as the
+    // customer's (§6.7) — which is precisely why it can be seeded once and then
+    // left alone forever.
+    if (projectless) {
+      const projectsOutput = join(destinationRoot, 'projects');
+      mkdirSync(projectsOutput, { recursive: true });
+      writeFileSync(join(projectsOutput, '.gitkeep'), '');
+    }
     for (const key of projectKeys) {
       const projectOutput = join(destinationRoot, 'projects', key);
       copyTree(join(privateRoot, 'projects', key), projectOutput,
@@ -1694,7 +2307,9 @@ export function stageFilteredSourceTree(options) {
     // and start.ps1 must not promise or hash a diagnosis package that is not there. It defaults to
     // true so every existing caller keeps describing a normal delivery; only the generator's
     // explicit --no-rag run turns it off.
-    writeWorkspaceFiles(destinationRoot, coreRoot, privateRoot, project, projectKey, delivery, manifest, options.connectPin ?? null, deliveredDocs, options.hasDiagnosis ?? true);
+    if (workspaceFiles) {
+      writeWorkspaceFiles(destinationRoot, coreRoot, privateRoot, project, projectKey, delivery, manifest, options.connectPin ?? null, deliveredDocs, options.hasDiagnosis ?? true);
+    }
   }
   writeWorkspaceTsconfig(coreOutput);
 
@@ -1796,6 +2411,13 @@ export function assertNoSentinelInArtifacts(distRoot, sentinels) {
   });
 }
 
+// The release tag names the delivered viewer version. The prefix moved from `viewer-v` to
+// `realvirtual-v` with 6.3.16 (2026-08-07) when the product was renamed; both are accepted, because
+// a repository delivered before that carries the old prefix on its baseline and re-reading it must
+// not fail. Kept in sync with deliver.mjs, which gates the same tag before it builds anything.
+export const RELEASE_TAG_PATTERN = /^(?:realvirtual|viewer)-v\d+\.\d+\.\d+(?:[-+].+)?$/;
+export const RELEASE_TAG_HINT = 'realvirtual-vX.Y.Z';
+
 //! Returns deterministic Git provenance and enforces clean/tagged source gates.
 export function gitProvenance(repoRoot, { requireTag = false } = {}) {
   const cwd = resolve(repoRoot);
@@ -1803,8 +2425,8 @@ export function gitProvenance(repoRoot, { requireTag = false } = {}) {
   if (status) throw new Error(`Git tree is dirty: ${cwd}`);
   const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
   const tags = execFileSync('git', ['tag', '--points-at', 'HEAD'], { cwd, encoding: 'utf8' }).trim().split(/\r?\n/).filter(Boolean);
-  if (requireTag && !tags.some((tag) => /^viewer-v\d+\.\d+\.\d+(?:[-+].+)?$/.test(tag))) {
-    throw new Error(`Core HEAD must carry a viewer-vX.Y.Z release tag: ${cwd}`);
+  if (requireTag && !tags.some((tag) => RELEASE_TAG_PATTERN.test(tag))) {
+    throw new Error(`Core HEAD must carry a ${RELEASE_TAG_HINT} release tag: ${cwd}`);
   }
   return { commit, tags };
 }
@@ -1912,7 +2534,24 @@ export function runBuild(workspaceRoot, options = {}) {
   const coreRoot = existsSync(join(candidate, 'realvirtual-web', 'package.json')) ? join(candidate, 'realvirtual-web') : candidate;
   if (options.dryRun) return { coreRoot, distDir: join(coreRoot, 'dist'), dryRun: true, cacheStatus: 'disabled' };
   const env = { ...process.env };
-  if (options.mode === 'public') env.VITE_PUBLIC_BUILD = '1';
+  if (options.mode === 'public') { env.VITE_PUBLIC_BUILD = '1'; delete env.VITE_PRIVATE_BUILD; }
+  else if (options.mode === 'demo') {
+    // The hosted demo: the COMMERCIAL code as a compiled application, on the public demo
+    // content. So neither switch is set — `VITE_PUBLIC_BUILD` would alias `@rv-private` to
+    // the stubs and leave the site without a single commercial feature, and
+    // `VITE_PRIVATE_BUILD` is what suppresses the bundled example scenes (see
+    // `discoverPublishedScenes` in src/main.ts), which are the demo.
+    delete env.VITE_PUBLIC_BUILD;
+    delete env.VITE_PRIVATE_BUILD;
+    // Hard, not inherited: whatever the operator's shell or .env says, a publicly hosted
+    // build ships neither the internal tier (agents, omniverse, internal-plugins) nor source
+    // maps — a `.map` next to these chunks IS the private TypeScript source.
+    delete env.RV_INTERNAL;
+    delete env.RV_SOURCEMAP;
+    // The demo IS the commercial product (ADR-047); an AGPL watermark on a build that
+    // contains code absent from the public repo would be a false licensing statement.
+    env.RV_COMMERCIAL = '1';
+  }
   else { delete env.VITE_PUBLIC_BUILD; env.VITE_PRIVATE_BUILD = '1'; }
   if (options.base) env.VITE_BASE = options.base;
   const npmRunner = options.npmRunner ?? runNpm;
@@ -2133,7 +2772,14 @@ export function applyMergedSnapshot(stagedRoot, cloneRoot, options) {
   }
   copyTree(staged, clone, (rel, entry) => rel !== '.git' && !rel.startsWith('.git/')
     && !isNonDeliveredBuildDir(entry)
-    && rel !== 'projects' && !rel.startsWith('projects/'));
+    // `projects/` itself is traversed only so that `projects/.gitkeep` can be
+    // copied; every other path below it is rejected here. The `.gitkeep` is not a
+    // merge decision — it only makes the customer-owned folder exist in a
+    // repository that cannot carry an empty directory (plan-434 Phase 4).
+    // Everything else under `projects/` is decided by the per-project loop below,
+    // which for a projectless delivery has nothing to iterate — so the whole
+    // folder stays the customer's, untouched (§6.7).
+    && (!rel.startsWith('projects/') || rel === 'projects/.gitkeep'));
 
   const report = {};
   for (const { key, vendor } of projects) {
@@ -2319,18 +2965,126 @@ export function deliveryChangelog(coreRoot, previousCoreCommit, { limit = 25 } =
  * What is deliberately absent: a per-file hash map. The customer repository already
  * keeps a complete hash tree — its own history.
  */
-export function createDeliveryManifest({ core, privateRepo, profile, connect, projectRoot, viewerVersion, plasticChangeset = null, projects = null }) {
+export function createDeliveryManifest({ core, privateRepo, profile, connect, projectRoot, viewerVersion, plasticChangeset = null, projects = null, privateSources = null }) {
   const base = {
     viewerVersion,
     plasticChangeset: Number.isInteger(plasticChangeset) ? plasticChangeset : null,
     coreCommit: core.commit,
     privateCommit: privateRepo.commit,
-    projectTreeSha256: hashTree(projectRoot),
+    // `null` for a projectless delivery: there is no project tree to hash, and a
+    // hash of "nothing" would read as a real one (plan-434 Phase 4).
+    projectTreeSha256: projectRoot ? hashTree(projectRoot) : null,
     profile: { tier: profile.tier, restrictedFeatures: [...(profile.restrictedFeatures ?? [])] },
     generatedAt: new Date().toISOString(),
     connect,
   };
+  // The inventory the NEXT delivery diffs against (§2.4). Omitted when the caller has
+  // none, so the v1 shape and every existing test stay byte-identical.
+  if (privateSources) base.privateSources = privateSources;
   return projects ? withDeliveryBaseline(base, { version: viewerVersion, projects }) : base;
+}
+
+// ─── private-source inventory + tier diff gate (plan-434 §2.4) ───────────
+//
+// The default tier is `commercial`, so a NEW private file ships to every customer
+// unless someone writes a rule. That is the right default for a product, and the
+// wrong one for a mistake: nothing else in the pipeline would notice. The gate
+// closes exactly that gap — it does not judge content, it only asks whether a path
+// under `realvirtual-web-pro/src/` has ever been delivered to THIS customer before.
+
+const PRIVATE_SOURCE_PREFIX = 'realvirtual-web-pro/src';
+
+//! Hash over the sorted path list — an integrity check of the INVENTORY, not of the
+//! files. File contents are already covered by the customer repository's own history.
+export function inventoryDigest(paths) {
+  return createHash('sha256').update([...paths].sort().join('\n')).digest('hex');
+}
+
+//! Collects every staged private source path, sorted, with its inventory digest.
+export function collectPrivateSourceInventory(workspaceRoot) {
+  const root = join(workspaceRoot, ...PRIVATE_SOURCE_PREFIX.split('/'));
+  const paths = [];
+  if (existsSync(root)) {
+    walk(root, (_absolute, rel, entry) => {
+      if (entry.isFile()) paths.push(`${PRIVATE_SOURCE_PREFIX}/${toPosix(rel)}`);
+    });
+  }
+  paths.sort();
+  return { count: paths.length, sha256: inventoryDigest(paths), paths };
+}
+
+/**
+ * Normalises the `privateSources` block of a baseline delivery manifest.
+ *
+ * `null` in means "no baseline at all" (first delivery) and comes straight back out.
+ * Anything present but unusable — unparsable JSON, a manifest from before this block
+ * existed, a list that disagrees with its own digest — returns an EMPTY, untrusted
+ * inventory. That is deliberate: every current path then reads as new, so the
+ * delivery fails closed and asks instead of guessing what was shipped last time.
+ */
+export function parseBaselineSourceInventory(baseline) {
+  if (baseline === null || baseline === undefined) return null;
+  let raw = baseline;
+  if (typeof baseline === 'string') {
+    try {
+      raw = JSON.parse(baseline);
+    } catch {
+      return { paths: [], trusted: false, reason: 'the baseline delivery-manifest.json is not readable JSON' };
+    }
+  }
+  const block = raw && typeof raw === 'object' ? raw.privateSources : null;
+  if (!block || typeof block !== 'object' || !Array.isArray(block.paths)
+      || block.paths.some((path) => typeof path !== 'string')) {
+    return { paths: [], trusted: false, reason: 'the baseline delivery-manifest.json carries no privateSources inventory' };
+  }
+  const paths = [...block.paths].sort();
+  if (block.sha256 !== inventoryDigest(paths)
+      || (block.count !== undefined && block.count !== paths.length)) {
+    return { paths: [], trusted: false, reason: 'the baseline privateSources inventory does not match its own sha256' };
+  }
+  return { paths, trusted: true, reason: null };
+}
+
+//! Pure set difference between the baseline and the staged inventory. A rename is an
+//! add plus a delete; only the add side is ever gated.
+export function diffPrivateSourceInventory(baseline, current) {
+  if (baseline === null || baseline === undefined) {
+    return { gated: false, trusted: true, reason: null, added: [], removed: [] };
+  }
+  const before = new Set(baseline.paths);
+  const after = new Set(current.paths);
+  return {
+    gated: true,
+    trusted: baseline.trusted !== false,
+    reason: baseline.reason ?? null,
+    added: current.paths.filter((path) => !before.has(path)),
+    removed: baseline.paths.filter((path) => !after.has(path)),
+  };
+}
+
+/**
+ * The gate itself. New paths abort the delivery by name unless `acceptNew` was passed;
+ * disappearing paths are reported and never block — dropping a file is always the
+ * safe direction. Returns the diff so the caller can log the removals.
+ */
+export function assertPrivateSourceInventory(baseline, current, { acceptNew = false } = {}) {
+  const diff = diffPrivateSourceInventory(baseline, current);
+  if (!diff.gated || !diff.added.length || acceptNew) return diff;
+  throw new Error([
+    `${diff.added.length} private source file(s) would reach this customer for the first time`
+      + (diff.trusted ? ':' : ` (${diff.reason}; the whole delivery is treated as new):`),
+    ...diff.added.map((path) => `  + ${path}`),
+    'Review them and re-run with --accept-new-private-files if they are meant to ship.',
+  ].join('\n'));
+}
+
+//! Reads the baseline inventory out of a customer clone. Returns `null` when the
+//! customer has no baseline tag yet, so the first delivery is never gated.
+export function readBaselineSourceInventory(clone, baselineTag) {
+  if (!baselineTag) return null;
+  const text = gitIn(clone, ['show', `${baselineTag}:delivery-manifest.json`], { allowFailure: true });
+  // The tag exists but carries no manifest: that is damage, not a first delivery.
+  return parseBaselineSourceInventory(text ?? '');
 }
 
 //! One-line merge summary per project for the delivery CLI (§3.1).

@@ -336,6 +336,42 @@ describe('mergeProjectManifest (§2.7)', () => {
     expect(models.some(m => m.path === 'stale.glb')).toBe(false);
   });
 
+  // plan-413 phase 6: `documents[]` is a merged section like the others, but its
+  // paths already carry their folder — the classification must not prefix them
+  // again, or every customer document would be classified as ours.
+  it('merges documents[] entry-wise and keeps a handover document', () => {
+    const customer = {
+      schemaVersion: 2, id: 'x', name: 'y',
+      documents: [
+        { id: 'doc_mine', path: 'models/custom/mine.glb', section: 'models', label: 'Mine' },
+        { id: 'doc_stale', path: 'models/stale.glb', section: 'models' },
+      ],
+    };
+    const vendor = {
+      ...vendorManifest, schemaVersion: 2,
+      documents: [{ id: 'doc_a', path: 'models/a.glb', section: 'models' }],
+    };
+    const { merged, changed } = mergeProjectManifest(customer, vendor, globs);
+    const docs = merged!.documents as Array<Record<string, unknown>>;
+    expect(docs).toContainEqual(customer.documents[0]);   // handover → theirs
+    expect(docs.some(d => d.path === 'models/a.glb')).toBe(true);
+    expect(docs.some(d => d.path === 'models/stale.glb')).toBe(false);
+    expect(changed).toContain('documents');
+  });
+
+  it('leaves a customer that has not migrated yet with their three arrays', () => {
+    // A repository nobody has opened in a current client still carries
+    // scenes/models/library and no documents[]. A delivery must not fail over
+    // that, and must not invent a documents[] the customer never had.
+    const customer = {
+      schemaVersion: 1, id: 'x', name: 'y',
+      library: [{ path: 'gripper.glb' }],
+    };
+    const { merged } = mergeProjectManifest(customer, vendorManifest, globs);
+    expect(merged!.documents).toBeUndefined();
+    expect(merged!.library).toEqual([{ path: 'gripper.glb' }]);
+  });
+
   it('does not merge into an unreadable customer manifest — it reports instead', () => {
     expect(mergeProjectManifest(null, vendorManifest, globs))
       .toMatchObject({ merged: null, unreadable: true });

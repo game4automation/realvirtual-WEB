@@ -56,6 +56,18 @@ export interface SceneOwnerRecord {
   projectIds: string[];
   /** Project the body in `rv-scenes/<id>` came from. Null = unknown. */
   cachedFrom: string | null;
+  /**
+   * Revision (SHA-256) of the body the cache was filled **from** (plan-397
+   * §2.8). Null = unknown.
+   *
+   * `cachedFrom` answers *whose* body this is; this answers *which version*
+   * of it. Both are needed for the compare-and-swap: a write has to name the
+   * revision it is replacing, and after a hydration the only place that
+   * knows it is here. Optional and defaulting to null, so every record
+   * written before plan-397 keeps meaning exactly what it meant — "unknown",
+   * which makes an unconditional write the only honest option.
+   */
+  cachedRevision: string | null;
 }
 
 /** Read the record for one scene. Never throws; unknown reads as null. */
@@ -78,21 +90,38 @@ export function readSceneOwner(sceneId: string): SceneOwnerRecord | null {
       typeof parsed.cachedFrom === 'string' && parsed.cachedFrom !== ''
         ? parsed.cachedFrom
         : null;
-    return { projectIds, cachedFrom };
+    const cachedRevision =
+      typeof parsed.cachedRevision === 'string' && parsed.cachedRevision !== ''
+        ? parsed.cachedRevision
+        : null;
+    return { projectIds, cachedFrom, cachedRevision };
   } catch {
     return null;
   }
 }
 
 /**
+ * What a writer must supply.
+ *
+ * `cachedRevision` is optional here and mandatory on {@link SceneOwnerRecord}:
+ * a *reader* always gets an answer (null when unknown), while a caller that
+ * predates plan-397 — or simply has no revision to offer — should not have to
+ * write `cachedRevision: null` to say so. Same additive posture the rest of
+ * this module is built on.
+ */
+export type SceneOwnerRecordInput =
+  Omit<SceneOwnerRecord, 'cachedRevision'> & { cachedRevision?: string | null };
+
+/**
  * Write the record verbatim. Quota failures are swallowed: an ownership
  * marker is a safety net, never a precondition for opening a scene.
  */
-export function writeSceneOwner(sceneId: string, record: SceneOwnerRecord): void {
+export function writeSceneOwner(sceneId: string, record: SceneOwnerRecordInput): void {
   if (!sceneId) return;
   const clean: SceneOwnerRecord = {
     projectIds: [...new Set(record.projectIds.filter(p => typeof p === 'string' && p !== ''))],
     cachedFrom: record.cachedFrom || null,
+    cachedRevision: record.cachedRevision ?? null,
   };
   try {
     localStorage.setItem(ownerKey(sceneId), JSON.stringify(clean));
@@ -117,6 +146,7 @@ export function noteSceneMembership(sceneId: string, projectId: string): void {
   writeSceneOwner(sceneId, {
     projectIds: [...(current?.projectIds ?? []), projectId],
     cachedFrom: current?.cachedFrom ?? null,
+    cachedRevision: current?.cachedRevision ?? null,
   });
 }
 
@@ -125,14 +155,33 @@ export function noteSceneMembership(sceneId: string, projectId: string): void {
  * membership. Called wherever a body enters the cache on a project's behalf:
  * hydration, an applied conflict resolution, and project creation.
  */
-export function setCachedFrom(sceneId: string, projectId: string): void {
+export function setCachedFrom(sceneId: string, projectId: string, revision?: string | null): void {
   if (!sceneId || !projectId) return;
   const current = readSceneOwner(sceneId);
-  if (current?.cachedFrom === projectId && current.projectIds.includes(projectId)) return;
+  // A caller that does not know the revision must not erase a recorded one:
+  // `undefined` means "no news", only an explicit `null` clears it.
+  const nextRevision = revision === undefined ? (current?.cachedRevision ?? null) : revision;
+  if (
+    current?.cachedFrom === projectId &&
+    current.projectIds.includes(projectId) &&
+    current.cachedRevision === nextRevision
+  ) return;
   writeSceneOwner(sceneId, {
     projectIds: [...(current?.projectIds ?? []), projectId],
     cachedFrom: projectId,
+    cachedRevision: nextRevision,
   });
+}
+
+/**
+ * Revision the cached body was filled from, or null when unknown.
+ *
+ * The value a compare-and-swap write passes as `expectedRevision`. Null means
+ * "we do not know what we are replacing", and the honest response to that is
+ * an unconditional write, not a guess.
+ */
+export function cachedRevisionOf(sceneId: string): string | null {
+  return readSceneOwner(sceneId)?.cachedRevision ?? null;
 }
 
 // ─── Queries ────────────────────────────────────────────────────────────

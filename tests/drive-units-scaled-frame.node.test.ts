@@ -26,8 +26,8 @@ import { GroupRegistry } from '../src/core/engine/rv-group-registry';
 import { RVDrive } from '../src/core/engine/rv-drive';
 import { DriveDirection } from '../src/core/engine/rv-coordinate-utils';
 import { parentScaleAlong } from '../src/core/engine/rv-drive-units';
-import { DriveDragPreview } from '../src/plugins/asset-editor/drive-drag-preview';
-import { resolveEditorDriveGizmoSource } from '../src/plugins/asset-editor/editor-drive-gizmo-source';
+import { DriveDragPreview } from '@rv-private/plugins/asset-editor/drive-drag-preview';
+import { resolveEditorDriveGizmoSource } from '@rv-private/plugins/asset-editor/editor-drive-gizmo-source';
 
 /** Scene root → CAD root (scale s, mm inside) → axis node. */
 function makeCadScene(s: number) {

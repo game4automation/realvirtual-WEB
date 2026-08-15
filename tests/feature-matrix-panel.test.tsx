@@ -162,8 +162,10 @@ describe('FeatureMatrixPlugin settings panel', () => {
       <FeatureMatrixPanel viewer={harness.viewer} tierMap={{ 'project-tool': 'commercial' }} />,
     );
 
-    expect(screen.getByText(/Ein\/Aus = active \(lifecycle\)/)).toBeTruthy();
-    expect(screen.getByText(/UI-Slots bleiben sichtbar/)).toBeTruthy();
+    // plan-435: the legend now has to be honest about the retroactive teardown —
+    // the slots are unregistered, not merely inert, and the choice is persisted.
+    expect(screen.getByText(/Ein\/Aus = active \(lifecycle \+ UI-Slots\)/)).toBeTruthy();
+    expect(screen.getByText(/UI-Slots abgemeldet, Wirkung zurückgebaut/)).toBeTruthy();
     expect(document.querySelectorAll('table[aria-label]')).toHaveLength(1);
     expect(screen.getByRole('columnheader', { name: 'Tier Info' })).toBeTruthy();
     expect(screen.getByLabelText('Ein/Aus User-Intention').getAttribute('tabindex')).toBe('0');

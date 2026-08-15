@@ -41,7 +41,7 @@ import {
   TextField,
   Typography,
 } from '@mui/material';
-import { Cloud, FolderOpen, GitHub } from '@mui/icons-material';
+import { Cloud, GitHub } from '@mui/icons-material';
 import { getLibraryStore } from './library-store-singleton';
 
 /** Credentials the private Asset-Manager extension needs to open a connection. */
@@ -64,7 +64,7 @@ export interface AddLibraryDialogProps {
   onConnectAssetManager?: (request: AssetManagerConnectRequest) => string | undefined;
 }
 
-type TabId = 'url' | 'github' | 'assetManager' | 'localFolder';
+type TabId = 'url' | 'github' | 'assetManager';
 
 const CODE_SX = {
   fontFamily: 'monospace',
@@ -81,13 +81,11 @@ export function AddLibraryDialog({
   onConnectAssetManager,
 }: AddLibraryDialogProps) {
   const store = getLibraryStore();
-  const localFolderSupported = store.isLocalFolderSupported;
 
   const tabs: TabId[] = [
     'url',
     'github',
     ...(onConnectAssetManager ? (['assetManager'] as TabId[]) : []),
-    ...(localFolderSupported ? (['localFolder'] as TabId[]) : []),
   ];
 
   const [tab, setTab] = useState<TabId>('url');
@@ -131,19 +129,6 @@ export function AddLibraryDialog({
     }
   }, [store, finish]);
 
-  const addLocalFolder = useCallback(async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await store.addLocalFolder();
-      finish('local');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }, [store, finish]);
-
   const connectAssetManager = useCallback(() => {
     if (!onConnectAssetManager) return;
     const id = onConnectAssetManager({
@@ -170,9 +155,6 @@ export function AddLibraryDialog({
           <Tab value="github" label="GitHub" icon={<GitHub sx={{ fontSize: 12 }} />} iconPosition="start" sx={{ gap: 0.5 }} />
           {onConnectAssetManager && (
             <Tab value="assetManager" label="Asset Manager" icon={<Cloud sx={{ fontSize: 12 }} />} iconPosition="start" sx={{ gap: 0.5 }} />
-          )}
-          {localFolderSupported && (
-            <Tab value="localFolder" label="Local Folder" icon={<FolderOpen sx={{ fontSize: 12 }} />} iconPosition="start" sx={{ gap: 0.5 }} />
           )}
         </Tabs>
 
@@ -224,15 +206,6 @@ export function AddLibraryDialog({
           </Box>
         )}
 
-        {active === 'localFolder' && (
-          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, mt: 1 }}>
-            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-              Pick a folder on this computer. Its <Box component="code" sx={CODE_SX}>library/</Box> subfolders
-              become collections. The permission is remembered between sessions.
-            </Typography>
-          </Box>
-        )}
-
         {error && (
           <Typography sx={{ mt: 1.5, fontSize: 12, color: 'error.main' }}>{error}</Typography>
         )}
@@ -252,11 +225,6 @@ export function AddLibraryDialog({
         {active === 'assetManager' && (
           <Button variant="contained" disabled={busy || !amComplete} onClick={connectAssetManager} sx={{ textTransform: 'none' }}>
             Connect
-          </Button>
-        )}
-        {active === 'localFolder' && (
-          <Button variant="contained" disabled={busy} onClick={() => void addLocalFolder()} sx={{ textTransform: 'none' }}>
-            {busy ? <CircularProgress size={16} /> : 'Choose folder…'}
           </Button>
         )}
       </DialogActions>

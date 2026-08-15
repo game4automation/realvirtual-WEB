@@ -148,12 +148,20 @@ export async function downloadAssetGlb(viewer: RVViewer, doc: AssetDocument, nam
   }
 }
 
-/** Render a 256px PNG thumbnail of the asset with the main scene's lighting. */
+/**
+ * Render a 512px PNG thumbnail of the asset in the frozen thumbnail look
+ * (plan-712 — same size and look as the browser-cached previews, so a saved
+ * custom asset does not stand out next to the generated ones).
+ *
+ * This builds a throw-away ThumbnailRenderer per save, so the cached composer
+ * never applies here; a full build + dispose per custom-library save is the
+ * accepted cost of a rare, explicit user action.
+ */
 function renderThumbnailBlob(viewer: RVViewer, assetRoot: Object3D): Promise<Blob> | null {
   try {
     const renderer = viewer.renderer as unknown as WebGLRenderer;
     const thumbs = new ThumbnailRenderer(renderer, viewer.scene);
-    const dataUrl = thumbs.render(assetRoot as Group, 256);
+    const dataUrl = thumbs.render(assetRoot as Group, 512);
     thumbs.dispose();
     // null = skipped (WebGPURenderer — thumbnails need the classic WebGLRenderer, plan-271)
     if (!dataUrl) return null;

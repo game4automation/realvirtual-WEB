@@ -34,6 +34,7 @@ import { RVViewerProvider } from '../src/hooks/use-viewer';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { ConnectInterface, ConnectInterfaceSignal } from '../src/core/hmi/connect-store';
+import { findSignalRowLabel, getSignalRowLabel, querySignalRowLabel } from './helpers/signal-row-label';
 
 const SERVER = 'http://127.0.0.1:59999';
 /** The gated poll period (`setInterval(fetchStatus, 2000)`). */
@@ -178,7 +179,7 @@ describe('ConnectPanel — reopening restores the whole view (Phase 3.4)', () =>
     const viewer = makeViewer(new LeftPanelManager(), store);
 
     const first = renderList(iface, viewer);
-    await screen.findByText('S_0');
+    await findSignalRowLabel('S_0');
 
     const scroller = first.container.querySelector('.rv-scroll') as HTMLElement | null
       ?? first.container.querySelector('div[class*="MuiBox"] div[class*="MuiBox"]') as HTMLElement;
@@ -201,8 +202,14 @@ describe('ConnectPanel — reopening restores the whole view (Phase 3.4)', () =>
     // Close (unmount) and reopen (fresh mount) — the offset comes back.
     first.unmount();
     renderList(iface, viewer);
-    await screen.findByText('S_0');
-    const reopened = document.querySelector('.rv-scroll') as HTMLElement;
+    // Wait for the LIST, not for a particular row: the whole point of this
+    // assertion is that the reopened panel scrolls back down, which means the
+    // first row is virtualised away again by the time the restore has landed.
+    const reopened = await waitFor(() => {
+      const el = document.querySelector('.rv-scroll') as HTMLElement | null;
+      if (!el) throw new Error('signal list did not remount');
+      return el;
+    });
     await waitFor(() => expect(reopened.scrollTop).toBeGreaterThan(0));
   });
 
@@ -210,7 +217,7 @@ describe('ConnectPanel — reopening restores the whole view (Phase 3.4)', () =>
     const iface = listInterface('never-scrolled');
     const viewer = makeViewer(new LeftPanelManager(), null);
     renderList(iface, viewer);
-    await screen.findByText('S_0');
+    await findSignalRowLabel('S_0');
     expect(localStorage.getItem('rv-connect-scroll:never-scrolled')).toBeNull();
   });
 });
@@ -249,14 +256,14 @@ describe('ConnectPanel — memoised rows survive parent re-renders (Phase 3.3)',
         </RVViewerProvider>
       </ThemeProvider>,
     );
-    const row = await screen.findByText('S_0');
+    const row = await findSignalRowLabel('S_0');
     // A memoised row that does NOT re-render keeps its exact DOM node.
     const nodeBefore = row;
 
     await act(async () => { bump!(); });
     await act(async () => { bump!(); });
 
-    expect(screen.getByText('S_0')).toBe(nodeBefore);
+    expect(getSignalRowLabel('S_0')).toBe(nodeBefore);
   });
 });
 

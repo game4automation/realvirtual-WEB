@@ -4,7 +4,7 @@
 import type { Object3D } from 'three';
 import type { RVViewer } from '../../core/rv-viewer';
 import type { SignalDragPayload } from '../../core/hmi/signal-drag-store';
-import { BINDING_SLOT_RV_KEYS } from '../../core/engine/rv-binding-slot-resolver';
+import { hasResolverComponent } from '../../core/engine/rv-binding-slot-resolver';
 import { plcKindOf, slotAcceptsSignal } from './drop-accept';
 import {
   findSignalBindTarget,
@@ -31,15 +31,6 @@ interface PlannerLike {
     getSnapshot: () => { placed: ReadonlyArray<{ id: string }> };
   };
   getPlacedRootById: (id: string) => Object3D | null;
-}
-
-function hasResolverComponent(node: Object3D): boolean {
-  const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
-  if (!rv) return false;
-  for (const key of BINDING_SLOT_RV_KEYS) {
-    if (rv[key] !== undefined) return true;
-  }
-  return false;
 }
 
 /**

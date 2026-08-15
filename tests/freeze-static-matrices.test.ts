@@ -7,10 +7,12 @@
  * Verifies the static/dynamic classification that gates the per-frame
  * updateMatrixWorld pruning: a node stays dynamic iff it, an ancestor, or a
  * descendant carries a mover component (Drive, Kinematic, Grip,
- * TransportSurface, Source, Sink, MU, Cam); everything else is frozen. The
- * scenarios mirror the live cases — including a deep static mesh under a Drive
- * (the "Cylinder001" shape, where the moving mesh has matrixAutoUpdate=false
- * but sits below a Drive).
+ * TransportSurface, Source, Sink, MU, Cam, SceneButtonMoveable); everything else
+ * is frozen. The scenarios mirror the live cases — including a deep static mesh
+ * under a Drive (the "Cylinder001" shape, where the moving mesh has
+ * matrixAutoUpdate=false but sits below a Drive) and the plan-417 scene-button
+ * cap, which this pass must recognise itself because it runs AFTER component
+ * construction and would otherwise re-freeze what the component just thawed.
  */
 import { describe, it, expect } from 'vitest';
 import { Object3D, Mesh } from 'three';
@@ -96,6 +98,48 @@ describe('freezeStaticMatrices', () => {
       expect(carrier.matrixWorldAutoUpdate, `${key} carrier`).toBe(true);
       expect(child.matrixWorldAutoUpdate, `${key} child`).toBe(true);
     }
+  });
+
+  it('keeps a SceneButtonMoveable cap dynamic (plan-417 order bug)', () => {
+    // This pass runs in loader Phase 11 — AFTER component construction — so the
+    // thaw in RVSceneButtonMoveable._bind() (Phase 8) cannot survive it. The cap
+    // has to be recognised HERE or the button animates only on paper.
+    const root = named('root');
+    const housing = named('SimpleButton');
+    const cap = withComponent(named('Button', true), 'SceneButtonMoveable');
+    const sibling = named('Base', true);              // the static button base
+    root.add(housing); housing.add(cap); housing.add(sibling);
+
+    freezeStaticMatrices(root);
+
+    expect(cap.matrixWorldAutoUpdate).toBe(true);
+    expect(housing.matrixWorldAutoUpdate).toBe(true);  // ancestor of a mover
+    // The closure keeps the mover's ancestors and the mover's OWN subtree — a
+    // sibling is not in it. The static button base is correctly frozen, and can
+    // be: its dynamic parent still recurses into it, it just is not recomposed.
+    expect(sibling.matrixWorldAutoUpdate).toBe(false);
+  });
+
+  it('keeps a cap marked only by _rvSceneButtonMesh dynamic (runtime placement)', () => {
+    const root = named('root');
+    const cap = named('Button', true);
+    cap.userData._rvSceneButtonMesh = true;           // stamped by _bind()
+    root.add(cap);
+
+    freezeStaticMatrices(root);
+
+    expect(cap.matrixWorldAutoUpdate).toBe(true);
+  });
+
+  it('freezes a SceneButtonBase-only subtree (not every scene-button key is a mover)', () => {
+    const root = named('root');
+    const branch = named('branch');
+    const base = withComponent(named('Base', true), 'SceneButtonBase');
+    root.add(branch); branch.add(base);
+
+    freezeStaticMatrices(root);
+
+    expect(base.matrixWorldAutoUpdate).toBe(false);
   });
 
   it('freezes a static sibling subtree while a Drive sibling stays dynamic', () => {

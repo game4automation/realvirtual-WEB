@@ -2,13 +2,23 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * library-sidecar — per-asset metadata beside a writable library root
- * (plan-372 §2.6.5, Phase 9).
+ * library-sidecar — READING the legacy `library.json`
+ * (plan-372 §2.6.5 Phase 9, reduced by plan-717 Phase 4).
  *
- * The parsing tests carry the weight here. A sidecar is derived convenience,
- * so the rule is: unusable input is ignored and the file is NEVER rewritten.
- * Overwriting a sidecar written by a newer build would destroy a user's
- * collections, which is exactly the failure the version check prevents.
+ * The parsing tests are all that is left, and they always carried the weight. A
+ * sidecar is derived convenience, so the rule is: unusable input is ignored,
+ * never thrown on — one bad character must not take a whole library offline.
+ *
+ * The mutation cases went with the API they exercised. `withAssetMeta`,
+ * `withRenamedAsset` and `serialiseSidecar` are deleted (F9): collections live
+ * on the manifest row since §2.4 and nothing in this build may produce a
+ * `library.json` again. `resolveAssetMeta` is deleted too — it was the read
+ * half nobody called, and its folder-derived fallback is now the catalog's
+ * folder chips (`toCatalogEntry`, pinned in `collections-roundtrip.test.ts`).
+ *
+ * What still consumes this module: `library-sidecar-ingest.ts` (one-time
+ * ingestion into the rows) and `project-store`'s adopt run. Both parse; neither
+ * writes.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -16,10 +26,6 @@ import {
   emptySidecar,
   isValidSidecarV1,
   parseSidecar,
-  resolveAssetMeta,
-  serialiseSidecar,
-  withAssetMeta,
-  withRenamedAsset,
 } from '../src/core/library/library-sidecar';
 
 describe('parseSidecar — defensive', () => {
@@ -72,55 +78,15 @@ describe('isValidSidecarV1', () => {
   });
 });
 
-describe('resolveAssetMeta — folder fallback', () => {
-  it('derives the collection from the parent folder when there is no entry', () => {
-    const meta = resolveAssetMeta(null, 'conveyor/belt.glb');
-    expect(meta.collections).toEqual(['conveyor']);
-    expect(meta.displayName).toBe('belt');
-  });
-
-  it('gives a root-level asset no collection rather than inventing one', () => {
-    expect(resolveAssetMeta(null, 'belt.glb').collections).toEqual([]);
-  });
-
-  it('lets the sidecar win over the folder derivation', () => {
-    const s = { schemaVersion: 1 as const, assets: { 'conveyor/belt.glb': { collections: ['Custom'] } } };
-    expect(resolveAssetMeta(s, 'conveyor/belt.glb').collections).toEqual(['Custom']);
-  });
-
-  it('treats an explicit empty array as "no collections", not as missing', () => {
-    const s = { schemaVersion: 1 as const, assets: { 'conveyor/belt.glb': { collections: [] } } };
-    expect(resolveAssetMeta(s, 'conveyor/belt.glb').collections).toEqual([]);
-  });
-});
-
-describe('mutations', () => {
-  it('does not persist an empty record', () => {
-    const s = withAssetMeta(emptySidecar(), 'a.glb', {});
-    expect(s.assets['a.glb']).toBeUndefined();
-  });
-
-  it('replaces an existing record', () => {
-    let s = withAssetMeta(emptySidecar(), 'a.glb', { tags: ['x'] });
-    s = withAssetMeta(s, 'a.glb', { tags: ['y'] });
-    expect(s.assets['a.glb'].tags).toEqual(['y']);
-  });
-
-  it('moves a record on rename and leaves nothing behind', () => {
-    const s = withRenamedAsset(
-      withAssetMeta(emptySidecar(), 'old.glb', { displayName: 'Old' }),
-      'old.glb',
-      'new.glb',
-    );
-    expect(s.assets['old.glb']).toBeUndefined();
-    expect(s.assets['new.glb'].displayName).toBe('Old');
-  });
-
-  it('round-trips through serialise/parse with sorted keys', () => {
-    let s = withAssetMeta(emptySidecar(), 'z.glb', { tags: ['t'] });
-    s = withAssetMeta(s, 'a.glb', { tags: ['t'] });
-    const text = serialiseSidecar(s);
-    expect(text.indexOf('a.glb')).toBeLessThan(text.indexOf('z.glb'));
-    expect(parseSidecar(text)).toEqual(s);
+describe('an explicit empty collections list survives the parse', () => {
+  it('is kept as an empty array, not dropped as "missing"', () => {
+    // The distinction the ingestion depends on: "the user filed this under
+    // nothing" is an answer and must reach the row as one, where a MISSING
+    // field is what re-opens the legacy fallback for that row.
+    const s = parseSidecar(JSON.stringify({
+      schemaVersion: 1,
+      assets: { 'conveyor/belt.glb': { collections: [] } },
+    }));
+    expect(s?.assets['conveyor/belt.glb'].collections).toEqual([]);
   });
 });

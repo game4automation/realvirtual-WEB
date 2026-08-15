@@ -23,6 +23,24 @@ export const AI_BRIDGE_CONSENT_KEY = 'rv-ai-bridge-consent';
  */
 export const ASSETS_SECTIONS_COLLAPSED_KEY = 'rv-assets-sections-collapsed';
 
+/**
+ * Card edge length in the project dashboard's content grid, in pixels.
+ *
+ * A view preference, not project data: it follows the person, not the project
+ * they happen to have open, which is why it lives here and not in the manifest.
+ */
+export const PROJECTS_CARD_SIZE_KEY = 'rv-projects-card-size';
+
+/**
+ * The asset the Editor mode opened last (plan-410 F2).
+ *
+ * Holds a versioned `{ v, base, savedAt }` record whose `base` is an
+ * `AssetBase` identity — never a URL, never `kind: 'empty'`. Read by
+ * `last-edited-asset-store.ts` as the last fallback of the editor's open chain
+ * (pending > draft > shelf hint > THIS > empty).
+ */
+export const EDITOR_LAST_ASSET_KEY = 'rv-editor-last-asset';
+
 export const ALL_RV_STORAGE_KEYS = [
   'rv-visual-settings',
   'rv-visual-presets',
@@ -35,6 +53,7 @@ export const ALL_RV_STORAGE_KEYS = [
   'rv-extras-overlay',
   // Hierarchy & Inspector keys
   'rv-extras-editor-width',
+  'rv-projects-card-size',
   'rv-extras-editor-open',
   'rv-extras-editor-selected',
   'rv-hierarchy-expanded',
@@ -68,12 +87,24 @@ export const ALL_RV_STORAGE_KEYS = [
   'rv-local-folders',
   'rv-splat-transform',  // legacy — transforms now managed via PlacedComponent
   'rv-analytics-consent',  // GDPR analytics opt-in (consent-store)
+  // Sender-side share state (plan-386 §2.6). Declared as literals rather than
+  // imported so this list stays a leaf; the constants live in
+  // core/share/rv-share-session.ts (SHARE_SESSION_KEY / SHARE_DRAFT_KEY).
+  // Note these are the SENDER's keys — the receiver of a shared link writes
+  // nothing at all (F7).
+  'rv-share-session',  // magic-link session of the person sharing
+  'rv-share-draft',    // share dialog form, kept across the sign-in mail round trip
+  // The ONE key the receiver of a shared link may write, and only after he
+  // clicks "add to my library" (plan-386 F13). Everything else on the consumer
+  // path stays read-only.
+  'rv-shared-bookmarks',
   'rv-news-seen',  // public WEB news IDs acknowledged on this device
   'rv-welcome-dismissed',  // WelcomeModal "Got it" flag (ButtonPanel) — reset re-shows the welcome box
   'rv-auto-quality-applied',  // auto-quality boot seed already picked a preset on this device
   CONNECT_EMBED_SIGNAL_HINT_SEEN_KEY,
   AI_BRIDGE_CONSENT_KEY,
   ASSETS_SECTIONS_COLLAPSED_KEY,
+  EDITOR_LAST_ASSET_KEY,
 ] as const;
 
 /** Read the CONNECT standalone hint flag without failing when storage is unavailable. */
@@ -148,6 +179,12 @@ export const RV_DYNAMIC_PREFIXES = [
   'rv-sig-unlock:',
   'rv-login-',    // login gate keys
   'rv-layouts/',  // multi-layout registry entries (rv-layouts/<id>)
+  // Per-project user plugin overrides (plan-435). Declared as a literal so this
+  // list stays a leaf; the constant lives in
+  // core/plugin-overrides/rv-plugin-override-store.ts
+  // (LS_KEY_PLUGIN_OVERRIDES_PREFIX). Without this entry a "Reset all" would
+  // leave a switched-off plugin switched off forever.
+  'rv-plugin-overrides/',
 ] as const;
 
 /**

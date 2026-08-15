@@ -2,41 +2,57 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * library-asset-ops — rename, duplicate, delete and re-collect a library asset
- * (plan-372 §2.6.5 / Phase 9).
+ * library-asset-ops — cross-source transfer and collections, ROW route only
+ * (plan-372 §2.6.5 / Phase 9, gutted by plan-717 Phase 4).
  *
- * All four operate on the active project's `library/` folder through the
- * `ProjectBackend`, so one implementation serves a folder project (disk) and a
- * browser project (OPFS) alike.
+ * What this module used to be — "rename, duplicate, delete and re-collect a
+ * library asset, all four writing bytes and a `library.json` beside them" — is
+ * exactly what plan-717 removed. Every one of those verbs moved bytes past the
+ * manifest, so the row (and with it the document's id) was a thing the next
+ * folder scan re-derived from the new path. That is how a rename used to break
+ * an `assetId` reference silently.
  *
- * ## Delete is a move, not a delete
+ * ## What is left, and which route each takes
  *
- * "Delete" puts the asset in `library/.trash/` and leaves it there. A library
- * asset can be the only copy of hours of authoring work, and a mis-click must
- * not be terminal. `.trash/` is excluded from `.rvprojectignore` and from the
- * `.rvproject` export, so the safety net never travels or bloats an archive.
+ *  - **`copyDocumentAcrossSources` / `moveDocumentAcrossSources`** — transfer
+ *    between two *different* sources. Row-based from the start (plan-413): the
+ *    arrival gets a manifest row through `updateManifestEntry`, a copy with a
+ *    new id and a move with the source's.
+ *  - **`setAssetCollections`** — one field on one row, through
+ *    `applyManifestDelta`.
+ *  - **`LIBRARY_FOLDER` / `TRASH_FOLDER`** and the small path helpers, which the
+ *    rest of the persistence layer imports.
  *
- * ## The sidecar follows the bytes
+ * Same-project create, rename, duplicate and delete are NOT here any more. They
+ * are `rv-document-ops` (`createDocument`, `duplicateDocument`,
+ * `deleteDocument`) and `applyTreeMove` — the one create/rename/move path
+ * (§2.7, F6/F7).
  *
- * Every operation updates `library.json` in the same pass: a rename that left
- * the metadata behind would silently drop the asset's collections, which is the
- * exact failure the sidecar exists to prevent. Metadata is written *after* the
- * bytes, so a torn operation leaves an asset without metadata (recoverable —
- * the folder fallback applies) rather than metadata without an asset.
+ * ## The sidecar is read-only legacy
+ *
+ * Nothing in this module touches `library.json` any more. Collections are a row
+ * field (§2.4), so a transfer carries them in the row it writes; the file
+ * survives only as a migration INPUT that the adopt verb ingests once and then
+ * deletes (`library-sidecar-ingest.ts`). The write API is deleted and
+ * `registration-removal-guard.test.ts` keeps it deleted.
+ *
+ * ## Delete is still a move, not a delete
+ *
+ * A move between sources retires the original into `<root>/.trash/` rather than
+ * removing it: a library asset can be the only copy of hours of authoring work,
+ * and a mis-click must not be terminal. `.trash/` is excluded from
+ * `.rvprojectignore` and from the `.rvproject` export, so the safety net never
+ * travels or bloats an archive.
  */
 
-import { buildEmptyGlbBlob } from '../hmi/scene/empty-glb';
-import type { ProjectBackend } from '../project/backends/project-backend';
+import type { DocumentTransferSession, DocumentTransferSide } from '../project/rv-document-transfer';
 import {
-  SIDECAR_FILENAME,
-  emptySidecar,
-  parseSidecar,
-  serialiseSidecar,
-  withAssetMeta,
-  withRenamedAsset,
-  type LibrarySidecarAsset,
-  type LibrarySidecarV1,
-} from './library-sidecar';
+  classificationOfGlbBlob,
+  isDocumentSection,
+  newDocumentId,
+} from '../project/rv-project-documents';
+import type { DocumentClassification } from '../project/rv-document-classification';
+import type { RvDocumentEntry, RvProject } from '../project/rv-project-types';
 
 /** Root folder of a project's own assets. */
 export const LIBRARY_FOLDER = 'library';
@@ -56,217 +72,447 @@ function libPath(relPath: string): string {
   return `${LIBRARY_FOLDER}/${relPath}`;
 }
 
-/** Read the sidecar, tolerating absence and corruption alike. */
-async function readSidecar(backend: ProjectBackend): Promise<LibrarySidecarV1> {
-  const resolved = await backend.readBlobUrl(libPath(SIDECAR_FILENAME));
-  if (!resolved) return emptySidecar();
-  try {
-    const text = await (await fetch(resolved.url)).text();
-    // A sidecar we cannot parse must not be treated as empty and rewritten —
-    // that would destroy a newer build's metadata. Callers get an empty view;
-    // `writeSidecar` is what refuses to clobber, see below.
-    return parseSidecar(text) ?? emptySidecar();
-  } catch {
-    return emptySidecar();
-  } finally {
-    resolved.release();
-  }
-}
-
-/** True when a sidecar file exists but cannot be parsed by this build. */
-async function sidecarIsUnreadable(backend: ProjectBackend): Promise<boolean> {
-  const resolved = await backend.readBlobUrl(libPath(SIDECAR_FILENAME));
-  if (!resolved) return false;                 // absent is fine
-  try {
-    return parseSidecar(await (await fetch(resolved.url)).text()) === null;
-  } catch {
-    return false;
-  } finally {
-    resolved.release();
-  }
-}
-
 /**
- * Persist the sidecar — unless the existing one is unreadable.
+ * The slice of a backend these operations actually touch.
  *
- * Overwriting a file we could not parse is how a user opening their project in
- * an older build would lose every collection they had set. Skipping the write
- * loses only the current edit, and says so.
+ * Named so the cross-source verbs below can take a {@link DocumentTransferSide}
+ * — which is deliberately narrower than a backend — through the same helpers a
+ * same-project rename uses, instead of growing a second copy of "read the
+ * bytes, write the bytes, probe the name".
  */
-async function writeSidecar(backend: ProjectBackend, sidecar: LibrarySidecarV1): Promise<void> {
-  if (await sidecarIsUnreadable(backend)) {
-    throw new Error(
-      `${SIDECAR_FILENAME} was written by a newer version and cannot be updated safely.`,
-    );
-  }
-  await backend.writeBlob(
-    libPath(SIDECAR_FILENAME),
-    new Blob([serialiseSidecar(sidecar)], { type: 'application/json' }),
-  );
+interface BlobSurface {
+  readBlobUrl(relPath: string): Promise<{ url: string; release(): void } | null>;
+  writeBlob(relPath: string, blob: Blob): Promise<void>;
+  deleteBlob(relPath: string): Promise<void>;
 }
 
-/** Copy the bytes at `from` to `to`. Returns false when the source is gone. */
-async function copyBlob(backend: ProjectBackend, from: string, to: string): Promise<boolean> {
-  const resolved = await backend.readBlobUrl(libPath(from));
-  if (!resolved) return false;
+/** Read a full path as bytes, or null when it is not there. */
+async function readBytesAt(surface: BlobSurface, path: string): Promise<Blob | null> {
+  const resolved = await surface.readBlobUrl(path);
+  if (!resolved) return null;
   try {
-    const blob = await (await fetch(resolved.url)).blob();
-    await backend.writeBlob(libPath(to), blob);
-    return true;
+    return await (await fetch(resolved.url)).blob();
   } finally {
     resolved.release();
   }
 }
 
-/** True when an asset already exists at `relPath`. */
-async function exists(backend: ProjectBackend, relPath: string): Promise<boolean> {
-  const resolved = await backend.readBlobUrl(libPath(relPath));
+/** True when something is stored at this full path. */
+async function existsAt(surface: BlobSurface, path: string): Promise<boolean> {
+  const resolved = await surface.readBlobUrl(path);
   if (!resolved) return false;
   resolved.release();
   return true;
 }
 
+// ─── Deleted in plan-717 Phase 4 (F1/F6/F9) ─────────────────────────────
+//
+// `createEmptyAsset`, `renameAsset`, `duplicateAsset`, `deleteAsset` and
+// `moveSidecarEntry`, together with the sidecar write API they shared
+// (`readSidecar`/`writeSidecar`/`writeSidecarAt`/`sidecarIsUnreadableAt`) and
+// the two blob helpers only they used (`copyBlob`, `exists`).
+//
+// All five wrote bytes — and in four cases metadata — without going through the
+// manifest, which is what made a document's identity a function of its current
+// path. Their replacements all keep the row and the id:
+//
+//   createEmptyAsset  → `createDocument(store, name, { folder })`
+//   renameAsset       → `runTreeEdit` / `applyTreeMove` (row name + file name)
+//   duplicateAsset    → `duplicateDocument` (row copy, new id, collections carried)
+//   deleteAsset       → `deleteDocument` (row removed, bytes to `.trash/`)
+//   moveSidecarEntry  → nothing: collections are on the row `applyTreeMove` repoints
+//
+// Phase 3 emptied their call sites; this deleted the functions. The unreadable-
+// sidecar refusal they carried lives on where a sidecar is still touched at all:
+// the ingestion reports it and leaves the file alone (`project-store`, R1-S3).
+
+// ─── Cross-source copy and move (plan-413 §2.7, phase 5) ────────────────
+
 /**
- * Create an empty asset in the project library.
+ * Where a transferred document lands by default.
  *
- * "New asset" used to jump straight into the editor, which meant the project
- * gained nothing until the user saved — abandon the editor and there was never
- * an asset. Writing a minimal valid GLB up front makes the row real
- * immediately: it can be renamed, opened later, and it survives a reload.
- *
- * The name is probed like {@link duplicateAsset} does, so clicking twice
- * produces two assets rather than a collision.
+ * A copy arrives as a *library asset* of the target, whatever it was in the
+ * source. That is not a simplification: `library/` is the one folder every
+ * writable project has, it is what the source registry lists, and a scene
+ * dropped into another project's `scenes/` would need a manifest scene entry,
+ * a body revision and an id the scene index agrees with — a second, larger
+ * feature wearing the same verb's name.
  */
-export async function createEmptyAsset(
-  backend: ProjectBackend,
-  baseName = 'New asset',
-): Promise<AssetOpResult & { newPath?: string }> {
+export const DEFAULT_TRANSFER_FOLDER = LIBRARY_FOLDER;
+
+export interface DocumentTransferOptions {
+  /** Folder inside the target. Defaults to {@link DEFAULT_TRANSFER_FOLDER}. */
+  targetFolder?: string;
+}
+
+export interface DocumentTransferOk {
+  kind: 'ok';
+  /** Path of the arrival inside the target, including its folder. */
+  path: string;
+  /** Identity of the arrival: a NEW id for a copy, the SAME id for a move. */
+  id: string;
+  /** What the arrived bytes say they are — read back out of the copy. */
+  classification: DocumentClassification | null;
+  /** True when the target had no manifest file to record the row in. */
+  manifestSkipped?: boolean;
+  /**
+   * Set when a move delivered the bytes but could not clear the source.
+   *
+   * The document then exists twice, which is the failure this order was chosen
+   * to produce: a duplicate is a tidy-up, a loss is not (§5.4).
+   */
+  warning?: string;
+}
+
+export type DocumentTransferResult =
+  | DocumentTransferOk
+  | { kind: 'exists'; message: string }
+  | { kind: 'error'; message: string };
+
+/** Split a path into the parts a name probe needs. */
+function splitFileName(path: string): { folder: string; file: string; stem: string; ext: string } {
+  const segments = path.split('/').filter(Boolean);
+  const file = segments.pop() ?? path;
+  const dot = file.lastIndexOf('.');
+  return {
+    folder: segments.join('/'),
+    file,
+    stem: dot > 0 ? file.slice(0, dot) : file,
+    ext: dot > 0 ? file.slice(dot) : '',
+  };
+}
+
+/**
+ * First free name in `folder`, starting from `file` and counting up.
+ *
+ * Probed rather than assumed, for the same reason {@link duplicateAsset} probes:
+ * copying the same document into the same target twice must produce two
+ * documents, not one silent overwrite of the first.
+ */
+async function probeFreeName(
+  surface: BlobSurface,
+  folder: string,
+  file: string,
+): Promise<string | null> {
+  const { stem, ext } = splitFileName(file);
+  for (let n = 1; n < 100; n++) {
+    const candidate = n === 1 ? `${stem}${ext}` : `${stem} ${n}${ext}`;
+    const path = folder ? `${folder}/${candidate}` : candidate;
+    if (!(await existsAt(surface, path))) return path;
+  }
+  return null;
+}
+
+/** The `.trash/` path a document at `path` is retired to, inside its own root. */
+function trashPathFor(path: string): string {
+  const { folder, file } = splitFileName(path);
+  const root = folder.split('/').filter(Boolean)[0] ?? '';
+  return root ? `${root}/${TRASH_FOLDER}/${file}` : `${TRASH_FOLDER}/${file}`;
+}
+
+/** The manifest section a path belongs to. Unknown roots are library assets. */
+function sectionOfPath(path: string): 'scenes' | 'models' | 'library' {
+  const root = path.split('/').filter(Boolean)[0] ?? '';
+  return isDocumentSection(root) ? root : 'library';
+}
+
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Copy a document from one writable source into another (F11).
+ *
+ * ## The copy is a NEW document
+ *
+ * New `id`, minted; `copiedFrom` records where it came from (SOL R1-4). Two
+ * files with the same identity in two places is not a copy, it is a fork of one
+ * document that the reference resolver would then answer for arbitrarily. A
+ * *move* is the operation that keeps the id — same document, new home.
+ *
+ * ## The order, and what each failure costs
+ *
+ *  1. read the source bytes            — nothing written yet
+ *  2. probe a free name in the target  — never overwrites
+ *  3. write the bytes                  — the copy exists
+ *  4. read it back and verify the size — a truncated write is caught here
+ *  5. read the classification OUT OF THE COPY (§2.5: the file wins, always)
+ *  6. manifest row, then sidecar       — caches, in that order
+ *
+ * A failure at 6 deletes the bytes again (nothing half-arrived); a failure at 3
+ * or 4 leaves the target as it was. The classification travels inside the bytes
+ * and is therefore never passed in — it is read back out, which is the same
+ * rule the scan follows and the reason a GLB copied in from outside shows up
+ * correctly classified too.
+ *
+ * Verification is by size, not by hash: re-reading and digesting a hundred
+ * megabytes on every transfer is the cost that would make the verb unusable,
+ * while the write surfaces are all-or-nothing, so the thing left to catch is a
+ * write that did not land at all.
+ */
+export async function copyDocumentAcrossSources(
+  session: DocumentTransferSession,
+  doc: RvDocumentEntry,
+  opts: DocumentTransferOptions = {},
+): Promise<DocumentTransferResult> {
+  return transferDocument(session, doc, opts, { keepId: false });
+}
+
+/**
+ * Move a document between two writable sources: copy, verify, then trash the
+ * original (F11).
+ *
+ * ## Same id, new home
+ *
+ * A move keeps the document's `id`, so an `AssetReference` or a Layout Planner
+ * placement pointing at it still resolves once the target's library is
+ * registered — identity is what the resolver looks up, not the path. The
+ * consequence is a transient window in which two sources list the same id; the
+ * scan reports it (`findDocumentIdCollisions`) and it closes when the source
+ * row goes.
+ *
+ * ## Delete is a move into `.trash/`, and delete failure is not a rollback
+ *
+ * The original is retired into `<root>/.trash/` with the same numeric probing
+ * {@link deleteAsset} uses, never removed outright. And if that step fails
+ * after the bytes arrived, the copy **stays** and the result says so: the
+ * ordering exists precisely so a torn move costs a duplicate rather than the
+ * only copy of somebody's work (§5.4).
+ */
+export async function moveDocumentAcrossSources(
+  session: DocumentTransferSession,
+  doc: RvDocumentEntry,
+  opts: DocumentTransferOptions = {},
+): Promise<DocumentTransferResult> {
+  return transferDocument(session, doc, opts, { keepId: true });
+}
+
+async function transferDocument(
+  session: DocumentTransferSession,
+  doc: RvDocumentEntry,
+  opts: DocumentTransferOptions,
+  mode: { keepId: boolean },
+): Promise<DocumentTransferResult> {
+  const { source, target } = session;
+  if (!source) return { kind: 'error', message: 'This transfer has no source.' };
+  if (!target) return { kind: 'error', message: 'This transfer has no target.' };
+  // Both halves are checked, and for a move both matter: the target has to
+  // accept bytes and the source has to be able to give up its own.
+  if (!target.writable) {
+    return { kind: 'error', message: `"${target.label}" is read-only.` };
+  }
+  if (mode.keepId && !source.writable) {
+    return { kind: 'error', message: `"${source.label}" is read-only — copy it instead.` };
+  }
+  if (source.backendId === target.backendId) {
+    return {
+      kind: 'error',
+      message: 'Source and target are the same library — use Duplicate instead.',
+    };
+  }
+
+  const folder = (opts.targetFolder ?? DEFAULT_TRANSFER_FOLDER).replace(/\/+$/, '');
+  const { file } = splitFileName(doc.path);
+
+  let bytes: Blob | null;
   try {
-    let target = `${baseName}.glb`;
-    for (let n = 2; await exists(backend, target); n++) target = `${baseName} ${n}.glb`;
-    await backend.writeBlob(libPath(target), buildEmptyGlbBlob());
-    return { ...ok, newPath: target };
+    bytes = await readBytesAt(source, doc.path);
   } catch (e) {
-    return { kind: 'error', message: e instanceof Error ? e.message : String(e) };
+    return { kind: 'error', message: errText(e) };
+  }
+  if (!bytes) return { kind: 'error', message: `"${doc.name}" could not be read.` };
+
+  let targetPath: string | null;
+  try {
+    targetPath = await probeFreeName(target, folder, file);
+  } catch (e) {
+    return { kind: 'error', message: errText(e) };
+  }
+  if (!targetPath) {
+    return { kind: 'exists', message: `Too many copies of "${file}" already exist there.` };
+  }
+
+  try {
+    await target.writeBlob(targetPath, bytes);
+  } catch (e) {
+    return { kind: 'error', message: errText(e) };
+  }
+
+  // Everything from here on has bytes in the target to clean up if it fails.
+  let classification: DocumentClassification | null = null;
+  let manifestSkipped = false;
+  try {
+    const arrived = await readBytesAt(target, targetPath);
+    if (!arrived) throw new Error(`The copy of "${doc.name}" could not be read back.`);
+    if (arrived.size !== bytes.size) {
+      throw new Error(`The copy of "${doc.name}" is incomplete.`);
+    }
+    classification = await classificationOfGlbBlob(arrived);
+
+    const arrivedName = splitFileName(targetPath).stem;
+    const sourceName = splitFileName(doc.path).stem;
+    const entry: RvDocumentEntry = {
+      ...doc,
+      id: mode.keepId ? doc.id : newDocumentId(),
+      path: targetPath,
+      // A probed name has to reach the display string too, or two rows read
+      // "Belt" and only the file names tell them apart.
+      name: arrivedName === sourceName ? doc.name : arrivedName,
+      section: sectionOfPath(targetPath),
+      sizeBytes: bytes.size,
+      modifiedAt: new Date().toISOString(),
+    };
+    if (classification) entry.classification = classification;
+    else delete entry.classification;
+    if (mode.keepId) delete entry.copiedFrom;
+    else entry.copiedFrom = doc.id;
+    // Stats and revisions describe the source's file, not this one. Left in
+    // place they would make the target's scan pre-filter clear on a document it
+    // has never looked at.
+    delete entry.mtimeMs;
+    delete entry.sha256;
+    delete entry.revision;
+
+    const recorded = await target.updateManifestEntry((documents) => [
+      ...documents.filter(d => d.path !== targetPath),
+      entry,
+    ]);
+    manifestSkipped = !recorded;
+
+    // No sidecar write, and nothing lost with it (plan-717 Phase 4). What the
+    // two halves of that record used to carry now both travel in the row above:
+    // `tags` inside `entry.classification`, read back out of the arrived BYTES,
+    // and `collections` in the `...doc` spread, because they are a row field
+    // since §2.4. Writing them a second time into a `library.json` is precisely
+    // the two-homes failure this plan removed.
+
+    if (!mode.keepId) {
+      return { kind: 'ok', path: targetPath, id: entry.id, classification, manifestSkipped };
+    }
+
+    // ── Move only: retire the original ──
+    try {
+      await retireSourceDocument(source, doc);
+    } catch (e) {
+      return {
+        kind: 'ok',
+        path: targetPath,
+        id: entry.id,
+        classification,
+        manifestSkipped,
+        warning: `"${doc.name}" was copied to "${target.label}" but could not be removed from `
+          + `"${source.label}" (${errText(e)}). It now exists in both.`,
+      };
+    }
+    return { kind: 'ok', path: targetPath, id: entry.id, classification, manifestSkipped };
+  } catch (e) {
+    // Body written, cache (or verification) failed: take the partial copy back
+    // out. A target left holding bytes nothing lists is exactly the orphan the
+    // "bytes first" ordering is meant to make repairable, not permanent.
+    await target.deleteBlob(targetPath).catch(() => {});
+    return { kind: 'error', message: errText(e) };
   }
 }
 
 /**
- * Rename an asset, keeping it in the same folder.
+ * Retire a document in its own source: bytes to `.trash/`, then the row.
  *
- * Refuses to overwrite an existing name — silently replacing another asset is
- * the one outcome a rename must never produce.
+ * Throws on failure — the caller turns that into the "it now exists in both"
+ * warning rather than into a rollback, because rolling back would mean deleting
+ * the copy that already succeeded.
+ *
+ * Removing the row is what drops the document's metadata, collections included
+ * (plan-717 Phase 4). It used to clear a sidecar record as well; with the row
+ * gone there is no second place left for a stale record to survive in and
+ * reattach itself to a future document of the same path.
  */
-export async function renameAsset(
-  backend: ProjectBackend,
-  relPath: string,
-  newFileName: string,
-): Promise<AssetOpResult> {
-  try {
-    const segments = relPath.split('/');
-    segments.pop();
-    const target = [...segments, newFileName].join('/');
-    if (target === relPath) return ok;
-    if (await exists(backend, target)) {
-      return { kind: 'exists', message: `"${newFileName}" already exists in this folder.` };
-    }
-    if (!(await copyBlob(backend, relPath, target))) {
-      return { kind: 'error', message: `"${relPath}" could not be read.` };
-    }
-    await backend.deleteBlob(libPath(relPath));
-    await writeSidecar(backend, withRenamedAsset(await readSidecar(backend), relPath, target));
-    return ok;
-  } catch (e) {
-    return { kind: 'error', message: e instanceof Error ? e.message : String(e) };
-  }
+async function retireSourceDocument(
+  source: DocumentTransferSide,
+  doc: RvDocumentEntry,
+): Promise<void> {
+  const trashTarget = trashPathFor(doc.path);
+  const { folder, file } = splitFileName(trashTarget);
+  const free = await probeFreeName(source, folder, file);
+  if (!free) throw new Error('The trash folder already holds too many files of that name.');
+
+  const bytes = await readBytesAt(source, doc.path);
+  if (!bytes) throw new Error(`"${doc.name}" could not be read.`);
+  await source.writeBlob(free, bytes);
+  await source.deleteBlob(doc.path);
+
+  await source.updateManifestEntry(documents => documents.filter(d => d.path !== doc.path));
 }
 
 /**
- * Duplicate an asset next to itself, appending " copy" (then " copy 2", …).
+ * The manifest half of a project, as narrow as this verb needs it.
  *
- * The generated name is probed rather than assumed, so duplicating three times
- * produces three assets instead of two failures.
+ * A structural type rather than `ProjectStore` so the collections write can be
+ * tested without a backend, a folder handle or a boot path — the same device
+ * the rest of this file uses for {@link BlobSurface}.
  */
-export async function duplicateAsset(
-  backend: ProjectBackend,
-  relPath: string,
-): Promise<AssetOpResult & { newPath?: string }> {
-  try {
-    const segments = relPath.split('/');
-    const fileName = segments.pop() ?? relPath;
-    const dot = fileName.lastIndexOf('.');
-    const stem = dot > 0 ? fileName.slice(0, dot) : fileName;
-    const ext = dot > 0 ? fileName.slice(dot) : '';
-
-    let target = '';
-    for (let n = 1; n < 100; n++) {
-      const candidate = n === 1 ? `${stem} copy${ext}` : `${stem} copy ${n}${ext}`;
-      const path = [...segments, candidate].join('/');
-      if (!(await exists(backend, path))) { target = path; break; }
-    }
-    if (!target) return { kind: 'error', message: 'Too many copies of this asset already exist.' };
-
-    if (!(await copyBlob(backend, relPath, target))) {
-      return { kind: 'error', message: `"${relPath}" could not be read.` };
-    }
-    // The copy inherits the original's metadata — collections and tags are
-    // what make a duplicate useful as a starting point.
-    const sidecar = await readSidecar(backend);
-    const meta = sidecar.assets[relPath];
-    if (meta) await writeSidecar(backend, withAssetMeta(sidecar, target, meta));
-    return { kind: 'ok', newPath: target };
-  } catch (e) {
-    return { kind: 'error', message: e instanceof Error ? e.message : String(e) };
-  }
+export interface DocumentRowWriter {
+  applyManifestDelta(
+    apply: (current: RvProject) => RvProject,
+    opts?: { publish?: boolean },
+  ): Promise<RvProject | null>;
 }
 
 /**
- * Move an asset into `library/.trash/`.
+ * Replace a document's collections (the Collections editor's single write).
  *
- * Deliberately recoverable: a library asset can be the only copy of hours of
- * work. A name already in the trash gets a numeric suffix rather than being
- * overwritten — the trash is a safety net, and a safety net that discards its
- * own contents is not one.
+ * ## Why this writes the ROW and not the sidecar any more (plan-717 §2.4/F4)
+ *
+ * Until plan-717 this wrote `library/library.json`, and nothing in production
+ * ever read it back — `resolveAssetMeta()` had zero callers, so setting
+ * collections was a write into a file the catalog never consulted. The row is
+ * now the one home for them, which is what closes that loop (§2.6).
+ *
+ * ## Why through `applyManifestDelta` and not `backend.updateManifestEntry`
+ *
+ * Three reasons, in the order they bite:
+ *
+ *  1. `updateManifestEntry` is not on `ProjectBackend` at all — it belongs to
+ *     `DocumentTransferSide`, the cross-source surface. Reaching it from here
+ *     would mean widening the backend interface for one verb.
+ *  2. `applyManifestDelta` already serves both media: the CAS chain for a
+ *     folder project, `writeManifest` for a browser one. A backend-level write
+ *     would have to re-implement that fork.
+ *  3. It is **durable-first and merging**: the row lands on disk before the
+ *     store publishes it, and a concurrent writer's rows are merged rather than
+ *     overwritten by a captured snapshot. Collections are exactly the kind of
+ *     hand-typed metadata that must not vanish because a second tab saved.
  */
-export async function deleteAsset(
-  backend: ProjectBackend,
-  relPath: string,
-): Promise<AssetOpResult> {
-  try {
-    const fileName = relPath.split('/').pop() ?? relPath;
-    let target = `${TRASH_FOLDER}/${fileName}`;
-    for (let n = 2; n < 100 && (await exists(backend, target)); n++) {
-      const dot = fileName.lastIndexOf('.');
-      const stem = dot > 0 ? fileName.slice(0, dot) : fileName;
-      const ext = dot > 0 ? fileName.slice(dot) : '';
-      target = `${TRASH_FOLDER}/${stem} ${n}${ext}`;
-    }
-    if (!(await copyBlob(backend, relPath, target))) {
-      return { kind: 'error', message: `"${relPath}" could not be read.` };
-    }
-    await backend.deleteBlob(libPath(relPath));
-    // Drop the metadata: the asset is no longer in the library, and a stale
-    // record would reattach itself to a future asset of the same path.
-    await writeSidecar(backend, withAssetMeta(await readSidecar(backend), relPath, {}));
-    return ok;
-  } catch (e) {
-    return { kind: 'error', message: e instanceof Error ? e.message : String(e) };
-  }
-}
-
-/** Replace an asset's collections (the Collections editor's single write). */
 export async function setAssetCollections(
-  backend: ProjectBackend,
+  rows: DocumentRowWriter,
   relPath: string,
   collections: string[],
 ): Promise<AssetOpResult> {
+  const path = libPath(relPath);
+  // Trim, drop blanks and de-duplicate: collection names are user-typed and
+  // "Conveyors " must not become a second chip beside "Conveyors".
+  const cleaned = [...new Set(collections.map(c => c.trim()).filter(Boolean))];
+  let found = false;
   try {
-    const sidecar = await readSidecar(backend);
-    const previous: LibrarySidecarAsset = sidecar.assets[relPath] ?? {};
-    // Trim, drop blanks and de-duplicate: collection names are user-typed and
-    // "Conveyors " must not become a second chip beside "Conveyors".
-    const cleaned = [...new Set(collections.map(c => c.trim()).filter(Boolean))];
-    await writeSidecar(backend, withAssetMeta(sidecar, relPath, { ...previous, collections: cleaned }));
+    const written = await rows.applyManifestDelta((current) => {
+      const documents = (current.documents ?? []).map((doc) => {
+        if ((doc.path ?? '').replace(/\\/g, '/') !== path) return doc;
+        found = true;
+        // An empty list is stored as an empty array, not as a missing field:
+        // "the user filed this under nothing" is an answer, and dropping the
+        // field would re-open the legacy read fallback for this row.
+        return { ...doc, collections: cleaned };
+      });
+      return { ...current, documents };
+    });
+    if (written === null) {
+      return { kind: 'error', message: 'This project has no manifest to record collections in.' };
+    }
+    if (!found) {
+      return {
+        kind: 'error',
+        message: `"${relPath}" is not registered in this project yet — reopen the project and try again.`,
+      };
+    }
     return ok;
   } catch (e) {
     return { kind: 'error', message: e instanceof Error ? e.message : String(e) };

@@ -8,6 +8,7 @@ import { RVDrive } from './rv-drive';
 import { NodeRegistry } from './rv-node-registry';
 import { debug } from './rv-debug';
 import { createSignalWriter } from './rv-signal-store';
+import { wireBoolSignal } from './rv-signal-wiring';
 
 /** Two-position pneumatic/hydraulic drive behavior. */
 export class RVDriveCylinder implements RVComponent {
@@ -36,6 +37,9 @@ export class RVDriveCylinder implements RVComponent {
   private drive: RVDrive | null = null;
   private feedbackCb: ((drive: RVDrive) => void) | null = null;
   private readonly feedbackListeners: (() => void)[] = [];
+  /** Store subscriptions + re-apply slots of Out/In. Held so `dispose()` can
+   *  drop them — before plan-427 the handles were discarded (F6). */
+  private readonly inputUnsubs: (() => void)[] = [];
 
   constructor(node: Object3D) {
     this.node = node;
@@ -111,16 +115,17 @@ export class RVDriveCylinder implements RVComponent {
     drive.currentPosition = minPos;
     drive.applyToNode();
 
-    if (this.Out) {
-      const address = this.Out;
-      context.signalStore.subscribeByPath(address, (value) => this.commandOut(value));
-      debug('loader', `  Drive_Cylinder "${drive.name}": Out signal="${address}"`);
-    }
-    if (this.In && !this.OneBitCylinder) {
-      const address = this.In;
-      context.signalStore.subscribeByPath(address, (value) => this.commandIn(value));
-      debug('loader', `  Drive_Cylinder "${drive.name}": In signal="${address}"`);
-    }
+    // plan-427: via the helper, so the current Out/In level is re-asserted after
+    // a reset — an extended cylinder whose `Out` never toggles again would
+    // otherwise sit at MinPos for the rest of the run.
+    this.inputUnsubs.push(
+      wireBoolSignal(context.signalStore, this.Out,
+        (value) => this.commandOut(value),
+        `Drive_Cylinder "${drive.name}": Out signal`, context.reapply).unsubscribe,
+      wireBoolSignal(context.signalStore, this.OneBitCylinder ? null : this.In,
+        (value) => this.commandIn(value),
+        `Drive_Cylinder "${drive.name}": In signal`, context.reapply).unsubscribe,
+    );
 
     const feedbackRefs: { key: string; addr: string }[] = [];
     for (const [key, address] of [
@@ -158,6 +163,8 @@ export class RVDriveCylinder implements RVComponent {
 
   dispose(): void {
     if (this.drive && this.feedbackCb) this.drive.removeAfterUpdate(this.feedbackCb);
+    for (const unsub of this.inputUnsubs) unsub();
+    this.inputUnsubs.length = 0;
     this.feedbackCb = null;
     this.drive = null;
     this.feedbackListeners.length = 0;

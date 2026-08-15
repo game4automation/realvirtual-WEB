@@ -2,25 +2,37 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-project-folder-writer — writes scene bodies and the settings bundle
- * back into the open project folder.
+ * rv-project-folder-writer — keeps `project.json` and the settings bundle in
+ * step with the open project folder.
  *
  * Subscribes to the scene mutation bus (§4d), coalesces the resulting work
- * over a short debounce, and then writes **bodies first, manifest last** —
- * the same ordering `writeScene()` uses for body-before-index, and for the
- * same reason: a manifest may never point at a file that is not there yet.
+ * over a short debounce, and then writes the **manifest last** — after the
+ * bodies, which is the ordering `writeScene()` uses for body-before-index and
+ * for the same reason: a manifest may never point at a file that is not there
+ * yet.
+ *
+ * ## It no longer writes scene bodies (plan-413 phase 6)
+ *
+ * It used to serialise the mutation's `RvScene` into `scenes/<slug>.scene.json`.
+ * That was the op-log world; since plan-397 a scene body is a GLB written by
+ * `writeSceneGlbBody()` → `backend.writeScene()`, *before* the mutation is even
+ * emitted. Keeping the JSON write alongside it did more than waste a file: the
+ * manifest row it upserted named the `.scene.json` path, so the next save
+ * pushed GLB bytes into a file called `.scene.json` and the scene stopped being
+ * readable. What the writer keeps is the half only it can do — the manifest row,
+ * the rename retirement, the deletion, the active id and the settings bundle.
  *
  * ## RR1 — the filename contract, and why it is enforced here
  *
- * Filenames come from {@link sceneFileNameFor}, which folds the scene **id**
+ * Filenames come from {@link sceneGlbFileNameFor}, which folds the scene **id**
  * into the name. That alone would already be enough to stop two scenes
  * called "Cell" from sharing a file. The writer nevertheless re-checks,
- * before *every* write and *every* delete, that the path it is about to
- * touch belongs to the manifest entry it thinks it is touching, and that no
- * other entry claims it. Belt and braces, because the failure mode is not a
- * broken render — it is silently overwriting or deleting a different,
- * still-valid scene file. On a mismatch the operation is refused and the
- * project is marked as not-saved-to-disk; nothing is overwritten.
+ * before *every* delete, that the path it is about to touch belongs to the
+ * manifest entry it thinks it is touching, and that no other entry claims it.
+ * Belt and braces, because the failure mode is not a broken render — it is
+ * silently deleting a different, still-valid scene file. On a mismatch the
+ * operation is refused and the project is marked as not-saved-to-disk;
+ * nothing is removed.
  *
  * ## §4e — failure is visible, and "saved" means saved
  *
@@ -49,13 +61,13 @@ import {
   deleteSceneFile,
   mergeManifest,
   writeManifest,
-  writeSceneFile,
   writeSettingsFile,
   type ManifestUpdate,
 } from './rv-project-storage';
+import { sceneDocumentsOf } from './rv-project-documents';
 import {
   sceneFileNameOfPath,
-  sceneRelPathFor,
+  sceneGlbRelPathFor,
   type RvProject,
   type RvProjectSceneEntry,
 } from './rv-project-types';
@@ -182,7 +194,7 @@ export class RVProjectFolderWriter {
         // has to go after the new one is written. Record the old path now,
         // while the manifest still carries it.
         const prev = this._manifestEntry(mutation.id)?.path;
-        const next = sceneRelPathFor(mutation.scene);
+        const next = this._pathFor(mutation.scene);
         if (prev && prev !== next) this._staleScenePaths.set(mutation.id, prev);
         this._dirtyScenes.add(mutation.id);
         this._deletedScenes.delete(mutation.id);
@@ -295,26 +307,24 @@ export class RVProjectFolderWriter {
     const problems: string[] = [];
 
     try {
-      // ── 1. Scene bodies first ──
+      // ── 1. Manifest rows for the scenes whose bodies were just written ──
       for (const id of dirtyIds) {
         const scene = readSceneFn(id);
         if (!scene) {
-          // The body vanished between the event and this batch (deleted, or
-          // a quota-swallowed write). Nothing to mirror; skip quietly rather
-          // than writing a truncated file.
+          // The catalogue row vanished between the event and this batch
+          // (deleted, or a quota-swallowed write). Nothing to record.
           continue;
         }
-        const relPath = sceneRelPathFor(scene);
+        const relPath = this._pathFor(scene);
         const guard = this._checkPathOwnership(id, relPath);
         if (!guard.ok) { problems.push(guard.reason); continue; }
-        await writeSceneFile(dir, relPath, scene);
         upserts.push(sceneEntryOf(scene, relPath, this._manifestEntry(id)));
       }
 
       // ── 2. Retire files left behind by a rename ──
       for (const [id, oldPath] of staleRenames) {
         const stillReferenced = upserts.some(e => e.path === oldPath)
-          || (this._host.getManifest().scenes ?? []).some(e => e.id !== id && e.path === oldPath);
+          || sceneDocumentsOf(this._host.getManifest()).some(e => e.id !== id && e.path === oldPath);
         if (stillReferenced) continue;
         await deleteSceneFile(dir, oldPath);
       }
@@ -385,7 +395,7 @@ export class RVProjectFolderWriter {
     relPath: string,
     opts: { forDelete?: boolean } = {},
   ): { ok: true } | { ok: false; reason: string } {
-    const scenes = this._host.getManifest().scenes ?? [];
+    const scenes = sceneDocumentsOf(this._host.getManifest());
     const own = scenes.find(e => e.id === id);
 
     const claimant = scenes.find(e => e.id !== id && e.path === relPath);
@@ -413,7 +423,7 @@ export class RVProjectFolderWriter {
     // A write to a *new* path for a known id is legitimate (rename); it is
     // handled by the stale-path retirement above, not refused here. What is
     // refused is a filename that does not derive from this id at all — the
-    // only way that happens is a caller bypassing `sceneRelPathFor`.
+    // only way that happens is a caller inventing a filename of its own.
     if (!sceneFileNameOfPath(relPath).includes(idTokenOf(id))) {
       return {
         ok: false,
@@ -424,7 +434,20 @@ export class RVProjectFolderWriter {
   }
 
   private _manifestEntry(id: string): RvProjectSceneEntry | undefined {
-    return (this._host.getManifest().scenes ?? []).find(e => e.id === id);
+    return sceneDocumentsOf(this._host.getManifest()).find(e => e.id === id);
+  }
+
+  /**
+   * Where this scene's bytes are — the recorded path, or the derived one.
+   *
+   * The recorded path comes first because `writeSceneGlbBody()` wrote the body
+   * to exactly that path a moment ago (`existing?.path ?? sceneGlbRelPathFor`).
+   * Deriving unconditionally would make the manifest name a file nobody wrote,
+   * which is precisely how a rename used to end up deleting the body it had
+   * just renamed.
+   */
+  private _pathFor(scene: RvScene): string {
+    return this._manifestEntry(scene.id)?.path ?? sceneGlbRelPathFor(scene);
   }
 }
 

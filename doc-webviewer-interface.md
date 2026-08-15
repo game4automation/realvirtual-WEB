@@ -528,10 +528,13 @@ Requires the API key. Reports what is on offer and what an operation in flight i
   not an error, and produces no entry and no message.
 - `sizeBytes` is `null` when the server does not report a content length; the dialog then says the
   size is unknown.
-- `pinWillChange` is true only inside a developer workspace whose `connect.lock.json` would be
-  rewritten, so the confirmation dialog can say a project file is about to change.
-- `state` runs `idle → checking → available → downloading → verifying → staging → restarting →
-  verifying-health` and ends in `succeeded`, `failed` or `rolled-back`.
+- `pinWillChange` is always `false` on current gateways: the download-only update never touches
+  `connect.lock.json`. The field stays on the wire for older gateways that still announce a pin
+  rewrite.
+- `state` runs `idle → checking → available → downloading → verifying` and ends in `downloaded`
+  (success: the verified file lies beside the running program, `downloadedPath` names it) or
+  `failed`. Older gateways that still perform the background swap additionally use `staging →
+  restarting → verifying-health` ending in `succeeded` or `rolled-back`.
 - When `updateSupported` is false, `reason` says why. The viewer shows a sentence only for
   `no-api-key` and `no-write-permission`, which the operator can act on, and stays silent otherwise.
 
@@ -547,22 +550,19 @@ taken from `/update/status`, not just a version number:
 
 The gateway re-reads the manifest and compares the whole candidate against it. Any difference —
 including the same version with a different build or hash — is rejected with `manifest-changed`
-rather than installing something other than what was confirmed. A second call while an operation is
-running answers `409` with `update-in-progress`; a non-terminal operation keeps blocking across a
-restart.
+rather than downloading something other than what was confirmed. A second call while an operation
+is running answers `409` with `update-in-progress`.
 
-Both update endpoints check the API key **themselves** and refuse when none is configured, rather
-than relying on the global middleware, which passes everything through when no key is set.
+Authentication is the global access rule (loopback peer or valid key); `/update/apply`
+additionally keeps its browser gate on Origin and Host.
 
 ### Reading the result
 
-A reachable `/health` after the restart means the connection is back and nothing more. The
-operation is successful only when `/update/status` reports `succeeded`, because pin and job are
-committed after health is confirmed. A viewer that celebrates on `/health` would report success for
-an operation that is still able to roll back.
-
-If `/health` comes back with a release other than the confirmed one, that is a failure, not a
-success — the gateway is not the build the operator agreed to.
+The operation is successful when `/update/status` reports the terminal state `downloaded` and
+names the file in `downloadedPath`. The gateway keeps running unchanged; installing the new
+version is the operator's move — stop CONNECT, start the downloaded file. On gateways older than
+this build the swap flow applies instead: success there is the terminal `succeeded`, and a
+reachable `/health` after their restart means only that the connection is back.
 
 ## Unity-Side Setup
 

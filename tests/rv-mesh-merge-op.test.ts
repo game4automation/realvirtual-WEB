@@ -30,13 +30,11 @@ import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { AssetDocument, planMergeMesh } from '../src/core/editor/rv-asset-document';
 import {
   assetOpHeader,
-  canCoalesceAssetOps,
   assetOpTouchesHierarchy,
   classifyAssetOpRaycastImpact,
-  describeAssetOp,
-  type AssetOp,
   type MergeMeshOp,
 } from '../src/core/editor/rv-asset-ops';
+import { canCoalesceRvOps, describeRvOp, type RvAssetOp } from '../src/core/ops/rv-unified-ops';
 import { materialFingerprint } from '../src/core/editor/rv-mesh-merge';
 import { exportAssetGlb } from '../src/core/editor/rv-asset-glb-export';
 import { computeBVHAsync } from '../src/core/engine/rv-scene-loader';
@@ -220,12 +218,12 @@ describe('mergeMesh op semantics', () => {
   };
 
   it('never coalesces — a merge is one deliberate action', () => {
-    expect(canCoalesceAssetOps(op, { ...op, ...assetOpHeader() })).toBe(false);
-    const other: AssetOp = {
+    expect(canCoalesceRvOps(op, { ...op, ...assetOpHeader() })).toBe(false);
+    const other: RvAssetOp = {
       ...assetOpHeader(), kind: 'renameNode', nodePath: 'Asset/X', name: 'Y', prevName: 'X',
     };
-    expect(canCoalesceAssetOps(op, other)).toBe(false);
-    expect(canCoalesceAssetOps(other, op)).toBe(false);
+    expect(canCoalesceRvOps(op, other)).toBe(false);
+    expect(canCoalesceRvOps(other, op)).toBe(false);
   });
 
   it('touches the hierarchy, forces a raycast rebuild, and describes itself', () => {
@@ -233,11 +231,11 @@ describe('mergeMesh op semantics', () => {
     const impact = classifyAssetOpRaycastImpact(op);
     expect(impact.rebuild).toBe(true);
     expect(impact.refitPaths).toEqual([]);
-    expect(describeAssetOp(op)).toBe('Merge Assembly (2 → 1 mesh)');
+    expect(describeRvOp(op)).toBe('Merge Assembly (2 → 1 mesh)');
   });
 
   it('propagates through a composite', () => {
-    const composite: AssetOp = { ...assetOpHeader(), kind: 'composite', label: 'Batch', ops: [op] };
+    const composite: RvAssetOp = { ...assetOpHeader(), kind: 'composite', label: 'Batch', ops: [op] };
     expect(assetOpTouchesHierarchy(composite)).toBe(true);
     expect(classifyAssetOpRaycastImpact(composite).rebuild).toBe(true);
   });

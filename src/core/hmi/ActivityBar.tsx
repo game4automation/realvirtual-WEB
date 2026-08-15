@@ -48,7 +48,50 @@ import {
 } from './help-context';
 import { LogoBadge } from './ButtonPanel';
 import { MultiuserButton } from './MultiuserPanel';
+import { DirtyDot } from './rv-dirty-dot';
 import type { WebXRPluginAPI } from '../types/plugin-types';
+
+/** Stand-in subscribe for the boot window in which there is no scene store. */
+const NO_STORE_SUBSCRIBE = () => () => {};
+
+/**
+ * What the unsaved mark means, in the two cases that differ for the user.
+ *
+ * A transient workspace — a shared link, an Example — persists nothing at all
+ * by design, so "unsaved" there is not a chore to get around to but a warning:
+ * the work exists only in this tab. Saying so is the difference between the
+ * user copying it somewhere and losing it to a reload.
+ */
+export function unsavedTitle(transient: boolean): string {
+  return transient
+    ? 'Unsaved — this scene is not stored anywhere yet; reloading discards it'
+    : 'Unsaved changes';
+}
+
+/** Tooltip of the Projects entry: which project, plus the unsaved state. */
+export function projectsEntryTitle(
+  projectName: string | null,
+  dirty: boolean,
+  transient: boolean,
+): string {
+  const base = projectName ? `Projects — ${projectName}` : 'Projects';
+  return dirty ? `${base} · ${unsavedTitle(transient)}` : base;
+}
+
+/**
+ * Tooltip of the AI Bridge entry — the icon's accent says "connected", the
+ * tooltip says to what. While a tool call is running the label rides along, so
+ * the button alone answers "is something driving my scene right now?" even when
+ * the AiActivityOverlay pill is off-screen or covered.
+ */
+export function aiBridgeTitle(
+  mcp: { connected: boolean; enabled: boolean; toolCount: number },
+  activity: string | null,
+): string {
+  if (!mcp.connected) return mcp.enabled ? 'AI Bridge — connecting…' : 'AI Bridge — off';
+  const base = `AI Bridge — connected (${mcp.toolCount} tools)`;
+  return activity ? `${base} · ${activity}` : base;
+}
 
 /** One icon button in the activity bar. */
 function ActivityButton({
@@ -153,6 +196,29 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
   const dashboardSnapshot = useSyncExternalStore(subscribeProjectsDashboard, getProjectsDashboardSnapshot);
   const projectStore = getProjectStore();
   const projectSnapshot = useSyncExternalStore(projectStore.subscribe, projectStore.getSnapshot);
+  // Unsaved work on the Projects icon — the same amber mark the asset card and
+  // the breadcrumb use, so one glance at the rail answers "did I leave
+  // something unsaved?" without opening the dashboard. Selects two primitives
+  // rather than the snapshot object: the store does cache the snapshot, but a
+  // component that re-renders on every scene notification would repaint the
+  // whole rail for an undo label it does not show.
+  //
+  // Both halves are called through `?.`: the rail is mounted by shells and
+  // tests that supply a partial scene store (subscribe but no snapshot, or
+  // neither), and a missing method here would take down the whole ActivityBar —
+  // help button, settings, AI entry — over a dot. `ProjectStore` reads the same
+  // seam the same way.
+  const sceneSubscribe = typeof sceneStore?.subscribe === 'function'
+    ? sceneStore.subscribe
+    : NO_STORE_SUBSCRIBE;
+  const sceneDirty = useSyncExternalStore(
+    sceneSubscribe,
+    () => sceneStore?.getSnapshot?.()?.dirty === true,
+  );
+  const sceneTransient = useSyncExternalStore(
+    sceneSubscribe,
+    () => sceneStore?.getSnapshot?.()?.transient === true,
+  );
   const placement = isMobile ? 'top' as const : 'right' as const;
   // Mobile: anchor for the top-right "⋮" window-opener menu.
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
@@ -225,6 +291,12 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
   // Settings panel on the AI tab, where AiBridgeGate asks for consent before the
   // panel mounts. The status text rides beside the button over the 3D scene via
   // AiActivityOverlay.
+  //
+  // The accent (`active`) tracks the CONNECTION, not the momentary tool call: a
+  // live bridge is a standing state of this session and is worth seeing at rest,
+  // whereas the 3s activity flicker made the icon look broken between calls. The
+  // per-call signal stays where it reads better — the AiActivityOverlay pill and
+  // the tooltip.
   const mcp = useMcpBridge();
   const aiActivity = useAiActivity();
   const [aiProbe, setAiProbe] = useState<'idle' | 'probing' | 'unreachable'>('idle');
@@ -255,15 +327,23 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
     <>
       {isEntryShown('models') && sceneStore && (
         <ActivityButton
-          title={projectSnapshot.project ? `Projects — ${projectSnapshot.project.name}` : 'Projects'}
+          title={projectsEntryTitle(projectSnapshot.project?.name ?? null, sceneDirty, sceneTransient)}
           active={dashboardSnapshot.open}
           onClick={toggleScene}
           placement={placement}
         >
           <FolderOpen />
-          {/* The single ambient project indicator (§3.5) — the TopBar carries
-              none any more. Only a writable open project earns the dot. */}
-          {projectSnapshot.project && projectSnapshot.writable && (
+          {/* One corner, two possible marks, unsaved wins. The ambient dot says
+              "a writable project is open", which is worth knowing but never as
+              urgent as "you have work that is not saved"; showing both would put
+              two dots of different meaning in the same 6px corner. */}
+          {sceneDirty ? (
+            <DirtyDot
+              size={6}
+              title={unsavedTitle(sceneTransient)}
+              sx={{ position: 'absolute', right: 6, top: 6 }}
+            />
+          ) : projectSnapshot.project && projectSnapshot.writable && (
             <Box
               sx={{
                 position: 'absolute',
@@ -406,8 +486,8 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
           feature matrix; `isEntryAllowed` still beats "always visible". */}
       {isEntryShown('ai-bridge') && (
         <ActivityButton
-          title="AI Bridge"
-          active={!!aiActivity}
+          title={aiBridgeTitle(mcp, aiActivity)}
+          active={mcp.connected}
           onClick={() => { void openAiEntry(); }}
           placement={placement}
         >

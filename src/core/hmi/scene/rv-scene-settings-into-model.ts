@@ -116,8 +116,42 @@ export class UnrepresentableValueError extends Error {
 
 type GltfNode = { name?: string; extras?: Record<string, unknown> };
 
-/** Recursively describe why a value would not survive `JSON.stringify` intact. */
-function unrepresentableReason(value: unknown, seen: Set<object>): string | null {
+/**
+ * Recursively describe why a value would not survive `JSON.stringify` intact.
+ *
+ * Exported because the full bake (`rv-scene-glb-bake.ts`) writes six more
+ * categories through the same JSON chunk and needs the identical verdict — a
+ * second copy of "what survives JSON" is exactly how two writers start
+ * disagreeing about which scene is saveable.
+ *
+ * ## `undefined` is not one verdict but two (plan-422 F1)
+ *
+ * The blanket refusal of `undefined` cost more than it saved. Its position
+ * decides whether JSON LOSES the value or CHANGES it, and only the second is
+ * worth a refusal:
+ *
+ *  - **As an object property** `{ topic: undefined }` becomes `{}`. The key is
+ *    gone, and reading it back yields `undefined` again — the round-trip is
+ *    exact. Refusing here rejected the whole file to prevent a loss that never
+ *    happens, which is how one topic-less CONNECT binding used to abort an
+ *    entire draft autosave and take every unsaved edit with it.
+ *  - **As an array element** `[1, undefined]` becomes `[1, null]`. That is a
+ *    different value in a different type, sitting at the same index — silent
+ *    corruption, and still a refusal.
+ *  - **As the whole field value** there is nothing left to write, so the
+ *    override itself is meaningless. Still a refusal.
+ *
+ * Pass `droppedProperties` to opt into the lenient property reading: matching
+ * keys are RECORDED there (as a dotted path, for the caller's warn log) instead
+ * of failing the file. Without it the function behaves exactly as before, so
+ * callers that never learned about the distinction keep the strict verdict.
+ */
+export function unrepresentableReason(
+  value: unknown,
+  seen: Set<object> = new Set(),
+  droppedProperties?: string[],
+  path = '',
+): string | null {
   if (value === null) return null;
   switch (typeof value) {
     case 'number':
@@ -136,19 +170,40 @@ function unrepresentableReason(value: unknown, seen: Set<object>): string | null
   try {
     if (Array.isArray(obj)) {
       for (let i = 0; i < obj.length; i++) {
-        const why = unrepresentableReason(obj[i], seen);
+        // Deliberately NOT lenient: JSON rewrites a hole to `null` here.
+        const why = unrepresentableReason(obj[i], seen, droppedProperties, `${path}[${i}]`);
         if (why) return `[${i}]: ${why}`;
       }
       return null;
     }
     for (const [key, entry] of Object.entries(obj)) {
-      const why = unrepresentableReason(entry, seen);
+      if (entry === undefined && droppedProperties) {
+        droppedProperties.push(`${path}.${key}`);
+        continue;
+      }
+      const why = unrepresentableReason(entry, seen, droppedProperties, `${path}.${key}`);
       if (why) return `.${key}: ${why}`;
     }
     return null;
   } finally {
     seen.delete(obj);
   }
+}
+
+/**
+ * The warn line for properties `JSON.stringify` will drop without complaint.
+ *
+ * Shared by both writers so the message reads the same wherever a bake happens.
+ * Says nothing when nothing was dropped.
+ */
+export function warnDroppedUndefined(where: string, locations: readonly string[]): void {
+  if (locations.length === 0) return;
+  console.warn(
+    `[${where}] ${locations.length} undefined propert${locations.length === 1 ? 'y is' : 'ies are'} `
+    + 'not written to the model file (JSON drops them; reading back yields undefined either way): '
+    + locations.slice(0, 8).join('; ')
+    + (locations.length > 8 ? `; … (+${locations.length - 8} more)` : ''),
+  );
 }
 
 /**
@@ -182,6 +237,8 @@ export function writeSettingsIntoModel(
 
   const unresolved: string[] = [];
   const unrepresentable: string[] = [];
+  const droppedUndefined: string[] = [];
+  const scratch: string[] = [];
   const resolved: { node: GltfNode; overrides: Record<string, Record<string, unknown>> }[] = [];
 
   for (const [nodePath, overrides] of Object.entries(overlay.nodes)) {
@@ -197,7 +254,9 @@ export function writeSettingsIntoModel(
 
     for (const [componentType, fields] of Object.entries(overrides)) {
       for (const [fieldName, value] of Object.entries(fields)) {
-        const why = unrepresentableReason(value, new Set());
+        scratch.length = 0;
+        const why = unrepresentableReason(value, new Set(), scratch);
+        for (const prop of scratch) droppedUndefined.push(`${nodePath} → ${componentType}.${fieldName}${prop}`);
         if (why) unrepresentable.push(`${nodePath} → ${componentType}.${fieldName}${why.startsWith('.') || why.startsWith('[') ? why : `: ${why}`}`);
       }
     }
@@ -205,6 +264,7 @@ export function writeSettingsIntoModel(
   }
   if (unresolved.length > 0) throw new NodeNotFoundError(unresolved);
   if (unrepresentable.length > 0) throw new UnrepresentableValueError(unrepresentable);
+  warnDroppedUndefined('scene-settings', droppedUndefined);
 
   let nodes = 0;
   let fields = 0;

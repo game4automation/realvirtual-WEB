@@ -123,41 +123,80 @@ describe('resolveInterfaceOrigin — source label → CONNECT interface (plan-24
   });
 });
 
-describe('resolveInterfaceOriginForSignal — membership-first resolution (plan-246 F6)', () => {
+describe('resolveInterfaceOriginForSignal — membership-first resolution (plan-246 F6, plan-353 F3)', () => {
+  // Topics now carry their `topic` name (plan-353 F3) so the origin can report
+  // it. `Legacy_NoTopicName` keeps a topic entry WITHOUT a name, which is what a
+  // snapshot from an older gateway looks like.
   const interfaces = [
     {
       id: 'MQTT1',
       type: 'MQTT',
       topics: [
-        { signals: [{ name: 'MC07_Start' }, { name: 'MC07_Occupied' }] },
-        { signals: [{ name: 'Turntable_Dest' }] },
+        { topic: 'Data_Q01', signals: [{ name: 'MC07_Start' }, { name: 'MC07_Occupied' }] },
+        { topic: 'Data_Q02', signals: [{ name: 'Turntable_Dest' }] },
+        { signals: [{ name: 'Legacy_NoTopicName' }] },
       ],
     },
     { id: 'S7-Main', type: 'S7', signals: [{ name: 'DB1_Speed' }] },
   ];
 
-  it('resolves via topic-signal membership (primary path)', () => {
-    expect(resolveInterfaceOriginForSignal('MC07_Start', undefined, interfaces)).toBe('MQTT1');
-    expect(resolveInterfaceOriginForSignal('Turntable_Dest', undefined, interfaces)).toBe('MQTT1');
+  it('resolves via topic-signal membership and carries the topic (primary path)', () => {
+    expect(resolveInterfaceOriginForSignal('MC07_Start', undefined, interfaces))
+      .toEqual({ interfaceId: 'MQTT1', topic: 'Data_Q01' });
+    expect(resolveInterfaceOriginForSignal('Turntable_Dest', undefined, interfaces))
+      .toEqual({ interfaceId: 'MQTT1', topic: 'Data_Q02' });
   });
 
-  it('resolves via flat-signal membership', () => {
-    expect(resolveInterfaceOriginForSignal('DB1_Speed', undefined, interfaces)).toBe('S7-Main');
+  it('omits the topic entirely when the topic entry has no name', () => {
+    // Absent, not `undefined`-valued: a present undefined reaches the persisted
+    // mapping and the GLB bake refuses the file over it (plan-422 F1).
+    const origin = resolveInterfaceOriginForSignal('Legacy_NoTopicName', undefined, interfaces);
+    expect(origin).toEqual({ interfaceId: 'MQTT1' });
+    expect(origin && 'topic' in origin).toBe(false);
+  });
+
+  it('resolves via flat-signal membership, without a topic', () => {
+    const origin = resolveInterfaceOriginForSignal('DB1_Speed', undefined, interfaces);
+    expect(origin).toEqual({ interfaceId: 'S7-Main' });
+    expect(origin && 'topic' in origin).toBe(false);
   });
 
   it('membership wins even when the source label points elsewhere', () => {
-    expect(resolveInterfaceOriginForSignal('DB1_Speed', 'MQTT · Data_I_1', interfaces)).toBe('S7-Main');
+    expect(resolveInterfaceOriginForSignal('DB1_Speed', 'MQTT · Data_I_1', interfaces))
+      .toEqual({ interfaceId: 'S7-Main' });
   });
 
-  it('falls back to the source-label heuristic for unknown signals', () => {
-    expect(resolveInterfaceOriginForSignal('UnknownSig', 'MQTT · Data_I_1', interfaces)).toBe('MQTT1');
-    expect(resolveInterfaceOriginForSignal('UnknownSig', 'S7 · DB1', interfaces)).toBe('S7-Main');
+  it('falls back to the source-label heuristic for unknown signals (no topic)', () => {
+    expect(resolveInterfaceOriginForSignal('UnknownSig', 'MQTT · Data_I_1', interfaces))
+      .toEqual({ interfaceId: 'MQTT1' });
+    expect(resolveInterfaceOriginForSignal('UnknownSig', 'S7 · DB1', interfaces))
+      .toEqual({ interfaceId: 'S7-Main' });
   });
 
   it('returns undefined when neither membership nor source resolve', () => {
     expect(resolveInterfaceOriginForSignal('UnknownSig', undefined, interfaces)).toBeUndefined();
     expect(resolveInterfaceOriginForSignal(undefined, undefined, interfaces)).toBeUndefined();
     expect(resolveInterfaceOriginForSignal('X', 'Simulation', interfaces)).toBeUndefined();
+  });
+
+  it('is deterministic on multiple membership: first interface, topics before the flat list', () => {
+    // The same name really can sit on two interfaces (a mirrored signal). The
+    // answer must not depend on iteration luck — it is the FIRST find, scanning
+    // interfaces in order and topics before the interface's own flat list.
+    const shared = [
+      { id: 'A', type: 'MQTT', signals: [{ name: 'Shared' }], topics: [{ topic: 'T_A', signals: [{ name: 'Shared' }] }] },
+      { id: 'B', type: 'MQTT', topics: [{ topic: 'T_B', signals: [{ name: 'Shared' }] }] },
+    ];
+    expect(resolveInterfaceOriginForSignal('Shared', undefined, shared))
+      .toEqual({ interfaceId: 'A', topic: 'T_A' });
+    // Reversing the interface order flips the answer — and stays stable.
+    expect(resolveInterfaceOriginForSignal('Shared', undefined, [shared[1], shared[0]]))
+      .toEqual({ interfaceId: 'B', topic: 'T_B' });
+    // Repeated calls never disagree.
+    for (let i = 0; i < 5; i++) {
+      expect(resolveInterfaceOriginForSignal('Shared', undefined, shared))
+        .toEqual({ interfaceId: 'A', topic: 'T_A' });
+    }
   });
 });
 

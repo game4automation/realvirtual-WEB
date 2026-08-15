@@ -51,6 +51,9 @@ function fakeBackend(overrides: Partial<ProjectBackend> = {}): ProjectBackend & 
     kind: 'browser', id: 'test', writable: true, isActive: true, writes,
     listModels: async () => [],
     writeBlob: async (relPath: string) => { writes.push(relPath); },
+    // The adoption re-reads what was just written (plan-709 §2.5). Serving the
+    // same fixture back keeps the happy path actually reachable in these tests.
+    readBlobBytes: async () => demoGlbBytes().buffer as ArrayBuffer,
     ...overrides,
   } as unknown as ProjectBackend & { writes: string[] };
 }
@@ -230,9 +233,11 @@ describe('saveSettingsIntoModel is transactional', () => {
       deleteBlob: async (relPath: string) => { deleted.push(relPath); },
     } as Partial<ProjectBackend>);
     setBackend(backend);
-    // resolveAssetUrl returns null → failure AFTER writeBlob succeeded.
-    (getProjectStore() as unknown as { resolveAssetUrl: (p: string) => Promise<string | null> })
-      .resolveAssetUrl = async () => null;
+    // The written file cannot be resolved back → failure AFTER writeBlob
+    // succeeded. Since plan-709 §2.5 the adoption re-resolves through
+    // `resolveAssetSource` (bytes, or a URL with an owner), not `resolveAssetUrl`.
+    (getProjectStore() as unknown as { resolveAssetSource: (p: string) => Promise<null> })
+      .resolveAssetSource = async () => null;
     await store.applyOp(setSpeedOp());
 
     const glbFetch = stubGlbFetch();
@@ -252,8 +257,11 @@ describe('saveSettingsIntoModel is transactional', () => {
       listModels: async () => [{ path: 'models/Demo.glb' }],
     } as Partial<ProjectBackend>);
     setBackend(backend);
-    (getProjectStore() as unknown as { resolveAssetUrl: (p: string) => Promise<string | null> })
-      .resolveAssetUrl = async (p: string) => `blob:${p}`;
+    (getProjectStore() as unknown as {
+      resolveAssetSource: (p: string) => Promise<{ kind: 'bytes'; bytes: ArrayBuffer }>;
+    }).resolveAssetSource = async () => ({
+      kind: 'bytes', bytes: demoGlbBytes().buffer as ArrayBuffer,
+    });
     await store.applyOp(setSpeedOp());
 
     const glbFetch = stubGlbFetch();

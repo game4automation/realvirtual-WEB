@@ -11,17 +11,16 @@ import { describe, it, expect } from 'vitest';
 import {
   assetOpTouchesHierarchy,
   classifyAssetOpRaycastImpact,
-  type AssetOp,
-  type AssetPrimitiveOp,
 } from '../src/core/editor/rv-asset-ops';
+import type { RvAssetOp, RvAssetPrimitiveOp } from '../src/core/ops/rv-unified-ops';
 
 /** Minimal op stub — the predicates only inspect `kind`, `nodePath` and `ops`. */
-function op(kind: AssetPrimitiveOp['kind'], nodePath = 'Root/Node'): AssetOp {
-  return { kind, nodePath } as unknown as AssetOp;
+function op(kind: RvAssetPrimitiveOp['kind'], nodePath = 'Root/Node'): RvAssetOp {
+  return { kind, nodePath } as unknown as RvAssetOp;
 }
 
-function composite(...ops: AssetOp[]): AssetOp {
-  return { kind: 'composite', ops } as unknown as AssetOp;
+function composite(...ops: RvAssetOp[]): RvAssetOp {
+  return { kind: 'composite', ops } as unknown as RvAssetOp;
 }
 
 describe('assetOpTouchesHierarchy', () => {
@@ -37,7 +36,7 @@ describe('assetOpTouchesHierarchy', () => {
     ['transformNode', false],
     ['setField', false],
     ['unsetField', false],
-  ] as Array<[AssetPrimitiveOp['kind'], boolean]>)('%s → %s', (kind, expected) => {
+  ] as Array<[RvAssetPrimitiveOp['kind'], boolean]>)('%s → %s', (kind, expected) => {
     expect(assetOpTouchesHierarchy(op(kind))).toBe(expected);
   });
 
@@ -60,7 +59,7 @@ describe('classifyAssetOpRaycastImpact', () => {
     ['removeComponent', true],
     ['createNode', true],       // conservative: redo-restore may re-attach a subtree
     ['reparentNode', true],     // BVH bakes world positions AND registry paths
-  ] as Array<[AssetPrimitiveOp['kind'], boolean]>)('%s → full rebuild', (kind) => {
+  ] as Array<[RvAssetPrimitiveOp['kind'], boolean]>)('%s → full rebuild', (kind) => {
     expect(classifyAssetOpRaycastImpact(op(kind))).toEqual({ rebuild: true, refitPaths: [] });
   });
 

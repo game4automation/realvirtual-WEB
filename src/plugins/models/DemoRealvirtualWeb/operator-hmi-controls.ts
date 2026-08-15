@@ -35,6 +35,23 @@ export class OperatorHmiControlsPlugin implements RVViewerPlugin {
     this.off = subscribeHmiVisible(sync);
   }
 
+  /**
+   * plan-435: the `hmiVisible` subscription and the `operator-hmi` context
+   * both live until `dispose()`, so the fallback would leave the engineering
+   * controls hidden behind a switched-off plugin. Release both — no model
+   * state is involved (invariant 3).
+   */
+  onDeactivate(): void {
+    this.off?.();
+    this.off = null;
+    deactivateContext(OPERATOR_HMI_CONTEXT);
+  }
+
+  /** Re-bridge the store to the context. `registerUIElement` is idempotent. */
+  onActivate(): void {
+    this.onModelLoaded();
+  }
+
   dispose(): void {
     this.off?.();
     this.off = null;

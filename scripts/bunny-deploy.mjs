@@ -13,9 +13,23 @@
  * Credentials come exclusively from env (no EditorPrefs, no hardcoded secret).
  * See `.env.example`. Exit code: 0 = OK, 1 = error.
  *
+ * Three forms, two axes — WHICH CODE is compiled in, and WHICH CONTENT ships with it:
+ *
+ *   form        code tier                      content                     target
+ *   ----------  -----------------------------  --------------------------  -------------
+ *   (default)   core only (AGPL, stubs)        public demo (scenes, lib)   {path}/
+ *   --demo      commercial (all 15 features)   public demo (scenes, lib)   {path}/
+ *   --private   commercial + customer project  customer project only       {code}/
+ *
+ * `--demo` is the hosted demo of the full commercial product (ADR-047): the private
+ * TypeScript is compiled in and never published — chunks yes, sources and `.map` no. It is
+ * the public form in every other respect: same remote prefix, same model allowlist, same
+ * scene pruning, same SEO/GA/news injection, same GLB signing.
+ *
  * Usage:
  *   node scripts/bunny-deploy.mjs                          # public deploy (build + upload)
  *   node scripts/bunny-deploy.mjs --path demo              # public, custom remote prefix
+ *   node scripts/bunny-deploy.mjs --demo --path demo --base /demo/   # commercial demo
  *   node scripts/bunny-deploy.mjs --private --project "Kunde XY"
  *   node scripts/bunny-deploy.mjs --private --list         # list private projects
  *   node scripts/bunny-deploy.mjs --force                  # skip diff, upload all
@@ -52,6 +66,7 @@ import { generateFragmentSecret, bytesToBase64Url, base64UrlToBytes } from './li
 import { loadSigningConfig, signGlbFile } from './rv-sign-glb.mjs';
 import {
   assertBuildProvenance,
+  assertNoCrossTierLeak,
   loadDeliveryConfig,
   runBuild as runFilteredBuild,
   stageFilteredSourceTree,
@@ -131,20 +146,65 @@ function assertSaneBase(base) {
 
 // ─── Build ───────────────────────────────────────────────────────────────
 
-function stageAndBuild({ mode, projectDir = null, base = null, dryRun = false }) {
+//! The staging profile of the `--demo` form: the FULL commercial tier and nothing beyond it.
+//! `restrictedFeatures: []` is the load-bearing half — agents and omniverse are restricted, so
+//! an empty entitlement list is what keeps them (and the whole internal tier) out of a
+//! publicly hosted build. It is exactly the profile a commercial customer without extras
+//! receives, which is the point: the demo shows what a customer gets.
+const DEMO_PROFILE = Object.freeze({ tier: 'commercial', restrictedFeatures: [] });
+
+export function stageAndBuild({ mode, projectDir = null, base = null, dryRun = false }) {
+  const demo = mode === 'demo';
   const privateRoot = projectDir ? dirname(dirname(projectDir)) : join(ROOT, '..', 'realvirtual-WebViewer-Private~');
   const projectKey = projectDir ? projectDir.split(/[\\/]/).filter(Boolean).pop() : null;
   const delivery = projectKey ? loadDeliveryConfig(privateRoot, projectKey) : null;
+  const profile = demo ? DEMO_PROFILE : (delivery ?? { tier: 'core', restrictedFeatures: [] });
   const staged = stageFilteredSourceTree({
     coreRoot: ROOT,
     privateRoot,
     projectKey,
     delivery,
-    profile: delivery ?? { tier: 'core', restrictedFeatures: [] },
+    profile,
+    // The two things that make this the DEMO staging rather than a customer delivery:
+    // the public demo content stays (a commercial tier would otherwise drop it), and no
+    // customer workspace is generated (there is no customer, and no delivery config to
+    // generate one from).
+    ...(demo ? { includePublicDemoContent: true, workspaceFiles: false } : {}),
   });
+  // The staged private tree is what gets compiled, so this is the check that the internal
+  // tier never entered the demo build in the first place — before Vite, before any upload.
+  if (demo) assertNoCrossTierLeak(staged.workspaceRoot, staged.manifest, profile);
   const build = runFilteredBuild(staged.workspaceRoot, { mode, base, dryRun, projectKey });
   if (!dryRun) assertBuildProvenance(build.distDir, { mode, projectKey });
   return { ...staged, ...build };
+}
+
+//! Refuses to publish a build output that carries source code: any `.map` (a sourcemap next
+//! to a commercial chunk IS the private TypeScript) or any `.ts`/`.tsx` that a copied
+//! `public/` folder dragged along.
+//!
+//! Three independent layers already point the same way — `sourcemap: false` in vite.config.ts,
+//! the `delete env.RV_SOURCEMAP` in the demo build env, and the `.map` skip in
+//! collectLocalFiles — and that is the reason this one exists: it is the only one that FAILS
+//! instead of silently doing the right thing, so a regression in any of the three is loud.
+function assertNoPublishableSource(distDir) {
+  const offenders = [];
+  const walk = (dir, prefix) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(join(dir, entry.name), rel);
+      else if (/\.(?:map|ts|tsx|mts|cts)$/i.test(entry.name)) offenders.push(rel);
+    }
+  };
+  walk(distDir, '');
+  if (offenders.length) {
+    throw new Error(
+      `Refusing to deploy: ${offenders.length} source artifact(s) in ${distDir} — `
+      + `${offenders.slice(0, 10).join(', ')}${offenders.length > 10 ? ', …' : ''}. `
+      + 'A .map next to a commercial chunk is the private source code itself. '
+      + 'Rebuild without RV_SOURCEMAP=1.',
+    );
+  }
 }
 
 function signGlbsInDirectory(rootDir, signing) {
@@ -230,15 +290,18 @@ export async function uploadDirectory(client, localDir, remotePrefix, {
 
 async function deployPublic(cfg, opts) {
   const remotePrefix = opts.path ?? cfg.remotePath;
-  const filtered = stageAndBuild({ mode: 'public', base: opts.base, dryRun: opts.dryRun });
+  // `--demo` swaps the code tier and nothing else: same prefix, same content pipeline below.
+  const mode = opts.demo ? 'demo' : 'public';
+  const filtered = stageAndBuild({ mode, base: opts.base, dryRun: opts.dryRun });
   const distDir = filtered.distDir;
   if (opts.dryRun) {
-    log(`${DIM}[dry-run] filtered public source staged; no build/upload performed${RESET}`);
+    log(`${DIM}[dry-run] filtered ${mode} source staged; no build/upload performed${RESET}`);
     rmSync(filtered.workspaceRoot, { recursive: true, force: true });
     return;
   }
   if (!existsSync(distDir)) throw new Error(`Filtered build output not found: ${distDir}`);
   assertNoDevArtifacts(distDir);
+  assertNoPublishableSource(distDir);
 
   // The DemoRealvirtual content is bundled: it lives in `public/` (models/,
   // scenes/, library/), so Vite has already copied it into dist/ as part of the
@@ -302,7 +365,7 @@ async function deployPublic(cfg, opts) {
 
   log('');
   log(`${MAGENTA}realvirtual WebViewer · Bunny Deploy${RESET}`);
-  info('mode', 'public');
+  info('mode', opts.demo ? 'demo  (commercial code · public demo content)' : 'public');
   info('zone', `${cfg.storageZone}  region ${cfg.region}`);
   info('remote', `${remotePrefix || '(root)'}/`);
 
@@ -608,6 +671,7 @@ async function main() {
   }
   const opts = {
     private: hasFlag('private'),
+    demo: hasFlag('demo'),
     project: getArg('project', null),
     list: hasFlag('list'),
     path: getArg('path', null),
@@ -619,6 +683,11 @@ async function main() {
     noPurge: hasFlag('no-purge'),
   };
   assertSaneBase(opts.base);
+  if (opts.private && opts.demo) {
+    throw new Error('--demo and --private are different deploy forms: --demo publishes the '
+      + 'commercial code on the PUBLIC demo content, --private publishes one customer project. '
+      + 'Pick one.');
+  }
 
   // --list does not need full credentials.
   if (opts.private && opts.list) {

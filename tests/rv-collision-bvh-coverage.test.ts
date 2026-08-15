@@ -25,8 +25,9 @@ import { Mesh } from 'three';
 import type { BufferGeometry } from 'three';
 import { computeBVHAsync } from '../src/core/engine/rv-scene-loader';
 import { createInlineBVHPort } from '../src/core/engine/rv-bvh-build-port';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
-const MODEL = '/models/DemoRobotIK.glb';
+const MODEL = DEV_GLB.robotIK;
 
 describe('BVH coverage on the reference model (plan-394 Phase 0)', () => {
   it('builds a boundsTree for every non-skipped mesh geometry', async () => {

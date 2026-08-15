@@ -514,4 +514,39 @@ describe('Agv zones — claim before entry, hold at the entrance, release after 
     expect(zones.holderCount('X')).toBe(0);
     expect(spacing.size).toBe(0);
   });
+
+  it('queue-order regression: a follower never claims a zone ACROSS its leader (gridlock)', () => {
+    // Same corridor, two vehicles in a row before the zone entrance. The
+    // follower's LookAhead reaches the entrance PAST its leader; claiming there
+    // would invert the queue: the follower holds the zone, the leader waits at
+    // the entrance for it, the follower waits behind the leader — gridlock
+    // (plan-921 field finding). The follower must leave the claim to the leader.
+    const net = getDefaultPathNetwork();
+    net.register(linePath('In', 0, 0, 10, { successors: ['Cross'] }));
+    net.register(linePath('Cross', 0, 10, 13, { successors: ['Out'], zone: 'X' }));
+    net.register(linePath('Out', 0, 13, 20));
+    const host = makeHost();
+    const CFG2 = { TargetSpeed: 500, UseAcceleration: false, LookAhead: 5000, SafetyDistance: 1500, MinGap: 200, HeadwayGain: 2 };
+    const leader = makeAgv('Leader', { ...CFG2, PathId: 'In', StartPosition: 9500 });
+    const follower = makeAgv('Follower', { ...CFG2, PathId: 'In', StartPosition: 7000 });
+    // Bind + tick the FOLLOWER FIRST — the order that used to let it claim
+    // the entrance before the leader's walk ran.
+    const hF = bindAgv(follower, host);
+    const hL = bindAgv(leader, host);
+    const zones = getDefaultZoneRegistry();
+
+    for (let i = 0; i < 3000; i++) {
+      iterateFixedUpdate(hF, TICK);
+      iterateFixedUpdate(hL, TICK);
+      expect(zones.holderCount('X')).toBeLessThanOrEqual(1);
+      // The inversion itself: the follower must never hold the zone while the
+      // leader is still between it and the entrance (leader on 'In').
+      if (zones.isHolder('X', 'Follower')) {
+        expect(leader.position.z).toBeGreaterThan(10 - 1e-6);
+      }
+    }
+    // No gridlock: both passed through the zone.
+    expect(leader.position.z).toBeGreaterThan(13.5);
+    expect(follower.position.z).toBeGreaterThan(13.5);
+  });
 });

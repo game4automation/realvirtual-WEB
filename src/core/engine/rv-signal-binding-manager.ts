@@ -44,12 +44,15 @@ import {
   type MappedSignalSlot,
   type SlotScope,
 } from './rv-binding-slot-resolver';
+import { findRepairCandidate, type RepairRejectReason } from './rv-binding-repair';
 import {
   claimBound,
   claimForced,
+  clearSlotWriteRole,
   makeSignalChannelId,
   makeSlotId,
   registerSlotChannel,
+  registerSlotWriteRole,
   releaseBound,
   releaseForced,
   setInstanceLiveControlled,
@@ -74,6 +77,26 @@ export const MAX_FLUSH_DRAIN_CYCLES = 8;
 export type ElementBindingState = 'unbound' | 'live' | 'pending' | 'disconnected' | 'conflict';
 export type SlotLiveness = 'pending' | 'live' | 'hold' | 'disconnected' | 'conflict';
 type SlotRole = 'control' | 'feedback' | 'unknown';
+
+/**
+ * One model slot a CONNECT source signal drives — the row shape of
+ * {@link SignalBindingManager.getLinksForSource}.
+ *
+ * `slot` is the IDENTITY (raw slot key); `componentType` + `label` are the
+ * display pair added by plan-353 F2 and may be absent (slot fixtures without a
+ * resolvable registry instance). A renderer therefore falls back
+ * `label ?? slot`, and omits the type prefix entirely when `componentType` is
+ * missing — never a placeholder like "Component".
+ */
+export interface SourceLink {
+  path: string;
+  slot: string;
+  placedId: string;
+  /** rv_extras component key of the owning instance (e.g. `Drive_Simple`). */
+  componentType?: string;
+  /** Human-readable slot name (label SSOT); falls back to `slot` when absent. */
+  label?: string;
+}
 
 /** One active relay for a single (placedId, slot). */
 interface SlotBinding {
@@ -115,6 +138,24 @@ interface SlotBinding {
     | { kind: 'feedback' };
 }
 
+/**
+ * A saved mapping the last apply could not bind (plan-425 F4).
+ *
+ * `candidateComponentPath` present = the case-B second pass found EXACTLY one
+ * plausible new home and a human may confirm it. Absent = `reason` says why no
+ * offer is being made. Never both: an offer and an excuse are different answers.
+ */
+export interface UnresolvedMapping {
+  mapping: SignalMapping;
+  /** The single slot a repair would move this mapping to, when there is one. */
+  candidateComponentPath?: string;
+  /** Why no repair is offered. Absent exactly when a candidate is present. */
+  reason?: RepairRejectReason;
+}
+
+/** Shared empty result — `getUnresolvedMappings` is called per render. */
+const EMPTY_UNRESOLVED: readonly UnresolvedMapping[] = Object.freeze([]);
+
 interface ElementEntry {
   node: Object3D;
   /** slot → binding. */
@@ -138,6 +179,8 @@ export class SignalBindingManager {
   holdMs = DEFAULT_HOLD_MS;
 
   private readonly _elements = new Map<string, ElementEntry>();
+  /** Per element: what the last applyMappings could NOT bind (plan-425 F4). */
+  private readonly _unresolved = new Map<string, UnresolvedMapping[]>();
   /**
    * Resolution scope per element id, registered by whoever creates the bind
    * target (`findSignalBindTarget`): Planner placements aggregate their whole
@@ -252,6 +295,10 @@ export class SignalBindingManager {
 
     const sourceName = mapping.signal;
     const role = this._deriveSlotRole(resolved);
+    // Mirror the role out to the authority service (plan-353 F6) so the write
+    // gate can tell a COMMAND slot from a FEEDBACK slot. The derivation itself
+    // stays here — this is a publication, not a second source of truth.
+    registerSlotWriteRole(slotId, role);
 
     let initialLiveness: SlotLiveness = 'pending';
     // Provider auto-resolution applies ONLY to CONNECT sources — an internal
@@ -367,6 +414,10 @@ export class SignalBindingManager {
     // The store-level force itself (channel) is untouched.
     releaseForced(binding.slotId);
     releaseBound(binding.slotId);
+    // The role is binding state too (plan-353 F6): without the binding there is
+    // nothing to keep it in step, and a stale `feedback` would keep granting a
+    // write right to a slot nobody drives any more.
+    clearSlotWriteRole(binding.slotId);
     unregisterSlotChannel(binding.slotId);
     entry.bindings.delete(key!);
     if (binding.sink.kind === 'command') binding.sink.neutralize();
@@ -414,25 +465,75 @@ export class SignalBindingManager {
       setInstanceLiveControlled(s.drive, false);
     }
     this._elements.delete(placedId);
+    // The finding belongs to the element, not to the session: an element that is
+    // gone has no broken links to report. applyMappings re-populates it straight
+    // after its own unbindAll, so this does not erase a fresh diagnosis.
+    this._unresolved.delete(placedId);
     this.onStateChanged?.(placedId);
   }
 
-  /** Apply a whole list of mappings for an element (used on load / picker save). */
+  /**
+   * Apply a whole list of mappings for an element (used on load / picker save).
+   *
+   * Mappings that do not resolve are still dropped — that part is unavoidable,
+   * a binding to a slot that is not there cannot be honoured. What changed with
+   * plan-425 F4 is that they are no longer dropped in SILENCE: each one is
+   * recorded, with a second-pass look for where the slot went, and the result is
+   * readable via {@link getUnresolvedMappings}. The old `.filter()` swallowed
+   * whole broken restores without a word, and the user's report — "my links are
+   * gone" — had nothing on the screen to corroborate it.
+   */
   applyMappings(placedId: string, node: Object3D, mappings: readonly SignalMapping[]): SignalMapping[] {
     this.unbindAll(placedId);
     const entry = this._ensureElement(placedId, node);
-    const applied = mappings
-      .filter((mapping) => {
-        const requestedKind = mapping.kind ?? 'mapped-signal';
-        return entry.slots.some((slot) =>
-          slot.kind !== 'unavailable'
-          && slot.kind === requestedKind
-          && slot.slot === mapping.slot
-          && (mapping.componentPath === undefined || slot.componentPath === mapping.componentPath));
-      })
-      .map((mapping) => ({ ...mapping }));
+    const applied: SignalMapping[] = [];
+    const unresolved: UnresolvedMapping[] = [];
+    for (const mapping of mappings) {
+      const requestedKind = mapping.kind ?? 'mapped-signal';
+      const resolves = entry.slots.some((slot) =>
+        slot.kind !== 'unavailable'
+        && slot.kind === requestedKind
+        && slot.slot === mapping.slot
+        && (mapping.componentPath === undefined || slot.componentPath === mapping.componentPath));
+      if (resolves) {
+        applied.push({ ...mapping });
+        continue;
+      }
+      // Second pass (case B). It NEVER binds — `findRepairCandidate` returning a
+      // path means "a human could confirm this", not "this is it". See
+      // rv-binding-repair for why an apparently unique match is not proof.
+      const lookup = findRepairCandidate(mapping, entry.slots.filter(
+        (slot): slot is Exclude<BindableSlot, { kind: 'unavailable' }> =>
+          slot.kind !== 'unavailable' && slot.kind === requestedKind));
+      unresolved.push({
+        mapping: { ...mapping },
+        ...(lookup.found
+          ? { candidateComponentPath: lookup.componentPath }
+          : { reason: lookup.reason }),
+      });
+    }
+    // Set unconditionally: an element that resolves cleanly must CLEAR a stale
+    // finding from an earlier load, or a repaired binding keeps being reported.
+    if (unresolved.length > 0) this._unresolved.set(placedId, unresolved);
+    else this._unresolved.delete(placedId);
     for (const m of applied) this.bind(placedId, node, m);
     return applied;
+  }
+
+  /**
+   * Mappings the last {@link applyMappings} for this element could not bind.
+   *
+   * Empty is the normal answer. A non-empty one is the raw material for the
+   * orphan notice and the bindings overview — including, where the second pass
+   * found exactly one, the slot a repair would move the mapping to.
+   */
+  getUnresolvedMappings(placedId: string): readonly UnresolvedMapping[] {
+    return this._unresolved.get(placedId) ?? EMPTY_UNRESOLVED;
+  }
+
+  /** Every element with unbindable mappings, for whole-scene reporting. */
+  getAllUnresolvedMappings(): ReadonlyMap<string, readonly UnresolvedMapping[]> {
+    return this._unresolved;
   }
 
   // ─── tick ────────────────────────────────────────────────────────────
@@ -618,15 +719,26 @@ export class SignalBindingManager {
    * For each linked CONNECT source signal, the model element(s) it drives —
    * node path + slot + placedId. Lets the interface signal list show WHAT a
    * signal is linked to and navigate to it on click.
+   *
+   * `componentType` / `label` are the DISPLAY pair (plan-353 F2), taken from the
+   * resolved slot that this binding already holds — no second lookup and no
+   * second humanisation: `resolved.label` is the label SSOT
+   * (`rv-binding-slot-resolver.ts`, plan-341 Phase 4) and `componentType` is the
+   * technical rv_extras key, shown verbatim (`Drive_Simple`, not "Drive").
+   * Both stay OPTIONAL — hand-built slot fixtures legitimately have neither, and
+   * `slot` above remains the identity a consumer keys on.
    */
-  getLinksForSource(): Map<string, { path: string; slot: string; placedId: string }[]> {
-    const map = new Map<string, { path: string; slot: string; placedId: string }[]>();
+  getLinksForSource(): Map<string, SourceLink[]> {
+    const map = new Map<string, SourceLink[]>();
     for (const [placedId, entry] of this._elements) {
       const path = NodeRegistry.computeNodePath(entry.node);
       for (const b of entry.bindings.values()) {
         if (!b.mapping.enabled) continue;
         const arr = map.get(b.sourceName) ?? [];
-        arr.push({ path, slot: b.mapping.slot, placedId });
+        const link: SourceLink = { path, slot: b.mapping.slot, placedId };
+        if (b.resolved.componentType !== undefined) link.componentType = b.resolved.componentType;
+        if (b.resolved.label !== undefined) link.label = b.resolved.label;
+        arr.push(link);
         map.set(b.sourceName, arr);
       }
     }
@@ -703,6 +815,7 @@ export class SignalBindingManager {
     for (const [placedId] of [...this._elements]) this.unbindAll(placedId);
     this._elements.clear();
     this._scopes.clear();
+    this._unresolved.clear();
     this._feedbackWriters.clear();
     for (const k in this._pendingWrites) delete this._pendingWrites[k];
   }
@@ -727,6 +840,12 @@ export class SignalBindingManager {
     if (nextRole !== b.role) {
       if (b.role === 'feedback') this._releaseFeedbackWriter(b);
       b.role = nextRole;
+      // Keep the gate's mirror in step (plan-353 F6). The role really does
+      // change at runtime — the derivation depends on the store type and the
+      // provider count, both of which arrive after a gateway connect — so a
+      // register-once-at-bind mirror would go stale on exactly the transition
+      // that matters (unknown → feedback once the PLC type is known).
+      registerSlotWriteRole(b.slotId, nextRole);
       b.fanInConflict = false;
       if (b.role === 'feedback') this._claimFeedbackWriter(b);
     } else if (b.role === 'feedback' && b.fanInConflict) {
@@ -737,6 +856,8 @@ export class SignalBindingManager {
       b.holdTimer = 0;
       return;
     }
+
+    this._resolveLateProvider(b);
 
     if (b.role === 'unknown' || b.fanInConflict || this._slotConflict(b)) {
       b.liveness = 'conflict';
@@ -812,6 +933,55 @@ export class SignalBindingManager {
     }
 
     b.liveness = 'disconnected';
+  }
+
+  /**
+   * Late provider resolution (plan-421 F2) — the fix for "the order must not
+   * matter".
+   *
+   * `bind()` resolves a names-only CONNECT mapping (no `interfaceId`) against
+   * the providers that happen to exist AT THAT MOMENT, exactly once. Load the
+   * model before CONNECT is up and there are none, so the binding stays
+   * `pending` forever — the reported "links are gone after reload". Running the
+   * same resolution per tick makes model→connect and connect→model end in the
+   * same state, with or without a persisted `interfaceId`.
+   *
+   * Hot path: a resolved binding costs one truthy check. An unresolved one adds
+   * an allocation-free provider COUNT; the allocating identity lookup happens
+   * ONCE, at the transition to exactly one provider. More than one provider is
+   * left to the conflict branch below — never guess.
+   *
+   * ATOMIC (SOL-R1-3): the feedback claim is keyed by (interfaceId, topic,
+   * signal), which the empty `interfaceId` is part of. The old claim is
+   * therefore released BEFORE the identity moves and re-taken after — releasing
+   * afterwards would look up a key that no longer exists and strand the writer
+   * entry, so fan-in would misreport for the rest of the session.
+   *
+   * Purely IN-MEMORY: no persistence, no ops, no undo entries, no events
+   * (plan-421 decision log; persist-back is the F4 follow-up). A reload simply
+   * resolves again. Once resolved, the identity is STABLE: if that provider
+   * disappears the binding drops out of `live` rather than silently adopting a
+   * different provider of the same signal name (SOL-R2-4 — no guessing).
+   */
+  private _resolveLateProvider(b: SlotBinding): void {
+    if (b.mapping.interfaceId) return;
+    if (b.resolved.kind === 'direct-property') return;
+    if (mappingSourceKind(b.mapping) !== 'connect') return;
+    if (this._store.getSignalProviderCount(b.sourceName) !== 1) return;
+    const providers = this._store.getSignalProviders(b.sourceName);
+    const provider = providers.length === 1 ? providers[0] : undefined;
+    // An empty interfaceId would stay falsy and re-enter this path every tick.
+    if (!provider?.interfaceId) return;
+
+    this._releaseFeedbackWriter(b);
+    b.mapping.interfaceId = provider.interfaceId;
+    b.mapping.topic = provider.topic;
+    b.feedbackKey = signalSourceKey({
+      interfaceId: provider.interfaceId,
+      ...(provider.topic !== undefined ? { topic: provider.topic } : {}),
+      signal: b.sourceName,
+    });
+    this._claimFeedbackWriter(b);
   }
 
   // Role derivation reads ONLY the SLOT side (targetName / descriptor) — an

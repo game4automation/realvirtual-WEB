@@ -2,25 +2,67 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-scene-storage — localStorage CRUD for the unified Scene model.
+ * rv-scene-storage — the `rv-scenes/*` keyspace.
  *
  * Keyspace:
  *   rv-scenes-index                  JSON: RvSceneMeta[] (sorted modifiedAt desc)
  *   rv-scenes/<id>                   JSON: RvScene
  *   rv-scenes/active                 JSON: { id: string }
- *   rv-scenes/draft/<baseKey>        JSON: RvScene  (per-base autosaved draft —
- *                                                    fresh built-in / empty
- *                                                    workspaces with no saved id)
- *   rv-scenes/scene-draft/<savedId>  JSON: RvScene  (per-saved-scene autosaved
- *                                                    draft — survives reload via
- *                                                    openScene; keyed by id so
- *                                                    multiple scenes built on
- *                                                    the same base don't collide)
+ *   rv-scenes/draft/<baseKey>        DEAD SLOT — cleared, never read or written
+ *   rv-scenes/scene-draft/<savedId>  DEAD SLOT — cleared, never read or written
  *
- * Pure CRUD — no React, no Three.js, no DOM. Imported by SceneStore and tests.
+ * ## This is no longer a catalogue of user content (plan-716 Phase 6)
+ *
+ * It was: every scene a user owned was a row here, minted by `newSceneId()`.
+ * F1 ended that. `newSceneId()` is deleted, `SceneStore` writes nothing here,
+ * and the eager migration (`rv-workspace-migration.ts`) converts every row it
+ * finds into a GLB document and RETIRES the original under `rv-scenes-retired/`.
+ * A profile that has booted once has an empty index.
+ *
+ * Three things still use these keys, and each is a READ or a cache — never a
+ * new artefact:
+ *
+ *  1. **The migration**, which reads rows and bodies to convert them, and needs
+ *     {@link removeScenesFromIndex} to drop a row whose bytes it has retired.
+ *  2. **The folder-project scene cache.** `ProjectStore.hydrateScene()` and
+ *     `_applyFolderScene()` mirror a folder's scene into `rv-scenes/<id>` and
+ *     `rv-project-conflict.ts` compares the two on the next open — the
+ *     documented "never a silent overwrite" net. Those rows carry
+ *     `readSceneOwner(id).cachedFrom`, which is why the migration skips them
+ *     (§2.3 step 0), and they outlive this phase deliberately: they can only go
+ *     once that comparison is expressed over document revisions, and doing it by
+ *     revision alone would be weaker than the content comparison it replaces
+ *     (see the note in `resolveSceneConflict` step 4).
+ *  3. **The active-id pointer**, {@link readActiveId}, which resolves through
+ *     the permanent alias map and so answers with a documentId.
+ *
+ * `tests/scene-removal-guard.test.ts` pins that list: a fourth writer of this
+ * keyspace is a regression, not a feature.
+ *
+ * ## Both draft keyspaces are dead (plan-397 phase 7, plan-413 phase 6)
+ *
+ * `writeDraft` and `writeSceneDraft` went first: since plan-397 phase 6 an
+ * autosave is a GLB body, and leaving a second way to persist an op log would
+ * have meant two writers with two formats and no rule about which wins. The
+ * READERS survived one release, so a draft written by the previous version
+ * still resumed. That release is over: both readers are gone with the rest of
+ * the JSON scene reader, and what remains of the two keyspaces is the `clear*`
+ * half, which removes keys without parsing them and is what stops the old slots
+ * accumulating.
+ *
+ * `writeScene` stores a ROW (base + empty ops) rather than a body:
+ * `rv-scenes/<id>` is the index entry, and the scene itself is the GLB it
+ * points at. A row still carrying the op-log generation gets the F10 error —
+ * see {@link readScene}.
+ *
+ * Pure CRUD — no React, no Three.js, no DOM.
  */
 
+import { resolveDocumentId } from '../../project/rv-doc-alias';
+import { LegacyFormatError } from '../../project/rv-legacy-format';
 import {
+  isLegacySchemaVersion,
+  isSupportedSchemaVersion,
   type RvScene,
   type RvSceneMeta,
   type SceneBase,
@@ -90,7 +132,13 @@ function sceneDraftKey(id: string): string {
 // instead of vanishing. A build with no subscriber behaves exactly as before.
 
 export interface SceneStorageError {
-  op: 'write-scene' | 'write-index' | 'write-draft';
+  /**
+   * `write-alias` is the migration's (plan-716 §2.3d): the alias write is the
+   * one localStorage write whose failure must ABORT its row rather than be
+   * swallowed, and it is announced here so it reaches the same banner as every
+   * other quota failure instead of inventing a second channel for one caller.
+   */
+  op: 'write-scene' | 'write-index' | 'write-draft' | 'write-alias';
   /** Scene id, where one is known. */
   id?: string;
   cause: unknown;
@@ -122,6 +170,19 @@ function reportStorageError(error: SceneStorageError): void {
   for (const l of [...storageErrorListeners]) {
     try { l(error); } catch { /* a bad listener must not break a save */ }
   }
+}
+
+/**
+ * Announce a persistence failure raised OUTSIDE this module (plan-716 §2.3d).
+ *
+ * The workspace migration writes into two keyspaces this module does not own
+ * (`rv-doc-alias/`, `rv-scenes-retired/`) and must reach the same subscribers:
+ * the banner that tells the user their storage is full is the same banner
+ * whichever key ran out of room. Exported rather than duplicated so there stays
+ * ONE list of listeners and one "last error" for a poller to read.
+ */
+export function reportSceneStorageError(error: SceneStorageError): void {
+  reportStorageError(error);
 }
 
 // ─── Index ──────────────────────────────────────────────────────────────
@@ -163,16 +224,31 @@ function removeMeta(id: string): void {
 
 // ─── Scene CRUD ─────────────────────────────────────────────────────────
 
+/**
+ * Read one catalogue row.
+ *
+ * A row of the op-log generation **throws** {@link LegacyFormatError} rather
+ * than reading as absent (plan-413 F10). The difference is the whole point:
+ * {@link LegacyFormatError} names the release that can still convert, which is
+ * actionable; a `null` here would delete the user's scene from the list on the
+ * next index rewrite and say nothing.
+ *
+ * The parse itself still fails soft — an unparseable key is corruption, not a
+ * format decision, and there is nothing a user can do about it.
+ */
 export function readScene(id: string): RvScene | null {
+  let parsed: RvScene;
   try {
     const raw = localStorage.getItem(sceneKey(id));
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as RvScene;
-    if (parsed?.schemaVersion !== 2) return null;
-    return parsed;
+    parsed = JSON.parse(raw) as RvScene;
   } catch {
     return null;
   }
+  if (isLegacySchemaVersion(parsed?.schemaVersion)) {
+    throw new LegacyFormatError('localstorage-scene-v2', sceneKey(id));
+  }
+  return isSupportedSchemaVersion(parsed?.schemaVersion) ? parsed : null;
 }
 
 /**
@@ -199,13 +275,42 @@ export function deleteScene(id: string): void {
     /* ignore */
   }
   removeMeta(id);
-  // If active was this scene, clear it.
-  if (readActiveId() === id) writeActiveId(null);
+  // If active was this scene, clear it. Compared against the STORED pointer:
+  // the resolving read would answer with a document id for a migrated scene and
+  // never match the `scn_` id being deleted here.
+  if (readStoredActiveId() === id) writeActiveId(null);
 }
 
 // ─── Active scene ───────────────────────────────────────────────────────
 
+/**
+ * The id of whatever was open last — ALIAS-TOLERANT since plan-716 §2.4.
+ *
+ * The pointer is written by a session and read by the next one, so the update
+ * that migrates the catalogue lands squarely between the two: the stored value
+ * is a `scn_` id and the thing it names is now a document. Resolving here rather
+ * than at the (twelve) call sites is what makes that invisible to all of them —
+ * they asked "what should I reopen", and the honest answer is the document.
+ *
+ * A pointer with no alias comes back unchanged, which is every pre-migration
+ * profile and every id the migration did not touch (a folder project's cache
+ * row, for one).
+ */
 export function readActiveId(): string | null {
+  const stored = readStoredActiveId();
+  if (stored === null) return null;
+  return resolveDocumentId(stored);
+}
+
+/**
+ * The pointer exactly as stored, alias unresolved.
+ *
+ * For the one caller that has to compare against what was WRITTEN rather than
+ * what it resolves to — {@link deleteScene}, which clears the pointer when the
+ * scene it names is deleted and would otherwise miss a pointer whose alias
+ * target differs from the id being deleted.
+ */
+export function readStoredActiveId(): string | null {
   try {
     const raw = localStorage.getItem(LS_KEY_ACTIVE);
     if (!raw) return null;
@@ -227,26 +332,6 @@ export function writeActiveId(id: string | null): void {
 }
 
 // ─── Per-base draft slots ───────────────────────────────────────────────
-
-export function readDraft(base: SceneBase): RvScene | null {
-  try {
-    const raw = localStorage.getItem(draftKey(base));
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as RvScene;
-    if (parsed?.schemaVersion !== 2) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-
-export function writeDraft(base: SceneBase, scene: RvScene): void {
-  try {
-    localStorage.setItem(draftKey(base), JSON.stringify(scene));
-  } catch {
-    /* quota */
-  }
-}
 
 export function clearDraft(base: SceneBase): void {
   try {
@@ -294,30 +379,7 @@ export function listDraftBaseKeys(): string[] {
 
 // ─── Per-saved-scene draft slots ────────────────────────────────────────
 //
-// Drafts for workspaces that have a saved scene (`SceneStore._saved != null`)
-// are keyed by saved-scene id so they survive reload via `openScene(id)`
-// and don't collide with the source built-in's own draft slot. Same shape
-// as the per-base helpers above; just a different keyspace.
-
-export function readSceneDraft(id: string): RvScene | null {
-  try {
-    const raw = localStorage.getItem(sceneDraftKey(id));
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as RvScene;
-    if (parsed?.schemaVersion !== 2) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-
-export function writeSceneDraft(id: string, scene: RvScene): void {
-  try {
-    localStorage.setItem(sceneDraftKey(id), JSON.stringify(scene));
-  } catch {
-    /* quota */
-  }
-}
+// A dead keyspace, kept only so the keys can be removed. See the file header.
 
 export function clearSceneDraft(id: string): void {
   try {
@@ -337,6 +399,27 @@ export function listSceneDraftIds(): string[] {
     }
   }
   return out;
+}
+
+/**
+ * Drop rows from the INDEX only, leaving their `rv-scenes/<id>` bodies alone
+ * (plan-716 §2.3 step 4).
+ *
+ * The migration needs exactly this and nothing stronger. {@link deleteScene}
+ * would remove the body key, and the migration does not remove it — it RETIRES
+ * it under `rv-scenes-retired/`, which is a write it has to perform itself
+ * because only it knows the graveyard's shape. Splitting the two lets a crash
+ * between them be repaired: an index without a row is the finished state, a
+ * retired key without an index entry is the finished state, and both together
+ * is a state the re-run resolves.
+ *
+ * Rows the migration could NOT convert are simply not passed in, which is what
+ * keeps them listed and retried on the next boot (§2.3d).
+ */
+export function removeScenesFromIndex(ids: readonly string[]): void {
+  if (ids.length === 0) return;
+  const doomed = new Set(ids);
+  writeIndex(listMetas().filter(m => !doomed.has(m.id)));
 }
 
 // ─── Bulk helpers ───────────────────────────────────────────────────────

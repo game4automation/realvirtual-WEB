@@ -190,6 +190,12 @@ export class MultiuserPlugin extends RVBehavior {
 
   // ── Avatar manager ──
   private _avatarManager: AvatarManager | null = null;
+  /** plan-435: the avatar manager parked by `onDeactivate`. Every incoming
+   *  message handler bails on a null `_avatarManager`, so parking it here is
+   *  what actually suspends remote presence while the room stays joined. */
+  private _suspendedAvatars: AvatarManager | null = null;
+  /** Last known participants, so `onActivate` can put the avatars back. */
+  private _suspendedPlayers: PlayerInfo[] = [];
 
   // ── Outgoing avatar_update throttle ──
   // _sendAccumulator accumulates dt; a message is only sent when it reaches _sendInterval.
@@ -417,6 +423,46 @@ export class MultiuserPlugin extends RVBehavior {
     }
   }
 
+  /**
+   * plan-435: switching this plugin off is a LOCAL diagnostic action. The
+   * inherited `onModelCleared` would run `onDestroy()` and leave the multiuser
+   * room — visible to every other participant, and irreversible from a
+   * checkbox. So the session stays joined and only local presence is
+   * suspended: remote avatars leave the scene, view-following stops, buffered
+   * sync is dropped.
+   *
+   * Invariant 3: nothing model-owned is released here. `onModelCleared` keeps
+   * doing the real teardown; it also drains the parked manager below.
+   */
+  onDeactivate(): void {
+    if (this._suspendedAvatars) return;   // idempotent
+    this._stopFollowing();
+    this._pendingDriveSync = null;
+    this._pendingMUSync = null;
+    const manager = this._avatarManager;
+    if (!manager) return;
+    this._suspendedPlayers = manager.getPlayers().slice();
+    manager.clear();
+    this._suspendedAvatars = manager;
+    this._avatarManager = null;
+    this._emitChanged();
+  }
+
+  /**
+   * Restore local presence. The last known participants are re-added straight
+   * away; their poses re-sync with the next `avatar_broadcast` and the roster
+   * is corrected by the next `room_state`.
+   */
+  onActivate(): void {
+    const manager = this._suspendedAvatars;
+    if (!manager) return;
+    this._avatarManager = manager;
+    this._suspendedAvatars = null;
+    for (const player of this._suspendedPlayers) manager.addAvatar(player);
+    this._suspendedPlayers = [];
+    this._emitChanged();
+  }
+
   protected onDestroy(): void {
     this._destroyed = true;
     this._clearReconnect();
@@ -424,6 +470,10 @@ export class MultiuserPlugin extends RVBehavior {
     this._disconnect();
     this._avatarManager?.clear();
     this._avatarManager = null;
+    // A suspended manager still owns Three.js resources — drain it too.
+    this._suspendedAvatars?.clear();
+    this._suspendedAvatars = null;
+    this._suspendedPlayers = [];
     this._inRoom = false;
   }
 

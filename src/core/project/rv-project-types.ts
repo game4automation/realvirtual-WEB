@@ -31,10 +31,23 @@
  * deletion). See `rv-project-storage.mergeManifest`.
  */
 
+import type { DocumentClassification } from './rv-document-classification';
+
 // ─── Constants ──────────────────────────────────────────────────────────
 
-/** Current manifest schema version. */
-export const RV_PROJECT_SCHEMA_VERSION = 1;
+/**
+ * Current manifest schema version.
+ *
+ * **2** since plan-413: the manifest carries one `documents[]` list. Phase 6
+ * made that a requirement rather than an offer — {@link isValidProjectV2} now
+ * insists on the list, and a stored manifest that only has the three legacy
+ * arrays gets exactly one chance to become one, in `migrateProjectDocuments`
+ * inside `readManifest()`.
+ */
+export const RV_PROJECT_SCHEMA_VERSION = 2;
+
+/** The version before plan-413 — the one the delivery scripts still write. */
+export const RV_PROJECT_SCHEMA_VERSION_V1 = 1;
 
 /** Manifest filename at the project root. */
 export const PROJECT_MANIFEST_FILE = 'project.json';
@@ -98,11 +111,31 @@ export interface RvProjectSceneEntry {
    * a stale manifest claim a level it does not have. See `rv-project-tiers`.
    */
   forkedFrom?: string;
+  /**
+   * Content revision of the stored body — SHA-256 hex (plan-397 §2.8).
+   *
+   * The compare-and-swap token of {@link SceneWrite}. Optional because every
+   * manifest written before plan-397 lacks it, and a missing revision means
+   * "unknown", never "empty": a write that wants a precondition has to read
+   * the body first, which is the honest cost of not having one recorded.
+   */
+  revision?: string;
   [key: string]: unknown;
 }
 
 /** `{path, label, sha256, sizeBytes}` artefact reference (models[], library[]). */
 export interface RvProjectAssetEntry {
+  /**
+   * Stable identity of the artefact, independent of where it currently sits
+   * (plan-397 F2, §2.7).
+   *
+   * Until now `path` was the de-facto key, which made every rename a broken
+   * reference: an `AssetReference` resolves by id **first** and falls back to
+   * the path, so a moved file keeps its referrers. Optional, because a
+   * manifest written before this plan has none — `assetEntryKey()` is the one
+   * place that decides what to use.
+   */
+  id?: string;
   path: string;
   label?: string;
   sha256?: string;
@@ -110,6 +143,128 @@ export interface RvProjectAssetEntry {
   thumbnail?: string;
   /** Path of the bundled entry this one was forked from (§2.3). */
   forkedFrom?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * The key an artefact is addressed by: its id when it has one, else its path.
+ *
+ * The fallback is what makes the `id` field additive — an entry without one
+ * behaves exactly as it did before, and gaining an id later does not change
+ * the answer for anybody who still refers to it by path.
+ */
+export function assetEntryKey(entry: RvProjectAssetEntry): string {
+  const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+  return id !== '' ? id : entry.path;
+}
+
+/** Mint an artefact id. Same shape rationale as {@link newProjectId}. */
+export function newAssetId(): string {
+  return 'ast_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+/**
+ * One document of the project — the entry type that replaces all three
+ * (plan-413 §2.3).
+ *
+ * `RvProjectSceneEntry` and `RvProjectAssetEntry` described the same thing from
+ * two directions: a GLB the project owns, plus whatever the section it happened
+ * to sit in needed. Since plan-397 they are literally the same bytes; the
+ * difference that survives is a **role** ("this one is opened", "this one is
+ * referenced"), and a role is not a type.
+ *
+ * Two fields are worth reading twice:
+ *
+ *  - **`id` is mandatory** (F2). It is what a reference, a fork and a move all
+ *    survive on. `RvProjectAssetEntry.id` was optional because the manifests
+ *    that predate plan-397 have none — the documents migration mints one for
+ *    every entry that arrives without, which is why this field can be required
+ *    while the old one stays optional.
+ *  - **`classification` is a CACHE.** The truth lives in the GLB's root extras
+ *    (`rv-document-classification`). When the two disagree, the file wins and
+ *    this field is replaced, never merged (§2.5).
+ *
+ * The index signature is the same forward-compatibility contract the other
+ * entry types carry: a field written by a newer client survives a save by this
+ * one.
+ */
+export interface RvDocumentEntry {
+  /** Mandatory (F2). The migration mints one for every entry that lacks it. */
+  id: string;
+  /** Where the bytes are, relative to the project. A bare id for the browser backend. */
+  path: string;
+  name: string;
+  /** Cache of the GLB's own classification. The file wins on conflict (§2.5). */
+  classification?: DocumentClassification;
+  /** Which storage surface holds the bytes — see `DocumentSection`. */
+  section?: 'scenes' | 'models' | 'library';
+  /** SHA-256 of the body — the compare-and-swap token from plan-397. */
+  revision?: string;
+  createdAt?: string;
+  modifiedAt?: string;
+  thumbnail?: string;
+  /** Id of the bundled entry this one was forked from (§2.3). */
+  forkedFrom?: string;
+  /** Id of the document this one was copied from (plan-413 §2.7, phase 5). */
+  copiedFrom?: string;
+  sizeBytes?: number;
+  sha256?: string;
+  /**
+   * The collections the user filed this document under (plan-717 §2.4).
+   *
+   * The row is the ONE home for it. Until plan-717 the same information lived
+   * in `library/library.json`, a sidecar nothing in production read back — so
+   * the field is not a duplicate of that file, it is its successor. Folder
+   * chips derived from the path are a different thing (a *place*, not a
+   * filing) and are computed by the catalog, never stored here.
+   */
+  collections?: string[];
+  /**
+   * When the adopt verb first found this row's file missing, ISO-8601
+   * (plan-717 §2.2 step 4).
+   *
+   * A quarantine mark, not a tombstone: the row is still fully live, and the
+   * next run that finds the file again deletes the field. Removal needs a
+   * LATER run *and* a mark older than the quarantine window, which is what
+   * keeps a half-copied folder or a lagging cloud sync from costing a user
+   * their collections. Absent on every healthy row — the normal state.
+   */
+  missingSince?: string;
+  /**
+   * Modification time recorded at the last classification scan, epoch ms.
+   *
+   * Half of the `(size, mtime)` pre-filter of §2.5 — the half that makes "a scan
+   * over a hundred unchanged documents reads zero GLBs" true. Never a
+   * correctness input: a wrong mtime costs one needless read, never a wrong
+   * answer, because the GLB is what the read then believes.
+   */
+  mtimeMs?: number;
+  /**
+   * The CONNECT configuration file this document is bound to (plan-718 §2.3).
+   *
+   * A project-relative path — never a name, never a folder convention. Two rows
+   * may carry the SAME value and that is the point (N:1): switching between two
+   * documents bound to one config is not a config change, so the workers keep
+   * running. Absent means "no binding", which is a valid state and not an error.
+   */
+  connectRef?: string;
+  /**
+   * The project's own code for this document (plan-718 §2.6).
+   *
+   * Project-relative path of the `.ts` source. Replaces the module's
+   * self-declaration `models: string[]`, which bound code to a GLB FILE NAME and
+   * therefore broke on every rename. This binding hangs on the row, whose id is
+   * frozen at birth (plan-717), so renaming or moving the GLB cannot break it.
+   */
+  scriptRef?: string;
+  /**
+   * The knowledge file for this document (plan-718 §2.3, stage 3).
+   *
+   * Project-relative path. The file it points at is what references the PDFs and
+   * the RAG index — this field never names them itself, so no `docs/` or `rag/`
+   * folder convention is implied.
+   */
+  knowledgeRef?: string;
   [key: string]: unknown;
 }
 
@@ -159,6 +314,21 @@ export interface RvProjectVendorBlock {
   [key: string]: unknown;
 }
 
+/**
+ * What a project folder IS (plan-434 §2.6).
+ *
+ * Operator-facing metadata: the browser neither sets nor reads it, but it must
+ * know the field exists, because the manifest is read-modify-written here and an
+ * unknown section is carried through, never dropped. The Node side is the
+ * authority — `PROJECT_KINDS` in `scripts/_rv-guards.mjs`, kept in the same
+ * three spellings.
+ *
+ *  - `customer` — real customer material, delivered, under an NDA.
+ *  - `demo` — something shown publicly.
+ *  - `internal` — test fixtures, scratch, spikes.
+ */
+export type RvProjectKind = 'customer' | 'demo' | 'internal';
+
 /** Who wrote this manifest last, and with what. */
 export interface RvProjectProvenance {
   createdBy?: string;
@@ -185,6 +355,12 @@ export interface RvProject {
   modifiedAt?: string;
   provenance?: RvProjectProvenance;
   /**
+   * What this project is — customer material, a demo, or internal (plan-434).
+   * Optional here on purpose: a manifest written before phase 2 has none, and
+   * `isValidProjectV1` never rejects a manifest over a missing optional field.
+   */
+  kind?: RvProjectKind;
+  /**
    * Vendor/customer split used by the customer-delivery merge (plan-700).
    * Absent means "the whole project is customer-owned" — nothing is updated.
    */
@@ -198,12 +374,38 @@ export interface RvProject {
   /** Deploy settings (`{ defaultModel }`). NOT the settings bundle — see `settingsRef`. */
   settings?: Record<string, unknown>;
 
-  // ── artefact sections (all optional) ──
-  models?: RvProjectAssetEntry[];
-  library?: RvProjectAssetEntry[];
+  // ── the one artefact list (plan-413 §2.4 step B) ──
+  /**
+   * Every document the project owns — the **only** artefact list.
+   *
+   * `scenes[]`, `models[]` and `library[]` are gone from this type as of phase
+   * 6. They may still be present in a stored manifest nobody has opened since,
+   * and the index signature carries them through the parse; what reads them is
+   * `migrateProjectDocuments`, once, on the way in. Nothing writes them.
+   *
+   * Optional in the type and mandatory in practice: `readManifest()` migrates
+   * or refuses (F10), so every project this build hands out has one. The `?`
+   * exists for the moment before that, and for a hand-built fixture.
+   */
+  documents?: RvDocumentEntry[];
+
+  /**
+   * Folders that exist even though nothing is in them.
+   *
+   * Every other folder in the tree is DERIVED from the paths in `documents[]`,
+   * which is why an empty one had no way to exist: delete the last file and the
+   * folder went with it. A user who makes a folder before they have anything to
+   * put in it is stating an intent, and this is where that intent is recorded.
+   *
+   * Paths are project-relative, `/`-separated, no leading or trailing slash —
+   * the same spelling `documents[].path` uses. A folder that later holds a
+   * document may stay listed here or not; the tree unions the two, so neither
+   * answer changes what is on screen.
+   */
+  folders?: string[];
+
   /** External catalog subscriptions that travel with the project (§2.6.3). */
   libraries?: RvProjectLibraryRef[];
-  scenes?: RvProjectSceneEntry[];
   activeSceneId?: string | null;
   /**
    * Ids/paths the user has hidden (§2.3.2).
@@ -215,13 +417,44 @@ export interface RvProject {
   hidden?: string[];
   docs?: { indexRef?: string; basePath?: string; [key: string]: unknown };
   aasx?: { indexRef?: string; basePath?: string; [key: string]: unknown };
-  connect?: Record<string, unknown>;
+  /**
+   * Project-wide CONNECT references (plan-718 §2.3).
+   *
+   * Narrowed from `Record<string, unknown>` (K10): the loose form was a
+   * placeholder nothing ever read or wrote, and leaving it open would have let a
+   * second, undeclared shape grow next to the two fields that are actually
+   * resolved. Unknown keys still travel through — the index signature keeps
+   * forward-compatibility without pretending the schema is unknown.
+   */
+  connect?: {
+    /** Path of the agents/diagnosis section file CONNECT feeds its config pipeline from. */
+    agentsRef?: string;
+    /** Path of the gitignored secrets sidecar. Defaults to {@link DEFAULT_SECRETS_REF}. */
+    secretsRef?: string;
+    /**
+     * Path of the RAG bundle CONNECT unpacks for the diagnosis feature
+     * (plan-718 stage 3.3).
+     *
+     * Declared here because CONNECT already reads it (`ProjectManifest.RagRef`)
+     * and an undeclared field that one side resolves is exactly the drift the
+     * cross-language fixture exists to prevent. The bundle is the project's
+     * artefact; the generations CONNECT extracts from it stay host-local under
+     * the data root and are never referenced from a manifest.
+     */
+    ragRef?: string;
+    [key: string]: unknown;
+  };
   /** Reference to `settings/project-settings.json`. Named `settingsRef` on purpose. */
   settingsRef?: { ref: string; [key: string]: unknown };
   /** Reserved for the shared-roots follow-up plan. Accepted, never written here. */
   sharedRoots?: Array<{ name: string; purpose?: string; hint?: string; [key: string]: unknown }>;
-  rag?: Record<string, unknown>;
-  plugins?: { entry?: string; models?: string[]; [key: string]: unknown };
+  // `rag` and `plugins` used to sit here as typed placeholders. Neither was ever
+  // read or written anywhere in `src/`, `scripts/` or `tests/`, and plan-718
+  // gives both of them a real home on the document row instead
+  // (`knowledgeRef`, `scriptRef`). They are removed rather than kept as a third
+  // schema beside the two that resolve (K10). The manifest's index signature
+  // still carries them through untouched on an old file — removing the type
+  // removes the *invitation*, not the data.
   attachments?: Array<{ path: string; label?: string; kind?: string; [key: string]: unknown }>;
 
   /** Unknown/future sections travel through untouched. */
@@ -230,7 +463,7 @@ export interface RvProject {
 
 // ─── Id + slug ──────────────────────────────────────────────────────────
 
-/** Mint a project id. Same shape rationale as `newSceneId()`. */
+/** Mint a project id: short, sortable, unique enough for a client-side id. */
 export function newProjectId(): string {
   return 'prj_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
 }
@@ -250,27 +483,64 @@ export function canonicalNameOf(name: string): string {
   return slug || 'project';
 }
 
-// ─── Scene filenames (RR1) ──────────────────────────────────────────────
+// ─── Declared folders ───────────────────────────────────────────────────
 
 /**
- * Derive the on-disk filename for a scene. **Never derived from the name
- * alone** (RR1).
+ * Normalise a folder path to the one spelling the manifest stores.
  *
- * Scene names are not unique: `_uniqueSceneName()` is used only by
- * `addPublishedToMyScenes`, while `rename()` and `saveAs()` check nothing.
- * The pre-existing `exportSceneJSON` download name
- * (`scene.name.replace(/\s+/g,'_')`) is fine for a one-off browser download
- * but catastrophic for a managed folder: two scenes called "Cell" would
- * slug onto the same file, and with the delete semantics of §4d one could
- * remove the other's data.
- *
- * The id is therefore part of the filename and carries the uniqueness; the
- * slug is only there so a human (and a git diff) can read the folder.
+ * Empty string for anything that is not a usable path, so callers can reject
+ * with a single falsy check instead of repeating the rules.
  */
-export function sceneFileNameFor(scene: { id: string; name?: string }): string {
-  const slug = canonicalNameOf(scene.name ?? '').slice(0, 40);
-  return `${slug}-${sceneIdToken(scene.id)}.scene.json`;
+export function normaliseFolderPath(raw: string | null | undefined): string {
+  return (raw ?? '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .join('/');
 }
+
+/**
+ * The folders a project declares, de-duplicated and in manifest order.
+ *
+ * Defensive like every reader in this layer: a malformed or future-shaped
+ * `folders[]` yields an empty list rather than a throw.
+ */
+export function readProjectFolders(project: RvProject | null | undefined): string[] {
+  const raw = project?.folders;
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'string') continue;
+    const path = normaliseFolderPath(item);
+    if (!path || out.includes(path)) continue;
+    out.push(path);
+  }
+  return out;
+}
+
+/**
+ * Return a manifest whose `folders[]` is exactly `paths`.
+ *
+ * Passing an empty list removes the section rather than writing `[]`, so a
+ * project that never declared a folder stays byte-identical — the same rule
+ * {@link RvProject.libraries} follows.
+ */
+export function withProjectFolders(project: RvProject, paths: readonly string[]): RvProject {
+  const wanted: string[] = [];
+  for (const p of paths) {
+    const path = normaliseFolderPath(p);
+    if (path && !wanted.includes(path)) wanted.push(path);
+  }
+  if (wanted.length === 0) {
+    if (project.folders === undefined) return project;
+    const { folders: _dropped, ...rest } = project;
+    return rest as RvProject;
+  }
+  return { ...project, folders: wanted };
+}
+
+// ─── Scene filenames (RR1) ──────────────────────────────────────────────
 
 /** Filesystem-safe token derived from a scene id. Distinct ids yield distinct tokens. */
 export function sceneIdToken(id: string): string {
@@ -279,9 +549,25 @@ export function sceneIdToken(id: string): string {
   return safe || 'unknown';
 }
 
-/** Full manifest path (`scenes/<file>`) for a scene. */
-export function sceneRelPathFor(scene: { id: string; name?: string }): string {
-  return `${PROJECT_FOLDER.scenes}/${sceneFileNameFor(scene)}`;
+/**
+ * On-disk filename for a scene. **Never derived from the name alone** (RR1).
+ *
+ * Scene names are not unique: `_uniqueSceneName()` is used only by
+ * `addPublishedToMyScenes`, while `rename()` and `saveAs()` check nothing. Two
+ * scenes called "Cell" would slug onto the same file, and with the delete
+ * semantics of §4d one could remove the other's data.
+ *
+ * The id is therefore part of the filename and carries the uniqueness; the
+ * slug is only there so a human (and a git diff) can read the folder.
+ */
+export function sceneGlbFileNameFor(scene: { id: string; name?: string }): string {
+  const slug = canonicalNameOf(scene.name ?? '').slice(0, 40);
+  return `${slug}-${sceneIdToken(scene.id)}.scene.glb`;
+}
+
+/** Full manifest path (`scenes/<file>.scene.glb`) for a GLB scene. */
+export function sceneGlbRelPathFor(scene: { id: string; name?: string }): string {
+  return `${PROJECT_FOLDER.scenes}/${sceneGlbFileNameFor(scene)}`;
 }
 
 /** Split a `scenes/<file>` ref into its filename. Tolerates a bare filename. */
@@ -308,9 +594,15 @@ export function isValidProjectV1(value: unknown): value is RvProject {
   if (typeof p.id !== 'string' || p.id.trim() === '') return false;
   if (typeof p.name !== 'string' || p.name.trim() === '') return false;
 
-  if (p.scenes !== undefined) {
-    if (!Array.isArray(p.scenes)) return false;
-    for (const raw of p.scenes) {
+  // The three legacy arrays are no longer part of the type, but a stored
+  // manifest that has not been migrated yet still carries them, and their shape
+  // is what `migrateProjectDocuments` is about to read. Checking it here is what
+  // turns "malformed legacy array" into a refusal at the door rather than a
+  // half-built `documents[]` further in.
+  const legacyScenes = (p as { scenes?: unknown }).scenes;
+  if (legacyScenes !== undefined) {
+    if (!Array.isArray(legacyScenes)) return false;
+    for (const raw of legacyScenes) {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
       const e = raw as Record<string, unknown>;
       if (typeof e.id !== 'string' || e.id.trim() === '') return false;
@@ -318,8 +610,8 @@ export function isValidProjectV1(value: unknown): value is RvProject {
     }
   }
 
-  if (!isOptionalAssetList(p.models)) return false;
-  if (!isOptionalAssetList(p.library)) return false;
+  if (!isOptionalAssetList((p as { models?: unknown }).models)) return false;
+  if (!isOptionalAssetList((p as { library?: unknown }).library)) return false;
 
   if (p.activeSceneId !== undefined && p.activeSceneId !== null && typeof p.activeSceneId !== 'string') {
     return false;
@@ -361,6 +653,36 @@ export function isValidProjectV1(value: unknown): value is RvProject {
   return true;
 }
 
+/**
+ * Validate a manifest of schema 2 — a v1-shaped manifest that **has**
+ * `documents[]`.
+ *
+ * Hard since phase 6, and that is the change: through the transition this
+ * accepted a manifest with no `documents[]` at all, because a v1 manifest was
+ * a v2 manifest that had not been migrated yet. There is no transition left to
+ * be in. A manifest reaching this check without a document list has either been
+ * through {@link migrateProjectDocuments} — which builds one from the legacy
+ * arrays — or it is something this build cannot open, and saying so out loud
+ * (F10) is the whole point of the gate.
+ *
+ * `documents[]` itself is checked on `id` and `path`, the two fields every
+ * later step keys off. An entry without them is not forward compatibility; it
+ * is a bug in whoever wrote it, and carrying it further would surface as a
+ * document that cannot be selected, referenced or moved.
+ */
+export function isValidProjectV2(value: unknown): value is RvProject {
+  if (!isValidProjectV1(value)) return false;
+  const p = value as Record<string, unknown>;
+  if (!Array.isArray(p.documents)) return false;
+  for (const raw of p.documents) {
+    if (!isPlainObject(raw)) return false;
+    const e = raw as Record<string, unknown>;
+    if (typeof e.id !== 'string' || e.id.trim() === '') return false;
+    if (typeof e.path !== 'string' || e.path.trim() === '') return false;
+  }
+  return true;
+}
+
 function isOptionalAssetList(value: unknown): boolean {
   if (value === undefined) return true;
   if (!Array.isArray(value)) return false;
@@ -384,7 +706,7 @@ export function newProject(name: string): RvProject {
     createdAt: now,
     modifiedAt: now,
     provenance: { generator: 'realvirtual WEB', lastWriter: 'web' },
-    scenes: [],
+    documents: [],
     activeSceneId: null,
     settingsRef: { ref: PROJECT_SETTINGS_REF },
   };

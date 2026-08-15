@@ -20,7 +20,11 @@ import type { RVViewer } from '../rv-viewer';
 import type { SignalStore } from '../engine/rv-signal-store';
 import { getConsumedFields } from '../engine/rv-extras-validator';
 import { getFieldDescriptor, getSignalSlotFields, isFieldDisplayReadonly, isSignalSlotField } from '../engine/rv-component-registry';
-import { ComponentSignalSlots } from '../../plugins/signal-bind/InlineSignalSlots';
+import {
+  ComponentSignalSlots,
+  isPLCSignalComponent,
+  PLCSignalSlot,
+} from '../../plugins/signal-bind/InlineSignalSlots';
 import { signalTypeBadgeColor } from './signal-colors';
 import {
   baseComponentType,
@@ -386,6 +390,15 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
     const symbol = typeof data.Name === 'string' ? data.Name : (nodePath.split('/').pop() ?? nodePath);
     const valueText = signalValue ?? '—';
     const valueColor = getSignalHeaderColor(componentType, String(valueText));
+    // Unity's `Signal.Comment` — the one line of prose that says what a tag is
+    // FOR. It already travels in rv_extras and is already indexed on the store
+    // (rv-signal-construction registerSignal), and the badge tooltip and the
+    // picker have shown it for a while; this card was the surface that dropped
+    // it (plan-425 F1). Read through the SAME store metadata the other surfaces
+    // read — a second pipeline straight out of `userData.realvirtual` would be
+    // free to disagree with them. Absent comment renders NO row, so the card
+    // does not grow an empty line for the majority of signals that have none.
+    const comment = signalStore?.getSignalMeta(symbol)?.comment;
     return (
       <Box>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, px: 1, py: 0.375, bgcolor: color + '11', borderBottom: `1px solid ${color}22`, borderTop: `1px solid ${color}22` }}>
@@ -407,6 +420,12 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
           <Typography sx={{ fontSize: 11, color: INK_LOW, width: 64, flexShrink: 0 }}>Value</Typography>
           <Typography sx={{ fontSize: 11, fontFamily: 'monospace', color: valueColor, fontWeight: 500 }}>{valueText}</Typography>
         </Box>
+        {comment && (
+          <Box sx={{ display: 'flex', alignItems: 'flex-start', px: 1, py: 0.15 }}>
+            <Typography sx={{ fontSize: 11, color: INK_LOW, width: 64, flexShrink: 0 }}>Comment</Typography>
+            <Typography sx={{ fontSize: 11, color: INK_MED }}>{comment}</Typography>
+          </Box>
+        )}
         {extraContent}
       </Box>
     );
@@ -551,6 +570,18 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
           nodePath={nodePath}
           componentType={componentType}
           data={data}
+        />
+      )}
+
+      {/* plan-418 F6: a raw PLC signal node (PLCInput… / PLCOutput…) IS the
+          signal, so its section gets the ONE synthetic `Value` bind row — same row component,
+          same persistence, and the only surface that also explains a
+          fail-closed slot (duplicate name / unregistered signal). */}
+      {isPLCSignalComponent(base) && (
+        <PLCSignalSlot
+          viewer={viewer}
+          nodePath={nodePath}
+          componentType={componentType}
         />
       )}
 

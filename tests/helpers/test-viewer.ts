@@ -21,6 +21,7 @@
 
 import { EventEmitter } from '../../src/core/rv-events';
 import { TickStage } from '../../src/core/rv-tick-stages';
+import { SignalReapplyRegistry } from '../../src/core/engine/rv-signal-reapply-registry';
 
 /** Minimal MU snapshot — only counters that the reset tests inspect. */
 export interface TestTransportManager {
@@ -76,9 +77,12 @@ export interface TestViewer {
    * In normal usage (createTestViewer()) this is always initialized non-null.
    */
   signalStore: TestSignalStore | null;
+  /** Viewer-owned re-apply registry (plan-427), mirroring `RVViewer.signalReapply`.
+   *  `resetSimulation()` runs `reapplyAll()` on it as its last step. */
+  signalReapply: SignalReapplyRegistry;
   /** User-facing reset facade — emits simulation-reset → (engine clear) →
-   *  simulation-resetstat → simulation-start, mirroring RVViewer. Clears MUs +
-   *  LogicSteps and resets drives; leaves signals alone. */
+   *  simulation-resetstat → simulation-start → signal re-apply, mirroring
+   *  RVViewer. Clears MUs + LogicSteps and resets drives; leaves signals alone. */
   resetSimulation(): void;
   /** Plugin map (for layout-planner tests that do `viewer.getPlugin('layout-planner')`). */
   _plugins: Map<string, unknown>;
@@ -301,6 +305,7 @@ export function createTestViewer(options: CreateTestViewerOptions = {}): TestVie
     transportManager,
     logicEngine,
     get signalStore(): TestSignalStore | null { return currentSignalStore; },
+    signalReapply: new SignalReapplyRegistry(),
     resetSimulation(): void {
       // Mirror RVViewer.resetSimulation()'s three-phase orchestration (minus the
       // statisticsManager the mock doesn't carry): RESET → engine clear →
@@ -311,6 +316,9 @@ export function createTestViewer(options: CreateTestViewerOptions = {}): TestVie
       logicEngine.reset();
       emitter.emit('simulation-resetstat', undefined);
       emitter.emit('simulation-start', undefined);
+      // plan-427: last step, AFTER the start subscribers — same position as in
+      // RVViewer, so ordering assertions carry over.
+      viewer.signalReapply.reapplyAll();
     },
     _plugins: plugins,
     getPlugin<T = unknown>(id: string): T | undefined {

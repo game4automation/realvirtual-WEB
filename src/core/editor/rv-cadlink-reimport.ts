@@ -28,7 +28,7 @@ import type { RVViewer } from '../rv-viewer';
 import type { AssetDocument } from './rv-asset-document';
 import { getCadProvider, cadFormatOfName } from './rv-cad-provider';
 import { parseGlbSubtree } from '../engine/rv-glb-parse';
-import { assetOpHeader } from './rv-asset-ops';
+import { assetOpHeader, type CADLinkExtras } from './rv-asset-ops';
 import { dedupeSiblingNames } from './rv-asset-executors';
 import { deepCloneJSON } from '../ops/rv-op-utils';
 
@@ -163,21 +163,42 @@ export async function reimportCad(
   const oldRoot = viewer.registry?.getNode(cadRootPath);
   if (!oldRoot) throw new Error(`CAD root not found: ${cadRootPath}`);
 
-  const { glb, cadlink } = await provider.importFile(file, quality);
-  // Parse the converted GLB once: this tree is BOTH what we diff the old
-  // revision against and what the document inserts (handed over via opts.root),
-  // so the matching is done on exactly the nodes that end up in the scene.
-  const newRoot = await parseGlbSubtree(glb);
+  // ── The base swap starts HERE, not at the transaction (plan-710 §2.4) ──
+  //
+  // Everything below until `endBaseSwap` is preparation against the OUTGOING
+  // tree, and it takes seconds (tessellation, GLB parse). An edit the user
+  // makes in that window targets nodes the transaction is about to delete: it
+  // would be applied to a tree on its way out and recorded into the history of
+  // the tree coming in. The gate refuses those ops inside the queue — the same
+  // contract `SceneStore` has had against a scene load.
+  doc.beginBaseSwap();
+  let glb: ArrayBuffer;
+  let cadlink: CADLinkExtras;
+  let newRoot: Object3D;
+  let oldMap: Map<string, Object3D>;
+  let newMap: Map<string, Object3D>;
+  try {
+    ({ glb, cadlink } = await provider.importFile(file, quality));
+    // Parse the converted GLB once: this tree is BOTH what we diff the old
+    // revision against and what the document inserts (handed over via opts.root),
+    // so the matching is done on exactly the nodes that end up in the scene.
+    newRoot = await parseGlbSubtree(glb);
 
-  // Same sibling-name dedup the importCad executor applies at insertion —
-  // done BEFORE matching so old tree (deduped at its own import) and new
-  // tree carry identical unique names and carry-over paths target the right
-  // instance. The executor re-run on this root is an idempotent no-op.
-  dedupeSiblingNames(newRoot);
+    // Same sibling-name dedup the importCad executor applies at insertion —
+    // done BEFORE matching so old tree (deduped at its own import) and new
+    // tree carry identical unique names and carry-over paths target the right
+    // instance. The executor re-run on this root is an idempotent no-op.
+    dedupeSiblingNames(newRoot);
 
-  // Collect the preservation work BEFORE any mutation.
-  const oldMap = relativePathMap(oldRoot);
-  const newMap = relativePathMap(newRoot);
+    // Collect the preservation work BEFORE any mutation.
+    oldMap = relativePathMap(oldRoot);
+    newMap = relativePathMap(newRoot);
+  } finally {
+    // Unconditionally: a gate left standing would silently swallow every later
+    // edit, which is worse than the hazard it guards. The re-import's own ops
+    // run after this point and must apply.
+    doc.endBaseSwap();
+  }
   const report: ReimportReport = { matched: 0, unmatched: [], newUnmapped: [] };
 
   /**

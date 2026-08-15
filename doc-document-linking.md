@@ -37,9 +37,9 @@ The index maps the **AAS id** (as authored on the Unity `AASLink` component and 
 
 ```json
 {
-  "http://smart.festo.com/aas/99920200617190044000012858": {
+  "http://smart.festo.com/aas/1234567890": {
     "file": "24_Festo.aasx",
-    "idShort": "Festo_EMME-AS-40-M-LV-AS_99920200617190044000012858"
+    "idShort": "Festo_EMME-AS-40-M-LV-AS"
   }
 }
 ```

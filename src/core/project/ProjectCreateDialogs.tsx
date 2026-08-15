@@ -162,6 +162,67 @@ export function NewProjectDialog(
   );
 }
 
+/** Pending "rename this project" request. */
+export interface ProjectRenameRequest {
+  id: string;
+  name: string;
+}
+
+export interface ProjectRenameDialogProps {
+  request: ProjectRenameRequest | null;
+  onChange: (next: ProjectRenameRequest | null) => void;
+  onConfirm: () => void;
+}
+
+/**
+ * Rename a project's display name.
+ *
+ * The folder keeps its name on purpose: the folder name is the stable thing
+ * links, recents and the workspace scan hang on to, and the copy says so —
+ * a rename that silently moved a folder would break every one of them.
+ */
+export function ProjectRenameDialog(
+  { request, onChange, onConfirm }: ProjectRenameDialogProps,
+) {
+  const canSubmit = (request?.name.trim().length ?? 0) > 0;
+  return (
+    <Dialog open={request !== null} onClose={() => onChange(null)} maxWidth="xs" fullWidth>
+      <DialogTitle sx={{ fontSize: 14, fontWeight: 600 }}>Rename project</DialogTitle>
+      <DialogContent>
+        <DialogContentText sx={{ fontSize: 13 }}>
+          Only the display name changes — the folder keeps its name.
+        </DialogContentText>
+        <TextField
+          autoFocus
+          fullWidth
+          size="small"
+          label="Project name"
+          value={request?.name ?? ''}
+          onChange={e => onChange(request ? { ...request, name: e.target.value } : request)}
+          // Enter is the expected way out of a single-field dialog.
+          onKeyDown={e => { if (e.key === 'Enter' && canSubmit) onConfirm(); }}
+          sx={{ mt: 2 }}
+        />
+      </DialogContent>
+      <DialogActions>
+        <Button size="small" onClick={() => onChange(null)} sx={{ textTransform: 'none' }}>
+          Cancel
+        </Button>
+        <Button
+          size="small"
+          variant="contained"
+          data-testid="project-rename-confirm"
+          disabled={!canSubmit}
+          onClick={onConfirm}
+          sx={{ textTransform: 'none' }}
+        >
+          Rename
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
 export interface FromScenesDialogProps<T extends FromScenesRequest> {
   request: T | null;
   onChange: (next: T | null) => void;

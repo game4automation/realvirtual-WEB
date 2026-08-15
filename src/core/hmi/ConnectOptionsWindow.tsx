@@ -48,6 +48,7 @@ import {
   deleteProfile,
   activateProfile,
   fetchActiveModel,
+  describeProfileBinding,
   type ConnectProfileInfo,
 } from './connect-store';
 import { historianStore, fetchInfluxSettings, saveInfluxSettings, type InfluxDbSettings } from './historian-store';
@@ -238,7 +239,10 @@ function ProfileSection({ onSwitched }: { onSwitched: () => void }) {
             renderValue={(v) => {
               if (!v) return <em style={{ opacity: 0.7 }}>unsaved live configuration</em>;
               const p = profiles.find(x => x.name === v);
-              return p?.model ? `${v} · model: ${p.model}` : v;
+              // plan-718: prefer the manifest binding (documents / connectRef) and fall back to the
+              // deprecated model name, so both gateway generations render something meaningful.
+              const binding = p ? describeProfileBinding(p) : null;
+              return binding ? `${v} · ${binding}` : v;
             }}
           >
             {profiles.length === 0 && (
@@ -248,7 +252,8 @@ function ProfileSection({ onSwitched }: { onSwitched: () => void }) {
               <MenuItem key={p.name} value={p.name} sx={{ fontSize: 12 }}>
                 {p.name}
                 <Typography component="span" sx={{ fontSize: 10, color: 'rgba(255,255,255,0.6)', ml: 0.75 }}>
-                  {p.interfaceCount} interface{p.interfaceCount === 1 ? '' : 's'}{p.model ? ` · model: ${p.model}` : ''}
+                  {p.interfaceCount} interface{p.interfaceCount === 1 ? '' : 's'}
+                  {describeProfileBinding(p) ? ` · ${describeProfileBinding(p)}` : ''}
                 </Typography>
               </MenuItem>
             ))}

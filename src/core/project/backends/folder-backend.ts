@@ -27,28 +27,48 @@ import {
   writeBlobFile,
 } from '../../engine/rv-local-filesystem';
 import { emitSceneMutation } from '../../hmi/scene/rv-scene-mutations';
-import type { RvScene } from '../../hmi/scene/rv-scene-types';
 import {
+  deleteSceneFile,
   readManifest,
-  readSceneFile,
+  readSceneGlbFile,
   readSettingsFile,
   splitRelPath,
+  writeSceneGlbFile,
 } from '../rv-project-storage';
+import { assertReadableScenePath } from '../rv-legacy-format';
+import {
+  assertRevisionPrecondition,
+  glbSceneRecord,
+  revisionOfBytes,
+  type SceneRecord,
+  type SceneRevision,
+  type SceneWrite,
+} from '../rv-scene-record';
 import {
   RVProjectFolderWriter,
   type FolderWriterHost,
   type FolderWriterStatus,
   type FolderWriterStatusListener,
 } from '../rv-project-folder-writer';
-import type {
-  RvProjectAssetEntry,
-  RvProjectSceneEntry,
-  RvProject,
+import {
+  assetDocumentsOf,
+  documentsFromLists,
+  readDocuments,
+  sectionOfDocument,
+  type DocumentStat,
+} from '../rv-project-documents';
+import {
+  type RvDocumentEntry,
+  type RvProjectAssetEntry,
+  type RvProjectSceneEntry,
+  type RvProject,
 } from '../rv-project-types';
 import {
   assertWritable,
+  WriteQueue,
   type ProjectBackend,
   type ResolvedBackendBlob,
+  type WriteBlobOptions,
 } from './project-backend';
 
 export interface FolderBackendOptions {
@@ -78,6 +98,15 @@ export class FolderBackend implements ProjectBackend {
   private _writer: RVProjectFolderWriter | null = null;
   private _active = false;
   private _statusListeners = new Set<FolderWriterStatusListener>();
+  /**
+   * Serialises every write of THIS backend (plan-709 §2.2.1-3).
+   *
+   * The precondition below is a read-then-write, so it has a TOCTOU window by
+   * construction. The queue closes that window for everything inside this tab;
+   * a SECOND tab holding the same folder handle remains racy exactly as it is
+   * today, and is documented as an accepted residual rather than claimed fixed.
+   */
+  private readonly _writes = new WriteQueue();
 
   constructor(dir: FileSystemDirectoryHandle, opts: FolderBackendOptions = {}) {
     this._dir = dir;
@@ -119,8 +148,19 @@ export class FolderBackend implements ProjectBackend {
     return result?.project ?? null;
   }
 
-  readScene(relPath: string): Promise<RvScene | null> {
-    return readSceneFile(this._dir, relPath);
+  /**
+   * Read one scene body. GLB, and nothing else (plan-413 phase 6).
+   *
+   * A `.scene.json` path is refused before any I/O rather than parsed and
+   * found wanting: the bytes of a JSON body are perfectly readable, so a
+   * tolerant reader would hand back a "GLB" that only fails four layers later,
+   * as a broken render instead of a sentence the user can act on.
+   */
+  async readScene(relPath: string): Promise<SceneRecord | null> {
+    assertReadableScenePath(relPath);
+    const meta = await this._entryForPath(relPath);
+    const glb = await readSceneGlbFile(this._dir, relPath);
+    return glb ? glbSceneRecord(glb, { ...meta, path: relPath }) : null;
   }
 
   readSettings(relPath?: string): Promise<unknown | null> {
@@ -130,21 +170,11 @@ export class FolderBackend implements ProjectBackend {
   // ─── Listing ──────────────────────────────────────────────────────────
 
   /**
-   * Scene listing is manifest-driven, on purpose.
-   *
-   * A scene is more than a file: it has an id that other artefacts reference,
-   * a display name, a base and a `modifiedAt` that conflict resolution keys
-   * off. None of that can be recovered from a filename, so `project.json`
-   * stays the source of truth here.
-   */
-  async listScenes(): Promise<RvProjectSceneEntry[]> {
-    return (await this.readManifest())?.scenes ?? [];
-  }
-
-  /**
    * Models are **folder-driven**: every GLB in `models/` belongs to the project.
    *
-   * This is the opposite of {@link listScenes}, and deliberately so. A model has
+   * This is the opposite of the manifest-driven scene half, and deliberately
+   * so — a scene has an id, a display name and a `modifiedAt` that conflict
+   * resolution keys off, none of which can be recovered from a filename. A model has
    * no identity beyond its file — dropping `Machine.glb` into a project's
    * `models/` folder *is* the act of adding it, and requiring a second edit to
    * `project.json` before it appears only produced projects that silently
@@ -155,7 +185,7 @@ export class FolderBackend implements ProjectBackend {
    */
   async listModels(): Promise<RvProjectAssetEntry[]> {
     const declared = new Map(
-      ((await this.readManifest())?.models ?? []).map(e => [e.path, e] as const),
+      assetDocumentsOf(await this.readManifest(), 'models').map(e => [e.path, e] as const),
     );
     const files = await this._listFolderGlbs('models');
     if (files.length === 0) return [];
@@ -201,18 +231,21 @@ export class FolderBackend implements ProjectBackend {
   private async _walkAssets(root: string): Promise<string[]> {
     const dir = await this._resolveDir(root);
     if (!dir) return [];
+    // The empty root is the project itself — its files are paths with no
+    // folder half, not paths starting with a slash.
+    const prefix = root === '' ? '' : `${root}/`;
     const out: string[] = [];
     const subdirs: string[] = [];
     try {
       for await (const [name, handle] of dir.entries()) {
         if (handle.kind === 'directory') {
           // `.thumbnails` and friends are sidecars, not assets.
-          if (!name.startsWith('.')) subdirs.push(`${root}/${name}`);
+          if (!name.startsWith('.')) subdirs.push(`${prefix}${name}`);
           continue;
         }
         const lower = name.toLowerCase();
         if (FolderBackend.ASSET_EXTENSIONS.some(ext => lower.endsWith(ext))) {
-          out.push(`${root}/${name}`);
+          out.push(`${prefix}${name}`);
         }
       }
     } catch {
@@ -224,6 +257,15 @@ export class FolderBackend implements ProjectBackend {
   }
 
   /** Walk a slash-separated folder path down from the project root. */
+  /** {@link _resolveDir}, creating each missing segment as it goes. */
+  private async _createDir(folder: string): Promise<FileSystemDirectoryHandle> {
+    let dir: FileSystemDirectoryHandle = this._dir;
+    for (const segment of folder.split('/').filter(Boolean)) {
+      dir = await getOrCreateSubfolder(dir, segment);
+    }
+    return dir;
+  }
+
   private async _resolveDir(folder: string): Promise<FileSystemDirectoryHandle | null> {
     let dir: FileSystemDirectoryHandle = this._dir;
     for (const segment of folder.split('/').filter(Boolean)) {
@@ -251,11 +293,71 @@ export class FolderBackend implements ProjectBackend {
    */
   async listLibrary(): Promise<RvProjectAssetEntry[]> {
     const declared = new Map(
-      ((await this.readManifest())?.library ?? []).map(e => [e.path, e] as const),
+      assetDocumentsOf(await this.readManifest(), 'library').map(e => [e.path, e] as const),
     );
     const found = await this._walkAssets('library');
     if (found.length === 0) return [];
     return found.map(path => declared.get(path) ?? { path });
+  }
+
+  /**
+   * The one list (plan-413 §2.4) — ONE walk of the whole project tree.
+   *
+   * This used to be composed from the three section listings above, which made
+   * the folder layout a type system through the back door: scenes were
+   * manifest-driven, `models/` and `library/` were each walked separately, and
+   * a GLB anywhere else — the project root included — existed on disk and in
+   * the manifest yet fell out of the list on every rescan. Since plan-716/717 a
+   * section is a *place*, so the scan is now placeless: every asset file
+   * anywhere under the project root (dot-folders excepted) is a document, and
+   * its section is derived from its path exactly as `sectionOfDocument` would
+   * derive it anywhere else.
+   *
+   * The manifest's `documents[]` stays the metadata overlay — it is where the
+   * classification cache lives — but it never adds an entry the folder does
+   * not have, because a document with no bytes is a phantom. That phantom rule
+   * now covers scenes too: a scene row whose body is gone is a card that opens
+   * to nothing, and listing it was the old split's bug, not its feature.
+   */
+  async listDocuments(): Promise<RvDocumentEntry[]> {
+    const manifest = await this.readManifest();
+    const declared = readDocuments(manifest) ?? [];
+    const declaredByPath = new Map(declared.map(d => [d.path, d] as const));
+    const scenes: RvProjectSceneEntry[] = [];
+    const models: RvProjectAssetEntry[] = [];
+    const library: RvProjectAssetEntry[] = [];
+    for (const path of await this._walkAssets('')) {
+      const row = declaredByPath.get(path);
+      const section = sectionOfDocument(row ?? ({ path } as RvDocumentEntry));
+      // The empty id/name are the "mint one for me" markers `documentOfSceneEntry`
+      // has always honoured — a bare file off the scan has no row to speak with.
+      if (section === 'scenes') scenes.push(row ?? { path, id: '', name: '' });
+      else if (section === 'models') models.push(row ?? { path });
+      else library.push(row ?? { path });
+    }
+    return documentsFromLists({ scenes, models, library }, declared);
+  }
+
+  /** Real `(size, mtime)` for every stored document. See the interface. */
+  async statDocuments(): Promise<DocumentStat[]> {
+    // The same one walk the listing uses: a stat for every file that exists,
+    // which is the only kind of stat there is.
+    const paths = await this._walkAssets('');
+
+    const out: DocumentStat[] = [];
+    for (const path of paths) {
+      const { folder, filename } = splitRelPath(path);
+      const dir = folder ? await this._resolveDir(folder) : this._dir;
+      if (!dir) continue;
+      try {
+        const file = await (await dir.getFileHandle(filename)).getFile();
+        out.push({ path, size: file.size, mtime: file.lastModified });
+      } catch {
+        // Gone, or unreadable. No stat means "not scannable", which leaves the
+        // manifest entry alone — the honest answer for a file we cannot see.
+      }
+    }
+    return out;
   }
 
   // ─── Lifecycle (§2.2.1b) ──────────────────────────────────────────────
@@ -285,44 +387,122 @@ export class FolderBackend implements ProjectBackend {
   // ─── Write (delegated — see the file header) ──────────────────────────
 
   /**
-   * Queue a scene body write.
+   * Write a scene GLB into the project folder, under a precondition.
    *
-   * `relPath` is validated against the writer's own view of the manifest
-   * rather than used as a path: RR1 says the on-disk name is derived from
-   * the scene **id**, and the writer re-checks ownership before touching
-   * anything. A caller passing a stale or foreign path must be refused, not
-   * obeyed.
+   * ## Why this one does *not* go through `RVProjectFolderWriter`
+   *
+   * The file header says scene writes are delegated to the writer, and for
+   * the JSON body they still are — the writer is what carries the RR1
+   * ownership check and the debounce that keeps a save from writing the file
+   * five times a second. But the writer is driven by the scene **mutation
+   * bus**, whose events carry an `RvScene`, and its whole reason for existing
+   * is to serialise that object. A GLB body is not derivable from it.
+   *
+   * Rather than push bytes through a bus that speaks op-logs, the GLB path is
+   * direct and keeps the two guarantees the writer would have provided:
+   * `_assertPathMatchesEntry` is the RR1 check, unchanged, and
+   * `writeSceneGlbFile` is atomic. What it does not keep is the debounce —
+   * that belongs on the *caller* side (the phase-6 autosave), because a
+   * compare-and-swap write cannot be coalesced by something that does not
+   * know which revision each queued version was based on.
+   *
+   * `relPath` is still validated rather than obeyed: a path owned by another
+   * scene is refused here, which is cheaper than discovering it after the
+   * file is gone.
    */
-  async writeScene(relPath: string, scene: RvScene): Promise<void> {
+  async writeScene(relPath: string, write: SceneWrite): Promise<SceneRevision> {
     assertWritable(this);
-    this._assertPathMatchesEntry(relPath, scene.id);
-    this._requireWriter().handleMutation({ type: 'upsert', id: scene.id, scene });
+    const id = write.meta?.id;
+    if (!id) throw new Error('writeScene needs meta.id.');
+    this._assertPathMatchesEntry(relPath, id);
+
+    return this._writes.run(async () => {
+      // Read-before-write: the stored revision is the only thing that can tell
+      // us somebody edited this file in the folder since we last looked. On the
+      // queue, so a write already accepted cannot land between this read and
+      // the write below.
+      const current = await readSceneGlbFile(this._dir, relPath);
+      const actual = current ? await revisionOfBytes(current) : null;
+      assertRevisionPrecondition(relPath, write.expectedRevision, actual);
+
+      await writeSceneGlbFile(this._dir, relPath, write.glb);
+      return revisionOfBytes(write.glb);
+    });
   }
 
+  /**
+   * Delete a scene body.
+   *
+   * Direct rather than through the mutation bus: the writer would have to
+   * derive the filename from the scene id, and the manifest path is the only
+   * thing that actually knows it. The manifest-entry check above is what keeps
+   * R2 intact, so this is still never a tidy-up of something unmanaged — and
+   * the bus still hears about it, so the writer retires the manifest row.
+   */
   async deleteScene(relPath: string): Promise<void> {
     assertWritable(this);
     const id = this._entryIdForPath(relPath);
     if (!id) throw new Error(`No manifest entry owns "${relPath}" — refusing to delete.`);
-    // The bus is what `SceneStore.delete()` uses; going through it keeps one
-    // deletion path instead of two that can drift.
-    this._requireWriter().handleMutation({ type: 'delete', id });
+    await deleteSceneFile(this._dir, relPath);
+    emitSceneMutation({ type: 'delete', id });
   }
 
-  async writeBlob(relPath: string, blob: Blob): Promise<void> {
+  /**
+   * Write a binary artefact, optionally under a revision precondition.
+   *
+   * The precondition costs a read here (there is no stored digest to consult,
+   * unlike the browser backend) — which is why it is OPT-IN: a caller that
+   * passes no `opts` performs exactly the same single write it always did, with
+   * no extra file access at all.
+   */
+  async writeBlob(relPath: string, blob: Blob, opts?: WriteBlobOptions): Promise<void> {
     assertWritable(this);
     const { folder, filename } = splitRelPath(relPath);
-    const dir = folder ? await getOrCreateSubfolder(this._dir, folder) : this._dir;
-    await writeBlobFile(dir, filename, blob);
+    return this._writes.run(async () => {
+      if (opts && opts.expectedRevision !== undefined) {
+        assertRevisionPrecondition(
+          relPath, opts.expectedRevision, await this._blobRevision(folder, filename));
+      }
+      // Segment by segment, for the same reason `readBlobUrl` resolves that way:
+      // `getDirectoryHandle` takes ONE name, and `library/.trash` is not a
+      // directory called "library/.trash" — it is two lookups. Handing the whole
+      // string to the real API throws; handing it to a Map-shaped test double
+      // quietly "works", which is how the trash path could look tested and still
+      // have been unreachable on disk.
+      //
+      // AFTER the precondition, deliberately: `_createDir` creates, and a
+      // refused write must not leave an empty directory behind as its trace.
+      const dir = folder ? await this._createDir(folder) : this._dir;
+      await writeBlobFile(dir, filename, blob);
+    });
   }
 
   async deleteBlob(relPath: string): Promise<void> {
     assertWritable(this);
     const { folder, filename } = splitRelPath(relPath);
+    return this._writes.run(async () => {
+      try {
+        const dir = folder ? await this._resolveDir(folder) : this._dir;
+        if (!dir) return;              // the folder never existed — already gone
+        await dir.removeEntry(filename);
+      } catch {
+        // Already gone — the desired end state.
+      }
+    });
+  }
+
+  /** SHA-256 of what is stored at `folder/filename`, or null when nothing is. */
+  private async _blobRevision(
+    folder: string | null,
+    filename: string,
+  ): Promise<SceneRevision | null> {
     try {
-      const dir = folder ? await this._dir.getDirectoryHandle(folder) : this._dir;
-      await dir.removeEntry(filename);
+      const dir = folder ? await this._resolveDir(folder) : this._dir;
+      if (!dir) return null;
+      const file = await (await dir.getFileHandle(filename)).getFile();
+      return await revisionOfBytes(await file.arrayBuffer());
     } catch {
-      // Already gone (or the folder never existed) — the desired end state.
+      return null;                     // no such file — "this is new" holds
     }
   }
 
@@ -343,7 +523,20 @@ export class FolderBackend implements ProjectBackend {
     return { url, release: () => URL.revokeObjectURL(url) };
   }
 
+  async readBlobBytes(relPath: string): Promise<ArrayBuffer | null> {
+    const { folder, filename } = splitRelPath(relPath);
+    const dir = folder ? await this._resolveDir(folder) : this._dir;
+    if (!dir) return null;
+    try {
+      // A `File` already IS the bytes on disk; `readBlobUrl` only wraps it.
+      return await (await (await dir.getFileHandle(filename)).getFile()).arrayBuffer();
+    } catch {
+      return null;
+    }
+  }
+
   async flush(): Promise<void> {
+    await this._writes.drain();
     await this._writer?.flush();
   }
 
@@ -385,14 +578,42 @@ export class FolderBackend implements ProjectBackend {
     }
   }
 
+  // The three helpers below read the ONE document list, not the scenes
+  // projection. They used to consult `sceneDocumentsOf`, which made the RR1
+  // collision guard, the delete-ownership check and the meta lookup silently
+  // blind for any document outside `scenes/` — a hole that only opened up once
+  // documents could legitimately live anywhere in the project tree.
+
   private _entryIdForPath(relPath: string): string | null {
-    const entries = this._manifest()?.scenes ?? [];
-    return entries.find(e => e.path === relPath)?.id ?? null;
+    return (readDocuments(this._manifest()) ?? []).find(e => e.path === relPath)?.id ?? null;
+  }
+
+  /**
+   * Manifest metadata for a scene path, for {@link SceneRecord.meta}.
+   *
+   * Prefers the writer host's in-memory manifest (no I/O, and the version the
+   * rest of the store is already working against) and only reads `project.json`
+   * when there is none — which is the discovered/read-only case, where a
+   * body read is rare enough that one small JSON read does not matter.
+   *
+   * A path the manifest does not know is **not** an error: an id is never
+   * invented from a filename here, because a wrong id is worse than a missing
+   * one — it would make the record claim to be a scene it is not.
+   */
+  private async _entryForPath(relPath: string): Promise<Partial<RvProjectSceneEntry>> {
+    const fromHost = (readDocuments(this._manifest()) ?? []).find(e => e.path === relPath);
+    if (fromHost) return fromHost;
+    let onDisk: RvDocumentEntry | undefined;
+    try {
+      onDisk = (readDocuments(await this.readManifest()) ?? []).find(e => e.path === relPath);
+    } catch {
+      onDisk = undefined;
+    }
+    return onDisk ?? {};
   }
 
   private _assertPathMatchesEntry(relPath: string, id: string): void {
-    const entries = this._manifest()?.scenes ?? [];
-    const owner = entries.find(e => e.path === relPath);
+    const owner = (readDocuments(this._manifest()) ?? []).find(e => e.path === relPath);
     // An unknown path is a *new* scene — legitimate. A path owned by someone
     // else is the RR1 collision, and refusing it here is cheaper than
     // discovering it after the file is gone.

@@ -31,9 +31,10 @@ class FakeCache {
   async clear(): Promise<void> { this.seeded.clear(); }
 }
 
-/** Tracks concurrent render() entries so re-entrancy is observable. */
+/** Tracks concurrent render() entries so re-entrancy is observable, plus the
+ *  sizes it was asked for (plan-712: the default must reach the renderer). */
 function makeRendererStub() {
-  const state = { inFlight: 0, maxInFlight: 0, renders: 0 };
+  const state = { inFlight: 0, maxInFlight: 0, renders: 0, sizes: [] as (number | undefined)[] };
   return { state };
 }
 
@@ -53,7 +54,8 @@ function makeService(opts: { cache?: FakeCache; isWebGPU?: boolean } = {}) {
   const stub = makeRendererStub();
   // Replace the lazily-built renderer with a counting stub.
   (svc as unknown as { _thumbRenderer: unknown })._thumbRenderer = {
-    render: () => {
+    render: (_model: Object3D, size?: number) => {
+      stub.state.sizes.push(size);
       stub.state.inFlight++;
       stub.state.maxInFlight = Math.max(stub.state.maxInFlight, stub.state.inFlight);
       stub.state.renders++;
@@ -135,6 +137,30 @@ describe('ThumbnailService', () => {
     svc.cancel('doomed');
     expect(await doomed).toBeNull();
     expect(await head).toBeInstanceOf(Blob);
+  });
+
+  it('renders queued previews at the 512px default (plan-712)', async () => {
+    const { svc, stub } = makeService();
+    await svc.enqueue('k', loadModel);
+    expect(stub.state.sizes).toEqual([512]);
+  });
+
+  it('honours an explicit size, both per service and per renderNow call', async () => {
+    const cache = new FakeCache();
+    const svc = new ThumbnailService({
+      renderer: {} as never,
+      scene: {} as never,
+      cache: cache as unknown as ThumbnailCache,
+      size: 256,
+    });
+    const sizes: (number | undefined)[] = [];
+    (svc as unknown as { _thumbRenderer: unknown })._thumbRenderer = {
+      render: (_m: Object3D, size?: number) => { sizes.push(size); return 'data:image/png;base64,x'; },
+      dispose: () => {},
+    };
+    svc.renderNow(new Group());        // no size → service default
+    svc.renderNow(new Group(), 1024);  // explicit override
+    expect(sizes).toEqual([256, 1024]);
   });
 
   it('dispose resolves every queued job with null and reports unavailable', async () => {

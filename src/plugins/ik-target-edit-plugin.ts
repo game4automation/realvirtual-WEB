@@ -17,7 +17,7 @@
  * written back to the target's AxisPos (in-memory + persisted setField op).
  *
  * Persistence: moving a point (gizmo drag, numeric pose edit, align shortcut)
- * persists the new LOCAL transform as a `setNodeTransform` op plus the fresh
+ * persists the new LOCAL transform as a scale-less `transformNode` op plus the fresh
  * AxisPos in ONE undoable transaction — edited paths survive scene reloads and
  * every drag is a single undo step.
  *
@@ -62,6 +62,7 @@ import { popoverStore } from '../core/hmi/popover-store';
 import { persistFieldOp } from '../core/hmi/scene/scene-field-ops';
 import { getSceneStore } from '../core/hmi/scene/scene-store-singleton';
 import { freshOpId, deepCloneJSON } from '../core/hmi/scene/rv-scene-edits';
+import type { RvTransformNodeOp } from '../core/ops/rv-unified-ops';
 import type { RuntimeNodeSpec } from '../core/engine/rv-scene-loader';
 import { disposeSubtree } from '../core/engine/rv-traverse-utils';
 import { ndcToScreen, type ScreenPoint } from '../core/engine/rv-ndc';
@@ -492,12 +493,18 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
     const nodePath = this.viewer?.registry?.getPathForNode(c.node);
     if (!store || !nodePath) return;
     const n = c.node;
-    const tOp = {
-      id: freshOpId(), ts: Date.now(), schemaV: 1 as const,
-      kind: 'setNodeTransform' as const, nodePath,
-      position: [n.position.x, n.position.y, n.position.z] as [number, number, number],
-      quaternion: [n.quaternion.x, n.quaternion.y, n.quaternion.z, n.quaternion.w] as [number, number, number, number],
-      prev: { position: prevPos, quaternion: prevQuat },
+    // NO `scale` — and that is the load-bearing part, not an omission. An
+    // IKTarget exported from Unity ships `scale (-1,1,1)`; the absent scale is
+    // what routes this op to the frozen-safe scene path, which writes position
+    // and rotation and leaves the mirror alone.
+    const tOp: RvTransformNodeOp = {
+      id: freshOpId(), ts: Date.now(), schemaV: 1,
+      kind: 'transformNode', nodePath,
+      transform: {
+        position: [n.position.x, n.position.y, n.position.z],
+        quaternion: [n.quaternion.x, n.quaternion.y, n.quaternion.z, n.quaternion.w],
+      },
+      prev: { position: [...prevPos], quaternion: [...prevQuat] },
     };
     if (angles) {
       const raw = (n.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined)?.['IKTarget'];
@@ -844,7 +851,7 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
 
   /** Write the applied configuration into the target's AxisPos — in-memory (the
    *  replay drives to what the user sees) AND as a persisted setField op (node
-   *  transforms persist too via setNodeTransform, so no reload inconsistency). */
+   *  transforms persist too via transformNode, so no reload inconsistency). */
   private commitAxisPos(c: Candidate, angles: readonly number[]): void {
     c.target.AxisPos = [...angles];
     const nodePath = this.viewer?.registry?.getPathForNode(c.node);

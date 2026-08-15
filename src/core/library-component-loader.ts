@@ -30,6 +30,7 @@ import type {
   DirectionEnum,
   AxisCode,
 } from './behavior-runtime';
+import { DEFAULT_TRANSPORT_SPEED_MM_S } from './engine/rv-constants';
 
 // ─── Name parsers ───────────────────────────────────────────────────────
 
@@ -173,6 +174,10 @@ export function scanLibraryComponent(root: Object3D): KinematicsSpec {
         spec.drives!.push({
           target: node,
           direction: ('Linear' + axis) as DirectionEnum,
+          // Realistic conveyor speed — without it the RVDrive default of
+          // 100 mm/s (Unity parity, stays untouched) makes library conveyors
+          // crawl. Shared with the DES transit-timing fallback.
+          speed: DEFAULT_TRANSPORT_SPEED_MM_S,
         });
         spec.transports!.push({
           target: node,

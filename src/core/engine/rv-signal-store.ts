@@ -28,6 +28,7 @@ import {
 import {
   channelForSlot,
   getSlotAuthority,
+  getSlotWriteRole,
   remoteWriteOverridesForce,
   slotsForChannel,
   SIGNAL_BINDING_RELAY_WRITER_ID,
@@ -113,6 +114,44 @@ export interface WriteConflict {
 /** Local-simulation writer kinds — the kinds a live binding displaces. */
 function isLocalSimKind(kind: SignalWriterKind): boolean {
   return kind === 'component' || kind === 'behavior' || kind === 'sdk';
+}
+
+// ── Write-authority decision codes (plan-353 NFR: allocation-free) ──────────
+//
+// The gate runs on the write path, so the decision travels as a SCALAR and the
+// `{ allowed, reason }` object is built only in `canWriteSlot()`, the UI
+// boundary. Codes below `DEC_DENY_BOUND` allow the write; the two above it deny
+// it. That ordering is the whole encoding — see {@link decisionAllows}.
+
+/** No authority contests the write. */
+const DEC_OK = 0;
+/** A binding owns the slot, but this writer still lands (hmi/mcp/debug/…). */
+const DEC_ADVISORY_BOUND = 1;
+/** The force writer lands, but a strict remote owner overrides it right after. */
+const DEC_ALLOW_REMOTE = 2;
+/** A live binding owns a command slot on this channel — local sim is displaced. */
+const DEC_DENY_BOUND = 3;
+/** An operator force pins this channel. */
+const DEC_DENY_FORCED = 4;
+
+/** True when the decision lets the write through. */
+function decisionAllows(decision: number): boolean {
+  return decision < DEC_DENY_BOUND;
+}
+
+/**
+ * The reason string for a decision — the taxonomy `canWriteSlot()` documents
+ * and `_recordConflict()` logs, so a UI hint and a telemetry row that describe
+ * the same situation always use the same word.
+ */
+function decisionReason(decision: number): string {
+  switch (decision) {
+    case DEC_ADVISORY_BOUND:
+    case DEC_DENY_BOUND: return 'authority-bound';
+    case DEC_ALLOW_REMOTE: return 'authority-remote';
+    case DEC_DENY_FORCED: return 'authority-forced';
+    default: return 'ok';
+  }
 }
 
 const UNKNOWN_WRITER: WriterIdentity = {
@@ -296,35 +335,100 @@ export class SignalStore {
     slotId: SlotId,
     writer: Pick<SignalWriter, 'writerId' | 'writerKind'>,
   ): { allowed: boolean; reason: string } {
-    // Effective authority: the slot claim, escalated to 'forced' when the
-    // slot's CHANNEL is operator-forced (a channel force needs no binding —
-    // the store's force map is authoritative on the channel level).
-    let authority = getSlotAuthority(slotId);
-    if (authority !== 'forced') {
-      const channel = channelForSlot(slotId);
-      if (channel !== undefined && this.forced.has(channel)) authority = 'forced';
+    // Thin UI wrapper (plan-353 NFR): the DECISION is the allocation-free
+    // scalar below; the object is created here, at the UI boundary, and only
+    // here. Nothing on the write path may call this method.
+    const decision = this._decideAuthority(slotId, channelForSlot(slotId), writer);
+    return { allowed: decisionAllows(decision), reason: decisionReason(decision) };
+  }
+
+  /**
+   * THE write-authority decision, as a scalar (plan-353 F6/F7/F8).
+   *
+   * One implementation for both callers — `canWriteSlot()` (UI) and
+   * `_gateRejects()` (write path) — so the answer the operator reads and the
+   * answer the store acts on cannot diverge. Returns a `DEC_*` code; no object
+   * is allocated on any branch.
+   *
+   * `slotId` is optional context (the row the UI asked about); `channel` drives
+   * the aggregation. Asking at CHANNEL level is deliberate and matches this
+   * method's contract — "does a write by this writer reach the store now?" is a
+   * question about the value, and the value is the channel. A slot whose
+   * SIBLING on the same channel is forced genuinely cannot land a write.
+   *
+   * Aggregation (plan-353 §2.4, order-independent by construction):
+   *   1. any `forced` slot on the channel — or a channel-level operator force —
+   *      decides `forced`, regardless of roles;
+   *   2. otherwise, with at least one `bound` slot and a local-sim writer:
+   *      every `control`/`unknown` bound slot rejects; the write is allowed only
+   *      when ALL bound slots on the channel are `feedback`;
+   *   3. otherwise nothing claims the channel → ok.
+   *
+   * Step 2 is what F6 buys: command authority stays with CONNECT, feedback
+   * authority stays with the component, and a fan-out of both kinds onto one
+   * channel resolves the same way whichever slot was registered first.
+   */
+  private _decideAuthority(
+    slotId: SlotId | undefined,
+    channel: SignalChannelId | undefined,
+    writer: Pick<SignalWriter, 'writerId' | 'writerKind'>,
+  ): number {
+    let hasForced = false;
+    let hasBound = false;
+    let hasBoundNonFeedback = false;
+
+    // A channel force needs no binding — the store's force map is authoritative
+    // at channel level (an operator can pin a signal nothing is bound to).
+    if (channel !== undefined && this.forced.has(channel)) hasForced = true;
+
+    if (channel !== undefined) {
+      const slots = slotsForChannel(channel);
+      // Single pass, NO early return: an early return is exactly the first-hit
+      // bug F7 fixes — a `bound` slot registered before a `forced` one used to
+      // hide it and mislabel the conflict.
+      for (let i = 0; i < slots.length; i++) {
+        const authority = getSlotAuthority(slots[i]);
+        if (authority === 'forced') { hasForced = true; continue; }
+        if (authority === 'bound') {
+          hasBound = true;
+          if (getSlotWriteRole(slots[i]) !== 'feedback') hasBoundNonFeedback = true;
+        }
+      }
     }
+    if (slotId !== undefined && channel === undefined) {
+      // Slot without a channel (direct-property command slots): fall back to
+      // the slot's own claim so those rows still get a truthful answer.
+      const authority = getSlotAuthority(slotId);
+      if (authority === 'forced') hasForced = true;
+      else if (authority === 'bound') {
+        hasBound = true;
+        if (getSlotWriteRole(slotId) !== 'feedback') hasBoundNonFeedback = true;
+      }
+    }
+
     if (writer.writerKind === 'remote') {
       // Upstream layer: strict ranking passes through a force, legacy does not.
-      if (authority === 'forced' && !remoteWriteOverridesForce()) {
-        return { allowed: false, reason: 'authority-forced' };
-      }
-      return { allowed: true, reason: 'ok' };
+      if (hasForced && !remoteWriteOverridesForce()) return DEC_DENY_FORCED;
+      return DEC_OK;
     }
     if (writer.writerId === FORCE_WRITER.writerId) {
       // Forcing itself always lands — but a strict remote owner overrides it.
-      if (remoteWriteOverridesForce()) return { allowed: true, reason: 'authority-remote' };
-      return { allowed: true, reason: 'ok' };
+      return remoteWriteOverridesForce() ? DEC_ALLOW_REMOTE : DEC_OK;
     }
-    if (authority === 'forced') return { allowed: false, reason: 'authority-forced' };
-    if (authority === 'bound') {
-      if (writer.writerId === SIGNAL_BINDING_RELAY_WRITER_ID) return { allowed: true, reason: 'ok' };
-      if (isLocalSimKind(writer.writerKind)) return { allowed: false, reason: 'authority-bound' };
+    if (hasForced) return DEC_DENY_FORCED;
+    if (hasBound) {
+      if (writer.writerId === SIGNAL_BINDING_RELAY_WRITER_ID) return DEC_OK;
+      if (isLocalSimKind(writer.writerKind)) {
+        // F6: a bound FEEDBACK slot is still written by its component — the
+        // binding reports that value onwards, it does not produce it. Only a
+        // command slot (or an underived one) displaces the local writer.
+        return hasBoundNonFeedback ? DEC_DENY_BOUND : DEC_OK;
+      }
       // Operator-style writers (hmi/mcp/debug/...) land now but the relay stays
       // authoritative — advisory reason, not a rejection.
-      return { allowed: true, reason: 'authority-bound' };
+      return DEC_ADVISORY_BOUND;
     }
-    return { allowed: true, reason: 'ok' };
+    return DEC_OK;
   }
 
   // ── Name-based access (primary) ──
@@ -446,17 +550,50 @@ export class SignalStore {
   private _gateRejects(name: string, writer: WriterIdentity): boolean {
     if (!isLocalSimKind(writer.writerKind)) return false;
     if (writer.writerId === SIGNAL_BINDING_RELAY_WRITER_ID) return false;
-    const slots = slotsForChannel(name as SignalChannelId);
+    const channel = name as SignalChannelId;
+    const slots = slotsForChannel(channel);
     if (slots.length === 0) return false;
-    for (const slotId of slots) {
+
+    // Rank the channel in ONE pass without an early return (plan-353 F7). The
+    // old first-hit loop returned at the first claimed slot and always logged
+    // 'authority-bound', so a `forced` slot registered after a `bound` one was
+    // invisible AND misreported. Witnesses are captured per class so the
+    // conflict row names the slot that actually decided.
+    let forcedWitness: SlotId | undefined;
+    let boundWitness: SlotId | undefined;
+    let feedbackOnly = true;
+    for (let i = 0; i < slots.length; i++) {
+      const slotId = slots[i];
       const authority = getSlotAuthority(slotId);
-      if (authority === 'bound' || authority === 'forced') {
-        this._recordConflict(slotId, writer, 'authority-bound');
-        // Enforce is prepared but never rejects unknown writers (raw legacy API).
-        return this.signalWriteGate === 'enforce' && writer.writerId !== UNKNOWN_WRITER.writerId;
+      if (authority === 'forced') { if (forcedWitness === undefined) forcedWitness = slotId; continue; }
+      if (authority === 'bound') {
+        if (getSlotWriteRole(slotId) === 'feedback') continue;
+        feedbackOnly = false;
+        if (boundWitness === undefined) boundWitness = slotId;
       }
     }
-    return false;
+
+    let witness: SlotId | undefined;
+    let reason: string;
+    if (forcedWitness !== undefined) {
+      witness = forcedWitness;
+      reason = 'authority-forced';
+    } else if (!feedbackOnly && boundWitness !== undefined) {
+      witness = boundWitness;
+      reason = 'authority-bound';
+    } else {
+      // Nothing contests this write: no claim at all, or every bound slot on
+      // the channel is a FEEDBACK slot, which the component legitimately writes
+      // (F6). Not a conflict, so nothing is logged either — the shadow log must
+      // not fill up with the case the plan just declared correct.
+      return false;
+    }
+
+    this._recordConflict(witness, writer, reason);
+    // Enforce is prepared but never rejects unknown writers (raw legacy API):
+    // a classified writer that still carries the legacy id must not vanish
+    // silently once the gate goes hot.
+    return this.signalWriteGate === 'enforce' && writer.writerId !== UNKNOWN_WRITER.writerId;
   }
 
   /** Dedup-record one (slotKey, writer, reason) conflict — nested maps, no

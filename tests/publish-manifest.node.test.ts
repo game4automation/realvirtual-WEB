@@ -7,7 +7,8 @@
  * What the publish path takes from the manifest, and what it deliberately does
  * NOT. The folder stays the source of truth for assets (P0-3): `models.json`
  * comes from `readdirSync` and must keep doing so. The manifest contributes the
- * Examples catalogue (`scenes[]`) and the project's own settings; publishing
+ * Examples catalogue (`documents[]`, plan-413 phase 6) and the project's own
+ * settings; publishing
  * also records per-target provenance instead of one shared `lastPublished`.
  *
  * Runner: `npm run test:node` (vitest.node.config.ts, environment: node).
@@ -25,6 +26,7 @@ import {
   publishedSceneIndex,
   projectModelNames,
   stagePrivateProject,
+  loadProject,
   SETTINGS_RESERVED_KEYS,
 } from '../scripts/_bunny-lib.mjs';
 import {
@@ -105,34 +107,98 @@ describe('models.json stays folder-derived (P0-3)', () => {
   });
 });
 
+// plan-413 phase 6: the catalogue is derived from `documents[]`, not from the
+// `scenes[]` mirror, and the file has to be a `.glb` — a `.scene.json` entry
+// would publish a catalogue row pointing at a format phase 3 stopped shipping.
 describe('publishedSceneIndex', () => {
-  const scene = (over: Record<string, unknown> = {}) => ({
-    id: 'published:A', name: 'A', path: 'scenes/A.scene.json', baseKind: 'published', ...over,
+  const doc = (over: Record<string, unknown> = {}) => ({
+    id: 'published:A', name: 'A', path: 'scenes/A.glb',
+    section: 'scenes', baseKind: 'published', ...over,
   });
+  const manifest = (over: Record<string, unknown> = {}) => ({ documents: [doc(over)] });
 
-  it('derives the curated [{file,name,mode}] catalogue from scenes[]', () => {
-    expect(publishedSceneIndex({ scenes: [scene({ mode: 'planner' })] }))
-      .toEqual([{ file: 'A.scene.json', name: 'A', mode: 'planner' }]);
+  it('derives the curated [{file,name,mode}] catalogue from documents[]', () => {
+    expect(publishedSceneIndex(manifest({ mode: 'planner' })))
+      .toEqual([{ file: 'A.glb', name: 'A', mode: 'planner' }]);
   });
 
   it('omits mode when the entry has none', () => {
-    expect(publishedSceneIndex({ scenes: [scene()] }))
-      .toEqual([{ file: 'A.scene.json', name: 'A' }]);
+    expect(publishedSceneIndex(manifest())).toEqual([{ file: 'A.glb', name: 'A' }]);
+  });
+
+  it('carries the classification level so a bundled deploy needs no scan', () => {
+    // A bundled source is never scanned (§2.5), and reading the level out of
+    // the GLBs would mean downloading every example just to draw a list.
+    expect(publishedSceneIndex(manifest({ classification: { v: 1, level: 'scene' } })))
+      .toEqual([{ file: 'A.glb', name: 'A', level: 'scene' }]);
+  });
+
+  it('sections a documents[] entry by its path when it carries no section', () => {
+    expect(publishedSceneIndex({ documents: [{ ...doc(), section: undefined }] }))
+      .toEqual([{ file: 'A.glb', name: 'A' }]);
+  });
+
+  it('refuses a legacy .scene.json entry rather than publishing an unreadable row', () => {
+    expect(publishedSceneIndex(manifest({ path: 'scenes/A.scene.json' }))).toBeNull();
   });
 
   it('ignores scenes the customer owns — only published entries are Examples', () => {
-    expect(publishedSceneIndex({ scenes: [scene({ baseKind: 'user' })] })).toBeNull();
+    expect(publishedSceneIndex(manifest({ baseKind: 'user' }))).toBeNull();
   });
 
   it('ignores paths that leave scenes/ or are nested', () => {
-    expect(publishedSceneIndex({ scenes: [scene({ path: '../other/A.scene.json' })] })).toBeNull();
-    expect(publishedSceneIndex({ scenes: [scene({ path: 'scenes/sub/A.scene.json' })] })).toBeNull();
-    expect(publishedSceneIndex({ scenes: [scene({ path: 'scenes/A.json' })] })).toBeNull();
+    expect(publishedSceneIndex(manifest({ path: '../other/A.glb' }))).toBeNull();
+    expect(publishedSceneIndex(manifest({ path: 'scenes/sub/A.glb' }))).toBeNull();
+    expect(publishedSceneIndex(manifest({ path: 'scenes/A.json' }))).toBeNull();
+  });
+
+  it('ignores a document that is not a scene', () => {
+    expect(publishedSceneIndex({ documents: [doc({ section: 'library', path: 'library/A.glb' })] }))
+      .toBeNull();
+  });
+
+  it('has no scenes[] fallback of its own any more (plan-703 phase 9)', () => {
+    // It used to keep three lines for the customer nobody had opened in a
+    // current client. That case did not go away — it moved one level up, to
+    // `loadProject()`, so it is answered once for every consumer instead of
+    // once per consumer. This function now reads `documents[]` and nothing else.
+    expect(publishedSceneIndex({ scenes: [{ ...doc(), section: undefined }] })).toBeNull();
+  });
+
+  it('still publishes an unmigrated customer\'s Examples, via loadProject()', () => {
+    // The guarantee the deleted fallback existed for, pinned where it now
+    // lives. The .glb rule still applies on the way through — a .scene.json row
+    // would point at a format the viewer stopped opening in phase 3.
+    const dir = tempDir('rv-unmigrated-');
+    try {
+      const projectDir = makeProject(join(dir, 'p'), {
+        name: 'P', code: 'code1', canonicalName: 'p', schemaVersion: 1,
+        scenes: [{ ...doc(), section: undefined }],
+      }, { scenes: ['A.glb'] });
+      const loaded = loadProject(projectDir);
+      // Derived in memory only — the file on disk is untouched.
+      expect(JSON.parse(readFileSync(join(projectDir, 'project.json'), 'utf8')).documents)
+        .toBeUndefined();
+      expect(publishedSceneIndex(loaded)).toEqual([{ file: 'A.glb', name: 'A' }]);
+
+      const jsonDir = makeProject(join(dir, 'q'), {
+        name: 'Q', code: 'code2', canonicalName: 'q', schemaVersion: 1,
+        scenes: [{ ...doc(), path: 'scenes/A.scene.json' }],
+      }, { scenes: ['A.scene.json'] });
+      expect(publishedSceneIndex(loadProject(jsonDir))).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('prefers documents[] over the legacy array it was derived from', () => {
+    expect(publishedSceneIndex({
+      documents: [doc({ name: 'From documents' })],
+      scenes: [{ ...doc(), name: 'From the mirror' }],
+    })).toEqual([{ file: 'A.glb', name: 'From documents' }]);
   });
 
   it('returns null for a manifest that declares none, so the folder index stands', () => {
     expect(publishedSceneIndex({})).toBeNull();
-    expect(publishedSceneIndex({ scenes: [] })).toBeNull();
+    expect(publishedSceneIndex({ documents: [] })).toBeNull();
     expect(publishedSceneIndex(null)).toBeNull();
   });
 
@@ -141,20 +207,20 @@ describe('publishedSceneIndex', () => {
     try {
       const withScenes = makeProject(join(dir, 'p1'), {
         name: 'P', code: 'code1', canonicalName: 'p1',
-        scenes: [scene({ name: 'Planner Demo', mode: 'planner' })],
-      }, { models: [], scenes: ['A.scene.json'] });
+        documents: [doc({ name: 'Planner Demo', mode: 'planner' })],
+      }, { models: [], scenes: ['A.glb'] });
       const distDir = makeDist(join(dir, 'dist'));
       const staged = await stagePrivateProject({ distDir, projectDir: withScenes });
       expect(JSON.parse(readFileSync(join(staged, 'scenes', 'index.json'), 'utf8')))
-        .toEqual([{ file: 'A.scene.json', name: 'Planner Demo', mode: 'planner' }]);
+        .toEqual([{ file: 'A.glb', name: 'Planner Demo', mode: 'planner' }]);
       rmSync(staged, { recursive: true, force: true });
 
       const silent = makeProject(join(dir, 'p2'), { name: 'P2', code: 'code2', canonicalName: 'p2' },
-        { models: [], scenes: ['A.scene.json'] });
-      writeFileSync(join(silent, 'scenes', 'index.json'), '[{"file":"A.scene.json","name":"Hand written"}]');
+        { models: [], scenes: ['A.glb'] });
+      writeFileSync(join(silent, 'scenes', 'index.json'), '[{"file":"A.glb","name":"Hand written"}]');
       const staged2 = await stagePrivateProject({ distDir, projectDir: silent });
       expect(JSON.parse(readFileSync(join(staged2, 'scenes', 'index.json'), 'utf8')))
-        .toEqual([{ file: 'A.scene.json', name: 'Hand written' }]);
+        .toEqual([{ file: 'A.glb', name: 'Hand written' }]);
       rmSync(staged2, { recursive: true, force: true });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

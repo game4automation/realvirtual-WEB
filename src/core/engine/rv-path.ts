@@ -443,8 +443,9 @@ export function pathFromNode(node: Object3D): RVPath | null {
  */
 export class RVPathComponent implements RVComponent {
   /** Loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187
-   *  style). Only the schema-typable scalars live there — segments/successors/
-   *  align are parsed by `parsePathExtras` (this module is their TS-SSOT). */
+   *  style). Structured fields (segments/successors/align) are generic 'json'
+   *  schema fields; `parsePathExtras` (this module) stays the SSOT for their
+   *  inner shape and validates on every (re)parse. */
   static readonly schema: ComponentSchema = loadSchemaFromSpec('Path');
 
   readonly node: Object3D;
@@ -486,6 +487,25 @@ export class RVPathComponent implements RVComponent {
     }
     this.path = null;
   }
+
+  /** Re-derive the path from the node's (edited) rv_extras and swap the
+   *  network/zone registration. Called by the generic editor pipeline after
+   *  setField/unsetField (`reapplySchemaForComponent` → `reapplyConfig`), so
+   *  segment/successor/zone edits take effect live — id changes included. */
+  reapplyConfig(): void {
+    if (this.path) {
+      defaultPathNetwork.unregister(this.path.id);
+      if (this.path.zoneId) defaultZoneRegistry.undefine(this.path.zoneId);
+    }
+    // Invalidate the parse cache (pathFromNode memoizes on userData).
+    delete (this.node.userData as Record<string, unknown>)['_rvPath'];
+    this.path = pathFromNode(this.node);
+    if (!this.path) return; // unparsable payload → stays unregistered until fixed
+    defaultPathNetwork.register(this.path);
+    if (this.path.zoneId) {
+      defaultZoneRegistry.define(this.path.zoneId, this.path.zoneCapacity ?? undefined);
+    }
+  }
 }
 
 // ─── Self-register ───────────────────────────────────────────────────────
@@ -498,6 +518,10 @@ registerComponent({
     inspectorVisible: true,
     filterLabel: 'Paths',
     badgeColor: '#26a69a',
+    // Authorable in the asset editor / via MCP: a fresh Path starts from the
+    // schema defaults (empty segment list) and is edited through the generic
+    // json fields (segments/successors) — no dedicated path tool needed.
+    authorable: true,
   },
   create: (node) => new RVPathComponent(node),
   afterCreate: (inst, node) => {

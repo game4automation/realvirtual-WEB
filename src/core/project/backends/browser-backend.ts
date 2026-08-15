@@ -14,7 +14,7 @@
  *
  * | Data | Where | Why |
  * |---|---|---|
- * | scene JSON | `rv-scenes/*`, **unchanged** | the draft/conflict machinery delivered by plan-370 Phase 2 is written against exactly these keys |
+ * | scene catalogue rows | `rv-scenes/*`, **unchanged** | the conflict machinery delivered by plan-370 Phase 2 is written against exactly these keys |
  * | blobs (GLB, thumbnails) | OPFS, SHA-addressed | localStorage is a ~5 MB string store |
  * | manifest | `rv-project/browser/<projectId>` (new key) | there is no folder to hold a `project.json` |
  * | blob path map | `rv-project/browser/<projectId>/blobs` (new key) | a manifest `path` has to resolve to a digest |
@@ -49,9 +49,9 @@
  *     browser project's only copy as a foreign cache and default to "folder
  *     wins" — deleting the sole copy of a user's scene. Membership yes
  *     ({@link noteSceneMembership}), provenance no.
- *  5. **Drafts are already scoped.** `setDraftScope(projectId)` prefixes the
- *     per-base draft slot, and `rv-scenes/scene-draft/<id>` is keyed by the
- *     same unique scene id. Both are collision-free for free.
+ *  5. **Draft slots no longer exist.** Both keyspaces are dead since plan-413
+ *     phase 6; `setDraftScope(projectId)` survives only so the leftovers of a
+ *     given project can still be cleared.
  *
  * The one case the marker cannot express is two projects that *want*
  * independent copies of the same scene id. That is not reachable through any
@@ -67,14 +67,9 @@
  * (and asks for persistent storage); it starts nothing.
  */
 
+import { deleteScene as deleteSceneBody } from '../../hmi/scene/rv-scene-storage';
 import {
-  deleteScene as deleteSceneBody,
-  listMetas,
-  readScene as readSceneBody,
-  writeScene as writeSceneBody,
-} from '../../hmi/scene/rv-scene-storage';
-import type { RvScene } from '../../hmi/scene/rv-scene-types';
-import {
+  getBlob,
   getBlobUrl,
   putBlob,
   requestPersistence,
@@ -82,22 +77,44 @@ import {
   deleteBlob,
 } from '../../storage/rv-opfs-blobs';
 import {
+  deleteSceneGlb,
+  readSceneGlb,
+  sceneGlbRevision,
+  writeSceneGlb,
+} from '../../storage/rv-scene-glb-store';
+import {
+  assertRevisionPrecondition,
+  glbSceneRecord,
+  type SceneRecord,
+  type SceneRevision,
+  type SceneWrite,
+} from '../rv-scene-record';
+import { assertReadableScenePath } from '../rv-legacy-format';
+import {
   clearSceneOwner,
   noteSceneMembership,
   readSceneOwner,
   writeSceneOwner,
 } from '../rv-scene-owner';
 import {
+  assetDocumentsOf,
+  readDocuments,
+  withDerivedDocuments,
+  type DocumentStat,
+} from '../rv-project-documents';
+import {
   RV_PROJECT_SCHEMA_VERSION,
   canonicalNameOf,
+  type RvDocumentEntry,
   type RvProject,
   type RvProjectAssetEntry,
-  type RvProjectSceneEntry,
 } from '../rv-project-types';
 import {
   assertWritable,
+  WriteQueue,
   type ProjectBackend,
   type ResolvedBackendBlob,
+  type WriteBlobOptions,
 } from './project-backend';
 
 // ─── Keyspace (additive only) ───────────────────────────────────────────
@@ -123,15 +140,9 @@ export interface BrowserBackendOptions {
   name?: string;
   /** Backend id. Defaults to `browser:<projectId>`. */
   id?: string;
-  /**
-   * Treat unowned index entries as belonging to this project (§2.4).
-   *
-   * True for exactly one backend — the user tier of the Sample project. A
-   * scene with no marker is a scene from before this plan, and §2.4 says it
-   * belongs to Sample. Any *other* browser project claiming them would be
-   * inventing membership.
-   */
-  adoptsUnowned?: boolean;
+  // `adoptsUnowned` is gone (plan-716 Phase 6). It made one backend adopt
+  // owner-less `rv-scenes-index` rows, and the derivation it steered went with
+  // the catalogue; a browser project's content is its manifest now.
   /** Ask for persistent storage on activation. Off in tests. */
   requestPersistence?: boolean;
 }
@@ -146,23 +157,41 @@ export class BrowserBackend implements ProjectBackend {
 
   private readonly _projectId: string;
   private readonly _name: string;
-  private readonly _adoptsUnowned: boolean;
   private readonly _wantsPersistence: boolean;
   private _active = false;
+  private _persistenceGranted: boolean | null = null;
+  /**
+   * Serialises every write of THIS backend (plan-709 §2.2.1-3).
+   *
+   * Not decoration: `_readBlobIndex`/`_writeBlobIndex` is a read-modify-write
+   * over one localStorage value, so two concurrent writes to two different
+   * paths could each write an index that has forgotten the other's entry.
+   */
+  private readonly _writes = new WriteQueue();
 
   constructor(projectId: string, opts: BrowserBackendOptions = {}) {
     if (!projectId) throw new Error('BrowserBackend needs a project id.');
     this._projectId = projectId;
     this._name = opts.name ?? 'My scenes';
-    this._adoptsUnowned = opts.adoptsUnowned ?? false;
     this._wantsPersistence = opts.requestPersistence ?? true;
     this.id = opts.id ?? `browser:${projectId}`;
   }
 
   get isActive(): boolean { return this._active; }
   get projectId(): string { return this._projectId; }
-  /** Does this backend adopt marker-less scenes (§2.4)? */
-  get adoptsUnowned(): boolean { return this._adoptsUnowned; }
+
+  /**
+   * Outcome of the persistent-storage request made in {@link activate}.
+   *
+   * `null` until asked (or when the browser has no answer), `false` when it
+   * was refused. Scene bodies now live in OPFS, which is **evictable** — a
+   * refusal is the difference between "saved" and "saved until the device
+   * runs low", and plan-397's answer to it is to keep working and say so
+   * (open question 2). This is the field the shell reads to say it; the
+   * `not-persisted` notice on `onBlobStoreNotice` carries the same fact for
+   * listeners that were not holding the backend.
+   */
+  get persistenceGranted(): boolean | null { return this._persistenceGranted; }
 
   // ─── Read ─────────────────────────────────────────────────────────────
 
@@ -184,28 +213,45 @@ export class BrowserBackend implements ProjectBackend {
       canonicalName: canonicalNameOf(this._name),
       activeSceneId: null,
     };
-    return { ...base, scenes: this._sceneEntries() };
+    return { ...base, documents: this._documentsOf(base) };
   }
 
   /** Persist the parts of the manifest that are not derived from the index. */
   async writeManifest(project: RvProject): Promise<void> {
     assertWritable(this);
-    // `scenes` is derived on every read; storing it would only create a copy
-    // that can disagree with the index.
-    const { scenes: _scenes, ...rest } = project;
-    void _scenes;
-    this._writeStoredManifest({ ...rest, id: this._projectId } as RvProject);
+    // Every row is stored, with no filter. The filter that used to sit here
+    // dropped `scn_` scene rows because the catalogue derived them on read and
+    // a stored copy could disagree with it; with the catalogue gone (plan-716
+    // Phase 6) the manifest is the only place a browser project records what it
+    // owns, and dropping anything on the way in would lose it.
+    const documents = readDocuments(project) ?? [];
+    this._writeStoredManifest({ ...project, documents, id: this._projectId } as RvProject);
   }
 
   /**
-   * Read a scene body.
+   * Read a scene body from the OPFS GLB store.
    *
    * `relPath` is a scene id here. A `scenes/<id>` form is accepted too, so a
    * caller holding a manifest path from a folder project does not have to
    * branch on `backend.kind`.
+   *
+   * The localStorage op-log body it used to fall back to is gone with the rest
+   * of the JSON reader (plan-413 phase 6). A record still carrying one is
+   * refused by `rv-scene-storage.readScene` with the F10 error, at the layer
+   * that can actually see it — here, the id simply has no bytes.
    */
-  async readScene(relPath: string): Promise<RvScene | null> {
-    return readSceneBody(sceneIdOfPath(relPath));
+  async readScene(relPath: string): Promise<SceneRecord | null> {
+    assertReadableScenePath(relPath);
+    const id = sceneIdOfPath(relPath);
+    if (!id) return null;
+    const glb = await readSceneGlb(id);
+    if (!glb) return null;
+    // The name comes from the manifest row, the only place a browser project
+    // records one since the catalogue went (plan-716 Phase 6). A body with no
+    // row still reads — it is bytes, and refusing them here would turn a
+    // recoverable orphan into a lost one.
+    const meta = (readDocuments(this._readStoredManifest()) ?? []).find(d => d.id === id);
+    return glbSceneRecord(glb, { id, name: meta?.name ?? '', ...meta, path: id });
   }
 
   async readSettings(): Promise<unknown | null> {
@@ -214,17 +260,50 @@ export class BrowserBackend implements ProjectBackend {
 
   // ─── Listing ──────────────────────────────────────────────────────────
 
-  /** Index entries this project owns, newest first (the index's own order). */
-  async listScenes(): Promise<RvProjectSceneEntry[]> {
-    return this._sceneEntries();
-  }
-
   async listModels(): Promise<RvProjectAssetEntry[]> {
-    return this._readStoredManifest()?.models ?? [];
+    return assetDocumentsOf(this._readStoredManifest(), 'models');
   }
 
   async listLibrary(): Promise<RvProjectAssetEntry[]> {
-    return this._readStoredManifest()?.library ?? [];
+    return assetDocumentsOf(this._readStoredManifest(), 'library');
+  }
+
+  /** The one list (plan-413 §2.4), over the index plus the stored manifest. */
+  async listDocuments(): Promise<RvDocumentEntry[]> {
+    return this._documentsOf(this._readStoredManifest());
+  }
+
+  /**
+   * The stored manifest's documents — all of them, verbatim.
+   *
+   * This used to splice in a scene half derived from `rv-scenes-index` on every
+   * read, because the catalogue owned scenes and the manifest owned everything
+   * else. Since plan-716 Phase 6 there is no catalogue: a browser project's
+   * documents are written through {@link writeBlob} and recorded in its
+   * manifest like any other project's, so the stored list is the whole answer
+   * and the two-source reconciliation that used to live here has nothing left
+   * to reconcile.
+   */
+  private _documentsOf(stored: RvProject | null): RvDocumentEntry[] {
+    return readDocuments(stored) ?? [];
+  }
+
+  /**
+   * Stats for the documents this backend actually stores.
+   *
+   * Blobs are sha-addressed, and the digest alone is enough to clear the
+   * scan's pre-filter, so the size is reported as 0 rather than paid for with
+   * an OPFS read. The scene-pointer half that used to precede this went with
+   * the catalogue (plan-716 Phase 6): the bodies it stat'ed were catalogue
+   * bodies, and a browser project's documents are blobs.
+   */
+  async statDocuments(): Promise<DocumentStat[]> {
+    const out: DocumentStat[] = [];
+    const blobs = this._readBlobIndex();
+    for (const [path, sha] of Object.entries(blobs)) {
+      out.push({ path, size: 0, sha256: sha });
+    }
+    return out;
   }
 
   // ─── Lifecycle (§2.2.1b) ──────────────────────────────────────────────
@@ -242,8 +321,10 @@ export class BrowserBackend implements ProjectBackend {
     this._active = true;
     if (this._wantsPersistence) {
       // A refusal is announced through the blob store's notice channel, not
-      // thrown — the project is perfectly usable either way.
-      await requestPersistence().catch(() => false);
+      // thrown — the project is perfectly usable either way. It is also
+      // recorded on {@link persistenceGranted}, because since plan-397 the
+      // scene bodies themselves are in the evictable store.
+      this._persistenceGranted = await requestPersistence().catch(() => false);
     }
   }
 
@@ -254,18 +335,28 @@ export class BrowserBackend implements ProjectBackend {
   // ─── Write ────────────────────────────────────────────────────────────
 
   /**
-   * Persist a scene body and record membership.
+   * Persist a scene GLB into OPFS and record membership.
    *
    * `cachedFrom` is deliberately **not** set — see point 4 of the file header.
+   *
+   * The precondition is checked against the pointer rather than the bytes, so
+   * a compare-and-swap costs one `getItem`. What it protects against here is
+   * the two-tab case: both tabs share this localStorage, so the second one to
+   * save has a stale revision and is told so instead of quietly winning.
    */
-  async writeScene(relPath: string, scene: RvScene): Promise<void> {
+  async writeScene(relPath: string, write: SceneWrite): Promise<SceneRevision> {
     assertWritable(this);
-    const id = sceneIdOfPath(relPath) || scene.id;
-    if (id !== scene.id) {
-      throw new Error(`"${relPath}" does not address scene ${scene.id}.`);
-    }
-    writeSceneBody(scene);
-    noteSceneMembership(scene.id, this._projectId);
+    return this._writes.run(async () => {
+      const id = sceneIdOfPath(relPath) || write.meta?.id;
+      if (!id) throw new Error('writeScene needs a scene id.');
+      if (write.meta?.id && id !== write.meta.id) {
+        throw new Error(`"${relPath}" does not address scene ${write.meta.id}.`);
+      }
+      assertRevisionPrecondition(relPath, write.expectedRevision, sceneGlbRevision(id));
+      const revision = await writeSceneGlb(id, write.glb);
+      noteSceneMembership(id, this._projectId);
+      return revision;
+    });
   }
 
   /**
@@ -284,10 +375,18 @@ export class BrowserBackend implements ProjectBackend {
     const others = (owner?.projectIds ?? []).filter(p => p !== this._projectId);
     if (others.length > 0) {
       // Still owned elsewhere: give up the claim, keep the data.
-      writeSceneOwner(id, { projectIds: others, cachedFrom: owner?.cachedFrom ?? null });
+      writeSceneOwner(id, {
+        projectIds: others,
+        cachedFrom: owner?.cachedFrom ?? null,
+        cachedRevision: owner?.cachedRevision ?? null,
+      });
       return;
     }
+    // Both bodies go: during the migration window a scene can have a GLB and
+    // a legacy record at once, and leaving either behind would make a deleted
+    // scene reappear the next time the other one is consulted.
     deleteSceneBody(id);
+    await deleteSceneGlb(id);
     clearSceneOwner(id);
   }
 
@@ -298,14 +397,31 @@ export class BrowserBackend implements ProjectBackend {
    * manifest entries pointing at identical bytes cost one copy. A degraded
    * (no-OPFS) store leaves the path unmapped rather than recording a
    * reference to something that was never written.
+   *
+   * The compare-and-swap (plan-709 §2.3) costs nothing here: the index already
+   * maps every path to the SHA-256 of its bytes, which IS the revision token —
+   * so the precondition is one map lookup and never a read of the blob.
+   *
+   * The precondition is evaluated INSIDE the write queue, not before it. Read
+   * outside, it would describe a state a queued write is about to change, and a
+   * caller would be told "unchanged" about bytes that are one tick from being
+   * replaced.
    */
-  async writeBlob(relPath: string, blob: Blob): Promise<void> {
+  async writeBlob(relPath: string, blob: Blob, opts?: WriteBlobOptions): Promise<void> {
     assertWritable(this);
-    const sha = await sha256OfBlob(blob);
-    await putBlob(sha, blob);
-    const index = this._readBlobIndex();
-    index[normaliseRelPath(relPath)] = sha;
-    this._writeBlobIndex(index);
+    return this._writes.run(async () => {
+      const key = normaliseRelPath(relPath);
+      const index = this._readBlobIndex();
+      assertRevisionPrecondition(relPath, opts?.expectedRevision, index[key] ?? null);
+      const sha = await sha256OfBlob(blob);
+      await putBlob(sha, blob);
+      // Re-read: `putBlob` awaited, so an entry written by an earlier queue
+      // item is already in localStorage, but the object read above is a
+      // snapshot from before that await.
+      const fresh = this._readBlobIndex();
+      fresh[key] = sha;
+      this._writeBlobIndex(fresh);
+    });
   }
 
   /**
@@ -325,53 +441,59 @@ export class BrowserBackend implements ProjectBackend {
     return { url: resolved.url, release: () => resolved.revokeUrl() };
   }
 
-  /** Forget a blob path. The bytes go only when nothing else maps to them. */
-  async deleteBlob(relPath: string): Promise<void> {
-    assertWritable(this);
-    const index = this._readBlobIndex();
+  async readBlobBytes(relPath: string): Promise<ArrayBuffer | null> {
     const key = normaliseRelPath(relPath);
-    const sha = index[key];
-    if (!sha) return;
-    delete index[key];
-    this._writeBlobIndex(index);
-    if (!Object.values(index).includes(sha)) await deleteBlob(sha);
+    const sha = this._readBlobIndex()[key] ?? (isDigestLike(key) ? key : null);
+    if (!sha) return null;
+    // The store hands back the stored File itself. `getBlobUrl` wraps exactly
+    // this in an object URL; skipping the wrapper is the whole point.
+    const blob = await getBlob(sha);
+    return blob ? await blob.arrayBuffer() : null;
   }
 
-  /** Nothing is queued, so there is nothing to await. */
-  async flush(): Promise<void> {}
+  /**
+   * Forget a blob path. The bytes go only when nothing else maps to them.
+   *
+   * On the write queue for the same reason `writeBlob` is: this is the OTHER
+   * read-modify-write of the shared index, and a delete interleaved with a
+   * write is exactly how a live path loses its digest.
+   */
+  async deleteBlob(relPath: string): Promise<void> {
+    assertWritable(this);
+    return this._writes.run(async () => {
+      const index = this._readBlobIndex();
+      const key = normaliseRelPath(relPath);
+      const sha = index[key];
+      if (!sha) return;
+      delete index[key];
+      this._writeBlobIndex(index);
+      if (!Object.values(index).includes(sha)) await deleteBlob(sha);
+    });
+  }
+
+  /** Await the write queue. Nothing else is buffered. */
+  async flush(): Promise<void> {
+    await this._writes.drain();
+  }
 
   // ─── Internals ────────────────────────────────────────────────────────
 
-  /**
-   * Index entries this project owns.
-   *
-   * The `path` is the scene id: for a browser project the "path" is an
-   * addressing token, and inventing a `scenes/<slug>-<id>.scene.json` that
-   * corresponds to no file would be a lie a later reader could act on.
-   */
-  private _sceneEntries(): RvProjectSceneEntry[] {
-    const out: RvProjectSceneEntry[] = [];
-    for (const meta of listMetas()) {
-      const owner = readSceneOwner(meta.id);
-      const owned = owner?.projectIds.includes(this._projectId) ?? false;
-      const unowned = !owner || owner.projectIds.length === 0;
-      if (!owned && !(this._adoptsUnowned && unowned)) continue;
-      out.push({
-        id: meta.id,
-        name: meta.name,
-        path: meta.id,
-        createdAt: meta.createdAt,
-        modifiedAt: meta.modifiedAt,
-        baseKind: meta.baseKind,
-        baseLabel: meta.baseLabel,
-        ...(meta.parentId ? { parentId: meta.parentId } : {}),
-      });
-    }
-    return out;
-  }
+  // `_sceneEntries()` is gone (plan-716 Phase 6). It scanned `rv-scenes-index`
+  // and the OPFS body pointers to synthesise scene rows for `listScenes()` and
+  // for the scene half of `listDocuments()`. Both callers are gone: a browser
+  // project records what it owns in its manifest, like every other project.
 
+
+  /**
+   * The stored manifest, with its document list derived when it has none.
+   *
+   * A manifest an older build of this very app wrote carries `models[]` /
+   * `library[]` and no `documents[]`. Nothing converts it on the way in — there
+   * is no folder read to hang that off — so the derivation happens here, at the
+   * one place that reads the key.
+   */
   private _readStoredManifest(): RvProject | null {
-    return readJson<RvProject>(browserManifestKey(this._projectId));
+    return withDerivedDocuments(readJson<RvProject>(browserManifestKey(this._projectId)));
   }
 
   private _writeStoredManifest(project: RvProject): void {
@@ -389,12 +511,18 @@ export class BrowserBackend implements ProjectBackend {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
-/** `scenes/<id>`, `<id>` and `<id>.scene.json` all address the same scene. */
+// `isCatalogueSceneDocument()` is gone with the catalogue (plan-716 Phase 6).
+// It told a `scn_` row derived from `rv-scenes-index` apart from a real
+// manifest document, so that the derived half was never stored twice. Nothing
+// derives any more: every row in this backend's list is a document, and the
+// distinction it drew no longer has two sides.
+
+/** `scenes/<id>`, `<id>` and `<id>.scene.glb` all address the same scene. */
 export function sceneIdOfPath(relPath: string): string {
   const raw = (relPath ?? '').trim();
   if (!raw) return '';
   const last = raw.split('/').pop() ?? raw;
-  return last.replace(/\.scene\.json$/i, '');
+  return last.replace(/\.scene\.glb$/i, '');
 }
 
 function normaliseRelPath(relPath: string): string {

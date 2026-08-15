@@ -17,6 +17,7 @@ import type { Object3D } from 'three';
 import type { ComponentContext, ComponentSchema, RVComponent } from './rv-component-registry';
 import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import type { GizmoHandle, GizmoShape } from './rv-gizmo-manager';
+import { wireValueSignal } from './rv-signal-wiring';
 
 // ─── Types ─────────────────────────────────────────────────────────────
 
@@ -234,21 +235,18 @@ export class RVWebSensor implements RVComponent {
       console.warn('[WebSensor] both SignalBool and SignalInt bound — using SignalInt');
     }
 
+    // plan-427: Int and Bool are ALTERNATIVES (Int wins), so the single
+    // `_unsubscribe` handle always holds the one active wiring. Both go through
+    // the helper, which registers a re-apply slot and skips an unresolved path.
+    // `_applyState` compares against the current state, so a replay of an
+    // unchanged level does not touch the gizmo.
     if (this.SignalInt) {
       this._intMap = parseIntStateMap(this.IntStateMap);
-      this._unsubscribe = ctx.signalStore.subscribeByPath(
-        this.SignalInt,
-        (v) => this._onIntChange(Number(v)),
-      );
-      const current = ctx.signalStore.getByPath(this.SignalInt);
-      if (current !== undefined) this._onIntChange(Number(current));
+      this._unsubscribe = wireValueSignal(ctx.signalStore, this.SignalInt,
+        (v) => this._onIntChange(Number(v)), undefined, ctx.reapply).unsubscribe;
     } else if (this.SignalBool) {
-      this._unsubscribe = ctx.signalStore.subscribeByPath(
-        this.SignalBool,
-        (v) => this._onBoolChange(!!v),
-      );
-      const current = ctx.signalStore.getByPath(this.SignalBool);
-      if (current !== undefined) this._onBoolChange(!!current);
+      this._unsubscribe = wireValueSignal(ctx.signalStore, this.SignalBool,
+        (v) => this._onBoolChange(!!v), undefined, ctx.reapply).unsubscribe;
     } else if (WebSensorConfig.randomDemoStates) {
       // Demo mode: assign a random state instead of 'unbound'.
       // State is stable per-sensor for the session (does not change).

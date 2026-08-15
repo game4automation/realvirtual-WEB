@@ -16,3 +16,16 @@ Browser-side soft PLC — ships only in internal dev builds; elsewhere the tools
 
 Deploying never starts scanning — always `web_plc_run` afterwards.
 Full language reference: `doc-plc-programming.md`.
+
+## Tool reference
+
+<!-- BEGIN GENERATED: tool-reference plc — do not edit; run `npm run gen:mcp-docs` -->
+_4 tools in this family, generated from the @McpTool decorators — do not edit by hand._
+
+| Tool | Access | Parameters | Summary |
+|------|--------|------------|---------|
+| `web_plc_deploy` | write | `code` string **req** | Deploy an IEC 61131-3 Structured Text program to the virtual PLC: compile + COLD load (fresh function-block states and memory). |
+| `web_plc_run` | write | — | Start cyclic PLC scanning (one scan per 60 Hz sim tick: input snapshot → program pass → output batch write). |
+| `web_plc_status` | read | — | Virtual PLC status: run state (stopped/running/error), scan time in ms, last error, and the online watch values (VAR_EXTERNAL variables plus function-block outputs like… |
+| `web_plc_stop` | write | — | Stop cyclic PLC scanning (WARM stop — program memory and function-block states are kept; outputs keep their last written values). |
+<!-- END GENERATED: tool-reference plc -->

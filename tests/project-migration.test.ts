@@ -28,6 +28,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { seedDeadDraft, seedDeadSceneDraft } from './helpers/dead-draft-slots';
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 import {
   LS_KEY_MIGRATION_STATE,
@@ -56,8 +57,6 @@ import {
   listMetas,
   writeScene,
   writeActiveId,
-  writeDraft,
-  writeSceneDraft,
 } from '../src/core/hmi/scene/rv-scene-storage';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
 import {
@@ -84,7 +83,7 @@ function scene(id: string, name: string): RvScene {
     name,
     createdAt: '2025-01-01T00:00:00.000Z',
     modifiedAt: '2025-01-01T00:00:00.000Z',
-    schemaVersion: 2,
+    schemaVersion: 3,
     base: { kind: 'empty' },
     edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
   };
@@ -98,7 +97,7 @@ function folderProject(name: string, id: string, sceneIds: string[]): FakeDir {
     id,
     name,
     canonicalName: name.toLowerCase(),
-    scenes: sceneIds.map(s => ({ id: s, name: s, path: `scenes/${s}.scene.json` })),
+    scenes: sceneIds.map(s => ({ id: s, name: s, path: `scenes/${s}.scene.glb` })),
   };
   dir.seedText(PROJECT_MANIFEST_FILE, JSON.stringify(manifest));
   return dir;
@@ -130,8 +129,8 @@ function seedLegacyWorld(): string[] {
   const ids = ['scn_a', 'scn_b', 'scn_c'];
   for (const id of ids) writeScene(scene(id, `Scene ${id}`));
   writeActiveId('scn_b');
-  writeDraft({ kind: 'empty' }, scene('scn_draft', 'unsaved'));
-  writeSceneDraft('scn_a', scene('scn_a', 'Scene scn_a edited'));
+  seedDeadDraft({ kind: 'empty' });
+  seedDeadSceneDraft('scn_a');
   return ids;
 }
 

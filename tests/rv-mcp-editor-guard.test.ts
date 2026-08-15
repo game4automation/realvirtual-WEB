@@ -5,9 +5,9 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { requireEditor, isGuardError } from '../src/plugins/mcp-bridge/rv-mcp-editor-guard';
-import { setActiveAssetContext } from '../src/plugins/asset-editor/active-asset-store';
+import { setActiveAssetContext } from '../src/core/editor/active-asset-store';
 import type { RVViewer } from '../src/core/rv-viewer';
-import type { ActiveAssetContext } from '../src/plugins/asset-editor/active-asset-store';
+import type { ActiveAssetContext } from '../src/core/editor/active-asset-store';
 
 const viewerInMode = (mode: string): RVViewer =>
   ({ modes: { activeMode: mode } } as unknown as RVViewer);

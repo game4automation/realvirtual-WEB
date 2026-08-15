@@ -12,8 +12,8 @@ import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
-import { clearAssetDraft } from '../src/core/editor/rv-asset-draft-storage';
-import { pruneDescendantPaths, deleteSelectedNodes } from '../src/plugins/asset-editor/delete-selection';
+import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
+import { pruneDescendantPaths, deleteSelectedNodes } from '@rv-private/plugins/asset-editor/delete-selection';
 
 function makeMockViewer() {
   const scene = new Scene();
@@ -61,7 +61,7 @@ function makeMockViewer() {
 }
 
 beforeEach(async () => {
-  await clearAssetDraft();
+  await __clearDraftStoresForTests();
 });
 
 describe('pruneDescendantPaths', () => {

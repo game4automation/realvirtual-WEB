@@ -19,8 +19,12 @@ import type { SelectionSnapshot } from './rv-selection-manager';
 import type { NodeRegistry } from './rv-node-registry';
 import type { ObjectHoverData, ObjectUnhoverData } from './rv-raycast-manager';
 import type { RVComponent } from './rv-component-registry';
+import { getComponentInstances } from './rv-component-registry';
 
 const MAX_PARENT_DEPTH = 32;
+
+/** The component callbacks this dispatcher routes. */
+type ComponentHook = 'onHover' | 'onClick' | 'onSelect';
 
 export class ComponentEventDispatcher {
   private _lastHoveredNode: Object3D | null = null;
@@ -48,11 +52,11 @@ export class ComponentEventDispatcher {
     if (node === this._lastHoveredNode) return;
 
     if (this._lastHoveredNode) {
-      const prev = this._findComponent(this._lastHoveredNode);
+      const prev = this._findComponent(this._lastHoveredNode, 'onHover');
       this._safeCall(() => prev?.onHover?.(false));
     }
     if (node) {
-      const comp = this._findComponent(node);
+      const comp = this._findComponent(node, 'onHover');
       this._safeCall(() => comp?.onHover?.(true, data ?? undefined));
     }
     this._lastHoveredNode = node;
@@ -60,7 +64,7 @@ export class ComponentEventDispatcher {
 
   private _dispatchClick(node: Object3D, data: { path: string; node: Object3D }): void {
     if (this.viewer.logicRunState && this.viewer.logicRunState !== 'active') return;
-    const comp = this._findComponent(node);
+    const comp = this._findComponent(node, 'onClick');
     this._safeCall(() => comp?.onClick?.(data));
   }
 
@@ -76,26 +80,38 @@ export class ComponentEventDispatcher {
     // Newly selected
     for (const node of newSelected) {
       if (!this._selectedNodes.has(node)) {
-        const comp = this._findComponent(node);
+        const comp = this._findComponent(node, 'onSelect');
         this._safeCall(() => comp?.onSelect?.(true));
       }
     }
     // Deselected
     for (const node of this._selectedNodes) {
       if (!newSelected.has(node)) {
-        const comp = this._findComponent(node);
+        const comp = this._findComponent(node, 'onSelect');
         this._safeCall(() => comp?.onSelect?.(false));
       }
     }
     this._selectedNodes = newSelected;
   }
 
-  private _findComponent(node: Object3D): RVComponent | null {
+  /**
+   * First component up the parent chain that IMPLEMENTS the requested hook.
+   *
+   * Two refinements over the original "first instance wins" walk (plan-417
+   * §2.4): a node may carry SEVERAL components (the demo scene button puts
+   * `SceneButtonMoveable` and `SceneButtonBase` on the same node), and an
+   * instance without the hook must not swallow the event for an ancestor that
+   * has it. Ordered per node by registration order, so a single-instance node
+   * behaves exactly as before.
+   */
+  private _findComponent(node: Object3D, hook: ComponentHook): RVComponent | null {
     let n: Object3D | null = node;
     let depth = 0;
     while (n && depth < MAX_PARENT_DEPTH) {
-      const inst = n.userData?._rvComponentInstance as RVComponent | undefined;
-      if (inst) return inst;
+      for (const candidate of getComponentInstances(n)) {
+        const inst = candidate as RVComponent;
+        if (typeof inst[hook] === 'function') return inst;
+      }
       n = n.parent;
       depth++;
     }

@@ -4,11 +4,19 @@
 import { Scene, Object3D, Box3, BufferAttribute, Mesh, BufferGeometry, Material } from 'three';
 import { RVDrive } from './rv-drive';
 import { AABB } from './rv-aabb';
-import { registerSignal, constructDrive, SIGNAL_TYPES } from './rv-signal-construction';
+import { registerSignal, constructDrive, SIGNAL_TYPES, DRIVE_BEHAVIOR_MAP } from './rv-signal-construction';
 import {
   gltfLoader, detectRenamedNodes, collectRenamedNodes, collectGltfNodeIndices, collectGltfNodeNames, type GltfParserLike,
 } from './rv-glb-parse';
 import { classifyShadows } from './rv-mesh-classifier';
+import {
+  compose, hasReferences, collectGatedNodes, isFrameGated,
+  type ComposeResult, type ComposedFrame, type GlbTemplateCache, type ReferenceResolver,
+} from './rv-glb-compose';
+import { createReferenceResolver } from './rv-glb-reference-resolver';
+import { reportMissingReferences } from '../hmi/problems-store';
+import type { OrphanedOverride } from './rv-asset-reference';
+import { ROOT_SOURCE_KEY } from './rv-node-id';
 import type { EventEmitter } from '../rv-events';
 import type { ViewerEvents } from '../rv-viewer-events';
 // Side-effect imports: trigger registerComponent() at module load
@@ -20,10 +28,17 @@ import './rv-grip';
 import './rv-grip-target';
 import './rv-connect-signal';
 import './rv-lamp';
+import './rv-scene-button-base';
+import './rv-scene-button-moveable';
+import './rv-push-button3d';
+import './rv-emergency-button3d';
+import './rv-handle-switch3d';
 import './rv-energy-chain';
 import './rv-safety-door';
 import './rv-physics-zone';
 import './rv-collision-role';
+import './rv-machining-volume';
+import './rv-machining-tool';
 import './rv-web-sensor';
 import './rv-web-diagnostics';
 import './rv-web-error';
@@ -31,6 +46,9 @@ import './rv-web-visibility';
 import './rv-custom-runtime-instruction';
 import './rv-metadata';
 import './rv-group-component';
+// Agent memory (plan-394) — registers the 'NodeKnowledge' schema + capabilities
+// but NO factory: the note is data on the node, never a live instance.
+import './rv-node-knowledge';
 import './rv-ik-target';
 import './rv-ik-path';
 import './rv-robot-ik';
@@ -43,11 +61,21 @@ import { RVPipe } from './rv-pipe';
 import { RVTank } from './rv-tank';
 import { RVPump } from './rv-pump';
 import { RVProcessingUnit } from './rv-processing-unit';
-import { applySchema, resolveComponentRefs, getRegisteredFactories, registerCapabilities, type RVComponent, type ComponentContext, type ComponentSchema } from './rv-component-registry';
+import { applySchema, resolveComponentRefs, getRegisteredFactories, getSchemaDefaults, registerCapabilities, type RVComponent, type ComponentContext, type ComponentSchema } from './rv-component-registry';
 import type { GizmoOverlayManager } from './rv-gizmo-manager';
 import type { LampManager } from './rv-lamp-manager';
+import type { SceneButtonManager } from './rv-scene-button-manager';
 import type { EnergyChainManager } from './rv-energy-chain-manager';
+import type { MachiningManager } from './rv-machining-manager';
 import type { CollisionRoleRegistrar } from './rv-collision-role';
+// plan-404: the rigid-body mechanism manager is a PRIVATE implementation behind
+// a public registry slot. Every ComponentContext built below reads it from the
+// singleton rather than an option, so no construction path can miss it.
+import { getKinematicManager } from './rv-kinematic-registry';
+import {
+  getActiveSignalReapplyRegistry,
+  type SignalReapplyRegistry,
+} from './rv-signal-reapply-registry';
 import type { RVOutlineManager } from './rv-outline-manager';
 import type { ErrorStore } from './rv-error-store';
 import type { InstructionRuntimeStore } from './rv-instruction-runtime-store';
@@ -202,6 +230,19 @@ export interface LoadResult {
   logicGated: boolean;
   /** Deferred Start/onSceneReady payload retained for one late activation. */
   deferredLogic: DeferredLogic | null;
+  /**
+   * Composition outcome when the model referenced other GLBs (plan-397 Phase 3).
+   * `null` for the overwhelming majority of models, which reference nothing —
+   * composition is then skipped entirely rather than run over an empty set.
+   */
+  composition: ComposeResult | null;
+  /**
+   * Referenced occurrences whose logic was NOT initialized because their file is
+   * less trusted than the root (§2.9). Empty unless `composition` is set.
+   */
+  gatedFrames: ComposedFrame[];
+  /** Overrides from the composition whose target node no longer exists (F9). */
+  orphanedOverrides: OrphanedOverride[];
 }
 
 /**
@@ -260,13 +301,22 @@ export interface LoadGLBOptions {
   gizmoManager?: GizmoOverlayManager;
   /** Optional viewer-owned manager for Lamp flashing. */
   lampManager?: LampManager;
+  /** Optional viewer-owned manager for 3D scene buttons (plan-417). */
+  sceneButtonManager?: SceneButtonManager;
   energyChainManager?: EnergyChainManager;
+  /** Optional viewer-owned CSG machining registry (plan-405) — passed into
+   *  ComponentContext so `MachiningVolume` components can register themselves. */
+  machiningManager?: MachiningManager;
   /** Optional viewer-owned collision registry (plan-394) — passed into
    *  ComponentContext so `CollisionRole` components can register their node. */
   collisionManager?: CollisionRoleRegistrar;
   /** Optional outline manager — passed into ComponentContext so components
    *  (CustomRuntimeInstruction) can drive the OutlinePass status outline. */
   outlineManager?: RVOutlineManager;
+  /** Optional viewer-owned signal re-apply registry (plan-427) — passed into
+   *  ComponentContext so wired input slots can be re-driven with the current
+   *  signal level after reset/reconnect. Falls back to the module slot. */
+  reapply?: SignalReapplyRegistry;
   /** Optional error registry — passed into ComponentContext so components (e.g. WebError) can report active errors. */
   errorStore?: ErrorStore;
   /** Optional runtime-instruction registry — passed into ComponentContext so
@@ -320,6 +370,28 @@ export interface LoadGLBOptions {
    * 404s. The main viewer keeps the existing default behavior.
    */
   loadKinematicsSidecar?: boolean;
+  /**
+   * Content hash of the root GLB, when the caller already has it.
+   *
+   * Only used to DERIVE `NodeId`s for the root file's own nodes, which in turn
+   * gives its reference nodes stable occurrence segments. Omitting it costs
+   * nothing for a file that carries authored ids and falls back to per-file
+   * ordinals for one that does not — it is never worth hashing 35 MB here just
+   * in case.
+   */
+  sourceSha256?: string;
+  /**
+   * How an `AssetReference` becomes bytes (plan-397 Phase 3). Defaults to the
+   * library-registry + relative-path resolver. Tests inject their own so a
+   * composition can be exercised without a network.
+   */
+  referenceResolver?: ReferenceResolver;
+  /**
+   * Reuse a parse-template cache across loads. Omit and the composition owns a
+   * fresh one that is freed with the model — see `rv-glb-compose.ts` on why
+   * cross-load sharing is opt-in.
+   */
+  composeCache?: GlbTemplateCache;
 }
 
 /**
@@ -407,29 +479,49 @@ export interface MeshProcessResult {
 }
 
 /**
- * Pre-scan for Drive/TransportSurface nodes and classify meshes:
+ * Pre-scan for MOTION/TransportSurface nodes and classify meshes:
  * shadow casting, matrixAutoUpdate, triangle counting.
  *
  * CRITICAL: Returns driveNodeSet — it MUST be passed to subsequent functions
- * so drive meshes are NOT incorrectly set to matrixAutoUpdate = false.
+ * so moving meshes are NOT incorrectly set to matrixAutoUpdate = false.
  */
 export function processMeshes(root: Object3D): MeshProcessResult {
   let triangleCount = 0;
   let noShadowCount = 0;
 
-  // Pre-scan: Drive/TransportSurface node sets for shadow classification
-  // Collect drive node set for static/dynamic classification (Phase 1.3)
-  // We need a two-step approach: first find all drives, then classify meshes
-
-  // Collect drive node set for static/dynamic classification (Phase 1.3)
-  // We need a two-step approach: first find all drives, then classify meshes
+  // Pre-scan: motion/TransportSurface node sets for shadow classification
+  // Collect the motion node set for static/dynamic classification (Phase 1.3)
+  // We need a two-step approach: first find all movers, then classify meshes
+  //
+  // `Kinematic` counts as a mover, not just `Drive`. A KinematicMechanism moves
+  // its PASSIVE links — a Delta's six rods and its platform — by writing their
+  // node transforms every tick, and those links carry `Kinematic` (a rigid
+  // group) with no Drive of their own. Classifying them as static froze them
+  // twice over: `matrixAutoUpdate = false` below meant the solver's writes never
+  // reached matrixWorld, and `driveAnchor()` put them in the root-parented
+  // static arena, which cannot move by construction. Symptom: a mechanism that
+  // jogs perfectly in the asset editor (`preserveHierarchy` skips both passes)
+  // while in every merged load — the F5 test run, HMI, planner — the driven arms
+  // move and the rods and platform hang frozen in mid-air.
+  //
+  // This mirrors MOVER_KEY in rv-freeze-static.ts, which already keeps
+  // `Kinematic` subtrees matrix-dynamic; the two classifications disagreeing was
+  // the bug.
   const driveNodeSet = new Set<Object3D>();
   const transportSurfaceNodeSet = new Set<Object3D>();
+
+  // `Drive`/`Drive_*` (behaviours) and the rigid group `Kinematic`/`Kinematic_N`.
+  // Deliberately NOT KinematicJoint / KinematicMechanism / KinematicTarget: those
+  // are descriptive nodes, and anchoring meshes to them would mis-group whole
+  // subtrees (a mechanism container is typically an ancestor of everything).
+  const MOTION_KEY = /^Drive|^Kinematic(_\d+)?$/i;
 
   root.traverse((node: Object3D) => {
     const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
     if (!rv) return;
-    if (rv['Drive']) driveNodeSet.add(node);
+    for (const key in rv) {
+      if (rv[key] && MOTION_KEY.test(key)) { driveNodeSet.add(node); break; }
+    }
     if (rv['TransportSurface']) transportSurfaceNodeSet.add(node);
   });
 
@@ -680,6 +772,64 @@ export function applyKinematicParenting(
   return { groupNames: kinematicGroupNames, affectedSubtrees };
 }
 
+// ─── Unity marker key normalization (plan-419) ──────────────────────────
+
+/**
+ * Unity `Web*` marker keys → their canonical viewer component key.
+ *
+ * `WebCollisionRole` is the Unity-side marker (CLAUDE.md § "Web* naming
+ * convention") that makes a collision role authorable in the Unity scene, so it
+ * survives every re-export instead of having to be patched back into the GLB by
+ * hand. The exporter keys rv_extras by the C# `type.Name`, and a C# class
+ * `CollisionRole` could not carry a field of the same name (CS0542) — hence the
+ * `Web` prefix on the class and the canonical name on the field.
+ *
+ * ONE entry today, deliberately not a general alias system (plan-419
+ * Alternative 1): a second `registerComponent` factory for the alias would
+ * construct a SECOND `RVCollisionRole` on the same node — the factory loops run
+ * every matching factory — with an order-dependent winner.
+ */
+const COMPONENT_KEY_ALIASES: ReadonlyArray<readonly [alias: string, canonical: string]> = [
+  ['WebCollisionRole', 'CollisionRole'],
+];
+
+/**
+ * Rewrite Unity marker keys in an rv_extras object to their canonical viewer
+ * keys, IN PLACE, BEFORE any factory loop reads it (plan-419 F3).
+ *
+ * Contract:
+ * - alias only        → renamed to the canonical key (the alias is removed, so
+ *                       exactly one factory matches and exactly one instance
+ *                       exists; a viewer-side re-export then writes the
+ *                       canonical, web-native key)
+ * - canonical present → the alias is left untouched and IGNORED. `CollisionRole`
+ *                       (web-native authoring / rv-extras overlay) wins
+ *                       deterministically, and since no factory is registered
+ *                       for the alias it stays inert.
+ * - no alias          → no-op (the hot path: one `in` check per node)
+ *
+ * "Canonical present" tolerates a `null`/`undefined` value as absent, matching
+ * the factory loops' own truthiness test — otherwise an empty canonical stamp
+ * would suppress the alias AND build nothing.
+ *
+ * Must be called from EVERY construction path that reads rv_extras:
+ * {@link traverseAndRegister} (loadGLB), {@link processExtras} (placed
+ * subtrees) and {@link createRuntimeNode} (op-log `addNode`).
+ * {@link constructComponentOnNode} deliberately does NOT call it — see the note
+ * on that function.
+ */
+export function normalizeComponentKeys(rv: Record<string, unknown> | null | undefined): void {
+  if (!rv) return;
+  for (const [alias, canonical] of COMPONENT_KEY_ALIASES) {
+    const aliasData = rv[alias];
+    if (aliasData === undefined || aliasData === null) continue;
+    const canonicalData = rv[canonical];
+    if (canonicalData !== undefined && canonicalData !== null) continue;
+    rv[canonical] = aliasData;
+    delete rv[alias];
+  }
+}
+
 /** Collected data from the main traversal step. */
 interface TraverseResult {
   drives: RVDrive[];
@@ -751,6 +901,11 @@ export function traverseAndRegister(
 
     const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
     if (!rv) return;
+
+    // plan-419: Unity `Web*` marker keys → canonical viewer keys. Runs AFTER
+    // the overlay (an overlay-authored `CollisionRole` must win) and BEFORE any
+    // consumer, so the factory loop below sees exactly one key.
+    normalizeComponentKeys(rv);
 
     // Counted before the kill-switch strip so the stat reflects what the GLB
     // carries in both modes (enabled = built, disabled = would be built).
@@ -1178,6 +1333,24 @@ export function prepareTransportSurfaces(
 
 // ─── Runtime node creation (op-log `addNode`) ───────────────────────────
 
+/**
+ * The sim-loop drive collection, as the runtime construction path needs it
+ * (plan-411 Phase 1). `RVViewer` implements it; a test can pass a two-line fake.
+ *
+ * Why this is threaded through instead of reaching for the viewer: a drive that
+ * is only in the NodeRegistry is invisible to the simulation — `CoreSubsystems`
+ * ticks `RVViewer.drives`, and nothing else. Registry registration and tick-list
+ * membership must therefore happen together, which is what the Drive branch of
+ * {@link constructComponentOnNode} does.
+ */
+export interface DriveLifecycleHost {
+  readonly drives: RVDrive[];
+  /** Add to the tick list. Idempotent; returns true when it changed. */
+  addDrive(drive: RVDrive): boolean;
+  /** Remove from the tick list. Returns true when it changed. */
+  removeDrive(drive: RVDrive): boolean;
+}
+
 /** Subsystems needed to construct + init a component node at runtime. */
 export interface RuntimeNodeDeps {
   registry: NodeRegistry;
@@ -1186,13 +1359,25 @@ export interface RuntimeNodeDeps {
   transportManager: RVTransportManager;
   gizmoManager?: GizmoOverlayManager;
   lampManager?: LampManager;
+  /** plan-417 — so a runtime-placed scene button animates and is torn down. */
+  sceneButtonManager?: SceneButtonManager;
   energyChainManager?: EnergyChainManager;
+  /** plan-405 — so a runtime-created `MachiningVolume` reaches the manager. */
+  machiningManager?: MachiningManager;
   /** plan-394 — so a runtime-created `CollisionRole` reaches the manager. */
   collisionManager?: CollisionRoleRegistrar;
   outlineManager?: RVOutlineManager;
+  /** plan-427 — so a runtime-created component's input slots take part in the
+   *  post-reset / post-reconnect level re-apply. Falls back to the module slot. */
+  reapply?: SignalReapplyRegistry;
   events?: EventEmitter<ViewerEvents>;
   errorStore?: ErrorStore;
   instructionStore?: InstructionRuntimeStore;
+  /** plan-411 — so a runtime-created `Drive` reaches the sim-loop tick list.
+   *  Absent (legacy callers / path-waypoint creation): the Drive branch of
+   *  {@link constructComponentOnNode} refuses rather than building a drive that
+   *  would never tick. */
+  driveHost?: DriveLifecycleHost;
 }
 
 /** A node to create at runtime: transform + `userData.realvirtual` content. */
@@ -1233,6 +1418,9 @@ export function createRuntimeNode(deps: RuntimeNodeDeps, spec: RuntimeNodeSpec):
   deps.registry.registerNode(path, node);
 
   const rv = node.userData.realvirtual as Record<string, unknown>;
+  // plan-419: same Unity marker-key normalization as the load-time traverse,
+  // before the factory loop below reads the extras.
+  normalizeComponentKeys(rv);
   // Same dev kill-switch as the load-time traverse: strip Runtime*
   // interaction extras before any consumer reads them.
   if (!isMetadataLoadingEnabled()) {
@@ -1257,11 +1445,15 @@ export function createRuntimeNode(deps: RuntimeNodeDeps, spec: RuntimeNodeSpec):
     registry: deps.registry, signalStore: deps.signalStore, scene: deps.scene,
     transportManager: deps.transportManager, root: parent,
     gizmoManager: deps.gizmoManager, lampManager: deps.lampManager,
+    sceneButtonManager: deps.sceneButtonManager,
     energyChainManager: deps.energyChainManager,
+    machiningManager: deps.machiningManager,
     collisionManager: deps.collisionManager,
     outlineManager: deps.outlineManager,
+    reapply: deps.reapply ?? getActiveSignalReapplyRegistry() ?? undefined,
     events: deps.events, errorStore: deps.errorStore,
     instructionStore: deps.instructionStore,
+    kinematicManager: getKinematicManager() ?? undefined,
   };
   for (const inst of constructed) {
     try {
@@ -1284,6 +1476,22 @@ export function createRuntimeNode(deps: RuntimeNodeDeps, spec: RuntimeNodeSpec):
  * (matching the loader's convention so field edits resolve the instance).
  * The caller has already written `data` into `userData.realvirtual[componentType]`.
  * Returns the instance, or null when no factory is registered for the type.
+ *
+ * CANONICAL EDITOR-ONLY PATH — no {@link normalizeComponentKeys} call here, and
+ * that is a verified property, not an omission (plan-419 Phase 2). Every caller
+ * supplies a canonical, registered component type:
+ *  - `RVAssetExecutors._addComponentWithFields()` is the ONLY production caller.
+ *    It runs the op-log `addComponent` / undo-of-`removeComponent` ops, whose
+ *    `componentType` is produced by `RVAssetDocument.addComponent()` from a
+ *    `baseType` its own callers hard-code (`Kinematic`, `Drive`, `Drive_Simple`,
+ *    LogicStep/signal types, mechanism `baseType`s) or, on the MCP route
+ *    (`web_editor_add_component`), reject unless the type is in
+ *    `getTypesWithCapability('authorable')` — i.e. a REGISTERED factory type.
+ *  - Undo of `removeComponent` replays a key that came out of a node's live
+ *    rv_extras, which the load paths above have already normalized.
+ * A Unity marker key is by construction never registered and never authorable,
+ * so it cannot reach here; normalizing would be dead code that only widened the
+ * editor's accepted type surface.
  */
 export function constructComponentOnNode(
   deps: RuntimeNodeDeps,
@@ -1292,6 +1500,16 @@ export function constructComponentOnNode(
   data: Record<string, unknown>,
 ): RVComponent | null {
   const baseType = componentType.replace(/_\d+$/, '');
+
+  // Drive and drive behaviors are the only components WITHOUT a ComponentFactory
+  // — their construction carries the behavior-selection and signal-provisioning
+  // logic of `constructDrive()`. Two separate cases, deliberately (plan-411 §2.1):
+  // a Drive is created, a behavior is ATTACHED to an existing Drive.
+  if (baseType === 'Drive') return constructDriveOnNode(deps, node, componentType, data);
+  if (DRIVE_BEHAVIOR_MAP[baseType]) {
+    return attachDriveBehaviorOnNode(deps, node, componentType, baseType, data);
+  }
+
   const factory = getRegisteredFactories().get(baseType);
   if (!factory) return null;
 
@@ -1304,16 +1522,7 @@ export function constructComponentOnNode(
   if (factory.afterCreate) factory.afterCreate(inst, node);
   deps.registry.register(componentType, path, inst);
 
-  const context: ComponentContext = {
-    registry: deps.registry, signalStore: deps.signalStore, scene: deps.scene,
-    transportManager: deps.transportManager, root: node,
-    gizmoManager: deps.gizmoManager, lampManager: deps.lampManager,
-    energyChainManager: deps.energyChainManager,
-    collisionManager: deps.collisionManager,
-    outlineManager: deps.outlineManager,
-    events: deps.events, errorStore: deps.errorStore,
-    instructionStore: deps.instructionStore,
-  };
+  const context = runtimeComponentContext(deps, node);
   try {
     resolveComponentRefs(inst as unknown as Record<string, unknown>, deps.registry);
     inst.init?.(context);
@@ -1321,6 +1530,216 @@ export function constructComponentOnNode(
     console.error(`[loader] runtime component init failed for ${componentType} on "${node.name}":`, e);
   }
   return inst;
+}
+
+/** The `ComponentContext` the runtime construction paths hand to `init()`. */
+function runtimeComponentContext(deps: RuntimeNodeDeps, root: Object3D): ComponentContext {
+  return {
+    registry: deps.registry, signalStore: deps.signalStore, scene: deps.scene,
+    transportManager: deps.transportManager, root,
+    gizmoManager: deps.gizmoManager, lampManager: deps.lampManager,
+    sceneButtonManager: deps.sceneButtonManager,
+    energyChainManager: deps.energyChainManager,
+    machiningManager: deps.machiningManager,
+    collisionManager: deps.collisionManager,
+    outlineManager: deps.outlineManager,
+    reapply: deps.reapply ?? getActiveSignalReapplyRegistry() ?? undefined,
+    events: deps.events, errorStore: deps.errorStore,
+    instructionStore: deps.instructionStore,
+    kinematicManager: getKinematicManager() ?? undefined,
+  };
+}
+
+/**
+ * Report a refused runtime construction (plan-411 Phase 1). There is no generic
+ * "findings" store in the public repo — the mechanism findings list is
+ * mechanism-scoped — so the finding travels as a typed viewer event plus a
+ * console error, and the CALLER rolls back the extras stamp. What must never
+ * happen is the silent half-state: extras written, no instance, no word.
+ */
+function refuseConstruction(
+  deps: RuntimeNodeDeps, nodePath: string, componentType: string, reason: string,
+): null {
+  console.error(`[loader] cannot add "${componentType}" at "${nodePath}": ${reason}`);
+  deps.events?.emit('component-construction-failed', { nodePath, componentType, reason });
+  return null;
+}
+
+/**
+ * Runtime `addComponent Drive` — construct a real `RVDrive` through the SAME
+ * `constructDrive()` the loader uses, then put it in the sim-loop tick list.
+ *
+ * Idempotent: a node already carrying a registered Drive returns that instance
+ * (redo after undo must not produce a second drive at one node).
+ */
+function constructDriveOnNode(
+  deps: RuntimeNodeDeps,
+  node: Object3D,
+  componentType: string,
+  data: Record<string, unknown>,
+): RVComponent | null {
+  const path = NodeRegistry.computeNodePath(node);
+  const existing = deps.registry.getByPath<RVDrive>('Drive', path);
+  if (existing) return existing;
+
+  if (!deps.driveHost) {
+    return refuseConstruction(deps, path, componentType,
+      'no drive lifecycle host — a drive built here would never be ticked');
+  }
+
+  // A Drive without `Direction` yields null from constructDrive(). The editor's
+  // `addComponent` legitimately starts from an empty field set, so the schema
+  // defaults are seeded first — the same values the inspector would show.
+  const driveData: Record<string, unknown> = { ...getSchemaDefaults('Drive'), ...data };
+  const rv = (node.userData.realvirtual ?? {}) as Record<string, unknown>;
+  // Keep the stamp and the instance in step: the caller wrote `data`, we
+  // construct from the defaulted record.
+  rv[componentType] = driveData;
+  node.userData.realvirtual = rv;
+
+  const result = constructDrive(node, rv, driveData, path, deps.registry, deps.signalStore);
+  if (!result) {
+    return refuseConstruction(deps, path, componentType,
+      `Drive has no usable Direction ("${String(driveData['Direction'])}")`);
+  }
+
+  const context = runtimeComponentContext(deps, node);
+  try {
+    resolveComponentRefs(result.drive as unknown as Record<string, unknown>, deps.registry);
+  } catch (e) {
+    console.error(`[loader] runtime Drive ref resolution failed on "${node.name}":`, e);
+  }
+  // Behaviors authored in the same extras record (a paste / redo of a drive that
+  // already carried one) go through loader STEP 2 verbatim.
+  for (const pb of result.pendingBehaviors) {
+    try {
+      resolveComponentRefs(pb.component as unknown as Record<string, unknown>, deps.registry);
+      pb.component.init?.(context);
+    } catch (e) {
+      console.error(`[loader] runtime drive behavior init failed for ${pb.type} on "${node.name}":`, e);
+    }
+  }
+  deps.signalStore.buildIndex();
+
+  // ATOMIC with the registry registration constructDrive() just did: from here
+  // on the drive is both resolvable and ticking.
+  deps.driveHost.addDrive(result.drive);
+  return result.drive;
+}
+
+/**
+ * Runtime `addComponent Drive_<Behavior>` — a separate ATTACH case.
+ *
+ * Rules (plan-411 §2.1 / T1b):
+ *  - No parent Drive at the node ⇒ refused. Silently creating one would invent
+ *    a machine axis the user never asked for.
+ *  - The same behavior type already registered ⇒ idempotent, returns it.
+ *  - Another Drive_* behavior already active ⇒ refused. Exactly one behavior is
+ *    active per drive (the loader's rule); a duplicate `_N` key would otherwise
+ *    tick a second, invisible model.
+ */
+function attachDriveBehaviorOnNode(
+  deps: RuntimeNodeDeps,
+  node: Object3D,
+  componentType: string,
+  baseType: string,
+  data: Record<string, unknown>,
+): RVComponent | null {
+  const path = NodeRegistry.computeNodePath(node);
+
+  const existing = deps.registry.getByPath<RVComponent>(componentType, path);
+  if (existing) return existing;
+
+  const drive = deps.registry.getByPath<RVDrive>('Drive', path);
+  if (!drive) {
+    return refuseConstruction(deps, path, componentType,
+      'the node carries no Drive — add a Drive first');
+  }
+
+  const active = drive.Behaviors[0];
+  if (active && active !== componentType) {
+    return refuseConstruction(deps, path, componentType,
+      `"${active}" is already the active behavior of this drive`);
+  }
+
+  const entry = DRIVE_BEHAVIOR_MAP[baseType];
+  const inst = new entry.ctor(node);
+  const record = { ...getSchemaDefaults(baseType), ...data };
+  applySchema(inst as unknown as Record<string, unknown>, entry.schema, record);
+
+  const rv = (node.userData.realvirtual ?? {}) as Record<string, unknown>;
+  rv[componentType] = record;
+  node.userData.realvirtual = rv;
+
+  deps.registry.register(componentType, path, inst);
+  drive.Behaviors = [componentType];
+  drive.BehaviorExtras = { ...drive.BehaviorExtras, [componentType]: record };
+
+  const context = runtimeComponentContext(deps, node);
+  try {
+    resolveComponentRefs(inst as unknown as Record<string, unknown>, deps.registry);
+    inst.init?.(context);
+  } catch (e) {
+    console.error(`[loader] runtime drive behavior init failed for ${componentType} on "${node.name}":`, e);
+  }
+  deps.signalStore.buildIndex();
+  return inst;
+}
+
+/**
+ * Inverse of the Drive / drive-behavior branches of {@link constructComponentOnNode}
+ * (plan-411 Phase 1): take the component off the node so nothing keeps ticking.
+ *
+ * Returns true when this function owned the removal — the caller then skips its
+ * generic dispose/unregister path. A Drive removal takes its behavior with it:
+ * a behavior without its drive is inert metadata, and leaving it registered
+ * would make a later re-add look like a duplicate.
+ */
+export function removeDriveComponentFromNode(
+  deps: Pick<RuntimeNodeDeps, 'registry'> & { driveHost?: DriveLifecycleHost },
+  nodePath: string,
+  componentType: string,
+): boolean {
+  const baseType = componentType.replace(/_\d+$/, '');
+  const registry = deps.registry;
+
+  const disposeAndUnregister = (type: string, instance: unknown): void => {
+    try { (instance as { dispose?: () => void }).dispose?.(); }
+    catch (e) { console.warn(`[loader] dispose failed for ${type} at "${nodePath}":`, e); }
+    registry.unregisterComponent(type, nodePath);
+  };
+
+  if (baseType === 'Drive') {
+    const drive = registry.getByPath<RVDrive>('Drive', nodePath);
+    if (!drive) return false;
+    // Behaviors first — their dispose() detaches from the drive it is holding.
+    for (const [type, instance] of registry.getComponentsAt(nodePath)) {
+      if (type === 'Drive') continue;
+      if (!DRIVE_BEHAVIOR_MAP[type.replace(/_\d+$/, '')]) continue;
+      disposeAndUnregister(type, instance);
+    }
+    drive.Behaviors = [];
+    drive.BehaviorExtras = {};
+    deps.driveHost?.removeDrive(drive);
+    disposeAndUnregister(componentType === 'Drive' ? 'Drive' : componentType, drive);
+    return true;
+  }
+
+  if (DRIVE_BEHAVIOR_MAP[baseType]) {
+    const instance = registry.getByPath<RVComponent>(componentType, nodePath);
+    if (!instance) return false;
+    disposeAndUnregister(componentType, instance);
+    const drive = registry.getByPath<RVDrive>('Drive', nodePath);
+    if (drive) {
+      drive.Behaviors = drive.Behaviors.filter((b) => b !== componentType);
+      const next = { ...drive.BehaviorExtras };
+      delete next[componentType];
+      drive.BehaviorExtras = next;
+    }
+    return true;
+  }
+
+  return false;
 }
 
 /** Remove an op-created node (inverse of addNode). No-op on original GLB nodes
@@ -1589,6 +2008,56 @@ export async function tryFetchSidecarSpec(glbUrl: string): Promise<import('../be
   }
 }
 
+/**
+ * Apply each composed occurrence's OWN `<glb>.kin.json` sidecar (plan-397 §2.9).
+ *
+ * Two rules, both per source file rather than once globally:
+ *
+ *  - A **signed** referenced file gets no sidecar. It declares itself
+ *    self-contained, and an adjacent JSON that could rewrite its kinematics
+ *    would make the signature meaningless.
+ *  - A sidecar is applied to **its own occurrence only**, with any deeper
+ *    occurrences temporarily detached. Node lookup is by name, so leaving them
+ *    attached would let one file's sidecar reconfigure another's nodes — the
+ *    same escalation the per-frame trust chain exists to prevent.
+ */
+async function applyFrameSidecars(composition: ComposeResult): Promise<void> {
+  for (const frame of composition.frames) {
+    if (frame.signaturePresent) {
+      debug('loader', `Signed referenced asset is self-contained: no sidecar for ${frame.assetId || frame.url}`);
+      continue;
+    }
+    const spec = await tryFetchSidecarSpec(frame.url).catch((e) => {
+      console.warn(`[loadGLB] sidecar load failed for ${frame.url}:`, e);
+      return null;
+    });
+    if (!spec) continue;
+
+    const nested = composition.frames.filter(
+      (f) => f !== frame && f.subtreeRoot.parent && isDescendantOf(f.subtreeRoot, frame.subtreeRoot),
+    );
+    const detached = nested.map((f) => ({ parent: f.subtreeRoot.parent!, child: f.subtreeRoot }));
+    for (const { parent, child } of detached) parent.remove(child);
+    try {
+      const report = applyKinematicsSpec(frame.subtreeRoot, spec);
+      debug('loader', `Sidecar applied to ${frame.assetId || frame.url}: drives=${report.applied.drives} `
+        + `transports=${report.applied.transports} sensors=${report.applied.sensors}`);
+    } finally {
+      for (const { parent, child } of detached) parent.add(child);
+    }
+  }
+}
+
+/** Is `node` anywhere below `ancestor`? */
+function isDescendantOf(node: Object3D, ancestor: Object3D): boolean {
+  let current: Object3D | null = node.parent;
+  while (current) {
+    if (current === ancestor) return true;
+    current = current.parent;
+  }
+  return false;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // loadGLB — Orchestrator calling phase functions
 // ═══════════════════════════════════════════════════════════════════
@@ -1617,39 +2086,30 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
     signaturePresent,
     signerOrganization,
   } = await loadAndPrepareGLTF(url, scene, options?.data);
+  const allowUntrustedLogic = options?.allowUntrustedLogic ?? false;
   const logicGated =
     (signatureState === 'invalid' || signatureState === 'unverifiable')
-    && !(options?.allowUntrustedLogic ?? false);
+    && !allowUntrustedLogic;
   prof.mark('gltf-parse');
 
-  // Phase 2: Process meshes (shadow classification, triangle counting, drive/transport node sets)
-  const { triangleCount, driveNodeSet } = processMeshes(root);
-  prof.mark('processMeshes');
-
-  // Phase 3: Detect renamed nodes (Three.js dedup)
+  // Phase 1a: Detect renamed nodes (Three.js dedup) and capture the parser's
+  // index map. MOVED AHEAD of the tree phases (plan-397): composition needs the
+  // root file's index map to derive its NodeIds, and the parser is dropped right
+  // after the parse. Nothing between here and the old position looked at names
+  // or indices, so the move is behaviour-neutral for a model without references.
+  //
+  // The map's two consumers: `rv-scene-settings-into-model.ts` uses the indices
+  // to patch `nodes[i].extras` and the raw names to prove the bytes it
+  // re-fetched are still the ones those indices describe.
   const renamedNodes = detectRenamedNodes(gltfParser);
-  // Same parser, second consumer: the node → glTF-index map plus the raw names
-  // behind it. Collected here because `gltfParser` is dropped right after this
-  // phase, and `rv-scene-settings-into-model.ts` needs both much later — the
-  // indices to patch `nodes[i].extras`, the names to prove the bytes it
-  // re-fetched are still the ones the indices describe.
   const gltfNodeIndices = collectGltfNodeIndices(gltfParser);
   const gltfNodeNames = collectGltfNodeNames(gltfParser);
 
-  // Phase 4: Initialize core systems
-  const registry = new NodeRegistry();
-  registry.setGltfNodeIndices(gltfNodeIndices, gltfNodeNames);
-  const signalStore = new SignalStore();
-  const manager = new RVTransportManager();
-  manager.scene = scene;
-  // WebGPU guard flag (plan-271 PR#0) — gates the GLSL-only MU dissolve/grow
-  // effects the manager creates during simulation.
-  manager.isWebGPU = options?.isWebGPU ?? false;
-  manager.muComputeRenderer = options?.muComputeRenderer ?? null;
-
-  // Phase 4b: Sidecar JSON — `<glb>.kin.json` (fetch started before Phase 1).
-  // Silent on 404 (no warning); parse errors are warned but not fatal.
-  // Spec is applied before component construction so factories see the writes.
+  // Phase 1b: the ROOT file's `<glb>.kin.json` sidecar — applied here, on the
+  // un-composed tree, precisely so it can only ever configure the root file's
+  // own nodes. Applied after composition it would resolve node names into
+  // referenced subtrees and let an unsigned scene reach into a signed asset
+  // (§2.9). Spec goes in before component construction so factories see it.
   {
     const sidecarSpec = signaturePresent || options?.loadKinematicsSidecar === false
       ? null
@@ -1666,6 +2126,60 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
       debug('loader', 'Self-contained load: .kin.json sidecar request disabled');
     }
   }
+
+  // Phase 1.5: COMPOSITION (plan-397). Referenced GLBs are resolved into ONE
+  // tree HERE — before processMeshes, the naming scan and the traverse — so a
+  // referenced subtree goes through every phase the root file goes through
+  // (F15). Skipped outright when the model references nothing, which is every
+  // model in the existing corpus.
+  let composition: ComposeResult | null = null;
+  if (hasReferences(root)) {
+    composition = await compose(root, {
+      baseUrl: url,
+      sha256: options?.sourceSha256,
+      gltfNodeIndices,
+      signatureState,
+      signaturePresent,
+      resolve: options?.referenceResolver ?? createReferenceResolver(),
+      cache: options?.composeCache,
+      shouldAbort: options?.shouldAbort,
+    });
+    // Each referenced file's OWN sidecar, scoped to its own occurrence and
+    // skipped for a signed file — the same rule the root just followed, applied
+    // per source file instead of once globally.
+    if (options?.loadKinematicsSidecar !== false) {
+      await applyFrameSidecars(composition);
+    }
+    prof.mark('compose');
+  }
+
+  // Phase 2: Process meshes (shadow classification, triangle counting, drive/transport node sets)
+  const { triangleCount, driveNodeSet } = processMeshes(root);
+  prof.mark('processMeshes');
+
+  // Composed subtrees carry their own rename stamps; merging them here is what
+  // makes `registerNodeAliases` (Phase 6) cover referenced nodes too.
+  for (const frame of composition?.frames ?? []) {
+    for (const [node, orig] of frame.renamedNodes) renamedNodes.set(node, orig);
+  }
+
+  // Phase 4: Initialize core systems
+  const registry = new NodeRegistry();
+  registry.setGltfNodeIndices(gltfNodeIndices, gltfNodeNames);
+  // One index map PER SOURCE FILE. Without the source key a writer would patch
+  // `nodes[7]` of the root file with what belongs in `nodes[7]` of a referenced
+  // one — and the `expectedNames` identity check would pass while doing it.
+  for (const frame of composition?.frames ?? []) {
+    registry.addGltfNodeSource(frame.sourceKey, frame.gltfNodeIndices, frame.gltfNodeNames);
+    registry.registerNodeIdsForSubtree(frame.subtreeRoot, frame.occurrence);
+  }
+  const signalStore = new SignalStore();
+  const manager = new RVTransportManager();
+  manager.scene = scene;
+  // WebGPU guard flag (plan-271 PR#0) — gates the GLSL-only MU dissolve/grow
+  // effects the manager creates during simulation.
+  manager.isWebGPU = options?.isWebGPU ?? false;
+  manager.muComputeRenderer = options?.muComputeRenderer ?? null;
 
   // Phase 4c: Library-Component naming-convention scan — walks the entire
   // GLB tree and derives a spec from Drive-*/Transport-* names. No marker
@@ -1689,19 +2203,59 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
   // Phase 6: Register node aliases for renamed nodes
   registerNodeAliases(renamedNodes, registry, signalStore);
 
+  // Phase 6b: unresolved references become entries in the Problems panel
+  // (plan-703 §2.8, F16). Here and not right after `compose` on purpose — the
+  // registry only exists from Phase 4 on, and a problem that cannot name the
+  // node it is about sends the user hunting through the hierarchy by eye.
+  // Always called, including with an empty list: that is what retires the
+  // entries of a reference the user has just repaired.
+  reportMissingReferences((composition?.missing ?? []).map((m) => ({
+    assetId: m.assetId,
+    path: m.path,
+    occurrence: m.occurrence,
+    label: m.label,
+    nodePath: registry.getPathForNode(m.referenceNode) ?? undefined,
+  })));
+
   // Phase 7: Initialize components (Step 2 "Start"). ONE context, shared with
   // the Phase 8d onSceneReady pass below.
   const componentContext: ComponentContext = {
     registry, signalStore, scene, transportManager: manager, root,
     gizmoManager: options?.gizmoManager, lampManager: options?.lampManager,
+    sceneButtonManager: options?.sceneButtonManager,
     energyChainManager: options?.energyChainManager, expectSceneReady: true,
+    machiningManager: options?.machiningManager,
     collisionManager: options?.collisionManager,
     outlineManager: options?.outlineManager,
+    reapply: options?.reapply ?? getActiveSignalReapplyRegistry() ?? undefined,
     events: options?.events,
     errorStore: options?.errorStore, instructionStore: options?.instructionStore,
+    kinematicManager: getKinematicManager() ?? undefined,
   };
   prepareTransportSurfaces(traverseResult.pending, componentContext);
-  if (!logicGated) initializeComponents(traverseResult.pending, componentContext);
+
+  // Phase 7 trust gate (plan-397 §2.9). Without composition this is the single
+  // global flag it has always been. With composition it is PER FRAME: a signed
+  // root must not lend its trust to an unsigned referenced file, or dropping a
+  // GLB next to a signed scene would be a privilege escalation. Components from
+  // an ungated frame still run — the gate is per subtree, not all-or-nothing.
+  const gatedFrames = composition
+    ? composition.frames.filter((f) => isFrameGated(f.effectiveState, signatureState, allowUntrustedLogic))
+    : [];
+  const gatedNodes = composition && gatedFrames.length > 0
+    ? collectGatedNodes(composition, signatureState, allowUntrustedLogic)
+    : null;
+  const trusted = gatedNodes
+    ? traverseResult.pending.filter((p) => !gatedNodes.has(p.component.node))
+    : traverseResult.pending;
+  if (!logicGated) initializeComponents(trusted, componentContext);
+  if (gatedFrames.length > 0) {
+    console.warn(
+      `[loadGLB] ${gatedFrames.length} referenced asset(s) are less trusted than this scene — `
+      + 'their logic is disabled. Assets: '
+      + gatedFrames.map((f) => `${f.assetId || f.url} (${f.ownSignatureState})`).join(', '),
+    );
+  }
   prof.mark('initializeComponents');
 
   // Phase 8: Build groups
@@ -1775,7 +2329,7 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
   // Phase 8d: Late-init pass — components opting into onSceneReady() now see
   // the final hierarchy (kinematic re-parenting complete). Used by gizmos that
   // need an accurate subtree AABB (e.g. RVSafetyDoor floor halo + label).
-  if (!logicGated) runOnSceneReady(traverseResult.pending, componentContext);
+  if (!logicGated) runOnSceneReady(trusted, componentContext);
   prof.mark('buildGroups+kinematicParenting');
 
   // Phase 9: WebGPU compatibility fixes
@@ -1825,6 +2379,11 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
   const abortLoad = (): never => {
     scene.remove(root);
     batchTable?.dispose();
+    // Composed occurrences SHARE their geometry and materials with the parse
+    // templates in the compose cache. Detaching them first — and letting the
+    // cache free those resources itself — is what keeps the sweep below from
+    // disposing a buffer another occurrence (or a later load) still renders.
+    composition?.dispose();
     const disposedMaterials = new Set<Material>();
     root.traverse((node: Object3D) => {
       const mesh = node as unknown as {
@@ -1888,16 +2447,46 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
   if (batchTable && rootWasVisible) root.visible = true;
 
   // Phase 11: Freeze static matrices — turn off matrixWorldAutoUpdate on every
-  // node with no Drive/Kinematic/Grip/Transport/Source/Sink/MU in its up- or
-  // down-path, so Three.js skips the bulk of the scene graph in the per-frame
+  // node with no Drive/Kinematic/Grip/Transport/Source/Sink/MU/SceneButtonMoveable
+  // in its up- or down-path, so Three.js skips the bulk of the scene graph in the per-frame
   // updateMatrixWorld recursion. MUST run here, after kinematic re-parenting
   // (Phase 8b) and the merges (Phase 10c/10d), so the parent chains driving the
   // mover closure are final. ~2x render-loop speedup on large static CAD scenes.
+  // NOTE: running AFTER component construction (Phase 8) means this pass has the
+  // last word on matrixWorldAutoUpdate — a component that thaws itself in init()
+  // is overwritten here. Anything that moves must be a MOVER_KEY in
+  // rv-freeze-static.ts (plan-417: SceneButtonMoveable learned that the hard way).
   const freezeResult = freezeStaticMatrices(root);
   debug('loader', `[Freeze] static matrixWorldAutoUpdate=false on ${freezeResult.frozen}/${freezeResult.total} nodes (${freezeResult.dynamic} kept dynamic)`);
 
   // Phase 12: Bounding box (after merge — merged geometry changes bounds)
-  const boundingBox = new Box3().setFromObject(root);
+  //
+  // NOT `Box3.setFromObject(root)`: it would count the BatchedMesh arenas built
+  // in 10c/10d by their RAW geometry buffer, which holds the source vertices in
+  // the source's own units and ignores the per-instance matrices that actually
+  // place them. On a CAD import whose meshes carry scale 0.001 that buffer reads
+  // ~1000x too large — measured on a Delta: arena bbox radius 313 m for a 0.6 m
+  // arm, static arena 1095 m for a 1.5 m machine. Rendering stays correct (the
+  // instance matrices are right), but this box feeds the initial camera fit and
+  // the ground disc, so the floor grew to kilometres and the fit camera ended up
+  // ~2.5 km outside the machine — the model looked like it had vanished.
+  //
+  // The still-present source meshes give the true bounds. Same rule as
+  // RVViewer._computeContentBounds(); keep the two in step.
+  const boundingBox = new Box3();
+  {
+    const tmpBox = new Box3();
+    root.traverse((obj) => {
+      const mesh = obj as Mesh;
+      if (!mesh.isMesh || !mesh.geometry) return;
+      if ((mesh as unknown as { isBatchedMesh?: boolean }).isBatchedMesh) return;
+      mesh.updateWorldMatrix(true, false);
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+      if (!mesh.geometry.boundingBox) return;
+      tmpBox.copy(mesh.geometry.boundingBox).applyMatrix4(mesh.matrixWorld);
+      boundingBox.union(tmpBox);
+    });
+  }
   prof.mark('boundingBox');
 
   // Phase 13: three-mesh-bvh prototype patches only (computeBoundsTree /
@@ -2005,8 +2594,11 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
     signerOrganization,
     logicGated,
     deferredLogic: logicGated
-      ? { pending: traverseResult.pending, context: componentContext }
+      ? { pending: trusted, context: componentContext }
       : null,
+    composition,
+    gatedFrames,
+    orphanedOverrides: composition?.orphanedOverrides ?? [],
   };
 }
 
@@ -2025,6 +2617,8 @@ export interface ProcessExtrasOptions {
   logicRunState?: 'active' | 'gated' | 'activating';
   /** plan-394 — so a placed asset's `CollisionRole` reaches the manager. */
   collisionManager?: CollisionRoleRegistrar;
+  /** plan-405 — so a placed asset's `MachiningVolume` reaches the manager. */
+  machiningManager?: MachiningManager;
 }
 
 /**
@@ -2061,6 +2655,7 @@ export function processExtras(
   outlineManager?: RVOutlineManager,
   lampManager?: LampManager,
   energyChainManager?: EnergyChainManager,
+  sceneButtonManager?: SceneButtonManager,
 ): ProcessExtrasResult {
   const drives: RVDrive[] = [];
   const pending: PendingComponent[] = [];
@@ -2082,6 +2677,10 @@ export function processExtras(
 
     const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
     if (!rv) return;
+
+    // plan-419: Unity `Web*` marker keys → canonical viewer keys, before the
+    // auto-discovered-components loop below reads the extras.
+    normalizeComponentKeys(rv);
 
     // ── PLC Signals ──
     for (const sigType of SIGNAL_TYPES) {
@@ -2148,8 +2747,14 @@ export function processExtras(
   const context: ComponentContext = {
     registry, signalStore, scene, transportManager, root,
     gizmoManager, lampManager, outlineManager, events, errorStore, instructionStore,
-    energyChainManager, expectSceneReady: true,
+    energyChainManager, sceneButtonManager, expectSceneReady: true,
+    machiningManager: options?.machiningManager,
     collisionManager: options?.collisionManager,
+    kinematicManager: getKinematicManager() ?? undefined,
+    // plan-427: the placement path has no viewer-owned option bag of its own —
+    // it is called positionally from the Layout Planner and the asset editor —
+    // so the module slot is the source here (see rv-signal-reapply-registry.ts).
+    reapply: getActiveSignalReapplyRegistry() ?? undefined,
   };
   prepareTransportSurfaces(pending, context);
   const gated = options?.logicRunState !== undefined && options.logicRunState !== 'active';

@@ -2,32 +2,52 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-scene-edits — Operation log for the unified Scene model.
+ * rv-scene-edits — the SCENE-lineage op payloads and their folding helpers.
  *
- * Edits to a Scene are stored as an ordered array of `EditOp` records.
- * Each op is immutable, carries its own inverse (`prev`), and can be replayed
- * deterministically on top of the base GLB to materialise the live state
- * (component overrides + planner placements + camera preset).
+ * Edits to a Scene are stored as an ordered array of {@link RvOp} records — the
+ * ONE op vocabulary (`core/ops/rv-unified-ops.ts`). Each op is immutable,
+ * carries its own inverse (`prev`), and can be replayed deterministically on top
+ * of the base GLB to materialise the live state (component overrides + planner
+ * placements + camera preset).
+ *
+ * ── What plan-710 removed from this file ────────────────────────────────────
+ *
+ * Until plan-710 this module also declared a SECOND op union — `EditOp` /
+ * `PrimitiveEditOp` / `CompositeOp` — plus its own `canCoalesce` / `mergeOps` /
+ * `describeOp`, each a hand-maintained twin of the unified function next to it.
+ * Every apply crossed the two vocabularies through an up-/downcast. The names
+ * are gone and the twins with them; what stays here is what is genuinely
+ * scene-specific: the per-kind PAYLOAD interfaces (which the union imports),
+ * `materialise()` and `inverseOp()`.
  *
  * This module is **pure** — no Three.js, no DOM, no localStorage, no plugin
- * references. It defines the op taxonomy and provides folding / coalescing /
- * description helpers that the SceneStore and tests share.
+ * references.
  *
  * The actual application of ops to the live scene lives in
  * `rv-scene-executors.ts`; the queue / transaction machinery lives in
- * `rv-scene-op-queue.ts`. Together they implement the command-pattern
- * undo/redo system documented in the plan.
+ * `core/ops/rv-document.ts`.
  */
 
 import type { RVExtrasOverlay } from '../../engine/rv-extras-overlay-store';
 import type { PlacedComponent } from '../../../plugins/layout-planner/rv-layout-store';
 import type { ModelCameraStart } from '../camera-startpos-types';
 import type { RvConnection, ConnectionType } from '../../engine/rv-connection-registry';
+import type {
+  RvOp,
+  RvPrimitiveOp,
+  RvSceneOp,
+  RvScenePrimitiveOp,
+} from '../../ops/rv-unified-ops';
 
 // ─── Edit operations ────────────────────────────────────────────────────
 
-/** Common header fields on every edit op. */
-interface EditOpBase {
+/**
+ * Common header fields on every scene-lineage op payload.
+ *
+ * Structurally the unified `RvOpHeader`; kept local so this module stays a leaf
+ * of the union rather than a cycle through it.
+ */
+interface SceneOpHeader {
   /** Stable id (`op_<base36-time>_<rand6>`) used for stack identity and coalescing. */
   id: string;
   /** Wall-clock timestamp at the moment the op was created. Display-only. */
@@ -40,7 +60,7 @@ interface EditOpBase {
 }
 
 /** Set a single field on `userData.realvirtual[componentType][fieldName]`. */
-export interface SetFieldOp extends EditOpBase {
+export interface SetFieldOp extends SceneOpHeader {
   kind: 'setField';
   nodePath: string;
   componentType: string;
@@ -51,7 +71,7 @@ export interface SetFieldOp extends EditOpBase {
 }
 
 /** Remove a field — restores the GLB-default value via inverse `prev`. */
-export interface UnsetFieldOp extends EditOpBase {
+export interface UnsetFieldOp extends SceneOpHeader {
   kind: 'unsetField';
   nodePath: string;
   componentType: string;
@@ -61,7 +81,7 @@ export interface UnsetFieldOp extends EditOpBase {
 }
 
 /** Add a planner placement (catalog-spawned object). */
-export interface AddPlacementOp extends EditOpBase {
+export interface AddPlacementOp extends SceneOpHeader {
   kind: 'addPlacement';
   /** Full placement record. `placement.id` is the stable handle for the
    *  placement throughout subsequent transform / remove ops. */
@@ -69,14 +89,14 @@ export interface AddPlacementOp extends EditOpBase {
 }
 
 /** Remove a planner placement by id. Carries the full snapshot for undo. */
-export interface RemovePlacementOp extends EditOpBase {
+export interface RemovePlacementOp extends SceneOpHeader {
   kind: 'removePlacement';
   placementId: string;
   placement: PlacedComponent;
 }
 
 /** Move / rotate / scale a placement. */
-export interface TransformPlacementOp extends EditOpBase {
+export interface TransformPlacementOp extends SceneOpHeader {
   kind: 'transformPlacement';
   placementId: string;
   position: [number, number, number];
@@ -89,21 +109,18 @@ export interface TransformPlacementOp extends EditOpBase {
   };
 }
 
-/** Move / rotate an EXISTING scene node (e.g. a dragged IK path waypoint).
- *  Stores the LOCAL transform relative to the node's parent; scale is
- *  deliberately untouched (GLB nodes may carry mirror scale that must
- *  survive). For op-created nodes the transform folds into the addNode spec
- *  at materialise time — this op only reaches the loader for base-GLB nodes. */
-export interface SetNodeTransformOp extends EditOpBase {
-  kind: 'setNodeTransform';
-  nodePath: string;
-  position: [number, number, number];
-  quaternion: [number, number, number, number];
-  prev: {
-    position: [number, number, number];
-    quaternion: [number, number, number, number];
-  };
-}
+// Moving / rotating an EXISTING scene node (e.g. a dragged IK path waypoint) is
+// the unified `transformNode` op WITHOUT `scale` — see `RvNodeTransform` in
+// `core/ops/rv-unified-ops.ts`. The absent scale is the scene lineage itself:
+// GLB nodes may carry mirror scale that must survive, so the scene executor
+// writes position and quaternion only and `[1,1,1]` is never substituted. For
+// op-created nodes the transform folds into the addNode spec at materialise
+// time — this op only reaches the loader for base-GLB nodes.
+//
+// Before plan-710 the same op existed a second time under the name
+// `setNodeTransform`, with `position`/`quaternion` flat on the record. Logs in
+// that shape are still readable: `normalizePersistedSceneOp` renames them where
+// a persisted log enters the session.
 
 // ─── WebComponent script code (plan-210 JS-in-GLB authoring) ─────────────
 //
@@ -128,7 +145,7 @@ export const WEB_COMPONENT_TYPE = 'WebComponent';
 export const WEB_COMPONENT_CODE_FIELD = 'Code';
 
 /** Set the WebComponent script code on a node. Coalesces per keystroke run. */
-export interface SetCodeOp extends EditOpBase {
+export interface SetCodeOp extends SceneOpHeader {
   kind: 'setCode';
   nodePath: string;
   /** New script source. */
@@ -146,20 +163,20 @@ export interface SetCodeOp extends EditOpBase {
 // base GLB (with its authored connections) has loaded.
 
 /** Add one connection edge. Inverse: removeConnection. */
-export interface AddConnectionOp extends EditOpBase {
+export interface AddConnectionOp extends SceneOpHeader {
   kind: 'addConnection';
   connection: RvConnection;
 }
 
 /** Remove one connection edge (full snapshot carried for undo). */
-export interface RemoveConnectionOp extends EditOpBase {
+export interface RemoveConnectionOp extends SceneOpHeader {
   kind: 'removeConnection';
   connectionId: string;
   connection: RvConnection;
 }
 
 /** Add or replace a user-defined connection type signature. */
-export interface SetConnectionTypeOp extends EditOpBase {
+export interface SetConnectionTypeOp extends SceneOpHeader {
   kind: 'setConnectionType';
   connectionType: ConnectionType;
   /** Previous signature of the same type name (undefined = newly created). */
@@ -167,14 +184,14 @@ export interface SetConnectionTypeOp extends EditOpBase {
 }
 
 /** Remove a user-defined connection type signature (edges of the type stay). */
-export interface RemoveConnectionTypeOp extends EditOpBase {
+export interface RemoveConnectionTypeOp extends SceneOpHeader {
   kind: 'removeConnectionType';
   /** Full snapshot for undo. */
   connectionType: ConnectionType;
 }
 
 /** Set or clear the per-scene camera start preset. */
-export interface SetCameraOp extends EditOpBase {
+export interface SetCameraOp extends SceneOpHeader {
   kind: 'setCamera';
   preset: ModelCameraStart | null;
   prev: ModelCameraStart | null;
@@ -193,7 +210,7 @@ export interface NodeSpec {
 }
 
 /** Create a new node (e.g. an inserted IK path waypoint) under an existing parent. */
-export interface AddNodeOp extends EditOpBase {
+export interface AddNodeOp extends SceneOpHeader {
   kind: 'addNode';
   /** Resulting full path of the new node (parentPath + '/' + name). */
   nodePath: string;
@@ -203,40 +220,16 @@ export interface AddNodeOp extends EditOpBase {
 /** Remove a node created by an `addNode` op (inverse / delete of an added node).
  *  Carries the full spec so undo can re-create it. Removal only affects nodes
  *  marked as op-created — original GLB nodes are unaffected. */
-export interface RemoveNodeOp extends EditOpBase {
+export interface RemoveNodeOp extends SceneOpHeader {
   kind: 'removeNode';
   nodePath: string;
   spec: NodeSpec;
 }
 
-/** Composite (transaction) — multiple primitive ops as one undo unit. */
-export interface CompositeOp extends EditOpBase {
-  kind: 'composite';
-  /** Human-readable label for the entire transaction. */
-  label: string;
-  /** Child ops, applied forward in order, undone in reverse. */
-  ops: PrimitiveEditOp[];
-}
-
-/** Ops that may NOT appear inside a composite (composites can't nest). */
-export type PrimitiveEditOp =
-  | SetFieldOp
-  | UnsetFieldOp
-  | AddPlacementOp
-  | RemovePlacementOp
-  | TransformPlacementOp
-  | SetNodeTransformOp
-  | SetCameraOp
-  | SetCodeOp
-  | AddNodeOp
-  | RemoveNodeOp
-  | AddConnectionOp
-  | RemoveConnectionOp
-  | SetConnectionTypeOp
-  | RemoveConnectionTypeOp;
-
-/** Top-level op type (anything that may appear in `_ops`). */
-export type EditOp = PrimitiveEditOp | CompositeOp;
+// The composite (transaction) op and the union over these payloads live in
+// `core/ops/rv-unified-ops.ts` — `RvCompositeOp`, `RvSceneOp` /
+// `RvScenePrimitiveOp`. There is exactly one union, derived from the origin
+// table, so a payload declared here reaches the scene executor by construction.
 
 // ─── Container types ────────────────────────────────────────────────────
 
@@ -248,7 +241,7 @@ export interface SceneEditsSettings {
 
 /** What `RvScene.edits` becomes (added in PR C; PR A only ships the type). */
 export interface SceneEdits {
-  ops: EditOp[];
+  ops: RvOp[];
   settings: SceneEditsSettings;
 }
 
@@ -258,7 +251,7 @@ export interface AddedNode {
   spec: NodeSpec;
 }
 
-/** A persisted local transform for a base-GLB node (op-log `setNodeTransform`).
+/** A persisted local transform for a base-GLB node (op-log `transformNode`).
  *  Op-created nodes never appear here — their transform folds into the spec. */
 export interface NodeTransformEntry {
   nodePath: string;
@@ -287,7 +280,7 @@ export interface MaterialisedEdits {
 // rv-op-utils directly (it must not depend on scene types).
 
 export { MAX_OP_HISTORY, COALESCE_WINDOW_MS, freshOpId, deepCloneJSON } from '../../ops/rv-op-utils';
-import { COALESCE_WINDOW_MS, freshOpId, deepCloneJSON } from '../../ops/rv-op-utils';
+import { freshOpId, deepCloneJSON } from '../../ops/rv-op-utils';
 
 // ─── Materialise (replay ops onto an empty workspace) ───────────────────
 
@@ -304,7 +297,7 @@ import { COALESCE_WINDOW_MS, freshOpId, deepCloneJSON } from '../../ops/rv-op-ut
  * Composite ops are flattened recursively in apply order. Removal ops cancel
  * their corresponding adds. Transform ops update the live position/rotation/scale.
  */
-export function materialise(ops: ReadonlyArray<EditOp>): MaterialisedEdits {
+export function materialise(ops: ReadonlyArray<RvOp>): MaterialisedEdits {
   const overlay: RVExtrasOverlay = emptyOverlay();
   const placements = new Map<string, PlacedComponent>();
   const addedNodes = new Map<string, AddedNode>();
@@ -341,8 +334,8 @@ export function materialise(ops: ReadonlyArray<EditOp>): MaterialisedEdits {
   };
 }
 
-function flattenOps(ops: ReadonlyArray<EditOp>): PrimitiveEditOp[] {
-  const out: PrimitiveEditOp[] = [];
+function flattenOps(ops: ReadonlyArray<RvOp>): RvPrimitiveOp[] {
+  const out: RvPrimitiveOp[] = [];
   for (const op of ops) {
     if (op.kind === 'composite') out.push(...op.ops);
     else out.push(op);
@@ -350,9 +343,15 @@ function flattenOps(ops: ReadonlyArray<EditOp>): PrimitiveEditOp[] {
   return out;
 }
 
-/** Pure-data forward apply for a single primitive op against working buffers. */
+/**
+ * Pure-data forward apply for a single primitive op against working buffers.
+ *
+ * Takes the WHOLE primitive union, not just the scene subset: a persisted log is
+ * data, and a document that ever mixed lineages must fold rather than throw. The
+ * `default` branch is that tolerance, stated once.
+ */
 function applyForwardPure(
-  op: PrimitiveEditOp,
+  op: RvPrimitiveOp,
   overlay: RVExtrasOverlay,
   placements: Map<string, PlacedComponent>,
   addedNodes: Map<string, AddedNode>,
@@ -387,20 +386,26 @@ function applyForwardPure(
       nodeTransforms.delete(op.nodePath);
       return;
     }
-    case 'setNodeTransform': {
+    case 'transformNode': {
       // Op-created node: fold the transform straight into its creation spec
       // (the node doesn't exist during loadGLB, so the loader-side transform
       // pass could never find it). Base-GLB node: last-write-wins entry.
+      //
+      // `scale` is read by neither branch, and that is the scene lineage, not an
+      // oversight: `NodeTransformEntry` has no scale field because the base GLB
+      // owns it. An asset-lineage transform that reached here would fold its
+      // position and rotation and leave the mirror scale alone — the same
+      // tolerance the executor applies.
       const added = addedNodes.get(op.nodePath);
       if (added) {
-        added.spec.position = [...op.position];
-        added.spec.quaternion = [...op.quaternion];
+        added.spec.position = [...op.transform.position];
+        added.spec.quaternion = [...op.transform.quaternion];
         return;
       }
       nodeTransforms.set(op.nodePath, {
         nodePath: op.nodePath,
-        position: [...op.position],
-        quaternion: [...op.quaternion],
+        position: [...op.transform.position],
+        quaternion: [...op.transform.quaternion],
       });
       return;
     }
@@ -448,6 +453,10 @@ function applyForwardPure(
       overlay.nodes[op.nodePath][WEB_COMPONENT_TYPE][WEB_COMPONENT_CODE_FIELD] = op.code;
       return;
     }
+    default:
+      // Asset-lineage kind in a scene log — nothing to fold, and refusing would
+      // make a stale record unloadable rather than merely inert.
+      return;
   }
 }
 
@@ -463,187 +472,6 @@ function ensureComponent(overlay: RVExtrasOverlay, nodePath: string, componentTy
   if (!overlay.nodes[nodePath][componentType]) overlay.nodes[nodePath][componentType] = {};
 }
 
-// ─── Coalescing ─────────────────────────────────────────────────────────
-
-/**
- * Decide whether two adjacent ops should merge into a single history entry.
- * Coalescing keeps the history tight when the user types into a field or
- * drags an object — without losing the original `prev` (so a single undo
- * still reverts the full sequence).
- *
- * Rules: same kind, same target, within COALESCE_WINDOW_MS, primitive only.
- */
-export function canCoalesce(last: EditOp, next: EditOp): boolean {
-  if (last.kind !== next.kind) return false;
-  if (last.kind === 'composite' || next.kind === 'composite') return false;
-  if (next.ts - last.ts > COALESCE_WINDOW_MS) return false;
-  if (next.ts < last.ts) return false; // clock went backwards — don't coalesce
-  switch (next.kind) {
-    case 'setField': {
-      const a = last as SetFieldOp;
-      return a.nodePath === next.nodePath
-        && a.componentType === next.componentType
-        && a.fieldName === next.fieldName;
-    }
-    case 'unsetField': {
-      // Unset is idempotent — coalesce identical targets.
-      const a = last as UnsetFieldOp;
-      return a.nodePath === next.nodePath
-        && a.componentType === next.componentType
-        && a.fieldName === next.fieldName;
-    }
-    case 'transformPlacement': {
-      const a = last as TransformPlacementOp;
-      return a.placementId === next.placementId;
-    }
-    case 'setNodeTransform': {
-      const a = last as SetNodeTransformOp;
-      return a.nodePath === next.nodePath;
-    }
-    case 'setCamera': {
-      // Camera coalesces unconditionally on consecutive saves.
-      return true;
-    }
-    case 'setCode': {
-      // Keystroke coalescing — an editor typing run on the same node folds
-      // into one history entry (the first op's `prev` survives the merge).
-      const a = last as SetCodeOp;
-      return a.nodePath === next.nodePath;
-    }
-    case 'setConnectionType': {
-      // Editing one type's parameters folds into a single history entry.
-      const a = last as SetConnectionTypeOp;
-      return a.connectionType.type === next.connectionType.type;
-    }
-    case 'addPlacement':
-    case 'removePlacement':
-    case 'addNode':
-    case 'removeNode':
-    case 'addConnection':
-    case 'removeConnection':
-    case 'removeConnectionType':
-      return false; // never coalesce structural add/remove — discrete user actions
-  }
-}
-
-/**
- * Merge `next` into `last`. Caller has verified `canCoalesce(last, next)`.
- * The merged op keeps `last.id`, `last.prev`, and `last.ts`; takes `next`'s
- * forward payload (value / position / preset). Net effect: a single undo
- * after the merge reverts to the state BEFORE the first op in the run.
- */
-export function mergeOps(last: EditOp, next: EditOp): EditOp {
-  if (last.kind !== next.kind || last.kind === 'composite' || next.kind === 'composite') {
-    throw new Error('mergeOps: precondition violated — call canCoalesce first');
-  }
-  switch (next.kind) {
-    case 'setField': {
-      const a = last as SetFieldOp;
-      return { ...a, value: (next as SetFieldOp).value };
-    }
-    case 'unsetField': {
-      // Identical target → result is the same op.
-      return last;
-    }
-    case 'transformPlacement': {
-      const a = last as TransformPlacementOp;
-      const n = next as TransformPlacementOp;
-      return { ...a, position: n.position, rotation: n.rotation, scale: n.scale };
-    }
-    case 'setNodeTransform': {
-      const a = last as SetNodeTransformOp;
-      const n = next as SetNodeTransformOp;
-      return { ...a, position: n.position, quaternion: n.quaternion };
-    }
-    case 'setCamera': {
-      const a = last as SetCameraOp;
-      return { ...a, preset: (next as SetCameraOp).preset };
-    }
-    case 'setCode': {
-      const a = last as SetCodeOp;
-      return { ...a, code: (next as SetCodeOp).code };
-    }
-    case 'setConnectionType': {
-      const a = last as SetConnectionTypeOp;
-      return { ...a, connectionType: (next as SetConnectionTypeOp).connectionType };
-    }
-    case 'addPlacement':
-    case 'removePlacement':
-    case 'addNode':
-    case 'removeNode':
-    case 'addConnection':
-    case 'removeConnection':
-    case 'removeConnectionType':
-      throw new Error('mergeOps: should not be called for structural add/remove ops');
-  }
-}
-
-// ─── Description (for tooltips / history UI) ────────────────────────────
-
-/**
- * Produce a short human-readable label for a tooltip or history entry.
- * Pure function — fully testable. Localisation-friendly: English only for now;
- * future i18n can replace this single function.
- */
-export function describeOp(op: EditOp): string {
-  switch (op.kind) {
-    case 'setField':
-      return `Set ${op.componentType}.${op.fieldName} = ${formatValue(op.value)} on ${nodeLeaf(op.nodePath)}`;
-    case 'unsetField':
-      return `Reset ${op.componentType}.${op.fieldName} on ${nodeLeaf(op.nodePath)}`;
-    case 'addPlacement':
-      return `Add ${op.placement.label}`;
-    case 'removePlacement':
-      return `Remove ${op.placement.label}`;
-    case 'transformPlacement':
-      return `Move ${shortPlacementLabel(op)}`;
-    case 'setNodeTransform':
-      return `Move ${nodeLeaf(op.nodePath)}`;
-    case 'setCamera':
-      return op.preset ? 'Set camera view' : 'Clear camera view';
-    case 'setCode':
-      return `Edit script on ${nodeLeaf(op.nodePath)}`;
-    case 'addNode':
-      return `Add ${op.spec.name}`;
-    case 'removeNode':
-      return `Remove ${op.spec.name}`;
-    case 'addConnection':
-      return `Connect ${nodeLeaf(op.connection.source)} → ${nodeLeaf(op.connection.target)} (${op.connection.type})`;
-    case 'removeConnection':
-      return `Disconnect ${nodeLeaf(op.connection.source)} → ${nodeLeaf(op.connection.target)}`;
-    case 'setConnectionType':
-      return `Edit connection type ${op.connectionType.type}`;
-    case 'removeConnectionType':
-      return `Remove connection type ${op.connectionType.type}`;
-    case 'composite':
-      return op.label;
-  }
-}
-
-function nodeLeaf(path: string): string {
-  const parts = path.split('/');
-  return parts[parts.length - 1] || path;
-}
-
-function shortPlacementLabel(op: TransformPlacementOp): string {
-  // We only have the placement id here. The id is opaque (e.g. plc_abc123)
-  // so we surface it shortened. Real label comes from a placements lookup
-  // — caller can provide a richer description by composing on top.
-  return op.placementId.length > 12 ? op.placementId.slice(0, 12) + '…' : op.placementId;
-}
-
-function formatValue(v: unknown): string {
-  if (v === null) return 'null';
-  if (v === undefined) return 'undefined';
-  if (typeof v === 'number') {
-    return Number.isInteger(v) ? v.toString() : v.toFixed(3).replace(/\.?0+$/, '');
-  }
-  if (typeof v === 'boolean') return v ? 'true' : 'false';
-  if (typeof v === 'string') return v.length > 20 ? `"${v.slice(0, 20)}…"` : `"${v}"`;
-  if (Array.isArray(v)) return `[${v.length}]`;
-  return '{…}';
-}
-
 // ─── Inverse helpers (used by executors and tests) ──────────────────────
 
 /**
@@ -655,8 +483,12 @@ function formatValue(v: unknown): string {
  * Note: the executor doesn't necessarily call this — it applies the inverse
  * directly via the `prev` field of the original op. This helper is exposed
  * for tests and for any future code that wants an "inverse op" record.
+ *
+ * SCENE lineage only, and deliberately typed that way: the asset lineage never
+ * had a counterpart (its executor inverts from `prev` directly), so widening the
+ * signature to `RvOp` would promise an inverse this function cannot produce.
  */
-export function inverseOp(op: EditOp): EditOp {
+export function inverseOp(op: RvSceneOp): RvSceneOp {
   switch (op.kind) {
     case 'setField': {
       // Inverse: setField with prev value (or unsetField if prev was undefined)
@@ -705,13 +537,16 @@ export function inverseOp(op: EditOp): EditOp {
         prev: { position: op.position, rotation: op.rotation, scale: op.scale },
       };
     }
-    case 'setNodeTransform': {
+    case 'transformNode': {
+      // Swap forward and prev WITHOUT normalising either side: whatever the
+      // original carried for `scale` (present or absent) is what its inverse
+      // must carry, or an undo would change the lineage of the op it reverses.
       return {
         id: freshOpId(), ts: Date.now(), schemaV: 1,
-        kind: 'setNodeTransform',
+        kind: 'transformNode',
         nodePath: op.nodePath,
-        position: op.prev.position, quaternion: op.prev.quaternion,
-        prev: { position: op.position, quaternion: op.quaternion },
+        transform: op.prev,
+        prev: op.transform,
       };
     }
     case 'setCamera': {
@@ -774,12 +609,12 @@ export function inverseOp(op: EditOp): EditOp {
       };
     }
     case 'composite': {
-      const reversed: PrimitiveEditOp[] = [];
+      const reversed: RvScenePrimitiveOp[] = [];
       for (let i = op.ops.length - 1; i >= 0; i--) {
-        const inv = inverseOp(op.ops[i]);
+        const inv = inverseOp(op.ops[i] as RvScenePrimitiveOp);
         if (inv.kind === 'composite') {
           // Defensive — composites don't nest. Flatten.
-          reversed.push(...inv.ops);
+          reversed.push(...(inv.ops as RvScenePrimitiveOp[]));
         } else {
           reversed.push(inv);
         }
@@ -796,7 +631,7 @@ export function inverseOp(op: EditOp): EditOp {
 
 /** Compare two op arrays by id sequence. Op records are immutable — id
  *  equality implies content equality. */
-export function opsEqual(a: ReadonlyArray<EditOp>, b: ReadonlyArray<EditOp>): boolean {
+export function opsEqual(a: ReadonlyArray<RvOp>, b: ReadonlyArray<RvOp>): boolean {
   if (a === b) return true;
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i].id !== b[i].id) return false;

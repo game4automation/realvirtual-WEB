@@ -2,184 +2,111 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * library-asset-ops — rename / duplicate / delete / collections
- * (plan-372 Phase 9).
+ * library-asset-ops — what is left of it after plan-717 Phase 4.
  *
- * Two rules carry the weight here. Delete is a MOVE into `library/.trash/`,
- * because a library asset can be the only copy of hours of authoring work. And
- * an unreadable sidecar is never overwritten — doing so would destroy the
- * collections of a user who opened the project in a newer build.
+ * This file used to pin four blob-only verbs: rename, duplicate, delete and
+ * create, each moving bytes and a `library.json` record past the manifest. All
+ * four are deleted (F1/F6/F9) and their cases went with them — they were
+ * characterising a route, and the route is gone. Where each one's behaviour is
+ * pinned now:
+ *
+ *  - rename  → `one-rename-path.test.ts` (row name + file name, id stable)
+ *  - create  → `open-save-document.test.ts` / `dashboard-documents.test.ts`
+ *  - delete / duplicate → `open-save-document.test.ts` (row route, `.trash/`)
+ *  - the deletions themselves → `registration-removal-guard.test.ts`
+ *
+ * What remains in the module, and therefore here, is `setAssetCollections`:
+ * one field, one row, one write. The full round trip (row → catalog → filter)
+ * is `collections-roundtrip.test.ts`; what is pinned here is the verb.
+ *
+ * The cross-source transfer verbs living in the same module have their own
+ * file, `library-cross-source-ops.test.ts`.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import {
   LIBRARY_FOLDER,
-  TRASH_FOLDER,
-  deleteAsset,
-  createEmptyAsset,
-  duplicateAsset,
-  renameAsset,
   setAssetCollections,
+  type DocumentRowWriter,
 } from '../src/core/library/library-asset-ops';
-import { SIDECAR_FILENAME, parseSidecar } from '../src/core/library/library-sidecar';
-import type { ProjectBackend } from '../src/core/project/backends/project-backend';
+import type { RvDocumentEntry, RvProject } from '../src/core/project/rv-project-types';
 
-/** In-memory backend double: only the blob surface the ops actually use. */
-class FakeBackend {
-  files = new Map<string, string>();
+/**
+ * The manifest half `setAssetCollections` writes through, in memory.
+ *
+ * Deliberately not a `ProjectStore`: the verb takes the narrow
+ * {@link DocumentRowWriter} precisely so the row write can be exercised
+ * without a backend, a folder handle or a boot path.
+ */
+class FakeRows implements DocumentRowWriter {
+  publishes = 0;
+  constructor(public project: RvProject | null) {}
 
-  async writeBlob(relPath: string, blob: Blob): Promise<void> {
-    this.files.set(relPath, await blob.text());
-  }
-  async deleteBlob(relPath: string): Promise<void> {
-    this.files.delete(relPath);
-  }
-  async readBlobUrl(relPath: string) {
-    const body = this.files.get(relPath);
-    if (body === undefined) return null;
-    const url = URL.createObjectURL(new Blob([body]));
-    return { url, release: () => URL.revokeObjectURL(url) };
+  async applyManifestDelta(
+    apply: (current: RvProject) => RvProject,
+    opts: { publish?: boolean } = {},
+  ): Promise<RvProject | null> {
+    if (!this.project) return null;             // no manifest to record into
+    this.project = apply(this.project);
+    if (opts.publish !== false) this.publishes++;
+    return this.project;
   }
 
-  // ── helpers ──
-  lib(rel: string): string | undefined { return this.files.get(`${LIBRARY_FOLDER}/${rel}`); }
-  putLib(rel: string, body: string): void { this.files.set(`${LIBRARY_FOLDER}/${rel}`, body); }
-  sidecar() {
-    const raw = this.files.get(`${LIBRARY_FOLDER}/${SIDECAR_FILENAME}`);
-    return raw ? parseSidecar(raw) : null;
+  row(path: string): RvDocumentEntry | undefined {
+    return (this.project?.documents ?? []).find(d => d.path === path);
   }
 }
 
-const as = (b: FakeBackend) => b as unknown as ProjectBackend;
+function projectWith(...paths: string[]): RvProject {
+  return {
+    schemaVersion: 3,
+    id: 'prj_ops',
+    name: 'Ops fixture',
+    documents: paths.map(path => ({
+      id: `doc_${path}`,
+      path,
+      name: (path.split('/').pop() ?? path).replace(/\.glb$/, ''),
+      section: 'library' as const,
+    })),
+  } as unknown as RvProject;
+}
 
-let backend: FakeBackend;
-beforeEach(() => {
-  backend = new FakeBackend();
-  backend.putLib('conveyor/belt.glb', 'BELT');
-});
+const BELT = `${LIBRARY_FOLDER}/conveyor/belt.glb`;
 
-describe('renameAsset', () => {
-  it('moves the bytes and leaves nothing at the old path', async () => {
-    expect((await renameAsset(as(backend), 'conveyor/belt.glb', 'belt2.glb')).kind).toBe('ok');
-    expect(backend.lib('conveyor/belt2.glb')).toBe('BELT');
-    expect(backend.lib('conveyor/belt.glb')).toBeUndefined();
-  });
-
-  it('carries the sidecar metadata across', async () => {
-    await setAssetCollections(as(backend), 'conveyor/belt.glb', ['Conveyors']);
-    await renameAsset(as(backend), 'conveyor/belt.glb', 'belt2.glb');
-    const s = backend.sidecar();
-    expect(s?.assets['conveyor/belt.glb']).toBeUndefined();
-    expect(s?.assets['conveyor/belt2.glb'].collections).toEqual(['Conveyors']);
-  });
-
-  it('refuses to overwrite an existing name', async () => {
-    backend.putLib('conveyor/other.glb', 'OTHER');
-    const r = await renameAsset(as(backend), 'conveyor/belt.glb', 'other.glb');
-    expect(r.kind).toBe('exists');
-    expect(backend.lib('conveyor/other.glb')).toBe('OTHER');   // untouched
-    expect(backend.lib('conveyor/belt.glb')).toBe('BELT');     // and not lost
-  });
-
-  it('renaming to the same name is a no-op, not a delete', async () => {
-    expect((await renameAsset(as(backend), 'conveyor/belt.glb', 'belt.glb')).kind).toBe('ok');
-    expect(backend.lib('conveyor/belt.glb')).toBe('BELT');
-  });
-
-  it('reports a missing source instead of creating an empty file', async () => {
-    const r = await renameAsset(as(backend), 'conveyor/ghost.glb', 'x.glb');
-    expect(r.kind).toBe('error');
-    expect(backend.lib('conveyor/x.glb')).toBeUndefined();
-  });
-});
-
-describe('duplicateAsset', () => {
-  it('creates "<name> copy" beside the original', async () => {
-    const r = await duplicateAsset(as(backend), 'conveyor/belt.glb');
-    expect(r.kind).toBe('ok');
-    expect(r.newPath).toBe('conveyor/belt copy.glb');
-    expect(backend.lib('conveyor/belt copy.glb')).toBe('BELT');
-    expect(backend.lib('conveyor/belt.glb')).toBe('BELT');
-  });
-
-  it('numbers further copies rather than failing', async () => {
-    await duplicateAsset(as(backend), 'conveyor/belt.glb');
-    const second = await duplicateAsset(as(backend), 'conveyor/belt.glb');
-    expect(second.newPath).toBe('conveyor/belt copy 2.glb');
-  });
-
-  it('the copy inherits collections — that is what makes it a starting point', async () => {
-    await setAssetCollections(as(backend), 'conveyor/belt.glb', ['Conveyors']);
-    const r = await duplicateAsset(as(backend), 'conveyor/belt.glb');
-    expect(backend.sidecar()?.assets[r.newPath!].collections).toEqual(['Conveyors']);
-  });
-});
-
-describe('deleteAsset', () => {
-  it('moves into .trash rather than destroying the bytes', async () => {
-    expect((await deleteAsset(as(backend), 'conveyor/belt.glb')).kind).toBe('ok');
-    expect(backend.lib('conveyor/belt.glb')).toBeUndefined();
-    expect(backend.lib(`${TRASH_FOLDER}/belt.glb`)).toBe('BELT');
-  });
-
-  it('never overwrites something already in the trash', async () => {
-    await deleteAsset(as(backend), 'conveyor/belt.glb');
-    backend.putLib('other/belt.glb', 'SECOND');
-    await deleteAsset(as(backend), 'other/belt.glb');
-    expect(backend.lib(`${TRASH_FOLDER}/belt.glb`)).toBe('BELT');
-    expect(backend.lib(`${TRASH_FOLDER}/belt 2.glb`)).toBe('SECOND');
-  });
-
-  it('drops the metadata so it cannot reattach to a future asset', async () => {
-    await setAssetCollections(as(backend), 'conveyor/belt.glb', ['Conveyors']);
-    await deleteAsset(as(backend), 'conveyor/belt.glb');
-    expect(backend.sidecar()?.assets['conveyor/belt.glb']).toBeUndefined();
-  });
-});
-
-describe('setAssetCollections', () => {
+describe('setAssetCollections writes the row', () => {
   it('trims, drops blanks and de-duplicates user-typed names', async () => {
-    await setAssetCollections(as(backend), 'conveyor/belt.glb', [' Conveyors ', 'Conveyors', '', '  ']);
-    expect(backend.sidecar()?.assets['conveyor/belt.glb'].collections).toEqual(['Conveyors']);
+    const rows = new FakeRows(projectWith(BELT));
+    const r = await setAssetCollections(rows, 'conveyor/belt.glb', [' Conveyors ', 'Conveyors', '', '  ']);
+    expect(r.kind).toBe('ok');
+    expect(rows.row(BELT)?.collections).toEqual(['Conveyors']);
   });
 
-  it('an empty list clears the record rather than persisting an empty one', async () => {
-    await setAssetCollections(as(backend), 'conveyor/belt.glb', ['A']);
-    await setAssetCollections(as(backend), 'conveyor/belt.glb', []);
-    expect(backend.sidecar()?.assets['conveyor/belt.glb']).toBeUndefined();
+  it('an empty list is stored as an empty array — "filed under nothing" is an answer', async () => {
+    const rows = new FakeRows(projectWith(BELT));
+    await setAssetCollections(rows, 'conveyor/belt.glb', ['A']);
+    await setAssetCollections(rows, 'conveyor/belt.glb', []);
+    // Deleting the field instead would re-open the legacy sidecar fallback for
+    // this row, which is the opposite of what the user just asked for.
+    expect(rows.row(BELT)?.collections).toEqual([]);
   });
-});
 
-describe('an unreadable sidecar is never overwritten', () => {
-  it('refuses the write and says why', async () => {
-    // A sidecar from a newer build: parseable JSON, unknown schemaVersion.
-    backend.putLib(SIDECAR_FILENAME, JSON.stringify({ schemaVersion: 99, assets: {} }));
-    const r = await setAssetCollections(as(backend), 'conveyor/belt.glb', ['A']);
+  it('touches only the row it was asked about', async () => {
+    const other = `${LIBRARY_FOLDER}/other.glb`;
+    const rows = new FakeRows(projectWith(BELT, other));
+    await setAssetCollections(rows, 'conveyor/belt.glb', ['Conveyors']);
+    expect(rows.row(other)?.collections).toBeUndefined();
+  });
+
+  it('reports a document with no row instead of writing a manifest nobody asked for', async () => {
+    const rows = new FakeRows(projectWith(`${LIBRARY_FOLDER}/other.glb`));
+    const r = await setAssetCollections(rows, 'conveyor/belt.glb', ['A']);
     expect(r.kind).toBe('error');
-    expect(r.kind === 'error' && r.message).toMatch(/newer version/i);
-    // Their file is exactly as it was.
-    expect(JSON.parse(backend.lib(SIDECAR_FILENAME)!).schemaVersion).toBe(99);
-  });
-});
-
-// A card the user can rename and open later only exists if the bytes do — the
-// old "New asset" jumped into the editor and left the project with nothing.
-describe('createEmptyAsset', () => {
-  it('writes a real GLB so the row survives a reload', async () => {
-    const result = await createEmptyAsset(as(backend));
-    expect(result.kind).toBe('ok');
-    expect(result.newPath).toBe('New asset.glb');
-    const body = backend.lib('New asset.glb');
-    expect(body).toBeDefined();
-    // 'glTF' magic — a loader must accept it, not just a placeholder file.
-    expect(body!.startsWith('glTF')).toBe(true);
+    expect(r.kind === 'error' && r.message).toMatch(/not registered/i);
   });
 
-  it('probes the name so clicking twice makes two assets', async () => {
-    await createEmptyAsset(as(backend));
-    const second = await createEmptyAsset(as(backend));
-    expect(second.newPath).toBe('New asset 2.glb');
-    expect(backend.lib('New asset.glb')).toBeDefined();
-    expect(backend.lib('New asset 2.glb')).toBeDefined();
+  it('reports a project with no manifest to write into', async () => {
+    const r = await setAssetCollections(new FakeRows(null), 'conveyor/belt.glb', ['A']);
+    expect(r.kind).toBe('error');
+    expect(r.kind === 'error' && r.message).toMatch(/no manifest/i);
   });
 });

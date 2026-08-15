@@ -11,8 +11,8 @@
  * wrong twice over:
  *
  *  - `save()`/`saveAs()` are only two of the seams. `rename()`,
- *    `duplicate()`, `delete()`, `addPublishedToMyScenes()`,
- *    `importSceneJSON()`, `markGlbActive()` and `_loadIntoWorkspace()` all
+ *    `duplicate()`, `delete()`, `addPublishedToMyScenes()`, `createEmpty()`,
+ *    `markGlbActive()` and `_loadIntoWorkspace()` all
  *    write persisted state too. A hook in save() alone lets an open project
  *    drift away from its folder with nothing visible to show for it.
  *  - `main.ts` calls `writeActiveId(null)` **directly** from the heavy-CAD

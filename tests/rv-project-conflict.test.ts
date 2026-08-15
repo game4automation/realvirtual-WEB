@@ -32,7 +32,7 @@ function scene(overrides: Partial<RvScene> = {}): RvScene {
     name: 'Cell A',
     createdAt: T0,
     modifiedAt: T0,
-    schemaVersion: 2,
+    schemaVersion: 3,
     base: { kind: 'empty' },
     edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
     ...overrides,

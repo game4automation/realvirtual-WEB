@@ -14,6 +14,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { Scene, Object3D } from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
 // ─── GLB Loading Helper ────────────────────────────────────────────
 
@@ -65,7 +66,7 @@ beforeAll(async () => {
 
   // Check if file exists and has content
   try {
-    const headResp = await fetch('/models/tests.glb', { method: 'HEAD' });
+    const headResp = await fetch(DEV_GLB.tests, { method: 'HEAD' });
     if (!headResp.ok) {
       loadError = `HTTP ${headResp.status} - file not found`;
       return;
@@ -81,7 +82,7 @@ beforeAll(async () => {
   }
 
   try {
-    const gltf = await gltfLoader.loadAsync('/models/tests.glb');
+    const gltf = await gltfLoader.loadAsync(DEV_GLB.tests);
     scene.add(gltf.scene);
 
     // Collect all nodes with realvirtual extras

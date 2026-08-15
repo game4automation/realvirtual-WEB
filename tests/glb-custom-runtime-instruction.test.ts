@@ -18,6 +18,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { Scene, Object3D } from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
 const dracoLoader = new DRACOLoader();
 dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
@@ -30,7 +31,7 @@ let nodes: RVNode[] = [];
 beforeAll(async () => {
   const scene = new Scene();
   try {
-    const gltf = await gltfLoader.loadAsync('/models/tests.glb');
+    const gltf = await gltfLoader.loadAsync(DEV_GLB.tests);
     scene.add(gltf.scene);
     scene.traverse((n: Object3D) => {
       const rv = n.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;

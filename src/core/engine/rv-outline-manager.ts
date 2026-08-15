@@ -94,17 +94,30 @@ export const DEFAULT_CHAIN_OUTLINE_STYLE: OutlineStyle = Object.freeze({
   pulsePeriod: 0,
 });
 
-/** Default status outline — the alarm/severity silhouette (Toray-style pulse
- *  parameters). Callers always override color + pulsePeriod per status via
- *  setStatusStyle; these defaults just keep the channel sane before first use.
+/** Edge geometry shared by the attention channels (status + flash).
+ *
+ *  Deliberately the SAME crisp silhouette as the selection outline above: only
+ *  the color and the pulse should tell an alarm apart from a selection. The
+ *  original Toray values (strength 20, thickness 10, glow 1.5) were far outside
+ *  the 1..4 px thickness the OutlinePass is built for — the blur kernel widened
+ *  faster than the mask, so the "outline" rendered as a fat, washed-out halo
+ *  around the part instead of an edge. Change these three numbers here and both
+ *  attention channels follow. */
+export const ATTENTION_OUTLINE_GEOMETRY = Object.freeze({
+  edgeStrength: 6,
+  edgeThickness: 2,
+  edgeGlow: 0.35,
+});
+
+/** Default status outline — the alarm/severity silhouette. Callers always
+ *  override color + pulsePeriod per status via setStatusStyle; these defaults
+ *  just keep the channel sane before first use.
  *  WebGL only — the status channel has no TSL mirror (WebGPU shows no status
  *  outline; the OutlinePass pulse never animated there anyway). */
 export const DEFAULT_STATUS_OUTLINE_STYLE: OutlineStyle = Object.freeze({
   visibleEdgeColor: 0xffa726,
   hiddenEdgeColor: 0x8c5c15,
-  edgeStrength: 20,
-  edgeThickness: 10,
-  edgeGlow: 1.5,
+  ...ATTENTION_OUTLINE_GEOMETRY,
   pulsePeriod: 0.6,
 });
 
@@ -116,9 +129,7 @@ export const DEFAULT_STATUS_OUTLINE_STYLE: OutlineStyle = Object.freeze({
 export const DEFAULT_FLASH_OUTLINE_STYLE: OutlineStyle = Object.freeze({
   visibleEdgeColor: 0xff3030,
   hiddenEdgeColor: 0x591111,
-  edgeStrength: 20,
-  edgeThickness: 10,
-  edgeGlow: 1.5,
+  ...ATTENTION_OUTLINE_GEOMETRY,
   pulsePeriod: 0.6,
 });
 

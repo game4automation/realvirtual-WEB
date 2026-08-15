@@ -5,7 +5,8 @@ import { describe, it, expect } from 'vitest';
 import { Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { AssetDocument } from '../src/core/editor/rv-asset-document';
-import type { AssetOp, AddComponentOp, RemoveComponentOp } from '../src/core/editor/rv-asset-ops';
+import type { AddComponentOp, RemoveComponentOp } from '../src/core/editor/rv-asset-ops';
+import type { RvAssetOp } from '../src/core/ops/rv-unified-ops';
 import { GroupRegistry } from '../src/core/engine/rv-group-registry';
 import {
   nodeHasGroupNamed,
@@ -18,12 +19,12 @@ import {
   groupSelection,
   ungroupSelection,
   autoAssignToKinematic,
-} from '../src/plugins/asset-editor/group-actions';
-import { createKinematicWithGroup } from '../src/plugins/asset-editor/kinematics/create-actions';
+} from '@rv-private/plugins/asset-editor/group-actions';
+import { createKinematicWithGroup } from '@rv-private/plugins/asset-editor/kinematics/create-actions';
 
 /** Fake AssetDocument capturing withTransaction/applyOp/create/addComponent calls. */
 function makeDoc() {
-  const ops: AssetOp[] = [];
+  const ops: RvAssetOp[] = [];
   const transactions: string[] = [];
   const created: { parentPath: string | null; baseName: string }[] = [];
   const doc = {
@@ -31,7 +32,7 @@ function makeDoc() {
       transactions.push(label);
       await fn();
     },
-    async applyOp(op: AssetOp) {
+    async applyOp(op: RvAssetOp) {
       ops.push(op);
     },
     async createEmptyNode(parentPath: string | null, baseName: string) {
@@ -39,7 +40,7 @@ function makeDoc() {
       return baseName;
     },
     addComponent(nodePath: string, baseType: string, fields: Record<string, unknown>) {
-      ops.push({ kind: 'addComponent', nodePath, componentType: baseType, fields } as unknown as AssetOp);
+      ops.push({ kind: 'addComponent', nodePath, componentType: baseType, fields } as unknown as RvAssetOp);
       return baseType;
     },
   };

@@ -25,9 +25,9 @@ import type { RVViewer } from '../src/core/rv-viewer';
 import type { ContextMenuTarget } from '../src/core/hmi/context-menu-store';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
-import { buildMergeMenuItem, disposeMergeClient } from '../src/plugins/asset-editor/mesh-merge-actions';
-import { setActiveAssetContext } from '../src/plugins/asset-editor/active-asset-store';
-import { getPendingDialog } from '../src/plugins/asset-editor/editor-dialog-store';
+import { buildMergeMenuItem, disposeMergeClient } from '@rv-private/plugins/asset-editor/mesh-merge-actions';
+import { setActiveAssetContext } from '../src/core/editor/active-asset-store';
+import { getPendingDialog } from '@rv-private/plugins/asset-editor/editor-dialog-store';
 
 function triangleGeometry(offset = 0): BufferGeometry {
   const geom = new BufferGeometry();

@@ -28,6 +28,8 @@
 import { RVBehavior } from '../core/rv-behavior';
 import type { RVViewer } from '../core/rv-viewer';
 import { lastPathSegment } from '../core/engine/rv-constants';
+import { builtinSources } from '../core/rv-model-catalog';
+import { isModelRoot } from '../core/engine/rv-model-root';
 import type { RVLogicStep } from '../core/engine/rv-logic-step';
 import {
   McpTool,
@@ -38,7 +40,15 @@ import {
 import { McpViewTools } from './mcp-bridge/rv-mcp-view-tools';
 import { McpObserveTools } from './mcp-bridge/rv-mcp-observe-tools';
 import { McpEditorTools } from './mcp-bridge/rv-mcp-editor-tools';
+import { McpSignalBindTools } from './mcp-bridge/rv-mcp-signal-bind-tools';
+import { McpKnowledgeTools } from './mcp-bridge/rv-mcp-knowledge-tools';
+import { McpProjectTools } from './mcp-bridge/rv-mcp-project-tools';
+import { McpDescribeTool } from './mcp-bridge/rv-mcp-describe-tool';
+import { installMcpDialogPolicy, withDialogReport } from './mcp-bridge/rv-mcp-dialog-policy';
 import { McpHelpTool } from './mcp-bridge/rv-mcp-help-tool';
+import {
+  DELTA_PROBES, mergeDelta, parseResult, releaseCall, safeProbe,
+} from './mcp-bridge/rv-mcp-delta-probes';
 import { getLastLogs, queryLogs } from '../core/engine/rv-debug';
 import type { LogLevel } from '../core/engine/rv-debug';
 import { Box3, MeshBasicMaterial, Vector3 } from 'three';
@@ -269,6 +279,10 @@ export class McpBridgePlugin extends RVBehavior {
   private readonly _viewTools = new McpViewTools(() => this.viewer ?? undefined);
   private readonly _observeTools = new McpObserveTools(() => this.viewer ?? undefined);
   private readonly _editorTools = new McpEditorTools(() => this.viewer ?? undefined);
+  private readonly _signalBindTools = new McpSignalBindTools(() => this.viewer ?? undefined);
+  private readonly _knowledgeTools = new McpKnowledgeTools(() => this.viewer ?? undefined);
+  private readonly _projectTools = new McpProjectTools(() => this.viewer ?? undefined);
+  private readonly _describeTool = new McpDescribeTool(() => this.viewer ?? undefined);
   private readonly _helpTool = new McpHelpTool();
 
   // WebSocket state
@@ -294,6 +308,10 @@ export class McpBridgePlugin extends RVBehavior {
   private _serverStatus: BridgeServerStatus | null = null;
   /** Lazily created multi-view mosaic renderer for web_screenshot_analyze. */
   private _objectAnalyzer: ObjectAnalyzer | null = null;
+  /** plan-435: the bridge was live when the user switched the plugin off, so
+   *  `onActivate` must reconnect. Kept separate from the persisted `enabled`
+   *  setting — a plugin toggle is not a change of the user's bridge preference. */
+  private _reconnectOnActivate = false;
 
   // ── Public getters ──
 
@@ -424,6 +442,34 @@ export class McpBridgePlugin extends RVBehavior {
    *  change.) Final teardown happens in dispose() when the viewer is destroyed. */
   onModelCleared(): void { /* intentionally no-op: bridge spans the viewer lifetime */ }
 
+  /**
+   * plan-435: the bridge defines no meaningful `onModelCleared` (above) and
+   * never enters the model bookkeeping, so the fallback teardown would do
+   * nothing at all and the WebSocket would stay open behind a switched-off
+   * plugin. Close it here — but do NOT persist "disabled": the toggle is a
+   * diagnostic action, not a change of the user's bridge preference.
+   */
+  onDeactivate(): void {
+    this._reconnectOnActivate = !this._destroyed;
+    if (this._destroyed) return;
+    this._destroyed = true;
+    if (this._reconnectTimer !== null) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+    this._disconnect();
+    this._emitChanged();
+  }
+
+  /** Reopen the connection {@link onDeactivate} closed, if it was open then. */
+  onActivate(): void {
+    if (!this._reconnectOnActivate || !this._destroyed) return;
+    this._reconnectOnActivate = false;
+    this._destroyed = false;
+    this._connect();
+    this._emitChanged();
+  }
+
   protected onDestroy(): void {
     this._destroyed = true;
     // Clear reconnect timer to prevent leak (review fix #4)
@@ -535,7 +581,11 @@ export class McpBridgePlugin extends RVBehavior {
 
   private _sendDiscover(): void {
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
-    const instances = [this, this._viewTools, this._observeTools, this._editorTools, this._helpTool];
+    const instances = [
+      this, this._viewTools, this._observeTools, this._editorTools,
+      this._signalBindTools, this._knowledgeTools, this._projectTools,
+      this._describeTool, this._helpTool,
+    ];
     const schemas = generateToolSchemasMulti(instances);
     this._dispatcher = buildMultiDispatcher(instances);
     this._ws.send(JSON.stringify({
@@ -629,6 +679,12 @@ export class McpBridgePlugin extends RVBehavior {
 
     this._showActivity(tool);
 
+    // The editor's modal dialogs settle on a CLICK. Nobody is going to click
+    // during an MCP call, so a raised dialog would block until the bridge
+    // timeout and stay on screen poisoning the next call too. The policy
+    // answers the safe ones and reports what it answered; see
+    // rv-mcp-dialog-policy.ts for the per-dialog reasoning.
+    const releaseDialogs = await installMcpDialogPolicy();
     try {
       const method = (entry.instance as Record<string, Function>)[entry.methodKey];
       if (typeof method !== 'function') {
@@ -639,11 +695,39 @@ export class McpBridgePlugin extends RVBehavior {
       // Build ordered arguments from named params
       const orderedArgs = entry.paramNames.map(name => args[name]);
       await this._prepareEditorChoreography(tool, args ?? {});
+
+      // ── Effect verification (plan-707 part c) ──
+      // One table lookup, two guarded hooks around the SAME `method.apply` the
+      // choreography already brackets. Every probe half runs inside safeProbe,
+      // and mergeDelta returns the original string on any doubt, so nothing
+      // here can turn a working tool call into a failing one (F9/R1).
+      const probe = DELTA_PROBES[tool] ?? null;
+      const pctx = probe && this.viewer ? { viewer: this.viewer, tool, callId: id } : null;
+      const snap = probe && pctx ? safeProbe(() => probe.before(pctx, args ?? {})) : undefined;
+
       const result = await method.apply(entry.instance, orderedArgs);
-      this._sendResult(id, result);
-      this._applyEditorFeedback(tool, args, result);
+      const reported = withDialogReport(result, releaseDialogs()) as string;
+
+      // parseResult lives INSIDE the closure: a non-JSON result (an image)
+      // yields null there and can never damage the call.
+      const delta = probe && pctx
+        ? safeProbe(() => probe.after(pctx, args ?? {}, snap, parseResult(reported))) ?? null
+        : null;
+      this._sendResult(id, mergeDelta(reported, delta));
+      this._applyEditorFeedback(tool, args, reported);
     } catch (e) {
-      this._sendResult(id, undefined, String(e));
+      const answered = releaseDialogs();
+      const note = answered.length > 0
+        ? ` (dialogs auto-answered: ${answered.map(a => `${a.kind}=${a.answer}`).join(', ')})`
+        : '';
+      this._sendResult(id, undefined, String(e) + note);
+    } finally {
+      // Idempotent: releasing twice just returns an empty log the second time.
+      releaseDialogs();
+      // The probe's own `after` releases the scope on the happy path, but it
+      // never runs when the tool body throws — and a call left in the registry
+      // makes every later call on that scope report `ambiguous` forever.
+      safeProbe(() => releaseCall(id));
     }
   }
 
@@ -1634,9 +1718,9 @@ export class McpBridgePlugin extends RVBehavior {
     });
   }
 
-  @McpTool('Get the scene-graph tree from a root path (or the whole scene) with component types per node. Use to understand structure before selecting/kinematizing; depth defaults to 3. includeBounds adds per-node world AABB size [x,y,z] (m) + subtree meshCount — one call sizes a whole CAD assembly instead of N web_node_bounds calls.', { readOnly: true })
+  @McpTool('Get the scene-graph tree from a root path (default: the loaded model root, which reports locked:true) with component types per node. Use to understand structure before selecting/kinematizing; depth defaults to 3. includeBounds adds per-node world AABB size [x,y,z] (m) + subtree meshCount — one call sizes a whole CAD assembly instead of N web_node_bounds calls.', { readOnly: true })
   async webNodeTree(
-    @McpParam('root', 'Root path to start from (empty = entire scene)', 'string', false) root: string,
+    @McpParam('root', 'Root path to start from (empty = the loaded model root, or the whole scene when no model is loaded)', 'string', false) root: string,
     @McpParam('depth', 'Max depth to traverse (default 3)', 'integer', false) depth: number,
     @McpParam('includeBounds', 'Add sizeM [x,y,z] + center + meshCount per node (default false)', 'boolean', false) includeBounds?: boolean,
   ): Promise<string> {
@@ -1648,7 +1732,14 @@ export class McpBridgePlugin extends RVBehavior {
     const scene = v.scene;
     if (!scene) return JSON.stringify({ error: 'No scene loaded' });
 
-    let startNode = root ? reg.getNode(root) : scene;
+    // Default start = the MODEL ROOT, not the raw Three.js scene (plan-715 F6).
+    // The scene is a container for the model plus runtime siblings (the planner's
+    // `_layoutRoot`, gizmo groups); starting there spent the first level of the
+    // depth budget on a node the user never authored. Child paths in the answer
+    // are unchanged — `computeNodePath` is untouched — so only the root ENTRY and
+    // the reachable depth per call differ. `root` stays the escape hatch, and a
+    // viewer with no model loaded still falls back to the scene.
+    let startNode = root ? reg.getNode(root) : (v.currentModelRoot ?? scene);
     if (!startNode) return JSON.stringify({ error: `Node not found: "${root}"` });
 
     // One O(N) snapshot pass joins bounds + mesh counts into the tree.
@@ -1670,6 +1761,9 @@ export class McpBridgePlugin extends RVBehavior {
         path: path ?? node.name,
         types,
       };
+      // The model root is structurally frozen (plan-715 F4) — say so in the
+      // tree, so an agent does not have to discover it by getting refused.
+      if (isModelRoot(node, v.currentModelRoot)) entry.locked = true;
       if (geo && path) {
         const g = geo.get(path);
         if (g && g.meshCount > 0) {
@@ -1913,51 +2007,85 @@ export class McpBridgePlugin extends RVBehavior {
     }));
   }
 
-  @McpTool('Save the current layout as a persisted scene. With name: saves a NEW named scene (returns id); without: saves the active scene in place. Reopen via web_scene_open; raw JSON via web_scene_export.', { readOnly: false })
+  // ─── The webScene* family — DEPRECATED ALIASES (plan-716 §2.7) ─────────
+  //
+  // These five predate `web_model_list` / `web_model_open` and were the second,
+  // older MCP view of a world that no longer has two halves: since plan-716
+  // there is one owned artefact, the GLB DOCUMENT, and "scene" is not a storage
+  // concept at all. The NAMES stay — an agent, a saved prompt or a customer
+  // script that learnt them keeps working — but every one of them is wired onto
+  // a document op, which is what allowed `SceneStore.listScenes()/listBuiltins()`
+  // to be deleted in Phase 6 (risk 11). Built-in SOURCES are still listed; they
+  // come from the model catalogue now, not from the scene store.
+
+  @McpTool('Save the current document. DEPRECATED ALIAS (plan-716) — the name says "scene", the op is a document write. With name: saves a NEW named document and returns its documentId; without: saves the open one in place with compare-and-swap. Reopen via web_model_open; raw layout JSON via web_scene_export.', { readOnly: false })
   async webSceneSave(
-    @McpParam('name', 'Scene name (optional — omit to save the active scene in place)', 'string', false) name: string,
+    @McpParam('name', 'Document name (optional — omit to save the open document in place)', 'string', false) name: string,
   ): Promise<string> {
     const store = getSceneStore();
     if (!store) return JSON.stringify({ error: 'Scene store not available' });
     try {
       if (name && name.trim()) {
+        // `saveAs` places a FILE plus a manifest row since Phase 3 — the id it
+        // returns is a documentId, so it is reported under that name too.
         const id = await store.saveAs(name.trim());
-        return JSON.stringify({ saved: true, id, name: name.trim() });
+        return JSON.stringify({ saved: true, id, documentId: id, name: name.trim() });
       }
       await store.save();
       return JSON.stringify({ saved: true });
     } catch (e) { return JSON.stringify({ error: String(e) }); }
   }
 
-  @McpTool('Create a new empty scene (clears the current layout to a fresh draft). The clean reset before building a new layout.', { readOnly: false })
+  @McpTool('Create a new empty DOCUMENT in the project and open it, returning its documentId. DEPRECATED ALIAS (plan-716) — it used to clear the viewport to an unsaved draft; it now places a file plus a manifest row, so the clean reset before building a layout survives a reload.', { readOnly: false })
   async webSceneNew(): Promise<string> {
     const store = getSceneStore();
     if (!store) return JSON.stringify({ error: 'Scene store not available' });
-    try { await store.newEmpty(); return JSON.stringify({ ok: true }); }
-    catch (e) { return JSON.stringify({ error: String(e) }); }
+    try {
+      const documentId = await store.createEmpty();
+      await store.openDocument(documentId);
+      return JSON.stringify({ ok: true, documentId });
+    } catch (e) { return JSON.stringify({ error: String(e) }); }
   }
 
-  @McpTool('Open a saved scene by id (from web_scene_list).', { readOnly: false })
+  @McpTool('Open a document by id. DEPRECATED ALIAS of web_model_open (plan-716). Takes a documentId from web_scene_list / web_model_list, and tolerates a pre-migration scn_ id through the permanent alias map.', { readOnly: false })
   async webSceneOpen(
-    @McpParam('id', 'Saved scene id (from web_scene_list)') id: string,
+    @McpParam('id', 'Document id (from web_scene_list or web_model_list)') id: string,
   ): Promise<string> {
     const store = getSceneStore();
     if (!store) return JSON.stringify({ error: 'Scene store not available' });
-    try { await store.openScene(id); return JSON.stringify({ ok: true, id }); }
-    catch (e) { return JSON.stringify({ error: String(e) }); }
+    try {
+      // `openScene` is itself a forward onto `openDocument` for every id that
+      // names a document (alias-tolerant), and the only thing it still reaches
+      // beyond that is an unconverted catalogue row — which is precisely what
+      // this alias must keep opening until Phase 6 removes the catalogue.
+      await store.openScene(id);
+      return JSON.stringify({ ok: true, id });
+    } catch (e) { return JSON.stringify({ error: String(e) }); }
   }
 
-  @McpTool('List scenes: saved (id, name — pass id to web_scene_open) plus built-ins.', { readOnly: true })
+  @McpTool('List the project documents plus the built-in sources. DEPRECATED ALIAS of web_model_list (plan-716): `documents` is THE one list — every GLB the project owns, with its `section` (scenes/models/library). `saved` is kept as an alias of the same array for callers written before the merge.', { readOnly: true })
   async webSceneList(): Promise<string> {
     const store = getSceneStore();
     if (!store) return JSON.stringify({ error: 'Scene store not available' });
+    const [{ getProjectStore }, documents] = await Promise.all([
+      import('../core/project/project-store'),
+      import('../core/project/rv-project-documents'),
+    ]);
+    const rows = documents.documentsOf(getProjectStore().getProject()).map(d => ({
+      id: d.id,
+      name: d.name,
+      path: d.path,
+      section: documents.sectionOfDocument(d),
+    }));
     return JSON.stringify({
-      saved: store.listScenes().map(s => ({ id: s.id, name: s.name, baseKind: s.baseKind })),
-      builtins: store.listBuiltins().map(b => ({ url: b.url, label: b.label })),
+      documents: rows,
+      /** @deprecated plan-716 — same array as `documents`. */
+      saved: rows,
+      builtins: builtinSources(this.viewer),
     });
   }
 
-  @McpTool('Export the current layout as raw JSON (placements + catalogs + grid) without persisting a scene.', { readOnly: true })
+  @McpTool('Export the current layout as raw JSON (placements + catalogs + grid) without persisting anything. DEPRECATED NAME (plan-716) — it exports the planner snapshot and touches no document.', { readOnly: true })
   async webSceneExport(): Promise<string> {
     const planner = this._planner();
     if (!planner) return JSON.stringify({ error: 'Layout planner not available — call web_mode_set(\"planner\") first' });

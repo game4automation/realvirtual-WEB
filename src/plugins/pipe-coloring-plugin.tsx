@@ -138,4 +138,18 @@ export class PipeColoringPlugin implements RVViewerPlugin {
     const persisted = loadPipeColoringEnabled();
     viewer.getPlugin<ProcessIndustryPlugin>('processindustry')?.setColoringEnabled(persisted);
   }
+
+  /** plan-435: this plugin's visible effect lives in a FOREIGN plugin
+   *  (`processindustry` does the actual colouring), so dropping our own button
+   *  would leave the pipes coloured. Switch the colouring off explicitly —
+   *  without touching the persisted preference, which `onActivate` restores. */
+  onDeactivate(viewer: RVViewer): void {
+    viewer.getPlugin<ProcessIndustryPlugin>('processindustry')?.setColoringEnabled(false);
+  }
+
+  /** Counterpart to {@link onDeactivate}: re-apply the user's stored choice. */
+  onActivate(viewer: RVViewer): void {
+    const persisted = loadPipeColoringEnabled();
+    viewer.getPlugin<ProcessIndustryPlugin>('processindustry')?.setColoringEnabled(persisted);
+  }
 }

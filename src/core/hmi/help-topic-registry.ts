@@ -23,7 +23,8 @@
  * same `sourceId` keeps its original position. Unregister and register again to
  * move it.
  *
- * Follows the unregister-function pattern of `hierarchy-header-registry.ts`.
+ * Follows the codebase's unregister-function registry pattern (see
+ * `componentActionRegistry`).
  */
 
 import type { HelpTopic } from './help-topics';

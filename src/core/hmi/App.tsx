@@ -25,6 +25,7 @@ import { ActivityBar } from './ActivityBar';
 import { ViewportFrame } from './ViewportFrame';
 import { ButtonPanel } from './ButtonPanel';
 import { MessagePanel } from './MessagePanel';
+import { ProblemsPanel } from './ProblemsPanel';
 import { BottomBar } from './BottomBar';
 import { GroupsOverlay } from './GroupsOverlay';
 
@@ -78,7 +79,9 @@ import { InstructionLayer } from './InstructionLayer';
 import { AnnotationPanel } from './AnnotationPanel';
 import { SharedViewBanner } from './SharedViewBanner';
 import { GPUWarningBanner } from './GPUWarningBanner';
+import { StorageNoticeBanner } from './StorageNoticeBanner';
 import { SigWarningBanner } from './SigWarningBanner';
+import { CommissioningTrustBanner } from './CommissioningTrustBanner';
 import { AutoQualityDialog } from './AutoQualityDialog';
 import { NewsDialogHost } from './NewsDialog';
 import { OmniverseStatusOverlay } from './OmniverseStatusOverlay';
@@ -172,7 +175,11 @@ export function App() {
   // (raw geometry editing — no KPIs, alarms or charts), like the Planner does.
   // 'mode:viewer' (plan-387) is the spectator workspace: the model, the running
   // kinematics, Settings and the view/grouping controls — nothing else.
-  const showKpiBar = useUIVisible('kpi-bar', { hiddenIn: ['fpv', 'planner', 'xr', 'mode:editor', 'mode:viewer'] });
+  // 'mode:commissioning' (plan-423) drops the OPERATOR HMI only — KPI cards,
+  // the message stack, the views slot and the AI activity overlay. Everything an
+  // integrator needs (Inspector, Hierarchy, CONNECT, AI bridge, ButtonPanel)
+  // stays, which is why those lines carry no commissioning string at all.
+  const showKpiBar = useUIVisible('kpi-bar', { hiddenIn: ['fpv', 'planner', 'xr', 'mode:editor', 'mode:viewer', 'mode:commissioning'] });
   // top-bar and activity-bar stay MOUNTED in the viewer: they carry Settings,
   // the camera cluster and the Groups button. Their children are gated one by
   // one inside TopBar/ActivityBar instead.
@@ -182,8 +189,8 @@ export function App() {
   // FPV / XR remain in the hidden list because they own the entire viewport.
   const showActivityBar = useUIVisible('activity-bar', { hiddenIn: ['fpv', 'xr'] });
   const showButtonPanel = useUIVisible('button-panel', { hiddenIn: ['fpv', 'xr', 'mode:viewer'] });
-  const showMessagePanel = useUIVisible('message-panel', { hiddenIn: ['fpv', 'planner', 'xr', 'mode:editor', 'mode:viewer'] });
-  const showViewsSlot = useUIVisible('views-slot', { hiddenIn: ['fpv', 'planner', 'xr', 'mode:editor', 'mode:viewer'] });
+  const showMessagePanel = useUIVisible('message-panel', { hiddenIn: ['fpv', 'planner', 'xr', 'mode:editor', 'mode:viewer', 'mode:commissioning'] });
+  const showViewsSlot = useUIVisible('views-slot', { hiddenIn: ['fpv', 'planner', 'xr', 'mode:editor', 'mode:viewer', 'mode:commissioning'] });
 
   return (
     <ThemeProvider theme={theme}>
@@ -273,7 +280,9 @@ function FullHmiShell({
   const showSigWarningBanner = useUIVisible('sig-warning-banner', { hiddenIn: ['mode:viewer'] });
   const showNewsDialog = useUIVisible('news-dialog', { hiddenIn: ['mode:viewer'] });
   const showOmniverseStatus = useUIVisible('omniverse-status-overlay', { hiddenIn: ['mode:viewer'] });
-  const showAiActivity = useUIVisible('ai-activity-overlay', { hiddenIn: ['mode:viewer'] });
+  // The AI *bridge* stays reachable in commissioning (ActivityBar entry, Settings
+  // tab) — only the floating activity overlay is operator chrome and goes.
+  const showAiActivity = useUIVisible('ai-activity-overlay', { hiddenIn: ['mode:viewer', 'mode:commissioning'] });
   const showAnnotationEditModal = useUIVisible('annotation-edit-modal', { hiddenIn: ['mode:viewer'] });
   // These three panels own a leftPanelManager slot, so their gate is not a local
   // literal: it is the shared pairing TopBar reconciles the slot against. Hiding
@@ -317,6 +326,12 @@ function FullHmiShell({
         {hmiVisible && showActivityBar && <ActivityBar />}
         {hmiVisible && showButtonPanel && <ButtonPanel />}
         {hmiVisible && showMessagePanel && <MessagePanel />}
+        {/* Document problems (plan-703 §2.8) — content-driven: renders nothing
+            while the list is empty, so it costs no viewport in the normal case.
+            Not gated on `showMessagePanel`: that switch hides MACHINE messages
+            in editor/planner, and an unresolvable reference is exactly the thing
+            an author in those modes has to see. */}
+        {hmiVisible && <ProblemsPanel />}
         {showSearchBar && <BottomBar />}
         {/* Groups / Display overlay — a SIBLING of the search bar, never its
             child: it portals to #rv-floating-panel-root and keeps its own open
@@ -327,7 +342,15 @@ function FullHmiShell({
         {hmiVisible && showViewsSlot && <SlotRenderer slot="views" />}
         <SharedViewBanner />
         <GPUWarningBanner />
+        <StorageNoticeBanner />
         {showSigWarningBanner && <SigWarningBanner />}
+        {/* plan-423 F6. Gates itself: it owns its own `useUIVisible` rule
+            (commissioning only) AND renders nothing unless the model on screen
+            actually came from a shared link — two independent reasons, neither
+            of which belongs in this list. Its own banner sits BELOW the
+            signature one in z-order: an invalid signature is the more serious
+            of the two and must stay on top when both apply. */}
+        <CommissioningTrustBanner />
         <AutoQualityDialog />
         {showNewsDialog && <NewsDialogHost includeWeb />}
         {showOmniverseStatus && <OmniverseStatusOverlay />}

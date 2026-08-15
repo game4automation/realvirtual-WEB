@@ -128,7 +128,6 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
         {!isMobile && !isTabLocked('devtools') && <Tab label="Dev Tools" value={6} />}
         {!isMobile && !isTabLocked('tests') && <Tab label="Tests" value={7} />}
         {!isTabLocked('groups') && <Tab label="Groups" value={8} />}
-        <Tab label="Local Folder" value={11} />
       </Tabs>
 
       {/* Tab content - minHeight: 0 for correct flexbox scrolling.

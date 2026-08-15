@@ -14,6 +14,7 @@ import {
   setSignalLinkModeExplicit,
   subscribeSignalLinkMode,
 } from '../signal-bind/signal-link-mode-store';
+import type { RvReferenceBounds } from '../../core/engine/rv-asset-reference';
 
 // ─── Re-exports: the library layer moved to core/library (plan-372 §2.6.1) ──
 //
@@ -27,7 +28,6 @@ export type {
   LibraryOrigin,
   LibrarySnapshot,
 } from '../../core/library/library-types';
-export { LOCAL_NEEDS_PERMISSION } from '../../core/library/library-types';
 export {
   LibraryStore,
   resolveUrl,
@@ -73,6 +73,30 @@ export interface SignalMapping {
   direction: SignalLinkDirection;
   /** Binding temporarily disable-able without deleting it. */
   enabled: boolean;
+  /**
+   * Case A anchor (plan-425 F2): the unique SignalStore NAME of the node that
+   * CARRIES this mapping, recorded at bind time.
+   *
+   * A node mapping is addressed by the path of its carrier, and a path is the
+   * one thing a Unity re-parent changes. The signal name does not change — and
+   * since plan-418 a duplicate name is fail-closed, so it identifies the carrier
+   * as well as the path did. Written ONLY when the name was unambiguous at bind
+   * time; a mapping without it keeps exactly today's behaviour (orphan).
+   */
+  carrierSignalName?: string;
+  /**
+   * Case B anchor (plan-425 F3): rv_extras component key of the slot this
+   * mapping resolved to at bind time.
+   *
+   * The resolver has always known the type and has never persisted it
+   * ("never persisted", rv-binding-slot-resolver), which left a re-parented
+   * slot mapping with an under-determined key — component path plus slot name,
+   * where the path is the broken half. With the type stored, a lost slot can be
+   * looked for by type + slot + leaf name. Legacy mappings without it do NOT
+   * take part in that search: guessing from two thirds of a key is the failure
+   * mode this anchor exists to avoid.
+   */
+  componentType?: string;
 }
 
 /**
@@ -100,6 +124,16 @@ export interface PlacedComponent {
   /** Live-signal links to realvirtual CONNECT. Optional → legacy scenes load
    *  unchanged. Serialized as-is by {@link serializeLayout}. */
   signalMappings?: SignalMapping[];
+  /**
+   * Local extents of the placed asset, measured once at placement time
+   * (plan-703 §2.8). Written into `AssetReference.bounds` by the bake.
+   *
+   * Optional in every direction, and read by exactly one consumer: the
+   * wireframe placeholder shown when the asset can no longer be resolved. It is
+   * recorded HERE, at the one moment the geometry is provably in hand — later
+   * the file may be gone, which is the case the field exists for.
+   */
+  bounds?: RvReferenceBounds;
 }
 
 export interface LayoutFile {
@@ -455,17 +489,6 @@ export class LayoutStore {
     this._pendingPlacements = list.map((p) => ({ ...p }));
     this._notify();
   }
-
-  // ─── Local Working Folder — DELEGATED (§2.6.2) ────────────────────
-
-  /** True if the browser supports the File System Access API. */
-  get isLocalFolderSupported(): boolean { return this._library.isLocalFolderSupported; }
-
-  async addLocalFolder(): Promise<void> { return this._library.addLocalFolder(); }
-  async restoreLocalFolder(): Promise<void> { return this._library.restoreLocalFolder(); }
-  async activateLocalFolder(): Promise<void> { return this._library.activateLocalFolder(); }
-  async refreshLocalFolder(): Promise<void> { return this._library.refreshLocalFolder(); }
-  async removeLocalFolder(): Promise<void> { return this._library.removeLocalFolder(); }
 
   // ─── Component management ─────────────────────────────────────────
 

@@ -80,6 +80,8 @@ import {
   getDefaultSpacingController,
 } from '../core/engine/rv-spacing-controller';
 import { getDefaultZoneRegistry } from '../core/engine/rv-zone-registry';
+import { getDefaultAgvFleet, type AgvTask, type AgvPhase, type AgvHandle } from '../core/engine/rv-agv-fleet';
+import { getDefaultPathDockRegistry } from '../core/engine/rv-path-dock';
 
 // PLC contract — auto-declared as `Agv.<key>` with typed `self.sig.<key>`
 // accessors. Run follows the Conveyor convention (command in, status out).
@@ -129,6 +131,23 @@ interface AgvLocal {
   targetSpeed: number;     // mm/s
   acceleration: number;    // mm/s²
   useAcceleration: boolean;
+  // Plan-921 — low-level task control (destination + service time + callbacks).
+  /** Current task (null = cruising, or idle after a completed task). */
+  task: AgvTask | null;
+  /** The declarative config task (Destination/ServiceTime) — re-armed on reset. */
+  startTask: AgvTask | null;
+  /** Movement phase — drives the stop/dwell state machine. */
+  phase: AgvPhase;
+  /** Continuous dwell countdown in seconds (phase 'servicing' only). */
+  serviceRemainingSec: number;
+  /** Scheduled DES ServiceEnd event id (−1 = none) — cancelled on reset. */
+  desServiceEvent: number;
+  /** Who ends the stay: 'timer' = task serviceSec; 'dock' = the dock's release(). */
+  serviceMode: 'timer' | 'dock';
+  /** Set by a dock's release() in continuous mode — ends the stay next tick. */
+  dockReleaseFlag: boolean;
+  /** Segment already served this visit (dock re-trigger guard) — cleared on hand-off. */
+  servedPathId: string | null;
   // Phase 2 — headway / zone parameters (mm, mm/s, 1/s)
   safetyDistanceMm: number;
   minGapMm: number;
@@ -231,6 +250,12 @@ function claimAheadZones(l: AgvLocal, t: PathTraveler): number {
   let p = t.path as RVPath; // caller guards non-null
   if (p.zoneId) relevant.push(p.zoneId);
   if (p.closed) return Number.POSITIVE_INFINITY; // a loop has no entrances to gate
+  // Queue-order guard: the arc-length gap to the vehicle ahead. A NEW claim is
+  // only ours when the entrance lies CLOSER than the leader — a leader standing
+  // between this vehicle and the entrance must claim first (headway already
+  // gates us behind it). Claiming across the leader inverts the queue into a
+  // gridlock: the follower holds the zone the leader is waiting for.
+  const gapMm = getDefaultSpacingController().gapOf(t.id) * 1000;
   let accMm = (p.length - t.s) * 1000;
   for (let i = 0; i < MAX_ZONE_WALK; i++) {
     if (accMm > l.lookAheadMm) return Number.POSITIVE_INFINITY;
@@ -240,6 +265,7 @@ function claimAheadZones(l: AgvLocal, t: PathTraveler): number {
     if (z) {
       if (relevant.indexOf(z) < 0) relevant.push(z);
       if (!zones.isHolder(z, t.id)) {
+        if (gapMm <= accMm) return Number.POSITIVE_INFINITY; // leader before the entrance — its claim, not ours
         zones.define(z, next.zoneCapacity ?? undefined);
         if (!zones.claim(z, t.id)) return accMm; // hold at this entrance
       }
@@ -269,6 +295,89 @@ function releaseStaleZones(l: AgvLocal, t: PathTraveler): void {
   for (let i = 0; i < n; i++) {
     if (relevant.indexOf(held[i]) < 0) zones.release(held[i], t.id);
   }
+}
+
+// ── Task control (plan-921 — destination + service time + callbacks) ───────────────
+
+/**
+ * Enter the service stay at the segment end. Two triggers, one mechanism:
+ * the segment is the TASK DESTINATION (vehicle-side `serviceSec` timer), or a
+ * DOCK is bound to it (station-side control — the dock's `release()` ends the
+ * stay and OVERRIDES the task timer; "die Station definiert selbst, was sie
+ * macht"). The task's `onArrive` fires only at its destination.
+ */
+function beginService(self: AgvSelf): void {
+  const l = self.local;
+  const t = l.traveler!;
+  const dock = getDefaultPathDockRegistry().dockAt(t.path!.id);
+  const isDest = atTaskDestination(l);
+  l.phase = 'servicing';
+  l.serviceMode = dock ? 'dock' : 'timer';
+  l.serviceRemainingSec = !dock && isDest ? Math.max(0, Number(l.task!.serviceSec) || 0) : 0;
+  l.dockReleaseFlag = false;
+  t.v = 0;
+  self.sig.Moving.set(false);
+  if (isDest) {
+    const task = l.task!;
+    try { task.onArrive?.(t.id, task); } catch (e) { console.error('[Agv] task onArrive failed:', e); }
+  }
+  if (dock) {
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      if (self.mode === 'des') {
+        if (l.phase === 'servicing' && l.desServiceEvent < 0) {
+          l.desServiceEvent = self.in(DES_MIN_TRANSIT_SEC, 'ServiceEnd', null, null);
+        }
+      } else {
+        l.dockReleaseFlag = true; // fixedUpdate ends the stay next tick
+      }
+    };
+    try { dock.onVehicleArrive(t.id, release); }
+    catch (e) { console.error('[Agv] dock onVehicleArrive failed — releasing:', e); release(); }
+  }
+}
+
+/**
+ * Finish the service stay. At the TASK DESTINATION: fires `onServiceEnd` —
+ * assigning a NEW task from inside the callback chains directly (work-plan
+ * style); otherwise the vehicle parks idle and the fleet's idle channel fires
+ * (the dispatch trigger). At a THROUGH dock (not the destination) the vehicle
+ * simply resumes its route. Either way the segment is marked served, so the
+ * dock does not re-trigger until the vehicle leaves it.
+ */
+function endService(self: AgvSelf): void {
+  const l = self.local;
+  const t = l.traveler!;
+  l.servedPathId = t.path?.id ?? null;
+  if (!atTaskDestination(l)) {
+    l.phase = l.task ? 'driving' : 'cruising';
+    return;
+  }
+  const finished = l.task;
+  try { finished?.onServiceEnd?.(t.id, finished); } catch (e) { console.error('[Agv] task onServiceEnd failed:', e); }
+  if (l.task === finished) {
+    l.task = null;
+    l.phase = 'idle';
+    getDefaultAgvFleet().notifyIdle(t.id);
+  }
+}
+
+/** True while the traveler stands ON its destination segment (drive → service
+ *  is triggered at that segment's END). */
+function atTaskDestination(l: AgvLocal): boolean {
+  return l.task !== null && l.traveler?.path?.id === l.task.destination;
+}
+
+/** True when the CURRENT segment's end requires a service stop this visit:
+ *  task destination, or a bound dock that has not served this visit yet. */
+function serviceStopAhead(l: AgvLocal): boolean {
+  const p = l.traveler?.path;
+  if (!p) return false;
+  if (l.servedPathId === p.id) return false; // already served — drive off
+  if (atTaskDestination(l)) return true;
+  return getDefaultPathDockRegistry().dockAt(p.id) !== null;
 }
 
 // ── DES helpers (plan-268 Phase 3 — leg scheduling + Reisezeit-Cache) ───────
@@ -332,6 +441,10 @@ const def = {
     UseAcceleration: { type: 'boolean' as const, default: DEFAULTS.UseAcceleration },
     PathId:          { type: 'string' as const, default: DEFAULTS.PathId },
     StartPosition:   { type: 'number' as const, default: DEFAULTS.StartPosition },
+    // Plan-921 — declarative one-shot task (no callbacks): drive to
+    // Destination (any path id), wait ServiceTime seconds, then idle.
+    Destination:     { type: 'string' as const, default: '' },
+    ServiceTime:       { type: 'number' as const, default: 0 },
     SafetyDistance:  { type: 'number' as const, default: DEFAULTS.SafetyDistance },
     MinGap:          { type: 'number' as const, default: DEFAULTS.MinGap },
     LookAhead:       { type: 'number' as const, default: DEFAULTS.LookAhead },
@@ -345,6 +458,14 @@ const def = {
     targetSpeed: DEFAULTS.TargetSpeed,
     acceleration: DEFAULTS.Acceleration,
     useAcceleration: DEFAULTS.UseAcceleration,
+    task: null,
+    startTask: null,
+    phase: 'cruising',
+    serviceRemainingSec: 0,
+    desServiceEvent: -1,
+    serviceMode: 'timer',
+    dockReleaseFlag: false,
+    servedPathId: null,
     safetyDistanceMm: DEFAULTS.SafetyDistance,
     minGapMm: DEFAULTS.MinGap,
     lookAheadMm: DEFAULTS.LookAhead,
@@ -395,7 +516,62 @@ const def = {
 
     const traveler = new PathTraveler(self.root.name || 'Agv', path, net);
     traveler.hooks.onArrive = (nodeId) => { l.atNodeId = nodeId; };
+    // Plan-921 junction resolution — layered: central control first (the
+    // registered network router — "ask the superordinate control for the new
+    // target"), then the mechanical shortest-distance hop toward the task
+    // destination, then the successors[0] default. Installed as the
+    // per-traveler hook, so peekNext (headway/zone look-ahead) predicts the
+    // SAME route the carry takes.
+    traveler.hooks.selectNextPath = (candidates, ctx) => {
+      const routerPick = net.routerSelect(candidates, ctx);
+      if (typeof routerPick === 'string' && candidates.includes(routerPick)) return routerPick;
+      const dest = l.task?.destination;
+      if (dest) {
+        const current = net.get(ctx.currentPathId);
+        const hop = current ? net.nextHopToward(current, dest) : null;
+        if (hop && candidates.includes(hop.id)) return hop.id;
+      }
+      return undefined; // → candidates[0]
+    };
     l.traveler = traveler;
+
+    // Fleet handle — the low-level control surface for project fleet logic.
+    const fleet = getDefaultAgvFleet();
+    fleet.register({
+      id: traveler.id,
+      assign: (task: AgvTask) => {
+        l.task = task;
+        l.phase = 'driving';
+        l.serviceRemainingSec = 0;
+        if (l.desServiceEvent >= 0) { self.cancel(l.desServiceEvent); l.desServiceEvent = -1; }
+        // DES: a parked vehicle has no pending leg — re-kick the event chain.
+        if (self.mode === 'des' && l.desLegEvent < 0 && traveler.path) {
+          l.desLegEvent = self.in(DES_MIN_TRANSIT_SEC, 'Arrival', null, null);
+        }
+        traveler.atEnd = false;
+      },
+      clear: () => {
+        l.task = null;
+        l.phase = 'cruising';
+        l.serviceRemainingSec = 0;
+        if (l.desServiceEvent >= 0) { self.cancel(l.desServiceEvent); l.desServiceEvent = -1; }
+        if (self.mode === 'des' && l.desLegEvent < 0 && traveler.path) {
+          l.desLegEvent = self.in(DES_MIN_TRANSIT_SEC, 'Arrival', null, null);
+        }
+        traveler.atEnd = false;
+      },
+      get task() { return l.task; },
+      get phase() { return l.phase; },
+    });
+
+    // Declarative one-shot task from the config (no callbacks — MCP/inspector
+    // authoring): Destination = any path id, ServiceTime seconds, then idle.
+    const cfgDest = typeof bag['Destination'] === 'string' ? (bag['Destination'] as string) : '';
+    if (cfgDest) {
+      l.startTask = { destination: cfgDest, serviceSec: cfgNumber(bag, 'ServiceTime', 0) };
+      l.task = { ...l.startTask };
+      l.phase = 'driving';
+    }
     l.startPath = path;
     l.startPosM = Math.min(Math.max(0, startPosMm / 1000), path.length);
     traveler.s = l.startPosM;
@@ -421,6 +597,19 @@ const def = {
     const l = self.local;
     const t = l.traveler;
     l.atNodeId = null;
+    // Plan-921: cancel a pending service stay and re-arm the declarative config task
+    // (deterministic restart — imperative fleet tasks do NOT survive a reset;
+    // fleet logic re-assigns on 'simulation-start').
+    if (l.desServiceEvent >= 0) {
+      self.cancel(l.desServiceEvent);
+      l.desServiceEvent = -1;
+    }
+    l.serviceRemainingSec = 0;
+    l.serviceMode = 'timer';
+    l.dockReleaseFlag = false;
+    l.servedPathId = null;
+    l.task = l.startTask ? { ...l.startTask } : null;
+    l.phase = l.task ? 'driving' : 'cruising';
     // Phase 3: drop the pending DES leg (stale ids are ignored by the queue)
     // and the boundary bookkeeping — a restart re-kicks via onGenerate.
     if (l.desLegEvent >= 0) {
@@ -460,6 +649,29 @@ const def = {
 
       const run = self.sig.Run.get() === true;
 
+      // Dock re-trigger guard: leaving the served segment clears the mark.
+      if (l.servedPathId !== null && t.path.id !== l.servedPathId) l.servedPathId = null;
+
+      // ── Task phases (plan-921): service countdown / idle park ──
+      if (l.phase === 'servicing') {
+        t.v = 0;
+        if (l.serviceMode === 'dock') {
+          if (l.dockReleaseFlag) endService(self); // the dock released the vehicle
+        } else {
+          l.serviceRemainingSec -= dt;
+          if (l.serviceRemainingSec <= 0) endService(self); // may assign the next task
+        }
+        self.sig.Moving.set(false);
+        self.sig.Blocked.set(false);
+        return;
+      }
+      if (l.phase === 'idle') {
+        t.v = 0;
+        self.sig.Moving.set(false);
+        self.sig.Blocked.set(false);
+        return;
+      }
+
       // ── Headway (1D arc-length, forward only — plan-268 F4) ──
       // gapOf reads the shared start-of-tick snapshot (auto-refresh per round).
       const gapM = getDefaultSpacingController().gapOf(t.id);
@@ -476,7 +688,13 @@ const def = {
       // ── Zone reservation (claims ahead as a side effect — plan-268 F5) ──
       const zoneHoldMm = claimAheadZones(l, t);
 
-      const stopMm = Math.min(remainingToStopMm(t), zoneHoldMm, headwayStopMm);
+      // Plan-921: a service stop (task destination OR a bound dock) is a
+      // positioning stop like a dead end — the drive ramp decelerates into it.
+      const destStopMm = serviceStopAhead(l)
+        ? Math.max(0, (t.path.length - t.s) * 1000)
+        : Number.POSITIVE_INFINITY;
+
+      const stopMm = Math.min(remainingToStopMm(t), zoneHoldMm, headwayStopMm, destStopMm);
       const target = run ? Math.min(l.targetSpeed, headwayCap) : 0;
 
       if (t.atEnd || stopMm <= 0) {
@@ -498,7 +716,11 @@ const def = {
       // cross an unclaimed zone entrance — regardless of what the ramp decided.
       let parkedByConstraint = false;
       if (t.v > 0) {
-        const hardMm = Math.min(headwayFreeMm, zoneHoldMm);
+        // destStopMm is HARD too (plan-921): the destination end must never be
+        // crossed by a single-tick overshoot (UseAcceleration=false travels
+        // v·dt per tick) — the carry would hand the vehicle to a successor
+        // before the arrival check runs.
+        const hardMm = Math.min(headwayFreeMm, zoneHoldMm, destStopMm);
         if (Number.isFinite(hardMm)) {
           const allowedMm = Math.max(0, hardMm - HARD_CLAMP_BACKOFF_MM);
           if (t.v * dt > allowedMm) {
@@ -517,6 +739,14 @@ const def = {
 
       // Zone release strictly AFTER the position transfer (plan-268 §2.4).
       releaseStaleZones(l, t);
+
+      // Plan-921: arrival at a service stop (destination or dock) → stay starts.
+      if ((l.phase === 'driving' || l.phase === 'cruising') && serviceStopAhead(l)
+          && (t.path.length - t.s) * 1000 <= PARK_EPS_MM) {
+        beginService(self);
+        self.sig.Position.set(t.s * 1000);
+        return;
+      }
 
       // ── Signals ──
       const blocked = run && !t.atEnd && t.v === 0 && (
@@ -539,6 +769,7 @@ const def = {
       if (!t) return;
       getDefaultSpacingController().remove(t.id);
       getDefaultZoneRegistry().releaseAll(t.id);
+      getDefaultAgvFleet().unregister(t.id); // plan-921 — no stale handles
     },
   },
 
@@ -602,6 +833,19 @@ const def = {
         t.network?.notifyArrive(p.id, t.id);
       }
 
+      // Plan-921: destination reached → dwell instead of the next leg. The
+      // DwellEnd event ends the stay; a follow-up task assigned from inside
+      // onServiceEnd re-kicks the leg chain (fleet handle assign()).
+      if (serviceStopAhead(l)) {
+        beginService(self); // dock mode: the dock's release() schedules ServiceEnd
+        self.sig.Blocked.set(false);
+        if (l.serviceMode === 'timer') {
+          l.desServiceEvent = self.in(
+            Math.max(l.serviceRemainingSec, DES_MIN_TRANSIT_SEC), 'ServiceEnd', null, null);
+        }
+        return;
+      }
+
       const next = t.peekNext(p, 1);
       if (!next || next === p) {
         // Dead end: park (mirror of the continuous clamp+stop). `atEnd` was
@@ -636,6 +880,21 @@ const def = {
         }
       }
 
+      // Plan-921 DES parity — SEGMENT OCCUPANCY: one vehicle per segment. The
+      // follower brakes/stops only at PATH ENDS (the agreed simplification of
+      // the continuous car-following chain); a finer queue is modelled by
+      // splitting the path into shorter segments. Same discrete hold-and-poll
+      // as an occupied zone — arrival ORDER and throughput converge with the
+      // continuous mode, the momentary trajectory deliberately does not.
+      if (getDefaultSpacingController().occupantsOf(next.id, t.id) > 0) {
+        t.v = 0;
+        t.blocked = true;
+        self.sig.Moving.set(false);
+        self.sig.Blocked.set(true);
+        l.desLegEvent = self.in(DES_BLOCKED_RETRY_SEC, 'Arrival', null, null);
+        return;
+      }
+
       // Position transfer FIRST, then release the zone that was left (§2.4 —
       // never a gap where the crossing is unheld while the vehicle is inside).
       const leftZone = p.zoneId;
@@ -643,10 +902,33 @@ const def = {
       t.s = 0;
       t.atEnd = false;
       l.desArrivedPathId = null;
+      l.servedPathId = null; // left the served segment
       if (leftZone && leftZone !== next.zoneId) {
         getDefaultZoneRegistry().release(leftZone, t.id);
       }
       desScheduleLeg(self);
+    },
+
+    /**
+     * Plan-921: end of the dwell at a task destination. `endService` fires the
+     * task's `onServiceEnd`; a follow-up task assigned inside the callback has
+     * already re-kicked the leg chain via the fleet handle — without one the
+     * vehicle parks idle (and the fleet idle channel fired).
+     */
+    onServiceEnd(self: AgvSelf): void {
+      const l = self.local;
+      l.desServiceEvent = -1;
+      if (self.disabled || !l.traveler) return;
+      endService(self);
+      if (l.phase === 'idle') {
+        self.sig.Moving.set(false);
+        return;
+      }
+      // Through dock (or a chained follow-up task): resume the leg chain —
+      // the re-run arrival is de-duped (announce + served marks) and routes on.
+      if (l.desLegEvent < 0) {
+        l.desLegEvent = self.in(DES_MIN_TRANSIT_SEC, 'Arrival', null, null);
+      }
     },
   },
 };

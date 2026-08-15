@@ -33,8 +33,12 @@ function makeDrive(name: string, behaviorExtras: Record<string, unknown> = {}) {
   return { name, node, BehaviorExtras: behaviorExtras } as any;
 }
 
+/** Minimal viewer stand-in. Since plan-411 the plugin also SUBSCRIBES to
+ *  `drives-changed`, so the fake carries an `on` that hands back a disposer —
+ *  the runtime-add case that subscription exists for lives in
+ *  mechanism-drive-live.test.ts, this file stays about the sort itself. */
 const load = (drives: any[]) => {
-  const viewer = { drives } as any;
+  const viewer = { drives, on: () => () => { /* no listener bookkeeping needed */ } } as any;
   new DriveOrderPlugin().onModelLoaded({} as any, viewer);
   return viewer;
 };

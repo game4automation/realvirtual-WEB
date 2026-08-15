@@ -17,6 +17,7 @@ interface ViewerInternals {
   _postPluginsSnapshot: readonly RVViewerPlugin[] | null;
   _disabledIds: Set<string>;
   _userDisabledIds: Set<string>;
+  _persistedUserDisabled: Set<string>;
   _missedModelLoad: Set<string>;
   _modelLoadedIds: Set<string>;
   _lastLoadResult: null;
@@ -38,6 +39,7 @@ function createPluginApiViewer() {
     _postPluginsSnapshot: null,
     _disabledIds: new Set(),
     _userDisabledIds: new Set(),
+    _persistedUserDisabled: new Set(),
     _missedModelLoad: new Set(),
     _modelLoadedIds: new Set(),
     _lastLoadResult: null,

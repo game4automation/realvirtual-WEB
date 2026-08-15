@@ -8,7 +8,8 @@
  * both inherited from `rv-project-types`:
  *
  *  - **Defensive parse.** A malformed or future-shaped `libraries[]` yields an
- *    empty list, never a throw — the same posture `isValidSceneV2` takes.
+ *    empty list, never a throw — the posture every reader in this layer takes
+ *    for a field it does not own.
  *  - **Field-level read-modify-write.** Rewriting the list must not drop
  *    unknown keys on an entry a newer client wrote. Entries are matched by
  *    `url` and merged, not replaced.
