@@ -298,9 +298,7 @@ These mirror the values configured in the Unity Editor under **Tools > realvirtu
 
 ## 5. Continuous deployment
 
-A push to `main` on realvirtual's private DEV repository triggers `.github/workflows/deploy-bunny.yml`, which runs `npm run deploy` on a runner using the **repository secrets** of that repo. No Unity is involved — the CLI builds and uploads on its own.
-
-This workflow is hardwired to realvirtual's infrastructure: it sets `BUNNY_STORAGE_ZONE=realvitual-web`, `BUNNY_REMOTE_PATH=dev`, and a concrete `BUNNY_PULL_ZONE_ID` that only exists in realvirtual's account, then echoes `https://web.realvirtual.io/dev/`. The storage key, account key, and GA id come from GitHub secrets. A fork has none of those secrets, so this workflow will not publish anywhere on a fork until it is edited to point at the fork owner's own account.
+There is none — deliberately. All deploys run locally via the CLI (`npm run deploy`, `scripts/embed-deploy.mjs`); the runner-based `.github/workflows/` were removed 2026-08-28. A fork that wants CI deployment writes its own workflow around `npm run deploy` with its own Bunny credentials as repository secrets.
 
 ---
 
