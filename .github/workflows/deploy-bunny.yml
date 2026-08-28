@@ -14,6 +14,10 @@ env:
 
 jobs:
   deploy:
+    # The public GitHub repo is an unfiltered mirror and has no Bunny secrets —
+    # every /gitweb push used to trigger a guaranteed-failing run there. Skip on
+    # the mirror; anywhere else (Forgejo Actions, a future CI repo) still runs.
+    if: ${{ github.repository != 'game4automation/realvirtual-WEB' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
