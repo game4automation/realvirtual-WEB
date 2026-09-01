@@ -2,6 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, it, expect } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Group as ThreeGroup, Object3D, Scene } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
@@ -184,7 +185,7 @@ describe('the asset executor keeps viewer.groups in sync (real op path)', () => 
 
   it('addComponent Group registers the member immediately — no save, no reload', async () => {
     const { viewer, part, partPath } = makeDocViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.addComponent(partPath, 'Group', { GroupName: 'ZL1_axis' });
     await doc.whenIdle();
@@ -196,7 +197,7 @@ describe('the asset executor keeps viewer.groups in sync (real op path)', () => 
 
   it('memberships survive a whole transaction and unwind on undo', async () => {
     const { viewer, part, part2, partPath, part2Path } = makeDocViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     // One transaction, one fire-and-forget Group op per member — the exact shape
     // the PLMXML import applies (plmxml-import.ts, group mode: one addComponent
@@ -220,7 +221,7 @@ describe('the asset executor keeps viewer.groups in sync (real op path)', () => 
 
   it('a node in two groups is registered in both', async () => {
     const { viewer, part, partPath } = makeDocViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     // Awaited one at a time on purpose: `addComponent` derives its `_N` key from
     // the node's CURRENT extras, so two un-awaited adds of the SAME base type on
@@ -239,7 +240,7 @@ describe('the asset executor keeps viewer.groups in sync (real op path)', () => 
 
   it('removeComponent and a renamed GroupName unregister the old membership', async () => {
     const { viewer, part, partPath } = makeDocViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.addComponent(partPath, 'Group', { GroupName: 'Old' });
     await doc.whenIdle();

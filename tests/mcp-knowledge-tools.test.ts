@@ -277,6 +277,43 @@ describe('web_knowledge_set', () => {
     expect(readNodeKnowledge(fx.nodes['Cell/Axis2'])?.Confidence).toBe('observed');
   });
 
+  /**
+   * plan-431 test 9.5b — the write path the inspector feature must NOT break.
+   *
+   * plan-431 makes the five NodeKnowledge fields non-editable in the inspector.
+   * The obvious implementation, `readonly: true` in `NODE_KNOWLEDGE_SCHEMA`,
+   * would have switched this tool off completely: `updateOverlayField` uses
+   * `isFieldDisplayReadonly` — the very predicate that flag feeds — as a WRITE
+   * guard, and the loop above pushes all five fields through it. Measured while
+   * writing that plan: `readonly: true` on `Note` alone turned 20 of these tests
+   * red with "[rvExtrasEditor] Refusing to edit readonly field".
+   *
+   * So read-only is done in the UI (a custom field renderer plus
+   * `HIDDEN_FIELDS_PER_TYPE`) and this test states the other half of the deal
+   * explicitly: every field still goes through, nothing is rejected, the note is
+   * persisted. `field-descriptor-readonly` style unit checks would stay green if
+   * someone broke `webKnowledgeSet`, the type normalisation or the persistence
+   * report instead — this goes through the real tool.
+   */
+  it('accepts ALL FIVE field writes and reports them persisted (plan-431 §2.1)', async () => {
+    const { target, ops } = assetEditTarget();
+    setActiveEditTarget(target);
+
+    const res = parse(await fx.tools.webKnowledgeSet('Cell/Axis1', '## still writable', 'user', 'inferred'));
+
+    expect(res.error).toBeUndefined();
+    expect(res.rejected).toBeUndefined();
+    expect(res.persistedTo).toBe('asset');
+    expect(ops.filter((o) => o.kind === 'setField').map((o) => o.field)).toEqual([
+      'Note', 'UpdatedAt', 'Author', 'Confidence', 'NodeIdAtWrite',
+    ]);
+
+    const stored = readNodeKnowledge(fx.nodes['Cell/Axis1'])!;
+    expect(stored.Note).toBe('## still writable');
+    expect(stored.Author).toBe('user');
+    expect(stored.Confidence).toBe('inferred');
+  });
+
   it('keeps multi-line Markdown intact', async () => {
     setActiveEditTarget(recordingEditTarget().target);
     const note = '## Axis 1\n- one\n- two';

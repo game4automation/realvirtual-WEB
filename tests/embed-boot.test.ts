@@ -15,6 +15,15 @@ import {
   type EmbedBrowserMocks,
 } from './embed-test-kit';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.physicsZone);
 
 const MODEL_URL = DEV_GLB.physicsZone;
 const elements: RVEmbedElement[] = [];
@@ -41,7 +50,7 @@ afterEach(() => {
   mocks.restore();
 });
 
-describe('<rv-embed> boot lifecycle', () => {
+describe.skipIf(!DEV_ASSETS)('<rv-embed> boot lifecycle', () => {
   it('boots only after a continuous visibility dwell, fires rv-ready and ticks the engine', async () => {
     const element = makeElement();
     let readyDetail: RVEmbedReadyDetail | null = null;

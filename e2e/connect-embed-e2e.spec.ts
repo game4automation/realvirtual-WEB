@@ -239,7 +239,7 @@ test(PERSISTENCE_TEST_NAME, async ({ page }) => {
 });
 
 test('missing embedded model reports load-error and offers retry', async ({ page }) => {
-  await page.route('**/models/DemoRealvirtualWeb.glb', (route) => route.fulfill({ status: 404 }));
+  await page.route('**/DemoRealvirtualWeb.glb', (route) => route.fulfill({ status: 404 }));
   await page.goto('/');
   await page.getByTestId('connect-embed-start').click();
   await expect(page.getByTestId('connect-embed-error')).toBeVisible({ timeout: 30_000 });

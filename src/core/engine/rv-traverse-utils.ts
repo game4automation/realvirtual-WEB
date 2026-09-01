@@ -36,6 +36,18 @@ export const RV_CHAIN_SOURCE = '_rvEnergyChainSource';
  */
 export const RV_CHAIN_SOURCE_VISIBLE = '_rvEnergyChainSourceVisible';
 
+// ─── Runtime-element marker (plan-733, Chain) ────────────────────
+//
+// Unrelated to the EnergyChain markers above despite the neighbouring name: a
+// `Chain` clones its element template `NumberOfElements` times at load. The
+// marker lives here for the same reason as the ones above — the asset exporter's
+// prune pass must recognise the clones without importing the component module
+// (which would pull the whole component-registry side-effect chain into the
+// editor's export path).
+
+/** `userData` flag on every runtime element clone built by an `RVChain`. */
+export const RV_CHAIN_ELEMENT = '_rvChainElement';
+
 /**
  * True when a mesh belongs to a runtime deformation rig and must be kept out
  * of the material-collapsing pipelines (`deduplicateMaterials`,

@@ -276,6 +276,68 @@ export function documentsOf(project: RvProject | null | undefined): RvDocumentEn
   return readDocuments(project) ?? [];
 }
 
+/**
+ * The document a start-document reference names, or null (plan-726 F12).
+ *
+ * ## Why this is a function and not three inline `find`s
+ *
+ * `settings.defaultModel` is matched LITERALLY today, at two call sites that
+ * each spelled the same rule out by hand (`main.ts`, `ProjectsDashboardHost`).
+ * plan-726 adds a third — the non-kiosk boot — and three copies of a matching
+ * rule is how the three answers start to differ.
+ *
+ * ## Why it is tolerant, and exactly how far
+ *
+ * `settings.defaultModel` is authored by a human or written by a deploy script,
+ * while `documents[].path` is a project-relative path. Five delivered customer
+ * manifests (`Toray`, `festo`, `mauser3dhmi`, `wmyb`, `demo-process-industry`)
+ * carry a BARE FILENAME there against a `models/`-prefixed path. That is
+ * harmless today only because nothing consumes the `defaultModel` branch on the
+ * unlocked boot; the moment it is consumed, those five projects would open and
+ * show an empty scene. Correcting the manifests would not help — the deploys
+ * already shipped carry the old value.
+ *
+ * So the fallback exists, and it is deliberately the narrowest one that covers
+ * the real data:
+ *
+ *  1. an exact `path` match — **always wins**, so a project that spells the
+ *     reference out correctly can never be redirected by a coincidence;
+ *  2. an exact `id` match — a remembered pair may hold either spelling;
+ *  3. the file name, and **only when exactly one document carries it**. Two
+ *     documents named `Line.glb` in different folders is an ambiguous
+ *     reference, and guessing between them would be worse than the null: null
+ *     falls through to the caller's existing fallback, a wrong guess opens the
+ *     wrong machine.
+ */
+export function findStartDocument(
+  source: RvProject | readonly RvDocumentEntry[] | null | undefined,
+  asset: string | null | undefined,
+): RvDocumentEntry | null {
+  const wanted = typeof asset === 'string' ? asset.trim() : '';
+  if (wanted === '') return null;
+  const documents: readonly RvDocumentEntry[] = Array.isArray(source)
+    ? source
+    : documentsOf(source as RvProject | null | undefined);
+
+  const byPath = documents.find(d => d.path === wanted);
+  if (byPath) return byPath;
+  const byId = documents.find(d => d.id === wanted);
+  if (byId) return byId;
+
+  // Only a bare name may be resolved leniently. A reference that already names
+  // a folder said where it meant, and answering it with a file from somewhere
+  // else would be the guess this fallback exists to avoid.
+  if (wanted.includes('/') || wanted.includes('\\')) return null;
+  const matches = documents.filter(d => fileNameOf(d.path) === wanted);
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+/** The last path segment of a project-relative path. */
+function fileNameOf(path: unknown): string {
+  const text = typeof path === 'string' ? path : '';
+  return text.split(/[\\/]/).filter(Boolean).pop() ?? '';
+}
+
 /** Every document of one section, in manifest order. */
 export function documentsInSection(
   project: RvProject | null | undefined,

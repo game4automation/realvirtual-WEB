@@ -59,6 +59,8 @@ export interface SharedDeliveryTarget {
   customers: string[];
 }
 export function sharedDeliveryTarget(privateRoot: string, manifest?: TierManifest): SharedDeliveryTarget | null;
+/** Why this register entry has no git delivery, or `null` when it has one. The ONE rule. */
+export function undeliverableReason(customer: { customer: string; delivery: { channel: string } }): string | null;
 export function generateCustomerPrivatePlugins(manifest: TierManifest, profile: DeliveryProfile): string;
 export function renderFeatureMatrix(
   manifest: TierManifest,
@@ -106,3 +108,32 @@ export function assertPrivateSourceInventory(
 ): PrivateSourceDiff;
 export function readBaselineSourceInventory(clone: string, baselineTag: string | null): BaselineSourceInventory | null;
 export function deliveryChangelog(coreRoot: string, previousCoreCommit: string | null, options?: { limit?: number }): string;
+
+/**
+ * Options for {@link generatedSettings} (plan-721 F7).
+ *
+ * Both are opt-in and both default to "behave exactly as before": a delivery
+ * that passes neither produces the file this function has always produced.
+ */
+export interface GeneratedSettingsOptions {
+  /**
+   * Leave `defaultModel` OUT of the delivered `settings.json` entirely — not
+   * blank, absent. An appliance boots from `project.json`, and a second copy of
+   * "which document opens first" baked into the runtime is the LOP-116 class of
+   * bug: two answers that drift, with the stale one winning.
+   */
+  omitDefaultModel?: boolean;
+  /**
+   * Workspace mode to lock the deployment into (`"hmi"` for a kiosk). Written
+   * as `mode: { lock }` and read by `main.ts` BEFORE the boot resolves what to
+   * open. A blank value writes nothing.
+   */
+  modeLock?: string;
+}
+
+export function generatedSettings(
+  project: Record<string, any> | null | undefined,
+  delivery: Record<string, any>,
+  connectPin: Record<string, any> | null | undefined,
+  options?: GeneratedSettingsOptions,
+): Record<string, any>;

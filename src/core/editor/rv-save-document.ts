@@ -349,10 +349,13 @@ export function decideSaveVerb(
         relPath: `models/${modelFileName(name)}`,
         copies: true,
       };
-    // A brand-new asset. It is not a copy of anything, so the verb stays
-    // "save"; it just needs a name before it has a path.
-    case 'empty':
-      return { verb: 'save', relPath: `library/${CUSTOM_LIBRARY_FOLDER}/${assetFileName(name)}` };
+    // There is no `'empty'` case any more (plan-719 F3). It used to be the
+    // third answer here — "a brand-new asset that just needs a name before it
+    // has a path" — and it was the whole first-save special case: the one
+    // identity whose destination was invented at save time rather than known
+    // at open time. New documents are created with a path now, so the switch
+    // is down to the two the target semantics describe: a document saves to
+    // itself, a source asks once.
     default:
       return { verb: 'blocked', reason: 'This document has no place to be saved to.' };
   }
@@ -366,10 +369,57 @@ function modelFileName(name: string): string {
   return `${sanitizeAssetFileName(name)}.glb`;
 }
 
+/**
+ * The folder a "Save as…" copy lands in: the open document's own.
+ *
+ * Only a document that HAS a project path can name a folder. A slot-addressed
+ * document (`path === ''`) and a source that was never in the project have no
+ * neighbourhood to be saved beside, so both keep the historical destination.
+ */
+function saveAsFolder(base: AssetBase): string {
+  const path = (base.kind === 'document' || base.kind === 'referencedAsset' ? base.path : '') ?? '';
+  const slash = path ? path.lastIndexOf('/') : -1;
+  return slash > 0 ? path.slice(0, slash) : `library/${CUSTOM_LIBRARY_FOLDER}`;
+}
+
 // ─── The one entry point ────────────────────────────────────────────────
 
 /** Documents currently mid-save. The second click's no-op (§2.2.1-3). */
 const saving = new WeakSet<object>();
+
+/**
+ * Documents currently mid-PROMPT (plan-719 §2.10, second layer).
+ *
+ * Separate from {@link saving} because the two cover different windows and the
+ * gap between them is where the race lived: `saving` starts when the write
+ * does, and a name prompt can stand open for as long as the user looks at it.
+ * Marked before the `requestName` await and cleared in a `finally`, so a
+ * rejected prompt cannot leave a document permanently "busy".
+ */
+const prompting = new WeakSet<object>();
+
+/**
+ * Woken whenever {@link isSaving} could have changed.
+ *
+ * The two WeakSets above ARE the card's busy state, but they notify nobody. The
+ * last publish of a save happens inside `runExclusive`, i.e. before the
+ * `finally` that clears the marker — so the card's Save button kept saying
+ * "Saving…" long after the write had landed, until some unrelated document
+ * change came along to republish it (field finding 2026-08-26). The markers are
+ * announced here so a reader of {@link isSaving} hears them go quiet.
+ */
+const saveActivityListeners = new Set<() => void>();
+
+/** Subscribe to {@link isSaving} transitions. */
+export function subscribeSaveActivity(listener: () => void): () => void {
+  saveActivityListeners.add(listener);
+  return () => { saveActivityListeners.delete(listener); };
+}
+
+/** Copied before iterating — a listener may unsubscribe itself. */
+function noteSaveActivity(): void {
+  for (const fn of [...saveActivityListeners]) fn();
+}
 
 /**
  * The scene lineage as this module needs it — structural, on purpose.
@@ -388,6 +438,14 @@ export interface SceneSaveFacade {
     dirty: boolean;
     transient: boolean;
   } | null;
+  /**
+   * The store's document identity, when it can state one — the same surface
+   * the mode-transition BIND compares (`SceneStore.documentIdentity`).
+   * Optional in the facade because only the bound-save routing needs it; a
+   * facade without it falls back to `saved.id`, which covers the legacy
+   * scene-glb workspace.
+   */
+  documentIdentity?(): AssetBase | null;
   /** Resolves with what the save DID — see `SceneSaveVerdict`. */
   save(): Promise<'saved' | 'no-op' | 'target-changed'>;
   saveAs(name: string): Promise<string>;
@@ -513,6 +571,15 @@ async function sceneSaveTargetFor(sceneId: string): Promise<SceneSaveFacade | nu
     const { getSceneStore } = await import('../hmi/scene/scene-store-singleton');
     const store = getSceneStore();
     if (!store) return null;
+    // The same identity surface the BIND compared (`documentIdentity()`), not
+    // `saved.id`: a document workspace opens with `_saved = null` and only a
+    // scene save in THIS session fills it, so a bound editor document was
+    // refused as "not the scene that is open" until the planner had saved once
+    // — the very document the transition had just handed over. `saved.id`
+    // stays as the fallback for the legacy scene-glb workspace, whose identity
+    // answers from `saved` anyway.
+    const identity = store.documentIdentity?.();
+    if (identity?.kind === 'document' && identity.documentId === sceneId) return store;
     return store.getSnapshot()?.saved?.id === sceneId ? store : null;
   } catch {
     return null;
@@ -558,6 +625,16 @@ async function saveAssetDocument(
       };
     }
     const result = await saveSceneDocument(store, opts);
+    // F8 for the slot-addressed half too: this branch is a document save like
+    // any other, it just writes through the scene's writer. `relPath` is the
+    // row's path when it has one and `''` when the bytes live in a body slot —
+    // subscribers key on `documentId`, which is always meaningful.
+    if (result.kind === 'saved') {
+      viewer?.emit('document-saved', {
+        documentId: doc.base.documentId,
+        relPath: doc.base.path,
+      });
+    }
     // Translated, not re-shaped: the caller asked through the asset overload and
     // reads an `AssetBase` back. `relPath` is the identity's own — the row's
     // path when it carries one, empty for a genuinely slot-addressed document —
@@ -568,7 +645,15 @@ async function saveAssetDocument(
       : result;
   }
 
-  if (saving.has(doc)) return { kind: 'busy' };
+  // §2.10, the second layer. `saving` alone was not enough once the prompt
+  // became the REGULAR case for a read-only source: the WeakSet used to be set
+  // AFTER `requestName` resolved, so a second click during the open dialog
+  // sailed through this check and started a second run whose own prompt
+  // overwrote the first one's state and orphaned its resolve closure. The
+  // public `save-dialog-store` holds the primary guard (one pending slot per
+  // document, whichever entry point asks); this covers callers that inject a
+  // `requestName` of their own and never reach that store.
+  if (saving.has(doc) || prompting.has(doc)) return { kind: 'busy' };
 
   // §2.2.1-1: bind the destination BEFORE anything long-running starts.
   const store = getProjectStore();
@@ -577,34 +662,105 @@ async function saveAssetDocument(
   const baseAtStart = doc.base;
 
   let name = doc.name;
-  if (opts.forceNamePrompt || !name || name === 'Untitled') {
+  // Routed BEFORE the prompt, because the verb is what decides whether there is
+  // a question to ask at all. A document saves to itself in silence; only a
+  // source that cannot be written back has to be placed somewhere first.
+  const routed = decideSaveVerb({ lineage: 'asset', base: baseAtStart, name }, backend);
+  if (routed.verb === 'blocked' || !backend) {
+    return { kind: 'blocked', reason: routed.reason ?? 'This document cannot be saved.' };
+  }
+
+  /**
+   * The ONE prompt (plan-719 F2), and the three reasons it appears:
+   *
+   *  - `forceNamePrompt` — the explicit "Save as…" verb;
+   *  - `save-into-project` — a catalog asset, a built-in model or an unowned
+   *    reference. This is the behaviour change: the copy used to happen
+   *    SILENTLY into `models/<name>.glb`, choosing the destination for the
+   *    user. It is announced on the button and now confirmed in a dialog, and
+   *    it happens exactly once — afterwards the document is theirs and F1
+   *    applies forever;
+   *  - a document with NO name at all (an empty string — a state, not a
+   *    naming convention).
+   *
+   * "Untitled" is deliberately NOT a reason (field decision 2026-08-19): it is
+   * a NAME like any other, given by the create verb and changed by Rename. A
+   * document called Untitled saves to its own path in silence exactly like
+   * one called anything else — treating the string specially is how every
+   * fresh document grew its own save behaviour.
+   */
+  const mustPrompt = opts.forceNamePrompt === true
+    || routed.verb === 'save-into-project'
+    || !name;
+
+  if (mustPrompt) {
     if (!opts.requestName) {
-      return { kind: 'blocked', reason: 'This document needs a name before it can be saved.' };
+      // Two different situations, two sentences (F5). A caller that cannot ask
+      // is a real dead end, and "needs a name" would be actively misleading for
+      // a read-only source: the user has not withheld a name, the SOURCE is the
+      // problem, and the way out is choosing where the copy should go.
+      return {
+        kind: 'blocked',
+        reason: routed.verb === 'save-into-project'
+          ? 'This asset is read-only. Saving it needs a name for the copy in your project.'
+          : 'This document needs a name before it can be saved.',
+      };
     }
-    const picked = await opts.requestName(name === 'Untitled' ? '' : name);
+    // Marked BEFORE the await, cleared in `finally` — the whole point of the
+    // guard is to cover the window the dialog is open in, which is precisely
+    // the window the old placement (after the await) left uncovered.
+    prompting.add(doc);
+    noteSaveActivity();
+    let picked: string | null;
+    try {
+      picked = await opts.requestName(name);
+    } finally {
+      prompting.delete(doc);
+      noteSaveActivity();
+    }
+    // Declining writes NOTHING: no blob, no manifest row, no identity change.
+    // The source stays exactly the read-only thing it was.
     if (picked === null || !picked.trim()) return { kind: 'cancelled' };
     name = picked.trim();
   }
 
-  const routed = decideSaveVerb({ lineage: 'asset', base: baseAtStart, name }, backend);
-  // "Save as…" is not routing by identity — it is the user naming a NEW library
-  // asset, which is what the verb has always done. It overrides the DESTINATION
-  // only, never the refusals: a read-only project stays blocked.
-  const decision: SaveVerbDecision = opts.forceNamePrompt && routed.verb !== 'blocked'
-    ? { verb: 'save', relPath: `library/${CUSTOM_LIBRARY_FOLDER}/${assetFileName(name)}` }
-    : routed;
-  if (decision.verb === 'blocked' || !backend || !decision.relPath) {
+  // Re-routed with the CONFIRMED name, because the destination file name is
+  // derived from it — routing once with the old name would place the copy
+  // under the source's name and ignore what the user just typed.
+  const named = decideSaveVerb({ lineage: 'asset', base: baseAtStart, name }, backend);
+  // "Save as…" is the user naming a NEW document BESIDE the one that is open —
+  // `models/Cell.glb` saves as `models/<name>.glb`, a library asset stays in its
+  // own library folder. It used to send every save-as to
+  // `library/<Custom>/`, which is the pre-716 "the editor writes into the Custom
+  // library" rule surviving in the one branch that overrides the routing: a user
+  // saving a copy of a project model found it filed somewhere else entirely.
+  // `library/<Custom>/` remains the fallback for a document with no folder of
+  // its own (slot-addressed, or a root-level file).
+  //
+  // It overrides the DESTINATION only, never the refusals: a read-only project
+  // stays blocked. And it is a COPY — a new file with an identity of its own, so
+  // `copies` is what gives it a free path and a fresh document id instead of
+  // forking the source's.
+  const decision: SaveVerbDecision = opts.forceNamePrompt && named.verb !== 'blocked'
+    ? {
+        verb: 'save',
+        relPath: `${saveAsFolder(baseAtStart)}/${assetFileName(name)}`,
+        copies: true,
+      }
+    : named;
+  if (decision.verb === 'blocked' || !decision.relPath) {
     return { kind: 'blocked', reason: decision.reason ?? 'This document cannot be saved.' };
   }
 
   // §2.2.1-4: a clean document that already lives somewhere is a true no-op.
   // Notably it does NOT mint a new identity, which is what made a stray second
   // click on an untouched document produce a second file.
-  if (!doc.dirty && !decision.copies && baseAtStart.kind !== 'empty' && name === doc.name) {
+  if (!doc.dirty && !decision.copies && name === doc.name) {
     return { kind: 'no-op' };
   }
 
   saving.add(doc);
+  noteSaveActivity();
   try {
     // §2.2.1-2: the whole transaction holds the op queue. `runExclusive` is
     // what makes "the floor captured before the bake" a fact rather than a
@@ -680,6 +836,12 @@ async function saveAssetDocument(
       // The floor captured before the bake — NOT the log as it stands now.
       doc.document.markSaved({ floor: floorAtBakeStart });
 
+      // F8 — announced AFTER the identity has moved, so a subscriber reading
+      // the document back sees the state the bytes describe. Emitted for every
+      // path, which is what makes the planner's cache invalidation correct for
+      // `models/**` as well as `library/**` (Defect b).
+      viewer.emit('document-saved', { documentId: nextBase.documentId, relPath });
+
       return {
         kind: 'saved',
         base: nextBase,
@@ -692,12 +854,20 @@ async function saveAssetDocument(
     return { kind: 'error', message: e instanceof Error ? e.message : String(e) };
   } finally {
     saving.delete(doc);
+    noteSaveActivity();
   }
 }
 
-/** True while a save of this document is in flight (the card's busy state). */
+/**
+ * True while a save of this document is in flight (the card's busy state).
+ *
+ * Includes the PROMPT since plan-719: from the user's side "Save into project
+ * as…" is part of the save they started, and a card that showed the button
+ * back at rest while its own dialog was up would invite the second click the
+ * guard then has to swallow.
+ */
 export function isSaving(doc: object): boolean {
-  return saving.has(doc);
+  return saving.has(doc) || prompting.has(doc);
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -718,7 +888,11 @@ export function isSaving(doc: object): boolean {
  * migration and the legacy-record upgrade use, so all three agree on what a
  * given path's document id is.
  */
-function nextIdentity(base: AssetBase, relPath: string, name: string): AssetBase {
+function nextIdentity(
+  base: AssetBase,
+  relPath: string,
+  name: string,
+): Extract<AssetBase, { kind: 'document' }> {
   if (base.kind === 'document' && base.documentId) {
     return { kind: 'document', documentId: base.documentId, path: relPath, name };
   }

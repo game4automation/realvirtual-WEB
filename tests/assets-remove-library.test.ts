@@ -106,7 +106,7 @@ describe('removing a library', () => {
     expect(selectionPointsIntoGroup(
       { kind: 'asset', providerId: 'project', sourceId: 'https://x/catalog.json' }, group,
     )).toBe(false);
-    expect(selectionPointsIntoGroup({ kind: 'scene' }, group)).toBe(false);
+    expect(selectionPointsIntoGroup({ kind: 'document' }, group)).toBe(false);
     expect(selectionPointsIntoGroup({ kind: 'none' }, group)).toBe(false);
   });
 });

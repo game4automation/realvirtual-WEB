@@ -8,6 +8,7 @@ import { ThemeProvider } from '@mui/material/styles';
 import { App } from '../src/core/hmi/App';
 import appSource from '../src/core/hmi/App.tsx?raw';
 import connectEmbedActionsSource from '../src/plugins/connect-embed/connect-embed-actions.ts?raw';
+import { getProjectStore } from '../src/core/project/project-store';
 import { ActivityBar } from '../src/core/hmi/ActivityBar';
 import { UIPluginRegistry } from '../src/core/rv-ui-registry';
 import { rvDarkTheme } from '../src/core/hmi/theme';
@@ -34,6 +35,48 @@ import {
   subscribeConnectEmbedStore,
 } from '../src/plugins/connect-embed/connect-embed-store';
 
+// ── plan-726: the gate opens a PROJECT, so the stores have to answer ──
+//
+// The "Start the demo" button goes through startConnectEmbedDemo(), whose
+// production opener resolves the demo project through these two singletons
+// instead of calling loadModelWithProgress() with a filename constant. They
+// are stubbed rather than built because the subject here is the GATE — that a
+// click enters the state machine exactly once and leaves it in demo-running —
+// not what OPFS does with a 33 MB GLB.
+const demoDocument = {
+  id: 'doc_demorealvirtualweb_7l7hfw',
+  name: 'realvirtual WEB Demo',
+  path: 'DemoRealvirtualWeb.glb',
+  section: 'models',
+};
+const openDemoProjectMock = vi.fn(async () => true);
+
+// The SceneStore singleton is already module-mocked further down, with a
+// hoisted stand-in (`sceneStoreMock`). `openDocument` is added to it there —
+// a SECOND `vi.mock` for the same path would simply lose to the later one.
+// The ProjectStore is deliberately NOT module-mocked: `ActivityBar`
+// subscribes to the real singleton, so only the two methods the gate calls
+// are spied on below.
+
+/**
+ * Make the demo project resolvable without OPFS, a manifest fetch or a GLB.
+ *
+ * Two methods on the REAL project store are replaced — the two the gate calls
+ * — so every other consumer in this file keeps the store it expects.
+ */
+function primeDemoProjectStores(): void {
+  openDemoProjectMock.mockClear();
+  openDemoProjectMock.mockImplementation(async () => true);
+  const store = getProjectStore();
+  vi.spyOn(store, 'openDemoProject').mockImplementation(openDemoProjectMock as never);
+  vi.spyOn(store, 'getProject').mockReturnValue({
+    schemaVersion: 2, id: 'prj_sample', name: 'DemoRealvirtual',
+    settings: { defaultModel: demoDocument.path },
+    documents: [demoDocument],
+  } as never);
+  sceneStoreMock.openDocument.mockClear();
+}
+
 /**
  * Functional-enough SceneStore stand-in. The embed branch of `SceneWindow` only
  * reads the snapshot (it renders exactly one hard-coded row), but the hooks above
@@ -50,6 +93,9 @@ const sceneStoreMock = vi.hoisted(() => {
     subscribe: () => () => undefined,
     getSnapshot: () => snapshot,
     openBuiltin: vi.fn(async () => undefined),
+    // plan-726: the gate opens the demo project DOCUMENT now, so this is the
+    // verb the "Start the demo" button actually reaches.
+    openDocument: vi.fn(async () => undefined),
     openScene: vi.fn(async () => undefined),
     newEmpty: vi.fn(async () => undefined),
     ensureSceneHydrated: vi.fn(async () => true),
@@ -187,13 +233,12 @@ function GateActivityBarHarness() {
   );
 }
 
-function renderGate(
-  loader: (url: string) => Promise<{ ok: true } | { ok: false; error: string }> =
-    vi.fn(async () => ({ ok: true as const })),
-) {
+// The viewer slice the gate needs is tiny now: plan-726 moved the loading
+// itself into the project/scene stores, so no loader is passed in any more.
+function renderGate() {
   const leftPanelManager = new LeftPanelManager();
   leftPanelManager.open('connect', 360);
-  const viewer = { leftPanelManager, loadModelWithProgress: loader };
+  const viewer = { leftPanelManager };
   return render(
     <ThemeProvider theme={rvDarkTheme}>
       <RVViewerProvider value={viewer as never}>
@@ -333,8 +378,13 @@ describe('CONNECT embedded minimal shell', () => {
   });
 
   it('shows loading and typed load-error states inside the gate', () => {
+    // The gate hangs on the project OPEN now, not on a GLB download — so the
+    // promise that never settles moves one layer down. The states it drives,
+    // and the assertions on them, are unchanged.
+    primeDemoProjectStores();
     const never = new Promise<never>(() => undefined);
-    renderGate(vi.fn(() => never));
+    openDemoProjectMock.mockReturnValueOnce(never as never);
+    renderGate();
     fireEvent.click(screen.getByTestId('connect-embed-start'));
     expect(screen.getByTestId('connect-embed-loading')).toBeVisible();
     act(() => failConnectEmbedDemoLoad('404 Not Found'));
@@ -426,19 +476,39 @@ describe('CONNECT embedded minimal shell', () => {
     expect(await screen.findByTestId('connect-embed-signal-hint')).toBeVisible();
   });
 
-  it('keeps the integrated demo model as the only gate loading path', async () => {
-    const loader = vi.fn(async (_url: string) => ({ ok: true as const }));
-    renderGate(loader);
+  it('keeps the demo PROJECT as the only gate loading path (plan-726)', async () => {
+    primeDemoProjectStores();
+    renderGate();
 
     fireEvent.click(screen.getByTestId('connect-embed-start'));
-    await waitFor(() => expect(loader).toHaveBeenCalledOnce());
+    await waitFor(() => expect(openDemoProjectMock).toHaveBeenCalledOnce());
 
-    expect(loader.mock.calls[0]?.[0]).toMatch(/models\/DemoRealvirtualWeb\.glb$/);
+    // The demo is a project now: the gate opens it and then its START
+    // DOCUMENT, rather than handing a GLB url to loadModelWithProgress.
+    expect(sceneStoreMock.openDocument).toHaveBeenCalledWith(
+      demoDocument.id,
+      expect.objectContaining({ name: demoDocument.name }),
+    );
+    await waitFor(() => expect(getConnectEmbedSnapshot().state).toBe('demo-running'));
+
     // ONE entry point, shared by the start button and the model row: the state
-    // machine may only ever be entered from here.
+    // machine may only ever be entered from here. Unchanged by plan-726, and
+    // it survives the rewrite because it is the actual contract.
     expect(connectEmbedActionsSource.match(/\bbeginConnectEmbedDemoLoad\s*\(/g)).toHaveLength(1);
-    expect(connectEmbedActionsSource).toContain('CONNECT_EMBED_DEMO_MODEL');
     expect(connectEmbedActionsSource).toContain('completeConnectEmbedDemoLoad');
+    // …and the gate is driven from HERE on every exit, because openDocument()
+    // goes through viewer.loadScene() and never reaches the
+    // loadModelWithProgress path that main.ts completes the gate from.
+    expect(connectEmbedActionsSource).toContain('failConnectEmbedDemoLoad');
+
+    // The filename constant this plugin used to own is gone: what the demo
+    // opens comes from public/project.json on every channel now.
+    expect(connectEmbedActionsSource).not.toContain('CONNECT_EMBED_DEMO_MODEL');
+    // …and the viewer no longer has to supply a loader at all: the gate above
+    // was rendered with a viewer that has none. Pinned on the CONTRACT (the
+    // field is gone from the action viewer slice) rather than on the word,
+    // which still appears in the prose explaining the change.
+    expect(connectEmbedActionsSource).not.toContain('loadModelWithProgress?:');
   });
 
   // ── plan-373: the demo controls overlay is reduced to the hint ──

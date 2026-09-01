@@ -84,7 +84,8 @@ import { legacySceneId } from './helpers/legacy-scene-id';
  * `assetId`, because those are the pairings the comparison has to keep apart.
  */
 const bases = {
-  empty: { kind: 'empty' },
+  // `empty` was a fixture here until plan-719 F3 removed the kind. Its absence
+  // is the assertion: there is no identity left that cannot say what it is.
   document: {
     kind: 'document', documentId: 'doc_cell', path: 'models/Cell.glb', name: 'Cell',
   },
@@ -94,7 +95,6 @@ const bases = {
   },
   referencedAsset: { kind: 'referencedAsset', assetId: 'a1', label: 'Cell' },
 } satisfies Record<string, AssetBase> as {
-  empty: Extract<AssetBase, { kind: 'empty' }>;
   document: Extract<AssetBase, { kind: 'document' }>;
   builtinModel: Extract<AssetBase, { kind: 'builtinModel' }>;
   providerAsset: Extract<AssetBase, { kind: 'providerAsset' }>;
@@ -112,7 +112,6 @@ const slotDocument = sceneDocumentBase('doc_plant', 'Plant') as
 describe('sameDocumentBase — the canonical comparison', () => {
   it('matches every identifiable kind with an independent copy of itself', () => {
     for (const base of allBases) {
-      if (base.kind === 'empty') continue; // its own rule, asserted below
       const copy = JSON.parse(JSON.stringify(base)) as AssetBase;
       expect(sameDocumentBase(base, copy), `${base.kind} must recognise itself`).toBe(true);
       // Structural, not referential: the two sides come from different layers
@@ -146,9 +145,17 @@ describe('sameDocumentBase — the canonical comparison', () => {
     expect(sameDocumentBase(bases.providerAsset, bases.referencedAsset)).toBe(false);
   });
 
-  it('an untitled document never matches — not even another untitled one', () => {
-    expect(sameDocumentBase(bases.empty, { kind: 'empty' })).toBe(false);
-    expect(sameDocumentBase(bases.empty, bases.empty)).toBe(false);
+  /**
+   * plan-719 F3 retired the "an untitled document never matches itself" rule
+   * together with the kind it was about: an asset that lives nowhere cannot
+   * exist any more, so the comparison has no unidentifiable kind left. What
+   * survives is the half that still has to hold — a LEGACY value reaching this
+   * function out of an older record must not match anything, including itself.
+   */
+  it('a legacy homeless base never matches — not even another one', () => {
+    const legacy = { kind: 'empty' } as never;
+    expect(sameDocumentBase(legacy, { kind: 'empty' } as never)).toBe(false);
+    expect(sameDocumentBase(legacy, legacy)).toBe(false);
   });
 
   it('null on either side is "nothing to compare", not an error', () => {

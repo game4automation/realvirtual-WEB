@@ -59,13 +59,16 @@ import {
 } from '@mui/material';
 import {
   AutoAwesome,
+  Close,
   ContentCopy,
   Delete,
   DriveFileRenameOutline,
   FileDownload,
+  MenuBookOutlined,
   MoreVert,
   Redo,
   SaveAlt,
+  SettingsEthernet,
   Share as ShareIcon,
   Undo,
 } from '@mui/icons-material';
@@ -83,6 +86,12 @@ import { useOptionalViewer } from '../../../hooks/use-viewer';
 import { getAssetReference } from '../../engine/rv-asset-reference';
 import { getLibrarySource } from '../../library/library-source-registry';
 import { DirtyDot, DIRTY_INK } from '../rv-dirty-dot';
+import {
+  askSaveName,
+  isPromptingSaveName,
+  saveDocumentPromptKey,
+  SAVE_PROMPT_BUSY,
+} from './save-dialog-store';
 import { DocumentCrumbs } from './DocumentCrumbs';
 import { ShareDialog } from '../../share/ShareDialog';
 import type { RvShareMeta, RvShareLevel } from '../../share/rv-share-meta';
@@ -132,7 +141,44 @@ export interface DocumentCardProps {
    * passes it in; the card itself stays decoupled from that store.
    */
   previewVisible?: boolean;
+  /**
+   * The open document's CONNECT binding (`documents[].connectRef`), hero only —
+   * rendered as a Unity-style reference chip.
+   *
+   * A prop rather than a seam field for the same reason `onReveal` is: the
+   * binding lives in the project manifest, and only the dashboard — which sits
+   * next to the project store — knows the row of the open document. The card
+   * stays presentational: clicking the chip calls `onReveal` (the dashboard
+   * pings the config in the tree), the × calls `onClear`, and the DROP that
+   * assigns a config is handled by the mount around this card, not in here.
+   * `null` renders nothing; `{ kind: 'empty' }` renders the ghost drop slot.
+   */
+  connect?: DocumentCardRefSlot | null;
+  /**
+   * The document's knowledge binding (`documents[].knowledgeRef`) — same slot
+   * model, same drag-to-assign contract, book icon instead of the connector.
+   */
+  knowledge?: DocumentCardRefSlot | null;
 }
+
+/** One hero reference chip — bound (with name) or the empty slot. */
+export type DocumentCardRefSlot =
+  | {
+      kind: 'bound';
+      /** Display name — the classifying ending already stripped. */
+      label: string;
+      /** The file the binding names is not in the project. */
+      missing?: boolean;
+      /** Ping: reveal + select the referenced file in the dashboard. */
+      onReveal?: () => void;
+      /** Clear the binding. Absent = read-only. */
+      onClear?: () => void;
+    }
+  /** No binding. `droppable` says whether a drag could change that. */
+  | { kind: 'empty'; droppable?: boolean };
+
+/** Former name of {@link DocumentCardRefSlot} — the CONNECT slot came first. */
+export type DocumentCardConnect = DocumentCardRefSlot;
 
 /** Menu icons by verb id. Unknown ids simply render without one. */
 const VERB_ICONS: Record<string, SvgIconComponent> = {
@@ -148,11 +194,157 @@ const VERB_ICONS: Record<string, SvgIconComponent> = {
 
 type NameDialogState = { verb: ActiveDocumentVerb; value: string } | null;
 
+/** One-shot pulse when `label` changes to a NEW non-null value (mount is not
+ *  an event — an existing binding pulses nothing). */
+function usePulseOnChange(label: string | null): boolean {
+  const [flash, setFlash] = useState(false);
+  const prevRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const prev = prevRef.current;
+    prevRef.current = label;
+    if (prev === undefined || label === null || label === prev) return;
+    setFlash(true);
+    const timer = setTimeout(() => setFlash(false), 950);
+    return () => clearTimeout(timer);
+  }, [label]);
+  return flash;
+}
+
+/**
+ * One reference slot of the hero card, as a square DROP WELL (Unity
+ * object-field parity, user sketch 2026-08-19): the field label sits above a
+ * rounded square tile that pings on click, clears on the corner ×, states
+ * "None" when unbound, and pulses in its own accent when a drop binds it.
+ * `stopPropagation` throughout — the hero body's own click is "reveal the
+ * DOCUMENT", and the slot must not trigger it.
+ */
+function RefSlotTile({ fieldLabel, what, Icon, slot, accent, flash, testId }: {
+  fieldLabel: string;
+  /** Human phrase for tooltips, e.g. "CONNECT configuration". */
+  what: string;
+  Icon: SvgIconComponent;
+  slot: DocumentCardRefSlot;
+  /** The slot's accent as `"r, g, b"` — green for CONNECT, pink for knowledge. */
+  accent: string;
+  flash: boolean;
+  testId: string;
+}) {
+  const a = (alpha: number) => `rgba(${accent}, ${alpha})`;
+  const bound = slot.kind === 'bound';
+  const missing = bound && slot.missing === true;
+  const ink = missing ? 'rgba(255,167,38,0.95)' : bound ? a(0.95) : 'rgba(255,255,255,0.45)';
+  const clickable = bound && !!slot.onReveal;
+  return (
+    <Box
+      onClick={(e) => e.stopPropagation()}
+      sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0.5 }}
+    >
+      <Typography
+        component="span"
+        sx={{
+          fontSize: 10, fontWeight: 500, letterSpacing: 1,
+          textTransform: 'uppercase', color: 'rgba(255,255,255,0.5)',
+        }}
+      >
+        {fieldLabel}
+      </Typography>
+      <Box
+        component={clickable ? 'button' : 'div'}
+        data-testid={bound ? testId : `${testId}-empty`}
+        onClick={clickable ? slot.onReveal : undefined}
+        title={bound
+          ? (missing
+            ? `The ${what} this document references is missing from the project`
+            : `Show this ${what} in the project`)
+          : (slot.kind === 'empty' && slot.droppable
+            ? `Drag a ${what} from the project onto this card to bind it`
+            : `No ${what} referenced`)}
+        sx={{
+          appearance: 'none',
+          font: 'inherit',
+          position: 'relative',
+          width: 104,
+          height: 88,
+          p: 0.5,
+          borderRadius: '4px',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 0.5,
+          cursor: clickable ? 'pointer' : 'default',
+          bgcolor: missing ? 'rgba(255,167,38,0.08)' : bound ? a(0.1) : 'rgba(255,255,255,0.02)',
+          border: missing
+            ? '1px solid rgba(255,167,38,0.5)'
+            : bound ? `1px solid ${a(0.55)}` : '1px dashed rgba(255,255,255,0.25)',
+          '&:hover': clickable ? {
+            bgcolor: missing ? 'rgba(255,167,38,0.15)' : a(0.18),
+          } : {},
+          '&:focus-visible': {
+            outline: `1px solid ${a(1)}`,
+            outlineOffset: 1,
+          },
+          // The drop's receipt: a ring in the slot's own accent that swells
+          // out of the tile and fades — unmistakable, gone in under a second.
+          ...(flash && {
+            animation: 'rvRefSlotBound 900ms ease-out',
+            '@keyframes rvRefSlotBound': {
+              '0%': { boxShadow: `0 0 0 0 ${a(0.65)}` },
+              '100%': { boxShadow: `0 0 0 14px ${a(0)}` },
+            },
+          }),
+        }}
+      >
+        <Icon sx={{ fontSize: 26, color: bound || missing ? ink : 'rgba(255,255,255,0.3)' }} />
+        <Typography
+          component="span"
+          sx={{
+            fontSize: 11,
+            fontWeight: bound ? 500 : 400,
+            lineHeight: 1.2,
+            maxWidth: 92,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            color: ink,
+          }}
+        >
+          {bound ? slot.label : 'None'}
+        </Typography>
+        {missing && (
+          <Typography component="span" sx={{ fontSize: 9, lineHeight: 1, color: ink }}>
+            missing
+          </Typography>
+        )}
+        {bound && slot.onClear && (
+          <Close
+            role="button"
+            aria-label={`Clear ${fieldLabel} binding`}
+            titleAccess={`Clear ${fieldLabel} binding`}
+            onClick={(e) => { e.stopPropagation(); slot.onClear!(); }}
+            sx={{
+              position: 'absolute',
+              top: 3,
+              right: 3,
+              fontSize: 14,
+              opacity: 0.5,
+              cursor: 'pointer',
+              '&:hover': { opacity: 1 },
+            }}
+          />
+        )}
+      </Box>
+    </Box>
+  );
+}
+
 export function DocumentCard({
   variant = 'compact',
   activeMode = null,
   onReveal,
   previewVisible = true,
+  connect = null,
+  knowledge = null,
 }: DocumentCardProps) {
   const viewer = useOptionalViewer();
   const version = useSyncExternalStore(
@@ -285,18 +477,54 @@ export function DocumentCard({
     setRefCounts({ local, cloud });
   }, [variant, viewer, documentKey, modelTick]);
 
+  /**
+   * The drop's receipt (hero only): when a binding changes to a new value,
+   * its chip pulses once. Keyed on the LABEL, so a re-render with the same
+   * binding stays quiet; the initial mount is skipped — an existing binding
+   * is a fact, not an event.
+   */
+  const connectFlash = usePulseOnChange(connect?.kind === 'bound' ? connect.label : null);
+  const knowledgeFlash = usePulseOnChange(knowledge?.kind === 'bound' ? knowledge.label : null);
+
   const closeMenu = useCallback(() => setMenuAnchor(null), []);
 
-  /** Ask for a name through the card's own dialog (the seam owns no React). */
-  const askName = useCallback((initial: string, title: string): Promise<string | null> => {
-    return new Promise((resolve) => {
-      setNameDialog({
-        verb: { id: 'name', label: title, run: (name) => { resolve(name ?? null); } },
-        value: initial,
-      });
-    });
-  }, []);
+  /**
+   * Ask for a name — through the shared store, never a dialog of our own.
+   *
+   * The card used to hold this prompt itself, and that local copy carried the
+   * defect this plan closes: Cancel called `setNameDialog(null)` and NEVER
+   * settled the promise, so `await view.actions.save(askName)` hung forever and
+   * the live region kept announcing "Saving…". Routing every save prompt
+   * through `save-dialog-store` also makes the reentrancy guard total (§2.10) —
+   * the "Save as…" menu and Ctrl+S ask through the same one pending slot.
+   *
+   * The busy sentinel is mapped to `null` here on purpose: `NamePrompt` has two
+   * answers, and for the save that DID reach a second prompt "treat it as
+   * declined" is the only outcome that writes nothing. The click that would
+   * have raced is already stopped one level up, in `onSave`.
+   */
+  // The document's NAME, deliberately, and not `documentKey` (which folds in a
+  // thumbnail identity the editor never publishes): this key has to agree with
+  // the one `runSaveFlow` uses on the other side of the seam, or the two save
+  // entry points would hold two different pending slots and §2.10 would guard
+  // nothing. `saveDocumentPromptKey` is the one derivation, shared by both.
+  const promptKey = saveDocumentPromptKey(view?.name);
+  const askName = useCallback(
+    async (initial: string, title: string): Promise<string | null> => {
+      const answer = await askSaveName({ documentKey: promptKey, initial, title });
+      return answer === SAVE_PROMPT_BUSY || answer === null ? null : answer;
+    },
+    [promptKey],
+  );
 
+  /**
+   * The one status mechanism, for every save path (F7).
+   *
+   * `try/finally` rather than a switch that happens to cover the outcomes the
+   * author thought of: a save can also THROW, and an announcement written
+   * before the await and unwound only on enumerated results is an announcement
+   * that survives the failure it was describing.
+   */
   const onSave = useCallback(async () => {
     if (!view) return;
     if (view.saveVerb === 'blocked') {
@@ -305,36 +533,62 @@ export function DocumentCard({
       setAnnouncement(reason);
       return;
     }
+    // §2.10: a second click while this document's prompt is open is a busy
+    // no-op. The button stays enabled by design (§3.1) — busy is SHOWN, never
+    // enforced by taking the control out of the keyboard order.
+    if (isPromptingSaveName(promptKey)) return;
     setNotice(null);
     setAnnouncement('Saving…');
-    const outcome = await view.actions.save(askName);
-    switch (outcome.status) {
-      case 'saved':
-      case 'no-op':
-        setAnnouncement('Saved');
-        break;
-      case 'cancelled':
-        setAnnouncement('');
-        break;
-      case 'blocked':
-        setNotice(outcome.reason);
-        setAnnouncement(outcome.reason);
-        break;
-      case 'error':
-        setNotice(outcome.message);
-        setAnnouncement(`Save failed: ${outcome.message}`);
-        break;
+    try {
+      const outcome = await view.actions.save(askName);
+      switch (outcome.status) {
+        case 'saved':
+        case 'no-op':
+          setAnnouncement('Saved');
+          break;
+        case 'cancelled':
+          setAnnouncement('');
+          break;
+        case 'blocked':
+          setNotice(outcome.reason);
+          setAnnouncement(outcome.reason);
+          break;
+        case 'error':
+          setNotice(outcome.message);
+          setAnnouncement(`Save failed: ${outcome.message}`);
+          break;
+      }
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      setNotice(detail);
+      setAnnouncement(`Save failed: ${detail}`);
     }
-  }, [view, askName]);
+  }, [view, askName, promptKey]);
 
+  /**
+   * A menu verb, reported through the SAME live region as the button (F7).
+   *
+   * "Save as…" saves, and a save the assistive technology never hears about is
+   * half a save. Prompting verbs still hand off to the card's generic name
+   * dialog — they are renames and duplicates, not the save path.
+   */
   const runVerb = useCallback(async (verb: ActiveDocumentVerb) => {
     closeMenu();
     if (verb.prompt) {
       setNameDialog({ verb, value: verb.prompt.initial });
       return;
     }
-    const result = await verb.run();
-    if (typeof result === 'string') setMessage(result);
+    const saves = verb.id === 'save-as';
+    if (saves) setAnnouncement('Saving…');
+    try {
+      const result = await verb.run();
+      if (typeof result === 'string') setMessage(result);
+      if (saves) setAnnouncement('Saved');
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      setMessage(detail);
+      if (saves) setAnnouncement(`Save failed: ${detail}`);
+    }
   }, [closeMenu]);
 
   const submitNameDialog = useCallback(async () => {
@@ -343,8 +597,20 @@ export function DocumentCard({
     const name = pending.value.trim();
     if (!name) return;
     setNameDialog(null);
-    const result = await pending.verb.run(name);
-    if (typeof result === 'string') setMessage(result);
+    // The scene lineage's "Save as…" is a PROMPTING verb, so it lands here
+    // rather than in `runVerb` — and it is still a save, so it announces
+    // through the one live region like every other save path (F7).
+    const saves = pending.verb.id === 'save-as';
+    if (saves) setAnnouncement('Saving…');
+    try {
+      const result = await pending.verb.run(name);
+      if (typeof result === 'string') setMessage(result);
+      if (saves) setAnnouncement('Saved');
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      setMessage(detail);
+      if (saves) setAnnouncement(`Save failed: ${detail}`);
+    }
   }, [nameDialog]);
 
   const openExport = useCallback(async () => {
@@ -389,6 +655,12 @@ export function DocumentCard({
   const menu = view.actions.menu ?? [];
   const hasMenu = menu.length > 0 || !!view.actions.share || !!view.actions.exportGlb;
 
+  // Instrument Blue only when the click would DO something: unsaved changes,
+  // a save in flight, or the read-only copy (which materialises a document
+  // even from a clean source). A clean in-place save is a true no-op and a
+  // blocked one cannot land — both render muted, never blue.
+  const saveActive = view.dirty || view.busy || view.saveVerb === 'save-into-project';
+
   const saveButton = view.stale ? (
     <Typography
       data-testid="document-card-stale"
@@ -400,21 +672,24 @@ export function DocumentCard({
     <Tooltip
       title={view.saveVerb === 'save-into-project'
         ? 'This source cannot be written to — Save puts a copy in the open project.'
-        : (view.saveReason ?? 'Save changes')}
+        : (view.saveReason ?? (saveActive ? 'Save changes' : 'No unsaved changes'))}
       placement="top"
     >
       <Button
         data-testid="document-card-save"
-        variant="contained"
+        variant={saveActive ? 'contained' : 'outlined'}
+        color={saveActive ? 'primary' : 'inherit'}
         size="small"
         // Never disabled (§3.1): busy and blocked are SHOWN, not enforced by
-        // taking the control away from the keyboard.
+        // taking the control away from the keyboard. "Nothing to save" is
+        // shown the same way — muted, not removed.
         onClick={() => { void onSave(); }}
         sx={{
           fontSize: 11, textTransform: 'none', py: 0.4, lineHeight: 1.2,
           // The hero gives it breathing room beside the title; the compact
           // header stays as tight as its row.
           minWidth: 0, ...(hero && { px: 2.5, flexShrink: 0 }),
+          ...(!saveActive && { opacity: 0.55, borderColor: 'divider' }),
         }}
       >
         {view.busy ? 'Saving…' : saveLabel}
@@ -424,11 +699,15 @@ export function DocumentCard({
 
   const identity = (
     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
-      {view.dirty ? <DirtyDot /> : <Box sx={{ width: 7, minWidth: 7 }} />}
+      {/* The hero drops the leading dot column: every line under the title
+          starts at the same left edge, and the dirty dot joins the "Unsaved"
+          word at the right where it reads as one statement. The compact
+          header keeps the dot in front — there the trail is the title. */}
+      {!hero && (view.dirty ? <DirtyDot /> : <Box sx={{ width: 7, minWidth: 7 }} />)}
       <Typography
         data-testid="document-card-name"
         sx={{
-          fontSize: hero ? 14 : 13, fontWeight: 600, flex: 1, minWidth: 0,
+          fontSize: hero ? 16 : 13, fontWeight: 600, flex: 1, minWidth: 0,
           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
         }}
         title={view.name}
@@ -436,11 +715,14 @@ export function DocumentCard({
         {view.name}
       </Typography>
       {view.dirty && (
-        <Typography
-          sx={{ color: DIRTY_INK, fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5 }}
-        >
-          Unsaved
-        </Typography>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexShrink: 0 }}>
+          {hero && <DirtyDot />}
+          <Typography
+            sx={{ color: DIRTY_INK, fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.5 }}
+          >
+            Unsaved
+          </Typography>
+        </Box>
       )}
     </Box>
   );
@@ -538,8 +820,8 @@ export function DocumentCard({
         onClick={hero && onReveal ? () => onReveal() : undefined}
         sx={hero
           ? {
-              width: '100%', maxWidth: 620,
-              p: 1.5, borderRadius: '4px',
+              width: '100%', maxWidth: 780,
+              p: 2, borderRadius: '4px',
               bgcolor: 'rgba(255,255,255,0.04)',
               border: '1px solid rgba(255,255,255,0.08)',
               ...(onReveal && {
@@ -563,7 +845,7 @@ export function DocumentCard({
              right, vertically centred. Undo/redo stay with the compact header
              where the editing happens — here they were dead weight between the
              title and the kebab. */
-          <Box sx={{ display: 'flex', alignItems: 'stretch', gap: 1.5 }}>
+          <Box sx={{ display: 'flex', alignItems: 'stretch', gap: 2 }}>
             {/* The picture. Fixed box (the render is square, so letting the
                 image set the row height would balloon the card); keyboard
                 users focus it as the card's one reveal control (mouse clicks
@@ -579,7 +861,12 @@ export function DocumentCard({
                 if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onReveal(); }
               }}
               sx={{
-                width: 148, height: 92, flexShrink: 0,
+                // Stretches to the right column's height (the row is
+                // `alignItems: stretch`), so the picture and the content block
+                // always share top AND bottom edge. FULL-BLEED: the render
+                // fills its frame edge to edge — an inner margin here read as
+                // a picture floating in a box.
+                width: 200, alignSelf: 'stretch', minHeight: 150, flexShrink: 0,
                 borderRadius: '4px',
                 border: '1px solid rgba(255,255,255,0.08)',
                 bgcolor: 'rgba(255,255,255,0.02)',
@@ -597,7 +884,7 @@ export function DocumentCard({
                     component="img"
                     src={preview}
                     alt=""
-                    sx={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
+                    sx={{ width: '100%', height: '100%', objectFit: 'cover' }}
                   />
                 )
                 : (
@@ -607,14 +894,15 @@ export function DocumentCard({
                 )}
             </Box>
 
-            {/* Title and verbs share ONE row, aligned to the picture's top
-                edge; the trail (when it is a real trail) sits quietly
-                beneath it. */}
+            {/* One frame level, not four: the card is the frame, the identity
+                cluster sits at the top, a hairline separates it from the slot
+                wells pinned to the bottom. The old inner border box doubled
+                the card's own frame and made the whole hero read as boxes in
+                boxes. */}
             <Box
               sx={{
                 flex: 1, minWidth: 0,
-                display: 'flex', flexDirection: 'column',
-                justifyContent: 'flex-start', gap: 0.75,
+                display: 'flex', flexDirection: 'column', gap: 0.5,
               }}
             >
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -627,6 +915,27 @@ export function DocumentCard({
                   {kebab}
                 </Box>
               </Box>
+              {/* The trail — only when it says something the title does not.
+                  A root document's trail is exactly its name, and printing
+                  the name twice was the "weird" the redesign kept tripping
+                  over. */}
+              {((view.location?.length ?? 0) > 0
+                || view.crumbs.length > 1
+                || (view.crumbs[0]?.label ?? view.name) !== view.name) && (
+                <Box
+                  onClick={(e) => e.stopPropagation()}
+                  sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}
+                >
+                  <DocumentCrumbs
+                    crumbs={view.crumbs}
+                    location={view.location}
+                    onCrumbClick={view.actions.onCrumb}
+                    testIdPrefix="document-crumb"
+                    fontSize={11}
+                    ariaLabel="Document breadcrumb"
+                  />
+                </Box>
+              )}
               {/* What this file pulls in. "Self-contained" is as much a fact
                   worth stating as a dependency count — a file with cloud
                   references needs its libraries wherever it travels. */}
@@ -645,22 +954,40 @@ export function DocumentCard({
                       ].filter(Boolean).join(' · ')}
                 </Typography>
               )}
-              {/* Always the full trail — location segments in front of the
-                  chain. A single chip repeating the title used to be hidden as
-                  noise; with the location in front, the row is the one place
-                  that says where the open document actually is. */}
+              <Box sx={{ flex: 1, minHeight: 10 }} />
+              {/* The reference slot wells (Unity object fields): drop to bind,
+                  click to ping, × to clear. Green = CONNECT, pink = knowledge
+                  (user decision 2026-08-19). A hairline, not a box, carries
+                  the grouping. */}
               <Box
-                onClick={(e) => e.stopPropagation()}
-                sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}
+                sx={{
+                  display: 'flex', alignItems: 'flex-start', gap: 1.5,
+                  borderTop: '1px solid rgba(255,255,255,0.08)',
+                  pt: 1.25,
+                }}
               >
-                <DocumentCrumbs
-                  crumbs={view.crumbs}
-                  location={view.location}
-                  onCrumbClick={view.actions.onCrumb}
-                  testIdPrefix="document-crumb"
-                  fontSize={11}
-                  ariaLabel="Document breadcrumb"
-                />
+                {connect && (
+                  <RefSlotTile
+                    fieldLabel="Connect"
+                    what="CONNECT configuration"
+                    Icon={SettingsEthernet}
+                    slot={connect}
+                    accent="102, 187, 106"
+                    flash={connectFlash}
+                    testId="document-card-connect"
+                  />
+                )}
+                {knowledge && (
+                  <RefSlotTile
+                    fieldLabel="Knowledge"
+                    what="knowledge file"
+                    Icon={MenuBookOutlined}
+                    slot={knowledge}
+                    accent="233, 64, 120"
+                    flash={knowledgeFlash}
+                    testId="document-card-knowledge"
+                  />
+                )}
               </Box>
             </Box>
           </Box>

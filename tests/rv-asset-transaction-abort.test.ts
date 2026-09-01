@@ -14,6 +14,7 @@
  * a failure reaches the caller.
  */
 import { describe, it, expect, vi } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -65,7 +66,7 @@ describe('a failing op rejects instead of being recorded', () => {
     const { viewer, model, register } = makeMockViewer();
     addChild(model, 'A');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const boom = new Error('executor exploded');
     vi.spyOn(doc.executor, 'applyForward').mockRejectedValueOnce(boom);
 
@@ -81,7 +82,7 @@ describe('a failing op rejects instead of being recorded', () => {
     const { viewer, model, register } = makeMockViewer();
     addChild(model, 'A');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     await expect(doc.applyOp({
       ...assetOpHeader(), kind: 'reparentNode',
@@ -98,7 +99,7 @@ describe('a failing op rejects instead of being recorded', () => {
     const { viewer, model, register } = makeMockViewer();
     const a = addChild(model, 'A');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     await expect(doc.applyOp({
       ...assetOpHeader(), kind: 'reparentNode',
@@ -125,7 +126,7 @@ describe('a failing transaction leaves nothing behind', () => {
     const target = addChild(model, 'Link', 5);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const before = shapeOf(model);
 
     await expect(doc.withTransaction('bulk', async () => {
@@ -150,7 +151,7 @@ describe('a failing transaction leaves nothing behind', () => {
     const target = addChild(model, 'Link', 9);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const before = shapeOf(model);
 
     // Pull the third node out of the registry between resolve and apply — the
@@ -179,7 +180,7 @@ describe('a failing transaction leaves nothing behind', () => {
     const { viewer, model, register } = makeMockViewer();
     addChild(model, 'A');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const boom = new Error('component construction failed');
     const forward = vi.spyOn(doc.executor, 'applyForward');
     forward.mockRejectedValueOnce(boom);
@@ -200,7 +201,7 @@ describe('undo/redo stacks survive a failed apply', () => {
     const { viewer, model, register } = makeMockViewer();
     const a = addChild(model, 'A');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.renameNode('Asset/A', 'Renamed', 'A');
     await doc.whenIdle();
@@ -226,7 +227,7 @@ describe('undo/redo stacks survive a failed apply', () => {
     const { viewer, model, register } = makeMockViewer();
     addChild(model, 'A');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.renameNode('Asset/A', 'Renamed', 'A');
     await doc.whenIdle();

@@ -265,6 +265,35 @@ export interface RvDocumentEntry {
    * folder convention is implied.
    */
   knowledgeRef?: string;
+  /**
+   * Preferred workspace mode to switch to when this document is opened
+   * (e.g. `planner`, `des`). Optional — absent means "leave the mode alone".
+   *
+   * Carried by a manifest row since plan-731: it used to live in the curated
+   * `scenes/index.json`, the second catalogue that plan abolished. A `?mode=`
+   * in the URL still wins over it.
+   */
+  mode?: string;
+  /**
+   * Repo fixture: visible in the dev checkout, removed by every staging path
+   * (plan-731 §2.4).
+   *
+   * The successor of the `Test*` FILENAME convention `applyPublicScenePruning`
+   * used to prune by. A convention cannot say "this one is a test" about a file
+   * whose name does not start with `Test`, and it cannot be seen from the
+   * manifest at all — this field can, which is what lets the release gate of
+   * Phase 4 assert "no dev-only document reached the channel".
+   */
+  devOnly?: boolean;
+  /**
+   * The settings sidecar this document is bound to (plan-731 F5).
+   *
+   * A project-relative path, replacing the `<model>.settings.json` FILENAME
+   * convention the staging scripts used to hard-code. The convention stays as a
+   * fallback for a manifest that does not declare one — same shape as the
+   * `models/` path fallback beside it.
+   */
+  settingsPath?: string;
   [key: string]: unknown;
 }
 
@@ -406,6 +435,22 @@ export interface RvProject {
 
   /** External catalog subscriptions that travel with the project (§2.6.3). */
   libraries?: RvProjectLibraryRef[];
+
+  /**
+   * The document this project was last left on — **a live resume mechanism, not
+   * scene-era residue.** Read this before deleting it.
+   *
+   * It is priority 4 of the open decision ("decision 24", `rv-project-open.ts`),
+   * consumed by `project-store.ts` (`_seedSceneMetas`) and the dashboard host,
+   * and written by `rv-project-folder-writer.ts`. It is the ONLY resume signal
+   * that travels WITH the project rather than in the local remembered-pair, so
+   * it is what makes opening a delivered project on a fresh machine land on its
+   * real document instead of degrading to `settings.defaultModel`.
+   *
+   * The name is pre-plan-716 and the value is a document id. A plan-720 audit
+   * classified the field as dead on the name alone; the review caught it. Rename
+   * it if you like, but do not remove it (Z6).
+   */
   activeSceneId?: string | null;
   /**
    * Ids/paths the user has hidden (§2.3.2).
@@ -553,7 +598,7 @@ export function sceneIdToken(id: string): string {
  * On-disk filename for a scene. **Never derived from the name alone** (RR1).
  *
  * Scene names are not unique: `_uniqueSceneName()` is used only by
- * `addPublishedToMyScenes`, while `rename()` and `saveAs()` check nothing. Two
+ * `materializePublishedExample`, while `rename()` and `saveAs()` check nothing. Two
  * scenes called "Cell" would slug onto the same file, and with the delete
  * semantics of §4d one could remove the other's data.
  *

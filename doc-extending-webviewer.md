@@ -156,6 +156,8 @@ The Unity scene is exported as a **GLB file** with custom `extras` data on each 
 | `PLCInputBool/Float/Int` | Signal entry in `SignalStore` | `rv-signal-store.ts` |
 | `DrivesRecorder` | `RVDrivesPlayback` | `rv-drives-playback.ts` |
 | `ReplayRecording` | `RVReplayRecording` | `rv-replay-recording.ts` |
+| `MachiningVolume` | `RVMachiningVolume` | `rv-machining-volume.ts` |
+| `MachiningTool` | `RVMachiningTool` | `rv-machining-tool.ts` |
 
 ### Runtime messages and instructions
 
@@ -282,7 +284,7 @@ registerCapabilities('AASLink', {
 | `hoverable` | boolean | `false` | Highlight on mouse hover |
 | `selectable` | boolean | `false` | Can be clicked/selected |
 | `inspectorVisible` | boolean | `true` | Shown in Property Inspector |
-| `hierarchyVisible` | boolean | `true` | Shown in Hierarchy Browser |
+| `hierarchyVisible` | boolean | `true` | Declared but **not read anywhere** — see the note below |
 | `tooltipType` | string/null | `null` | Tooltip content type (key in tooltip-registry) |
 | `badgeColor` | string | `'#90a4ae'` | Hex color for hierarchy browser badge |
 | `filterLabel` | string/null | `null` | Label in search/filter dropdown |
@@ -294,6 +296,18 @@ registerCapabilities('AASLink', {
 > listed one; it never existed in `ComponentCapabilities` and nothing ever read
 > it. A component that needs a per-frame tick gets a **dedicated viewer-owned
 > manager** instead — see § Per-frame components below.
+
+> **`hierarchyVisible` currently does nothing** (measured, plan-431 §2.8).
+> `rg -n "hierarchyVisible" src` finds 11 hits: the declaration, the default and
+> nine components that SET it — and not one place that reads it. The hierarchy builds
+> its type list in `RvExtrasEditorPlugin._scanEditableNodes`, which filters
+> through `isHiddenComponentType()`, i.e. through **`inspectorVisible`** only. So
+> a type set `hierarchyVisible: false` still gets a chip — `rv-jt-data.ts` sets
+> it precisely to keep JT metadata out of the hierarchy, and the chip is there
+> anyway. The flag that actually removes a type from BOTH surfaces is
+> `inspectorVisible: false`.
+> Documented rather than fixed: making it live would change what existing models
+> show. Set it for intent, but do not rely on it.
 
 ### A metadata entry with no factory (data that is not a component)
 
@@ -355,6 +369,73 @@ What follows from having no factory:
 
 Use plain `registerCapabilities(type, caps)` instead when there is no schema to register at
 all — a pipeline marker or an externally-defined key such as `AASLink`.
+
+### Custom field renderers (when one field needs more than a row)
+
+The Property Inspector renders one `FieldRow` per rv_extras field. When a field
+holds something a single row cannot show — a nested step list, 2400 characters of
+Markdown — replace that row with a component via `fieldRendererRegistry`
+(`rv-field-renderer-registry.ts`). The key is `(componentType, fieldName)`, and
+the renderer wins over the `FieldRow` for that pair.
+
+```typescript
+// at the bottom of your renderer module
+fieldRendererRegistry.register({
+  componentType: 'NodeKnowledge',
+  fieldName: 'Note',
+  component: NodeKnowledgeNoteRenderer,   // gets FieldRendererProps
+});
+```
+
+**The step that is easy to miss: side-effect-import your module in `App.tsx`.**
+Nothing imports a renderer module for its exports — registration IS the module's
+effect, so a module nobody imports never runs. `App.tsx` carries the list:
+
+```typescript
+import './rv-metadata-field-renderer';
+import './rv-ik-path-field-renderer';
+import './rv-custom-runtime-instruction-field-renderer';
+import './rv-node-knowledge-field-renderer';
+```
+
+Forget that line and the renderer works in every test that imports it directly
+while the running application still shows the plain editable row. Test it
+through the bootstrap path (import `App`, then query the registry), not through
+a module import — `tests/rv-node-knowledge-field-renderer.test.tsx` does exactly
+that.
+
+**Taking over sibling fields — use `HIDDEN_FIELDS_PER_TYPE`.** A renderer that
+also presents neighbouring fields (a provenance header showing `UpdatedAt`,
+`Author`, `Confidence`, `NodeIdAtWrite`) has to stop those fields rendering their
+own rows. Add them to `HIDDEN_FIELDS_PER_TYPE` in `rv-inspector-helpers.ts`:
+
+```typescript
+export const HIDDEN_FIELDS_PER_TYPE: Record<string, ReadonlySet<string>> = {
+  LayoutObject: new Set(['Locked', 'Visible']),      // shown by ObjectHeaderSection
+  Splat: new Set(['InvertX', 'InvertY', 'InvertZ']), // shown as action buttons
+  NodeKnowledge: new Set(NODE_KNOWLEDGE_PROVENANCE_FIELDS), // shown in the renderer's header
+};
+```
+
+`isFieldHidden()` runs in `ComponentSection` **before** the consumed/other split,
+so a hidden field reaches neither a `FieldRow` nor an edit callback. Note the
+value type: a `ReadonlySet`, not an array — `isFieldHidden` calls `.has()`.
+
+**This is also how you make a field read-only in the UI.** Do NOT reach for
+`readonly: true` in the schema for that: `isFieldDisplayReadonly` is the single
+predicate shared by the inspector's editability gate **and** the
+`updateOverlayField` write guard, so the flag blocks programmatic writes too —
+including every MCP tool that goes through the overlay. For `NodeKnowledge` that
+would have switched `web_knowledge_set` off entirely (measured: `readonly: true`
+on `Note` alone turned 20 of 31 `mcp-knowledge-tools` tests red). Hiding the row
+removes the editor and leaves the write path open. Use `readonly: true` only when
+the value should be visible-but-frozen for *everyone*, tools included.
+
+One caveat: the `readOnlyLive` short-circuit in `ComponentSection` (ephemeral
+virtual components such as behavior live state and snap data) skips both
+`isFieldHidden` and the renderer lookup and dumps every field as a plain row.
+That branch is only reachable for the inspector's own `virtualComponents` list,
+never for a persisted rv_extras entry.
 
 ### Per-frame components (the manager pattern)
 
@@ -1974,6 +2055,72 @@ npm test              # All tests, headless
 npm run test:watch    # Watch mode
 ```
 
+### Where test assets live, and the rule that comes with them
+
+There are exactly **three** places a `.glb` can live, and they are not
+interchangeable:
+
+| Place | What belongs there |
+|---|---|
+| `public/models/` | **Only what is shipped.** The demo models a customer actually receives, as declared by `public/project.json`. A guard test (`publicModels_OnlyShippedDemos`) fails on anything else. |
+| `public/library/` | The delivered standard library (`PalletHandling` + `catalog.json`). Unchanged, and not a place for experiments. |
+| `../realvirtual-WebViewer-Private~/projects/Development/` | **Everything internal.** `fixtures/` for synthetic test GLBs, `models/` for real internal reference models, `library/Custom/` for the internal custom library, and `scratch/` for experiments. |
+
+**`scratch/` is where a try-out goes.** It exists precisely so `public/models/`
+does not become the dumping ground again - which is what it had become, because
+there was nowhere else. Nothing in `scratch/` is delivered, deployed or
+published, and nothing there needs a `documents[]` entry: those files are
+working material, not documents. Delete them whenever you like.
+
+#### Loading an internal asset from a test
+
+Never write the URL. It comes from the one source of truth,
+`tests/fixtures/glb-paths.mjs`:
+
+```typescript
+import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.tests);
+
+describe.skipIf(!DEV_ASSETS)('my suite', () => {
+  beforeAll(async () => { /* load DEV_GLB.tests */ });
+  it('...', () => { /* ... */ });
+});
+```
+
+**The `skipIf` is not optional, and a guard test enforces the pairing.** These
+assets exist only on a machine that has the private sibling checked out; a
+public checkout has none of them. Without the guard the suite fails there
+instead of reporting `skipped`.
+
+Two things that look like they would work and do not:
+
+- **`if (!ready) return`** reports the test as `passed`. That is a suite which
+  claims to have checked something it never loaded - the exact failure the
+  `skipIf` exists to prevent.
+- **`res.ok` as the probe.** Without the private sibling nothing claims
+  `/private-assets/`, so the dev server answers it with the SPA fallback: a
+  `200 text/html` for every path. `res.ok` is therefore `true` for an asset
+  that is not there. `devAssetAvailable()` checks the CONTENT TYPE, which is
+  why it is a shared helper and not four lines you write again.
+
+In a Playwright spec the equivalent is decided in Node, before a browser is
+even started:
+
+```typescript
+import { DEV_ASSETS_SKIP_REASON, HAS_DEV_ASSETS } from './dev-assets';
+
+test.describe('my spec', () => {
+  test.skip(!HAS_DEV_ASSETS, DEV_ASSETS_SKIP_REASON);
+  // ...
+});
+```
+
+The generated `physics-zone-test.glb` fixture is rebuilt with
+`node scripts/build-physics-test-glb.mjs`, which writes into the Development
+project and fails with instructions if the private sibling is not there.
+
 ### Testing Core Plugin Lifecycle
 
 Use a minimal mock to test plugin dispatch without the full viewer:
@@ -2540,6 +2687,17 @@ A plugin can opt to take over transport by setting `handlesTransport: true`. The
 **Why RVBehavior base class?**
 Mirrors Unity's MonoBehaviour pattern. Every plugin repeated the same boilerplate: store/null-check viewer, find drives, cleanup subscriptions. `RVBehavior` handles this automatically. Subclasses override named hooks (`onStart`, `onPreFixedUpdate`, etc.) instead of implementing raw interface methods.
 
+**Why may a load-time hierarchy mutation never be unconditional? (plan-727)**
+An authoring load must leave the node tree exactly as the GLB describes it — the
+asset editor exports the live tree, so anything a load moves gets baked into the
+saved bytes and the CAD re-import loses the moved nodes silently. If your plugin
+or component restructures nodes at load time (`attach()`, `add()`, reparenting a
+subtree from `onSceneReady`), gate it on `preserveAuthoringHierarchy` and prefer
+computing a world transform over moving the node. Do **not** gate on
+`preserveHierarchy` — that flag is about mesh baking and pickability, and the
+embed viewer sets it while still needing structure work to run. See the invariant
+section in `doc-webviewer.md`.
+
 **Why two signal lookup tables (name + path)?**
 Signals need to be addressed by **name** for communication (plugin API, HMI, interfaces) and by **path** for GLB object references (ComponentRef). The name is the signal's identity (Signal.Name if set, otherwise node name); the path is its location in the scene hierarchy. Both resolve to the same underlying value.
 
@@ -2888,6 +3046,50 @@ physicsRegistry.register(myProvider);   // private side; pass null to unregister
 Read-only diagnostics live in the `physicsDiagnostics` singleton (same module): `{ active, zones, bodies, stepMs }`, mutated in place by the provider's plugin and consumed by the Settings → Simulation line and the `web_transport_status` MCP tool.
 
 The private reference implementation is `RapierPhysicsProvider` + `PhysicsZonePlugin` (lifecycle owner: world build per model load, step/sync per tick, settle return, DES/multiuser/reset guards) in the private repo.
+
+## 21c. Machining Provider Registry (CSG material removal)
+
+The CSG milling/drilling feature (see "Machining (CSG material removal)" in [doc-webviewer.md](doc-webviewer.md)) follows the same public-interface / private-provider split as physics and the IK solver: the AGPL core ships only the contract, the registry singleton and the two components (`RVMachiningVolume`, `RVMachiningTool`) in `src/core/engine/rv-machining-registry.ts` / `rv-machining-volume.ts` / `rv-machining-tool.ts` / `rv-machining-manager.ts`; the actual kernel (`rv-csg` Rust crate → `rv_csg.wasm`, run inside a Web Worker) is a private provider. Without a registered provider, `machiningRegistry.provider` is `null`, every `MachiningVolume` keeps its authored workpiece mesh visible, and one console warning is logged (F10 — no crash, no synchronous fallback compute path).
+
+```ts
+import { machiningRegistry, type MachiningProvider } from '.../core/engine/rv-machining-registry';
+
+machiningRegistry.register(myProvider);   // private side; pass null to unregister
+```
+
+`MachiningProvider` is deliberately dependency-free (lean `{x,y,z}` structural types, no Three.js, no WASM types, no URL — nothing crosses the public/private seam but the interface itself). The private provider registers from a **feature adapter** (`features/machining.register.ts` in the private repo, same pattern as `ik-solver.register.ts`), loaded lazily only once a model actually contains a `MachiningVolume`.
+
+### Job/ack protocol instead of fire-and-forget
+
+Subtraction is too expensive to run on the main thread (SIMD128, single-threaded, no `rayon` in the browser build — see the plan's benchmark), so the entire kernel — SDF grid, `rvc_subtract`, tessellation — lives in one Web Worker per session. Because the worker is asynchronous and can fall behind, the contract is a **job/ack protocol with sequence numbers**, not fire-and-forget:
+
+- `submitSubtract(handle, job)` is non-blocking and returns `{accepted:true, seq}` or `{accepted:false, reason:'backlog'|'closed'}` immediately — it never throws and never awaits the worker.
+- `onAck(handle, cb)` delivers `{seq, removedVoxels, pendingJobs, pendingChunks}` per processed job. `pendingJobs`/`pendingChunks` are **momentary** queue depths, not cumulative counters.
+- `onChunkMeshes(handle, cb)` delivers transferable, trimmed-to-actual-size chunk batches as they're tessellated (budgeted `MACHINING_TESSELLATE_BATCH = 16` chunks per kernel call, parity with the Unity `CsgKernel.TESSELLATE_BATCH`).
+
+### Backpressure and sweep coalescing
+
+At most `MACHINING_MAX_PENDING_JOBS = 8` unacknowledged jobs are allowed per grid. When the manager's per-tick submit is rejected with `reason: 'backlog'`, it does **not** drop the tick or collapse the tool's motion to a straight chord — a `MachiningSubtractJob` carries an **ordered segment list** (`MachiningToolSegment[]`), and the rejected tick's segments are prepended to the next job's list. A curved path A→B→C stays two segments (A→B, B→C); every intermediate pose survives as its own `rvc_subtract` call in the worker, so coalescing is volume-equivalent up to `MACHINING_MAX_SEGMENTS_PER_JOB = 64` segments per job — only above that cap does the worker degrade deterministically by reducing per-segment substeps (lossy, and the only place it is).
+
+### Reset barrier and epochs
+
+`resetGrid(handle)` is a **barrier**, not just another job: every queued job is discarded (sequence-range invalidation), and the returned promise resolves only after the worker confirms the grid has been re-initialized — a new **epoch** begins at that point. Every chunk batch and ack carries the epoch it was produced under; a batch that arrives after a reset or a `destroyGrid()` of the same handle is silently dropped by the epoch guard instead of being applied to stale geometry.
+
+### Idle ack — why `SignalMachiningActive` actually falls
+
+`SignalMachiningActive` is derived from `pendingJobs + pendingChunks > 0` on the **last received ack** — a momentary state, never a latch on "the last ack had `removedVoxels > 0`" (that construction never falls again once material has been removed at all). To make the momentary state reachable even after the queues genuinely go idle, the worker emits a synthetic **idle ack** (`isIdleAck(ack)` is true for `seq < 0`, both depths `0`) once both the job queue and the chunk queue have drained — so the signal is guaranteed to fall to `false` by the following tick.
+
+### Fail-off latch and boot watchdog
+
+`failed` on the provider is a **permanent** latch: `catch_unwind` does not exist on `wasm32`, so a WASM panic traps the whole instance and the only safe reaction is to stop calling into it — every method becomes a no-op afterward (`submitSubtract` returns `reason: 'closed'`). The private provider also guards against a worker that never reports readiness at all: a boot watchdog (`MACHINING_BOOT_TIMEOUT_MS = 15s`) fails the provider off instead of leaving `init()` pending forever, and `worker.onerror` / `onmessageerror` are wired to the same fail-off path — the only channel available when the worker's module failed to load and no line of its own code ever ran.
+
+### `destroyGrid`, listener cleanup and `clearModel()`
+
+`destroyGrid(handle)` is idempotent, aborts an in-flight `createGrid`/`resetGrid` of the same handle cleanly, frees the grid's WASM linear memory exactly once, and removes every listener registered via `onAck`/`onChunkMeshes` for that handle (both of which return an `Unsubscribe` function). It is the *only* route by which a grid's memory is freed — `clearModel()` calls it for every live grid before geometry teardown, which is what keeps repeated model switches from leaking worker-side memory.
+
+### `MachiningManager` — the per-tick driver
+
+`MachiningManager` (`rv-machining-manager.ts`) is the per-frame-manager for this feature (see "Per-frame components" in §2 above): instantiated once in `RVViewer`'s constructor, reachable through `ComponentContext.machiningManager`, ticked in `CoreSubsystems.visuals(dt)` **after** the drive updates of the same tick (tool poses must see the fresh axis positions), and torn down in `clearModel()`/`dispose()`. It reads every registered tool's `matrixWorld` relative to its volume, builds the swept segments, submits jobs, applies acknowledged chunk batches to `RVMachiningVolume` (marking render **and** shadow dirty), and owns the reset-signal edge detection. It is inactive during DES FastForward and while following another session as a multiuser client — analogous to the physics provider.
 
 ## 22. Typed Connections (Script API)
 

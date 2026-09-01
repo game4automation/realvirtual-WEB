@@ -172,13 +172,20 @@ export function isGitHubRepoScanUrl(url: string): boolean {
 /**
  * True for any github.com / raw.githubusercontent.com catalog URL.
  *
- * GitHub libraries are strictly OPT-IN: they may only be loaded by an explicit
- * manual add this session (the GitHub tab, a constructor `catalogUrls` option,
- * or a `?library=<url>` parameter). They are NEVER auto-restored from persisted
- * storage or a restored scene's `catalogUrls`, and are NEVER written back to
- * storage — otherwise a former-default GitHub library that leaked into a user's
- * storage would re-scan GitHub (and 404) on every boot without the user ever
- * adding it.
+ * GitHub libraries load from a deliberate act — the Add-Library dialog, a
+ * constructor `catalogUrls` option, a `?library=<url>` parameter, or the
+ * `libraries[]` of the project the user opened. The one path that still does
+ * NOT pull one in is a restored legacy scene's `catalogUrls`, which is
+ * read-compat for a list the user never curated.
+ *
+ * The rule used to be absolute: no GitHub URL was ever persisted or restored,
+ * so a repo the user typed into the dialog appeared once and was gone after the
+ * next reload. The case it was actually guarding against is narrower — a
+ * former-default GitHub library that leaked into a user's storage and would
+ * then re-scan GitHub (and 404) on every boot without the user ever adding it.
+ * A leaked URL like that carries NO recorded origin, so `_persistUrls` and
+ * `restoreFromStorage` now key on an explicit `user` origin instead: the leak
+ * still self-heals, and a deliberate add survives a restart.
  */
 export function isGitHubCatalogUrl(url: string): boolean {
   return /^https?:\/\/(raw\.githubusercontent\.com|github\.com)\//i.test(url.trim());
@@ -510,8 +517,18 @@ export class LibraryStore {
    * Project-level subscriptions are swapped wholesale on a project switch: URLs
    * of the previous project that no other origin claims are removed, the new
    * ones are added with origin `'projectManifest'`. A URL the user ALSO added
-   * himself keeps its promoted `'user'` origin and therefore survives the swap —
-   * which is exactly the two-level SSOT §2.6.3 asks for.
+   * themselves keeps its promoted `'user'` origin and therefore survives the
+   * swap — which is exactly the two-level SSOT §2.6.3 asks for.
+   *
+   * A GitHub library listed here IS loaded. It used to be skipped, on the
+   * reasoning that GitHub must stay opt-in: but a manifest is not something
+   * that happens TO a user, it is the project they deliberately opened, and a
+   * library it names is part of that project. The reference travels with the
+   * project (git / zip / deploy) and needing the network to resolve it is
+   * expected, not a surprise. What the manifest still cannot do is leak into
+   * the user's GLOBAL list: `_persistUrls` persists a GitHub URL only on an
+   * explicit `user` origin, so opening a project never leaves its libraries
+   * behind in the next one.
    */
   async applyProjectLibraries(urls: readonly string[]): Promise<void> {
     const next = [...new Set(urls.filter(u => typeof u === 'string' && u.trim() !== ''))];
@@ -523,11 +540,10 @@ export class LibraryStore {
       // Keep anything the user promoted — only drop pure manifest entries.
       if (this._origins.get(url) === 'projectManifest') this.removeCatalog(url);
     }
-    for (const url of next) {
-      // GitHub stays opt-in even from a manifest — never auto-scan.
-      if (isGitHubCatalogUrl(url)) continue;
-      await this.addCatalog(url, 'projectManifest');
-    }
+    // Started together rather than one after the other: a manifest listing
+    // several catalogs would otherwise pay the sum of their fetches before the
+    // last root appears, and none of them depends on another.
+    await Promise.all(next.map(url => this.addCatalog(url, 'projectManifest')));
   }
 
   // ─── Persistence ──────────────────────────────────────────────────
@@ -537,15 +553,30 @@ export class LibraryStore {
       const urlsJson = localStorage.getItem(LS_KEY_URLS);
       if (!urlsJson) return;
       const urls = (JSON.parse(urlsJson) as string[]).filter(u => u.trim() !== '');
-      for (const url of urls) {
-        // GitHub libraries are opt-in only — never auto-restore a persisted
-        // GitHub catalog (it would re-scan GitHub on every boot without the
-        // user adding it this session). Only an explicit manual add loads it.
-        if (isGitHubCatalogUrl(url)) continue;
+      // Started TOGETHER, not one after the other. `addCatalog` registers its
+      // URL in `_catalogUrls` synchronously and only then awaits the fetch, so
+      // a sequential loop left every not-yet-reached URL absent from the list
+      // for as long as the earlier fetches took — and `_persistUrls` rewrites
+      // the stored list from exactly that live list. One `removeCatalog` (or
+      // any other add) landing in that window therefore wiped every library
+      // that had not been restored yet. Kicking them all off in one pass makes
+      // the list whole before the first `await`, and restores in parallel.
+      await Promise.all(urls.map(async (url) => {
+        // A GitHub catalog is restored ONLY on an EXPLICITLY stored `user`
+        // origin. The `?? 'user'` fallback below does not count: a former
+        // build-default GitHub URL that leaked into a pre-plan-372 storage
+        // list carries no origin at all, and restoring it would re-scan (and
+        // 404 on) GitHub on every boot without the user ever asking — the
+        // failure this rule was written for. A library the user typed into
+        // the Add-Library dialog DOES carry that origin, and it used to be
+        // dropped along with the leaked ones: added, visible, and then gone
+        // on the next reload with nothing said.
+        const storedOrigin = this._origins.get(url);
+        if (isGitHubCatalogUrl(url) && storedOrigin !== 'user') return;
         // Anything that reached the persisted list was a user subscription;
         // a stored origin (written since plan-372) wins over that default.
-        await this.addCatalog(url, this._origins.get(url) ?? 'user');
-      }
+        await this.addCatalog(url, storedOrigin ?? 'user');
+      }));
     } catch { /* ignore */ }
   }
 
@@ -577,16 +608,22 @@ export class LibraryStore {
 
   private _persistUrls(): void {
     try {
-      // Only persist USER-origin URLs (§2.6.3). Bundled/local keys and GitHub
-      // catalogs are excluded as before — GitHub is opt-in per session, and
-      // this also self-heals any former-default GitHub URL that leaked into
-      // storage: the next persist rewrites the list without it.
-      const userUrls = this._catalogUrls.filter(
-        u => u.trim() !== ''
-          && !this._bundledUrls.has(u)
-          && !isGitHubCatalogUrl(u)
-          && isPersistedOrigin(this._origins.get(u) ?? 'user'),
-      );
+      // Only persist USER-origin URLs (§2.6.3). Bundled/local keys are
+      // excluded outright.
+      //
+      // A GitHub catalog is persisted too — but only on an EXPLICIT `user`
+      // origin, never on the `?? 'user'` fallback the other kinds lean on.
+      // That preserves the self-heal this filter was written for: a
+      // former-default GitHub URL that leaked into storage has no recorded
+      // origin, so the next persist still rewrites the list without it. What
+      // it no longer throws away is the case the rule never meant to catch —
+      // a repo the user deliberately typed into the Add-Library dialog.
+      const userUrls = this._catalogUrls.filter((u) => {
+        if (u.trim() === '' || this._bundledUrls.has(u)) return false;
+        const origin = this._origins.get(u);
+        if (isGitHubCatalogUrl(u)) return origin === 'user';
+        return isPersistedOrigin(origin ?? 'user');
+      });
       localStorage.setItem(LS_KEY_URLS, JSON.stringify(userUrls));
 
       // The origin map is persisted for every non-bundled URL, not just the

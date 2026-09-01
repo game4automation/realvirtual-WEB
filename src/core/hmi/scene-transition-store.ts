@@ -63,6 +63,23 @@ let _nextToken: SceneTransitionToken = 1;
 let _snapshot: SceneTransitionSnapshot = { visible: false, label: '' };
 const _listeners = new Set<() => void>();
 
+/**
+ * True while the full-screen branded loading splash (`#loading-overlay`,
+ * owned by main.ts) is on screen. While it is, THIS overlay stays suppressed:
+ * the splash already covers the canvas, which is the only job a destructive
+ * transition needs done — showing "Opening editor…" on top of it is a second
+ * loading indicator over a first one. The moment the splash goes, a still-held
+ * transition surfaces, so the two are SEQUENTIAL rather than stacked.
+ * main.ts reports both edges through {@link setBrandedSplashVisible}.
+ */
+let _splashVisible = false;
+
+export function setBrandedSplashVisible(visible: boolean): void {
+  if (_splashVisible === visible) return;
+  _splashVisible = visible;
+  _publish();
+}
+
 /** When the overlay became visible (for the minimum-display rule). */
 let _visibleSince = 0;
 /** Pending "hide after the minimum display time" timer. */
@@ -77,7 +94,7 @@ let _overlayMounted = false;
 const _paintWaiters: Array<{ version: number; resolve: () => void }> = [];
 
 function _publish(): void {
-  const showing = [..._holders.values()].some((h) => h.showing);
+  const showing = !_splashVisible && [..._holders.values()].some((h) => h.showing);
   const label = [..._holders.values()].reverse().find((h) => h.showing)?.label ?? _snapshot.label;
   if (showing === _snapshot.visible && label === _snapshot.label) return;
   if (showing && !_snapshot.visible) _visibleSince = Date.now();
@@ -214,6 +231,7 @@ export function _resetSceneTransition(): void {
     if (holder.delayTimer) clearTimeout(holder.delayTimer);
   }
   _holders.clear();
+  _splashVisible = false;
   if (_hideTimer) { clearTimeout(_hideTimer); _hideTimer = null; }
   _drainPaintWaiters(Number.MAX_SAFE_INTEGER);
   _snapshot = { visible: false, label: '' };

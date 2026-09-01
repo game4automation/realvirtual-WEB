@@ -52,8 +52,8 @@ import {
 export function remediationFor(message: string): string | null {
   const m = message.toLowerCase();
   if (/memory access out of bounds|out of memory|allocation fail|wasm memory|heap limit/.test(m)) {
-    return 'The in-browser CAD engine ran out of memory — try a lower tessellation quality, '
-      + 'enable "Split assembly", or convert via realvirtual CONNECT.';
+    return 'The in-browser CAD engine ran out of memory — try a lower tessellation quality '
+      + 'or convert via realvirtual CONNECT.';
   }
   if (/unreachable|failed to fetch|networkerror|load failed|timed? ?out/.test(m)) {
     return 'The server could not be reached — check that realvirtual CONNECT is running '

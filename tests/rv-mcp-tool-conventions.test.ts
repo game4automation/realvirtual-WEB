@@ -24,16 +24,23 @@ import { allSchemas } from './helpers/mcp-schemas';
 const DOMAINS = new Set([
   'node', 'component', 'view', 'camera', 'select', 'selection', 'screenshot',
   'drive', 'signal', 'sensor', 'sim', 'transport', 'logic', 'mode',
-  'layout', 'library', 'scene', 'editor', 'des', 'plc',
+  'layout', 'scene', 'editor', 'des', 'plc',
   // plan-394. Deliberately NOT folded into `node`: that domain means structural
   // navigation throughout (find/tree/bounds), and a durable note is not that.
   'knowledge',
-  // plan-716 Phase 5 — `McpProjectTools` joined the shared instance list, and
-  // its two domains came with it. They are genuinely two: a PROJECT decides
-  // what project-relative paths resolve against, a MODEL is what is loaded in
-  // the viewport, and `web_model_list` is THE one document list the older
-  // `web_scene_*` aliases now forward agents to.
-  'model', 'project',
+  // 2026-08-19 rework — asset = document = model, ONE concept. `document` is
+  // the domain for the project's GLB documents (list/open/save/new/update);
+  // `catalog` is the planner's placeable parts catalogue (the former
+  // `web_library_*` pair). The old `model` and `library` domains are gone; a
+  // PROJECT still decides what project-relative paths resolve against, a
+  // DOCUMENT is what is loaded in the viewport.
+  'document', 'catalog', 'project',
+  // plan-437 — `web_link_compose` composes deep-link URLs INTO the viewer. Not
+  // folded into `scene`/`model`: those domains OPEN something, and handing out
+  // an address for it is the opposite direction. A domain rather than a root
+  // tool because the name parses as domain+action anyway and leaves room for
+  // later `web_link_*` tools.
+  'link',
 ]);
 
 /**
@@ -96,7 +103,96 @@ describe('MCP tool conventions', () => {
     // forces, statics, fix) plus `web_editor_test_start` / `_stop`. Counted from
     // the code after the plan-707 merge, not taken from the plan — 705, 706 and
     // 707 all edit this line, and the second one to land must re-count.
-    expect(schemas.length).toBe(137);
+    // 137 → 138 with `web_link_compose` (plan-437 Phase 2).
+    // 138 → 140 with `web_camera_fly` and `web_view_sweep` (plan-705). Counted
+    // from the code, not taken from the plan — the plan was written when this
+    // line still read 111, and 705/706/707 all edit it.
+    // 140 → 143 with plan-713 Phase 2: `web_library_assets`, `web_library_update`
+    // (McpSceneTools) and `web_editor_project_files` (McpEditorTools). Three NEW
+    // tools, unlike the Phase-1 move, which left this line alone on purpose.
+    // 143 → 145 → 143 with plan-713 Phase 3: `web_editor_descend` / `_back` added
+    // (F10), `web_scene_open` / `web_scene_list` retired (F8). Net zero, and the
+    // coincidence is worth stating so nobody reads the unchanged number as "no
+    // Phase-3 change reached the roster".
+    // 143 -> 144 with plan-713 Phase 4: `web_camera_view` (F9).
+    // 144 -> 143 with the 2026-08-19 terminology rework: `web_library_assets`
+    // merged INTO `web_document_list` (one list — asset = document = model);
+    // everything else was a hard rename (model/scene → document, library
+    // catalogue → catalog, web_scene_export → web_layout_export).
+    // 143 -> 145 with the project-tree rework (same day): `web_project_tree`
+    // (navigate folders/documents as the dashboard shows them) and
+    // `web_project_folder` (create/rename/move folders through the dashboard's
+    // own tree verdicts and `applyTreeMove`).
+    // 145 -> 147 with plan-722: `web_editor_list_circles` /
+    // `web_editor_pivot_to_circle` (McpEditorTools). NOT mechanism tools despite
+    // sharing `mechanism-snap.ts` — they belong to the axis-group Kinematic
+    // workflow, which is why they carry no `mechanism` segment and do not move
+    // the roster count in mechanism-mcp-inspect.test.ts.
+    // 147 -> 145 with plan-724: both of those are gone again. The circle
+    // ENUMERATION they were built on is deleted — Pivot to Circle is a hover
+    // now, and a hover has no agent-callable half. `web_editor_mechanism_snap_list`
+    // still returns `circle-center` candidates from the same fit maths, but
+    // cursor-bound: there is no longer a way to list every bore of a path.
+    expect(schemas.length).toBe(145);
+  });
+
+  /**
+   * plan-724 T3 — the retirement itself, not just the arithmetic.
+   *
+   * A count is satisfied by any two tools disappearing, or by two appearing
+   * while two others go. The names have to be asserted, or a later change that
+   * happened to balance out would leave a dead tool announced to agents.
+   */
+  it('the retired circle tools stay gone', () => {
+    const names = schemas.map((s) => s.name);
+    expect(names).not.toContain('web_editor_list_circles');
+    expect(names).not.toContain('web_editor_pivot_to_circle');
+  });
+
+  /**
+   * plan-713 F3 — `destructiveHint` is announced, and only where it is meant.
+   *
+   * The hint's whole value is that it is rare: a client that shows a
+   * confirmation for it must be able to trust that a tool carrying it can
+   * destroy something the caller did not name. If every write carried it the
+   * client would have to ignore it, which is the same as not having it.
+   */
+  describe('destructive classification', () => {
+    const destructive = schemas.filter((s) => s.annotations?.destructiveHint === true);
+
+    it('web_document_update is a destructive write', () => {
+      const t = schemas.find((s) => s.name === 'web_document_update');
+      expect(t, 'web_document_update must exist').toBeTruthy();
+      expect(t!.annotations?.readOnlyHint).toBe(false);
+      expect(t!.annotations?.destructiveHint).toBe(true);
+    });
+
+    it('nothing read-only is marked destructive', () => {
+      const bad = destructive.filter((s) => s.annotations?.readOnlyHint === true).map((s) => s.name);
+      expect(bad, `read-only tools cannot be destructive: ${bad.join(', ')}`).toEqual([]);
+    });
+
+    it('the hint stays rare — every carrier is listed here deliberately', () => {
+      expect(destructive.map((s) => s.name).sort()).toEqual(['web_document_update']);
+    });
+  });
+
+  /**
+   * plan-713 F2, renamed 2026-08-19 — the two listings answer different questions.
+   *
+   * `web_catalog_list` is the placeable PLANNER CATALOGUE (`catalogId` —
+   * templates you can place); `web_document_list` is the project's own GLB
+   * documents. They were a single tool in the plan until the review found the
+   * double semantics, so the separation is pinned here rather than left to the
+   * descriptions.
+   */
+  it('the catalogue listing and the document listing stay distinct', () => {
+    const catalogue = schemas.find((s) => s.name === 'web_catalog_list');
+    const documents = schemas.find((s) => s.name === 'web_document_list');
+    expect(catalogue?.description).toContain('catalogId');
+    expect(documents?.description).toContain('document');
+    expect(Object.keys(documents!.inputSchema.properties)).not.toContain('catalogId');
+    expect(documents!.annotations?.readOnlyHint).toBe(true);
   });
 
   // plan-707 — the instance list is shared now, and the whole point of sharing it
@@ -106,11 +202,14 @@ describe('MCP tool conventions', () => {
     const names = new Set(schemas.map((s) => s.name));
     for (const t of ['web_status', 'web_view_pick', 'web_render', 'web_editor_open',
       'web_signal_bind', 'web_knowledge_set', 'web_describe', 'web_help',
-      // plan-716 Phase 5 — the announced-but-unlinted delegate. `web_model_list`
+      // plan-716 Phase 5 — the announced-but-unlinted delegate. `web_document_list`
       // is THE one document list; leaving it out of this list left it out of
       // the generated reference too, which is where an agent looks for it.
-      'web_model_list', 'web_model_open', 'web_project_list', 'web_project_open',
-      'web_ping']) {
+      'web_document_list', 'web_document_open', 'web_project_list', 'web_project_open',
+      'web_ping',
+      // plan-437 — the link composer. Announced and documented from this one
+      // list like everything else.
+      'web_link_compose']) {
       expect(names.has(t), `${t} must come from the shared allSchemas() list`).toBe(true);
     }
   });
@@ -143,7 +242,10 @@ describe('MCP tool conventions', () => {
         'web_knowledge_get', 'web_knowledge_list',
         // plan-707 F4: web_describe aggregates existing getters and moves
         // neither selection, panels nor camera — unlike web_node_bounds below.
-        'web_describe']) {
+        'web_describe',
+        // plan-437: composing a URL is string work over live getters — it opens
+        // nothing, mints no share and moves no viewport.
+        'web_link_compose']) {
         expect(readOnly.has(n), `${n} must be read-only`).toBe(true);
       }
 
@@ -243,8 +345,40 @@ describe('MCP tool conventions', () => {
     for (const gone of ['web_component_add', 'web_hierarchy', 'web_place', 'web_move',
       'web_remove', 'web_placement_list', 'web_snap_list', 'web_snap_suggest',
       'web_snap_attach', 'web_set_mode', 'web_set_source_markers', 'web_analyze_object',
-      'web_components_by_type', 'web_view_bounds']) {
+      'web_components_by_type', 'web_view_bounds',
+      // plan-713 F8 — the two genuine duplicate pairs. One implementation each,
+      // reachable under a second name that bought nothing but a second thing
+      // for an agent to choose between.
+      'web_scene_open',   // → web_document_open
+      'web_scene_list',   // → web_document_list
+      // 2026-08-19 rework — asset = document = model, hard rename, no aliases.
+      'web_model_list',      // → web_document_list
+      'web_model_open',      // → web_document_open
+      'web_scene_save',      // → web_document_save
+      'web_scene_new',       // → web_document_new
+      'web_scene_export',    // → web_layout_export (it exports the planner snapshot)
+      'web_library_assets',  // merged into web_document_list
+      'web_library_update',  // → web_document_update
+      'web_library_list',    // → web_catalog_list
+      'web_library_describe']) { // → web_catalog_describe
       expect(names.has(gone), `${gone} should be renamed/removed`).toBe(false);
+    }
+  });
+
+  /**
+   * What the retirements replaced the old names WITH must still be there.
+   *
+   * A superseded entry says a name is gone; on its own that is also satisfied by
+   * deleting the capability. Pinning the replacements is what stops a later
+   * cleanup pass from removing a capability in the belief it is removing an
+   * alias.
+   */
+  it('the retired names have live replacements', () => {
+    const names = new Set(schemas.map((s) => s.name));
+    for (const kept of ['web_document_list', 'web_document_open', 'web_document_save',
+      'web_document_new', 'web_document_update', 'web_catalog_list',
+      'web_catalog_describe', 'web_layout_export']) {
+      expect(names.has(kept), `${kept} replaces a retired name and must exist`).toBe(true);
     }
   });
 });

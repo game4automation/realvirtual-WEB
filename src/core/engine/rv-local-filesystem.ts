@@ -78,6 +78,27 @@ export interface WorkFolderMeta {
   lastAccessed: string;   // ISO date
 }
 
+/**
+ * The outcome of a directory pick — four states, not two.
+ *
+ * `selectFolderForKey` used to answer `handle | null`, and that single `null`
+ * meant three different things: the user cancelled, the browser has no
+ * `showDirectoryPicker` at all, or the picker refused to open. Callers can only
+ * treat that as "cancelled", so a Firefox user clicking "Open workspace…" got
+ * no dialog, no message and no clue — the click looked broken. Naming the
+ * reasons is what lets the UI say which one happened.
+ */
+export type FolderPick =
+  /** The user chose a folder; the handle is persisted under the caller's key. */
+  | { kind: 'picked'; dir: FileSystemDirectoryHandle }
+  /** The user dismissed the dialog. The one outcome that is not a problem. */
+  | { kind: 'cancelled' }
+  /** No File System Access API in this browser (Firefox, Safari, old WebViews). */
+  | { kind: 'unsupported' }
+  /** The API exists but declined to open — enterprise policy, or a picker
+   *  that is already active because an earlier one never settled. */
+  | { kind: 'blocked'; reason: string };
+
 // ─── Feature detection ──────────────────────────────────────────────────
 
 export function isSupported(): boolean {
@@ -235,19 +256,46 @@ export async function removeWorkFolder(): Promise<void> {
  * project folder is authored into, so it asks for write up front and the
  * grant survives the reload via {@link getFolderHandle}.
  */
+export async function pickFolderForKey(
+  key: string,
+  pickerId = 'rv-projectfolder',
+): Promise<FolderPick> {
+  if (!isSupported()) return { kind: 'unsupported' };
+  try {
+    const handle = await window.showDirectoryPicker!({ id: pickerId, mode: 'readwrite' });
+    await putHandle(handle, key);
+    return { kind: 'picked', dir: handle };
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      // Chrome overloads AbortError: a dismissed dialog and a picker that is
+      // still open from an earlier call ("File picker already active") arrive
+      // with the same name. Only the message separates them, and only the
+      // second one is worth telling the user about — it survives until reload.
+      return /already active/i.test(e.message)
+        ? { kind: 'blocked', reason: 'A file dialog is already open. Reload the page and try again.' }
+        : { kind: 'cancelled' };
+    }
+    // NotAllowedError (enterprise policy, no user gesture) and SecurityError
+    // (cross-origin frame) are real refusals — reported, never swallowed.
+    if (e instanceof DOMException) return { kind: 'blocked', reason: e.message || e.name };
+    throw e;
+  }
+}
+
+/**
+ * Lenient wrapper over {@link pickFolderForKey}: the handle, or null for every
+ * outcome that produced none.
+ *
+ * Kept for callers that genuinely have nothing to say about the reason. Any
+ * caller attached to a button should use `pickFolderForKey` instead — a button
+ * that does nothing at all is the bug this pair exists to make impossible.
+ */
 export async function selectFolderForKey(
   key: string,
   pickerId = 'rv-projectfolder',
 ): Promise<FileSystemDirectoryHandle | null> {
-  if (!isSupported()) return null;
-  try {
-    const handle = await window.showDirectoryPicker!({ id: pickerId, mode: 'readwrite' });
-    await putHandle(handle, key);
-    return handle;
-  } catch (e: unknown) {
-    if (e instanceof DOMException && e.name === 'AbortError') return null;
-    throw e;
-  }
+  const pick = await pickFolderForKey(key, pickerId);
+  return pick.kind === 'picked' ? pick.dir : null;
 }
 
 /**

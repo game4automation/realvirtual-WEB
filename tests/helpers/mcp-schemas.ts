@@ -2,49 +2,45 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * mcp-schemas — the ONE instance list the MCP tool tests share (plan-707 Phase 3).
+ * mcp-schemas — the schemas the MCP tool tests share (plan-707 Phase 3).
  *
- * It used to live inside `rv-mcp-tool-conventions.test.ts` as a private
- * function. Three tests now need the same schemas (the convention lint, the
- * `web_describe` test and the documentation drift gate), and three private
- * copies of a list that must mirror `McpBridgePlugin._sendDiscover` is exactly
- * how one of them ends up stale.
+ * It used to carry its own copy of the delegate list. Since plan-713 Phase 1
+ * there is only ONE list — `McpBridgePlugin.mcpToolInstances`, backed by
+ * `src/plugins/mcp-bridge/rv-mcp-instances.ts` — and this helper reads it
+ * instead of restating it.
  *
- * **Keep this in step with `mcp-bridge-plugin.ts::_sendDiscover`.** An instance
- * missing here means its tools are announced to agents but linted by nothing —
- * and, since plan-707, documented by nothing either.
- *
- * The plan-707 KNOWN GAP is closed (plan-716 Phase 5): `McpProjectTools` was
- * announced by `_sendDiscover` and absent here, so `web_model_list` — the tool
- * plan-716 §2.7 makes THE one document list, and the one the deprecated
- * `webScene*` aliases now point agents at — appeared in no generated reference
- * and was checked by no lint. The blocker was the domain vocabulary, not the
- * tools: `model` and `project` are two ordinary domains and are now in the
- * whitelist, and `web_ping` is a root-level probe like `web_status`.
+ * That closes the drift class outright rather than one instance of it: the
+ * plan-707 KNOWN GAP (`McpProjectTools` announced but linted by nothing until
+ * plan-716 found it) and the still-open `McpSignalBindTools` omission in
+ * `rv-mcp-bridge.test.ts` were both the same bug — four hand-maintained copies
+ * of a list that has exactly one correct value.
  */
 
-import { generateToolSchemasMulti, type ToolSchema } from '../../src/core/engine/rv-mcp-tools';
+import {
+  generateToolSchemasMulti,
+  type ToolSchema,
+} from '../../src/core/engine/rv-mcp-tools';
 import { McpBridgePlugin } from '../../src/plugins/mcp-bridge-plugin';
-import { McpViewTools } from '../../src/plugins/mcp-bridge/rv-mcp-view-tools';
-import { McpObserveTools } from '../../src/plugins/mcp-bridge/rv-mcp-observe-tools';
-import { McpEditorTools } from '../../src/plugins/mcp-bridge/rv-mcp-editor-tools';
-import { McpHelpTool } from '../../src/plugins/mcp-bridge/rv-mcp-help-tool';
-import { McpSignalBindTools } from '../../src/plugins/mcp-bridge/rv-mcp-signal-bind-tools';
-import { McpKnowledgeTools } from '../../src/plugins/mcp-bridge/rv-mcp-knowledge-tools';
-import { McpDescribeTool } from '../../src/plugins/mcp-bridge/rv-mcp-describe-tool';
-import { McpProjectTools } from '../../src/plugins/mcp-bridge/rv-mcp-project-tools';
 
-/** Merged schemas of every linted delegate instance. */
+/**
+ * Every decorated instance whose tools are announced — read from the plugin, so
+ * this can never disagree with what `_sendDiscover` sends.
+ */
+export function allInstances(): readonly object[] {
+  return new McpBridgePlugin().mcpToolInstances;
+}
+
+/** Tools contributed per delegate class — the attributable half of the plan-713 baseline. */
+export function delegateCensus(): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const instance of allInstances()) {
+    const name = instance.constructor.name;
+    out[name] = (out[name] ?? 0) + generateToolSchemasMulti([instance]).length;
+  }
+  return out;
+}
+
+/** Merged schemas of every announced delegate instance. */
 export function allSchemas(): ToolSchema[] {
-  return generateToolSchemasMulti([
-    new McpBridgePlugin(),
-    new McpViewTools(() => undefined),
-    new McpObserveTools(() => undefined),
-    new McpEditorTools(() => undefined),
-    new McpSignalBindTools(() => undefined),
-    new McpKnowledgeTools(() => undefined),
-    new McpDescribeTool(() => undefined),
-    new McpProjectTools(() => undefined),
-    new McpHelpTool(),
-  ]);
+  return generateToolSchemasMulti(allInstances());
 }

@@ -2,8 +2,8 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * FileDropZone / PartSourceLinks — the "I just downloaded a part from a
- * catalog" path in the Unified Import Dialog.
+ * FileDropZone — the "I just downloaded a part from a catalog" path in the
+ * Unified Import Dialog.
  *
  * What these tests pin is the behaviour that would quietly rot:
  *
@@ -14,15 +14,17 @@
  *    element fires its own dragenter/dragleave pair, so a boolean flickers as
  *    the pointer crosses the inner text. The nested-enter test is the
  *    regression guard for that.
- *  - **The catalog pointers are plain outbound links.** realvirtual never
- *    talks to a catalog server; anything closer needs a written agreement with
- *    that catalog. A test on `href`/`target`/`rel` is what makes a later
- *    "let's just fetch it for the user" change visible in review.
+ *
+ * The `PartSourceLinks` suite that used to live here is GONE with the
+ * component (plan-444 F1, LOP-124): the import tabs no longer point at
+ * 3Dfindit / TraceParts at all. The export test below is what keeps the
+ * removal from being undone by a merge.
  */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
-import { FileDropZone, PartSourceLinks, matchesAccept } from '../src/plugins/unified-import/import-ui';
+import * as importUi from '../src/plugins/unified-import/import-ui';
+import { FileDropZone, matchesAccept } from '../src/plugins/unified-import/import-ui';
 
 afterEach(() => cleanup());
 
@@ -133,16 +135,8 @@ describe('FileDropZone', () => {
   });
 });
 
-describe('PartSourceLinks', () => {
-  it('links out to the catalogs and never fetches from them', () => {
-    render(<PartSourceLinks />);
-    for (const [name, host] of [['3Dfindit', '3dfindit.com'], ['TraceParts', 'traceparts.com']]) {
-      const link = screen.getByText(name).closest('a') as HTMLAnchorElement;
-      // Site root only: a deep link into their content is exactly what their
-      // terms of use reserve for written agreements.
-      expect(link.getAttribute('href')).toBe(`https://www.${host}/`);
-      expect(link.getAttribute('target')).toBe('_blank');
-      expect(link.getAttribute('rel')).toContain('noopener');
-    }
+describe('catalog links (removed, plan-444 F1)', () => {
+  it('exports no PartSourceLinks component any more', () => {
+    expect('PartSourceLinks' in importUi).toBe(false);
   });
 });

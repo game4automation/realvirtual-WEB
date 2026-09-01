@@ -182,7 +182,10 @@ function prefixRange(prefix: string): IDBKeyRange {
  * keeps the migration lossless without pretending bytes can become ops.
  */
 export type RvDraftBase =
-  | { kind: 'empty' }
+  // `{ kind: 'empty' }` was removed by plan-719 F3, exactly as in the twin —
+  // see `AssetDraftBase` for why a base meaning "this exists only in memory"
+  // has nothing left to describe. Persisted records are recovered through
+  // `migrateLegacyEmptyDraft`.
   /**
    * A GLB DOCUMENT the user owns. Field-identical twin of `AssetDraftBase`'s
    * variant of the same name — see there for what collapsed into it (plan-716
@@ -479,12 +482,25 @@ export async function clearDocumentDraft(frame: RvDraftFrameKey): Promise<void> 
 
 async function readRange(range: IDBKeyRange | null): Promise<RvDocumentDraft[]> {
   let db: IDBDatabase | null = null;
+  const perfT0 = performance.now(); // TEMP open-perf instrumentation
   try {
     db = await openDraftDb();
+    const perfOpenMs = performance.now() - perfT0; // TEMP open-perf
     const tx = db.transaction(DRAFT_STORE_FRAMES, 'readonly');
     const all = await idbRequest<RvDocumentDraft[]>(
       tx.objectStore(DRAFT_STORE_FRAMES).getAll(range) as IDBRequest<RvDocumentDraft[]>,
     );
+    // TEMP open-perf instrumentation — splits the DB open from the read, so a
+    // slow scan can be told apart from a stalled/queued connection. `ops` is
+    // the only bulky field in a record; its total count is what makes the
+    // structured-clone deserialization expensive, so report it.
+    debug('perf', '[open-perf] readRange', {
+      openMs: Math.round(perfOpenMs),
+      readMs: Math.round(performance.now() - perfT0 - perfOpenMs),
+      records: all?.length ?? 0,
+      ops: (all ?? []).reduce((n, d) => n + (d.ops?.length ?? 0), 0),
+      scan: range === null ? 'all' : 'prefix',
+    });
     return all ?? [];
   } catch (e) {
     console.warn('[rv-document-drafts] draft list failed:', e);

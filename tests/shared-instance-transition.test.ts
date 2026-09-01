@@ -15,6 +15,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -200,7 +201,7 @@ describe('ungleiches Dokument: Koexistenz unveraendert', () => {
     const sceneOps = store.document.opCount;
 
     const asset = makeAssetViewer();
-    const doc = AssetDocument.newUntitled(asset.viewer);
+    const doc = scratchAssetDocument(asset.viewer);
     doc.setField(asset.boxPath, 'Drive', 'TargetSpeed', 999, 50);
     await doc.whenIdle();
 
@@ -257,6 +258,50 @@ describe('ungleiches Dokument: Koexistenz unveraendert', () => {
   });
 });
 
+// ─── The handback race (dashboard double-click during recompose) ────────
+
+describe('Handback nach Dokumentwechsel: adoptiert NICHT (stale recompose)', () => {
+  it('release() with authored bytes adopts them only for the document it was bound to', async () => {
+    const viewer = makeSceneViewer();
+    const store = new SceneStore(viewer);
+    await store.openBuiltin('/models/Demo.glb', 'Demo');
+
+    const handover = store.beginProjectionHandover();
+    expect(handover).not.toBeNull();
+
+    // The race: while the editor's async export runs, a dashboard double-click
+    // opens ANOTHER document. The workspace has moved on by the time the
+    // handback releases.
+    await store.openBuiltin('/models/Other.glb', 'Other');
+
+    const adopt = vi.spyOn(store, 'adoptProjectedBaseBytes');
+    handover!.release({ authoredBytes: new ArrayBuffer(8) });
+
+    // The old document's authored tree must NOT become the new document's
+    // bake source — that was the "new name, old content" defect.
+    expect(adopt).not.toHaveBeenCalled();
+    expect(store.projectionSuspended).toBe(false);
+    store.dispose();
+  });
+
+  it('release() with authored bytes still adopts them when nothing changed', async () => {
+    const viewer = makeSceneViewer();
+    const store = new SceneStore(viewer);
+    await store.openBuiltin('/models/Demo.glb', 'Demo');
+
+    const handover = store.beginProjectionHandover();
+    expect(handover).not.toBeNull();
+
+    const adopt = vi.spyOn(store, 'adoptProjectedBaseBytes');
+    handover!.release({ authoredBytes: new ArrayBuffer(8) });
+
+    // The guard must never dull the normal way back: same document, adopted.
+    expect(adopt).toHaveBeenCalledTimes(1);
+    expect(store.projectionSuspended).toBe(false);
+    store.dispose();
+  });
+});
+
 // ─── Discard (§9.8) ─────────────────────────────────────────────────────
 
 describe('Discard am gebundenen Dokument (R1-S1)', () => {
@@ -301,7 +346,7 @@ describe('Discard am gebundenen Dokument (R1-S1)', () => {
 
   it('is a no-op at an unbound document, which discards by dying instead', async () => {
     const asset = makeAssetViewer();
-    const doc = AssetDocument.newUntitled(asset.viewer);
+    const doc = scratchAssetDocument(asset.viewer);
     doc.setField(asset.boxPath, 'Drive', 'TargetSpeed', 999, 50);
     await doc.whenIdle();
     expect(await doc.discardBoundEdits()).toBe(0);

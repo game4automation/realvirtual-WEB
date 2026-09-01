@@ -139,6 +139,34 @@ describe('DocumentCard save button', () => {
     }
   });
 
+  it('is BLUE only when a click would do something (2026-08-19)', () => {
+    // Active = contained/primary: unsaved changes, a save in flight, or the
+    // read-only copy. A clean in-place save is a no-op and renders muted —
+    // still enabled and in the keyboard order (§3.1), never removed.
+    const active = [
+      makeView({ dirty: true }),
+      makeView({ busy: true }),
+      makeView({ saveVerb: 'save-into-project', dirty: false }),
+    ];
+    for (const view of active) {
+      const r = mount(view);
+      expect(screen.getByTestId('document-card-save').className)
+        .toContain('MuiButton-contained');
+      r.unmount();
+    }
+    const muted = [
+      makeView({ dirty: false }),
+      makeView({ saveVerb: 'blocked', saveReason: 'The open project is read-only.' }),
+    ];
+    for (const view of muted) {
+      const r = mount(view);
+      const button = screen.getByTestId('document-card-save') as HTMLButtonElement;
+      expect(button.className).toContain('MuiButton-outlined');
+      expect(button.disabled).toBe(false);
+      r.unmount();
+    }
+  });
+
   it('announces the copy BEFORE the click when the source is read-only', () => {
     mount(makeView({ saveVerb: 'save-into-project' }));
     expect(screen.getByTestId('document-card-save').textContent).toBe('Save into project');

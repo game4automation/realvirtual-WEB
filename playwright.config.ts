@@ -3,12 +3,18 @@
 
 import { defineConfig, devices } from 'playwright/test';
 
+// Override with RV_E2E_PORT when 5177 is taken — e.g. a vitest browser runner
+// from a parallel worktree session on the same machine grabs 5177, and
+// `reuseExistingServer` would then "reuse" a server that serves
+// vitest-instrumented modules (boot dies on `__vitest_browser_runner__`).
+const E2E_PORT = Number(process.env.RV_E2E_PORT ?? 5177);
+
 export default defineConfig({
   testDir: './e2e',
   timeout: 60_000,
   retries: 0,
   use: {
-    baseURL: 'http://localhost:5177',
+    baseURL: `http://localhost:${E2E_PORT}`,
     headless: true,
     viewport: { width: 1280, height: 720 },
   },
@@ -29,8 +35,8 @@ export default defineConfig({
   ],
   webServer: [
     {
-      command: 'npm run dev -- --port 5177',
-      port: 5177,
+      command: `npm run dev -- --port ${E2E_PORT}`,
+      port: E2E_PORT,
       reuseExistingServer: true,
       timeout: 30_000,
     },

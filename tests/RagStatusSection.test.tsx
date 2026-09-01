@@ -37,6 +37,7 @@ function snap(state: ConnectSnapshot['state'], rag?: RagStatus): ConnectSnapshot
     discoveryLoading: false,
     updateSupported: false,
     updateReason: null,
+    revealSupported: false,
     rag,
   };
 }

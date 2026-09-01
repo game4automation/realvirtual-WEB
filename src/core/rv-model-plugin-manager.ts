@@ -78,10 +78,21 @@ export function resolveModelName(url: string): string {
 
 // Vite resolves these globs at build time and code-splits each match.
 // Public model plugins (in the main project)
-const pluginModuleImporters = import.meta.glob<ModelPluginModule>([
-  '/src/plugins/models/*/index.ts',
-  '/src/plugins/models/*/index.tsx',
-], { eager: false });
+//
+// MUST be gated behind __RV_EMBED__, for the same reason the private glob below
+// is gated behind __RV_HAS_PRIVATE__: the glob is lazy, so every model plugin
+// becomes its own async chunk that is EMITTED even when nothing ever fetches it.
+// The embed build never loads a model plugin, but two of them (DemoRealvirtualWeb,
+// DemoProcessIndustry) pull FpvPlugin, which is a React component — so React landed
+// in dist-embed and broke the plan-326 AP1 guard "no React anywhere in the output"
+// (found 2026-08-30). The dead branch and every chunk behind it is eliminated by Rollup.
+const pluginModuleImporters: Record<string, () => Promise<ModelPluginModule>> =
+  __RV_EMBED__
+    ? {}
+    : import.meta.glob<ModelPluginModule>([
+        '/src/plugins/models/*/index.ts',
+        '/src/plugins/models/*/index.tsx',
+      ], { eager: false });
 
 // Private project plugin modules
 // Glob paths in Vite are relative to the importing file's location (src/core/).

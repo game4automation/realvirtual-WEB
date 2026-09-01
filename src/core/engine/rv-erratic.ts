@@ -81,6 +81,19 @@ export class RVErraticDriver implements IDriveBehavior, RVComponent {
       this.Speed = drive.TargetSpeed;
     }
 
+    // Validation: a target range outside the drive's travel limits can never be
+    // reached — the drive clamps at the limit, the tolerance check (0.01) never
+    // fires, and the behavior deadlocks waiting for a position that cannot
+    // exist. Targets are clamped at pick time (see update()); warn so the
+    // author fixes the range at the source.
+    if (drive.UseLimits && (this.MinPos < drive.LowerLimit || this.MaxPos > drive.UpperLimit)) {
+      console.warn(
+        `[Drive_ErraticPosition] "${drive.name}": MinPos/MaxPos (${this.MinPos}…${this.MaxPos}) ` +
+        `exceed the drive limits (${drive.LowerLimit}…${drive.UpperLimit}) — ` +
+        'targets are clamped to the limits',
+      );
+    }
+
     // SignalEnable is already resolved to a string address (or null) by resolveComponentRefs()
     if (this.SignalEnable) {
       this.signalStore = context.signalStore;
@@ -103,6 +116,15 @@ export class RVErraticDriver implements IDriveBehavior, RVComponent {
     return this.signalStore.getBoolByPath(this.SignalEnable);
   }
 
+  /** Clamp a target position into the drive's travel limits. A target outside
+   *  them is unreachable (the drive clamps at the limit, `destPos` is never
+   *  reached within tolerance) and would deadlock the behavior forever. */
+  private clampToDriveLimits(value: number): number {
+    const drive = this.drive;
+    if (!drive || !drive.UseLimits) return value;
+    return Math.min(Math.max(value, drive.LowerLimit), drive.UpperLimit);
+  }
+
   /** Call every fixed timestep - picks targets and checks arrival */
   update(_dt: number) {
     // Guard: drive must be resolved by init()
@@ -111,26 +133,27 @@ export class RVErraticDriver implements IDriveBehavior, RVComponent {
     // Skip if drive is in positionOverwrite mode (controlled by recording)
     if (this.drive.positionOverwrite) return;
 
-    // Handle SignalEnable: when disabled, return to zero and stop
+    // Handle SignalEnable: when disabled, return to zero and stop.
+    // Zero is clamped too — with limits like 10…40 a bare 0 is unreachable.
     if (!this.isEnabled) {
-      if (Math.abs(this.drive.currentPosition) > this.tolerance && !this.movingToZero) {
+      const zeroPos = this.clampToDriveLimits(0);
+      if (Math.abs(this.drive.currentPosition - zeroPos) > this.tolerance && !this.movingToZero) {
         // Start moving back to zero
         this.drive.stop();
         this.driving = false;
         this.movingToZero = true;
-        this.drive.targetPosition = 0;
         this.drive.targetSpeed = this.Speed;
-        this.drive.startMove(0);
+        this.drive.startMove(zeroPos);
         return;
       }
 
       if (this.movingToZero) {
         // Check if reached zero
-        if (Math.abs(this.drive.currentPosition) <= this.tolerance) {
+        if (Math.abs(this.drive.currentPosition - zeroPos) <= this.tolerance) {
           this.movingToZero = false;
           this.driving = false;
           this.drive.stop();
-          this.drive.currentPosition = 0;
+          this.drive.currentPosition = zeroPos;
           this.drive.applyToNode();
         }
         return;
@@ -147,20 +170,24 @@ export class RVErraticDriver implements IDriveBehavior, RVComponent {
       this.drive.stop();
     }
 
-    // Pick new target when not driving
+    // Pick new target when not driving. The effective range is the authored
+    // MinPos/MaxPos clamped into the drive limits — an unclamped target outside
+    // them is unreachable and parks the axis forever (see clampToDriveLimits).
     if (!this.driving) {
       this.drive.targetSpeed = this.Speed;
+      const min = this.clampToDriveLimits(this.MinPos);
+      const max = this.clampToDriveLimits(this.MaxPos);
 
       if (!this.IterateBetweenMaxAndMin) {
         // Random position between min and max
-        this.drive.targetPosition =
-          this.MinPos + Math.random() * (this.MaxPos - this.MinPos);
+        this.drive.targetPosition = min + Math.random() * (max - min);
       } else {
-        // Toggle between min and max
-        if (Math.abs(this.drive.currentPosition - this.MaxPos) <= this.tolerance) {
-          this.drive.targetPosition = this.MinPos;
+        // Toggle between min and max (compared against the CLAMPED max — the
+        // authored MaxPos may sit outside the limits and is then never reached)
+        if (Math.abs(this.drive.currentPosition - max) <= this.tolerance) {
+          this.drive.targetPosition = min;
         } else {
-          this.drive.targetPosition = this.MaxPos;
+          this.drive.targetPosition = max;
         }
       }
 

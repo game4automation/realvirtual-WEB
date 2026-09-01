@@ -156,9 +156,32 @@ export const EDITOR_FEEDBACK: Record<string, FeedbackSpec> = {
   web_editor_import_glb: { paths: importRootPaths, frame: true, panel: 'kinematics' },
   web_editor_import_cad: { paths: importRootPaths, frame: true, panel: 'kinematics' },
 
+  // ─── Scene domains (plan-713 Phase 3) ────────────────────────────────
+  //
+  // Same table, same mechanism, no new machinery — which is the whole point of
+  // extending it rather than writing a planner equivalent. `applyEditorFeedback`
+  // was never editor-gated: it resolves paths through `viewer.registry` and
+  // no-ops when they do not resolve, so an entry is simply inert in a mode where
+  // its tool cannot be called.
+  //
+  // What these entries do NOT get is `panel`. The two panels the table knows
+  // (`kinematics`, `materials`) are the asset editor's right dock; opening one
+  // from planner mode would be feedback pointing at a surface that is not there.
+  //
+  // The layout verbs are absent for a concrete reason rather than an oversight:
+  // `web_layout_place` / `_move` / `_snap_attach` answer with a PLACEMENT id,
+  // not a node path, and every extractor here resolves through the node
+  // registry. Selecting and framing a placement needs a placement→path
+  // resolution the planner does not currently expose; adding a half-working
+  // extractor that silently returns nothing would look like feedback and be
+  // none.
+  web_component_set: { panel: undefined },
+
   // Deliberately absent: web_editor_verify_drive (own choreography),
   // open/close/status/save/undo/redo/shortcut/list_kinematics (no spatial target
-  // or they manage selection themselves).
+  // or they manage selection themselves), web_editor_descend / _back (they
+  // REPLACE the document and the stack drives its own isolation and camera —
+  // selecting or framing afterwards would fight it).
 };
 
 // ─── Camera framing (anti-spam) ─────────────────────────────────────────

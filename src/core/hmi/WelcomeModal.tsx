@@ -10,6 +10,11 @@ import GridViewOutlinedIcon from '@mui/icons-material/GridViewOutlined';
 import { setWelcomeModalOpen } from './welcome-modal-store';
 import { useCustomBranding } from './branding-store';
 import { formatVersionFull } from '../rv-version';
+import { getProjectStore } from '../project/project-store';
+import { DEMO_PROJECT_SLUG } from '../project/backends/bundled-backend';
+import { documentsInSection, findStartDocument, stableDocumentId } from '../project/rv-project-documents';
+import { projectStartDocument } from '../project/rv-project-open';
+import type { RvProject } from '../project/rv-project-types';
 
 /** Primary use cases, shown as a compact list. */
 const USE_CASES: Array<[string, string]> = [
@@ -20,9 +25,90 @@ const USE_CASES: Array<[string, string]> = [
   ['Training', 'safe, interactive learning environments'],
 ];
 
-/** Deep links to the two built-in demos (resolved against the deploy base path). */
-const HMI_DEMO_HREF = `${import.meta.env.BASE_URL}?model=DemoRealvirtualWeb.glb`;
-const PLANNER_DEMO_HREF = `${import.meta.env.BASE_URL}?scene=published:DemoPlanner&mode=planner`;
+/**
+ * Deep links to the two built-in demos, addressed as DOCUMENTS of the demo
+ * project (plan-726 Phase 5).
+ *
+ * Both buttons used to carry a filename literal each — `?model=…glb` and
+ * `?scene=published:…` — which made this file two of the seven independent
+ * definitions of "the demo model". They now resolve against the active
+ * project's own manifest, so renaming or replacing a demo document changes one
+ * file (`public/project.json`) instead of seven.
+ *
+ * `?doc=<id>` is the app's own canonical document address, and the ids the
+ * manifest carries are `stableDocumentId(path)` — the same ids
+ * `openDocument()` writes into the address bar. A link built here is therefore
+ * indistinguishable from one the user copied out of their own URL bar.
+ *
+ * The fallbacks are not decoration: this modal can be shown before a project
+ * resolves, and then there is no document list to pick an id from. What they
+ * must NOT be is a second definition of "the demo model" — that was the whole
+ * point of routing these buttons through the manifest.
+ *
+ * So the HMI fallback names the PROJECT, not a file: `?project=demorealvirtual`
+ * (the `DEMO_PROJECT_SLUG` route, plan-726 F7). An href is a navigation target,
+ * not a render-time answer — following it reloads the app, and resolution then
+ * runs normally and picks the project's own start document from the manifest.
+ * The race this fallback covers therefore costs nothing: the link is as correct
+ * as the `?doc=` one, just resolved a moment later.
+ *
+ * Since plan-735 `readManifest()` DOES return null — a deploy root without a
+ * readable `project.json` has no project, and none is invented. That does not
+ * weaken this fallback: the slug is a NAVIGATION target, and following it on a
+ * deploy with no manifest lands on the same "no project here" answer the boot
+ * would have given anyway, named rather than silent. What it does mean is that
+ * the fallback is no longer a guarantee that *something* opens — it is a
+ * guarantee that the link is correct wherever a project exists at all.
+ *
+ * The planner fallback used to carry the literal `?scene=published:DemoPlanner`
+ * — the last hard-coded address in the second identity space plan-731 melted
+ * down, and the first click of a community visitor. A project reference cannot
+ * replace it (that addresses the START document, and this button deliberately
+ * opens a DIFFERENT one), so it names the same document the manifest row does,
+ * by the same derivation: `stableDocumentId(<path>)`.
+ *
+ * That is not a second definition sneaking back in. `stableDocumentId` is a pure
+ * function of the path, and it is what MINTED the id sitting in
+ * `public/project.json` — the fallback and the manifest cannot drift, because
+ * one computes what the other stores. The path literal is the only input, and
+ * `DEMO_PLANNER_PATH` is where it is spelled once.
+ */
+
+/**
+ * Path of the planner demo document, relative to the deploy root — the sole
+ * input of the planner fallback link. Matches the `documents[]` row in
+ * `public/project.json`.
+ */
+const DEMO_PLANNER_PATH = 'DemoPlanner.glb';
+function demoHref(
+  pick: (project: RvProject | null) => { id: string } | null | undefined,
+  fallback: string,
+  extraParams = '',
+): string {
+  const base = import.meta.env.BASE_URL;
+  const doc = pick(getProjectStore().getProject());
+  return doc
+    ? `${base}?doc=${encodeURIComponent(doc.id)}${extraParams}`
+    : `${base}${fallback}`;
+}
+
+/** The HMI demo: the project's own start document. */
+function hmiDemoHref(): string {
+  return demoHref(
+    project => findStartDocument(project, projectStartDocument(project))
+      ?? documentsInSection(project, 'models')[0],
+    `?project=${DEMO_PROJECT_SLUG}`,
+  );
+}
+
+/** The planner demo: the project's first scene document, opened in planner mode. */
+function plannerDemoHref(): string {
+  return demoHref(
+    project => documentsInSection(project, 'scenes')[0],
+    `?doc=${encodeURIComponent(stableDocumentId(DEMO_PLANNER_PATH))}&mode=planner`,
+    '&mode=planner',
+  );
+}
 
 // ─── License / beta acceptance ────────────────────────────────────────────
 //
@@ -177,7 +263,7 @@ export function WelcomeModal({ open, onClose, onStartDemo }: WelcomeModalProps) 
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
               <Button
                 component="a"
-                href={HMI_DEMO_HREF}
+                href={hmiDemoHref()}
                 variant="outlined"
                 size="small"
                 startIcon={<ViewQuiltOutlinedIcon />}
@@ -193,7 +279,7 @@ export function WelcomeModal({ open, onClose, onStartDemo }: WelcomeModalProps) 
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
               <Button
                 component="a"
-                href={PLANNER_DEMO_HREF}
+                href={plannerDemoHref()}
                 variant="outlined"
                 size="small"
                 startIcon={<GridViewOutlinedIcon />}

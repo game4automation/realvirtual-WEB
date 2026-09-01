@@ -18,6 +18,7 @@
  * carrying a REAL InstancePickIndex (pattern: rv-asset-create-reparent.test.ts).
  */
 import { describe, it, expect } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import {
   BoxGeometry, BufferGeometry, Group, Mesh, MeshBasicMaterial, Raycaster, Scene, Vector3,
 } from 'three';
@@ -98,7 +99,7 @@ function setup() {
   ctx.model.updateMatrixWorld(true);
   ctx.register();
   ctx.index.addSubtree(ctx.model);
-  const doc = AssetDocument.newUntitled(ctx.viewer);
+  const doc = scratchAssetDocument(ctx.viewer);
   return { ...ctx, a, b, doc };
 }
 
@@ -165,7 +166,7 @@ describe('editor pick-index maintenance (ops → index)', () => {
     ctx.model.updateMatrixWorld(true);
     ctx.register();
     ctx.index.addSubtree(ctx.model);
-    const doc = AssetDocument.newUntitled(ctx.viewer);
+    const doc = scratchAssetDocument(ctx.viewer);
 
     expect(pick(ctx.index, 0)).toBe('Asset/Gearbox/Shaft'); // per-part
 

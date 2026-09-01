@@ -32,9 +32,14 @@ LocalFolderTest/
 # Oversized AASX asset (exceeds GitHub 100 MB limit)
 public/aasx/26_SEW_KA47-DRN90M4.aasx
 
-# Test / dev demo models are tracked via Git LFS since plan-360 — the test
-# suites need them in every worktree. They stay excluded from the public deploy
-# by the model allowlist (only DemoRealvirtual* + the library ship publicly).
+# plan-360's decision that test/dev models are tracked here via Git LFS is
+# SUPERSEDED by plan-395 and the comment that stated it is gone, because it was
+# the wrong thing to read next: its reasoning was that browser tests break hard
+# when a fixture is missing and cannot skip. They can - measured, and the whole
+# mechanism is in tests/fixtures/dev-asset-available.ts. Every internal model
+# and fixture now lives in the private sibling's projects/Development/ and is
+# served over /private-assets/. Nothing internal is tracked here at all any
+# more, so there is no allowlist left to rely on for keeping it out of a deploy.
 
 # Private customer models — canonical location is
 # ../realvirtual-WebViewer-Private~/projects/<name>/models/ (served via
@@ -49,24 +54,39 @@ public/models/Toray.glb
 public/models/.condensed-cache/
 public/models/library/.thumbnails/
 
-# Local CAD import experiments (Jul 2026, ~144 MB). Scratch files from a
-# side-cutter import session — not library content. Kept out of the repo for
-# size and because customer-derived geometry belongs in
-# ../realvirtual-WebViewer-Private~/projects/<name>/models/, never here.
-public/models/library/Custom/SideCuttingMachine.glb
-public/models/library/Custom/sidecutterv1.glb
-public/models/library/Custom/testsidecut.glb
-public/models/library/Custom/sstest.glb
-public/models/library/Custom/dddd.glb
-public/models/library/Custom/Side Cutting.glb
-
-# Kinematics import session (Jul 2026, ~216 MB). Same reason as above: customer
-# geometry, and far past GitHub's 100 MB per-file limit.
-public/models/library/Custom/P1002_M46_Deckelhandling_Kinematik.glb
+# CAD landing zones — ignored as FOLDERS, not filenames (2026-08-28). The old
+# filename deny-list let 103 MB of customer/scratch geometry into the public
+# mirror under names nobody had predicted (testfork.glb, ff.glb, …). These two
+# folders are defined by their purpose — everything a CAD/import session drops
+# lands here — so nothing in them is ever repo content. Customer-derived
+# geometry belongs in ../realvirtual-WebViewer-Private~/projects/<name>/models/;
+# the NDA models kept locally in these folders stay under Plastic control
+# (<WS>\ignore.conf), never git.
+# plan-395 emptied both of these: Custom/ moved into the private Development
+# project, imports/ was deleted outright (an import landing zone is transient by
+# definition). The rules STAY - they are what stops the next import session from
+# refilling a folder that no longer has any business existing here.
+public/models/library/Custom/
+public/models/library/imports/
 public/_tmp/
 public/models/D5347024_1-matrices.glb
+
+# impeccable design-tool state (critiques, live-injection config, hook cache).
+# Local working state of the design skill — its critiques are internal review
+# material and must never reach the public mirror. The Vite plugin
+# rv-strip-impeccable-live + the bunny-lib check guard the BUILD; this line
+# guards the REPO.
+.impeccable/
+
+# Stray tool logs at the repo root (e.g. vite.omniverse-debug.*.log).
+/*.log
 
 # Vitest browser failure screenshots - auto-generated on every red test run,
 # never read back by anything (no toMatchScreenshot in the repo). Untracked
 # on purpose; the previously committed ones were removed 2026-08-11.
 tests/**/__screenshots__/
+
+# plan-395 gate artefacts: the vitest JSON reports the two dev-asset gates are
+# computed from, plus their logs. Regenerated per run, never source.
+.rv-395-*.json
+.rv-395-*.log

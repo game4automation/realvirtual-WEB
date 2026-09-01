@@ -149,7 +149,19 @@ npm install
 npm run dev          # Vite dev server with HMR
 ```
 
-Drop `.glb` files into `public/models/` — they appear automatically in the model selector.
+Drop `.glb` files into `public/models/` and they appear in the dev model
+selector - but that folder is **only for models that ship**. There are three
+places, and the difference is not cosmetic:
+
+| Place | What lives there |
+|---|---|
+| `public/models/` | **What is delivered.** Only the demo models `public/project.json` declares. Enforced by the `publicModels_OnlyShippedDemos` guard test. |
+| `public/library/` | The delivered standard library (`PalletHandling` + `catalog.json`). |
+| `../realvirtual-WebViewer-Private~/projects/Development/` | **Everything internal** - test fixtures, internal reference models, the custom library, and `scratch/` for experiments. Never delivered, never published. |
+
+Put an experiment in `scratch/`. `public/models/` used to be where everything
+landed, for the simple reason that there was nowhere else; the Development
+project is that somewhere else (plan-395).
 
 ```bash
 npm run build        # Production build → dist/
@@ -204,7 +216,7 @@ DES *analyses material flow through* it, Planner *composes other assets into* it
 Commissioning *connects it to your plant*, Editor *authors its own content*.
 
 Switch modes via the dropdown or the `?mode=viewer|hmi|des|planner|commissioning|editor` URL parameter, so a
-shared link can boot directly into a workspace (e.g. `?scene=published:MyLayout&mode=planner`).
+shared link can boot directly into a workspace (e.g. `?doc=<documentId>&mode=planner`).
 A locked-down deployment can pin a single mode (the dropdown then hides).
 
 Inside an **iframe** the mode switcher additionally disappears: embedding a viewer in a foreign
@@ -291,7 +303,7 @@ The drag sequence (all files in `src/plugins/layout-planner/`):
 
 | Step | What happens |
 |---|---|
-| **Hover** a library card | After an 80 ms intent delay (`PREFETCH_INTENT_MS`, `LayoutLibraryPanel.tsx`) the card calls `ModelCache.prefetch(url)`. `pointerdown` fires it immediately — touch has no hover. Virtual/DES and splat entries are skipped: they never take this path. |
+| **Hover** a library card | After an 80 ms intent delay (`PREFETCH_INTENT_MS`, `LayoutLibraryPanel.tsx`) the card warms its geometry — `ModelCache.prefetch(url)` for a catalog entry, `prefetchEntry` → `prefetchResolved(cacheKey, …)` for a project document. `pointerdown` fires it immediately — touch has no hover. Virtual/DES and splat entries are skipped: they never take this path. |
 | **`dragstart`** | `_startGlbDraft` builds a catalog-sized wireframe box with an optional thumbnail billboard (`placeholder-node.ts`, well under a millisecond) and registers it as a real placement in **`light`** mode. `_moveDraft` therefore works from the very first pointer frame. |
 | **`drop`** | `_commitDraft` records the store entry and the `addPlacement` undo op immediately. The gesture never blocks, and the user can start the next drag. |
 | **decode lands** | `swapPlacedGeometry` (`scene-mutations.ts`) replaces the placeholder's **children** under the same root and re-registers the placement in **`full`** mode. |
@@ -341,6 +353,54 @@ rolled back.
 See [doc-lifecycle.md](doc-lifecycle.md) §3.4 for the swap order and the
 cancellation paths, and [doc-layout-planner.md](doc-layout-planner.md) for
 pivot, snap and library semantics.
+
+### The Planner's Library window
+
+The dropdown is fed from the **library source registry**
+(`core/library/library-source-registry.ts`) — the same list the Projects
+dashboard reads — and not from `LibraryStore.catalogUrls`. That is what puts the
+**active project first, and makes it the default selection**: a project *is* a
+library, and since plan-716 every document it owns (`scenes/`, `models/`,
+`library/`) is one placeable kind, filtered by the existing folder chips rather
+than by which folder it sits in.
+
+| Source | Where the tab comes from | Tab id |
+|---|---|---|
+| Active project (or a bundled deploy) | registry provider `project` | `project:<projectId>` |
+| Subscribed catalogs (URL / GitHub / bundled) | registry provider `global`, itself a bridge over `LibraryStore` | `global:<url>` |
+| Asset Manager connections | `plugin.cloudStore` — the registry's `unity-asset-manager` provider is filtered OUT so each connection appears once | `am:<connId>` |
+
+Three rules are easy to get wrong and are therefore pure, exported and tested
+(`buildLibraryTabs`, `resolveDefaultTab`, `storeTabUrlOf` in
+`LayoutLibraryPanel.tsx`; `tests/layout-library-panel-registry.test.ts`):
+
+- **Selection persistence is split.** A `global:` pick still writes
+  `LibraryStore.setActiveTab(url)` — a catalog can stay the default. A
+  `project:` or `am:` pick cannot: `setActiveTab` ignores anything that is not a
+  known catalog URL, so those go to the panel key `rv-planner-active-library`,
+  which is also read first and can express every tab. A legacy bare-URL value is
+  re-prefixed on read.
+- **Deploy dedup, project wins.** A deployed standard catalog and the project's
+  own `library/` list the same files. `crossSourceKeyOf`
+  (`core/hmi/projects/assets-library-groups.ts`) is the canonical identity — the
+  path below the last `library/` segment — and colliding entries are hidden from
+  the *catalog* tab. A tab left with nothing disappears from the dropdown.
+  Entries with no `library/` segment have no identity and are never deduped.
+- **Dedup waits for `loaded: true`.** Deduplicating against a half-filled
+  project source would make catalog cards blink out and back in during the async
+  listing.
+
+**Placing a project document.** Its catalog entry carries `glbUrl: ''`, because
+`LibrarySource.resolveAsset()` mints a fresh, volatile `blob:` URL per call.
+Every placement path — drag, click, snap, duplicate, restore, preview — goes
+through the single `LayoutPlannerPlugin.loadEntryModel(entry)`, which finds the
+owning source by asset id (`findRegistryOrigin`) and loads through
+`ModelCache.getOrLoadResolved(cacheKey, resolve)`. The cache key is the asset's
+stable identity, `resolved:<providerId>:<sourceId>:<entryId>` — never the URL,
+which would guarantee a cache miss every time — and the cache owns the
+`revokeUrl` obligation in the success, failure *and* abort paths. Saving the
+document in the editor evicts that key (`document-saved`), so the next placement
+re-reads the new bytes.
 
 ### Public material-flow kernel contracts
 
@@ -397,6 +457,43 @@ in the file (`rv_share.level`) and only matters at the moment of escalation.
 Precedence on boot: `?doc=` > `?scene=` (a permanent alias, redirected to `?doc=`) >
 `?glb=` > `?model=` > the last open document > `defaultModel`. `&mode=` always
 wins over the default viewer mode.
+
+### The demo is a project
+
+Since plan-726 there is no channel that opens "the demo model". `public/project.json`
+is an authored, checked-in manifest — `id: prj_sample`, slug `demorealvirtual` — and it
+is the single source of truth for what the demo contains and what it starts with. All
+four delivery channels boot through it:
+
+| Channel | What happens |
+|---|---|
+| Hosted demo (`web.realvirtual.io`) | `/` opens the project and loads its start document straight into 3D. No dashboard in between. |
+| Community download (CONNECT embed) | The gate's "Start the demo" opens the same project and the same start document out of the bundled manifest. |
+| Dev checkout | Identical, because the manifest is in `public/` and is served in dev too. |
+| Share / embed links | `?doc=<id>` addresses a document of that project; `?project=demorealvirtual` selects the project by slug. |
+
+Three rules follow from it, and each of them is load-bearing:
+
+- **The document ids are derived, never invented.** They are
+  `stableDocumentId(path)` — the same function that produces the ids
+  `openDocument()` writes into the address bar. A hand-written id would break
+  every `?doc=` link the app itself has already handed out.
+- **The demo is read-only.** `BundledBackend` is HTTP; there is nothing to write
+  to. Saving goes through the existing "Save into project as…" path and lands in
+  the writable *My Workspace* project.
+- **A broken manifest degrades, it does not break.** A 404, unparseable JSON, or
+  a manifest that fails `isValidProjectV2()` falls back to the synthetic demo
+  project **and logs a warning** — the demo still loads.
+
+The start-document reference is matched leniently by `findStartDocument()`: exact
+path, then id, then a *unique* file name. That last branch exists because five
+delivered customer manifests carry a bare filename against a `models/`-prefixed
+path; an ambiguous name is refused rather than guessed.
+
+> **Dev built-ins are not the product path.** Dropping a `.glb` into
+> `public/models/` still makes it selectable in the dev model list. It does **not**
+> make it part of the demo — only `public/project.json` does, and only what that
+> file declares is deployed.
 
 ### The receiver's view is part of the link
 
@@ -562,6 +659,10 @@ src/
 │   │   ├── rv-pipe-flow.ts              # Process pipe flow propagation
 │   │   ├── rv-tank-fill.ts              # Tank fill visualization
 │   │   ├── rv-safety-door.ts            # Safety door / hazard zone halo
+│   │   ├── rv-machining-registry.ts     # MachiningProvider seam (open, Three.js-free) + kill-switch
+│   │   ├── rv-machining-volume.ts       # RVMachiningVolume (MachiningVolume.cs) — SDF grid + chunk meshes
+│   │   ├── rv-machining-tool.ts         # RVMachiningTool (MachiningTool.cs) — cutter geometry (data-only)
+│   │   ├── rv-machining-manager.ts      # Per-tick driver: sweep, segment coalescing, reset, signals
 │   │   │
 │   │   │── # Rendering, raycast, optimization ────────────────────────────
 │   │   ├── rv-raycast-manager.ts        # Unified hover/click/XR raycaster
@@ -860,6 +961,40 @@ Opt-in rigid-body physics for free 3D material behavior — MUs falling off conv
 
 The physics engine itself is a **private provider** (Rapier, Rust → WASM) behind the public `PhysicsProvider` registry — open-source builds without a registered provider are a strict no-op and load zero physics bytes. See [doc-extending-webviewer.md](doc-extending-webviewer.md) for the provider contract.
 
+### Machining (CSG material removal)
+
+A **MachiningVolume** is a workpiece whose material is a voxel SDF (signed distance field) grid instead of a fixed mesh. One or more **MachiningTool** cutters listed on it subtract material every fixed tick as they sweep through the grid (milling, drilling) — the changed 16³ voxel chunks are re-tessellated (Marching Cubes or Dual Contouring) into per-chunk `BufferGeometry` meshes that replace the authored workpiece mesh. This is the browser port of the Unity `MachiningVolume`/`MachiningTool` components (`Packages/io.realvirtual.professional/Runtime/CSG/`).
+
+The compute kernel is `rv_csg.wasm` — the same Rust crate (`rv-csg`) that builds the Unity `rv_csg.dll`, additionally compiled for `wasm32-unknown-unknown` with SIMD128, running single-threaded (no `SharedArrayBuffer`/COOP-COEP needed) inside a dedicated Web Worker. Like physics and IK, this is a **private provider** behind a public, Three.js-free registry (`src/core/engine/rv-machining-registry.ts`) — an open-source build without a registered provider leaves every workpiece in its authored, unmachined state and logs one console warning; nothing crashes and nothing is loaded. See [doc-extending-webviewer.md § 21c](doc-extending-webviewer.md#21c-machining-provider-registry-csg-material-removal) for the provider contract, job/ack protocol and backpressure design.
+
+**MachiningVolume** (the workpiece) — key `rv_extras` fields:
+
+| Field | Meaning |
+| --- | --- |
+| `gridResolution` | Voxel lattice resolution (incl. one padding voxel per side); 4–256 per axis |
+| `workpieceSize` | Stock size in mm |
+| `Shape` | `Box`, `Cylinder`, or `Mesh` (Mesh uses the node's own render geometry — WYSIWYG) |
+| `Tools` | Ordered list of `MachiningTool` references — subtraction order matters |
+| `ToolGroup` | Optional group name; tools carrying it are discovered in addition to `Tools` |
+| `SweepToolMotion` / `MaxSweepSubsteps` | Whether the tool's motion between ticks is swept (not just sampled at the end pose) |
+| `Meshing` | `MarchingCubes` or `DualContouring` |
+| `CreaseAngle` | Hard-edge threshold in degrees for the tessellator |
+| `StatisticsInterval` | Seconds between `MaterialRemainingPercent` refreshes |
+
+**MachiningTool** (the cutter) is a pure data component — `Shape` (`Sphere`, `Cylinder`, `BallNose`, `Torus`, `ConicalEnd`), `ToolDiameter`, `ToolLength`, `CornerRadius`, `TaperAngleDeg`. Its node's `matrixWorld` is read once per tick by the manager, which builds the swept segments.
+
+**Signals** (read/write follows the usual PLC convention):
+
+| Signal | Direction | Meaning |
+| --- | --- | --- |
+| `SignalSpindleOn` | read (PLC output) | Subtraction only runs while true |
+| `SignalReset` | read (PLC output) | Rising edge re-initializes the grid to its full, unmachined state |
+| `SignalMachiningActive` | write (PLC input) | True while the worker still has jobs or chunks pending — a momentary state, not a latch |
+
+**Demo model:** `DemoCSGMachining.glb` — two stations (a Box and a Cylinder stock) driven by `MillingSequence` LogicSteps. It is an **internal** model as of 2026-08-30: it lives in `../realvirtual-WebViewer-Private~/projects/Development/models/` and is not in the public model selector. Tests reach it through `DEV_GLB.csgMachining`.
+
+**Performance:** a 64³ grid is the recommended operating point — milling stays fluid at 60 fps. 128³ works but a demanding sweep can fall behind the worker's per-tick budget; the queue backpressure and segment coalescing (see the extending guide) keep this correct but visibly laggy rather than dropping material or crashing. `rv_csg.wasm` itself is loaded lazily — only when a model actually contains a `MachiningVolume` — so it adds nothing to the entry bundle.
+
 ### Path Simulation (AGV / Overhead Conveyor)
 
 > Fleet control, tasks (destination + service time + callbacks), docks
@@ -1087,6 +1222,48 @@ the pick BVH. GLB export restores the original meshes and prunes the rig — the
 rig is rebuilt deterministically on load. If calibration or the follower
 assignment fails, the chain simply holds its CAD rest pose and says why in its
 status line; it is never worse than an unrigged part.
+
+### Chain (chain conveyors, bucket elevators)
+
+`Chain` is the other chain, and it has nothing to do with `EnergyChain` above:
+N identical elements — links, buckets, carriers, pallet fixtures — riding a
+spline, all moved by ONE `Drive`. It is the browser counterpart of Unity's
+`realvirtual.Chain` + `ChainElement`, and Unity remains the single source of
+truth for both the curve and its frames.
+
+The curve is **baked at export time**. `Chain.Spline` carries an arc-length
+equidistant table of position, tangent and up vector (flat
+`[px,py,pz, tx,ty,tz, ux,uy,uz]` per sample, metres, in the chain node's LOCAL
+frame) plus `closed` and the true `length`. The viewer only interpolates it:
+no spline mathematics is duplicated in TypeScript, and the up vectors come from
+Unity's `SplineContainer.EvaluateUpVector` rather than from a browser-side
+parallel transport, so there is no frame-flip class of bug to fix.
+
+The elements are **built, not loaded**. On load the component clones the
+`ChainElement` template `NumberOfElements` times, after dropping any child that
+follows Unity's generated-element convention `<NameChainElement>_<n>` (tolerating
+the glTF `_N` de-dup and the Unity `(N)` suffix) — a scene exported with Unity's
+edit-mode preview would otherwise deliver a second, stale set. Every clone gets
+its inherited rv_extras stripped (the `rv-source.ts` MU rule: `Object3D.clone()`
+JSON-round-trips `userData`) and carries `_rvChainElement`, which
+`pruneRuntimeHelpers()` drops before an editor save. In an **authoring load**
+nothing is cloned at all, so the asset editor saves the template only.
+
+Per tick the element position is `drivePosition + start + OffsetToDrivePosition`
+in millimetres, converted to an arc-length fraction over
+`ScaledOnFixedLength ? FixedLength : Length`. The wrap is Unity's, verbatim: a
+modulo on OPEN and closed splines alike (no clamping), with the negative branch
+`1 - |p| / length`. The tick hangs in `CoreSubsystems.visuals()` AFTER the drive
+stage so an element never lags its own drive by a frame, and
+`resetSimulation()` calls `chainManager.resetAll()` AFTER the `drive.reset()`
+loop — deliberately not from the `simulation-reset` event, which fires before
+the drives are reset.
+
+Chain subtrees are excluded from BatchedMesh arenas (they move every tick) and
+kept matrix-dynamic by the static-freeze pass. Degrading is quiet and total: a
+missing or under-sampled `Spline`, or an unresolvable template, makes the chain
+inert with a warning; an unresolvable `ConnectedDrive` places the elements and
+never moves them — matching Unity, which logs and keeps running.
 
 ### Mechanisms (rigid-body kinematics)
 
@@ -1756,6 +1933,7 @@ All geometry sources are imported through one entry point: the **Import** button
 | STEP | local `.step`/`.stp` via occt WASM (browser-local, no upload) | private |
 | Asset Manager | Unity Cloud Asset Manager (shared connections with the Library panel) | private |
 | Onshape | Onshape cloud (registry entry point reserved) | private |
+| AutomationML | local `.aml` **folder** (or a single `.amlx`) — CAEX topology + referenced COLLADA | private, **internal only** |
 
 The dialog makes the target explicit ("Import as"):
 
@@ -1763,6 +1941,43 @@ The dialog makes the target explicit ("Import as"):
 - **Open as new scene** — replace: loads the result as a new model (clears the current scene), identical to opening a model from the selector.
 
 Providers report availability reactively (`ready` / `needs-setup` / `connecting`); a provider that needs a login or credentials shows a setup hint instead of its form. Errors and partial results (e.g. 3 of 5 files converted) are listed in the dialog — nothing fails silently. See `doc-extending-webviewer.md` §21 for writing your own provider.
+
+### AutomationML (plan-420, internal preview)
+
+The AML tab is the one provider that picks a **folder**, not a file. An AutomationML package is a `.aml`
+document plus a sibling geometry folder referenced as `./dae_lib/X.dae`, and a browser cannot resolve
+that relative path from a lone `<input type="file">` — so the tab uses `webkitdirectory` and resolves
+every reference against `webkitRelativePath`. A single `.amlx` (ZIP) is accepted as a convenience road
+and is size/ratio/path-checked from the ZIP central directory before anything is decompressed.
+
+What it reads today, and what it deliberately does not:
+
+| Read | Not read (later phases) |
+|------|-------------------------|
+| `InstanceHierarchy` → one editable node per CAEX element | Kinematics (this format carries it inside COLLADA, not CAEX) |
+| `Frame` (x/y/z/rx/ry/rz) → node transforms | Signals and PLCopen logic |
+| CAEX `Attribute`s → one `AutomationMLAttributes` component per node | AML **export** |
+| All referenced COLLADA geometry, complete | |
+
+Three properties are worth knowing when reading the code:
+
+- **The whole package becomes exactly ONE GLB.** The editor sink loops over the resolved items and
+  notifies the document after each one; with more than one item, the semantics waiting to be applied
+  would fire at a half-loaded model. So every COLLADA resource is composed into one transient root and
+  serialized once.
+- **three's `ColladaLoader` is not enough on its own** and a text pre-stage
+  (`aml-collada-prepare.ts`) sits in front of it: `<tristrips>`/`<trifans>` are triangulated (84 % of
+  the reference library's triangles live there and the loader drops them without an error), and
+  cross-file `<instance_node url="Other.dae#id">` links are cut into placeholders and re-stitched over
+  a cycle-safe file graph (the loader throws a `TypeError` on them). The parse itself cannot move into
+  a Worker — `ColladaLoader` needs `DOMParser`, which Workers do not have — so it yields between files
+  and shares one built subtree per repeated reference instead.
+- **The Z-up→Y-up conversion happens exactly once**, on the import root, and the provider stamps
+  `ZIsUpVector: false` / `ImportScaleFactor: 1` so the sink does not apply it a second time. That is
+  also what makes a CAEX `Frame` directly usable: everything below the root is plain package space.
+
+Registered from `internal-plugins.ts` only. Console entry: `await rvAml.dryRun(files)` /
+`await rvAml.import(files)`. "Re-import…" is not supported for AutomationML.
 
 ### CAD metadata (`JTData`)
 
@@ -2086,6 +2301,66 @@ and no op is created.
 **The cost.** After a merge the parts share one bounding box, so culling is coarser
 and a click hits the merged mesh instead of the individual part. That is the point
 of the operation, and Separate is the way back.
+
+## Invariant — an authoring load never mutates the GLB hierarchy (plan-727)
+
+**Rule: a load that the asset editor performs must leave the node tree exactly as
+the GLB describes it.** The editor's live tree IS the CAD hierarchy at every
+moment, so save → reopen → save is a fixpoint and a later CAD re-import still
+finds every node where it was authored.
+
+The rule exists because it was broken. `applyKinematicParenting()` (Phase 8b of
+`loadGLB`) re-parents kinematic group members under their `Kinematic` node —
+correct for a runtime load, mirroring `Kinematic.Awake()` in Unity. It was the
+only structure-mutating load phase without a gate (10b, 10c/10d and 13b all have
+one). So every editor reopen restructured the live tree, the next save exported
+that restructuring, and `relativePathMap()` in `rv-cadlink-reimport.ts` — which
+builds its match keys by walking `children` down from the CAD root — no longer
+traversed the moved nodes at all. They vanished from the re-import **silently**:
+not matched, not even reported as unmatched, components and all.
+
+### Two flags, deliberately not one
+
+| Flag | Means | Set by |
+|------|-------|--------|
+| `preserveHierarchy` | skip the uber-material bake and the static/kinematic mesh merges; every node stays visible and individually pickable | asset editor, **and `RVEmbedViewer`** |
+| `preserveAuthoringHierarchy` | never mutate the node hierarchy: skip kinematic re-parenting | asset editor **only** |
+
+They must not be merged. `RVEmbedViewer` (`src/embed/rv-embed-viewer.ts`) is a
+*simulating production runtime* that sets `preserveHierarchy` purely for
+pickability while still requiring the re-parenting — gating Phase 8b on that flag
+would leave embedded kinematic groups behind their moving axis, with no error and
+no log. The Layout Planner's `processExtras()` placement calls likewise stay
+ungated.
+
+Guarded by `tests/rv-authoring-hierarchy-invariant.test.ts` (which asserts
+positively that `preserveHierarchy` alone does **not** gate) and
+`tests/rv-kinematic-save-reload-cycle.test.ts` (the save/reload fixpoint over a
+full structure + transform signature). Any future load-time hierarchy mutation
+has to respect `preserveAuthoringHierarchy` or those tests go red.
+
+### Why members still move when nothing is re-parented
+
+`processMeshes()` freezes a mesh with `matrixAutoUpdate = false` when no drive is
+in its **physical** parent chain — and a group member carries only `Group`, so in
+an authoring load the axis is not an ancestor. Frozen means three.js never
+rebuilds the matrix from the quaternion a drive writes, i.e. the drive reports
+running and the geometry stands still. `reclassifyKinematicGroupsDynamic()`
+(Phase 8a-bis) therefore asks the semantic question — *is this mesh moved by a
+drive?* rather than *does it hang under one?* — and re-marks every resolved
+kinematic group's members dynamic. It runs in **all** modes (in runtime loads it
+is idempotent to Pass 3 of `applyKinematicParenting`) and is monotone: it only
+ever sets `matrixAutoUpdate` to `true`.
+
+### Known limitation
+
+Overlays whose `onSceneReady()` expects the post-re-parent shape are wrong or
+empty in the editor: `RVSafetyDoor`'s outline/halo, the `RVWebError` badge size,
+`RVEnergyChain` rigging and the related gizmo AABBs. This is presentation
+comfort, not data loss, and is accepted for now — making those consumers
+group-aware is tracked as a follow-up plan. Assets whose restructuring was
+already baked in before this fix are **not** migrated; only newly saved assets
+are correct.
 
 ## Renderer Support
 
@@ -2703,6 +2978,37 @@ discarded: it renders as a labelled wireframe placeholder and gets an entry in
 the **Problems** panel naming what was searched for (both the asset id and the
 path).
 
+**The tree shows the whole folder** (plan-445). It used to show four curated
+listings — manifest documents, `docs-index.json` targets, `*.connect.json`,
+`*.knowledge.md` — and a file in none of them was simply not there, which is why
+people could not find their own drawings, scripts and notes. Now one backend
+walk lists everything except viewer machinery (dot-paths, `project.json`,
+`docs-index.json`, the `thumbnails/` cache), and the old distinction shows up as
+**verbs** instead of as presence: a file with no reference model behind it
+renders as an *inert* row — visible, selectable, no context menu, no F2, no
+drag, and refused as a move/rename source by the tree rules themselves, so the
+MCP write path obeys it too. `web_project_tree` is built from the same listing
+call, so an agent and the screen see one tree.
+
+**Built-in demos are a read-only root.** The models a build ships
+(`DemoRealvirtualWeb` and friends) appear as a *Built-in demos* catalog root with
+a padlock. It is read-only through the ordinary `writable: false` rule — no
+special case — and opening one loads it exactly as the `?model=` deep link does,
+**without switching the open project**. In a dev checkout that carries the same
+GLB inside its project folder, the project's own row wins and the built-in is
+dropped (matched on the file name).
+
+**Markdown has a preview and an editor.** Selecting a `*.knowledge.md` — or any
+other `.md` the full view now lists — gives the detail pane *Preview | Edit*
+tabs. Preview goes through the same lazy `react-markdown` chunk the node
+knowledge field uses; Edit is a plain textarea (no new dependency) and is
+offered only where the project is writable, saving through the ordinary
+`writeBlob` seam.
+
+**New document is a button.** The single most-used verb on the screen was a 16px
+plus among three other icon buttons; it is now a contained Instrument-Blue
+button in the folder header. The plus stays for anyone who learned it.
+
 **Copy and move between sources.** A document's context menu offers *Copy to…*
 and *Move to…*, listing only writable targets — a read-only project is absent
 rather than greyed out. **Copy** creates a new document (new `id`, with
@@ -2711,6 +3017,31 @@ the original into the source's `.trash/`, which is what makes an existing
 placement or `AssetReference` still resolve afterwards. The classification
 travels because it is in the bytes. Drag-and-drop between sources is
 deliberately out of scope.
+
+**The two CONNECT bridges** (plan-446). The project browser is the one screen that shows a project
+as *files*, so it carries the two verbs that lead out of the browser:
+
+- **Show in Explorer** — in a tree row's context menu, for anything inside the open project. The
+  browser cannot open a file-manager window and no web API can, so CONNECT does it:
+  `POST /project/reveal` with the project-relative path (see
+  `Assets/realvirtual-Connect~/doc-connect.md`, *"Show in Explorer"*). The entry
+  appears only when **both** hold: the gateway advertises `revealSupported` on `/health`, **and**
+  this page is local — `location.hostname` is `localhost`/`127.0.0.1`, or the gateway origin *is*
+  the page origin. The second condition is not redundant: a viewer opened on a tablet through a
+  forwarded port still looks like a loopback peer to CONNECT, and the window would open on the
+  machine in the plant. Any refusal (403/404/409) silently retires the verb until the next
+  `/health` — a convenience that fails costs its own menu entry and nothing else, so there is no
+  dialog. The rule is `canRevealInExplorer` in
+  [`connect-store.ts`](src/core/hmi/connect-store.ts).
+- **Open in CONNECT** — on a `*.connect.json` row's detail pane, beside a **Used by** list of the
+  documents whose `connectRef` names that file (0, 1 or several — the N:1 case of plan-718 made
+  visible; a chip selects that document). The list is a query over the loaded manifest, never a
+  stored back-reference: the manifest has one author and one direction, and a second copy of the
+  fact is the one that goes stale. The verb opens `ConnectOptionsWindow` with `initialProfile` set
+  to that path; the window names the profile the gateway loaded from that file and offers an
+  explicit *Activate* — it never switches on open, because a profile switch restarts workers.
+  **CONNECT stays the one place a configuration is written**; the browser is read-only about it by
+  decision (there is deliberately no second JSON editor beside CONNECT's live working set).
 
 Details: [`doc-persistence.md`](doc-persistence.md) §2.0-0, §3.6a, §3.6b, §3.7, §3.10.
 
@@ -2775,7 +3106,12 @@ npm run typecheck     # Full type check (tsconfig.full.json — includes private
 npx tsc --noEmit      # Community type check — the public tsconfig, excludes private-dependent tests
 ```
 
-Test GLB: Export from Unity demo scene → `public/models/tests.glb`.
+Test GLB: export from the Unity demo scene to
+`../realvirtual-WebViewer-Private~/projects/Development/fixtures/tests.glb`. It
+and every other internal fixture are reached through `DEV_GLB`
+(`tests/fixtures/glb-paths.mjs`), never by a hand-written URL, and every suite
+that loads one must pair it with the skip probe - see *Testing Plugins* in
+`doc-extending-webviewer.md`.
 
 Test files live in [tests/](tests/) (Vitest, browser-mode) and [e2e/](e2e/) (Playwright). Run `ls tests/*.test.*` for the current inventory — counts move every release, so no totals are kept here.
 

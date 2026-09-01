@@ -8,6 +8,7 @@
  * (real NodeRegistry + three Scene, no renderer).
  */
 import { describe, it, expect } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D, Vector3, Quaternion, Euler } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -55,7 +56,7 @@ describe('createNode op', () => {
   it('creates an empty under the parent, undo trashes it, redo restores with later components', async () => {
     const { viewer, model, registry, register } = makeMockViewer();
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const path = await doc.createEmptyNode(null, 'Empty');
     expect(path).toBe('Asset/Empty');
@@ -86,7 +87,7 @@ describe('createNode op', () => {
     addChild(model, 'Empty');
     addChild(model, 'Tail');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const path = await doc.createEmptyNode(null, 'Empty', { index: 1 });
     expect(path).toBe('Asset/Empty_1');
@@ -104,7 +105,7 @@ describe('reparentNode op', () => {
     const box = addChild(a, 'Box', [2, 3, 4]);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const worldBefore = box.getWorldPosition(new Vector3()).clone();
     const quatBefore = box.getWorldQuaternion(new Quaternion()).clone();
@@ -134,7 +135,7 @@ describe('reparentNode op', () => {
     const inner = addChild(a, 'Inner');
     addChild(model, 'C');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     // A under its own descendant → cycle → skipped.
     expect(await doc.reparentNodes(['Asset/A'], 'Asset/A/Inner')).toEqual([]);
@@ -152,7 +153,7 @@ describe('reparentNode op', () => {
     addChild(target, 'Box');
     const movedBox = addChild(a, 'Box');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const moved = await doc.reparentNodes(['Asset/A/Box'], 'Asset/Target');
     expect(moved).toEqual(['Asset/Target/Box_1']);
@@ -180,7 +181,7 @@ describe('unnamed asset root (regression: Kinematics actions on created empties)
   it('registers a root-level empty at the path computeNodePath re-derives', async () => {
     const { viewer, model, registry, register } = makeMockViewer('');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const path = await doc.createEmptyNode(null, 'Empty');
     const node = registry.getNode(path)!;
@@ -196,7 +197,7 @@ describe('unnamed asset root (regression: Kinematics actions on created empties)
   it('can add a component and an empty child to a created root-level empty', async () => {
     const { viewer, registry, register } = makeMockViewer('');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const emptyPath = await doc.createEmptyNode(null, 'Empty');
     const empty = registry.getNode(emptyPath)!;
@@ -225,7 +226,7 @@ describe('groupIntoEmpty (Kinematics window action)', () => {
     const aChild = addChild(a, 'AChild', [0.5, 0, 0]);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const aWorld = a.getWorldPosition(new Vector3()).clone();
     const bWorld = b.getWorldPosition(new Vector3()).clone();
@@ -261,7 +262,7 @@ describe('reparentNode reorder (sibling index — drag & drop)', () => {
     addChild(model, 'B');
     addChild(model, 'C');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     // Move A to the last slot (index 2 = "after C" in the excluded array).
     const moved = await doc.reparentNodes(['Asset/A'], 'Asset', { index: 2 });
@@ -278,7 +279,7 @@ describe('reparentNode reorder (sibling index — drag & drop)', () => {
     addChild(model, 'A');
     addChild(model, 'B');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     await doc.reparentNodes(['Asset/B'], 'Asset', { index: 0 });
     expect(model.children.map((c) => c.name)).toEqual(['B', 'A']);
@@ -297,7 +298,7 @@ describe('reparentNode reorder (sibling index — drag & drop)', () => {
     addChild(a, 'Box');
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     await doc.reparentNodes(['Asset/A/Box'], 'Asset/B', { index: 0 });
     expect(b.children.map((c) => c.name)).toEqual(['Box', 'X', 'Y']);
@@ -313,7 +314,7 @@ describe('reparentNode reorder (sibling index — drag & drop)', () => {
     addChild(model, 'C');
     addChild(model, 'D');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     // Drop B and D before A (index 0). Block lands contiguous at the front.
     await doc.reparentNodes(['Asset/B', 'Asset/D'], 'Asset', { index: 0 });
@@ -335,7 +336,7 @@ describe('reparentNode reorder (sibling index — drag & drop)', () => {
     (viewer as unknown as { signalStore: unknown }).signalStore = {
       remapPaths: (m: Map<string, string>) => { captured = m; return m.size; },
     };
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     await doc.reparentNodes(['Asset/A/Box'], 'Asset/B');
     expect(captured).not.toBeNull();

@@ -2,81 +2,40 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-published-scenes — catalogue of read-only "Example" scenes.
+ * rv-published-scenes — the `published:<urlName>` ALIAS (plan-731 Phase 2).
  *
- * Examples are curated demos (e.g. a planner layout). Unlike "My Scenes" they
- * are NOT stored in localStorage — opening one loads it transiently via
- * `SceneStore.openPublishedExample`, and "Add to My Scenes"
- * (`SceneStore.addPublishedToMyScenes`) materialises an editable copy the user
- * owns. The catalogue is a curated `scenes/index.json` (`[{ file, name, mode }]`).
+ * ## What this module used to be, and why it is not that any more
  *
- * ## Where the bytes live
+ * It used to own a second catalogue: a curated `scenes/index.json` listing
+ * read-only "Example" scenes under `public/scenes/`, each addressed by a
+ * `published:<urlName>` token. That token was a **second document identity
+ * space** standing beside `stableDocumentId(path)` — with seven independent
+ * consumers, among them a hard-coded literal in the Welcome modal's planner
+ * button, i.e. in the first click of a community visitor.
  *
- * They belong to the **DemoRealvirtual project**, which is BUNDLED: its scenes
- * are `public/scenes/`, so Vite serves them at `<BASE_URL>scenes/` in dev and
- * copies them to exactly that path in a build. One location, dev and deployed
- * alike — no dev-only mount and no base to record.
+ * Since plan-726 the demo is a PROJECT and `public/project.json`'s `documents[]`
+ * is the one catalogue. plan-731 finished the job: the `scenes/` folder and its
+ * `index.json` are gone, and every example is an ordinary document row.
  *
- * ## Examples are GLBs (plan-413 phase 3)
+ * ## What is left: an alias, and only an alias
  *
- * They used to be `.scene.json` op logs — the last corner of the product where
- * a scene was not a file. Since plan-397 every saved scene is a GLB, and an
- * Example is just a scene somebody else saved, so the catalogue now lists
- * `.glb` and the loader is the ordinary GLB path. The conversion itself is
- * `tests/bake-published-scenes.node.test.ts`, which ran the two op logs through
- * the very `materialise()` + `bakeIntoGlb()` pair a user's Save goes through.
+ * Old links do not break. `?scene=published:<urlName>` still resolves — through
+ * {@link resolvePublishedAlias}, which maps the token onto the document whose
+ * path carries that basename and hands back its **document id**. From that point
+ * on the boot follows the ordinary `openDocument()` path, exactly as `?doc=`
+ * does, and the address bar is normalised to `?doc=`.
  *
- * A `.scene.json` entry left in an older deploy's `index.json` is therefore
- * skipped — loudly (`console.warn`), because an Examples list that quietly
- * shrinks to nothing is the failure mode worth spending a log line on.
+ * The mapping is DERIVED, never stored. That distinguishes it from
+ * `rv-doc-alias`, whose `scn_ → doc_` aliases are localStorage records of a
+ * migration that happened on one machine: a `published:` link is a link a
+ * stranger clicks in a fresh browser, so its resolution has to be a pure
+ * function of the token and the manifest, and nothing else.
  */
 
-import { normaliseDocumentLevel, type DocumentLevel } from '../../project/rv-document-classification';
 
-/** A single example scene available in the "Examples" section. */
-export interface PublishedSceneEntry {
-  /** Filename inside the project's `scenes/` folder, e.g. "DemoPlanner.glb". */
-  file: string;
-  /** Token used in `?scene=published:<urlName>` — `file` without ".glb". */
-  urlName: string;
-  /** Display label shown in the Examples list. */
-  label: string;
-  /** Preferred workspace mode to switch to on open (e.g. "planner"). Optional. */
-  mode?: string;
-  /**
-   * Classification level of the example, cached from its GLB (plan-413 §2.5).
-   *
-   * The bytes are the source of truth here as everywhere, but a bundled deploy
-   * is the one place §2.5 says never to scan: it is read-only over HTTP, so its
-   * catalogue cannot go stale against bytes nobody can modify, and reading the
-   * level out of it would mean downloading every example to draw a list.
-   * Absent means unclassified, exactly as it does in a manifest.
-   */
-  level?: DocumentLevel;
-}
 
-/** Fetchable URL of one example scene file. */
-export function publishedSceneUrl(file: string): string {
-  return `${deployBase()}scenes/${file}`;
-}
-
-/**
- * Manifest `path` for one example scene.
- *
- * Always deploy-relative (`scenes/<file>`), because `BundledBackend` resolves
- * it against the deploy root itself.
- */
-export function publishedScenePath(file: string): string {
-  return `scenes/${file}`;
-}
-
-function deployBase(): string {
-  try {
-    return (import.meta as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? '/';
-  } catch {
-    return '/';
-  }
-}
+/** Prefix of the legacy example identity space. */
+export const PUBLISHED_ID_PREFIX = 'published:';
 
 /** The one extension an example may have since plan-413 phase 3. */
 export const PUBLISHED_SCENE_EXT = '.glb';
@@ -91,77 +50,82 @@ export function publishedFileFromUrlName(urlName: string): string {
   return `${urlName}${PUBLISHED_SCENE_EXT}`;
 }
 
-/** What a `?scene=published:<name>` deep link resolves to. */
-export interface PublishedDeepLink {
-  /** File to load, `<name>.glb` when the catalogue does not know the name. */
-  file: string;
-  label?: string;
-  mode?: string;
-  /**
-   * The catalogue lists it, so it exists and no probe is needed. When false the
-   * caller must establish existence itself before opening — and fall through to
-   * the normal boot chain when it cannot.
-   */
-  catalogued: boolean;
-}
-
 /**
- * Resolve a `?scene=published:<name>` token against the Examples catalogue.
+ * The `urlName` a document answers to under the legacy `published:` space.
  *
- * Lives here rather than inline in the boot routine for two reasons: the boot
- * routine is not reachable from a test, and the rule itself — "the catalogue
- * decides, the filesystem is only consulted when it does not know" — is the
- * whole of the deep link's behaviour (plan-413 §2.6 point 5, test 9.10).
+ * The basename of its path without the extension — the same string
+ * `scenes/index.json` used to carry as `file` minus `.glb`, which is what makes
+ * an old link and a current row meet.
  */
-export function resolvePublishedDeepLink(
-  urlName: string,
-  catalogue: readonly PublishedSceneEntry[],
-): PublishedDeepLink {
-  const entry = catalogue.find(e => e.urlName === urlName);
-  if (entry) {
-    return { file: entry.file, label: entry.label, mode: entry.mode, catalogued: true };
-  }
-  return { file: publishedFileFromUrlName(urlName), catalogued: false };
+export function publishedUrlNameOf(doc: { path?: string }): string {
+  const path = typeof doc?.path === 'string' ? doc.path : '';
+  const base = path.split(/[\\/]/).pop() ?? '';
+  return urlNameFromFile(base);
 }
 
 /**
- * Build a catalogue entry from a bare filename (glob fallback path) — label
- * defaults to the url name, no preferred mode.
- */
-export function publishedEntryFromFile(file: string): PublishedSceneEntry {
-  const urlName = urlNameFromFile(file);
-  return { file, urlName, label: urlName };
-}
-
-/**
- * Parse a curated `scenes/index.json` payload into catalogue entries.
- * Defensive: ignores non-array input and any item without a valid `file`
- * ending in `.glb`. `name` becomes the label (falls back to the url
- * name); `mode` is carried through only when it is a non-empty string.
+ * The `published:<urlName>` token a document would have been addressed by.
  *
- * A pre-plan-413 `.scene.json` entry is skipped with a warning naming the
- * reason — see the module docstring.
+ * Only ever used to RECOGNISE an old address, never to mint a new one — every
+ * link this build writes carries `?doc=<id>` (plan-731 2c, the compose side).
  */
-export function parsePublishedIndex(raw: unknown): PublishedSceneEntry[] {
-  if (!Array.isArray(raw)) return [];
-  const out: PublishedSceneEntry[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') continue;
-    const rec = item as Record<string, unknown>;
-    const file = rec.file;
-    if (typeof file === 'string' && /\.scene\.json$/i.test(file)) {
-      console.warn(
-        `[published-scenes] '${file}' is a legacy JSON example and is not listed. `
-        + 'Example scenes are GLBs since realvirtual WEB 6.3 — re-deploy to convert them.',
-      );
-      continue;
-    }
-    if (typeof file !== 'string' || !/\.glb$/i.test(file)) continue;
-    const urlName = urlNameFromFile(file);
-    const name = typeof rec.name === 'string' ? rec.name.trim() : '';
-    const mode = typeof rec.mode === 'string' && rec.mode.trim() ? rec.mode.trim() : undefined;
-    const level = normaliseDocumentLevel(rec.level);
-    out.push({ file, urlName, label: name || urlName, mode, level });
+export function publishedTokenOf(doc: { path?: string }): string {
+  return PUBLISHED_ID_PREFIX + publishedUrlNameOf(doc);
+}
+
+/**
+ * The `urlName` inside a `?scene=published:<name>` value, or null.
+ *
+ * Decodes the token so a name with a space or a slash in it survives the URL,
+ * exactly as the boot used to do inline.
+ */
+export function parsePublishedToken(scene: string | null | undefined): string | null {
+  if (typeof scene !== 'string' || !scene.startsWith(PUBLISHED_ID_PREFIX)) return null;
+  const raw = scene.slice(PUBLISHED_ID_PREFIX.length);
+  if (raw === '') return null;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    // A malformed escape is still a name — better a literal match attempt than
+    // a thrown boot.
+    return raw;
   }
-  return out;
+}
+
+/**
+ * Resolve a legacy `published:<urlName>` token against a project's documents.
+ *
+ * Returns the document row, or null when nothing in the manifest answers to that
+ * name. Null is the honest answer and the caller falls through to its normal
+ * boot chain — the same outcome the catalogue's "not catalogued" branch had.
+ *
+ * Matching is on the path BASENAME, case-insensitively, because that is the
+ * string the old catalogue derived `urlName` from. A row whose path is
+ * `scenes/DemoPlanner.glb` and one whose path is `DemoPlanner.glb` therefore
+ * both answer to `published:DemoPlanner` — which is exactly what has to hold
+ * across plan-731's move of the fixture out of `scenes/`.
+ */
+export function resolvePublishedAlias<T extends { path?: string }>(
+  urlName: string | null | undefined,
+  documents: readonly T[],
+): T | null {
+  if (!urlName) return null;
+  const wanted = urlName.toLowerCase();
+  for (const doc of documents) {
+    if (!doc || typeof doc !== 'object') continue;
+    if (publishedUrlNameOf(doc).toLowerCase() === wanted) return doc;
+  }
+  return null;
+}
+
+/**
+ * Resolve a whole `?scene=` value when — and only when — it is a `published:`
+ * token. Returns null for every other shape, so a caller can chain it into an
+ * `if` without pre-parsing.
+ */
+export function resolvePublishedSceneParam<T extends { path?: string }>(
+  scene: string | null | undefined,
+  documents: readonly T[],
+): T | null {
+  return resolvePublishedAlias(parsePublishedToken(scene), documents);
 }

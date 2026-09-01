@@ -49,6 +49,7 @@ import {
   updateManifestCas,
 } from './rv-project-storage';
 import { readDocuments } from './rv-project-documents';
+import { getProjectStore } from './project-store';
 import type { ProjectBackend, ResolvedBackendBlob } from './backends/project-backend';
 import type { RvDocumentEntry } from './rv-project-types';
 
@@ -147,6 +148,11 @@ function sideOf(endpoint: DocumentTransferEndpoint): DocumentTransferSide {
         // `undefined` is how a copy would silently land nowhere.
         return { ...current, documents: apply(readDocuments(current) ?? []) };
       });
+      // plan-725 §2.7. A copy across sources rewrites `documents[]` through this
+      // own CAS wrapper, not through the store's — so none of the store's own
+      // notify sites can see it, and it has to say so itself. Fire-and-forget by
+      // construction: `notifyProjectChanged` never throws and never awaits.
+      getProjectStore().notifyProjectChanged();
       return true;
     },
   };

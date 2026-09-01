@@ -43,6 +43,10 @@
 
 import type { TreeNode, VisibleTreeRow } from '../hmi/hierarchy-utils';
 import { flattenVisibleTree } from '../hmi/hierarchy-utils';
+import {
+  CONNECT_CONFIG_SUFFIX, KNOWLEDGE_FILE_SUFFIX,
+  isConnectConfigPath, isKnowledgeFilePath,
+} from './rv-project-refs';
 
 // ─── Reserved folders ───────────────────────────────────────────────────
 
@@ -100,6 +104,20 @@ export interface ProjectTreeNode extends TreeNode {
   documentId?: string;
   /** May the user move/rename/drop into this node? */
   writable: boolean;
+  /**
+   * A row the full-view listing shows but no verb acts on (plan-445 F2).
+   *
+   * The project browser lists EVERY file since plan-445, and a file that is
+   * neither a manifest document, a docs-index attachment, a CONNECT config nor
+   * a knowledge file has no reference model behind it — moving or renaming one
+   * would rewrite bytes nothing points at, with no row to keep honest. So it is
+   * visible, selectable, and inert.
+   *
+   * Enforced as a REFUSAL rather than as a UI state ({@link canMoveInTree},
+   * {@link canRenameInTree} refuse an inert SOURCE), which is what makes the
+   * MCP write path (`applyTreeMove`) obey it too and not only the tree widget.
+   */
+  inert?: boolean;
   /** Roots only: project or catalog. */
   rootKind?: ProjectTreeRootKind;
   /** Roots only: remote catalogs get the `(o)` origin mark of §3.1. */
@@ -134,6 +152,8 @@ export interface ProjectTreeFile {
   name?: string;
   /** Manifest document id, when the file has one. */
   documentId?: string;
+  /** See {@link ProjectTreeNode.inert} — a listed file with no verbs. */
+  inert?: boolean;
 }
 
 export interface ProjectTreeRootInput {
@@ -259,6 +279,7 @@ function buildRoot(input: ProjectTreeRootInput): ProjectTreeNode {
       relPath: rel,
       writable: input.writable && !reserved,
       ...(file.documentId ? { documentId: file.documentId } : {}),
+      ...(file.inert ? { inert: true } : {}),
     }));
   }
 
@@ -428,6 +449,8 @@ export type TreeEditRefusal =
   | 'not-found'
   | 'read-only'
   | 'system'
+  /** The SOURCE is an inert full-view row (plan-445 F2) — no verb acts on it. */
+  | 'inert'
   | 'cross-root'
   | 'into-itself'
   | 'not-a-folder'
@@ -453,6 +476,66 @@ function hasChildNamed(parent: ProjectTreeNode, name: string, except?: ProjectTr
 }
 
 /**
+ * Does `parent` already hold a child whose REL PATH is `relPath`?
+ *
+ * The sibling of {@link hasChildNamed}, and the authoritative half of the pair:
+ * a display name is suffix-stripped (`device.connect.json` shows as `device`),
+ * so two rows can differ by name and still be one file — or agree by name and
+ * be two. The name check answers "would the user see two identical rows", this
+ * one answers "would the write clobber something".
+ */
+function hasChildAtRelPath(
+  parent: ProjectTreeNode,
+  relPath: string,
+  except?: ProjectTreeNode,
+): boolean {
+  const wanted = relPath.toLowerCase();
+  return parent.children.some(c => c !== except && c.relPath.toLowerCase() === wanted);
+}
+
+/**
+ * The FILE name of a node — the last segment of its rel path.
+ *
+ * Deliberately not `node.name`. A row's name is a DISPLAY name: a manifest
+ * document shows `Bar`, not `Bar.glb`, and a CONNECT config shows `device`, not
+ * `device.connect.json`. Building a destination path out of it is how a move
+ * silently renamed `models/Bar.glb` to `Bar` — the extension gone, the file
+ * dropped out of every extension-filtered scan, and the row therefore invisible
+ * everywhere afterwards (LOP-119, plan-445 F3). A folder has no extension to
+ * lose and its name IS its segment, so the two agree there.
+ */
+export function fileNameOf(node: ProjectTreeNode): string {
+  if (node.kind === 'folder' || node.relPath === '') return node.name;
+  return node.relPath.split('/').pop() || node.name;
+}
+
+/**
+ * Can SOME rename of this row succeed — the structural half of
+ * {@link canRenameInTree}, without a candidate name.
+ *
+ * What a "Rename…" verb needs in order to decide whether to be OFFERED at all
+ * (plan-445 F4): the name-dependent refusals (`invalid-name`, `name-taken`,
+ * `unchanged`) are answers to a name the user has not typed yet, and hiding the
+ * verb for them would hide it always. Kept beside `canRenameInTree` and reused
+ * BY it, so the verb can never be offered where the commit refuses.
+ */
+export function isRenamableInTree(
+  roots: readonly ProjectTreeNode[],
+  path: string | null | undefined,
+): boolean {
+  const node = path ? findTreeNode(roots, path) : null;
+  return node !== null && renameRefusalOf(node) === null;
+}
+
+/** The name-independent refusal for renaming `node`, or null when there is none. */
+function renameRefusalOf(node: ProjectTreeNode): TreeEditRefusal | null {
+  if (node.kind === 'root' || node.kind === 'system') return 'system';
+  if (node.inert) return 'inert';
+  if (!node.writable) return 'read-only';
+  return null;
+}
+
+/**
  * May `node` be dropped into `target`, and where would it land?
  *
  * Every refusal is a named reason rather than a boolean, because the row that
@@ -473,6 +556,10 @@ export function canMoveInTree(
   const target = findTreeNode(roots, targetFolderPath);
   if (!node || !target) return { ok: false, reason: 'not-found' };
   if (node.kind === 'root' || node.kind === 'system') return { ok: false, reason: 'system' };
+  // The SOURCE, not only the target: an inert row (plan-445 F2) is refused
+  // here rather than merely hidden from the drag affordance, which is what
+  // makes the MCP write path obey the rule as well as the tree widget.
+  if (node.inert) return { ok: false, reason: 'inert' };
   if (target.kind === 'system') return { ok: false, reason: 'system' };
   if (target.kind !== 'folder' && target.kind !== 'root') return { ok: false, reason: 'not-a-folder' };
   if (!node.writable || !target.writable) return { ok: false, reason: 'read-only' };
@@ -485,9 +572,15 @@ export function canMoveInTree(
     return { ok: false, reason: 'into-itself' };
   }
 
-  const to = joinRel(target.relPath, node.name);
+  // The FILE name, never the display name — see {@link fileNameOf}. This one
+  // line is LOP-119: with `node.name` a move rewrote `models/Bar.glb` to `Bar`.
+  const to = joinRel(target.relPath, fileNameOf(node));
   if (to === node.relPath) return { ok: false, reason: 'unchanged' };
-  if (hasChildNamed(target, node.name)) return { ok: false, reason: 'name-taken' };
+  // Both halves: the path decides whether bytes would be clobbered, the name
+  // decides whether the user would end up with two rows they cannot tell apart.
+  if (hasChildAtRelPath(target, to) || hasChildNamed(target, node.name)) {
+    return { ok: false, reason: 'name-taken' };
+  }
   return { ok: true, from: node.relPath, to };
 }
 
@@ -499,8 +592,10 @@ export function canRenameInTree(
 ): TreeEditVerdict {
   const node = findTreeNode(roots, path);
   if (!node) return { ok: false, reason: 'not-found' };
-  if (node.kind === 'root' || node.kind === 'system') return { ok: false, reason: 'system' };
-  if (!node.writable) return { ok: false, reason: 'read-only' };
+  // The same three name-independent refusals the "Rename…" verb consults
+  // before it offers itself at all — one source, so the two cannot disagree.
+  const structural = renameRefusalOf(node);
+  if (structural) return { ok: false, reason: structural };
 
   let trimmed = (name ?? '').trim();
   if (trimmed === '' || trimmed === '.' || trimmed === '..' || ILLEGAL_NAME.test(trimmed)) {
@@ -514,21 +609,39 @@ export function canRenameInTree(
   // scan, which reads as the asset being deleted.
   if (node.kind !== 'folder') {
     const leaf = node.relPath.split('/').pop() ?? '';
-    const dot = leaf.lastIndexOf('.');
-    const ext = dot > 0 ? leaf.slice(dot) : '';
-    if (ext && !/\.[a-z0-9]+$/i.test(trimmed)) trimmed += ext;
+    if (isConnectConfigPath(leaf)) {
+      // A CONNECT config is classified by its COMPOUND ending (plan-718), and
+      // the simple-extension rule below would keep only ".json" — silently
+      // declassifying the file out of every config listing. The ending is
+      // therefore restored whole, whatever the user typed.
+      if (!isConnectConfigPath(trimmed)) trimmed += CONNECT_CONFIG_SUFFIX;
+    } else if (isKnowledgeFilePath(leaf)) {
+      // Same compound-ending rule for knowledge files.
+      if (!isKnowledgeFilePath(trimmed)) trimmed += KNOWLEDGE_FILE_SUFFIX;
+    } else {
+      const dot = leaf.lastIndexOf('.');
+      const ext = dot > 0 ? leaf.slice(dot) : '';
+      if (ext && !/\.[a-z0-9]+$/i.test(trimmed)) trimmed += ext;
+    }
   }
 
   if (trimmed === node.name) return { ok: false, reason: 'unchanged' };
 
-  const parent = parentOf(roots, node);
-  if (parent && hasChildNamed(parent, trimmed, node)) return { ok: false, reason: 'name-taken' };
-
   const dir = node.relPath.slice(0, Math.max(0, node.relPath.lastIndexOf('/')));
   const to = joinRel(dir, trimmed);
   // A friendly display name plus the restored extension can land exactly on
-  // the current path — that is "unchanged" at the level that matters.
+  // the current path — that is "unchanged" at the level that matters. Answered
+  // BEFORE the collision check below, so that a rename which lands back on the
+  // row's own path reports "unchanged" rather than "name-taken by itself".
   if (to === node.relPath) return { ok: false, reason: 'unchanged' };
+
+  const parent = parentOf(roots, node);
+  // Path first (what a write would clobber), display name second (what the
+  // user would be unable to tell apart) — the same pair `canMoveInTree` uses.
+  if (parent
+    && (hasChildAtRelPath(parent, to, node) || hasChildNamed(parent, trimmed, node))) {
+    return { ok: false, reason: 'name-taken' };
+  }
   return { ok: true, from: node.relPath, to };
 }
 

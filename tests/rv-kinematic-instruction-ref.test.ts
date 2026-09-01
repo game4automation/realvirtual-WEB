@@ -82,3 +82,39 @@ describe('GLB round-trip: instruction target on a kinematic-group member', () =>
     expect(registry.getNode(targets[0])).toBe(part);
   });
 });
+
+/**
+ * plan-727: the same GLB opened in AUTHORING mode. Nothing is re-parented, so
+ * there is no alias to register — the authoring path IS the current path, and
+ * the reference resolves directly. (Unity serializes references as authoring
+ * paths; the `_N` dedup / `_rvOrigName` alias mechanism of Phase 6 is an
+ * orthogonal concern and unaffected either way.)
+ */
+describe('GLB round-trip: instruction target in authoring mode', () => {
+  it('resolves without an alias because nothing moved', async () => {
+    const data = await buildGLB();
+    const scene = new Scene();
+    const result = await loadGLB('kinematic-instruction-ref.glb', scene, {
+      data,
+      preserveHierarchy: true,
+      preserveAuthoringHierarchy: true,
+    });
+    const registry = result.registry;
+
+    let part: Object3D | null = null;
+    result.root.traverse((n) => { if (n.name === 'Part') part = n; });
+    expect(part).not.toBeNull();
+    expect((part as unknown as Object3D).parent?.name).toBe('OldParent');
+
+    // The canonical path IS the authoring path here — no remap, no alias.
+    const canonical = registry.getPathForNode(part as unknown as Object3D);
+    expect(canonical!.endsWith('OldParent/Part')).toBe(true);
+    expect(registry.getNode('OldParent/Part')).toBe(part);
+
+    const instrs = registry.getAll<RVCustomRuntimeInstruction>('CustomRuntimeInstruction');
+    expect(instrs.length).toBe(1);
+    const targets = instrs[0].instance.stepTargetPaths(0);
+    expect(targets).toEqual(['OldParent/Part']);
+    expect(registry.getNode(targets[0])).toBe(part);
+  });
+});

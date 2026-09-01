@@ -35,6 +35,7 @@ import {
   listDeliveryConfigs,
   loadDeliveryConfigByCustomer,
   sharedDeliveryTarget,
+  undeliverableReason,
 } from '../scripts/_workspace-lib.mjs';
 
 const temporary: string[] = [];
@@ -586,6 +587,75 @@ describe('customer register — shared delivery translation', () => {
   it('reports no shared target when nobody is on the shared channel', () => {
     const root = fixture({ mauser: MAUSER });
     expect(withHubBaseUrl(() => sharedDeliveryTarget(root))).toBeNull();
+  });
+});
+
+/**
+ * The grouping a release run reads (plan-434 Phase 5).
+ *
+ * `/deliver-release` turns the register into a list of deliveries, and the two
+ * primitives it does that with live here: `undeliverableReason` decides who is
+ * in the release at all, and `sharedDeliveryTarget` decides that all shared
+ * customers are ONE delivery rather than one each. Both are asserted on
+ * synthetic registers, so a change in either is caught without a hub, a build,
+ * or the real customer files.
+ */
+describe('customer register — release grouping', () => {
+  const releaseRegister = () => fixture({
+    // Two own repositories and three customers on the shared one: the shape the
+    // grouping has to collapse from five entries to three deliveries.
+    mauser: MAUSER,
+    wmyb: {
+      ...MAUSER,
+      customer: 'wmyb',
+      displayName: 'WMYB',
+      forgejo: { org: 'rv-wmyb', repo: 'rv-project-wmyb', team: 'members', permission: 'write' },
+      delivery: { ...MAUSER.delivery, projects: ['wmyb'] },
+    },
+    acme: sharedCustomer('acme'),
+    beta: sharedCustomer('beta'),
+    gamma: sharedCustomer('gamma'),
+  }, { projects: ['mauser3dhmi', 'wmyb'] });
+
+  it('collapses every shared customer into one target and leaves own repos alone', () => {
+    const root = releaseRegister();
+    const shared = withHubBaseUrl(() => sharedDeliveryTarget(root))!;
+    expect(shared.customers).toEqual(['acme', 'beta', 'gamma']);
+    expect(shared.remote).toBe(`https://git.example.invalid/${SHARED_ORG}/${SHARED_REPO}.git`);
+
+    const own = listCustomers(root).filter(customer => !isSharedForgejo(customer));
+    expect(own.map(customer => customer.customer)).toEqual(['mauser', 'wmyb']);
+    // Three deliveries, not five: two own repositories plus the one shared.
+    const remotes = new Set([
+      ...own.map(customer => customerRemoteUrl(customer, 'https://git.example.invalid')),
+      shared.remote,
+    ]);
+    expect(remotes.size).toBe(3);
+  });
+
+  it('names the reason a customer is not in the release rather than dropping them', () => {
+    const root = fixture({
+      mauser: MAUSER,
+      // Toray's shape: a real customer, published to the CDN, with no git delivery.
+      toray: { ...MAUSER, customer: 'toray', displayName: 'Toray', forgejo: undefined,
+        delivery: { ...MAUSER.delivery, channel: 'hosted-link' } },
+    });
+    expect(undeliverableReason(loadCustomer(root, 'mauser'))).toBeNull();
+    expect(undeliverableReason(loadCustomer(root, 'toray')))
+      .toMatch(/is a "hosted-link" customer, no git delivery/);
+  });
+
+  it('excludes an undeliverable shared customer from the shared target', () => {
+    // Hub access to the shared repository without a git delivery: the register
+    // permits the combination one field at a time, and the release run must not
+    // then claim it delivered to them.
+    const root = fixture({
+      acme: sharedCustomer('acme'),
+      ghost: sharedCustomer('ghost', {
+        delivery: { ...MAUSER.delivery, projects: [] as string[], channel: 'hosted-link' },
+      }),
+    });
+    expect(withHubBaseUrl(() => sharedDeliveryTarget(root))!.customers).toEqual(['acme']);
   });
 });
 

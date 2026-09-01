@@ -19,7 +19,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Scene, Group, Mesh, BoxGeometry, MeshStandardMaterial, Object3D } from 'three';
 import { objectToGlb } from '../src/core/import/rv-import-object';
-import { loadGLB, type LoadResult } from '../src/core/engine/rv-scene-loader';
+import { loadGLB, resetSidecarProbeCache, type LoadResult } from '../src/core/engine/rv-scene-loader';
 import { setAssetReference } from '../src/core/engine/rv-asset-reference';
 import { ROOT_SOURCE_KEY } from '../src/core/engine/rv-node-id';
 import type { ReferenceResolver } from '../src/core/engine/rv-glb-compose';
@@ -104,6 +104,9 @@ async function loadPlant(resolver: ReferenceResolver = pressResolver()): Promise
 }
 
 beforeEach(async () => {
+  // The probe cache is session-scoped in the app; per-test here, so every test
+  // sees its own mocked fetch answered rather than a neighbour's cached one.
+  resetSidecarProbeCache();
   pressBytes = await objectToGlb(buildPressTree());
   plantBytes = await objectToGlb(buildPlantTree());
 });

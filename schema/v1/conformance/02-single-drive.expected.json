@@ -1,5 +1,5 @@
 {
-  "description": "Drive with every field set explicitly. Values pass through unchanged; the enum wire string maps to itself.",
+  "description": "Drive with every field of the original v1 set explicitly. Values pass through unchanged; the enum wire string maps to itself. The four smooth-motion fields added in plan-281 are absent from this (deliberately unregenerated) GLB and therefore take their defaults — which is exactly the backward-compatibility guarantee for GLBs written before that change.",
   "nodes": {
     "Axis": {
       "Drive": {
@@ -10,6 +10,10 @@
         "TargetSpeed": 250,
         "Acceleration": 500,
         "UseAcceleration": true,
+        "SmoothAcceleration": false,
+        "Jerk": 1000,
+        "SpeedOverride": 1,
+        "JumpToLowerLimitOnUpperLimit": false,
         "UseLimits": true,
         "LowerLimit": -90,
         "UpperLimit": 90,

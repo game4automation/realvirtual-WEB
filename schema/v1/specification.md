@@ -307,6 +307,10 @@ Linear or rotational motion control along a local axis. The base motion componen
 | `TargetSpeed` | number | 100 | The target speed of the drive in millimeters per second (degrees per second for rotational drives). |
 | `Acceleration` | number | 100 | The acceleration in millimeters per second squared. |
 | `UseAcceleration` | boolean | false | If set to true the drive uses the acceleration. |
+| `SmoothAcceleration` | boolean | false | If set to true the drive uses a jerk-limited S-curve instead of the trapezoidal ramp; requires UseAcceleration. |
+| `Jerk` | number | 1000 | The jerk in millimeters per second cubed (degrees per second cubed for rotational drives); only used with SmoothAcceleration. |
+| `SpeedOverride` | number | 1 | Speed override factor for this drive, multiplied with the global speed override. |
+| `JumpToLowerLimitOnUpperLimit` | boolean | false | If set to true the drive wraps around at its limits instead of stopping: passing the upper limit continues at the lower limit and vice versa. |
 | `UseLimits` | boolean | false | If set to true the drive motion is limited to the range between LowerLimit and UpperLimit. |
 | `LowerLimit` | number | -180 | Lower drive limit in millimeters or degrees. |
 | `UpperLimit` | number | 180 | Upper drive limit in millimeters or degrees. |
@@ -1357,6 +1361,68 @@ substitute for a hard-wired safety function.
 
 ```json
 { "HandleSwitch3D": { "stateSignal": { "type": "ComponentReference", "path": "PLC/OnSwitch", "componentType": "PLCInputBool" }, "activeOnStart": true } }
+```
+
+#### 7a.50 Chain
+
+Continuous chain transport — N identical elements riding a spline, all moved by
+one `Drive` (chain conveyors, bucket elevators, overhead power-and-free lines).
+The curve is **baked at export time**: `Spline.samples` is an arc-length
+equidistant table of position, tangent and up vector, so a reader interpolates
+instead of re-implementing Unity's spline mathematics, and the frames come from
+Unity rather than from a reader-side parallel transport.
+
+The reader builds the elements itself: it clones the `ChainElement` template
+`NumberOfElements` times and drops any pre-existing child named
+`<NameChainElement>_<n>` first, so a scene exported with Unity's edit-mode
+preview does not deliver a second, stale set. Element `i` sits at
+`StartPosition + i * delta`, where `delta` is `Length / NumberOfElements` while
+`CalculatedDeltaPosition` is set and `DeltaPosition` otherwise.
+
+Positions and lengths are **millimetres**; `Spline.length` and `Spline.samples`
+are **metres in the chain node's local frame** (glTF convention). The position
+of an element is `drivePosition + start + OffsetToDrivePosition`, converted to an
+arc-length fraction over `ScaledOnFixedLength ? FixedLength : Length` — wrapping
+by modulo on OPEN and closed splines alike, with the negative branch
+`1 - |p| / length` (Unity `ChainElement.SetPosition()`, reproduced verbatim).
+A missing `Spline` block, fewer than two samples, or an unresolvable
+`ChainElement` makes the component inert with a warning; an unresolvable
+`ConnectedDrive` places the elements but never moves them.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `ConnectedDrive` | ComponentReference | - | Drive that moves the whole chain; unresolvable places the elements at their start positions without motion. |
+| `chainOrientation` | enum(Horizontal, Vertical) | "Horizontal" | Vertical applies Unity's tangent-side flip of the element up vector. |
+| `NumberOfElements` | number | 0 | Number of elements built from the template; 0 builds nothing. |
+| `StartPosition` | number | 0 | Position of the first element along the chain, in millimeters. |
+| `CalculatedDeltaPosition` | boolean | true | Derive the spacing from chain length divided by `NumberOfElements` instead of using `DeltaPosition`. |
+| `DeltaPosition` | number | 0 | Manual spacing between two elements in millimeters; ignored while `CalculatedDeltaPosition` is set. |
+| `ScaledOnFixedLength` | boolean | false | Scale the position fraction over `FixedLength` while the sample table stays tied to the real arc length. |
+| `FixedLength` | number | 1500 | The length in millimeters the fraction is scaled over while `ScaledOnFixedLength` is set. |
+| `ChainElement` | ComponentReference | - | The element template node (wire `componentType` `UnityEngine.Transform`); unresolvable makes the chain inert. |
+| `NameChainElement` | string | "" | Base name of the generated elements; empty falls back to the template's node name. |
+| `Spline` | object | - | Baked curve `{ closed, length, samples }` — `samples` flat `[px,py,pz, tx,ty,tz, ux,uy,uz]` per sample, arc-length equidistant, chain-node local, metres. |
+
+```json
+{ "Chain": { "ConnectedDrive": { "type": "ComponentReference", "path": "Line/ChainDrive", "componentType": "realvirtual.Drive" }, "NumberOfElements": 24, "CalculatedDeltaPosition": true, "ChainElement": { "type": "ComponentReference", "path": "Line/Chain/Carrier", "componentType": "UnityEngine.Transform" }, "NameChainElement": "Carrier", "Spline": { "closed": true, "length": 6.4, "samples": [0, 0, 0, 0, 0, 1, 0, 1, 0] } } }
+```
+
+#### 7a.51 ChainElement
+
+Per-element configuration of a `Chain`, authored on the element **template**
+node. It carries no behaviour of its own in a reader: the owning `Chain` reads
+these fields and poses every clone, mirroring Unity's batch update
+(`UseBatchUpdate`, which disables the per-element drive subscription).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `AlignWithChain` | boolean | true | Align the element with the chain tangent; off writes only the position and leaves the template rotation. |
+| `AlignVector` | Vector3 | - | Additional up reference in Unity local coordinates; unused on the Unity-spline path, where the baked up vectors are authoritative. |
+| `InitialPosition` | number | 0 | Initial position of the element along the chain in millimeters; set by the `Chain` for generated elements. |
+| `OffsetToDrivePosition` | number | 0 | Position offset of every element relative to the drive position, in millimeters. |
+
+```json
+{ "ChainElement": { "AlignWithChain": true, "OffsetToDrivePosition": 0 } }
 ```
 
 ### 7b. Logic Steps

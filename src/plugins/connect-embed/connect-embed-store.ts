@@ -4,8 +4,11 @@
 import type { RVAppConfig } from '../../core/rv-app-config';
 import type { ModeManager } from '../../core/rv-mode-manager';
 
-/** The demo model shipped in the CONNECT public-demo bundle. */
-export const CONNECT_EMBED_DEMO_MODEL = 'DemoRealvirtualWeb.glb';
+// `CONNECT_EMBED_DEMO_MODEL` used to live here — one more independent
+// definition of "the demo model", carried by a store that has no business
+// knowing what a GLB is. Since plan-726 the CONNECT bundle ships the same
+// `project.json` as every other channel, and what the demo opens comes out of
+// that manifest (`connect-embed-actions.ts`).
 
 /** Runtime states of the CONNECT embedded-demo gate. */
 export type ConnectEmbedState = 'gated-empty' | 'loading' | 'demo-running' | 'load-error';

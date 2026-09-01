@@ -18,6 +18,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -120,7 +121,7 @@ describe('one op-draft writer', () => {
 
   it('one edit ⇒ exactly ONE frame record, and nothing in the retired slot', async () => {
     const { viewer, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 200, 50);
     await vi.advanceTimersByTimeAsync(0);
@@ -137,7 +138,7 @@ describe('one op-draft writer', () => {
 
   it('nothing reaches storage before the 2000 ms debounce elapses', async () => {
     const { viewer, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 200, 50);
     await vi.advanceTimersByTimeAsync(0);
@@ -154,7 +155,7 @@ describe('one op-draft writer', () => {
 
   it('a whole editing run still writes ONE record — the debounce restarts', async () => {
     const { viewer, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     for (let i = 0; i < 5; i++) {
       doc.setField(boxPath, 'Drive', 'TargetSpeed', 100 + i, 50);
@@ -171,7 +172,7 @@ describe('one op-draft writer', () => {
 
   it('a document undone back to its baseline CLEARS its slot instead of writing one', async () => {
     const { viewer, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 200, 50);
     await vi.advanceTimersByTimeAsync(0);
@@ -193,7 +194,7 @@ describe('one op-draft writer', () => {
 
   it('a suspended document writes nothing — and flushDraft still can', async () => {
     const { viewer, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     doc.suspendAutosave();
 
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 200, 50);
@@ -219,7 +220,7 @@ describe('the retired legacy slot', () => {
 
   it('is never written, however much the document is edited', async () => {
     const { viewer, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 1, 50);
     await doc.whenIdle();
     await doc.flushDraft();
@@ -231,7 +232,7 @@ describe('the retired legacy slot', () => {
 
   it('a leftover record there is NOT offered back — recovery sees nothing', async () => {
     const leftover: AssetDraft = {
-      shell: { id: 'old', name: 'Ancient', base: { kind: 'empty' }, createdAt: 1 },
+      shell: { id: 'old', name: 'Ancient', base: { kind: 'document', documentId: 'doc_scratch', path: 'scratch.glb', name: 'Scratch' }, createdAt: 1 },
       ops: [],
       savedAt: 9_999_999,
     };
@@ -258,7 +259,7 @@ describe('shelf compatibility across the merge', () => {
     // the SCENE transform, which cannot occur in an asset document. That is why
     // this is readable with no migration and no read-side branch.
     const preMerge: AssetDraft = {
-      shell: { id: 'shelved-1', name: 'Pre-merge', base: { kind: 'empty' }, createdAt: 1000 },
+      shell: { id: 'shelved-1', name: 'Pre-merge', base: { kind: 'document', documentId: 'doc_scratch', path: 'scratch.glb', name: 'Scratch' }, createdAt: 1000 },
       ops: [
         {
           id: 'op-1', ts: 1, schemaV: 1, kind: 'setField',

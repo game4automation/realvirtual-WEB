@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, expect, it } from 'vitest';
-import { agentChartToRenderModel } from '../src/plugins/agents/agent-report';
+import { agentChartToRenderModel } from '../../realvirtual-WebViewer-Private~/src/plugins/agents/agent-report';
 
 describe('agent report chart mapping', () => {
   it('maps a validated line spec to the shared ECharts shape', () => {

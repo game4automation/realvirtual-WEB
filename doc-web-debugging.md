@@ -523,3 +523,46 @@ A slot whose role reads `control` when you expect `feedback` usually means the
 slot signal's PLC type never arrived (`_deriveSlotRole` falls back to `unknown`,
 which the gate treats like `control`) — check that the gateway registered the
 type, not the binding.
+
+### "Something is missing" — the duplicated-scene signature
+
+A user report of the shape *"parts of the machine are just not there"* after a
+CAD import or an editor open is often not a missing part at all: it is TWO
+complete copies of the model in the scene, drawn on top of each other, with
+z-fighting deciding per-pixel which one you see. The registry, the hierarchy and
+the selection outline all look perfectly correct, because they describe one of
+the copies — which is what makes it so confusing to chase from the UI.
+
+Ask `web_status` first; the counts give it away immediately:
+
+| Field | Healthy | Duplicated |
+|---|---|---|
+| `render.meshes` | the model's mesh count | roughly **2×** it (live case: 208 instead of ~92) |
+| `render.maskHistogram["mesh:1"]` | one entry per model mesh | **doubled** |
+| `render.meshesEffVisible` | matches the visible model | a mix of both copies, so neither count matches |
+
+Confirm from the console — a healthy scene has exactly one model root:
+
+```js
+window.__rvViewer.scene.children.filter((c) => c.userData._rvModelRoot).length  // must be 1
+window.__rvViewer.checkSingleModelRoot('manual')   // logs under the `loader` category in dev
+```
+
+**Recovery: reopen the document** (`web_editor_open`, or leave and re-enter the
+mode). The next load's `clearModel()` sweeps every tagged root, so one clean
+open is enough — nothing has to be repaired by hand and nothing was lost.
+
+**Cause, and why you should rarely see it now.** It took two overlapping
+`loadModel()` runs: the loser's root is parented by `loadGLB` but only tagged
+`_rvModelRoot` after the load completes, so the winner's `clearModel()` sweep
+ran through the window where the root was invisible to it. Since plan-442 the
+root adoption is generation-checked — an overtaken run disposes its own subtree
+and rejects with `LoadAbortedError` — and editor activations are serialized
+through one queue, so the two runs cannot overlap in the first place. A
+backgrounded tab used to widen the window enormously (Chrome throttles timers in
+hidden tabs, stretching a load from 6 s to 37 s in the reported case), which is
+why the report came from a session left in the background.
+
+If the doubled counts DO come back, that is a real regression: capture
+`web_status`, the `loader`-category log lines around the load, and whether the
+tab was hidden.

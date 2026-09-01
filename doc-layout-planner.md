@@ -50,7 +50,9 @@ In the Unity Editor:
 2. Open **Window → realvirtual → WebViewer**.
 3. Click **Export as Library Object**.
 4. Pick the destination filename — defaults to the GameObject's name with
-   a `.glb` suffix, inside the WebViewer `public/models/` folder.
+   a `.glb` suffix, inside the WebViewer `public/models/` folder. That folder is
+   the DEV built-in drop, a checkout convenience: to put the asset into a real
+   project, save it into that project from the viewer instead.
 
 The export uses the multi-root constructor with a single transform, so the
 exported scene has the GameObject itself as the top-level glTF node — no
@@ -605,6 +607,7 @@ specific authoring state.
 | Parameter | Effect |
 |---|---|
 | `?mode=planner` | Boots a fresh empty scene and opens the Layout Planner in authoring mode. If an explicit `?scene=` or `?model=` is also given, that scene/model loads instead of the empty one and the Planner still opens on top. |
+| `?doc=<doc_…>` | Boots the project document with that id — the form the viewer MINTS for anything the project owns (plan-716 §2.5). `?scene=<id>` still resolves for old links via the permanent alias map, but nothing writes it for a document any more. |
 | `?scene=empty` | Boots a fresh empty scene (no base GLB). The Planner is wired but not auto-opened. |
 | `?library=<url>` | Appends a catalog source on top of the standard library (§4). Repeatable: `?library=<a>&library=<b>`. Accepts catalog-JSON URLs and GitHub repo-scan URLs. |
 
@@ -625,7 +628,7 @@ The `?mode=planner` deep-link is handled in
 - [`doc-webviewer.md`](doc-webviewer.md) — overall architecture and the
   scene loading pipeline.
 - [`doc-persistence.md`](doc-persistence.md) — how Planner state is stored
-  in the Scene model.
+  in the document model.
 - [`doc-extending-webviewer.md`](doc-extending-webviewer.md) — plugin
   system and how layout-planner integrates as a plugin.
 - [`src/plugins/layout-planner/model-cache.ts`](src/plugins/layout-planner/model-cache.ts) —

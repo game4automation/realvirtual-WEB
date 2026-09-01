@@ -172,7 +172,7 @@ export function sceneDocumentView(
     undoLabel: snap.undoLabel,
     redoLabel: snap.redoLabel,
     actions: {
-      save: (prompt?: NamePrompt) => saveScene(store, prompt),
+      save: (prompt?: NamePrompt) => saveFromDocumentCard(store, prompt),
       undo: () => store.undo(),
       redo: () => store.redo(),
       menu,
@@ -186,7 +186,12 @@ export function sceneDocumentView(
 }
 
 /**
- * Save the scene — through the ONE save path (plan-710 F5).
+ * Save what the card has open — through the ONE save path (plan-710 F5).
+ *
+ * Called `saveScene()` until plan-720. The name outlived the split it described:
+ * there is one document type, so this is not "the scene save" beside some other
+ * save, it is the CARD's thin adapter onto `saveDocument()`. It cannot simply be
+ * called `saveDocument` — that is the imported core function it delegates to.
  *
  * This function used to BE the scene's save routing: its own no-op rule, its
  * own "needs a name" refusal, its own error wrapping, all a second copy of what
@@ -196,7 +201,7 @@ export function sceneDocumentView(
  * the card's `NamePrompt` (which carries a dialog title) into the plain
  * `requestName` callback the core path speaks.
  */
-async function saveScene(
+async function saveFromDocumentCard(
   store: SceneStore,
   prompt?: NamePrompt,
 ): Promise<ActiveDocumentSaveOutcome> {

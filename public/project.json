@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 2,
+  "id": "prj_sample",
+  "name": "DemoRealvirtual",
+  "canonicalName": "demorealvirtual",
+  "kind": "demo",
+  "createdAt": "2026-08-27",
+  "activeSceneId": null,
+  "settings": {
+    "defaultModel": "DemoRealvirtualWeb.glb"
+  },
+  "libraries": [
+    { "url": "library/catalog.json", "label": "realvirtual Library" }
+  ],
+  "documents": [
+    {
+      "id": "doc_demorealvirtualweb_7l7hfw",
+      "name": "realvirtual WEB Demo",
+      "path": "DemoRealvirtualWeb.glb",
+      "section": "models",
+      "settingsPath": "DemoRealvirtualWeb.settings.json"
+    },
+    {
+      "id": "doc_demoplanner_gf4m6v",
+      "name": "Layout Planner Demo",
+      "path": "DemoPlanner.glb",
+      "section": "scenes",
+      "mode": "planner"
+    },
+    {
+      "id": "doc_test-des-turntable-loop_1y3v7m0",
+      "name": "Test DES Turntable Loop",
+      "path": "Test-DES-Turntable-Loop.glb",
+      "section": "scenes",
+      "mode": "des",
+      "devOnly": true
+    }
+  ]
+}

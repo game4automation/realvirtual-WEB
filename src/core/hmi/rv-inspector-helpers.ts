@@ -12,6 +12,7 @@
 import { getConsumedFields, getIgnoredFields, isKnownComponentType } from '../engine/rv-extras-validator';
 import { getCapabilities } from '../engine/rv-component-registry';
 import { COLLISION_ROLES } from '../engine/rv-collision-role';
+import { NODE_KNOWLEDGE_PROVENANCE_FIELDS, NODE_KNOWLEDGE_TYPE } from '../engine/rv-node-knowledge';
 import type { SignalStore } from '../engine/rv-signal-store';
 import { readSignalValue, formatValue } from './rv-value-resolver';
 import {
@@ -149,10 +150,19 @@ export const HIDDEN_FIELD_NAMES = new Set(['Name']);
  *    • A universal `ObjectHeaderSection` already exposes them (Locked,
  *      Visible), or
  *    • A registered ComponentAction (button) renders the control instead
- *      (Splat.InvertX/Y/Z → Invert X/Y/Z buttons). */
+ *      (Splat.InvertX/Y/Z → Invert X/Y/Z buttons), or
+ *    • A registered custom FIELD RENDERER already shows them — the
+ *      NodeKnowledge note renderer draws date/author/confidence in its own
+ *      header, so a second set of rows would be duplication (plan-431 §2.2).
+ *
+ *  This is also how a field is made non-editable WITHOUT `readonly: true`: the
+ *  schema flag is shared with the overlay write guard, so it would block
+ *  programmatic writes too (see the warning in `rv-node-knowledge.ts`). Hiding
+ *  the row removes the editor and leaves the write path open. */
 export const HIDDEN_FIELDS_PER_TYPE: Record<string, ReadonlySet<string>> = {
   LayoutObject: new Set(['Locked', 'Visible']),
   Splat: new Set(['InvertX', 'InvertY', 'InvertZ']),
+  [NODE_KNOWLEDGE_TYPE]: new Set(NODE_KNOWLEDGE_PROVENANCE_FIELDS),
 };
 
 /** True if the given field should be hidden in the inspector, considering

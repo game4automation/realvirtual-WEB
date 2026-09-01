@@ -96,19 +96,53 @@ describe('origin policy', () => {
     expect(persistedUrls()).toEqual([]);
   });
 
-  test('GitHub stays opt-in: never persisted, never auto-restored', async () => {
+  // GitHub is opt-in about how a library may ARRIVE (a deliberate add, never a
+  // scene or a manifest), not about how long it may stay. Persisting a repo the
+  // user typed in is what makes "add it once" mean what it says: before this,
+  // the library appeared, worked, and was gone after the next reload with
+  // nothing said about why.
+  test('a user-added GitHub library is persisted and comes back', async () => {
     const store = new LibraryStore();
-    // A manual add loads it this session…
     await store.addCatalog(GITHUB, 'user');
     expect(store.catalogUrls).toContain(GITHUB);
-    // …but it is never written to the global list.
-    expect(persistedUrls()).not.toContain(GITHUB);
+    expect(persistedUrls()).toContain(GITHUB);
 
-    // And a GitHub URL that leaked into storage is skipped on restore.
+    const restored = new LibraryStore();
+    await restored.restoreFromStorage();
+    expect(restored.catalogUrls).toContain(GITHUB);
+    expect(restored.getOrigin(GITHUB)).toBe('user');
+  });
+
+  // The failure the old blanket rule was written for, and the reason the new
+  // one keys on an EXPLICIT origin rather than the `?? 'user'` fallback: a
+  // former build-default GitHub URL sitting in a pre-plan-372 storage list
+  // carries no origin, and must not re-scan (and 404 on) GitHub every boot.
+  test('a GitHub URL that leaked into storage without an origin is skipped', async () => {
     localStorage.setItem('rv-layout-library-urls', JSON.stringify([GITHUB, URL_A]));
     const restored = new LibraryStore();
     await restored.restoreFromStorage();
     expect(restored.catalogUrls).toEqual([URL_A]);
+  });
+
+  // A manifest is not something that happens TO a user — it is the project
+  // they opened, and a library it names is part of that project. Needing the
+  // network to resolve it is expected.
+  test('a project manifest MAY reference a GitHub library', async () => {
+    const store = new LibraryStore();
+    await store.applyProjectLibraries([GITHUB, URL_A]);
+    expect(store.catalogUrls).toEqual([GITHUB, URL_A]);
+    expect(store.getOrigin(GITHUB)).toBe('projectManifest');
+  });
+
+  // ...but it must not leave its libraries behind in the NEXT project.
+  test('a manifest GitHub library never leaks into the global list', async () => {
+    const store = new LibraryStore();
+    await store.applyProjectLibraries([GITHUB]);
+    expect(persistedUrls()).not.toContain(GITHUB);
+
+    // Switching to a project that does not name it drops it again.
+    await store.applyProjectLibraries([URL_A]);
+    expect(store.catalogUrls).toEqual([URL_A]);
   });
 });
 
@@ -146,10 +180,16 @@ describe('two levels: project manifest vs. global list', () => {
     expect(persistedUrls()).toEqual([URL_B]);
   });
 
-  test('a GitHub URL in a manifest is not auto-scanned', async () => {
+  // A GitHub library is a project-level subscription like any other: loaded
+  // for as long as the project that names it is open, and gone with it.
+  test('a GitHub URL in a manifest loads, and leaves with the project', async () => {
     const store = new LibraryStore();
     await store.applyProjectLibraries([GITHUB]);
+    expect(store.catalogUrls).toContain(GITHUB);
+
+    await store.applyProjectLibraries([]);        // project closed
     expect(store.catalogUrls).not.toContain(GITHUB);
+    expect(persistedUrls()).not.toContain(GITHUB);
   });
 });
 

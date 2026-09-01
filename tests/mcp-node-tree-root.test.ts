@@ -15,7 +15,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { Group, Object3D, Scene } from 'three';
-import { McpBridgePlugin } from '../src/plugins/mcp-bridge-plugin';
+// plan-713 Phase 1 — web_node_tree moved off the plugin into McpSceneTools.
+import { McpSceneTools } from '../src/plugins/mcp-bridge/rv-mcp-scene-tools';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import type { RVViewer } from '../src/core/rv-viewer';
 
@@ -57,10 +58,8 @@ function buildScene() {
   return { scene, modelRoot, layoutRoot, registry };
 }
 
-function makePlugin(viewer: Partial<RVViewer>): McpBridgePlugin {
-  const plugin = new McpBridgePlugin();
-  (plugin as unknown as { viewer: unknown }).viewer = viewer;
-  return plugin;
+function makePlugin(viewer: Partial<RVViewer>): McpSceneTools {
+  return new McpSceneTools(() => viewer as RVViewer);
 }
 
 async function nodeTree(viewer: Partial<RVViewer>, root = '', depth = 3): Promise<TreeEntry> {

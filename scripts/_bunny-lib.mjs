@@ -42,10 +42,19 @@ import { documentsInSection, withDerivedDocuments } from './_rv-manifest.mjs';
 //! identical byte length, so size-only diff would incorrectly skip them and
 //! the CDN would keep serving HTML that points at stale JS/CSS.
 // SOURCE: BunnyCdnUploader.cs:637 (IsAlwaysUploadFile) — keep in sync
+//!
+//! `project.json` joined them for a different but equally load-bearing reason
+//! (plan-726 Phase 3): it is the boot SSOT of the public demo, it sits at a
+//! FIXED url, and a curator's edit — renaming a document, swapping the start
+//! document — routinely leaves the byte count untouched. It must never be
+//! cached like a hashed build asset, so it is always re-uploaded and the pull
+//! zone is purged afterwards (`maybePurge`), which together are what let the
+//! rollback in plan-726 §5.6 be "replace one file" rather than "redeploy".
 export const ALWAYS_UPLOAD_FILES = new Set([
   'settings.json',
   'models.json',
   'manifest.json',
+  'project.json',
 ]);
 
 const DEFAULT_REGION = 'storage.bunnycdn.com';
@@ -53,18 +62,24 @@ export const DEFAULT_NEWS_API_URL = 'https://download.realvirtual.io/news/api/v1
 const FETCH_TIMEOUT_MS = 300_000; // parity with C# HttpClient.Timeout = 5 min (R4)
 const MAX_ATTEMPTS = 3;
 
-//! Public-demo model allowlist prefix. On a PUBLIC deploy, only top-level
-//! `models/*.glb` whose filename starts with this prefix (case-insensitive) are
-//! published; the component library is a sibling of models/ and is never seen here.
-//! Every other top-level GLB (test fixtures, helper/MU GLBs, stray models) is
-//! pruned before upload so the public CDN ships only the official demo models.
+//! Public-demo model allowlist prefixes (comma-separated). On a PUBLIC deploy,
+//! only top-level `models/*.glb` whose filename starts with one of these prefixes
+//! (case-insensitive) are published; the component library is a sibling of
+//! models/ and is never seen here. Every other top-level GLB (test fixtures,
+//! helper/MU GLBs, stray models) is pruned before upload so the public CDN ships
+//! only the official demo models. DemoCSGMachining was public by user decision
+//! 2026-08-07 (plan-430) and was made INTERNAL again by user decision 2026-08-30 —
+//! it and DemoRobotIK are dev/test models (repo fixtures), not demo surface.
 //! Override per-deploy via the RV_PUBLIC_MODEL_PREFIX env var.
 export const PUBLIC_MODEL_PREFIX = 'DemoRealvirtual';
 
-//! Example scenes (`public/scenes/*.scene.json`) whose filename starts with this
-//! prefix (case-insensitive) are TEST fixtures: they live in the repo and show up
-//! in the dev "Examples" list, but must NEVER ship to the public demo. The public
-//! deploy prunes them from `dist/scenes/` (file + index.json) before upload.
+//! FALLBACK ONLY since plan-731 2k — `devOnly` on the manifest row is the rule.
+//! Example scenes (`public/scenes/*.glb`) whose filename starts with this prefix
+//! (case-insensitive) are TEST fixtures: they live in the repo and show up in the
+//! dev "Examples" list, but must NEVER ship to the public demo. The public deploy
+//! prunes them from `dist/scenes/` (file + index.json) before upload. `.scene.json`
+//! is still matched by the pruner for dists built from an older source tree — see
+//! `applyPublicScenePruning()` — but is no longer an authored format (plan-413).
 //! Override per-deploy via the RV_PUBLIC_TEST_SCENE_PREFIX env var.
 export const PUBLIC_TEST_SCENE_PREFIX = 'Test';
 
@@ -632,8 +647,8 @@ export function publishedSceneIndex(project) {
   return out.length > 0 ? out : null;
 }
 
-//! The GLBs a project publishes, in `readdirSync` order — the exact contents of
-//! the deployed `models.json`.
+//! The GLBs a project publishes, in `readdirSync` order first — the exact
+//! contents of the deployed `models.json`.
 //!
 //! **The folder is the source of truth, not the manifest** (plan-700 P0-3).
 //! plan-372 turned the browser-side `FolderBackend.listModels()` directory-driven
@@ -643,16 +658,125 @@ export function publishedSceneIndex(project) {
 //! bookkeeping that decision removed — and, with the manifests already emptied,
 //! would have published nothing.
 //!
+//! **Since plan-720 the list is a UNION, never a replacement** (Z2). P0-3 stands
+//! unchanged: a manifest can never HIDE a GLB that sits in `models/`. What it can
+//! do is ADD one the folder glob cannot see — a ROOT-LEVEL document, which is the
+//! layout the browser writes today (`wmyb/P1002_SAIER.glb`) and which published an
+//! empty `models.json` for as long as the glob was the whole answer. So:
+//!
+//!   union = every `models/*.glb` on disk
+//!         ∪ every `documents[]` entry that names an existing root-level or
+//!           `models/`-level `.glb`
+//!
+//! Documents under `scenes/` or `library/` are deliberately NOT in the union:
+//! staging copies those folders wholesale and they are catalogued elsewhere
+//! (`publishedSceneIndex()` / the library catalogue). Pulling them into
+//! `models.json` would duplicate their bytes into `models/` and list a library
+//! part as a machine model.
+//!
 //! Extracted from `stagePrivateProject` only so the derivation can be asserted
 //! against the real project folders without staging half a gigabyte of GLB.
 export function projectModelNames(projectDir) {
+  return projectModelNamesWithReport(projectDir).list;
+}
+
+//! `projectModelNames()` plus the bookkeeping it deliberately does not throw on:
+//! `{ list, sources, discrepancies }`.
+//!
+//! - `list` — the union of filenames written to `models.json`.
+//! - `sources` — Map<name, absolute source path>. A root-level document is
+//!   staged INTO `models/` under its bare filename, so the staging step needs to
+//!   know where each name actually came from.
+//! - `discrepancies` — `{ kind, path, reason }[]`. A manifest entry whose file is
+//!   gone is reported and NOT published (a dead `models.json` row 404s in the
+//!   viewer); a `models/` GLB with no manifest entry is reported and IS published
+//!   (P0-3). Both used to be silent, which is how the wmyb defect survived a
+//!   delivery: nothing that runs printed the fact that the publish list was empty.
+//!
+//! Reads the manifest defensively rather than through `loadProject()`: deriving a
+//! file list must never throw on a project that fails `code`/`name` validation —
+//! that verdict belongs to the deploy gate, one layer up. The manifest projection
+//! itself is still the shared one (`withDerivedDocuments()`), so an unmigrated
+//! customer's `models[]`/`library[]` is seen exactly as everywhere else.
+export function projectModelNamesWithReport(projectDir) {
+  const list = [];
+  const sources = new Map();
+  const discrepancies = [];
+
   const modelsDir = join(projectDir, 'models');
-  if (!existsSync(modelsDir)) return [];
-  const names = [];
-  for (const entry of readdirSync(modelsDir, { withFileTypes: true })) {
-    if (entry.isFile() && extname(entry.name).toLowerCase() === '.glb') names.push(entry.name);
+  if (existsSync(modelsDir)) {
+    for (const entry of readdirSync(modelsDir, { withFileTypes: true })) {
+      if (!entry.isFile() || extname(entry.name).toLowerCase() !== '.glb') continue;
+      list.push(entry.name);
+      sources.set(entry.name, join(modelsDir, entry.name));
+    }
   }
-  return names;
+
+  const manifest = readProjectManifest(projectDir);
+  const documents = Array.isArray(manifest?.documents) ? manifest.documents : [];
+  const declared = new Set();
+  for (const doc of documents) {
+    const raw = typeof doc?.path === 'string' ? doc.path.replace(/^\.?\//, '').replace(/\\/g, '/') : '';
+    if (!raw || !raw.toLowerCase().endsWith('.glb')) continue;
+    // Only the two places a "model" can live. scenes/ and library/ are staged as
+    // folders and catalogued separately — see the union note above.
+    const segments = raw.split('/');
+    const isRootLevel = segments.length === 1;
+    const isModelsLevel = segments.length === 2 && segments[0].toLowerCase() === 'models';
+    if (!isRootLevel && !isModelsLevel) continue;
+    const name = segments[segments.length - 1];
+    declared.add(name);
+    if (list.includes(name)) continue; // folder already has it — P0-3, folder wins
+    const absolute = join(projectDir, ...segments);
+    if (!existsSync(absolute)) {
+      discrepancies.push({ kind: 'missing-file', path: raw, reason: 'declared in documents[] but not on disk' });
+      continue;
+    }
+    list.push(name);
+    sources.set(name, absolute);
+  }
+
+  // Informational only: the folder wins, but an unregistered GLB usually means a
+  // manifest that drifted from the folder, and that is worth saying out loud.
+  if (documents.length > 0) {
+    for (const name of list) {
+      if (!declared.has(name)) {
+        discrepancies.push({ kind: 'unregistered', path: `models/${name}`, reason: 'on disk but not in documents[]' });
+      }
+    }
+  }
+
+  return { list, sources, discrepancies };
+}
+
+//! The THIRD read entry point for a manifest, and the one the public deploy needs
+//! (plan-726 Phase 3).
+//!
+//! `loadProject()` is the private-project gate: it demands a `code` so a delivery
+//! can never land under `undefined/`. The PUBLIC demo deliberately has no `code`
+//! — its URL is the site itself — so `loadProject()` would throw on it, which is
+//! why the allowlist could not simply reuse it. `readProjectManifest()` is the
+//! non-throwing reader that already existed for `projectModelNamesWithReport()`;
+//! this only exports it under a name that says which manifest is meant.
+//!
+//! `rootDir` is a DEPLOY ROOT (a `dist/` or a staged `public/`), not a project
+//! folder — but the file, its name and its projection are the same, so there is
+//! deliberately no second parser here.
+export function readDeployManifest(rootDir) {
+  return readProjectManifest(rootDir);
+}
+
+//! Parses `<projectDir>/project.json` through the shared document projection,
+//! or null when it is absent or unparseable. Unlike `loadProject()` this neither
+//! validates nor throws — see `projectModelNamesWithReport()`.
+function readProjectManifest(projectDir) {
+  const jsonPath = join(projectDir, 'project.json');
+  if (!existsSync(jsonPath)) return null;
+  try {
+    return withDerivedDocuments(JSON.parse(readFileSync(jsonPath, 'utf8')));
+  } catch {
+    return null;
+  }
 }
 
 // ─── Private project: staging ────────────────────────────────────────────
@@ -708,7 +832,7 @@ export async function stagePrivateProject({ distDir, projectDir, encryption = nu
     }
   }
   // Copy dist/ subdirectories EXCEPT models/, scenes/ and library/; strip .glb out of assets/.
-  // scenes/ holds realvirtual's curated "Example" demos (public/scenes/*.scene.json +
+  // scenes/ holds realvirtual's curated "Example" demos (public/scenes/*.glb +
   // index.json); they are intentional only on the public demo deploy. A private/kiosk
   // customer build must not surface a generic realvirtual "Planner Demo" in its Models
   // panel, so the scenes/ folder is dropped here (the Examples section then stays hidden).
@@ -724,13 +848,22 @@ export async function stagePrivateProject({ distDir, projectDir, encryption = nu
     copyDirRecursive(join(distDir, entry.name), join(stagingDir, entry.name), exclude);
   }
 
-  // Copy project models/*.glb.
-  const projectModelsDir = join(projectDir, 'models');
+  // Copy the project's publishable GLBs — `models/*.glb` plus any root-level
+  // document the manifest declares (plan-720 union, see projectModelNames()).
+  // Everything lands in `models/` under its bare filename, which is the path
+  // `models.json` and `settings.defaultModel` both address.
   const stagingModelsDir = join(stagingDir, 'models');
   mkdirSync(stagingModelsDir, { recursive: true });
-  const glbNames = projectModelNames(projectDir);
+  const { list: glbNames, sources: glbSources, discrepancies } = projectModelNamesWithReport(projectDir);
+  for (const d of discrepancies) {
+    console.log(`[bunny] models.json ${d.kind}: ${d.path} (${d.reason})`);
+  }
+  if (glbNames.length === 0) {
+    console.log(`[bunny] WARNING: ${basename(projectDir)} publishes an EMPTY models.json `
+      + `(no models/*.glb and no root-level document in project.json).`);
+  }
   for (const name of glbNames) {
-    const src = join(projectModelsDir, name);
+    const src = glbSources.get(name);
     const dst = join(stagingModelsDir, name);
     // Provenance order is security-sensitive: sign the finished plaintext
     // GLB first, then wrap those signed bytes in the optional RVE1 envelope.
@@ -771,8 +904,10 @@ export async function stagePrivateProject({ distDir, projectDir, encryption = nu
   }
 
   // models.json (array of GLB filenames) — AlwaysUpload file.
-  // Deliberately still `readdirSync`-derived: the folder is the single source
-  // of truth for assets (plan-700 P0-3), the manifest is a metadata overlay.
+  // Folder-derived FIRST: the folder is the single source of truth for assets
+  // (plan-700 P0-3) and the manifest can never shorten this list. Since plan-720
+  // the manifest may LENGTHEN it by a root-level document — the only asset the
+  // glob structurally cannot see.
   writeFileSync(join(stagingDir, 'models.json'), JSON.stringify(glbNames));
 
   // settings.json with project assets path + analytics, on top of the
@@ -832,20 +967,51 @@ export function assertNoDevArtifacts(distDir) {
 //! Idempotent (safe to re-run on an already-pruned dist/, e.g. with --no-build).
 //! In `dryRun` mode nothing is written/deleted — only the report is computed.
 //! Returns { kept, dropped, droppedAssets } (filenames, sorted).
-export function applyPublicModelAllowlist(distDir, { prefix = PUBLIC_MODEL_PREFIX, dryRun = false } = {}) {
+//!
+//! ## `keep` — the manifest as the curator (plan-726 Phase 3)
+//!
+//! `keep` is an explicit list of `models/` filenames taken from the deploy
+//! manifest's `documents[]` (see `publicDemoModelAllowlist()`). When it is
+//! given it REPLACES the prefix rule: the manifest is what says what the demo
+//! contains, and a second curator that only agrees by coincidence is how
+//! `DemoRobotIK.glb` came to be deleted by every public deploy — it is a demo
+//! model, it is in the manifest, and it matches neither prefix.
+//!
+//! The prefix stays as the fallback for a dist/ with no manifest and as the
+//! `RV_PUBLIC_MODEL_PREFIX` escape hatch, so the signature is additive: every
+//! existing caller (and every existing test) that passes no `keep` keeps the
+//! behaviour it had.
+export function applyPublicModelAllowlist(
+  distDir,
+  { prefix = PUBLIC_MODEL_PREFIX, dryRun = false, keep = null } = {},
+) {
   const modelsDir = join(distDir, 'models');
   const kept = [];
   const dropped = [];
   const droppedAssets = [];
   if (!existsSync(modelsDir)) return { kept, dropped, droppedAssets };
 
-  const pfx = String(prefix || PUBLIC_MODEL_PREFIX).toLowerCase();
+  // Comma-separated prefix list; a filename matching ANY prefix is kept.
+  const prefixes = String(prefix || PUBLIC_MODEL_PREFIX)
+    .split(',')
+    .map((p) => p.trim().toLowerCase())
+    .filter(Boolean);
+  // A manifest-derived list is authoritative and exact — never a prefix. Compared
+  // case-INSENSITIVELY here only because this half runs against a filesystem
+  // (Windows dev machines answer `readdir` with the on-disk case); the guard
+  // downstream does the case-SENSITIVE comparison that the Linux CDN cares about.
+  const explicit = Array.isArray(keep)
+    ? new Set(keep.map((f) => String(f).trim().toLowerCase()).filter(Boolean))
+    : null;
+  const isKept = (name) => (explicit
+    ? explicit.has(name.toLowerCase())
+    : prefixes.some((pfx) => name.toLowerCase().startsWith(pfx)));
 
   // Step 1+2: prune top-level models/*.glb; subdirectories (incl. library/) skipped.
   for (const entry of readdirSync(modelsDir, { withFileTypes: true })) {
     if (!entry.isFile()) continue;
     if (extname(entry.name).toLowerCase() !== '.glb') continue;
-    if (entry.name.toLowerCase().startsWith(pfx)) {
+    if (isKept(entry.name)) {
       kept.push(entry.name);
     } else {
       dropped.push(entry.name);
@@ -880,57 +1046,198 @@ export function applyPublicModelAllowlist(distDir, { prefix = PUBLIC_MODEL_PREFI
   };
 }
 
+// ─── Public deploy: the manifest as the curator (plan-726 Phase 3) ───────
+
+//! The `models/` filenames the deploy manifest declares, or null when the root
+//! has no readable `project.json`.
+//!
+//! Null and `[]` mean different things and the caller must keep them apart:
+//! null is "this dist/ has no manifest, use the prefix rule", `[]` is "the
+//! manifest declares no models", which is a manifest worth failing on rather
+//! than silently reinterpreting.
+//!
+//! Only `models/<file>.glb` counts. `scenes/` is pruned by a separate pass
+//! (`applyPublicScenePruning`) and `library/` is not a document surface here —
+//! see `assertPublicDemoManifestSatisfied()` for the check that covers all of
+//! them at once.
+export function publicDemoModelAllowlist(distDir) {
+  const manifest = readDeployManifest(distDir);
+  if (!manifest) return null;
+  const documents = Array.isArray(manifest.documents) ? manifest.documents : [];
+  const out = [];
+  for (const doc of documents) {
+    const raw = manifestDocumentPath(doc);
+    const segments = raw.split('/');
+    if (segments.length !== 2) continue;
+    if (segments[0].toLowerCase() !== 'models') continue;
+    if (!raw.toLowerCase().endsWith('.glb')) continue;
+    out.push(segments[1]);
+  }
+  return out;
+}
+
+//! Normalised, POSIX, leading-`./` and leading-`/` stripped path of a document row.
+function manifestDocumentPath(doc) {
+  const raw = doc && typeof doc.path === 'string' ? doc.path : '';
+  return raw.replace(/\\/g, '/').replace(/^\.?\//, '');
+}
+
+//! THE public-demo deploy gate: every document the manifest names is actually in
+//! `dist/` after all pruning has run (plan-726 F5).
+//!
+//! ## Why it exists
+//!
+//! The manifest is the boot SSOT of the demo — `settings.defaultModel` and the
+//! document list both come from it — so a document it names that the deploy does
+//! not ship is a 404 the visitor hits and nobody else sees. Before this, the only
+//! curator was a filename prefix, and the two could not disagree because there
+//! was only one of them.
+//!
+//! ## Three things it does deliberately
+//!
+//! - **models AND scenes.** `scenes/DemoPlanner.glb` is pruned by
+//!   `applyPublicScenePruning()`, a completely separate, prefix-based pass. A
+//!   guard hanging off the model allowlist would never have looked at the demo's
+//!   fourth document at all.
+//! - **Case-SENSITIVE.** The comparison is against the real names in `dist/`,
+//!   byte for byte. A manifest that says `Models/Demo.glb` passes on a Windows
+//!   dev machine and 404s on the Linux CDN, and a case-insensitive guard is a
+//!   guard that lets exactly that through.
+//! - **`library/` is skipped.** A manifest may subscribe to library assets that
+//!   are staged by another step or not shipped at all; that is not this gate's
+//!   question.
+//!
+//! Returns the list of offending paths; the caller decides to throw. Never
+//! throws by itself, and a dist/ with no manifest is vacuously fine (`[]`).
+export function publicDemoManifestMisses(distDir) {
+  const manifest = readDeployManifest(distDir);
+  if (!manifest) return [];
+  const documents = Array.isArray(manifest.documents) ? manifest.documents : [];
+  const misses = [];
+  for (const doc of documents) {
+    const rel = manifestDocumentPath(doc);
+    if (rel === '') continue;
+    const section = rel.split('/')[0].toLowerCase();
+    if (section !== 'models' && section !== 'scenes') continue;
+    if (!existsOnDiskExactly(distDir, rel)) misses.push(rel);
+  }
+  return misses;
+}
+
+//! `existsSync` that also insists on the SPELLING, one path segment at a time.
+//!
+//! `existsSync` alone answers "yes" for `Models/Demo.glb` on Windows and macOS,
+//! which is precisely the typo this guard is here to catch — it would survive
+//! every local check and break only on the Linux storage zone.
+function existsOnDiskExactly(rootDir, relPath) {
+  let current = rootDir;
+  for (const segment of relPath.split('/')) {
+    if (segment === '') continue;
+    let entries;
+    try { entries = readdirSync(current); } catch { return false; }
+    if (!entries.includes(segment)) return false;
+    current = join(current, segment);
+  }
+  return true;
+}
+
 // ─── Public deploy: test-scene pruning ───────────────────────────────────
 
-//! Prunes TEST example scenes from a freshly built public `dist/` so they never
-//! reach the public CDN (they stay in the repo + the dev Examples list):
+//! Prunes DEV-ONLY documents from a freshly built public `dist/` so they never
+//! reach the public CDN (they stay in the repo and in the dev checkout's list).
 //!
-//!  1. `dist/scenes/<prefix>*.{glb,scene.json}` — DELETE every example scene
-//!     whose filename starts with `prefix` (case-insensitive; default "Test").
-//!     Examples are GLBs since plan-413 phase 3; `.scene.json` is still matched
-//!     because a dist built from an older source tree may still contain one, and
-//!     a pruner that silently stops pruning is how a test scene reaches the
-//!     public CDN.
-//!  2. `dist/scenes/index.json` — rewrite the curated Examples manifest to DROP
-//!     the entries that point at the deleted files, so the public demo's Examples
-//!     list never references (or 404s on) a test scene.
+//! ## `devOnly` decides, the filename only catches strays (plan-731 2k)
+//!
+//! The rule used to be a FILENAME CONVENTION: anything under `dist/scenes/`
+//! starting with "Test". Two things were wrong with it. It could not say "this
+//! one is a fixture" about a file whose name does not start with Test — and it
+//! could not be seen from the manifest at all, so no release gate could check
+//! that it had done its job. `devOnly: true` on the `documents[]` row says it
+//! once, in the place both the app and the gate read.
+//!
+//! So the passes are, in order:
+//!
+//!  1. **`dist/project.json`** — every document row with `devOnly: true` has its
+//!     FILE deleted and its ROW removed from the shipped manifest. Wherever the
+//!     file sits: the folder is a place, not a type (plan-716), and the fixture
+//!     this rule exists for moved out of `scenes/` in plan-731 2a.
+//!  2. **`dist/scenes/<prefix>*.{glb,scene.json}`** — the old filename rule, kept
+//!     as a defensive FALLBACK for a `dist/` built from an older source tree
+//!     whose manifest carries no `devOnly` at all. A pruner that silently stops
+//!     pruning is how a test scene reaches the public CDN.
+//!  3. **`dist/scenes/index.json`** — likewise: rewrite the legacy curated
+//!     Examples manifest to drop what pass 2 deleted, so an old dist's Examples
+//!     list never 404s. Our own builds ship no such file since plan-731 2g.
 //!
 //! Idempotent (safe to re-run on an already-pruned dist/, e.g. with --no-build).
 //! In `dryRun` mode nothing is written/deleted — only the report is computed.
-//! Returns { kept, dropped } (scene filenames, sorted).
+//! Returns { kept, dropped } — relative paths of the SHIPPED and PRUNED
+//! documents, sorted. (Paths, not bare filenames, since a dev-only document is
+//! no longer confined to one folder.)
 export function applyPublicScenePruning(distDir, { prefix = PUBLIC_TEST_SCENE_PREFIX, dryRun = false } = {}) {
-  const scenesDir = join(distDir, 'scenes');
   const kept = [];
   const dropped = [];
-  if (!existsSync(scenesDir)) return { kept, dropped };
-
   const pfx = String(prefix || PUBLIC_TEST_SCENE_PREFIX).toLowerCase();
 
-  // Step 1: delete test scene files (matched by name prefix + a scene extension).
-  for (const entry of readdirSync(scenesDir, { withFileTypes: true })) {
-    if (!entry.isFile()) continue;
-    if (!/\.(glb|scene\.json)$/i.test(entry.name)) continue;
-    if (entry.name.toLowerCase().startsWith(pfx)) {
-      dropped.push(entry.name);
-      if (!dryRun) rmSync(join(scenesDir, entry.name), { force: true });
-    } else {
-      kept.push(entry.name);
+  // ── Pass 1: the manifest's own dev-only rows ──────────────────────────
+  const manifestPath = join(distDir, 'project.json');
+  if (existsSync(manifestPath)) {
+    let manifest = null;
+    try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { manifest = null; }
+    const rows = manifest && Array.isArray(manifest.documents) ? manifest.documents : null;
+    if (rows) {
+      const survivors = [];
+      for (const row of rows) {
+        const path = row && typeof row === 'object' && typeof row.path === 'string'
+          ? row.path : null;
+        if (!path) { survivors.push(row); continue; }
+        if (row.devOnly === true) {
+          dropped.push(path);
+          if (!dryRun) rmSync(join(distDir, path), { force: true });
+        } else {
+          kept.push(path);
+          survivors.push(row);
+        }
+      }
+      if (!dryRun && survivors.length !== rows.length) {
+        writeFileSync(
+          manifestPath,
+          JSON.stringify({ ...manifest, documents: survivors }, null, 2) + '\n',
+        );
+      }
     }
   }
 
-  // Step 2: drop the pruned files from the curated index.json (match by the same
-  // filename prefix so a stale entry can't resurrect a deleted scene as a 404).
-  const indexPath = join(scenesDir, 'index.json');
-  if (existsSync(indexPath)) {
-    let arr = null;
-    try { arr = JSON.parse(readFileSync(indexPath, 'utf8')); } catch { arr = null; }
-    if (Array.isArray(arr)) {
-      const filtered = arr.filter((e) => {
-        const f = e && typeof e === 'object' ? e.file : undefined;
-        return !(typeof f === 'string' && f.toLowerCase().startsWith(pfx));
-      });
-      if (!dryRun && filtered.length !== arr.length) {
-        writeFileSync(indexPath, JSON.stringify(filtered, null, 2) + '\n');
+  // ── Pass 2: the filename fallback, for a dist from an older source tree ──
+  const scenesDir = join(distDir, 'scenes');
+  if (existsSync(scenesDir)) {
+    for (const entry of readdirSync(scenesDir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      if (!/\.(glb|scene\.json)$/i.test(entry.name)) continue;
+      const rel = `scenes/${entry.name}`;
+      if (dropped.includes(rel) || kept.includes(rel)) continue;   // pass 1 ruled on it
+      if (entry.name.toLowerCase().startsWith(pfx)) {
+        dropped.push(rel);
+        if (!dryRun) rmSync(join(scenesDir, entry.name), { force: true });
+      } else {
+        kept.push(rel);
+      }
+    }
+
+    // ── Pass 3: the legacy curated index, matched by the same prefix ──────
+    const indexPath = join(scenesDir, 'index.json');
+    if (existsSync(indexPath)) {
+      let arr = null;
+      try { arr = JSON.parse(readFileSync(indexPath, 'utf8')); } catch { arr = null; }
+      if (Array.isArray(arr)) {
+        const filtered = arr.filter((e) => {
+          const f = e && typeof e === 'object' ? e.file : undefined;
+          if (typeof f !== 'string') return true;
+          return !(f.toLowerCase().startsWith(pfx) || dropped.includes(`scenes/${f}`));
+        });
+        if (!dryRun && filtered.length !== arr.length) {
+          writeFileSync(indexPath, JSON.stringify(filtered, null, 2) + '\n');
+        }
       }
     }
   }

@@ -36,6 +36,7 @@ import {
   writeSceneGlbFile,
 } from '../rv-project-storage';
 import { assertReadableScenePath } from '../rv-legacy-format';
+import { CONNECT_CONFIG_SUFFIX, KNOWLEDGE_FILE_SUFFIX } from '../rv-project-refs';
 import {
   assertRevisionPrecondition,
   glbSceneRecord,
@@ -65,6 +66,7 @@ import {
 } from '../rv-project-types';
 import {
   assertWritable,
+  isInternalProjectPath,
   WriteQueue,
   type ProjectBackend,
   type ResolvedBackendBlob,
@@ -229,6 +231,15 @@ export class FolderBackend implements ProjectBackend {
    * collection chips the provider derives from it. A missing root is normal.
    */
   private async _walkAssets(root: string): Promise<string[]> {
+    return this._walkMatching(root, lower =>
+      FolderBackend.ASSET_EXTENSIONS.some(ext => lower.endsWith(ext)));
+  }
+
+  /** The one recursive walk — `matches` gets the LOWERCASED file name. */
+  private async _walkMatching(
+    root: string,
+    matches: (lowerName: string) => boolean,
+  ): Promise<string[]> {
     const dir = await this._resolveDir(root);
     if (!dir) return [];
     // The empty root is the project itself — its files are paths with no
@@ -243,8 +254,7 @@ export class FolderBackend implements ProjectBackend {
           if (!name.startsWith('.')) subdirs.push(`${prefix}${name}`);
           continue;
         }
-        const lower = name.toLowerCase();
-        if (FolderBackend.ASSET_EXTENSIONS.some(ext => lower.endsWith(ext))) {
+        if (matches(name.toLowerCase())) {
           out.push(`${prefix}${name}`);
         }
       }
@@ -252,7 +262,7 @@ export class FolderBackend implements ProjectBackend {
       return out.sort();
     }
     out.sort();
-    for (const sub of subdirs.sort()) out.push(...await this._walkAssets(sub));
+    for (const sub of subdirs.sort()) out.push(...await this._walkMatching(sub, matches));
     return out;
   }
 
@@ -336,6 +346,39 @@ export class FolderBackend implements ProjectBackend {
       else library.push(row ?? { path });
     }
     return documentsFromLists({ scenes, models, library }, declared);
+  }
+
+  /**
+   * Every `*.connect.json` under the project root — by ENDING, not by folder
+   * (see the interface). The walk includes `connect/`, which the asset walk
+   * also enters but never matches anything in.
+   */
+  async listConnectConfigs(): Promise<string[]> {
+    return this._walkMatching('', lower => lower.endsWith(CONNECT_CONFIG_SUFFIX));
+  }
+
+  /** Every `*.knowledge.md` under the project root — see the interface. */
+  async listKnowledgeFiles(): Promise<string[]> {
+    return this._walkMatching('', lower => lower.endsWith(KNOWLEDGE_FILE_SUFFIX));
+  }
+
+  /**
+   * EVERY file under the project root, internals excluded (plan-445 F1).
+   *
+   * The same `_walkMatching` the two listings above run, with the predicate
+   * opened up: a catch-all instead of an ending. That is the whole difference,
+   * and it is what lets the dashboard replace two walks with one — the by-ending
+   * split happens afterwards, on the paths, in `classifyProjectFiles`.
+   *
+   * The filter runs on the PATH, not on the file name the walk matches with:
+   * `thumbnails/x.png` is internal because of its folder, and the predicate
+   * never sees a folder. (Dot-directories are skipped by the walk itself, so
+   * that clause of the rule is enforced twice — cheaply, and in the direction
+   * that fails safe.)
+   */
+  async listAllFiles(): Promise<string[]> {
+    const all = await this._walkMatching('', () => true);
+    return all.filter(path => !isInternalProjectPath(path));
   }
 
   /** Real `(size, mtime)` for every stored document. See the interface. */

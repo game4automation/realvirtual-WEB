@@ -271,6 +271,57 @@ export class RVPath {
   }
 }
 
+// ─── Path ends (plan-447 F2: snappoints at start/end) ────────────────────
+
+/** One free end of a path — the geometric basis of a path-end snappoint. */
+export interface PathEndpoint {
+  /** Which end of the segment chain this is. */
+  readonly which: 'start' | 'end';
+  /** World position of the end. */
+  readonly position: Vector3;
+  /**
+   * OUTWARD direction: at the start it points AGAINST travel (into the
+   * upstream neighbour), at the end it points ALONG travel (into the
+   * downstream neighbour) — the same convention the snap system uses for a
+   * port's outward normal, so two mating ends face each other.
+   */
+  readonly outward: Vector3;
+  /** Travel tangent at the end (always ALONG the path direction). */
+  readonly tangent: Vector3;
+  /** Material-flow semantics: a path START consumes, a path END emits. */
+  readonly flow: 'in' | 'out';
+}
+
+/**
+ * The two free ends of `path` (plan-447 F2) — null for a CLOSED path (a loop
+ * has no free ends) and for an empty segment chain. Positions/directions are
+ * derived from the SEGMENT DATA, not from a node's `matrixWorld`: path snaps
+ * are data-bound and must be re-derived after every geometry edit.
+ */
+export function getPathEndpoints(path: RVPath): { start: PathEndpoint; end: PathEndpoint } | null {
+  if (path.closed || path.segments.length === 0) return null;
+  const startPos = path.getAbsPosition(0);
+  const endPos = path.getAbsPosition(path.length);
+  const startTan = path.getAbsDirection(0);
+  const endTan = path.getAbsDirection(path.length);
+  return {
+    start: {
+      which: 'start',
+      position: startPos,
+      outward: startTan.clone().negate(),
+      tangent: startTan,
+      flow: 'in',
+    },
+    end: {
+      which: 'end',
+      position: endPos,
+      outward: endTan.clone(),
+      tangent: endTan,
+      flow: 'out',
+    },
+  };
+}
+
 // ─── rv_extras.Path schema (TS-SSOT, version 1) ──────────────────────────
 
 export const PATH_SCHEMA_VERSION = 1;
@@ -491,20 +542,48 @@ export class RVPathComponent implements RVComponent {
   /** Re-derive the path from the node's (edited) rv_extras and swap the
    *  network/zone registration. Called by the generic editor pipeline after
    *  setField/unsetField (`reapplySchemaForComponent` → `reapplyConfig`), so
-   *  segment/successor/zone edits take effect live — id changes included. */
+   *  segment/successor/zone edits take effect live — id changes included.
+   *
+   *  This is the LIVE-EDIT path (plan-447), NOT model-clear:
+   *  - the zone declaration goes through `ZoneRegistry.redefine` (hard capacity
+   *    overwrite so a SHRINK takes effect, holders preserved) instead of
+   *    `undefine` + `define` — a claim held by a driving vehicle must survive a
+   *    geometry edit, otherwise two vehicles end up inside one exclusive zone;
+   *    `undefine` stays reserved for {@link dispose} (model-cleared);
+   *  - the network is notified per pathId afterwards, which re-projects every
+   *    traveler onto the FRESH readonly `RVPath` object (rv-path-network.ts,
+   *    `reprojectTravelersOnPath`) and lets the visualizer / snap sources
+   *    re-derive.
+   */
   reapplyConfig(): void {
-    if (this.path) {
-      defaultPathNetwork.unregister(this.path.id);
-      if (this.path.zoneId) defaultZoneRegistry.undefine(this.path.zoneId);
-    }
+    const prevId = this.path?.id ?? null;
+    const prevZone = this.path?.zoneId ?? null;
+    if (this.path) defaultPathNetwork.unregister(this.path.id);
     // Invalidate the parse cache (pathFromNode memoizes on userData).
     delete (this.node.userData as Record<string, unknown>)['_rvPath'];
     this.path = pathFromNode(this.node);
-    if (!this.path) return; // unparsable payload → stays unregistered until fixed
-    defaultPathNetwork.register(this.path);
-    if (this.path.zoneId) {
-      defaultZoneRegistry.define(this.path.zoneId, this.path.zoneCapacity ?? undefined);
+    if (!this.path) {
+      // Unparsable payload → stays unregistered until fixed. Still announce the
+      // change so visualizer/snap consumers drop their stale derivation.
+      if (prevId !== null) defaultPathNetwork.notifyPathChanged(prevId);
+      return;
     }
+    defaultPathNetwork.register(this.path);
+    // The path LEFT its previous zone → withdraw only its capacity DECLARATION
+    // (back to "undeclared"), never the holders: another path may still share
+    // the zone, and the Agv claim walk re-declares the effective capacity on
+    // its next pass. `undefine` here would again free live claims.
+    if (prevZone && prevZone !== this.path.zoneId) {
+      defaultZoneRegistry.redefine(prevZone);
+    }
+    if (this.path.zoneId) {
+      defaultZoneRegistry.redefine(this.path.zoneId, this.path.zoneCapacity ?? undefined);
+    }
+    // An id rename affects BOTH ids: the old one vanished, the new one appeared.
+    if (prevId !== null && prevId !== this.path.id) {
+      defaultPathNetwork.notifyPathChanged(prevId);
+    }
+    defaultPathNetwork.notifyPathChanged(this.path.id);
   }
 }
 

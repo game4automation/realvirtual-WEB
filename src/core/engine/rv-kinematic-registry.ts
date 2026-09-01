@@ -158,8 +158,15 @@ export interface MechanismJointView {
 export interface MechanismLinkView {
   nodePath: string;
   name: string;
-  /** False when the link has no `MechanismBody` — the force analysis is then off. */
+  /** False when the link has no `MechanismBody` component at all. */
   hasBody: boolean;
+  /**
+   * False when the SOLVER counts this link as massless — no body, mass 0, or a
+   * degraded estimate (`massWarning` non-empty). This is the predicate the
+   * force analysis actually runs on; `hasBody` is mere component presence. UI
+   * that decides "is the analysis off?" must read THIS field, never `hasBody`.
+   */
+  hasMass: boolean;
   densityPreset: string;
   densityKgM3: number;
   /** Effective mass in kg (computed, or the override). 0 when unknown. */
@@ -225,6 +232,13 @@ export interface MechanismForceChannelView {
   unit: 'N' | 'N·m';
   /** This tick's value. Meaningless unless the snapshot's `dynamicsValid` is true. */
   value: number;
+  /**
+   * Node path of the link this channel physically belongs to — the link a
+   * drive dof moves, or the (child-side) link a bearing sits on. The panel's
+   * chart↔3D hover link keys on this; null when the topology has no link for
+   * the channel.
+   */
+  linkPath: string | null;
 }
 
 /** One joint's reaction wrench in world space — the input of the 3D arrows. */
@@ -275,6 +289,20 @@ export interface MechanismUiBridge {
    * `KinematicJoint` = 0). Omit it for the one-joint-per-node authoring shape.
    */
   jog(jointPath: string, value: number, componentType?: string): { converged: boolean; residualError: number } | null;
+  /**
+   * Re-solve one mechanism against the drives' CURRENT positions — TRANSIENT,
+   * no undo entry, no drive write.
+   *
+   * This is `jog()` without the drive half. A caller that already moved the axis
+   * node itself — the editor's drive-gizmo drag preview, which mutates the node
+   * against a pinned home pose — must not go through `jog()`: that would also run
+   * `applyToNode()` and re-derive the node transform from the drive's own base,
+   * fighting the pinned pose. Such a caller writes the position, then asks the
+   * dependent links to follow through here.
+   *
+   * Returns null when the mechanism is unknown or cannot solve.
+   */
+  solve(mechanismPath: string): { converged: boolean; residualError: number } | null;
   /** Rebuild a mechanism's topology after a structural authoring edit. */
   rebuild(mechanismPath: string): void;
   /** Apply a fixable finding's auto-fix; returns the field edits to persist. */
@@ -312,6 +340,13 @@ export interface MechanismUiBridge {
    * two triggers that leave the handle alive: play start and play stop.
    */
   resetForces(mechanismPath: string): void;
+
+  /**
+   * The live scene node behind each link — for the forces panel's chart↔3D
+   * hover link (raycast targets + emphasis roots). Direct references, no
+   * scene traversal: the bridge already holds the links.
+   */
+  linkNodes(mechanismPath: string): { path: string; node: Object3D }[];
 }
 
 let _uiBridge: MechanismUiBridge | null = null;

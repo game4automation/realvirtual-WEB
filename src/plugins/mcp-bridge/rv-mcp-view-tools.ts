@@ -22,7 +22,14 @@ import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { computeSubtreeAABB } from '../../core/engine/rv-traverse-utils';
 import { parsePathsParam } from './rv-object-analyzer-math';
-import { captureFrameCanvas, canvasToRvImage, saveCanvasToProject } from './rv-frame-capture';
+import {
+  captureFrameCanvas, canvasToRvImage, saveCanvasToProject, compositeMontage,
+} from './rv-frame-capture';
+import { computeFlyPose, type CameraPose } from './rv-camera-fly-math';
+import {
+  sweepPoses, sampleGrid, summarizeViewHits,
+  DEFAULT_SWEEP_COUNT, DEFAULT_SWEEP_PITCH_DEG, DEFAULT_TOP_N, type ViewNote,
+} from './rv-view-sweep-math';
 import { findPickOwner } from '../../core/engine/rv-pick-owner';
 import { projectLabelAnchors, drawAnnotations, type LabelTarget } from './rv-annotate';
 import {
@@ -34,6 +41,29 @@ import {
 
 const r3 = (n: number): number => +n.toFixed(3);
 const vec3 = (v: Vector3): [number, number, number] => [r3(v.x), r3(v.y), r3(v.z)];
+const num0 = (n: number | undefined): number =>
+  typeof n === 'number' && Number.isFinite(n) ? n : 0;
+
+// ── web_camera_fly ground probe (plan-705 §2.4 step 4) ──────────────────
+/** Eye height above the surface below when walking. Same value as FpvPlugin.DEFAULT_EYE_HEIGHT. */
+const EYE_HEIGHT_M = 1.7;
+/** Ray length of the downward probe. Same value as GROUND_RAY_MAX in fpv-plugin.tsx (L32). */
+const GROUND_RAY_MAX_M = 50;
+/**
+ * How far ABOVE the computed position the probe starts, so a camera already
+ * below a floor still finds it. The FPV plugin uses the same number as an
+ * unnamed inline literal (`camPos.y + 10`); only the VALUE is adopted here, it
+ * is not an existing exported constant.
+ */
+const GROUND_PROBE_UP_M = 10;
+
+// ── web_view_sweep defaults (plan-705 D-A10) ────────────────────────────
+/** Rays per axis for the visibility notes — 7×7 = 49 samples per view. */
+const SWEEP_GRID_N = 7;
+/** Long edge of each captured cell; compositeMontage caps cells at 640 px anyway. */
+const SWEEP_CELL_PX = 640;
+const SWEEP_MOVE_MS = 600;
+const SWEEP_SETTLE_MS = 120;
 
 /**
  * Selectable mesh universe for select-similar: every effectively-visible,
@@ -374,16 +404,28 @@ export class McpViewTools {
     });
   }
 
-  @McpTool('Orbit the camera around the current target: yaw (horizontal, degrees, + = counter-clockwise from above), pitch (vertical, degrees, + = up), and an optional distance factor (0.5 = half distance / zoom in, 2 = zoom out). Relative move — ideal for "look at it from the other side".', { readOnly: false })
+  @McpTool('Orbit the camera around a point: yaw (horizontal, degrees, + = counter-clockwise from above), pitch (vertical, degrees, + = up), and an optional distance factor (0.5 = half distance / zoom in, 2 = zoom out). Relative move — ideal for "look at it from the other side". pivot chooses the point: omit for the current orbit target (unchanged behaviour), "selection" for the centre of what is selected, or a node path. Refused while FPV, camera-follow or XR own the camera.', { readOnly: false })
   async webCameraOrbit(
     @McpParam('yawDeg', 'Horizontal orbit angle in degrees.', 'number') yawDeg: number,
     @McpParam('pitchDeg', 'Vertical orbit angle in degrees (default 0).', 'number', false) pitchDeg: number,
     @McpParam('distanceFactor', 'Multiply camera distance (default 1).', 'number', false) distanceFactor: number,
+    @McpParam('pivot', 'Orbit centre: "selection", a node path, or omit for the current target.', 'string', false) pivot?: string,
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
+    // D-A2 (plan-705): the three owners write the pose every frame, so an orbit
+    // under them is a silent no-op. Newly applied here — `web_camera_fly` had
+    // the guard and this one did not, which is the inconsistency F9 closes.
+    const blockedBy = this._cameraOwner(v);
+    if (blockedBy) {
+      return JSON.stringify({ error: `Camera is owned by ${blockedBy} — stop it before orbiting`, blockedBy });
+    }
     const state = v.getCameraState();
-    const target = state.target.clone();
+    // Default is verbatim the old behaviour: the CURRENT target. `pivot` only
+    // ever replaces it, so an existing caller sees no change at all.
+    const pivotPoint = this._resolvePivot(v, pivot);
+    if (pivotPoint && 'error' in pivotPoint) return JSON.stringify(pivotPoint);
+    const target = pivotPoint?.point.clone() ?? state.target.clone();
     const offset = state.position.clone().sub(target);
     const radius = offset.length() * (typeof distanceFactor === 'number' && distanceFactor > 0 ? distanceFactor : 1);
     // Spherical angles: theta = azimuth around +Y, phi = polar from +Y.
@@ -399,6 +441,313 @@ export class McpViewTools {
     v.animateCameraTo(pos, target, 0.7, 'easeInOut');
     await sleep(750);
     return this.webCameraGet();
+  }
+
+  // ═══ Named views (plan-713 F9) ════════════════════════════════════════
+
+  /**
+   * Resolve a `pivot` / `target` parameter to a point plus the nodes it covers.
+   *
+   * Shared by `web_camera_view` and `web_camera_orbit` so the two spell
+   * "selection" and "a node path" identically — an agent that learnt one must
+   * not have to discover that the other takes a different vocabulary.
+   *
+   * `undefined`/empty returns null, which every caller reads as "use your own
+   * default". That is what keeps the new parameter behaviour-neutral.
+   */
+  private _resolvePivot(
+    v: RVViewer, raw: string | undefined,
+  ): { point: Vector3; nodes: Object3D[] } | { error: string } | null {
+    const want = (raw ?? '').trim();
+    if (!want) return null;
+
+    const nodes: Object3D[] = [];
+    if (want.toLowerCase() === 'selection') {
+      const paths = v.selectionManager?.getSnapshot().selectedPaths ?? [];
+      if (paths.length === 0) {
+        return { error: 'pivot="selection" but nothing is selected — select something with web_select, or pass a node path.' };
+      }
+      for (const p of paths) { const n = v.registry?.getNode(p); if (n) nodes.push(n); }
+      if (nodes.length === 0) {
+        return { error: 'The selected paths no longer resolve to nodes — reselect and retry.' };
+      }
+    } else {
+      const n = v.registry?.getNode(want);
+      if (!n) return { error: `Node not found: ${want}. Pass "selection" or a path from web_node_find.` };
+      nodes.push(n);
+    }
+
+    const union = new Box3().makeEmpty();
+    for (const n of nodes) { n.updateMatrixWorld(true); union.union(computeSubtreeAABB(n, new Box3()).box); }
+    if (union.isEmpty()) {
+      return { error: `"${want}" has no geometry to aim at (empty bounds).` };
+    }
+    return { point: union.getCenter(new Vector3()), nodes };
+  }
+
+  @McpTool('Move the camera to a NAMED view: iso | top | front | back | left | right | home (home = iso). target chooses what to frame — "selection", a node path, or omit for the whole scene. The framing distance is MEASURED from the viewer\'s own fit, so a preset frames exactly as tightly as web_camera_focus does. Refused while FPV, camera-follow or XR own the camera.', { readOnly: false, timeoutMs: 30_000 })
+  async webCameraView(
+    @McpParam('preset', 'iso | top | front | back | left | right | home') preset: string,
+    @McpParam('target', '"selection", a node path, or omit for the whole scene.', 'string', false) target?: string,
+  ): Promise<string> {
+    const v = this.viewer;
+    if (!v) return JSON.stringify({ error: 'No viewer' });
+    const blockedBy = this._cameraOwner(v);
+    if (blockedBy) {
+      return JSON.stringify({
+        error: `Camera is owned by ${blockedBy} — stop it before changing the view`,
+        blockedBy,
+      });
+    }
+    const {
+      CAMERA_PRESETS, isCameraPreset, presetPose, applyMeasuredDistance,
+    } = await import('./rv-camera-presets-math');
+    const wanted = (preset ?? '').trim().toLowerCase();
+    if (!isCameraPreset(wanted)) {
+      return JSON.stringify({
+        error: `Unknown preset "${preset}". Use one of: ${CAMERA_PRESETS.join(', ')}.`,
+      });
+    }
+
+    const resolved = this._resolvePivot(v, target);
+    if (resolved && 'error' in resolved) return JSON.stringify(resolved);
+
+    // Bounds: the requested nodes, else the whole model.
+    const nodes = resolved?.nodes ?? (v.currentModelRoot ? [v.currentModelRoot] : []);
+    const box = new Box3().makeEmpty();
+    for (const n of nodes) { n.updateMatrixWorld(true); box.union(computeSubtreeAABB(n, new Box3()).box); }
+
+    let pose = presetPose(wanted, box);
+    // D-A5 — measure, never re-derive. One `fitToNodes` in the viewer's own
+    // projection and aspect, read back with `getCameraState`; the preset then
+    // keeps that distance and swaps only the direction. A second fit formula
+    // here would drift from the viewer's the first time either changed.
+    if (nodes.length > 0) {
+      try {
+        v.fitToNodes(nodes, undefined, { duration: 0, easing: 'easeInOut' });
+        const measured = v.getCameraState();
+        pose = applyMeasuredDistance(pose, {
+          position: measured.position.clone(), target: measured.target.clone(),
+        });
+      } catch { /* keep the bounding-sphere fallback */ }
+    }
+
+    v.animateCameraTo(pose.position, pose.target, 0.7, 'easeInOut');
+    await sleep(750);
+    return JSON.stringify({
+      preset: wanted,
+      framed: nodes.length,
+      distance: +pose.distance.toFixed(3),
+      camera: JSON.parse(await this.webCameraGet()),
+    });
+  }
+
+  /**
+   * Which subsystem owns the camera right now, or null if it is free.
+   *
+   * FPV, follow/sit-on and XR each write the camera pose every frame, so a
+   * scripted move would be silently overwritten in the next tick. A hard error
+   * beats a silent no-op (plan-705 D-A2).
+   */
+  private _cameraOwner(v: RVViewer): 'fpv' | 'follow' | 'xr' | null {
+    if (v.getPlugin<{ id: string; isActive?: boolean }>('fpv')?.isActive) return 'fpv';
+    if (v.cameraFollowMode && v.cameraFollowMode !== 'off') return 'follow';
+    if ((v.getPlugin('webxr') as { isPresenting?: boolean } | undefined)?.isPresenting) return 'xr';
+    return null;
+  }
+
+  @McpTool('Fly the camera RELATIVE to where it is now: forward/right/up in metres plus yawDeg/pitchDeg in degrees (+yaw = to the left, +pitch = up, clamped at ±85°). Unlike web_camera_orbit — which circles a fixed point — this MOVES THROUGH the plant, which is what a long line needs. ground=true walks instead of flying: forward/right stay horizontal and the camera is held at eyeHeight above the nearest surface below (no wall collision — flying through a wall is allowed). Refused while FPV, camera-follow or XR own the camera.', { readOnly: false, timeoutMs: 30_000 })
+  async webCameraFly(
+    @McpParam('forward', 'Metres along the view direction (default 0).', 'number', false) forward?: number,
+    @McpParam('right', 'Metres to the right (default 0).', 'number', false) right?: number,
+    @McpParam('up', 'Metres along world +Y (default 0).', 'number', false) up?: number,
+    @McpParam('yawDeg', 'Turn in degrees, + = to the left (default 0).', 'number', false) yawDeg?: number,
+    @McpParam('pitchDeg', 'Tilt in degrees, + = up, clamped at ±85° (default 0).', 'number', false) pitchDeg?: number,
+    @McpParam('ground', 'Walk instead of fly: horizontal moves, eye height above the surface below (default false).', 'boolean', false) ground?: boolean,
+    @McpParam('durationMs', 'Animation duration in ms (default 600).', 'number', false) durationMs?: number,
+  ): Promise<string> {
+    const v = this.viewer;
+    if (!v) return JSON.stringify({ error: 'No viewer' });
+    const blockedBy = this._cameraOwner(v);
+    if (blockedBy) {
+      return JSON.stringify({
+        error: `Camera is owned by ${blockedBy} — stop it before flying`,
+        blockedBy,
+      });
+    }
+
+    const cur = v.getCameraState();
+    const next = computeFlyPose(
+      { position: cur.position.clone(), target: cur.target.clone() },
+      { forward, right, up, yawDeg, pitchDeg, ground },
+    );
+
+    // Ground probe (F4). The raycast manager only exists after a GLB load, so a
+    // missing one is the SAME branch as "ray hit nothing": groundHit:false, no
+    // throw and no refusal (plan-705 §2.4 step 4 / D-A13 — pick BVH, not the FPV
+    // ground whitelist, so modelled floors and platforms count too).
+    let groundHit = false;
+    let groundY: number | undefined;
+    if (ground === true) {
+      const rm = v.raycastManager;
+      const hit = rm
+        ? rm.raycastRay(
+          new Vector3(next.position.x, next.position.y + GROUND_PROBE_UP_M, next.position.z),
+          new Vector3(0, -1, 0),
+          GROUND_RAY_MAX_M,
+        )
+        : null;
+      if (hit) {
+        groundHit = true;
+        groundY = hit.hitPoint[1];
+        const newY = groundY + EYE_HEIGHT_M;
+        // Shift the target by the same Δy, otherwise the view tips over on a step.
+        const dy = newY - next.position.y;
+        next.position.y = newY;
+        next.target.y += dy;
+      }
+    }
+
+    const dur = typeof durationMs === 'number' && Number.isFinite(durationMs)
+      ? Math.max(0, durationMs) / 1000 : 0.6;
+    v.animateCameraTo(next.position, next.target, dur, 'easeInOut');
+    await sleep(dur * 1000 + 100);
+
+    const state = JSON.parse(await this.webCameraGet()) as Record<string, unknown>;
+    return JSON.stringify({
+      ...state,
+      deltaM: { forward: num0(forward), right: num0(right), up: num0(up) },
+      yawDeg: num0(yawDeg),
+      pitchDeg: num0(pitchDeg),
+      ground: ground === true,
+      groundHit,
+      ...(groundY !== undefined ? { groundY: r3(groundY) } : {}),
+    });
+  }
+
+  @McpTool('Contact sheet of a part: flies 4-8 views evenly around it and returns ONE labelled montage plus a note per view (visible top nodes with coverage, background share, measured camera position). Understands an unknown assembly in a SINGLE call instead of an orbit+screenshot loop, at roughly a fifth of the vision tokens. Each note carries its cameraPosition, so pulling one view up in full resolution is one web_camera_set away. topNodes is a raycast SAMPLE, not a completeness guarantee — thin parts can be missed. Works under WebGPU too. Restores the starting pose unless restore=false.', { readOnly: false, timeoutMs: 120_000 })
+  async webViewSweep(
+    @McpParam('paths', 'Node paths to sweep around, comma/newline-separated. Empty = whole model.', 'string', false) paths?: string,
+    @McpParam('count', 'Number of views, clamped to 4..8 (default 6).', 'number', false) count?: number,
+    @McpParam('pitchDeg', 'Elevation of every view in degrees (default 20).', 'number', false) pitchDeg?: number,
+    @McpParam('yawStartDeg', 'Yaw of the first view (default: current camera azimuth).', 'number', false) yawStartDeg?: number,
+    @McpParam('restore', 'Return to the starting pose afterwards (default true).', 'boolean', false) restore?: boolean,
+    @McpParam('savePath', 'Optional PROJECT-relative path to also write the montage as PNG (bare name lands in "captures/").', 'string', false) savePath?: string,
+    @McpParam('topN', 'Nodes reported per view, max 10 (default 5).', 'number', false) topN?: number,
+  ): Promise<string> {
+    const v = this.viewer;
+    if (!v) return JSON.stringify({ error: 'No viewer' });
+    const blockedBy = this._cameraOwner(v);
+    if (blockedBy) {
+      return JSON.stringify({
+        error: `Camera is owned by ${blockedBy} — stop it before sweeping`,
+        blockedBy,
+      });
+    }
+
+    const requested = parsePathsParam(paths ?? '');
+    const nodes: Object3D[] = [];
+    const unresolved: string[] = [];
+    for (const p of requested) {
+      const n = v.registry?.getNode(p);
+      if (n) nodes.push(n); else unresolved.push(p);
+    }
+    if (requested.length > 0 && nodes.length === 0) {
+      return JSON.stringify({ error: `Node(s) not found: ${unresolved.join(', ')}` });
+    }
+    if (nodes.length === 0) {
+      const root = v.currentModelRoot;
+      if (!root) return JSON.stringify({ error: 'No model loaded' });
+      nodes.push(root);
+    }
+
+    const startState = v.getCameraState();
+    const start: CameraPose = {
+      position: startState.position.clone(),
+      target: startState.target.clone(),
+    };
+    // Freeze the orbit controls for the duration: a watching human could
+    // otherwise orbit mid-flight and overwrite the target trajectory, leaving
+    // the cell showing a different pose than the note reports (D-A14 / R12).
+    // Deliberately NOT setSharedViewMode(), which also disables the raycast
+    // manager — exactly the capability the per-view notes need.
+    const controls = v.controls as { enabled?: boolean } | undefined;
+    const controlsWasEnabled = controls?.enabled;
+    if (controls) controls.enabled = false;
+
+    try {
+      v.fitToNodes(nodes, undefined, { easing: 'easeInOut', duration: 0.8 });
+      await sleep(900);
+      // Radius by RE-MEASURING the canonical fit rather than a second fit
+      // formula — CameraManager.fitDistanceBothAxes must stay the only copy (D-A5).
+      const framed = v.getCameraState();
+      const center = framed.target.clone();
+      const radius = framed.position.distanceTo(framed.target) || 1;
+
+      const startYaw = typeof yawStartDeg === 'number' && Number.isFinite(yawStartDeg)
+        ? yawStartDeg
+        : Math.atan2(
+          framed.position.x - center.x, framed.position.z - center.z,
+        ) * 180 / Math.PI;
+
+      const poses = sweepPoses(center, radius, {
+        count: typeof count === 'number' ? count : DEFAULT_SWEEP_COUNT,
+        pitchDeg: typeof pitchDeg === 'number' ? pitchDeg : DEFAULT_SWEEP_PITCH_DEG,
+        yawStartDeg: startYaw,
+      });
+
+      const grid = sampleGrid(SWEEP_GRID_N);
+      const tol = Math.max(0.01 * radius, 1e-3);
+      const frames: HTMLCanvasElement[] = [];
+      const notes: ViewNote[] = [];
+
+      for (const pose of poses) {
+        v.animateCameraTo(pose.position, pose.target, SWEEP_MOVE_MS / 1000, 'easeInOut');
+        await sleep(SWEEP_MOVE_MS + SWEEP_SETTLE_MS);
+
+        // Capture BEFORE raycasting: captureFrameCanvas renders synchronously,
+        // so the rays provably see the pose that is in the frame (§2.4).
+        const shot = captureFrameCanvas(v, { maxDim: SWEEP_CELL_PX });
+        if ('error' in shot) return JSON.stringify({ error: shot.error, view: pose.index });
+        frames.push(shot.canvas);
+
+        const rm = v.raycastManager;
+        const rect = v.renderer.domElement.getBoundingClientRect();
+        const hits: Array<string | null> = [];
+        for (const [gx, gy] of grid) {
+          const hit = rm?.raycastForRVNodeDetailed({
+            clientX: rect.left + gx * rect.width,
+            clientY: rect.top + gy * rect.height,
+          });
+          hits.push(hit?.path ?? null);
+        }
+        const measured = v.getCameraState().position.clone();
+        notes.push(summarizeViewHits(
+          pose, hits, typeof topN === 'number' ? topN : DEFAULT_TOP_N, measured, tol,
+        ));
+      }
+
+      const mont = compositeMontage(frames, poses.map((p) => p.label));
+      if ('error' in mont) return JSON.stringify({ error: mont.error });
+      const saved = savePath?.trim() ? await saveCanvasToProject(mont, savePath) : {};
+      return canvasToRvImage(mont, {
+        views: notes,
+        center: vec3(center),
+        radius: r3(radius),
+        restored: restore !== false,
+        ...(unresolved.length ? { unresolved } : {}),
+        ...saved,
+      });
+    } catch (e) {
+      return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      // Both restorations live here so they also run on the error path (R11).
+      if (controls && controlsWasEnabled !== undefined) controls.enabled = controlsWasEnabled;
+      if (restore !== false) {
+        v.animateCameraTo(start.position, start.target, SWEEP_MOVE_MS / 1000, 'easeInOut');
+        await sleep(SWEEP_MOVE_MS + 100);
+      }
+    }
   }
 
   // ═══ Selection ════════════════════════════════════════════════════════

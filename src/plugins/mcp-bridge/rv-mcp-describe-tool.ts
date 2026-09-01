@@ -139,13 +139,13 @@ export const NEXT_RULES: readonly NextRule[] = [
   },
   {
     when: (f) => !f.hasModel && f.mode === 'planner',
-    next: 'Pick a part with web_library_list, then place it with web_layout_place',
+    next: 'Pick a part with web_catalog_list, then place it with web_layout_place',
     guide: 'web_help("layout")',
   },
   {
     when: (f) => !f.hasModel,
-    next: 'Nothing is loaded — open a scene with web_scene_open, or start authoring with '
-      + 'web_editor_open(source=empty)',
+    next: 'Nothing is loaded — open a document with web_document_open, or start authoring with '
+      + 'web_editor_open(source=new)',
   },
   {
     when: (f) => f.mode === 'planner',
@@ -191,7 +191,7 @@ export function computeBlocked(facts: DescribeFacts): DescribeBlocked[] {
   if (facts.doc === null) {
     out.push({
       family: 'web_editor_*',
-      reason: 'No asset document is open — call web_editor_open(source=empty|library)',
+      reason: 'No asset document is open — call web_editor_open(source=new|library)',
     });
   }
   if (facts.mode !== 'des') {

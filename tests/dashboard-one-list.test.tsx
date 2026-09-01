@@ -21,11 +21,12 @@
  *     reader with no test.
  *  3. **The role badge** — `section` rendered as a PLACE, beside "Sample"
  *     rather than instead of it.
- *  4. **Both MCP families.** `web_model_list` is the one list; the older
- *     `webScene*` family keeps its NAMES and is wired onto document ops. That
- *     second half is the contract that lets Phase 6 delete
- *     `SceneStore.listScenes()` at all (risk 11), so it is asserted against a
- *     recording store rather than inferred from a description.
+ *  4. **The MCP document verbs.** `web_document_list` is the one list (asset =
+ *     document = model since the 2026-08-19 rework), and the write verbs
+ *     (`web_document_save` / `_new`) are wired onto document ops. That second
+ *     half is the contract that lets Phase 6 delete `SceneStore.listScenes()`
+ *     at all (risk 11), so it is asserted against a recording store rather
+ *     than inferred from a description.
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
@@ -45,14 +46,16 @@ const h = vi.hoisted(() => ({
 
 const sceneStoreFake = {
   /**
-   * Neither method exists on `SceneStore` any more (plan-716 Phase 6) — they
-   * are kept HERE, on the fake, so the assertions below can still say "and the
-   * tool did not reach for them". A fake that simply dropped them would make
-   * that check unfalsifiable.
+   * None of these three exists on `SceneStore` any more — `listScenes` and
+   * `listBuiltins` went in plan-716 Phase 6, `listPublished` in plan-731 2e.
+   * They are kept HERE, on the fake, so the assertions below can still say
+   * "and the tool did not reach for them". A fake that simply dropped them
+   * would make that check unfalsifiable — which is why `listPublished` now
+   * RECORDS instead of silently answering `[]`.
    */
   listScenes: () => { h.calls.push({ verb: 'listScenes' }); return []; },
   listBuiltins: () => { h.calls.push({ verb: 'listBuiltins' }); return []; },
-  listPublished: () => [],
+  listPublished: () => { h.calls.push({ verb: 'listPublished' }); return []; },
   openDocument: async (id: string) => { h.calls.push({ verb: 'openDocument', arg: id }); },
   openScene: async (id: string) => { h.calls.push({ verb: 'openScene', arg: id }); },
   createEmpty: async () => { h.calls.push({ verb: 'createEmpty' }); return h.createdId; },
@@ -79,7 +82,8 @@ import type { RvDocumentEntry } from '../src/core/project/rv-project-types';
 import { resetProjectStore } from '../src/core/project/project-store';
 import { installFakeDocumentProject } from './helpers/fake-document-project';
 import { McpProjectTools } from '../src/plugins/mcp-bridge/rv-mcp-project-tools';
-import { McpBridgePlugin } from '../src/plugins/mcp-bridge-plugin';
+// plan-713 Phase 1 — the webScene* aliases moved off the plugin into McpSceneTools.
+import { McpSceneTools } from '../src/plugins/mcp-bridge/rv-mcp-scene-tools';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -125,6 +129,28 @@ describe('the dashboard has no second list left (F8)', () => {
     for (const gone of ['getProjectScenes(', 'sceneDocumentsOf(']) {
       expect(HOST_CODE).not.toContain(gone);
     }
+  });
+
+  it('reads no published-example catalogue either (plan-731 2d)', () => {
+    // plan-716 left ONE list plus a merge branch: rows were appended from
+    // `sceneSnap.published` whenever the backend was bundled, under a second
+    // key shape (`published:<urlName>`). That was the second identity space
+    // reaching the same surface the first one did, and plan-731 removed it.
+    for (const gone of ['sceneSnap?.published', 'sceneSnap.published', 'publishedScenePath']) {
+      expect(HOST_CODE, `${gone} is gone from the host`).not.toContain(gone);
+    }
+  });
+
+  it('keys every row the one way — no published: prefix survives', () => {
+    // The key shape IS the identity: two prefixes on one list meant two id
+    // spaces, and the detail pane had to branch on which one it was holding.
+    expect(HOST_CODE).not.toContain("'published:'");
+    expect(HOST_CODE).not.toContain("startsWith('published:')");
+    expect(HOST_CODE).toContain("'scene:' + doc.id");
+  });
+
+  it('opens a row through the one document verb, with no published fork', () => {
+    expect(HOST_CODE).not.toContain('openPublishedExample');
   });
 });
 
@@ -247,39 +273,43 @@ function manifestRows(): RvDocumentEntry[] {
   return ALL.map(({ tier: _tier, ...row }) => row as RvDocumentEntry);
 }
 
-describe('MCP — web_model_list is THE one list', () => {
+describe('MCP — web_document_list is THE one list', () => {
   beforeEach(() => { resetProjectStore(); h.calls.length = 0; });
 
   it('returns every document with its section, not the scenes/ third', async () => {
     const fake = installFakeDocumentProject({ documents: manifestRows() });
     try {
-      const out = JSON.parse(await new McpProjectTools(() => undefined).webModelList()) as {
+      const out = JSON.parse(await new McpProjectTools(() => undefined).webDocumentList()) as {
         documents: { id: string; name: string; path: string; section: string }[];
-        saved: unknown[];
         builtins: unknown[];
       };
-      expect(out.documents.map(d => d.id)).toEqual(['doc_line', 'doc_base', 'doc_part']);
-      expect(out.documents.map(d => d.section)).toEqual(['scenes', 'models', 'library']);
+      // Section order is storage order, not identity: since the terminology
+      // rework the rows are sorted by path, and asset = document = model.
+      expect([...out.documents.map(d => d.id)].sort())
+        .toEqual(['doc_base', 'doc_line', 'doc_part']);
+      expect([...out.documents.map(d => d.section)].sort())
+        .toEqual(['library', 'models', 'scenes']);
       // Every row carries the path, so an agent can build a reference without
       // a second call.
       expect(out.documents.every(d => typeof d.path === 'string' && d.path !== '')).toBe(true);
     } finally { fake.restore(); }
   });
 
-  it('keeps `saved` as a deprecated alias of the same array', async () => {
+  it('the deprecated `saved` alias array is gone', async () => {
     const fake = installFakeDocumentProject({ documents: manifestRows() });
     try {
-      const out = JSON.parse(await new McpProjectTools(() => undefined).webModelList()) as {
-        documents: unknown[]; saved: unknown[];
+      const out = JSON.parse(await new McpProjectTools(() => undefined).webDocumentList()) as {
+        documents: unknown[]; saved?: unknown[];
       };
-      expect(out.saved).toEqual(out.documents);
+      expect(out.saved, 'plan-716 promised to drop `saved` after one release').toBeUndefined();
+      expect(out.documents.length).toBeGreaterThan(0);
     } finally { fake.restore(); }
   });
 
   it('does not build the list out of the scene catalogue any more', async () => {
     const fake = installFakeDocumentProject({ documents: manifestRows() });
     try {
-      await new McpProjectTools(() => undefined).webModelList();
+      await new McpProjectTools(() => undefined).webDocumentList();
       expect(h.calls.filter(c => c.verb === 'listScenes')).toEqual([]);
     } finally { fake.restore(); }
   });
@@ -288,7 +318,7 @@ describe('MCP — web_model_list is THE one list', () => {
     const fake = installFakeDocumentProject({ documents: manifestRows() });
     try {
       const out = JSON.parse(
-        await new McpProjectTools(() => undefined).webModelOpen('Part'),
+        await new McpProjectTools(() => undefined).webDocumentOpen('Part'),
       ) as { opened: boolean; kind: string; id: string; section: string };
       expect(out).toMatchObject({ opened: true, kind: 'document', id: 'doc_part', section: 'library' });
       expect(h.calls).toContainEqual({ verb: 'openDocument', arg: 'doc_part' });
@@ -296,38 +326,48 @@ describe('MCP — web_model_list is THE one list', () => {
   });
 });
 
-describe('MCP — the older webScene* family survives as deprecated ALIASES', () => {
+describe('MCP — the web_document_* verbs own the document ops (old names retired)', () => {
   beforeEach(() => { resetProjectStore(); h.calls.length = 0; });
 
   /**
-   * The tool names themselves. Phase 6 may delete `SceneStore.listScenes()`
-   * only because these five were rewired first (risk 11); if one of them is
-   * renamed or dropped instead, that ordering rule silently stops applying.
+   * The 2026-08-19 rework finished what plan-713 F8 started: ONE name per
+   * capability. `webScene*` and `webModel*` are gone from both delegate
+   * classes — asset = document = model, and the document verbs carry it all.
    */
-  it('still announces all five names', () => {
-    const plugin = new McpBridgePlugin();
-    for (const verb of ['webSceneSave', 'webSceneNew', 'webSceneOpen',
-      'webSceneList', 'webSceneExport'] as const) {
+  it('announces the document verbs on the scene delegate', () => {
+    const plugin = new McpSceneTools(() => undefined);
+    for (const verb of ['webDocumentSave', 'webDocumentNew', 'webLayoutExport'] as const) {
       expect(typeof plugin[verb]).toBe('function');
     }
   });
 
-  it('web_scene_list answers with the DOCUMENT list', async () => {
+  it('the old names are RETIRED on both delegates, not merely deprecated', () => {
+    const scene = new McpSceneTools(() => undefined) as unknown as Record<string, unknown>;
+    const project = new McpProjectTools(() => undefined) as unknown as Record<string, unknown>;
+    for (const gone of ['webSceneOpen', 'webSceneList', 'webSceneSave', 'webSceneNew',
+      'webSceneExport', 'webLibraryAssets', 'webLibraryUpdate', 'webLibraryList',
+      'webLibraryDescribe'] as const) {
+      expect(scene[gone], `${gone} must be gone from McpSceneTools`).toBeUndefined();
+    }
+    for (const gone of ['webModelList', 'webModelOpen'] as const) {
+      expect(project[gone], `${gone} must be gone from McpProjectTools`).toBeUndefined();
+    }
+  });
+
+  it('web_document_list answers with the DOCUMENT list the retired names used to', async () => {
     const fake = installFakeDocumentProject({ documents: manifestRows() });
     try {
-      const plugin = new McpBridgePlugin();
       // The built-ins come from the model catalogue since Phase 6, so the tool
       // needs a viewer rather than a scene store to answer for them.
-      (plugin as unknown as { viewer: unknown }).viewer = {
+      const plugin = new McpProjectTools(() => ({
         availableModels: [{ url: '/models/Empty.glb', label: 'Empty' }],
-      };
-      const out = JSON.parse(await plugin.webSceneList()) as {
+      } as never));
+      const out = JSON.parse(await plugin.webDocumentList()) as {
         documents: { id: string; section: string }[];
-        saved: unknown[];
         builtins: { label: string }[];
       };
-      expect(out.documents.map(d => d.id)).toEqual(['doc_line', 'doc_base', 'doc_part']);
-      expect(out.saved).toEqual(out.documents);
+      expect([...out.documents.map(d => d.id)].sort())
+        .toEqual(['doc_base', 'doc_line', 'doc_part']);
       // The built-in SOURCES stay beside it — they are not documents and are
       // not being merged into the list (§2.6 decision log).
       expect(out.builtins.map(b => b.label)).toEqual(['Empty']);
@@ -338,34 +378,41 @@ describe('MCP — the older webScene* family survives as deprecated ALIASES', ()
     } finally { fake.restore(); }
   });
 
-  it('web_scene_new places a DOCUMENT and opens it, instead of clearing to a draft', async () => {
-    const out = JSON.parse(await new McpBridgePlugin().webSceneNew()) as {
+  it('web_document_new places a DOCUMENT and opens it, instead of clearing to a draft', async () => {
+    const out = JSON.parse(await new McpSceneTools(() => undefined).webDocumentNew()) as {
       ok: boolean; documentId: string;
     };
     expect(out).toEqual({ ok: true, documentId: 'doc_created' });
     expect(h.calls.map(c => c.verb)).toEqual(['createEmpty', 'openDocument']);
-    // `newEmpty()` was the pre-716 body of this alias — an unsaved draft that a
+    // `newEmpty()` was the pre-716 body of this op — an unsaved draft that a
     // reload lost.
     expect(h.calls.some(c => c.verb === 'newEmpty')).toBe(false);
   });
 
-  it('web_scene_open goes through the document-open funnel', async () => {
-    const out = JSON.parse(await new McpBridgePlugin().webSceneOpen('doc_part')) as { ok: boolean };
-    expect(out.ok).toBe(true);
-    // `openScene` IS the alias-tolerant forward onto `openDocument` since
-    // Phase 3; what matters here is that nothing else is reached.
-    expect(h.calls).toEqual([{ verb: 'openScene', arg: 'doc_part' }]);
+  it('web_document_open goes through the document-open funnel', async () => {
+    // Resolves against the document list first, so a typo is an error instead
+    // of a silent no-op, and reaches `openDocument` directly — with the id
+    // already resolved there is nothing left for the old openScene tolerance
+    // to do.
+    const fake = installFakeDocumentProject({ documents: manifestRows() });
+    try {
+      const out = JSON.parse(await new McpProjectTools(() => undefined).webDocumentOpen('doc_part')) as {
+        ok?: boolean; error?: string;
+      };
+      expect(out.error, 'web_document_open must open the listed document').toBeUndefined();
+      expect(h.calls.map(c => c.verb)).toContain('openDocument');
+    } finally { fake.restore(); }
   });
 
-  it('web_scene_save reports the id it wrote as a documentId', async () => {
-    const named = JSON.parse(await new McpBridgePlugin().webSceneSave('Copy')) as {
+  it('web_document_save reports the id it wrote as a documentId', async () => {
+    const named = JSON.parse(await new McpSceneTools(() => undefined).webDocumentSave('Copy')) as {
       saved: boolean; id: string; documentId: string;
     };
     expect(named).toMatchObject({ saved: true, id: 'doc_saved_as', documentId: 'doc_saved_as' });
     expect(h.calls).toContainEqual({ verb: 'saveAs', arg: 'Copy' });
 
     h.calls.length = 0;
-    const inPlace = JSON.parse(await new McpBridgePlugin().webSceneSave('')) as { saved: boolean };
+    const inPlace = JSON.parse(await new McpSceneTools(() => undefined).webDocumentSave('')) as { saved: boolean };
     expect(inPlace.saved).toBe(true);
     expect(h.calls).toEqual([{ verb: 'save' }]);
   });

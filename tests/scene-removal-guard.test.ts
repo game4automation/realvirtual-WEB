@@ -96,13 +96,44 @@ describe('plan-716 F1 — no code path mints a `scn_` id', () => {
     // the MCP alias's own documentation all still name the prefix, and must
     // keep doing so — an old id has to keep resolving forever. This pins WHICH
     // files may mention it in code, so a sixth is a decision somebody makes.
+    // plan-720 Phase 2 removed the sixth: `rv-mcp-link-tools.ts` spelled the
+    // prefix inside a user-facing WARNING STRING, which is neither a strip regex
+    // nor a match — it was the prefix leaking into the product's vocabulary. The
+    // warning now says "legacy pre-migration scene ids" and the alias map keeps
+    // doing the actual resolving. `mcp-bridge-plugin.ts` left the list on its
+    // own when its tools moved into `rv-mcp-*-tools.ts`.
     expect(filesMatching(/scn_/)).toEqual([
-      'mcp-bridge-plugin.ts',        // "tolerates a pre-migration scn_ id" — a doc string
       'rv-project-folder-writer.ts', // strips the prefix off a file name
       'rv-project-types.ts',         // strips the prefix off a file name
       'rv-scene-types.ts',           // the id shape, in a field comment
       'rv-workspace-migration.ts',   // recognises a row it has still to convert
     ]);
+  });
+});
+
+// ─── Nothing but the scene store mints `?scene=` ────────────────────────
+
+describe('plan-720 F4 — `?scene=` is written in exactly one place', () => {
+  it('no file outside scene-store.ts writes the ?scene= URL param', () => {
+    // The READ side is permanent (`rv-doc-alias`): a `?scene=<doc>` bookmark has
+    // to keep resolving forever. What plan-720 pinned is the WRITE side.
+    // `scene-store.ts` keeps it because `updateUrlSceneParam()` is the documented
+    // home of the non-document bases — `published:`, `builtin:`, `empty` — which
+    // have no document id and therefore nothing to put in `?doc=`. Anything
+    // else minting the param would be a second, undocumented URL vocabulary.
+    const offenders = filesMatching(/searchParams\.set\(\s*['"]scene['"]/)
+      .filter(f => f !== 'scene-store.ts');
+    expect(offenders).toEqual([]);
+  });
+
+  it('the MCP link generator mints no `scene` value for a document', () => {
+    // Behavioural cover is in rv-mcp-link-tools.test.ts; this is the source-level
+    // half — the snapshot branch for a `scene-glb` base must assign `values.doc`.
+    const text = Object.entries(sources)
+      .find(([p]) => basename(p) === 'rv-mcp-link-tools.ts')![1];
+    const branch = text.match(/kind === 'scene-glb'\)\s*\{([\s\S]*?)\n\s*\} else if/)?.[1] ?? '';
+    expect(branch).toMatch(/values\.doc\s*=/);
+    expect(branch).not.toMatch(/values\.scene\s*=/);
   });
 });
 
@@ -180,7 +211,11 @@ describe('plan-716 Phase 6 — the deleted symbols', () => {
 // ─── The webScene* MCP aliases are off the catalogue (risk 11) ──────────
 
 describe('plan-716 risk 11 — the older MCP family is on document ops', () => {
-  const mcpFiles = ['mcp-bridge-plugin.ts', 'rv-mcp-project-tools.ts'];
+  // `mcp-bridge-plugin.ts` used to be named here and no longer carries any of
+  // this: the tool classes moved into `rv-mcp-*-tools.ts` and the plugin became
+  // the registrar. Naming the files that actually hold the read is the point of
+  // an allow-list — a stale entry asserts nothing while looking like it does.
+  const mcpFiles = ['rv-mcp-project-tools.ts', 'rv-mcp-scene-tools.ts', 'rv-mcp-link-tools.ts'];
 
   for (const file of mcpFiles) {
     it(`${file} reads built-in SOURCES from the model catalogue, not the scene store`, () => {

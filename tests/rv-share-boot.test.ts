@@ -275,13 +275,15 @@ describe('share boot — main.ts routing', () => {
     expect(mainSource).toContain('sceneRouted = true;');
   });
 
-  it('share_GlbWithPlannerMode_NotOverriddenByEmpty: the planner fallback excludes ?glb= (Finding 15)', () => {
+  it('share_GlbWithPlannerMode_NotOverriddenByEmpty: the planner fallback excludes ?glb= and ?doc= (Finding 15)', () => {
     // Without `!urlGlb` here, `?glb=…&mode=planner` synthesises `scene=empty`,
     // the empty scene wins on precedence, and the shared content never
     // arrives. The defect is invisible in every other combination, which is
-    // exactly why it needs a pinned assertion.
+    // exactly why it needs a pinned assertion. `!urlDoc` joined 2026-08-31 for
+    // the identical reason — the planner demo's own `?doc=…&mode=planner` link
+    // was silently outranked by the synthesised empty scene.
     expect(mainSource).toMatch(
-      /const urlScene = params\.get\('scene'\)\s*\?\?\s*\(plannerMode && !params\.get\('model'\) && !urlGlb \? 'empty' : null\)/,
+      /const urlScene = params\.get\('scene'\)\s*\?\?\s*\(plannerMode && !params\.get\('model'\) && !urlGlb && !urlDoc \? 'empty' : null\)/,
     );
   });
 

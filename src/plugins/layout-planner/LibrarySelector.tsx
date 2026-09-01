@@ -44,9 +44,19 @@ import {
   Link as LinkIcon,
   CollectionsBookmark,
   MoreVert,
+  Inventory2,
+  FolderOpen,
 } from '@mui/icons-material';
 
-export type LibraryKind = 'url' | 'github' | 'cloud';
+/**
+ * Mirrors `LibrarySource['kind']` (plan-723 F1).
+ *
+ * The three original members were all the panel could feed it, because it only
+ * ever saw the LibraryStore's catalogs plus the Asset Manager. Now that the
+ * dropdown is fed from the library registry, the active project — and a bundled
+ * deploy, which is a read-only project — need a badge of their own.
+ */
+export type LibraryKind = 'project' | 'bundled' | 'url' | 'github' | 'local' | 'cloud';
 
 export interface LibraryItem {
   id: string;
@@ -73,6 +83,9 @@ export interface LibrarySelectorProps {
 function kindIcon(kind: LibraryKind, status: LibraryItem['cloudStatus'], error?: boolean): ReactNode {
   const sx = { fontSize: 16 } as const;
   switch (kind) {
+    case 'project': return <Inventory2 sx={{ ...sx, color: error ? '#ef5350' : '#4fc3f7' }} />;
+    case 'bundled': return <CollectionsBookmark sx={{ ...sx, color: error ? '#ef5350' : undefined }} />;
+    case 'local': return <FolderOpen sx={{ ...sx, color: error ? '#ef5350' : undefined }} />;
     case 'github': return <GitHub sx={sx} />;
     case 'cloud': {
       const color = status === 'connected' ? '#66bb6a' : status === 'connecting' ? '#ffb74d' : '#ef5350';

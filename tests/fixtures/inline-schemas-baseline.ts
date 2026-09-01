@@ -32,6 +32,12 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     TargetSpeed: { type: 'number', default: 100 },
     Acceleration: { type: 'number', default: 100 },
     UseAcceleration: { type: 'boolean', default: false },
+    // plan-281 Phase 4 — jerk-limited motion. Intentional schema change: spec
+    // and baseline updated together, as this file's header prescribes.
+    SmoothAcceleration: { type: 'boolean', default: false },
+    Jerk: { type: 'number', default: 1000 },
+    SpeedOverride: { type: 'number', default: 1 },
+    JumpToLowerLimitOnUpperLimit: { type: 'boolean', default: false },
     UseLimits: { type: 'boolean', default: false },
     LowerLimit: { type: 'number', default: -180 },
     UpperLimit: { type: 'number', default: 180 },
@@ -255,6 +261,30 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     BendUp:      { type: 'boolean', default: true },
     Bones:       { type: 'number', default: 24 },
     Enabled:     { type: 'boolean', default: true },
+  },
+
+  // plan-733 — Unity `Chain` / `ChainElement`. Added AFTER the rv-ODT
+  // migration: not a pre-migration snapshot but the frozen reference for the
+  // determinism test.
+  Chain: {
+    ConnectedDrive:          { type: 'componentRef' },
+    chainOrientation:        { type: 'enum', enumMap: { Horizontal: 'Horizontal', Vertical: 'Vertical' }, default: 'Horizontal' },
+    NumberOfElements:        { type: 'number', default: 0 },
+    StartPosition:           { type: 'number', default: 0 },
+    CalculatedDeltaPosition: { type: 'boolean', default: true },
+    DeltaPosition:           { type: 'number', default: 0 },
+    ScaledOnFixedLength:     { type: 'boolean', default: false },
+    FixedLength:             { type: 'number', default: 1500 },
+    ChainElement:            { type: 'componentRef' },
+    NameChainElement:        { type: 'string', default: '' },
+    Spline:                  { type: 'json' },
+  },
+
+  ChainElement: {
+    AlignWithChain:        { type: 'boolean', default: true },
+    AlignVector:           { type: 'vector3', unityCoords: true },
+    InitialPosition:       { type: 'number', default: 0 },
+    OffsetToDrivePosition: { type: 'number', default: 0 },
   },
 
   // plan-394 — collision role marker. Added AFTER the rv-ODT migration: not a

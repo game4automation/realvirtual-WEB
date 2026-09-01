@@ -7,7 +7,8 @@ import react from '@vitejs/plugin-react';
 // import { VitePWA } from 'vite-plugin-pwa';
 import { playwright } from '@vitest/browser-playwright';
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, createReadStream, statSync } from 'node:fs';
-import { join, resolve, dirname, extname } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
+import { parsePrivateAssetUrl, resolvePrivateAsset } from './scripts/_rv-private-assets.mjs';
 
 // ─── Private content detection ──────────────────────────────────────────
 const PRIVATE_ROOT_CANDIDATES = [
@@ -356,7 +357,10 @@ function debugApiPlugin() {
 /**
  * Vite plugin: Save library thumbnails to disk.
  * POST /api/library-thumbnail with { catalogId, dataUrl }
- * Writes PNG next to the GLB in public/models/library/.
+ * Writes PNG next to the GLB in public/library/ — the one library root
+ * (`LIBRARY_PREFIX`, `public/library/catalog.json`). It used to write into
+ * `public/models/library/`, which was the pre-plan-716 nesting and has not been
+ * the library path since; thumbnails landed beside nothing.
  */
 function thumbnailSavePlugin() {
   function readBody(req: { on: Function }): Promise<string> {
@@ -389,12 +393,12 @@ function thumbnailSavePlugin() {
 
           // Save next to GLB: use catalogId as filename stem
           const filename = catalogId.replace(/[^a-zA-Z0-9_-]/g, '_') + '.png';
-          const outDir = join(server.config.root, 'public/models/library');
+          const outDir = join(server.config.root, 'public/library');
           mkdirSync(outDir, { recursive: true });
           const outPath = join(outDir, filename);
           writeFileSync(outPath, buffer);
 
-          const url = `models/library/${filename}`;
+          const url = `library/${filename}`;
           console.log(`[rv-thumbnail] Saved ${outPath}`);
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify({ url }));
@@ -467,19 +471,6 @@ const PRIVATE_PROJECTS_DIR = [
   resolve(__dirname, '../projects'),
 ].find((candidate) => existsSync(candidate)) ?? resolve(PRIVATE_ROOT, 'projects');
 
-/** MIME types for static assets served from private projects. */
-const PRIVATE_ASSET_MIME: Record<string, string> = {
-  '.glb': 'model/gltf-binary',
-  '.aasx': 'application/asset-administration-shell-package',
-  '.pdf': 'application/pdf',
-  '.json': 'application/json',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.webp': 'image/webp',
-};
-
 /**
  * Vite plugin: Discover and serve GLB models + AASX/PDF assets from private project folders.
  *
@@ -487,12 +478,40 @@ const PRIVATE_ASSET_MIME: Record<string, string> = {
  *   - `models/*.glb`  → served under `/private-models/<project>/`
  *   - `aasx/*.aasx`   → served under `/private-assets/<project>/aasx/`
  *   - `pdf/*.pdf`     → served under `/private-assets/<project>/pdf/`
+ *   - everything else → `/private-assets/<project>/<path...>`, recursively
+ *     (`fixtures/`, `models/`, `library/`, `scratch/` of the internal
+ *     Development project since plan-395 — through this same route, on
+ *     purpose: a second recursive mount would double the attack surface and
+ *     need the same hardening twice)
  *
  * Also exposes:
  *   - `GET /__api/private-models` — JSON manifest of all GLB models
  *   - `GET /private-assets/<project>/aasx/index.json` — auto-generated AASX index
+ *
+ * `RV_NO_PRIVATE=1` turns the whole plugin off while leaving the working tree
+ * alone. That is how the test suite simulates a checkout without the private
+ * sibling (plan-395 §2.11): renaming the real folder to prove a skip works is
+ * the kind of test setup that eventually loses somebody's models.
  */
+/**
+ * Ends the response for a HEAD request, or reports that a body should follow.
+ *
+ * A HEAD must carry the headers of the GET and none of its bytes. Piping the
+ * file anyway is not merely wasteful: the plan-395 availability probe HEADs
+ * every internal asset at module scope, `tests.glb` is 36 MB, and streaming it
+ * eight times over turned a probe that should cost milliseconds into 22
+ * seconds - measured, as a test timeout, which is how this was found.
+ *
+ * @returns `true` when the caller should still stream the body.
+ */
+function sendBody(res: any, _path: string, method?: string): boolean {
+  if ((method ?? 'GET').toUpperCase() !== 'HEAD') return true;
+  res.end();
+  return false;
+}
+
 function privateModelsPlugin() {
+  if (process.env.RV_NO_PRIVATE === '1') return null;
   if (!HAS_PRIVATE || !existsSync(PRIVATE_PROJECTS_DIR)) return null;
 
   // Build manifest: scan all project subdirs for GLB files
@@ -526,16 +545,20 @@ function privateModelsPlugin() {
   }
 
   /** Serve a static file from a private project subfolder with correct MIME type. */
-  function serveProjectFile(res: any, project: string, subfolder: string, filename: string): boolean {
-    const filePath = join(PRIVATE_PROJECTS_DIR, project, subfolder, filename);
-    if (!existsSync(filePath)) return false;
-    const ext = extname(filename).toLowerCase();
-    const mime = PRIVATE_ASSET_MIME[ext] ?? 'application/octet-stream';
-    const stat = statSync(filePath);
-    res.setHeader('Content-Type', mime);
+  function serveProjectFile(
+    res: any, project: string, subfolder: string, filename: string, method?: string,
+  ): boolean {
+    // Through the same resolver as the recursive route: `/private-models/` takes
+    // its two segments straight off the URL, so it is exactly as reachable, and
+    // a second copy of the containment rules is a second place to get them wrong.
+    const resolved = resolvePrivateAsset(PRIVATE_PROJECTS_DIR, project, `${subfolder}/${filename}`);
+    if (!resolved) return false;
+    const stat = statSync(resolved.path);
+    res.setHeader('Content-Type', resolved.mime);
     res.setHeader('Content-Length', stat.size);
     res.setHeader('Cache-Control', 'no-store');
-    createReadStream(filePath).pipe(res);
+    if (!sendBody(res, resolved.path, method)) return true;
+    createReadStream(resolved.path).pipe(res);
     return true;
   }
 
@@ -559,7 +582,7 @@ function privateModelsPlugin() {
           const parts = url.replace('/private-models/', '').split('/');
           if (parts.length === 2) {
             const [project, file] = parts;
-            if (serveProjectFile(res, project, 'models', file)) return;
+            if (serveProjectFile(res, project, 'models', file, req.method)) return;
           }
           res.writeHead(404);
           res.end('Not found');
@@ -570,15 +593,19 @@ function privateModelsPlugin() {
         // Supports arbitrary depth paths (e.g., docs/subfolder/subfolder/file.pdf)
         // as well as flat paths (e.g., docs-index.json, aasx/index.json)
         if (url.startsWith('/private-assets/')) {
-          const decoded = decodeURIComponent(url);
-          const stripped = decoded.replace('/private-assets/', '');
-          const slashIdx = stripped.indexOf('/');
-          if (slashIdx > 0) {
-            const project = stripped.substring(0, slashIdx);
-            const assetPath = stripped.substring(slashIdx + 1);
+          // Query, fragment and percent-encoding are judged by the shared
+          // parser, containment by the shared resolver — both in
+          // `scripts/_rv-private-assets.mjs`, so a Node test can exercise the
+          // traversal rules without standing up an HTTP server (plan-395 §2.5).
+          const parsed = parsePrivateAssetUrl(url);
+          if (parsed) {
+            const { project, assetPath } = parsed;
 
-            // Auto-generate AASX index.json on the fly
-            if (assetPath === 'aasx/index.json') {
+            // Auto-generate AASX index.json on the fly. `listProjectFiles`
+            // composes a directory path from `project`, so the one-segment rule
+            // has to hold here too — this branch answers before the resolver.
+            if (assetPath === 'aasx/index.json'
+              && project !== '.' && project !== '..' && !/[\\/]/.test(project)) {
               const aasxFiles = listProjectFiles(project, 'aasx', '.aasx');
               const index: Record<string, { file: string; idShort: string }> = {};
               for (const f of aasxFiles) {
@@ -590,20 +617,19 @@ function privateModelsPlugin() {
               return;
             }
 
-            // Serve any file from the project directory
-            const filePath = join(PRIVATE_PROJECTS_DIR, project, assetPath);
-            if (existsSync(filePath)) {
+            // Serve any file from the project directory — through the one
+            // resolver, which is what decides whether the composed path is still
+            // inside PRIVATE_PROJECTS_DIR and of a type we serve.
+            const resolved = resolvePrivateAsset(PRIVATE_PROJECTS_DIR, project, assetPath);
+            if (resolved) {
               try {
-                const fstat = statSync(filePath);
-                if (fstat.isFile()) {
-                  const ext = extname(filePath).toLowerCase();
-                  const mime = PRIVATE_ASSET_MIME[ext] ?? 'application/octet-stream';
-                  res.setHeader('Content-Type', mime);
-                  res.setHeader('Content-Length', fstat.size);
-                  res.setHeader('Cache-Control', 'no-store');
-                  createReadStream(filePath).pipe(res);
-                  return;
-                }
+                const fstat = statSync(resolved.path);
+                res.setHeader('Content-Type', resolved.mime);
+                res.setHeader('Content-Length', fstat.size);
+                res.setHeader('Cache-Control', 'no-store');
+                if (!sendBody(res, resolved.path, req.method)) return;
+                createReadStream(resolved.path).pipe(res);
+                return;
               } catch { /* fall through to 404 */ }
             }
           }
@@ -808,6 +834,7 @@ export default defineConfig(({ command }) => ({
   },
   define: {
     __RV_HAS_PRIVATE__: JSON.stringify(HAS_PRIVATE),
+    __RV_EMBED__: 'false',
     __RV_COMMERCIAL__: JSON.stringify(!!process.env.RV_COMMERCIAL),
     // Internal/dev-only features (DES, IK solver, STEP import, layout cloud, …).
     // Dev server (and vitest, which runs in serve mode) always ON; production
@@ -914,7 +941,11 @@ export default defineConfig(({ command }) => ({
       // development — asset-editor saves write files there and must NOT trigger
       // a dev-server full reload. (The `LocalFolderTest/` entry that used to
       // sit here belonged to the retired work folder, plan-709 §2.6.)
-      ignored: ['**/public/models/library/**'],
+      // `public/models/library/**` is still ignored: it is the pre-plan-716
+      // nesting and a dev checkout can still hold that scratch folder (Custom/,
+      // imports/, .thumbnails/ — all gitignored). Un-ignoring it would make an
+      // old local folder start triggering full reloads.
+      ignored: ['**/public/library/**', '**/public/models/library/**'],
     },
   },
   build: {
@@ -1051,6 +1082,32 @@ export default defineConfig(({ command }) => ({
           const next = `${source.slice(0, beginEnd + 3)}${eol}${body}${eol}${source.slice(endAt)}`;
           if (next === source) return { written: false, reason: 'already up to date' };
           writeFileSync(abs, next, 'utf-8');
+          return { written: true };
+        },
+
+        /**
+         * plan-713 Phase 0 — the discover-payload BASELINE writer.
+         *
+         * Same shape and same reasoning as `writeMcpDocBlock` above: the
+         * schemas can only be produced in the browser, the baseline they are
+         * frozen into lives on disk. It is a write path, so it refuses unless
+         * `RV_UPDATE_MCP_BASELINE=1` is set and it writes exactly ONE file.
+         *
+         * The baseline is what T1 (delegate-split equivalence) and T4b
+         * (payload-reduction gate) compare against; it is never "fixed" to
+         * make a red test green — a legitimate tool change updates it in the
+         * same commit that changes the tools.
+         */
+        writeMcpBaseline(_ctx: unknown, contents: string): { written: boolean; reason?: string } {
+          if (process.env.RV_UPDATE_MCP_BASELINE !== '1') {
+            return { written: false, reason: 'RV_UPDATE_MCP_BASELINE is not set' };
+          }
+          const abs = resolve(__dirname, 'tests/fixtures/mcp-discover-baseline.json');
+          const existing = (() => {
+            try { return readFileSync(abs, 'utf-8'); } catch { return null; }
+          })();
+          if (existing === contents) return { written: false, reason: 'already up to date' };
+          writeFileSync(abs, contents, 'utf-8');
           return { written: true };
         },
       },

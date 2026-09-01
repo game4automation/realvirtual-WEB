@@ -218,12 +218,16 @@ export class RVMachiningVolume implements RVComponent, StockBoundsSource {
   /**
    * Resolves the ORDERED `Tools` list plus the optional `ToolGroup` scan.
    *
-   * The wire format of the `Tools` reference array is TOLERANT on purpose: the
-   * Unity export test that pins it down (`TestGlbMachiningExport`) is still
-   * outstanding, so all three shapes the reflection-based serializer could
-   * plausibly emit are accepted — a resolved `Object3D`, a raw node-path
-   * string, or an already-resolved component instance. Whatever it is, order
-   * is preserved, because the subtraction result depends on it.
+   * The wire format is pinned by the Unity export test `TestGlbMachiningExport`
+   * (plan-430 F2): a JSON array in LIST order whose entries are
+   * `ComponentReference` objects (path + componentType + componentIndex), with
+   * dropped/out-of-hierarchy references kept as POSITIONAL nulls. By the time
+   * this method runs, `resolveComponentRefs()` has already turned each entry
+   * into one of exactly three shapes — a registered component instance
+   * (`RVMachiningTool`), a resolved `Object3D` node, or the raw path string
+   * when resolution failed — so the three branches below are the resolver's
+   * contract, not leftover tolerance for an unverified exporter. Order is
+   * preserved throughout, because the subtraction result depends on it.
    */
   resolveTools(): void {
     this._tools.length = 0;

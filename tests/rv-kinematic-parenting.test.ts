@@ -294,3 +294,110 @@ describe('applyKinematicParenting', () => {
     expect(kinNode.parent).toBe(parentNode);
   });
 });
+
+/**
+ * plan-727 — the authoring mode of the same function, and the group-aware
+ * dynamic reclassification that has to compensate for it.
+ */
+describe('applyKinematicParenting — skipReparent (authoring, plan-727)', () => {
+  it('resolves names but moves nothing', () => {
+    const root = new Object3D(); root.name = 'Root';
+    const kinNode = new Object3D(); kinNode.name = 'Kine';
+    kinNode.position.set(100, 0, 0);
+    const cadParent = new Object3D(); cadParent.name = 'CadRoot';
+    const groupNode = new Object3D(); groupNode.name = 'Part';
+    groupNode.position.set(50, 0, 0);
+    cadParent.add(groupNode);
+    root.add(kinNode);
+    root.add(cadParent);
+    root.updateMatrixWorld(true);
+
+    const groups = new GroupRegistry();
+    groups.register('G', groupNode);
+    const registry = buildRegistry(root);
+
+    const result = applyKinematicParenting(
+      [{ node: kinNode, data: { IntegrateGroupEnable: true, GroupName: 'G' } }],
+      groups, registry, root, true,
+    );
+
+    // Names still flow — GroupRegistry.isKinematic() feeds the editor's group
+    // assignment menu and must answer the same in both modes.
+    expect(result.groupNames).toEqual(['G']);
+    // ...but nothing moved, so Phase 8c has nothing to recompute.
+    expect(result.affectedSubtrees).toEqual([]);
+    expect(groupNode.parent).toBe(cadParent);
+  });
+
+  it('skips KinematicParentEnable as well', () => {
+    const root = new Object3D(); root.name = 'Root';
+    const cadParent = new Object3D(); cadParent.name = 'CadRoot';
+    const kinNode = new Object3D(); kinNode.name = 'Kine';
+    cadParent.add(kinNode);
+    const mount = new Object3D(); mount.name = 'Mount';
+    root.add(cadParent);
+    root.add(mount);
+    const registry = buildRegistry(root);
+
+    const result = applyKinematicParenting(
+      [{ node: kinNode, data: { KinematicParentEnable: true, Parent: { path: 'Mount' } } }],
+      null, registry, root, true,
+    );
+
+    expect(kinNode.parent).toBe(cadParent);
+    expect(result.affectedSubtrees).toEqual([]);
+  });
+});
+
+describe('group-aware dynamic classification (plan-727 F8)', () => {
+  it('marks group members dynamic without reparenting', async () => {
+    const { loadGLB } = await import('../src/core/engine/rv-scene-loader');
+    const { Scene } = await import('three');
+    const { buildKinematicGroupGLB } = await import('./kinematic-fixture');
+
+    const scene = new Scene();
+    await loadGLB('kin.glb', scene, {
+      data: await buildKinematicGroupGLB(), preserveAuthoringHierarchy: true,
+    });
+    // The exact regression the isStatic branch of processMeshes describes:
+    // frozen means three.js never rebuilds the matrix from the quaternion the
+    // drive writes — "running" drive, motionless geometry.
+    expect(scene.getObjectByName('Part')?.matrixAutoUpdate).toBe(true);
+  });
+
+  // MONOTONICITY. A before/after run cannot exist inside one test process, so
+  // this is a golden set: the dynamic nodes of a RUNTIME load must still contain
+  // everything that was dynamic before the reclassification was added. The pass
+  // may only ever ADD.
+  it('runtime classification never turns a dynamic node static', async () => {
+    const { loadGLB } = await import('../src/core/engine/rv-scene-loader');
+    const { Scene } = await import('three');
+    const { buildKinematicGroupGLB } = await import('./kinematic-fixture');
+
+    const scene = new Scene();
+    await loadGLB('kin.glb', scene, { data: await buildKinematicGroupGLB() });
+    const dynamic = new Set<string>();
+    scene.traverse((n) => { if (n.matrixAutoUpdate) dynamic.add(n.name); });
+    expect(dynamic).toContain('Kine');   // carries the Drive
+    expect(dynamic).toContain('Part');   // group member
+  });
+
+  // Guards the SIDE EFFECT documented in plan-727 §2.5: a nested axis without a
+  // Drive of its own qualifies today only because MOTION_KEY matches the bare
+  // `Kinematic` key. This is not designed transitivity — tighten MOTION_KEY and
+  // this test is supposed to break.
+  it('nested axis without its own Drive still classifies as dynamic', async () => {
+    const { loadGLB } = await import('../src/core/engine/rv-scene-loader');
+    const { Scene } = await import('three');
+    const { buildNestedKinematicGLB } = await import('./kinematic-fixture');
+
+    const scene = new Scene();
+    await loadGLB('kin.glb', scene, {
+      data: await buildNestedKinematicGLB(), preserveAuthoringHierarchy: true,
+    });
+    // Reached through group membership (the plan-727 reclassification)...
+    expect(scene.getObjectByName('InnerPart')?.matrixAutoUpdate).toBe(true);
+    // ...and through the bare-`Kinematic` MOTION_KEY match on its parent axis.
+    expect(scene.getObjectByName('InnerChild')?.matrixAutoUpdate).toBe(true);
+  });
+});

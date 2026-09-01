@@ -8,6 +8,7 @@
  * selection clearing.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -89,7 +90,7 @@ describe('pruneDescendantPaths', () => {
 describe('deleteSelectedNodes', () => {
   it('deletes parent subtree + unrelated node as ONE undo unit; clears selection', async () => {
     const { viewer, model, conv, belt, box, conv2, selectionManager, path } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     // Parent + its child + an unrelated node — child must be deduped away.
     selectionManager.set([path(conv), path(belt), path(box)]);
@@ -109,7 +110,7 @@ describe('deleteSelectedNodes', () => {
 
   it('single selection uses the plain deleteNode label', async () => {
     const { viewer, model, box, conv, conv2, selectionManager, path } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     selectionManager.set([path(box)]);
     await deleteSelectedNodes(viewer, doc);
@@ -120,7 +121,7 @@ describe('deleteSelectedNodes', () => {
 
   it('skips the asset root and unresolvable paths; empty result records nothing', async () => {
     const { viewer, model, selectionManager } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     selectionManager.set(['Asset', 'Asset/DoesNotExist']);
     await deleteSelectedNodes(viewer, doc);

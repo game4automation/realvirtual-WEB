@@ -139,6 +139,27 @@
           "default": false,
           "description": "If set to true the drive uses the acceleration."
         },
+        "SmoothAcceleration": {
+          "type": "boolean",
+          "default": false,
+          "description": "If set to true the drive uses a jerk-limited S-curve instead of the trapezoidal ramp; requires UseAcceleration."
+        },
+        "Jerk": {
+          "type": "number",
+          "default": 1000,
+          "unit": "mm/s3",
+          "description": "The jerk in millimeters per second cubed (degrees per second cubed for rotational drives); only used with SmoothAcceleration."
+        },
+        "SpeedOverride": {
+          "type": "number",
+          "default": 1,
+          "description": "Speed override factor for this drive, multiplied with the global speed override."
+        },
+        "JumpToLowerLimitOnUpperLimit": {
+          "type": "boolean",
+          "default": false,
+          "description": "If set to true the drive wraps around at its limits instead of stopping: passing the upper limit continues at the lower limit and vice versa."
+        },
         "UseLimits": {
           "type": "boolean",
           "default": false,
@@ -1028,6 +1049,96 @@
           "type": "boolean",
           "default": true,
           "description": "Animate the chain. Off leaves it in the CAD rest pose."
+        }
+      }
+    },
+    "Chain": {
+      "type": "object",
+      "description": "Continuous chain transport: N identical elements riding a spline, all moved by one Drive (Unity realvirtual.Chain). The curve is exported as an arc-length equidistant sample table in 'Spline'; the viewer clones the 'ChainElement' template 'NumberOfElements' times and poses every clone from the drive position. Positions and lengths are millimetres, the sample table is metres in the chain node's local frame.",
+      "properties": {
+        "ConnectedDrive": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Drive that moves the whole chain. Unresolvable: the elements are placed at their start positions and never move."
+        },
+        "chainOrientation": {
+          "type": "string",
+          "enum": ["Horizontal", "Vertical"],
+          "default": "Horizontal",
+          "description": "Vertical applies Unity's tangent-side flip of the element up vector (tangent.z < 0, or tangent.z == 0 and tangent.x > 0)."
+        },
+        "NumberOfElements": {
+          "type": "number",
+          "default": 0,
+          "description": "Number of chain elements to build from the template. 0 builds nothing."
+        },
+        "StartPosition": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Position of the FIRST element along the chain."
+        },
+        "CalculatedDeltaPosition": {
+          "type": "boolean",
+          "default": true,
+          "description": "Derive the element spacing from the chain length divided by NumberOfElements instead of using DeltaPosition."
+        },
+        "DeltaPosition": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Manual spacing between two consecutive elements. Ignored while CalculatedDeltaPosition is set."
+        },
+        "ScaledOnFixedLength": {
+          "type": "boolean",
+          "default": false,
+          "description": "Scale the position fraction over FixedLength instead of the real arc length. The sample table always stays tied to the real length, so a shorter FixedLength makes the chain cycle faster over the same geometry (Unity parity)."
+        },
+        "FixedLength": {
+          "type": "number",
+          "default": 1500,
+          "unit": "mm",
+          "description": "The length the position fraction is scaled over while ScaledOnFixedLength is set."
+        },
+        "ChainElement": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "The element template node (wire componentType UnityEngine.Transform). Cloned NumberOfElements times at load; unresolvable makes the chain inert."
+        },
+        "NameChainElement": {
+          "type": "string",
+          "default": "",
+          "description": "Base name of the generated elements. Children called '<name>_<n>' are treated as stale editor-generated elements and dropped before cloning; empty falls back to the template's node name."
+        },
+        "Spline": {
+          "type": "object",
+          "description": "Baked curve: { closed: boolean, length: number (metres), samples: number[] }. 'samples' is flat [px,py,pz, tx,ty,tz, ux,uy,uz] per sample, arc-length equidistant, in the chain node's LOCAL frame. Fewer than two samples makes the chain inert. rv-chain-path.ts is the executable TS-SSOT for this shape."
+        }
+      }
+    },
+    "ChainElement": {
+      "type": "object",
+      "description": "Per-element configuration of a Chain, authored on the element TEMPLATE node (Unity realvirtual.ChainElement). It carries no behaviour of its own in the viewer: the owning Chain reads these fields and poses every clone, mirroring Unity's batch update.",
+      "properties": {
+        "AlignWithChain": {
+          "type": "boolean",
+          "default": true,
+          "description": "Align the element with the chain tangent while moving. Off leaves the template rotation untouched and only the position is written."
+        },
+        "AlignVector": {
+          "$ref": "#/$defs/Vector3",
+          "unityCoords": true,
+          "description": "Additional up reference for the alignment. Unused on the Unity-spline path, where the baked up vectors of the sample table are authoritative; kept so the field round-trips."
+        },
+        "InitialPosition": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Initial position of this element along the chain. Set by the Chain for generated elements."
+        },
+        "OffsetToDrivePosition": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Position offset of every element relative to the drive position."
         }
       }
     },
@@ -3572,6 +3683,12 @@
     },
     "EnergyChain": {
       "$ref": "#/$defs/EnergyChain"
+    },
+    "Chain": {
+      "$ref": "#/$defs/Chain"
+    },
+    "ChainElement": {
+      "$ref": "#/$defs/ChainElement"
     },
     "KinematicMechanism": {
       "$ref": "#/$defs/KinematicMechanism"

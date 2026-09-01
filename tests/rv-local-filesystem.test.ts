@@ -24,12 +24,15 @@ import {
   ensureHandlePermission,
   getFolderHandle,
   getHandle,
+  isSupported,
   listHandleKeys,
+  pickFolderForKey,
   projectHandleKey,
   putHandle,
   readTextFile,
   removeFileEntry,
   requestWriteAccess,
+  selectFolderForKey,
   tryGetSubfolder,
   writeTextFile,
 } from '../src/core/engine/rv-local-filesystem';
@@ -235,5 +238,75 @@ describe('text file primitives', () => {
     expect(await tryGetSubfolder(asDirHandle(dir), 'docs')).toBeNull();
     dir.seedDir('docs');
     expect(await tryGetSubfolder(asDirHandle(dir), 'docs')).not.toBeNull();
+  });
+});
+
+// ─── Directory picker — every empty outcome names itself ────────────────
+
+/**
+ * The regression these pin down: `selectFolderForKey` answered `handle | null`,
+ * and that one `null` covered *cancelled*, *no API in this browser* and
+ * *picker refused to open*. The dashboard could only read it as "cancelled",
+ * so "Open workspace…" on Firefox — or after a picker got stuck — was a button
+ * that did nothing at all, with no dialog and no message.
+ */
+describe('pickFolderForKey', () => {
+  const KEY = projectHandleKey('prj_a');
+  // The real Chromium picker would open a native dialog no test can answer, so
+  // the API itself is the seam: swapped for a canned outcome, and *removed* to
+  // stand in for a browser that never had it.
+  const w = window as unknown as { showDirectoryPicker?: unknown };
+  let original: unknown;
+
+  beforeEach(() => { original = w.showDirectoryPicker; });
+  afterEach(() => {
+    if (original === undefined) delete w.showDirectoryPicker;
+    else w.showDirectoryPicker = original;
+  });
+
+  /** Replace the picker with a canned outcome. `null` removes it entirely. */
+  function picker(outcome: (() => Promise<unknown>) | null): void {
+    if (outcome === null) delete w.showDirectoryPicker;
+    else w.showDirectoryPicker = outcome;
+  }
+
+  it('returns the handle and persists it under the caller key', async () => {
+    const dir = stub('picked');
+    picker(async () => dir);
+    const pick = await pickFolderForKey(KEY);
+    expect(pick.kind).toBe('picked');
+    expect(await getHandle(KEY)).toEqual(dir);
+  });
+
+  it('reports a dismissed dialog as cancelled — the one silent outcome', async () => {
+    picker(async () => { throw new DOMException('The user aborted a request.', 'AbortError'); });
+    expect((await pickFolderForKey(KEY)).kind).toBe('cancelled');
+  });
+
+  it('separates a stuck picker from a cancel, though both arrive as AbortError', async () => {
+    picker(async () => { throw new DOMException('File picker already active.', 'AbortError'); });
+    const pick = await pickFolderForKey(KEY);
+    expect(pick.kind).toBe('blocked');
+    if (pick.kind === 'blocked') expect(pick.reason).toMatch(/reload/i);
+  });
+
+  it('reports a refusal (policy, cross-origin frame) with its reason', async () => {
+    picker(async () => { throw new DOMException('blocked by policy', 'NotAllowedError'); });
+    const pick = await pickFolderForKey(KEY);
+    expect(pick.kind).toBe('blocked');
+    if (pick.kind === 'blocked') expect(pick.reason).toBe('blocked by policy');
+  });
+
+  it('reports a browser without the API as unsupported, not as a cancel', async () => {
+    picker(null);
+    expect(isSupported()).toBe(false);
+    expect((await pickFolderForKey(KEY)).kind).toBe('unsupported');
+  });
+
+  it('keeps selectFolderForKey lenient — every empty outcome is still null', async () => {
+    picker(null);
+    expect(await selectFolderForKey(KEY)).toBeNull();
+    picker(async () => { throw new DOMException('The user aborted a request.', 'AbortError'); });
+    expect(await selectFolderForKey(KEY)).toBeNull();
   });
 });

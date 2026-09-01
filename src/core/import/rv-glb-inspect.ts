@@ -33,6 +33,27 @@ export function countGlbMeshNodes(json: GlbJson): number {
   return (json.nodes ?? []).filter((n) => n.mesh !== undefined).length;
 }
 
+/**
+ * Node/mesh census of a GLB, read from the JSON chunk alone (plan-713 F2).
+ *
+ * This is the "header-only reader" the plan asks for, and it is a function
+ * rather than a new module because the reader it needs ALREADY EXISTS:
+ * {@link readGlbJson} sits on `parseGlbChunks`, whose contract is literally "the
+ * BIN chunk is never decoded, only located". Writing a second GLB header parser
+ * next to it to satisfy the letter of the plan would have added a second thing
+ * to keep in step with the spec for no capability at all.
+ *
+ * What the plan forbids is the OTHER path — `parseGlbSubtree*` in
+ * `rv-glb-parse.ts`, which runs a full `GLTFLoader` parse including geometry.
+ * Nothing here touches it.
+ */
+export function glbNodeCensus(json: GlbJson): { nodeCount: number; meshCount: number } {
+  return {
+    nodeCount: (json.nodes ?? []).length,
+    meshCount: (json.meshes ?? []).length,
+  };
+}
+
 /** Names of nodes that reference no mesh (candidates for a silent exporter drop). */
 export function meshlessGlbNodeNames(json: GlbJson): string[] {
   return (json.nodes ?? []).filter((n) => n.mesh === undefined).map((n) => n.name ?? '<unnamed>');

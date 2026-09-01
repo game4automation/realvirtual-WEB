@@ -1,0 +1,3069 @@
+{
+  "plan": "plan-713 Phase 0 — frozen before the delegate split",
+  "toolCount": 145,
+  "payloadBytes": 94856,
+  "approxTokens": 23714,
+  "perDelegate": {
+    "McpBridgePlugin": 6,
+    "McpViewTools": 16,
+    "McpObserveTools": 4,
+    "_McpEditorTools": 58,
+    "McpSignalBindTools": 4,
+    "McpKnowledgeTools": 3,
+    "McpProjectTools": 7,
+    "McpDescribeTool": 1,
+    "McpLinkTools": 1,
+    "McpRuntimeTools": 14,
+    "McpSceneTools": 20,
+    "McpDesPlcTools": 10,
+    "McpHelpTool": 1
+  },
+  "tools": [
+    {
+      "name": "web_camera_fly",
+      "description": "Fly the camera RELATIVE to where it is now: forward/right/up in metres plus yawDeg/pitchDeg in degrees (+yaw = to the left, +pitch = up, clamped at ±85°). Unlike web_camera_orbit — which circles a fixed point — this MOVES THROUGH the plant, which is what a long line needs. ground=true walks instead of flying: forward/right stay horizontal and the camera is held at eyeHeight above the nearest surface below (no wall collision — flying through a wall is allowed). Refused while FPV, camera-follow or XR own the camera.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "forward": {
+            "type": "number",
+            "description": "Metres along the view direction (default 0)."
+          },
+          "right": {
+            "type": "number",
+            "description": "Metres to the right (default 0)."
+          },
+          "up": {
+            "type": "number",
+            "description": "Metres along world +Y (default 0)."
+          },
+          "yawDeg": {
+            "type": "number",
+            "description": "Turn in degrees, + = to the left (default 0)."
+          },
+          "pitchDeg": {
+            "type": "number",
+            "description": "Tilt in degrees, + = up, clamped at ±85° (default 0)."
+          },
+          "ground": {
+            "type": "boolean",
+            "description": "Walk instead of fly: horizontal moves, eye height above the surface below (default false)."
+          },
+          "durationMs": {
+            "type": "number",
+            "description": "Animation duration in ms (default 600)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 30000
+    },
+    {
+      "name": "web_camera_focus",
+      "description": "Frame one or more nodes: animates the camera so they fill the view (keeps the current view direction). THE standard way to look at a part before a screenshot.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths, comma- or newline-separated."
+          }
+        },
+        "required": [
+          "paths"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_camera_get",
+      "description": "Get the current camera state: position, orbit target and the canvas size.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_camera_orbit",
+      "description": "Orbit the camera around a point: yaw (horizontal, degrees, + = counter-clockwise from above), pitch (vertical, degrees, + = up), and an optional distance factor (0.5 = half distance / zoom in, 2 = zoom out). Relative move — ideal for \"look at it from the other side\". pivot chooses the point: omit for the current orbit target (unchanged behaviour), \"selection\" for the centre of what is selected, or a node path. Refused while FPV, camera-follow or XR own the camera.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "yawDeg": {
+            "type": "number",
+            "description": "Horizontal orbit angle in degrees."
+          },
+          "pitchDeg": {
+            "type": "number",
+            "description": "Vertical orbit angle in degrees (default 0)."
+          },
+          "distanceFactor": {
+            "type": "number",
+            "description": "Multiply camera distance (default 1)."
+          },
+          "pivot": {
+            "type": "string",
+            "description": "Orbit centre: \"selection\", a node path, or omit for the current target."
+          }
+        },
+        "required": [
+          "yawDeg"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_camera_projection",
+      "description": "Switch the camera between perspective and orthographic (iso) rendering with a smooth animated transition — same as the view-cube Persp/Iso toggle. mode = perspective | orthographic (aliases: persp, ortho, iso); omit to toggle.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "description": "perspective | orthographic | iso (omit = toggle)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_camera_set",
+      "description": "Move the camera (animated) to an explicit position looking at a target. Coordinates in meters, world space. The visible viewport camera moves — a watching user sees the same view.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "px": {
+            "type": "number",
+            "description": "Camera position X (m)."
+          },
+          "py": {
+            "type": "number",
+            "description": "Camera position Y (m)."
+          },
+          "pz": {
+            "type": "number",
+            "description": "Camera position Z (m)."
+          },
+          "tx": {
+            "type": "number",
+            "description": "Look-at target X (m)."
+          },
+          "ty": {
+            "type": "number",
+            "description": "Look-at target Y (m)."
+          },
+          "tz": {
+            "type": "number",
+            "description": "Look-at target Z (m)."
+          },
+          "durationMs": {
+            "type": "number",
+            "description": "Animation duration in ms (default 600)."
+          }
+        },
+        "required": [
+          "px",
+          "py",
+          "pz",
+          "tx",
+          "ty",
+          "tz"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_camera_view",
+      "description": "Move the camera to a NAMED view: iso | top | front | back | left | right | home (home = iso). target chooses what to frame — \"selection\", a node path, or omit for the whole scene. The framing distance is MEASURED from the viewer's own fit, so a preset frames exactly as tightly as web_camera_focus does. Refused while FPV, camera-follow or XR own the camera.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "preset": {
+            "type": "string",
+            "description": "iso | top | front | back | left | right | home"
+          },
+          "target": {
+            "type": "string",
+            "description": "\"selection\", a node path, or omit for the whole scene."
+          }
+        },
+        "required": [
+          "preset"
+        ]
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 30000
+    },
+    {
+      "name": "web_catalog_describe",
+      "description": "Describe one parts-catalog entry for building: purpose, material-flow direction, snap connections, key config. catalogId from web_catalog_list.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "catalogId": {
+            "type": "string",
+            "description": "Catalog entry id (from web_catalog_list)"
+          }
+        },
+        "required": [
+          "catalogId"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_catalog_list",
+      "description": "List the placeable PARTS CATALOG of the layout planner: catalogId, name, category, footprintMm [x,z], short description. Catalog entries are templates you can place, NOT the project documents (those are web_document_list). Pass catalogId to web_layout_place / web_layout_snap_attach; full build docs via web_catalog_describe.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_component_get",
+      "description": "Get one component on a node by path and type (e.g. Drive, Sensor, TransportSurface). Returns its properties.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Full hierarchy path of the node"
+          },
+          "type": {
+            "type": "string",
+            "description": "Component type name (e.g. Drive, Sensor, TransportSurface, Source, Sink, Grip, GripTarget)"
+          }
+        },
+        "required": [
+          "path",
+          "type"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_component_get_all",
+      "description": "Get all components on one node with their properties. Node paths from web_node_find / web_node_tree.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Full hierarchy path of the node"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_component_list",
+      "description": "List all components of one type across the scene with paths + properties. Unknown type returns the available types.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Component type name (e.g. Drive, Sensor, TransportSurface, Source, Sink, Grip, GripTarget)"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_component_set",
+      "description": "Set config properties on an existing component (rv_extras overrides, e.g. drive TargetSpeed, source spawn interval). props = JSON object of fieldName -> value. In the asset editor prefer web_editor_set_field (undoable).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Full hierarchy path of the node"
+          },
+          "type": {
+            "type": "string",
+            "description": "Component type (e.g. Drive, Source, Sensor, TransportSurface)"
+          },
+          "props": {
+            "type": "string",
+            "description": "JSON object of fieldName -> value, e.g. {\"TargetSpeed\": 500}"
+          }
+        },
+        "required": [
+          "path",
+          "type",
+          "props"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_des_bottleneck",
+      "description": "Identify the DES bottleneck — the constraining component (highest Working%). Upstream of it parts pile up (Blocked); downstream they starve (Empty). Returns the bottleneck, the mean utilization, the throughput and a short diagnosis of how many upstream components are blocked vs downstream starved.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_des_components",
+      "description": "DES component states: per material-flow component the load / in-transit / blocked counts and the next/prev wiring. The go-to tool for diagnosing why parts are not flowing (deadlocks, full zones, missing or wrong connections). Pass busyOnly=true to list only components currently holding/transiting/blocking an MU.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "busyOnly": {
+            "type": "boolean",
+            "description": "Only list components currently holding/transiting/blocking an MU"
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_des_set_mode",
+      "description": "Set the DES sub-mode: animated (1x real-time), hybrid (Nx), fastforward (max speed), step (manual). Optionally set the hybrid speed multiplier.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "subMode": {
+            "type": "string",
+            "description": "animated | hybrid | fastforward | step"
+          },
+          "multiplier": {
+            "type": "number",
+            "description": "Hybrid speed multiplier (>= 1)"
+          }
+        },
+        "required": [
+          "subMode"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_des_stats",
+      "description": "DES per-component statistics: utilization (Working/Setup/Blocked/Empty/Failure %), output/h, current state and totalProcessed — in MATERIAL-FLOW order (sources first, sinks last) — plus aggregate mean utilization and throughput. Use to analyze line balance and where time is lost.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_des_status",
+      "description": "DES status: kernel mode, sub-mode, sim time and processed/pending event counts. The first check for \"is the DES simulation running and advancing?\" — if pending=0 and nextEventTime is null/Infinity the run has stalled or finished.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_des_step",
+      "description": "Advance the DES simulation by exactly N events (default 1) and return the new status. Use to step through the event queue when diagnosing flow — each step processes one scheduled event (arrival/generate/transfer).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Number of events to step (default 1)"
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_describe",
+      "description": "Report where you are and what to do next in one read-only call: active and available modes, the open asset document (name, base kind, dirty, busy, op/node counts, undo), selection size, runtime (connection, simulation running, model URL, drive and signal counts). Two derived fields make it actionable: `blocked` names each gated tool family with the tool that unblocks it, and `next` names the ONE recommended action for this exact state — a busy editor, a library document that opened empty, an unverified drive before save. Call it first in a session and whenever a result surprises you. Changes nothing: not selection, panels or camera. Deep guides stay in web_help.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "focus": {
+            "type": "string",
+            "description": "Reserved for a narrower report; ignored today."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_document_list",
+      "description": "List the DOCUMENTS of the open project — THE one list. Asset, model and scene are the same thing: a GLB document; the folder (`section`: scenes/models/library) is a storage place, not a type. Each row: id, name, path, section, sizeBytes, modified. `builtins` and `published` are read-only SOURCES, not documents: opening one and saving materialises a new document. filter matches name or path (case-insensitive substring); withNodeCount reads each GLB header to add nodeCount (slower). Pass an id, name or path to web_document_open, or its path to web_document_update / web_editor_open(source=library). Note the difference from web_project_list: a PROJECT decides what project-relative paths resolve against, a DOCUMENT is what is loaded in the viewport.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "string",
+            "description": "Case-insensitive substring of name or path"
+          },
+          "withNodeCount": {
+            "type": "boolean",
+            "description": "Read each GLB header to report nodeCount (slower; default false)"
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true,
+      "timeoutMs": 60000
+    },
+    {
+      "name": "web_document_new",
+      "description": "Create a new empty DOCUMENT in the project and open it, returning its documentId and path. Optional name (default \"Untitled\", auto-suffixed when taken) and folder (project-relative, e.g. \"parts\" or \"library/Machines\", \"\" = project root; see web_project_tree — create folders first with web_project_folder). Places a file plus a manifest row, so the clean reset before building a layout survives a reload.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Document name (default \"Untitled\"; a taken name gets a numeric suffix)."
+          },
+          "folder": {
+            "type": "string",
+            "description": "Project-relative folder to place it in (default: the project root)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 60000
+    },
+    {
+      "name": "web_document_open",
+      "description": "LOAD a document into the viewer, or clear it. `document` matches an id, name, path, built-in label or url from web_document_list; the special value \"empty\" opens an EMPTY viewport. Open \"empty\" BEFORE authoring a new asset: with a document still loaded, opening the asset editor with source=new leaves it in the scene and web_editor_import_cad attaches the import UNDER it — the new document silently adopts the whole scene, and a save would write the demo scene plus your part. Refused while the asset editor is open: the editor keeps its document (and its save path) bound to the previous file — call web_editor_close first.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "document": {
+            "type": "string",
+            "description": "Document id, name, path, built-in label or url from web_document_list, matched case- and separator-insensitively — or \"empty\" to clear the viewport (nodeCount then reports 1 instead of the whole scene)."
+          }
+        },
+        "required": [
+          "document"
+        ]
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 180000
+    },
+    {
+      "name": "web_document_save",
+      "description": "Save the current document. With name: saves a NEW named document and returns its documentId; without: saves the open one in place with compare-and-swap. Reports saveVerb (save | save-into-project | blocked with a reason), the same verb the save card shows. Reopen via web_document_open; raw planner layout JSON via web_layout_export.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Document name (optional — omit to save the open document in place)"
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_document_update",
+      "description": "Delete, rename or move a saved DOCUMENT or attachment file of the open project (path from web_document_list / web_project_tree — any folder, not just library/). Refused: the document currently open in the editor, reserved system paths, read-only projects. rename/move go through the dashboard tree machinery, so the document id never changes and references keep resolving. Delete moves the bytes to .trash/ and drops the manifest row. Folders are managed by web_project_folder.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "delete | rename | move"
+          },
+          "relPath": {
+            "type": "string",
+            "description": "Project-relative document path, e.g. \"library/Custom/MyAsset.glb\" (from web_document_list). The legacy \"Custom/…\" spelling still resolves."
+          },
+          "newName": {
+            "type": "string",
+            "description": "New document name (rename only; the extension is kept when omitted)."
+          },
+          "toFolder": {
+            "type": "string",
+            "description": "Destination folder, \"\" for the project root (move only; see web_project_tree)."
+          }
+        },
+        "required": [
+          "action",
+          "relPath"
+        ]
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 120000
+    },
+    {
+      "name": "web_drive_jog",
+      "description": "Jog a runtime drive forward or backward (sets jog flags; drive names from web_drive_list). Stop with web_drive_stop. For authored drives in the asset editor use web_editor_verify_drive instead.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Drive name"
+          },
+          "forward": {
+            "type": "boolean",
+            "description": "true for forward, false for backward"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_drive_list",
+      "description": "List all drives: current/target position, speed, running/jog flags, direction, limits. First stop when diagnosing why something does not move.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_drive_speed_override",
+      "description": "Master speed factor scaling ALL drives (1 = normal, 0.5 = half, 2 = double, 0 = stopped; relative speeds preserved). Omit factor to read the current value.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "factor": {
+            "type": "number",
+            "description": "Master speed factor (1 = normal). Omit to read the current value."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_drive_stop",
+      "description": "Stop a drive: clears jog flags and halts motion. Drive names from web_drive_list.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Drive name"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_add_component",
+      "description": "Add a component to a node (Quick Edit \"Components\" section): Drive, Kinematic, Sensor, TransportSurface, Source, Sink, Grip, drive behaviors, signals, LogicSteps… Starts from schema defaults; optional propsJson overrides fields (e.g. {\"Direction\":\"RotationY\"}). Returns the concrete component key. Undoable.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path."
+          },
+          "type": {
+            "type": "string",
+            "description": "Component base type (e.g. Drive)."
+          },
+          "propsJson": {
+            "type": "string",
+            "description": "Optional JSON object of field overrides."
+          }
+        },
+        "required": [
+          "path",
+          "type"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_add_logic_step",
+      "description": "Add a LogicStep to a node (Quick Edit \"Logic Steps\"). Unknown stepType returns the palette. Steps sequence one-per-node; a node that already has a step gets a sibling.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Context node path."
+          },
+          "stepType": {
+            "type": "string",
+            "description": "LogicStep type (e.g. LogicStep_DriveTo)."
+          }
+        },
+        "required": [
+          "path",
+          "stepType"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_add_signal",
+      "description": "Create a PLC signal node as a child (Quick Edit \"Signals\"). sigType: PLCInputBool | PLCOutputBool | PLCInputFloat | PLCOutputFloat | PLCInputInt | PLCOutputInt. Optional name renames the node. Returns the new path.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "parentPath": {
+            "type": "string",
+            "description": "Parent node path."
+          },
+          "sigType": {
+            "type": "string",
+            "description": "Signal type (e.g. PLCOutputBool)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Optional node name (default = signal type)."
+          }
+        },
+        "required": [
+          "parentPath",
+          "sigType"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_assign_material",
+      "description": "Assign a material to nodes (undoable, like the Materials panel): presetId (from web_editor_material_presets) OR free PBR values (color hex + metalness/roughness/opacity). Omit paths to paint the CURRENT selection — e.g. after web_editor_shortcut \"S>I\". Expands to paintable meshes automatically.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths, comma/newline-separated (omit = current selection)."
+          },
+          "presetId": {
+            "type": "string",
+            "description": "Material preset id (e.g. \"steel\")."
+          },
+          "color": {
+            "type": "string",
+            "description": "Hex color (e.g. \"#2271b3\") for a free PBR value."
+          },
+          "metalness": {
+            "type": "number",
+            "description": "Metalness 0..1 (default 0)."
+          },
+          "roughness": {
+            "type": "number",
+            "description": "Roughness 0..1 (default 0.5)."
+          },
+          "opacity": {
+            "type": "number",
+            "description": "Opacity 0..1 (default 1)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_assign_to_kinematic",
+      "description": "Assign nodes to a kinematic's group (they will move with the axis). Objects in another kinematic group are moved over; other kinematic axes are skipped. One undo unit.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths to assign, comma/newline-separated."
+          },
+          "groupName": {
+            "type": "string",
+            "description": "Target kinematic group name (see web_editor_list_kinematics)."
+          }
+        },
+        "required": [
+          "paths",
+          "groupName"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_back",
+      "description": "Leave the current descend level and return to the document above it (the inverse of web_editor_descend). Refuses at the root, where there is nothing to go back to — close the document with web_editor_close instead.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 120000
+    },
+    {
+      "name": "web_editor_close",
+      "description": "Close the asset editor and return to the previous workspace. ifDirty: fail (default) | save (optionally pass name) | discard.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "ifDirty": {
+            "type": "string",
+            "description": "fail | save | discard (default fail)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Asset name when ifDirty=save and the document is Untitled."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_convert_signal",
+      "description": "Convert a signal node to another datatype (Bool | Int | Float), keeping direction and value.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Signal node path."
+          },
+          "target": {
+            "type": "string",
+            "description": "Bool | Int | Float."
+          }
+        },
+        "required": [
+          "path",
+          "target"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_create_empty",
+      "description": "Create an empty node (under parentPath, or at the asset root when omitted). Returns the new path.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "parentPath": {
+            "type": "string",
+            "description": "Parent node path (omit for asset root)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Node name (default \"Empty\")."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_create_kinematic",
+      "description": "Create a new kinematic axis: an empty top-level node with a Kinematic component linked to a fresh group (Quick Edit \"Add Kinematic\"). Assign members afterwards with web_editor_assign_to_kinematic. Returns the axis path + group name.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Kinematic/group name (default auto \"Kinematic_N\")."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_delete",
+      "description": "Delete nodes (descendants of other given paths are pruned automatically; one undo unit).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths, comma/newline-separated."
+          }
+        },
+        "required": [
+          "paths"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_descend",
+      "description": "Descend INTO a referenced asset at path — opens that asset as its own document one level deeper, exactly like double-clicking the reference in the hierarchy. Editor mode only. The path must be a descendable reference; anything else is refused with the reason. Leave again with web_editor_back; the chain is in web_editor_status as depth + breadcrumb.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of the referenced asset to enter"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 120000
+    },
+    {
+      "name": "web_editor_import_cad",
+      "description": "Import a CAD file (STEP/JT) from the OPEN PROJECT into the open asset — converts via the CAD provider (private build), then attaches as an undoable importCad op. relPath is project-relative. quality: draft | standard | fine (default standard).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "relPath": {
+            "type": "string",
+            "description": "Project-relative path of a CAD file (.step/.stp/.jt), e.g. \"library/imports/machine.step\"."
+          },
+          "quality": {
+            "type": "string",
+            "description": "Tessellation quality: draft | standard | fine (default standard)."
+          }
+        },
+        "required": [
+          "relPath"
+        ]
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 600000
+    },
+    {
+      "name": "web_editor_import_glb",
+      "description": "Import a GLB file from the OPEN PROJECT into the open asset (undoable importCad op). relPath is project-relative (e.g. \"library/imports/part.glb\"). Returns the created root path.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "relPath": {
+            "type": "string",
+            "description": "Project-relative path of a .glb file (e.g. \"library/imports/part.glb\")."
+          }
+        },
+        "required": [
+          "relPath"
+        ]
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 120000
+    },
+    {
+      "name": "web_editor_kinematize",
+      "description": "KINEMATIZE in one undo step: group the given parts under a (new or existing) kinematic axis, add a Drive on the axis, set its direction/speed/limits, and center the pivot to the group. direction: LinearX|LinearY|LinearZ|RotationX|RotationY|RotationZ. Verify afterwards with web_editor_verify_drive. Fine-tune with web_editor_pivot / web_editor_set_field.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Part node paths to kinematize, comma/newline-separated."
+          },
+          "groupName": {
+            "type": "string",
+            "description": "Kinematic/group name (e.g. \"Turntable\")."
+          },
+          "direction": {
+            "type": "string",
+            "description": "Drive direction (default LinearX)."
+          },
+          "speed": {
+            "type": "number",
+            "description": "Target speed (mm/s linear, °/s rotary)."
+          },
+          "lowerLimit": {
+            "type": "number",
+            "description": "Lower limit (mm or °) — sets UseLimits."
+          },
+          "upperLimit": {
+            "type": "number",
+            "description": "Upper limit (mm or °) — sets UseLimits."
+          },
+          "startPosition": {
+            "type": "number",
+            "description": "Start position (mm or °)."
+          },
+          "centerPivot": {
+            "type": "boolean",
+            "description": "Center the axis pivot to the group bounds (default true)."
+          }
+        },
+        "required": [
+          "paths",
+          "groupName"
+        ]
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 60000
+    },
+    {
+      "name": "web_editor_list_kinematics",
+      "description": "List all kinematics in the asset: axis path, group name, member count, and the Drive on the axis (direction/speed/limits) when present.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_editor_material_presets",
+      "description": "List the material presets (built-in industrial library + user presets): id, name, category, color, metalness, roughness, opacity. Assign with web_editor_assign_material or web_editor_materialize.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_editor_material_stats",
+      "description": "Material overview of the asset: counts, warnings, and the APPEARANCE GROUPS (meshes bucketed by identical current material) with a stable key, current PBR value, mesh count and sample paths. The perception step before web_editor_materialize.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_editor_materialize",
+      "description": "MATERIALIZE: call with no assignments to get the appearance groups (same as web_editor_material_stats), then call again with assignmentsJson = [{\"key\"|\"samplePath\": ..., \"presetId\"|\"color\"(+metalness/roughness/opacity): ...}, ...] to re-material whole appearance groups in ONE undo step.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "assignmentsJson": {
+            "type": "string",
+            "description": "JSON array of {key|samplePath, presetId|color,metalness,roughness,opacity}."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 60000
+    },
+    {
+      "name": "web_editor_mechanism_add_body",
+      "description": "Add a MechanismBody to a link so the force analysis has a mass for it — without one the inverse dynamics reports \"a link without mass\" and every drive figure stays empty. densityPreset = steel|stainless|aluminum|pa|pom|custom. The mass itself is computed from the link's geometry and never stored, so it cannot go stale; use web_editor_mechanism_set_mass to override it. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of the link to give a body."
+          },
+          "densityPreset": {
+            "type": "string",
+            "description": "steel | stainless | aluminum | pa | pom | custom (default steel)."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_add_joint",
+      "description": "Add a KinematicJoint to a mechanism. jointType = Revolute|Prismatic|Spherical|Universal. bodyBPath is required; OMIT bodyAPath to anchor the joint against WORLD/static space (the authored world-anchor form — an absent Body A, never an empty string). anchors are in millimetres in the respective body local frame; axisA is Body-A-local. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node the joint component is added to (a child of the mechanism node)."
+          },
+          "jointType": {
+            "type": "string",
+            "description": "Revolute | Prismatic | Spherical | Universal."
+          },
+          "bodyBPath": {
+            "type": "string",
+            "description": "Node path of Body B (required)."
+          },
+          "bodyAPath": {
+            "type": "string",
+            "description": "Node path of Body A. Omit for a world anchor."
+          },
+          "anchorAJson": {
+            "type": "string",
+            "description": "Anchor A as JSON {x,y,z} in mm (Body-A-local)."
+          },
+          "anchorBJson": {
+            "type": "string",
+            "description": "Anchor B as JSON {x,y,z} in mm (Body-B-local)."
+          },
+          "axisAJson": {
+            "type": "string",
+            "description": "Axis A as JSON {x,y,z} (Body-A-local)."
+          }
+        },
+        "required": [
+          "path",
+          "jointType",
+          "bodyBPath"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_assign_drive",
+      "description": "Assign the Drive that actively controls a joint, or clear it. OMIT drivePath to make the joint PASSIVE again (the reference key is removed, which is the authored \"no drive\" form). NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of the joint."
+          },
+          "componentType": {
+            "type": "string",
+            "description": "Concrete joint key (e.g. KinematicJoint)."
+          },
+          "drivePath": {
+            "type": "string",
+            "description": "Node path carrying the Drive. Omit to clear."
+          }
+        },
+        "required": [
+          "path",
+          "componentType"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_create",
+      "description": "Add a rigid-body MECHANISM (KinematicMechanism) to a node — the container that solves a joint graph with loop closure and free bodies. Add joints afterwards with web_editor_mechanism_add_joint. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node the mechanism component is added to."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_fix",
+      "description": "Apply the auto-fix of a FIXABLE finding on a joint and persist it as an ordinary field composite, so it undoes like a manual edit. Get the code from the findings of web_editor_mechanism_inspect or web_editor_mechanism_validate — only entries with fixable=true have one. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of the joint the finding concerns."
+          },
+          "code": {
+            "type": "string",
+            "description": "Finding code, e.g. AnchorsApart or MissingSecondaryAxis."
+          }
+        },
+        "required": [
+          "path",
+          "code"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_forces",
+      "description": "Read the DRIVE SIZING figures of a mechanism: per channel the current value plus peak, time-weighted RMS and holding force with their unit, and per joint the world reaction force and torque. This is what turns a built mechanism into a motor choice — continuous rating above RMS, peak rating above peak. Record a cycle first with web_editor_test_start/_stop; holding comes from web_editor_mechanism_statics. With channelId and series=true one channel also carries a downsampled time series. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Read-only.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mechanismPath": {
+            "type": "string",
+            "description": "Node path of the mechanism."
+          },
+          "channelId": {
+            "type": "string",
+            "description": "Channel id from a previous call — required for series."
+          },
+          "series": {
+            "type": "boolean",
+            "description": "Also return the recorded time series for channelId, downsampled (default false)."
+          }
+        },
+        "required": [
+          "mechanismPath"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_editor_mechanism_inspect",
+      "description": "Read a rigid-body MECHANISM in full: joints (type, bodies, drive, current value, limits, world origin and axis, joggable), links with their mass properties (hasBody, massKg, massSource, massWarning), findings, and convergence (converged, residualError, dof, loopCount). Omit path to read every mechanism; use include to keep the answer small. This is the READ half of the authoring cycle — call it before and after every edit. NOTE: this is the joint-graph mechanism system, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Read-only.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of one mechanism. Omit to read all."
+          },
+          "include": {
+            "type": "string",
+            "description": "Comma-separated subset of joints,links,findings (default all three)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_editor_mechanism_jog",
+      "description": "Jog one driven joint to an absolute value (degrees for Revolute, millimetres for Prismatic) and run ONE solve, reporting the REAL convergence and residual. TRANSIENT — writes a live drive value only, creates no ops and no undo entry. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of the joint to jog."
+          },
+          "value": {
+            "type": "number",
+            "description": "Absolute joint value (deg or mm)."
+          },
+          "componentType": {
+            "type": "string",
+            "description": "Concrete joint key (e.g. KinematicJoint_2) when several joints sit on one node. Omit for one-joint-per-node authoring."
+          }
+        },
+        "required": [
+          "path",
+          "value"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_set_anchor",
+      "description": "Set a joint's anchor point(s), in millimetres, in the respective body local frame. Pass either or both. Both writes land in ONE composite, so an anchor snap is a single undo step. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of the joint."
+          },
+          "componentType": {
+            "type": "string",
+            "description": "Concrete joint key (e.g. KinematicJoint or KinematicJoint_1)."
+          },
+          "anchorAJson": {
+            "type": "string",
+            "description": "Anchor A as JSON {x,y,z} in mm."
+          },
+          "anchorBJson": {
+            "type": "string",
+            "description": "Anchor B as JSON {x,y,z} in mm."
+          }
+        },
+        "required": [
+          "path",
+          "componentType"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_set_anchor_snap",
+      "description": "Set a joint anchor from a snap candidate listed by web_editor_mechanism_snap_list — the geometrically exact alternative to typing millimetres into web_editor_mechanism_set_anchor. Writes AnchorA or AnchorB in the body-local frame and, unless assignBody=false, assigns the picked part as that side's body — ONE composite, one undo step. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of the joint."
+          },
+          "componentType": {
+            "type": "string",
+            "description": "Concrete joint key (e.g. KinematicJoint or KinematicJoint_1)."
+          },
+          "side": {
+            "type": "string",
+            "description": "A | B — which side of the joint the point belongs to."
+          },
+          "candidateId": {
+            "type": "string",
+            "description": "Id from web_editor_mechanism_snap_list, e.g. \"snap0\"."
+          },
+          "assignBody": {
+            "type": "boolean",
+            "description": "Also assign the picked node as this side's body (default true)."
+          }
+        },
+        "required": [
+          "path",
+          "componentType",
+          "side",
+          "candidateId"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_set_axis",
+      "description": "Set a joint's axis (AxisA, body-A-local) either from a snap candidate — a bore's normal IS its axis, so candidateId is the accurate route — or from an explicit world vector. Optionally set SecondaryAxisB for a Universal joint, and snapToPrincipal to magnet a nearly-axis-aligned direction onto X/Y/Z. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of the joint."
+          },
+          "componentType": {
+            "type": "string",
+            "description": "Concrete joint key (e.g. KinematicJoint)."
+          },
+          "candidateId": {
+            "type": "string",
+            "description": "Snap id whose normal becomes the axis (from web_editor_mechanism_snap_list)."
+          },
+          "axisWorldJson": {
+            "type": "string",
+            "description": "Axis as JSON {x,y,z} in WORLD space, when no candidateId is given."
+          },
+          "secondaryAxisWorldJson": {
+            "type": "string",
+            "description": "Universal joints only: second axis as JSON {x,y,z} in WORLD space."
+          },
+          "snapToPrincipal": {
+            "type": "boolean",
+            "description": "Magnet the axis onto the nearest world X/Y/Z when within 5° (default false)."
+          }
+        },
+        "required": [
+          "path",
+          "componentType"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_set_limits",
+      "description": "Set or clear a joint's motion limits — the travel a jog or a drive may use. useLimits=false switches them off and the bounds are ignored; useLimits=true takes lower/upper in degrees (Revolute) or millimetres (Prismatic). Read the current values with web_editor_mechanism_inspect. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of the joint."
+          },
+          "componentType": {
+            "type": "string",
+            "description": "Concrete joint key (e.g. KinematicJoint)."
+          },
+          "useLimits": {
+            "type": "boolean",
+            "description": "true to enforce the bounds, false to switch limits off."
+          },
+          "lower": {
+            "type": "number",
+            "description": "Lower bound (deg or mm) — only with useLimits=true."
+          },
+          "upper": {
+            "type": "number",
+            "description": "Upper bound (deg or mm) — only with useLimits=true."
+          }
+        },
+        "required": [
+          "path",
+          "componentType",
+          "useLimits"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_set_mass",
+      "description": "Set how heavy a link is — density preset, custom density, a pinned mass and a pinned centre of mass — in ONE composite and one undo step, because they are one decision. massKg=\"null\" or comJson=\"null\" DROP the respective override and return to the value computed from the geometry. Without masses the force figures are meaningless, so do this before reading web_editor_mechanism_forces. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of the link (must already carry a MechanismBody)."
+          },
+          "densityPreset": {
+            "type": "string",
+            "description": "steel | stainless | aluminum | pa | pom | custom."
+          },
+          "densityKgM3": {
+            "type": "number",
+            "description": "Density in kg/m³ — only meaningful with densityPreset=custom."
+          },
+          "massKg": {
+            "type": "string",
+            "description": "Pinned mass in kg, or the string \"null\" to drop the override."
+          },
+          "comJson": {
+            "type": "string",
+            "description": "Centre of mass as JSON {x,y,z} in link-local mm, or \"null\" to drop it."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_snap_list",
+      "description": "List the SNAP CANDIDATES under a canvas point (x,y as 0..1 fractions) so an anchor or a joint axis can be set on real geometry instead of guessed millimetres: bore axes, circle centres, edge/face centres and vertices, each with a stable id, a world position and a world normal. Exactly one is recommended — what a click would take. Aim the camera first (web_camera_focus, web_view_pick), then pass the ids to web_editor_mechanism_set_anchor_snap or _set_axis. Ids live until the next call. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Horizontal position, fraction 0..1 of canvas width."
+          },
+          "y": {
+            "type": "number",
+            "description": "Vertical position, fraction 0..1 of canvas height."
+          },
+          "maxCandidates": {
+            "type": "integer",
+            "description": "Cap on returned candidates (default 12)."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_editor_mechanism_statics",
+      "description": "Solve the HOLDING forces of a mechanism in its current pose (velocity and acceleration zero) and file them as each channel's holding figure — \"what does it take to just hold this here\", answerable without running the machine. Returns the same shape as web_editor_mechanism_forces with holding filled. Changes no pose and appends no undo entry, but it does replace the previously recorded holding numbers, which the panel shows. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mechanismPath": {
+            "type": "string",
+            "description": "Node path of the mechanism."
+          }
+        },
+        "required": [
+          "mechanismPath"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_mechanism_validate",
+      "description": "Validate a rigid-body mechanism: structured findings (MissingBodyB, SameBodyAAndB, UnresolvedBody, AnchorsApart, MissingSecondaryAxis, IdleSpinRod, NegativeDof, DriveAxisMismatch, DriveTypeMismatch) plus topology metrics. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). TRANSIENT — creates no ops and no undo entry.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path of the mechanism. Omit to validate all."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_editor_open",
+      "description": "Open the ASSET EDITOR with a document: source=new (creates a NEW document in the open project and opens it) or source=library with relPath (e.g. \"Custom/MyAsset.glb\", relative to <workfolder>/library/). source=empty is a deprecated alias of source=new. When the editor is already open with unsaved changes, ifDirty decides: fail (default) | save (needs a saved name) | discard. Editing happens through the web_editor_* tools; finish with web_editor_save.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "new | library. (\"empty\" is a deprecated alias of \"new\".)"
+          },
+          "relPath": {
+            "type": "string",
+            "description": "Library-relative GLB path (source=library), e.g. \"Custom/MyAsset.glb\"."
+          },
+          "ifDirty": {
+            "type": "string",
+            "description": "fail | save | discard — what to do with unsaved changes (default fail)."
+          }
+        },
+        "required": [
+          "source"
+        ]
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 120000
+    },
+    {
+      "name": "web_editor_pivot",
+      "description": "Move a node's PIVOT without moving geometry (children compensated, one undo unit). mode: bottom (pivot to bounds bottom-center) | object_center (to targetPath's precise vertex center — THE tool for placing a rotation axis on a specific part) | group_center (kinematic axis to its group's center) | align_y_up (rotate so local +Y is world up).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path whose pivot moves."
+          },
+          "mode": {
+            "type": "string",
+            "description": "bottom | object_center | group_center | align_y_up."
+          },
+          "targetPath": {
+            "type": "string",
+            "description": "Target node (required for object_center)."
+          }
+        },
+        "required": [
+          "path",
+          "mode"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_project_files",
+      "description": "List the files the OPEN PROJECT owns, project-relative (path, name, sizeBytes, modified, section, documentId). Narrow with dir (folder prefix, e.g. \"library/Custom\") and glob (\"*\" and \"?\", matched over the whole path, e.g. \"*.glb\"). With no project open it answers with the same projectOpen:false shape as web_editor_project_info. Oversized listings are truncated and say by how much.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dir": {
+            "type": "string",
+            "description": "Project-relative folder prefix, e.g. \"library/Custom\""
+          },
+          "glob": {
+            "type": "string",
+            "description": "Glob over the whole path, \"*\" and \"?\" only, e.g. \"*.glb\""
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true,
+      "timeoutMs": 60000
+    },
+    {
+      "name": "web_editor_project_info",
+      "description": "Locate the KNOWLEDGE FOLDER for the open asset inside the OPEN PROJECT — the durable home for notes, a part catalogue and saved views across sessions. Returns the project name/kind, whether it is writable, the asset's library-relative path when it has one, and knowledgeRelPath (\"knowledge/<AssetName>\"). Every path here is PROJECT-relative, which is all the other tools need: web_editor_import_glb / web_editor_import_cad read them, web_render / web_screenshot_annotated write them via savePath. absolutePath is ALWAYS null — the browser exposes no filesystem path, and a browser project (OPFS) has none; put files in through the app, not the OS file manager.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_editor_redo",
+      "description": "Redo the last N undone editor operations (default 1).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Number of redo steps (default 1)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_remove_component",
+      "description": "Remove a component from a node by its concrete key (e.g. \"Drive\" or \"Drive_1\" — see web_component_get_all). Undoable.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path."
+          },
+          "componentType": {
+            "type": "string",
+            "description": "Concrete component key."
+          }
+        },
+        "required": [
+          "path",
+          "componentType"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_rename",
+      "description": "Rename a node (undoable).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path."
+          },
+          "name": {
+            "type": "string",
+            "description": "New name."
+          }
+        },
+        "required": [
+          "path",
+          "name"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_reparent",
+      "description": "Move nodes under a new parent, preserving world poses (undoable). newParentPath omitted = asset root.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths to move, comma/newline-separated."
+          },
+          "newParentPath": {
+            "type": "string",
+            "description": "Target parent path (omit for asset root)."
+          }
+        },
+        "required": [
+          "paths"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_rotate90",
+      "description": "Rotate a node ±90° around a LOCAL axis (Quick Edit rotate buttons). axis = x|y|z, sign = 1|-1.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path."
+          },
+          "axis": {
+            "type": "string",
+            "description": "x | y | z."
+          },
+          "sign": {
+            "type": "integer",
+            "description": "1 or -1 (default 1)."
+          }
+        },
+        "required": [
+          "path",
+          "axis"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_save",
+      "description": "Save the asset as GLB into <workfolder>/library/Custom/. The document saves under its current name whatever it is (an \"Untitled\" name is a name like any other); the same name overwrites the existing file. Needs a configured work folder (File System Access). Reports saveVerb — save (in place), save-into-project (this write COPIES the document into the project and changes its identity) or blocked with a reason.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Asset name (default: current document name)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 60000
+    },
+    {
+      "name": "web_editor_separate",
+      "description": "SEPARATE meshes into child parts (undoable, same op as the context menu \"Separate ▸\"): islands = connected loose parts, groups = one part per material group. Each source mesh is replaced by a same-named Group carrying the parts (children \"<name>_part<N>\"). Omit paths to separate the CURRENT selection.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Mesh node paths, comma/newline-separated (omit = current selection)."
+          },
+          "mode": {
+            "type": "string",
+            "description": "islands | groups | auto (default auto: groups for multi-material meshes, islands otherwise)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 120000
+    },
+    {
+      "name": "web_editor_set_field",
+      "description": "Set one field of a component on a node (undoable, live in the panels). valueJson is parsed as JSON (numbers/booleans/strings/objects; bare strings work too). VERIFIED: ok is returned only after the value has been read back from the live scene — a dropped or refused op returns an error instead.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path."
+          },
+          "componentType": {
+            "type": "string",
+            "description": "Concrete component key (e.g. Drive)."
+          },
+          "fieldName": {
+            "type": "string",
+            "description": "Field name (e.g. TargetSpeed)."
+          },
+          "valueJson": {
+            "type": "string",
+            "description": "New value as JSON (e.g. 500, true, \"RotationY\")."
+          }
+        },
+        "required": [
+          "path",
+          "componentType",
+          "fieldName",
+          "valueJson"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_set_visible",
+      "description": "Show or hide nodes (authored visibility — saved with the asset, undoable).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths, comma/newline-separated."
+          },
+          "visible": {
+            "type": "boolean",
+            "description": "true to show, false to hide."
+          }
+        },
+        "required": [
+          "paths",
+          "visible"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_shortcut",
+      "description": "Run an editor keyboard shortcut on the CURRENT selection, exactly as a user would: \"S>I\" select identical, \"S>M\" same material, \"S>V\" invert, \"K\" + arg=name assign to kinematic, \"H\" hide, \"Shift+H\" show, \"Delete\", \"Ctrl+Z\"/\"Ctrl+Y\" undo/redo, \"Escape\" clear. Unknown keys return the table. Chain e.g. S>I then web_editor_assign_material (paths omitted = selection).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "keys": {
+            "type": "string",
+            "description": "Shortcut, e.g. \"S>I\", \"K\", \"H\", \"Ctrl+Z\"."
+          },
+          "arg": {
+            "type": "string",
+            "description": "Argument for shortcuts that need one (K: kinematic/group name)."
+          }
+        },
+        "required": [
+          "keys"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_status",
+      "description": "Asset editor status: document name/base/dirty, undo/redo availability + label, op count, selection and node counts.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_editor_test_start",
+      "description": "Start the editor's IN-PLACE TEST session: the authoring state is materialised through the real save path and the runtime is attached, so drives, logic and mechanisms actually run. Also arms the mechanism force recording, which is what makes web_editor_mechanism_forces return a cycle afterwards. Stop with web_editor_test_stop, which restores the authoring state exactly. Reports the state reached and whether force recording is on.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 120000
+    },
+    {
+      "name": "web_editor_test_stop",
+      "description": "Stop the editor's in-place test session and put the authoring state back exactly as it was before the run. The recorded force buffers are KEPT — \"what did that cycle need?\" is asked after the cycle — so web_editor_mechanism_forces still answers with peak and RMS afterwards. Reports the state reached and whether force recording is (still) on.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 120000
+    },
+    {
+      "name": "web_editor_to_ground",
+      "description": "Drop a node so its bounding box rests on the ground (Y = 0). Quick Edit \"To Ground\".",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_toggle_signal_direction",
+      "description": "Flip a signal node between PLC input and output (value preserved).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Signal node path."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_transform",
+      "description": "Set a node's LOCAL transform (partial): position in meters (px/py/pz), rotation in degrees XYZ Euler (rx/ry/rz), scale (sx/sy/sz). Omitted components keep their current value. One undoable op.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path."
+          },
+          "px": {
+            "type": "number",
+            "description": "Local position X (m)."
+          },
+          "py": {
+            "type": "number",
+            "description": "Local position Y (m)."
+          },
+          "pz": {
+            "type": "number",
+            "description": "Local position Z (m)."
+          },
+          "rx": {
+            "type": "number",
+            "description": "Local rotation X (deg)."
+          },
+          "ry": {
+            "type": "number",
+            "description": "Local rotation Y (deg)."
+          },
+          "rz": {
+            "type": "number",
+            "description": "Local rotation Z (deg)."
+          },
+          "sx": {
+            "type": "number",
+            "description": "Local scale X."
+          },
+          "sy": {
+            "type": "number",
+            "description": "Local scale Y."
+          },
+          "sz": {
+            "type": "number",
+            "description": "Local scale Z."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_undo",
+      "description": "Undo the last N editor operations (default 1).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Number of undo steps (default 1)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_editor_verify_drive",
+      "description": "VERIFY a drive visually before saving — performed like a user would: selects the axis (gizmo + group highlight appear), frames a fitted 3/4 view, then smoothly drags the drive through its range in the viewport while capturing N poses on the fly, springs back, and returns ONE labelled montage. Wrong axis/pivot/membership is immediately visible. Defaults: limits when UseLimits, else ±180° rotary / ±500mm linear around home.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "kinematicPath": {
+            "type": "string",
+            "description": "Path of the node carrying the Drive (usually the kinematic axis)."
+          },
+          "from": {
+            "type": "number",
+            "description": "Sweep start (mm or °)."
+          },
+          "to": {
+            "type": "number",
+            "description": "Sweep end (mm or °)."
+          },
+          "frames": {
+            "type": "integer",
+            "description": "Number of poses 2..12 (default 6)."
+          },
+          "keepView": {
+            "type": "boolean",
+            "description": "Keep the camera where the tool framed it (default true)."
+          }
+        },
+        "required": [
+          "kinematicPath"
+        ]
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 60000
+    },
+    {
+      "name": "web_editor_zero_position",
+      "description": "Zero the LOCAL position of the given nodes (Quick Edit \"Zero Local\"). One undo unit.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths, comma/newline-separated."
+          }
+        },
+        "required": [
+          "paths"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_errors",
+      "description": "List active machine errors/alarms with node path and age in seconds.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_help",
+      "description": "Get the deep how-to guide for a workflow domain. Topics: editor (kinematize/materialize CAD tool reference), kinematize (the full CAD-to-kinematic-model recipe incl. perception and verification), layout (build conveyor lines, heights), simulation (debugging drives/signals/flow), plc, des. Call without topic to list them. Read the matching guide BEFORE starting a multi-step workflow.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "editor | kinematize | layout | simulation | plc | des (omit to list topics)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_knowledge_get",
+      "description": "Get the knowledge note stored on one scene node as raw Markdown, with its provenance header (updatedAt, author, confidence). Read this before re-deriving what a node does — an earlier session may already have worked it out. Distinguishes an unknown path from a node that simply carries no note. Note that confidence \"inferred\" or \"unverified\" marks a previous agent's guess, not a measurement, and updatedAt tells you how stale it may be.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Full hierarchy path of the node (from web_node_find / web_knowledge_list)."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_knowledge_list",
+      "description": "List every scene node carrying a knowledge note, newest first, with an excerpt and provenance. Pass query to full-text filter over note text and node path. Start a session here: it maps in one call what earlier sessions already established about this machine, so you can read the relevant notes with web_knowledge_get instead of re-deriving them.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Case-insensitive substring matched against note text and node path."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum rows returned (default 100, max 500)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_knowledge_set",
+      "description": "Store or replace the knowledge note on one scene node — durable agent memory that travels inside the GLB. Overwrites the entire note; it does not append. Write facts worth recalling in a LATER session (what an axis really does, measured limits, why a node is misnamed), not scratch or session state. Prefer short Markdown bullets under headings over prose. An empty or whitespace-only note deletes the entry. Set confidence honestly: \"inferred\" or \"unverified\" stops a guess from reading as a measurement later. Check persistedTo in the result — \"none\" means the workspace keeps nothing and the note is gone on reload.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Full hierarchy path of the node (from web_node_find / web_node_tree)."
+          },
+          "markdown": {
+            "type": "string",
+            "description": "Note body as Markdown, max 4000 UTF-16 code units. Empty or whitespace-only deletes the note."
+          },
+          "author": {
+            "type": "string",
+            "description": "\"agent\" (default) or \"user\" — provenance only, not access control."
+          },
+          "confidence": {
+            "type": "string",
+            "description": "\"observed\" (default), \"inferred\" or \"unverified\" — how the knowledge was obtained."
+          }
+        },
+        "required": [
+          "path",
+          "markdown"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_layout_export",
+      "description": "Export the current planner layout as raw JSON (placements + catalogs + grid) without persisting anything. Exports the planner snapshot and touches no document.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_layout_list",
+      "description": "List placed layout components: id, catalogId, label, position (m), rotation (deg), world bounds (center + size). The id source for web_layout_move / web_layout_remove / web_layout_snap_*.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_layout_move",
+      "description": "Move/rotate a placement (position meters, rotation degrees XYZ). Unlike web_layout_place this DOES set the y height — use it to lift a pallet/MU onto a conveyor transport surface (height rules: web_help topic \"layout\"). id from web_layout_list.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Placement id (from web_layout_place / web_layout_list)"
+          },
+          "x": {
+            "type": "number",
+            "description": "X position in meters"
+          },
+          "y": {
+            "type": "number",
+            "description": "Y position in meters"
+          },
+          "z": {
+            "type": "number",
+            "description": "Z position in meters"
+          },
+          "rx": {
+            "type": "number",
+            "description": "X rotation in degrees (optional)"
+          },
+          "ry": {
+            "type": "number",
+            "description": "Y rotation in degrees (optional)"
+          },
+          "rz": {
+            "type": "number",
+            "description": "Z rotation in degrees (optional)"
+          }
+        },
+        "required": [
+          "id",
+          "x",
+          "y",
+          "z"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_layout_place",
+      "description": "Place a catalog component on the ground plane (planner mode; catalogId from web_catalog_list). Returns the placement id. y is IGNORED — parts drop to the ground; set height afterwards with web_layout_move (conveyor-height rules: web_help topic \"layout\").",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "catalogId": {
+            "type": "string",
+            "description": "Catalog entry id (from web_catalog_list)"
+          },
+          "x": {
+            "type": "number",
+            "description": "X position in meters"
+          },
+          "y": {
+            "type": "number",
+            "description": "Y position in meters. NOTE: ignored on place — parts drop to the ground plane. Set height afterwards with web_layout_move (e.g. a pallet onto the conveyor transport surface)."
+          },
+          "z": {
+            "type": "number",
+            "description": "Z position in meters"
+          }
+        },
+        "required": [
+          "catalogId",
+          "x",
+          "y",
+          "z"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_layout_remove",
+      "description": "Remove a placed component by id (from web_layout_list).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Placement id (from web_layout_list)"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_layout_snap_attach",
+      "description": "Attach a catalog component onto a free snap of a placement, auto-aligned — THE way to build connected conveyor lines. targetId from web_layout_list, catalogId from web_catalog_list / web_layout_snap_suggest; targetSnapName optional (defaults to the only free snap). Returns the new placement id. Planner mode.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetId": {
+            "type": "string",
+            "description": "Placement id to attach onto"
+          },
+          "catalogId": {
+            "type": "string",
+            "description": "Catalog entry id to attach (from web_catalog_list / web_layout_snap_suggest)"
+          },
+          "targetSnapName": {
+            "type": "string",
+            "description": "Target snap node name (from web_layout_snap_list); omit to auto-pick the only free snap"
+          }
+        },
+        "required": [
+          "targetId",
+          "catalogId"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_layout_snap_list",
+      "description": "List the free (unoccupied) snap points of a placement (id from web_layout_list): snapName, typeId, flow, axis, dirCode per open port. Feed snapName + id into web_layout_snap_attach.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Placement id (from web_layout_place / web_layout_list)"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_layout_snap_suggest",
+      "description": "Suggest library components compatible with a free snap (same typeId + compatible flow). Returns [{catalogId, name, ownSnapName}] — pass catalogId into web_layout_snap_attach.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetId": {
+            "type": "string",
+            "description": "Placement id to attach onto"
+          },
+          "targetSnapName": {
+            "type": "string",
+            "description": "Target snap node name (from web_layout_snap_list); omit to auto-pick the only free snap"
+          }
+        },
+        "required": [
+          "targetId"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_link_compose",
+      "description": "Compose a canonical, shareable deep link into the viewer — the one thing MCP could not do: open anything, then hand out a URL to it. Called with NO arguments it snapshots what is open right now (document or model, active workspace mode, model option) into a link that reproduces it. Called with model/glb/doc/scene/mode/option it validates each against the live catalogues and composes the URL. Returns {url, params, warnings}: an unknown value is a warning and still gets set, never a hard error. Read-only, mints no share, and copies nothing from the current address bar — access keys and share tokens can never leak into a composed link.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Model URL, built-in label or document name from web_document_list (the ?model= URL param)."
+          },
+          "glb": {
+            "type": "string",
+            "description": "Absolute GLB URL, or an existing \"s:<id>\" share value. Never minted here."
+          },
+          "doc": {
+            "type": "string",
+            "description": "Document id of the open project (see web_document_list)."
+          },
+          "scene": {
+            "type": "string",
+            "description": "empty | builtin:<file.glb> | published:<name> | a saved scene id."
+          },
+          "mode": {
+            "type": "string",
+            "description": "Workspace mode to boot into: hmi, planner, des, … Defaults to the ACTIVE mode."
+          },
+          "option": {
+            "type": "string",
+            "description": "Model variant id, validated against the model's declared options."
+          },
+          "base": {
+            "type": "string",
+            "description": "Base URL override. Defaults to this page's origin + path."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true,
+      "timeoutMs": 30000
+    },
+    {
+      "name": "web_logic_flow",
+      "description": "Get the LogicStep sequence hierarchy with per-step state and progress. Use to see where an automation sequence is stuck.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_logs",
+      "description": "Get recent browser console logs (errors, warnings, debug). Check after any unexpected tool failure or visual glitch.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "level": {
+            "type": "string",
+            "description": "Minimum log level: trace|debug|info|warn|error"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Max number of entries to return"
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_measure",
+      "description": "Measure BETWEEN parts (no side effects): for each pair of the given paths returns center distance, per-axis gap (negative = overlap depth), aabbGap (closest AABB separation, 0 = touching/overlapping) and overlaps flag. All meters, world space. The numeric grounding for clearances, conveyor gaps and pivot offsets. For a single node use web_node_bounds.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Two or more node paths, comma/newline-separated. All pairs are measured."
+          }
+        },
+        "required": [
+          "paths"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_mode_set",
+      "description": "Switch the workspace mode: hmi (operate/monitor), planner (build layouts — required before web_layout_place), des (event simulation). For the asset editor use web_editor_open instead of setting mode directly.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "description": "Target mode: hmi | planner | des"
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_node_bounds",
+      "description": "Measure nodes: world AABB (center/size/min/max, meters), node-local box + world quaternion (oriented bounds), mesh count. Also SELECTS and frames the nodes (viewport highlight + camera focus, like a user click + F) unless focus=false. THE numeric grounding for pivot placement, axis positions and part sizes. Paths from web_node_find / web_node_tree.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths, comma- or newline-separated."
+          },
+          "focus": {
+            "type": "boolean",
+            "description": "Also select and frame the measured nodes (default true); pass false for measurement only."
+          }
+        },
+        "required": [
+          "paths"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_node_find",
+      "description": "Find scene nodes by name AND/OR geometric filters. term = case-insensitive substring of node name or component type (empty term + filters = pure geometric search). Filters: sizeMin/sizeMax (largest AABB dim, m), region (\"minX,minY,minZ,maxX,maxY,maxZ\" world box the node center must lie in), color (hex like \"#c00\", tolerance-matched against mesh material color), hasComponent (rv type key, e.g. \"Drive\"), meshesOnly. Returns full paths + types + size — the paths every other tool takes. When names are meaningless CAD junk, filter by size/region/color instead, or use web_render mode=idmask / web_scene_query.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "term": {
+            "type": "string",
+            "description": "Name/component-type substring (may be empty when filters are given)"
+          },
+          "sizeMin": {
+            "type": "number",
+            "description": "Minimum largest-AABB-dimension in meters"
+          },
+          "sizeMax": {
+            "type": "number",
+            "description": "Maximum largest-AABB-dimension in meters"
+          },
+          "region": {
+            "type": "string",
+            "description": "World box \"minX,minY,minZ,maxX,maxY,maxZ\" the node bounds-center must lie in"
+          },
+          "color": {
+            "type": "string",
+            "description": "Material color to match, hex (e.g. \"#cc0000\")"
+          },
+          "hasComponent": {
+            "type": "string",
+            "description": "Only nodes carrying this rv component key (e.g. \"Drive\", \"Kinematic\")"
+          },
+          "meshesOnly": {
+            "type": "boolean",
+            "description": "Only nodes that are meshes themselves (default false)"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max results (default 100)"
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_node_shape",
+      "description": "PCA shape analysis of nodes (no side effects): principal axes (world unit vectors), extents along them, shape class (cylinder-like | beam-like | disc-like | plate-like | compact) and the FUNCTIONAL AXIS — the rotation/symmetry axis for cylinder- and disc-like parts. Directly answers \"which axis does this hinge/roller/shaft use\" when kinematizing. Vertex-sampled (cap 20k).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths, comma/newline-separated."
+          }
+        },
+        "required": [
+          "paths"
+        ]
+      },
+      "readOnlyHint": true,
+      "timeoutMs": 30000
+    },
+    {
+      "name": "web_node_tree",
+      "description": "Get the scene-graph tree from a root path (default: the loaded model root, which reports locked:true) with component types per node. Use to understand structure before selecting/kinematizing; depth defaults to 3. includeBounds adds per-node world AABB size [x,y,z] (m) + subtree meshCount — one call sizes a whole CAD assembly instead of N web_node_bounds calls.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "root": {
+            "type": "string",
+            "description": "Root path to start from (empty = the loaded model root, or the whole scene when no model is loaded)"
+          },
+          "depth": {
+            "type": "integer",
+            "description": "Max depth to traverse (default 3)"
+          },
+          "includeBounds": {
+            "type": "boolean",
+            "description": "Add sizeM [x,y,z] + center + meshCount per node (default false)"
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_ping",
+      "description": "CHEAP LIVENESS + THROTTLE PROBE — the first call to make when other web_* tools time out. Strictly synchronous (no timers, no frame wait, no imports), so it answers even from a browser tab that Chrome has throttled, which is exactly the situation other tools cannot report. Returns visibilityState/hidden/hasFocus plus a `diagnosis` line. A hidden tab clamps setTimeout and requestAnimationFrame to >=1s (up to 60s once heavily throttled), which is what turns a normal call into \"timed out, outcome=unknown\" while CONNECT itself is perfectly healthy. If this answers with hidden:true, the fix is to bring the viewer tab to the foreground, NOT to restart anything.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_plc_deploy",
+      "description": "Deploy an IEC 61131-3 Structured Text program to the virtual PLC: compile + COLD load (fresh function-block states and memory). Returns all diagnostics (compile errors/warnings + signal-binding warnings); with error diagnostics nothing is loaded and the PLC enters the error state. Deploying never starts scanning — call web_plc_run afterwards.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "IEC 61131-3 Structured Text source (PROGRAM ... END_PROGRAM)"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_plc_run",
+      "description": "Start cyclic PLC scanning (one scan per 60 Hz sim tick: input snapshot → program pass → output batch write). After an error state this performs a COLD restart with a fresh sandbox and fresh function-block states.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_plc_status",
+      "description": "Virtual PLC status: run state (stopped/running/error), scan time in ms, last error, and the online watch values (VAR_EXTERNAL variables plus function-block outputs like tDelay.Q as of the last scan). Returns an error when the PLC runtime is not part of this build.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_plc_stop",
+      "description": "Stop cyclic PLC scanning (WARM stop — program memory and function-block states are kept; outputs keep their last written values).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_project_folder",
+      "description": "Create, rename or move a FOLDER of the open project — the same verdicts and the same write path as the dashboard tree, so a folder move repoints every contained manifest row and breaks no reference (document ids never change). action=create: path names the new folder (parents may exist or not; an empty folder is a declared manifest entry). action=rename: path + newName. action=move: path + toFolder (destination folder, \"\" = project root). Reserved system folders and catalog rows are refused; documents are managed by web_document_update instead.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "create | rename | move"
+          },
+          "path": {
+            "type": "string",
+            "description": "Project-relative folder path (from web_project_tree)."
+          },
+          "newName": {
+            "type": "string",
+            "description": "New folder name (rename only)."
+          },
+          "toFolder": {
+            "type": "string",
+            "description": "Destination folder, \"\" for the project root (move only)."
+          }
+        },
+        "required": [
+          "action",
+          "path"
+        ]
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 120000
+    },
+    {
+      "name": "web_project_list",
+      "description": "List the PROJECTS available in the configured workspace, plus which one is currently open. Each row: slug (the id web_project_open takes), name, folderName, id, and `current`. Use this to find out where you are and what you can switch to — every project-relative path (cad/, library/, knowledge/, models/) resolves against the OPEN project. Returns an empty list with a hint when no workspace folder has been granted.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true,
+      "timeoutMs": 60000
+    },
+    {
+      "name": "web_project_open",
+      "description": "OPEN a project from the workspace IN PLACE — no page reload, so the MCP bridge connection survives (unlike the ?project= deep link, which reloads into a new tab and drops the editor document). `project` matches a slug, name or folder name from web_project_list, case- and separator-insensitively. Refuses when the current project has unsaved work unless force=true, because the underlying switch would otherwise raise a modal dialog that no agent can answer and the call would hang until it times out.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project": {
+            "type": "string",
+            "description": "Slug, name or folder name of the project to open (see web_project_list)."
+          },
+          "force": {
+            "type": "boolean",
+            "description": "Discard the unsaved-work guard and switch anyway (default false)."
+          }
+        },
+        "required": [
+          "project"
+        ]
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 120000
+    },
+    {
+      "name": "web_project_tree",
+      "description": "Show the open project as a TREE — folders, documents and attachment files, nested, exactly as the Projects dashboard shows them. Each node: name, kind (folder/document/file/system), path (project-relative — what web_document_open / web_document_update / web_project_folder take), documentId for a GLB with a manifest row, and writable. Reserved machinery (settings/connect/rag/thumbnails/.trash) is grouped under one read-only \"System\" node. Pass dir to start at a subfolder, maxDepth to limit nesting (childrenOmitted says what was cut). The flat alternative with sizes is web_document_list; files-with-glob is web_editor_project_files.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dir": {
+            "type": "string",
+            "description": "Project-relative folder to start at (default: the project root)."
+          },
+          "maxDepth": {
+            "type": "integer",
+            "description": "Maximum nesting depth to render (default 6)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true,
+      "timeoutMs": 60000
+    },
+    {
+      "name": "web_render",
+      "description": "Offscreen render from an ARBITRARY camera pose — never touches the user viewport, selection or scene. mode \"beauty\" renders the live scene; mode \"idmask\" renders a SEGMENTATION view: part groups flat-colored by identity, with the color→path legend returned as a JSON text block alongside the image (nothing burned into the frame) — one image + legend tells you which object owns which pixels, regardless of node names. groupBy \"hierarchy\" = subtrees at groupDepth under root (or explicit paths) — the kinematize view; groupBy \"geometry\" = all copies of an identical part share one color (\"12× wheel\") — the materialize view. Requires the classic WebGL renderer.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "description": "\"beauty\" (real materials) or \"idmask\" (flat ID colors + legend)."
+          },
+          "root": {
+            "type": "string",
+            "description": "Subtree to render (default: whole model)."
+          },
+          "groupBy": {
+            "type": "string",
+            "description": "idmask: \"hierarchy\" (default) or \"geometry\" (identical parts share a color)."
+          },
+          "groupDepth": {
+            "type": "number",
+            "description": "idmask hierarchy: group parts by ancestor at this depth below root (default 1 = direct children)."
+          },
+          "paths": {
+            "type": "string",
+            "description": "idmask hierarchy: explicit group-root paths instead of groupDepth."
+          },
+          "cameraPosition": {
+            "type": "string",
+            "description": "World camera position \"x,y,z\" (default: auto ¾ view)."
+          },
+          "cameraTarget": {
+            "type": "string",
+            "description": "Look-at point \"x,y,z\" (default: bounds center)."
+          },
+          "size": {
+            "type": "number",
+            "description": "Long-edge pixels 256..1024 (default 800)."
+          },
+          "savePath": {
+            "type": "string",
+            "description": "Optional PROJECT-relative path to also write the frame as PNG. A bare name lands in \"captures/\"; a path that names its own folders is taken as given (e.g. \"knowledge/MyAsset/views/overview.png\"). \".png\" is appended when missing. Requires an open writable project. The result reports savedPath, or saveError when the write failed."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true,
+      "timeoutMs": 60000
+    },
+    {
+      "name": "web_scene_query",
+      "description": "READ-ONLY JavaScript query over a frozen plain-data snapshot of the scene — the escape hatch for any geometric/material question no dedicated tool answers. The expression receives `nodes` (array of {path,name,depth,parentPath,components[],isMesh,meshCount,triangles,bounds{center,size,min,max}|null,material{name,color,metalness,roughness,opacity}|null,visible}, meters/world-space) and `lib` ({dist,maxDim,volume,contains,centerDist}). Example: nodes.filter(n=>n.isMesh&&lib.maxDim(n)>1&&n.bounds.center[1]<0.5).map(n=>n.path). Snapshot data only — it CANNOT modify the scene. Result JSON-capped at 60k chars.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "type": "string",
+            "description": "JS expression or statements ending in `return …` over (nodes, lib)."
+          },
+          "root": {
+            "type": "string",
+            "description": "Optional subtree root path (default: whole model)."
+          }
+        },
+        "required": [
+          "expression"
+        ]
+      },
+      "readOnlyHint": true,
+      "timeoutMs": 30000
+    },
+    {
+      "name": "web_screenshot",
+      "description": "Capture a screenshot of the 3D scene as an image. Crop options: `path` frames one node's on-screen bounds; x/y/w/h (fractions 0..1) crop a manual rectangle; omit all for the full view. For motion use web_screenshot_burst; for labelled markers web_screenshot_annotated; for multi-view shape analysis web_screenshot_analyze.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Node path to frame — crops to this object's on-screen bounding box (e.g. a machine). Omit for the whole view."
+          },
+          "x": {
+            "type": "number",
+            "description": "Manual crop: left edge as a fraction 0..1 of canvas width (provide x,y,w,h together; overrides path)."
+          },
+          "y": {
+            "type": "number",
+            "description": "Manual crop: top edge as a fraction 0..1 of canvas height."
+          },
+          "w": {
+            "type": "number",
+            "description": "Manual crop: width as a fraction 0..1 of canvas width."
+          },
+          "h": {
+            "type": "number",
+            "description": "Manual crop: height as a fraction 0..1 of canvas height."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_screenshot_analyze",
+      "description": "Analyze objects visually: one labelled 4-view mosaic (scene context far/near with the target highlighted through occluders + two isolated 3/4 views) with bounding-box dimensions in meters. Use to understand SHAPE, ORIENTATION, SIZE and SURROUNDINGS of specific parts; for single shots use web_screenshot. Needs the WebGL renderer.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "One or more node paths, comma- or newline-separated."
+          },
+          "includeChildren": {
+            "type": "boolean",
+            "description": "Include the full subtree (default true). false = only the node and its direct child meshes."
+          },
+          "tileSize": {
+            "type": "number",
+            "description": "Tile parameter in px (128..512, default 256). Tiles render at 2×tileSize; the mosaic is 4×tileSize wide."
+          }
+        },
+        "required": [
+          "paths"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_screenshot_annotated",
+      "description": "Screenshot with LABELS: captures the current view and pins a labelled marker on each given node (at its bounds center). Optionally crop to one node via cropPath. labels = optional comma-separated custom labels (defaults to each path's last segment; pass numbers=true for #1..#n). Ideal for confirming which part is which before kinematizing.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths to label, comma- or newline-separated."
+          },
+          "labels": {
+            "type": "string",
+            "description": "Optional labels, comma-separated, same order as paths."
+          },
+          "cropPath": {
+            "type": "string",
+            "description": "Optional node path to crop the shot to."
+          },
+          "numbers": {
+            "type": "boolean",
+            "description": "Label markers #1..#n instead of names."
+          },
+          "savePath": {
+            "type": "string",
+            "description": "Optional PROJECT-relative path to also write the shot as PNG. A bare name lands in \"captures/\"; a path that names its own folders is taken as given (e.g. \"knowledge/MyAsset/views/axis-z.png\"). \".png\" is appended when missing. Requires an open writable project. The result reports savedPath, or saveError when the write failed."
+          }
+        },
+        "required": [
+          "paths"
+        ]
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_screenshot_burst",
+      "description": "Capture a burst of frames over a time window while the simulation runs, composited into one labelled montage. Use to diagnose MOTION (drive rotation, MU flow) that a single web_screenshot cannot show. count = frames (2..16), durationMs = total span, optional `path` crops each frame to a node.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "number",
+            "description": "Number of frames to capture (2..16)."
+          },
+          "durationMs": {
+            "type": "number",
+            "description": "Total time window in ms the frames are evenly spread over (e.g. 2000)."
+          },
+          "path": {
+            "type": "string",
+            "description": "Node path to frame each shot (e.g. a machine). Omit for the whole view."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true,
+      "timeoutMs": 60000
+    },
+    {
+      "name": "web_select",
+      "description": "Change the selection (reflected in the viewport highlight and all panels, exactly like user clicks). mode: replace (default) | add | toggle | clear. paths = comma/newline-separated node paths (ignored for clear).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths, comma- or newline-separated."
+          },
+          "mode": {
+            "type": "string",
+            "description": "replace | add | toggle | clear (default replace)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_select_similar",
+      "description": "Select-similar (the editor's \"Select ▸\" menu, remote): kind = identical (same geometry content — all copies of a part, e.g. all rollers), material (same material/appearance), or invert (everything not selected). Seeds from seedPath or the current selection. Replaces the selection with the match set and returns the count.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "identical | material | invert."
+          },
+          "seedPath": {
+            "type": "string",
+            "description": "Seed node path (default: current selection)."
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_selection_get",
+      "description": "Get the current selection: node paths and the primary path.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_sensor_list",
+      "description": "List all sensors with occupancy state, mode and their occupied/not-occupied signal names.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_signal_bind",
+      "description": "Bind an external CONNECT signal (or an internal model signal) to one component slot, identified by targetId plus componentPath plus slot. Validates type and direction exactly as a manual drag does, checks the link can be saved before changing anything, and persists it. Unbind with web_signal_unbind.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetId": {
+            "type": "string",
+            "description": "Target id from web_signal_bindings_list (node path or placement id)."
+          },
+          "componentPath": {
+            "type": "string",
+            "description": "Component path of the slot — required whenever a target has the same slot name more than once."
+          },
+          "slot": {
+            "type": "string",
+            "description": "Slot name, e.g. \"Forward\"."
+          },
+          "signal": {
+            "type": "string",
+            "description": "Signal name to bind, from web_signal_sources_list."
+          }
+        },
+        "required": [
+          "targetId",
+          "componentPath",
+          "slot",
+          "signal"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_signal_bindings_list",
+      "description": "List every bindable signal slot in the scene with its canonical identity (targetId, componentPath, slot), current external signal, liveness and comment — plus saved links that no longer resolve, with a repair candidate where one is unambiguous. Start here before binding.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "string",
+            "description": "Only rows whose target, component path or slot contains this substring (case-insensitive)."
+          },
+          "boundOnly": {
+            "type": "boolean",
+            "description": "Only slots that already carry an external signal."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum rows returned (default 300)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_signal_list",
+      "description": "List all PLC signals with current values. For direction/forced/live-vs-stale diagnosis use web_signal_status instead.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_signal_set_bool",
+      "description": "Write a boolean PLC signal in the browser SignalStore. Fails when the signal does not exist — find names with web_signal_list.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Signal name"
+          },
+          "value": {
+            "type": "boolean",
+            "description": "Boolean value to set"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_signal_set_float",
+      "description": "Write a float PLC signal in the browser SignalStore. Fails when the signal does not exist — find names with web_signal_list.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Signal name"
+          },
+          "value": {
+            "type": "number",
+            "description": "Float value to set"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_signal_sources_list",
+      "description": "List signals available as binding sources: live realvirtual CONNECT signals from every connected interface plus internal model signals, each with direction, data type, provider and comment. Use with web_signal_bindings_list to match external names to slots.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "string",
+            "description": "Only signals whose name or comment contains this substring (case-insensitive)."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum signals returned (default 300)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_signal_status",
+      "description": "List PLC signals with full status: value, type, direction, forced state, live/stale activity, address/comment metadata. Use to diagnose whether signals actually update (live) vs stale/no-source. Filters: name substring, activeOnly, limit.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "string",
+            "description": "Only signals whose name contains this substring (case-insensitive). Empty = all."
+          },
+          "activeOnly": {
+            "type": "boolean",
+            "description": "Only signals currently live or supplied (drop stale / no-source)."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum number of signals returned (default 200)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_signal_unbind",
+      "description": "Remove the external signal from one component slot, identified by targetId plus componentPath plus slot. Checks the change can be saved before making it. The slot returns to local simulation.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "targetId": {
+            "type": "string",
+            "description": "Target id from web_signal_bindings_list (node path or placement id)."
+          },
+          "componentPath": {
+            "type": "string",
+            "description": "Component path of the slot — required whenever a target has the same slot name more than once."
+          },
+          "slot": {
+            "type": "string",
+            "description": "Slot name, e.g. \"Forward\"."
+          }
+        },
+        "required": [
+          "targetId",
+          "componentPath",
+          "slot"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_sim_play_pause",
+      "description": "Play or pause the simulation. Pass paused=true/false, or omit to toggle. Returns all active pause reasons.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paused": {
+            "type": "boolean",
+            "description": "true to pause, false to play; omit to toggle"
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_sim_reset",
+      "description": "Reset the simulation: clears MUs, resets LogicStep states and snaps every drive back to its authored StartPosition. Signals are untouched.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_status",
+      "description": "Get viewer status: connection state, FPS, loaded model, drive/signal/sensor/MU counts. Call first to orient in any session.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_transport_status",
+      "description": "Get material-flow status: spawned/consumed/active MU counts, blocked and physics-owned MUs, per-source and per-sink stats. Use when parts are missing, jammed or not spawning.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "readOnlyHint": true
+    },
+    {
+      "name": "web_view_gaze",
+      "description": "Pick what is at the CENTER of the current view (the gaze point): hit node path, 3D world point, surface normal, distance. Also selects the hit node unless select=false. Equivalent to web_view_pick at (0.5, 0.5).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "select": {
+            "type": "boolean",
+            "description": "Also select the hit node (default true)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_view_isolate",
+      "description": "Isolate nodes visually: only the given subtrees stay bright and interactive, everything else is dimmed; the camera frames the isolated set. Call with empty paths to EXIT isolation. Use before screenshots of buried parts.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths to isolate (comma/newline-separated). Empty = exit isolation."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_view_pick",
+      "description": "Pick what is at a screen position: returns the hit node path, 3D world point, surface normal and distance. In editor mode, path is the EXACT mesh node you see; ownerPath/ownerComponents name the nearest component-bearing ancestor (e.g. the owning Drive) — use web_select(ownerPath) to select that instead. The hit node is also SELECTED (viewport highlight + panels, like a user click) unless select=false. x/y are fractions 0..1 of the canvas (0,0 = top-left). Use to identify parts and get exact 3D coordinates for pivots/axes.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Horizontal position, fraction 0..1 of canvas width."
+          },
+          "y": {
+            "type": "number",
+            "description": "Vertical position, fraction 0..1 of canvas height."
+          },
+          "select": {
+            "type": "boolean",
+            "description": "Also select the hit node (default true)."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_view_source_markers",
+      "description": "Show or hide the floor markers (ring + label) under every Source. Persists in localStorage. Useful to locate spawn points in screenshots.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "visible": {
+            "type": "boolean",
+            "description": "true to show, false to hide"
+          }
+        },
+        "required": [
+          "visible"
+        ]
+      },
+      "readOnlyHint": false
+    },
+    {
+      "name": "web_view_sweep",
+      "description": "Contact sheet of a part: flies 4-8 views evenly around it and returns ONE labelled montage plus a note per view (visible top nodes with coverage, background share, measured camera position). Understands an unknown assembly in a SINGLE call instead of an orbit+screenshot loop, at roughly a fifth of the vision tokens. Each note carries its cameraPosition, so pulling one view up in full resolution is one web_camera_set away. topNodes is a raycast SAMPLE, not a completeness guarantee — thin parts can be missed. Works under WebGPU too. Restores the starting pose unless restore=false.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "string",
+            "description": "Node paths to sweep around, comma/newline-separated. Empty = whole model."
+          },
+          "count": {
+            "type": "number",
+            "description": "Number of views, clamped to 4..8 (default 6)."
+          },
+          "pitchDeg": {
+            "type": "number",
+            "description": "Elevation of every view in degrees (default 20)."
+          },
+          "yawStartDeg": {
+            "type": "number",
+            "description": "Yaw of the first view (default: current camera azimuth)."
+          },
+          "restore": {
+            "type": "boolean",
+            "description": "Return to the starting pose afterwards (default true)."
+          },
+          "savePath": {
+            "type": "string",
+            "description": "Optional PROJECT-relative path to also write the montage as PNG (bare name lands in \"captures/\")."
+          },
+          "topN": {
+            "type": "number",
+            "description": "Nodes reported per view, max 10 (default 5)."
+          }
+        },
+        "required": []
+      },
+      "readOnlyHint": false,
+      "timeoutMs": 120000
+    }
+  ]
+}

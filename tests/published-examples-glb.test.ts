@@ -2,164 +2,119 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * published-examples-glb — plan-413 §9.3.
+ * published-examples-glb — the shipped examples, against the bytes that are
+ * actually shipped (plan-413 §9.3, retargeted by plan-731 Phase 2).
  *
- * The Examples shelf end to end, against the bytes that are actually shipped:
- * the committed `public/scenes/*.glb` are served by the same dev server that
- * hosts this test, so `fetch('/scenes/index.json')` here is the fetch the boot
- * routine makes. That is the point — a catalogue that still said `.scene.glb`,
- * or a GLB that never got committed, fails here and nowhere else.
+ * The committed `public/` tree is served by the same dev server that hosts this
+ * test, so a fetch here is the fetch the boot routine makes. That is the whole
+ * point of the file — a manifest that names a file nobody committed fails here
+ * and nowhere else.
+ *
+ * ## What moved (plan-731 F2)
+ *
+ * It used to read `/scenes/index.json`, the curated second catalogue. There is
+ * no such file and no such folder any more: the examples are `documents[]` rows
+ * of `/project.json`, the SAME list the models are in. So the fetch changed and
+ * the assertions did not — which is exactly the claim the plan makes.
  *
  * What is pinned:
- *   1. the shipped catalogue lists GLBs and parses into entries;
- *   2. the shipped example files are GLBs carrying their classification;
- *   3. opening one is the ordinary GLB path — a transient scene over the
- *      example URL, no fetch and no op log in the store;
- *   4. "Add to My Scenes" copies the BYTES (compared byte for byte) into the
- *      user's own body slot and writes a v3 catalogue row with an empty op log;
- *   5. `BundledBackend.readScene()` answers a GLB `SceneRecord` for it.
+ *   1. the second catalogue is GONE, file and folder both (F2);
+ *   2. every scene-section document names a file the deploy really serves,
+ *      and that file is a GLB carrying its classification;
+ *   3. the dev-only fixture is a row like any other, marked `devOnly`;
+ *   4. `BundledBackend.readScene()` answers a GLB `SceneRecord` for one.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { SceneStore } from '../src/core/hmi/scene/scene-store';
-import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
-import {
-  parsePublishedIndex,
-  publishedSceneUrl,
-  type PublishedSceneEntry,
-} from '../src/core/hmi/scene/rv-published-scenes';
-import { listMetas, readScene } from '../src/core/hmi/scene/rv-scene-storage';
-import { readSceneGlbBody } from '../src/core/hmi/scene/rv-scene-glb-io';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { classificationOfGlbBlob } from '../src/core/project/rv-project-documents';
 import { BundledBackend } from '../src/core/project/backends/bundled-backend';
 import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { documentsOf, stableDocumentId } from '../src/core/project/rv-project-documents';
+import type { RvDocumentEntry, RvProject } from '../src/core/project/rv-project-types';
 
-/** The catalogue as the deploy publishes it. */
-async function shippedCatalogue(): Promise<PublishedSceneEntry[]> {
-  const resp = await fetch('/scenes/index.json', { cache: 'no-store' });
+/** The manifest as the deploy publishes it — the ONE catalogue. */
+async function shippedManifest(): Promise<RvProject> {
+  const resp = await fetch('/project.json', { cache: 'no-store' });
   expect(resp.ok).toBe(true);
-  return parsePublishedIndex(await resp.json());
+  return await resp.json() as RvProject;
 }
 
-interface FakeViewer {
-  loadScene: (s: RvScene) => Promise<void>;
-  loadEmptyScene: () => Promise<void>;
-  getPlugin: <T>(id: string) => T | undefined;
-  availableModels: { url: string; label: string }[];
-  availablePublishedScenes: PublishedSceneEntry[];
-  currentScene: RvScene | null;
-  currentModelUrl: string | null;
-  modes: { has: (id: string) => boolean; setMode: (id: string) => void };
-}
-
-function makeViewer(published: PublishedSceneEntry[]): FakeViewer {
-  const v: FakeViewer = {
-    availableModels: [],
-    availablePublishedScenes: published,
-    currentScene: null,
-    currentModelUrl: null,
-    modes: { has: () => true, setMode: vi.fn() },
-    loadScene: vi.fn(async (s: RvScene) => { v.currentScene = s; }),
-    loadEmptyScene: vi.fn(async () => { v.currentScene = null; }),
-    getPlugin: () => undefined,
-  };
-  return v;
-}
-
-describe('published examples are GLBs (plan-413 §9.3)', () => {
-  let catalogue: PublishedSceneEntry[];
+describe('the shipped examples are documents (plan-731 F2)', () => {
+  let manifest: RvProject;
+  let documents: RvDocumentEntry[];
+  let scenes: RvDocumentEntry[];
 
   beforeEach(async () => {
-    localStorage.clear();
-    catalogue = await shippedCatalogue();
+    manifest = await shippedManifest();
+    documents = documentsOf(manifest);
+    scenes = sceneDocumentsOf(manifest) as unknown as RvDocumentEntry[];
   });
 
-  afterEach(() => { vi.restoreAllMocks(); });
+  it('the second catalogue is gone — no scenes/index.json, no scenes/ folder', async () => {
+    // F2, stated against the deploy rather than the source tree. This host has
+    // an SPA history fallback, so a missing file answers 200 with index.html —
+    // "is it JSON" is therefore the only question that can be asked, and it is
+    // the one that matters: a leftover index.json would still be parsed by a
+    // `discover` backend pointed at this root.
+    const resp = await fetch('/scenes/index.json', { cache: 'no-store' });
+    const body = await resp.text();
+    expect(body.trimStart().startsWith('[')).toBe(false);
+    expect(body.trimStart().startsWith('{')).toBe(false);
+  });
 
-  it('the shipped catalogue lists .glb entries and parses into examples', () => {
-    expect(catalogue.length).toBeGreaterThan(0);
-    for (const e of catalogue) {
-      expect(e.file).toMatch(/\.glb$/i);
-      expect(e.urlName).not.toMatch(/\./);
-      expect(e.label.length).toBeGreaterThan(0);
+  it('the manifest lists at least one scene document', () => {
+    expect(scenes.length).toBeGreaterThan(0);
+  });
+
+  it('every document id is stableDocumentId(path) — one derivation, one space', () => {
+    // F3 at the source: the ids a link carries are computable from the path, so
+    // the WelcomeModal fallback and the manifest cannot drift apart.
+    for (const doc of documents) {
+      expect(doc.id, `${doc.path} carries its derived id`).toBe(stableDocumentId(doc.path));
     }
   });
 
-  it('every shipped example is a GLB that says it is a scene', async () => {
-    for (const e of catalogue) {
-      const resp = await fetch(publishedSceneUrl(e.file), { cache: 'no-store' });
-      expect(resp.ok, `${e.file} is served`).toBe(true);
+  it('every scene document names a GLB the deploy really serves', async () => {
+    for (const doc of scenes) {
+      const resp = await fetch(`/${doc.path}`, { cache: 'no-store' });
+      expect(resp.ok, `${doc.path} is served`).toBe(true);
       const bytes = new Uint8Array(await resp.arrayBuffer());
-      // 'glTF' — not a JSON body wearing a .glb name.
-      expect(new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true)).toBe(0x46546c67);
-      // The classification travels in the bytes (phase 1) and was stamped by the
-      // bake (phase 3).
+      // 'glTF' — not a JSON body (or an index.html) wearing a .glb name.
+      expect(
+        new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true),
+        `${doc.path} is a GLB`,
+      ).toBe(0x46546c67);
+
+      // The classification travels in the bytes (plan-413 phase 1) and was
+      // stamped by the bake (phase 3).
       const classification = await classificationOfGlbBlob(new Blob([bytes as BlobPart]));
-      expect(classification, `${e.file} carries a classification`).toBeTruthy();
+      expect(classification, `${doc.path} carries a classification`).toBeTruthy();
       expect(classification?.level).toBe('scene');
     }
   });
 
-  it('opening an example is the ordinary GLB path — transient, no op log, no fetch', async () => {
-    const viewer = makeViewer(catalogue);
-    const store = new SceneStore(viewer as unknown as ConstructorParameters<typeof SceneStore>[0]);
-    const spy = vi.spyOn(globalThis, 'fetch');
-
-    await store.openPublishedExample(catalogue[0]);
-
-    // The store hands a URL to the loader; it does not read the file itself.
-    expect(spy).not.toHaveBeenCalled();
-    const snap = store.getSnapshot();
-    expect(snap.transient).toBe(true);
-    expect(snap.draft?.edits.ops).toEqual([]);
-    expect(snap.draft?.base).toMatchObject({ kind: 'builtin' });
-    expect((snap.draft?.base as { url: string }).url).toContain(catalogue[0].file);
-    // Read-only: nothing of the visitor's was written.
-    expect(listMetas()).toEqual([]);
-    store.dispose();
+  it('the dev-only fixture is an ordinary row, marked devOnly', () => {
+    // plan-731 2a: it used to be reachable only through the second catalogue,
+    // which is why no release gate could see it. It is a row now, and `devOnly`
+    // is what every staging path prunes on (2k) and Phase 4 asserts against.
+    const devOnly = documents.filter(d => d.devOnly === true);
+    expect(devOnly.length).toBeGreaterThan(0);
+    for (const d of devOnly) {
+      expect(d.path).toMatch(/\.glb$/i);
+      expect(typeof d.name).toBe('string');
+    }
   });
 
-  it('"Add to My Scenes" copies the bytes and writes a v3 row with no op log', async () => {
-    const viewer = makeViewer(catalogue);
-    const store = new SceneStore(viewer as unknown as ConstructorParameters<typeof SceneStore>[0]);
-    const entry = catalogue[0];
-
-    const source = new Uint8Array(
-      await (await fetch(publishedSceneUrl(entry.file), { cache: 'no-store' })).arrayBuffer(),
-    );
-
-    const id = await store.addPublishedToMyScenes(entry);
-
-    // 1. The bytes are a copy, not a re-encode: compared in full.
-    const body = await readSceneGlbBody(id);
-    expect(body).toBeTruthy();
-    expect(body!.glb.byteLength).toBe(source.byteLength);
-    expect(Array.from(body!.glb)).toEqual(Array.from(source));
-
-    // 2. The row is a v3 shell over that body — no JSON op log anywhere.
-    const row = readScene(id)!;
-    expect(row.schemaVersion).toBe(3);
-    expect(row.base).toMatchObject({ kind: 'scene-glb', sceneId: id });
-    expect(row.edits.ops).toEqual([]);
-
-    // 3. The classification cache on the row came out of the copied bytes.
-    expect(row.classification?.level).toBe('scene');
-    expect(listMetas().find(m => m.id === id)?.classification?.level).toBe('scene');
-    store.dispose();
-  });
-
-  it('BundledBackend.readScene answers a GLB SceneRecord for an example', async () => {
-    const entry = catalogue[0];
+  it('BundledBackend.readScene answers a GLB SceneRecord for a scene document', async () => {
     const backend = new BundledBackend({
       baseUrl: '/',
-      publishedScenes: catalogue,
       // The deploy root of this test IS the dev server, so the real fetch is
       // the honest implementation here.
       fetchImpl: fetch.bind(globalThis),
     });
 
-    const scenes = sceneDocumentsOf(await backend.readManifest());
-    const meta = scenes.find(s => s.path.endsWith(entry.file));
+    const read = sceneDocumentsOf(await backend.readManifest());
+    const meta = read.find(s => s.path === scenes[0]!.path);
     expect(meta, 'the example is a manifest scene entry').toBeTruthy();
 
     const record = await backend.readScene(meta!.path);

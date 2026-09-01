@@ -2,8 +2,8 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, expect, it } from 'vitest';
-import { createDefaultAgentDefinition, FakeAgentProvider } from '../src/plugins/agents/agent-provider';
-import { pollAgentRun } from '../src/plugins/agents/agent-store';
+import { createDefaultAgentDefinition, FakeAgentProvider } from '../../realvirtual-WebViewer-Private~/src/plugins/agents/agent-provider';
+import { pollAgentRun } from '../../realvirtual-WebViewer-Private~/src/plugins/agents/agent-store';
 
 describe('FakeAgentProvider contract', () => {
   it('supports CRUD, run, and terminal polling', async () => {

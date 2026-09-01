@@ -32,6 +32,21 @@ export interface InstructionStep {
   targetPaths: string[];
   /** Document/URL opened by the URL button, or null when absent. */
   url: string | null;
+  /**
+   * Subset of `targetPaths` for which no node exists in the loaded model
+   * (plan-734 F6). Resolved ONCE in the component's `onSceneReady`, which is
+   * the first moment the registry is final — after alias registration AND after
+   * kinematic re-parenting has moved whatever it moves.
+   *
+   * Optional so the many hand-built `InstructionStep` literals across the
+   * codebase and its tests stay valid; `undefined` means "not resolved", which
+   * the card renders exactly like "nothing missing".
+   *
+   * Deliberately NOT re-resolved later: if the layout planner places the
+   * missing asset after the load, the step stays marked. A model switch runs
+   * `init()` + `onSceneReady()` afresh and gets it right there.
+   */
+  unresolvedTargetPaths?: string[];
 }
 
 /** An active (or dismissed-but-still-signalled) instruction entry, keyed by node path. */

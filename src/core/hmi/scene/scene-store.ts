@@ -59,7 +59,6 @@ import {
 // graph of anything that merely imports the SceneStore.
 type SceneGlbIo = typeof import('./rv-scene-glb-io');
 const sceneGlbIo = (): Promise<SceneGlbIo> => import('./rv-scene-glb-io');
-import { publishedSceneUrl, type PublishedSceneEntry } from './rv-published-scenes';
 import {
   type SceneEditsSettings, type MaterialisedEdits,
   COALESCE_WINDOW_MS, materialise,
@@ -87,9 +86,17 @@ import {
 import { setActiveSceneId } from './rv-scene-mutations';
 // Runtime-free module (one variable + two setters, type-only imports), so this
 // edge does not pull the editor graph into the core bundle.
-import { documentBase, sceneDocumentBase, setOpenDocumentBase } from '../../editor/active-asset-store';
+import {
+  documentBase, sameDocumentBase, sceneDocumentBase, setOpenDocumentBase,
+} from '../../editor/active-asset-store';
 import type { AssetBase } from '../../editor/rv-asset-document';
-import { showInfoOverlay, hideInfoOverlay } from '../info-overlay-store';
+// NOT a static import: info-overlay-store is a React/@mui surface, and a static
+// edge from here would pull @mui/material into the embed library build, which
+// plan-326 AP1 guards against ("no React/MUI anywhere in the output"). Loaded
+// dynamically at the one call site below and gated on __RV_EMBED__, so Rollup
+// drops the whole branch for the embed. In the app the module is already in the
+// module cache (App.tsx imports it for its side effects), so the await resolves
+// in a microtask and the overlay still paints before the blocking parse.
 import { nextOptionParam } from '../../../plugins/models/model-option-plugin';
 import { writeSettingsIntoModel } from './rv-scene-settings-into-model';
 import { getProjectStore } from '../../project/project-store';
@@ -112,6 +119,11 @@ import {
   resolveDocumentAlias,
   resolveDocumentId,
 } from '../../project/rv-doc-alias';
+import {
+  isWorkspaceDefaultProject,
+  openWorkspaceDefaultBackend,
+  workspaceDefaultExists,
+} from '../../project/rv-workspace-default';
 import type { RvDocumentEntry } from '../../project/rv-project-types';
 import { isSupported as isFileSystemAccessSupported } from '../../engine/rv-local-filesystem';
 import { saveStartPos } from '../camera-startpos-store';
@@ -125,9 +137,9 @@ import { deriveModelKey } from '../../../plugins/camera-startpos-plugin';
  * The three intrinsics (`dirty`, `busy`, `canUndo`, `canRedo`) come from
  * {@link RvDocumentCore} — derived once in the document layer (plan-710 §2.4).
  * Everything else here is scene-specific and STAYS scene-specific: a
- * materialised `RvScene`, the catalogue, the published list and the transient
- * flag have no asset counterpart, and forcing one shape over both was an
- * explicit review finding against an earlier draft of the merge.
+ * materialised `RvScene`, the catalogue and the transient flag have no asset
+ * counterpart, and forcing one shape over both was an explicit review finding
+ * against an earlier draft of the merge.
  */
 export interface SceneSnapshot extends RvDocumentCore {
   saved: RvScene | null;
@@ -138,10 +150,6 @@ export interface SceneSnapshot extends RvDocumentCore {
   dirty: boolean;
   /** Read-only built-in SOURCES, mirrored from `viewer.availableModels`. */
   builtins: BuiltinSceneEntry[];
-  /** Read-only "Example" scenes of the DemoRealvirtual project. */
-  published: PublishedSceneEntry[];
-  /** urlName of the open published example, for Examples-row highlight; null otherwise. */
-  activePublishedName: string | null;
   /**
    * The open workspace holds foreign content and persists nothing (plan-386
    * §2.5). Exposed so the UI can say so, and so a regression that leaves the
@@ -345,7 +353,6 @@ interface WorkspaceSnapshotState {
   ops: RvOp[];
   redoStack: RvOp[];
   saved: RvScene | null;
-  activePublishedName: string | null;
 }
 
 // ─── Store ──────────────────────────────────────────────────────────────
@@ -387,9 +394,6 @@ export class SceneStore {
   // Sources (plan-716 Phase 6 — the scene CATALOGUE that used to sit here is
   // gone; both of these are read-only origins, not owned artefacts).
   private _builtins: BuiltinSceneEntry[] = [];
-  private _published: PublishedSceneEntry[] = [];
-  /** urlName of the currently-open published example (for row highlight); null otherwise. */
-  private _activePublishedName: string | null = null;
 
   // UI state flags
   private _busy = false;
@@ -411,6 +415,8 @@ export class SceneStore {
    * persist a body with the editor's half silently missing.
    */
   private _projectionSuspended = false;
+  /** What {@link beginProjectionHandover} bound — checked on the way back. */
+  private _handoverBase: AssetBase | null = null;
   /**
    * A change arrived while suspended and still owes a write.
    *
@@ -504,7 +510,6 @@ export class SceneStore {
       hasUnpersistedWork: () => this._draftAutosaveTimer !== null || this._projectionDeferredWrite,
     });
     this._refreshBuiltins();
-    this._refreshPublished();
     this._snapshot = this._buildSnapshot();
   }
 
@@ -571,7 +576,6 @@ export class SceneStore {
     const base: SceneBase = { kind: 'builtin', url, label };
     if (this._workspace?.base.kind === 'builtin' && this._workspace.base.url === url) return;
     this._cancelAutosave();
-    this._activePublishedName = null;
     this._workspace = freshShell(base, label);
     this._settings = { ...DEFAULT_SETTINGS };
     this._installOps([], []);
@@ -583,14 +587,17 @@ export class SceneStore {
 
   // ─── Sources ────────────────────────────────────────────────────────
   //
-  // What is left after plan-716 Phase 6. `listScenes()` (the `rv-scenes-index`
-  // catalogue) and `listBuiltins()` are gone: the catalogue does not exist, and
-  // the built-ins were never the store's to hold — they are read from the model
-  // catalogue via `builtinSources(viewer)`, where they live. Published examples
-  // stay, because a SOURCE is still a concept: opening one persists nothing and
-  // saving it materialises a document.
-
-  listPublished(): PublishedSceneEntry[] { return this._published; }
+  // Nothing is left here after plan-731. plan-716 Phase 6 had already removed
+  // `listScenes()` (the `rv-scenes-index` catalogue) and `listBuiltins()`; what
+  // it kept was `listPublished()`, on the argument that "a SOURCE is still a
+  // concept: opening one persists nothing and saving it materialises a
+  // document".
+  //
+  // That sentence was true about the BEHAVIOUR and wrong about the LIST. The
+  // behaviour is a property of a row (`tier: 'bundled'` — read-only, saving
+  // forks), not a reason for a second catalogue with a second id space beside
+  // `documents[]`. plan-731 removed the list and kept the behaviour: an example
+  // is a document row, opened by `openDocument()` like every other one.
 
   // ─── Workspace lifecycle ────────────────────────────────────────────
 
@@ -657,6 +664,12 @@ export class SceneStore {
       document: { id: row.id, path: row.path },
     });
     if (opts.updateUrl !== false) updateUrlDocumentParam(row.id);
+    // The row's preferred workspace mode (plan-731 2e). It used to be a property
+    // of a catalogue ENTRY and was applied by `openPublishedExample`; it is a
+    // property of the manifest ROW now, so it is applied here — the one place
+    // every document is opened. Absent on all but the demo's example rows, and a
+    // no-op when absent, so nothing else changes behaviour.
+    this._applyMode(typeof row.mode === 'string' ? row.mode : undefined);
     // AFTER the load, never inside it: `_loadIntoWorkspace`'s own
     // `setOpenDocumentBase` block is a pinned characterisation surface
     // (plan-716 §9.3) and Phase 4 owns the decision to rewrite it. This is the
@@ -674,9 +687,9 @@ export class SceneStore {
     //
     // The mode comes from the viewer the store already holds; no new dependency
     // is created for it. An open is never transient here — `openDocument` calls
-    // `_loadIntoWorkspace` WITHOUT `transient`, and the transient openers
-    // (`openTransient`, `openPublished`, `openPublishedExample`) deliberately do
-    // not forward onto this verb (§2.5: a source is not a document). So the rule
+    // `_loadIntoWorkspace` WITHOUT `transient`, and the transient opener
+    // (`openTransient`) deliberately does not forward onto this verb (§2.5: a
+    // source is not a document). So the rule
     // `_loadIntoWorkspace` applies to the active-scene pointer — foreign content
     // leaves no trace — holds here by construction rather than by a guard.
     // `modes?.` although the type says it is always there: a resume hint is
@@ -720,6 +733,27 @@ export class SceneStore {
   async openScene(id: string): Promise<void> {
     const row = this._documentRow(id);
     if (row) return this.openDocument(row.id);
+    // ── The cross-project hop (plan-726 follow-up) ───────────────────────
+    //
+    // Since the deploy root carries a manifest, the boot's active project is
+    // the deploy's own — but the documents the eager migration converted
+    // live in "My Workspace", and an old `?scene=scn_…` link resolves to
+    // exactly such a document. A miss against the ACTIVE manifest is
+    // therefore not yet "not found": when the workspace owns the id, switch
+    // to it and open there. Guarded on ownership (a cheap localStorage
+    // manifest read), so a genuinely dead id still falls through to the
+    // legacy read and its honest throw — and on the user's dirty-guard veto
+    // inside the switch, which must keep beating a deep link.
+    const store = getProjectStore();
+    if (!isWorkspaceDefaultProject(store.getProject()) && workspaceDefaultExists()) {
+      const docId = resolveDocumentId(id);
+      const workspace = await openWorkspaceDefaultBackend({ requestPersistence: false })
+        .readManifest().catch(() => null);
+      if (workspace && documentsOf(workspace).some(d => d.id === docId)
+          && await store.openWorkspaceProject()) {
+        return this.openDocument(docId);
+      }
+    }
     // With lazy project hydration the body may not be cached yet. Without
     // this pre-fetch, a Models-panel click and `web_scene_open` would both
     // throw "Scene <id> not found" on a perfectly valid project scene.
@@ -767,58 +801,30 @@ export class SceneStore {
     }
   }
 
-  /**
-   * Open a "published" scene — a read-only GLB served from the deploy root
-   * (`scenes/<name>.glb`), routed via `?scene=published:<name>`. `name` only
-   * keeps the URL stable across reloads.
+  /*
+   * `openPublished(url, name, label)` used to sit here (removed in plan-731 2e).
    *
-   * ## It takes a URL now, not a scene (plan-413 phase 3)
+   * It opened an "Example" as a TRANSIENT over a `builtin` base and wrote
+   * `?scene=published:<name>` into the address bar — the write half of the
+   * second document identity space. Both halves are gone: an example is a
+   * `documents[]` row, {@link openDocument} opens it, and the address bar gets
+   * `?doc=<id>`. Old `published:` links keep working through the alias in
+   * `rv-published-scenes`, which resolves them to a document id BEFORE any
+   * store verb is reached.
    *
-   * It used to take an already-parsed `RvScene`: the caller fetched a
-   * `.scene.json`, and this method validated the op log before handing it on.
-   * Examples are GLBs since phase 3, so there is no JSON to parse and nothing
-   * to validate here — the bytes are a model, and the model loader is the one
-   * that judges them. What is left is exactly the difference between an example
-   * and any other transient content: it has a NAME, and the address bar has to
-   * say so.
-   *
-   * **Docstring correction (plan-386 Phase 3).** This comment used to claim
-   * that "a shared public link has no side effects on the visitor's stored
-   * scenes". That was false for two years: the load ran
-   * `setActiveSceneId(saved?.id ?? null)` with `saved === null`, which
-   * *deleted* the visitor's active-scene pointer, and the debounced autosave
-   * wrote a draft as soon as he moved anything. The claim is true now because
-   * {@link openTransient} makes it true — see there for what "transient"
-   * actually enforces. A comment is not a mechanism; this one is kept only to
-   * name the defect it used to hide.
+   * {@link openTransient} is untouched and is still the verb for foreign content
+   * that must leave no trace (a shared `?glb=` link) — that need was never about
+   * examples, which is why the two were separable at all.
    */
-  async openPublished(url: string, name: string, label?: string): Promise<void> {
-    const title = label?.trim() || name;
-    // The same shape a shared `?glb=` link builds (plan-386): a draft over a
-    // `builtin` base pointing at the bytes. `scene-glb` would be wrong here —
-    // that base names a scene ID for the storage layer to resolve, and an
-    // example has no body in the visitor's OPFS store and must not acquire one.
-    const scene = makeDraftScene({ kind: 'builtin', url, label: title }, title);
-    await this.openTransient(scene);
-    // Mark which example is active so the Examples row can highlight (transient
-    // scenes have no saved id / non-builtin base to match against).
-    this._activePublishedName = name;
-    // The URL update belongs HERE and not in `openTransient`: a published
-    // example is addressable by name, a shared `?glb=` link is not, and
-    // rewriting the address bar under a shared link would replace it with a
-    // path that does not exist (plan-386 F18/R11).
-    updateUrlSceneParam(`published:${name}`, baseLabelForOption(scene.base));
-    this._notify();
-  }
 
   /**
    * Open foreign content that must leave **no trace** on the visitor
    * (plan-386 §2.5).
    *
-   * Two callers, one need. `openPublished()` shows a read-only example that
-   * ships with the deploy; the plan-386 escalation shows a GLB somebody mailed
-   * a link to. Neither may write the visitor's active-scene pointer, his draft
-   * bodies or his address bar — and neither may READ from his slots either:
+   * One caller since plan-731 removed `openPublished()`: the plan-386
+   * escalation, which shows a GLB somebody mailed a link to. It may not write
+   * the visitor's active-scene pointer, his draft bodies or his address bar —
+   * and it may not READ from his slots either:
    * without `transient`, an empty-based scene probes `draft/empty`, which is
    * exactly where an unsaved empty workspace autosaves, so the visitor's own
    * draft would load *instead* of the content and the content's op log would be
@@ -868,7 +874,6 @@ export class SceneStore {
       ops: [...this._ops],
       redoStack: this._doc.captureHistory().redoOps,
       saved: this._saved,
-      activePublishedName: this._activePublishedName,
     };
   }
 
@@ -883,7 +888,6 @@ export class SceneStore {
       metaDirty: false,
     });
     this._saved = state.saved;
-    this._activePublishedName = state.activePublishedName;
     this._notify();
   }
 
@@ -1007,6 +1011,13 @@ export class SceneStore {
     // order to drop it when the document is clean again (plan-711 §2.4).
     this._sharedFrameMayExist = true;
     this._notify();
+    // Remembered for the way back: `endProjectionHandover` must be able to
+    // tell whether the workspace it returns INTO is still the document it was
+    // handed FROM. A dashboard double-click can open another document while
+    // the editor's async recompose is still exporting — without this fact the
+    // old document's authored bytes would be adopted under the new document's
+    // key (the "new name, old content" defect).
+    this._handoverBase = base;
     return {
       document: this._doc,
       base,
@@ -1034,7 +1045,26 @@ export class SceneStore {
    */
   endProjectionHandover(opts?: { authoredBytes?: ArrayBuffer }): void {
     if (!this._projectionSuspended) return;
-    if (opts?.authoredBytes) this.adoptProjectedBaseBytes(opts.authoredBytes);
+    const boundTo = this._handoverBase;
+    this._handoverBase = null;
+    // Adopt the authored tree ONLY when the workspace still is the document
+    // the handover was taken from. The editor's return is asynchronous (an
+    // export of the whole tree), and an open that lands in that window has
+    // already replaced the workspace — installing the OLD document's bytes as
+    // the NEW document's bake source is exactly the corruption this guard
+    // exists to refuse. The authored bytes are not lost work: they are the
+    // projection of the old document's op log, which that document still has.
+    const stillCurrent = boundTo !== null
+      && sameDocumentBase(this.documentIdentity(), boundTo);
+    if (opts?.authoredBytes) {
+      if (stillCurrent) {
+        this.adoptProjectedBaseBytes(opts.authoredBytes);
+      } else {
+        console.warn(
+          '[scene-store] editor handback arrived after another document was opened — '
+          + 'its authored bytes were dropped instead of being adopted by the wrong document.');
+      }
+    }
     this._projectionSuspended = false;
     // Flush what the suspension held back. Through `_afterOpsChanged` rather
     // than straight into `_autosaveBody`, so the write goes through the one
@@ -1070,6 +1100,11 @@ export class SceneStore {
     const workspace = this._workspace;
     if (!workspace) return;
     const bytes = await this._ensureBaseBytes();
+    // A newer open replaced the workspace while the bytes were being fetched:
+    // that open's load owns the viewer now, and reloading the captured
+    // workspace over it would put a stale document on screen (the same race
+    // the endProjectionHandover guard closes on the adopt side).
+    if (this._workspace !== workspace) return;
     if (!bytes) throw new Error('The scene could not be shown again — its bytes are unavailable.');
     this._loading = true;
     this._busy = true;
@@ -1205,90 +1240,22 @@ export class SceneStore {
   }
 
   /**
-   * Open an "Example" scene from the catalogue transiently (read-only — not
-   * written to localStorage), then switch to its preferred workspace mode if
-   * one is declared in the manifest.
+   * `openPublishedExample(entry)`, `materializePublishedExample(entry)` and
+   * `_fetchPublishedGlb(entry)` used to sit here (removed in plan-731 2e).
    *
-   * The preferred mode is applied here via the mode manager (which persists it);
-   * on reload the published boot path re-applies it from the catalogue entry, so
-   * the workspace is restored without the mode needing to live in the URL.
+   * All three took a `PublishedSceneEntry` — a row of the catalogue this plan
+   * abolished — and each was a second spelling of a verb the document layer
+   * already had:
+   *
+   *  - opening one is {@link openDocument}, which now also applies the row's
+   *    declared `mode`, the one thing the example path did that the document
+   *    path did not;
+   *  - making one your own is the ordinary bundled-tier fork (`saveAs` /
+   *    `duplicate`), which is what plan-716 Phase 6 had already routed
+   *    `materializePublishedExample` through internally;
+   *  - fetching its bytes is the backend's job, reached through the same
+   *    `rvproject:` resolution as every other document.
    */
-  async openPublishedExample(entry: PublishedSceneEntry): Promise<void> {
-    if (this._busy) return;        // ignore re-clicks while a load is in flight
-    this._busy = true;
-    this._notify();                // disable the rows immediately (load precedes _loadIntoWorkspace)
-    try {
-      await this.openPublished(publishedSceneUrl(entry.file), entry.urlName, entry.label);
-      this._applyMode(entry.mode);
-    } finally {
-      this._busy = false;
-      this._notify();
-    }
-  }
-
-  /**
-   * Import an "Example" into the user's project as a fresh, fully editable
-   * DOCUMENT, then open it. This is the "make the demo mine" path. Returns the
-   * new documentId.
-   *
-   * ## A source materialises a document (plan-716 F1, Phase 6)
-   *
-   * An Example is a read-only SOURCE: nothing owns its bytes, and the whole
-   * point of this verb is that afterwards something does. Until Phase 6 that
-   * "something" was a `scn_` catalogue row over an OPFS body — the last place in
-   * the product that minted a scene id, and the reason a demo the user had made
-   * his own was still a second-class artefact: not in `documents[]`, not
-   * placeable into another layout, not addressable by `?doc=`.
-   *
-   * It now goes through the same create seam as "New" and `saveAs`, so the copy
-   * is a file in the project with a manifest row from its first instant, and the
-   * name probe that keeps repeated imports apart is `planDocument`'s rather than
-   * a second one spelled here.
-   */
-  async addPublishedToMyScenes(entry: PublishedSceneEntry): Promise<string> {
-    if (this._busy) throw new Error('A scene operation is already in progress.');
-    this._busy = true;
-    this._notify();
-    try {
-      // Fetched BEFORE anything is created: a deploy still serving JSON under a
-      // `.glb` name must fail with "not a GLB" and leave no half-made document.
-      const glb = await this._fetchPublishedGlb(entry);
-      const created = await this._createDocument(entry.label, glb as unknown as BlobPart);
-      if (!created) {
-        throw new Error('There is no writable project to import the example into.');
-      }
-      await this._noteDocumentRevisionOf(created.relPath, toArrayBuffer(glb));
-      await this.openDocument(created.documentId);
-      this._applyMode(entry.mode);
-      return created.documentId;
-    } finally {
-      this._busy = false;
-      this._notify();
-    }
-  }
-
-  /**
-   * Fetch the bytes of a published example.
-   *
-   * Only the "make it mine" path needs them in hand — opening one hands the
-   * URL to the model loader and never touches the bytes here, which is why
-   * this is not on the open path any more (plan-413 phase 3).
-   *
-   * The GLB magic is checked because the alternative failure is worse than a
-   * message: a deploy still serving the old `.scene.json` under a `.glb` name
-   * would otherwise be written into the user's own body slot as a scene that
-   * can never load.
-   */
-  private async _fetchPublishedGlb(entry: PublishedSceneEntry): Promise<Uint8Array> {
-    const resp = await fetch(publishedSceneUrl(entry.file), { cache: 'no-store' });
-    if (!resp.ok) throw new Error(`Failed to fetch example scene ${entry.file}: HTTP ${resp.status}`);
-    const bytes = new Uint8Array(await resp.arrayBuffer());
-    if (bytes.byteLength < 12
-      || new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true) !== GLB_MAGIC) {
-      throw new Error(`Invalid example scene (not a GLB): ${entry.file}`);
-    }
-    return bytes;
-  }
 
   /** Switch workspace mode if the id is a registered mode. No-op when absent. */
   private _applyMode(mode?: string): void {
@@ -1405,9 +1372,6 @@ export class SceneStore {
     opts: { transient?: boolean; document?: { id: string; path: string } } = {},
   ): Promise<void> {
     this._cancelAutosave();
-    // Any normal open clears the "active example" marker; openPublished() re-sets
-    // it after this returns.
-    this._activePublishedName = null;
     this._loading = true;
     this._busy = true;
     // The document binding is installed with the shell and BEFORE `_resolveLoad`
@@ -1443,7 +1407,10 @@ export class SceneStore {
     // overlay is `pointerEvents:none` so it doesn't block any background
     // interactions that happen to remain responsive.
     const sceneLabel = scene.name || baseLabelOf(scene.base) || 'scene';
-    showInfoOverlay(`Loading ${sceneLabel}…`);
+    const overlay = __RV_EMBED__
+      ? null
+      : await import('../info-overlay-store').catch(() => null);
+    overlay?.showInfoOverlay(`Loading ${sceneLabel}…`);
     const perfT0 = performance.now(); // TEMP open-perf instrumentation
     let perfRecoveryMs = 0, perfResolveMs = 0, perfLoadMs = 0; // TEMP open-perf
     try {
@@ -1498,7 +1465,7 @@ export class SceneStore {
       // he cannot select. The camera preset is the one thing NOT taken over:
       // `saveStartPos` writes localStorage, and a link somebody mailed must not
       // change what the visitor's own models look like on open (F7).
-      if (resolved.fromGlb || opts.transient) {
+      if (resolved.fromGlb || resolved.adopt || opts.transient) {
         this._adoptFromLoadedGlb({ persistCamera: opts.transient !== true });
       }
       // A transient workspace does not own the active-scene pointer. Writing it
@@ -1556,6 +1523,8 @@ export class SceneStore {
       //    And `decideSaveVerb` on the published `builtinModel` answers
       //    `save-into-project` with `copies: true`, i.e. "make it mine", which
       //    is precisely the source→document materialisation §2.6 prescribes.
+      //    Since plan-719 F2 that materialisation is CONFIRMED in one prompt
+      //    instead of happening silently — same routing, announced.
       //
       // `documentIdentity()` still answers null for a transient workspace, and
       // that is not a contradiction with this line — the two answer different
@@ -1576,7 +1545,7 @@ export class SceneStore {
     } finally {
       this._loading = false;
       this._busy = false;
-      hideInfoOverlay();
+      overlay?.hideInfoOverlay();
       this._notify();
     }
   }
@@ -1624,7 +1593,7 @@ export class SceneStore {
   private async _resolveLoad(
     scene: RvScene,
     transient = false,
-  ): Promise<{ scene: RvScene; fromGlb: boolean; identityUrl?: string; data?: ArrayBuffer }> {
+  ): Promise<{ scene: RvScene; fromGlb: boolean; identityUrl?: string; data?: ArrayBuffer; adopt?: boolean }> {
     const slots = this._bodySlots();
     // The base URL the workspace was opened from, kept for the return below.
     // The resolved base is a blob: object URL — bytes, not identity — and every
@@ -1635,7 +1604,7 @@ export class SceneStore {
     const identityUrl = scene.base.kind === 'builtin' ? scene.base.url : undefined;
     // A transient scene brings its own body with it and owns no slot. Probing
     // for one would hand it a body belonging to whatever the visitor was doing
-    // before — see `openPublished`.
+    // before — see `openTransient`.
     const candidates = transient
       ? (scene.base.kind === 'scene-glb' ? [scene.base.sceneId] : [])
       : [slots.draft, ...(slots.saved ? [slots.saved] : [])];
@@ -1701,12 +1670,19 @@ export class SceneStore {
         // file holds by then.
         this._setBaseBytes(baseKeyOf(scene.base), source.bytes);
         void this._noteDocumentRevisionOf(assetPath, source.bytes);
-        return { scene, fromGlb: false, identityUrl: identity, data: source.bytes };
+        // `adopt`, not `fromGlb`: a project document's bytes are a baked scene
+        // GLB whose placements are reference nodes the planner must be told
+        // about (2026-08-31 — the DemoPlanner deploy showed the gap: composed
+        // but never adopted, so nothing was selectable). `fromGlb` would
+        // additionally clear the document's own op log, which is wrong here —
+        // that flag means "resumed from a stored BODY", and this is not that.
+        return { scene, fromGlb: false, adopt: true, identityUrl: identity, data: source.bytes };
       }
       this._installAssetSourceRelease(source.release);
       return {
         scene: { ...scene, base: { kind: 'builtin', url: source.url, label } },
         fromGlb: false,
+        adopt: true,
         identityUrl: identity,
       };
     }
@@ -1870,7 +1846,15 @@ export class SceneStore {
     if (entries.length > 0) {
       const planner = this._viewer.getPlugin<RVViewerPlugin & {
         adoptPlacements?: (e: readonly { node: Object3D; placement: PlacedComponent }[]) => number;
+        ensureAttached?: (viewer: unknown) => void;
       }>('layout-planner');
+      // Attach FIRST: `adoptPlacements` bails out silently when the planner has
+      // never been attached, and a GLB-scene document opened straight from a
+      // boot (`?doc=…&mode=planner`) reaches here before anything else attached
+      // it — loadScene only calls ensureAttached for op-based placements and
+      // empty bases, not for placements already baked into the tree
+      // (2026-08-31 — the DemoPlanner deploy: composed, visible, unselectable).
+      planner?.ensureAttached?.(this._viewer);
       planner?.adoptPlacements?.(entries);
     }
 
@@ -2156,7 +2140,6 @@ export class SceneStore {
     };
     this._saved = saved;
     this._publishDocumentIdentity();
-    this._activePublishedName = null;
     this._doc.markSaved({ floor: floorAtBakeStart });
 
     // Same conditional as the deleted row save: ops that arrived mid-bake are
@@ -2464,7 +2447,6 @@ export class SceneStore {
     this._setBaseBytes(baseKeyOf(base), toArrayBuffer(bytes));
     this._saved = saved;
     this._publishDocumentIdentity();
-    this._activePublishedName = null;  // now the user's own document
     this._doc.markSaved({ floor: floorAtBakeStart });
     // See the in-place save for the conditional-cleanup rationale: ops that
     // arrived mid-bake are not in the copy, so their draft must survive.
@@ -2613,7 +2595,7 @@ export class SceneStore {
       let next: WorkspaceShell = { ...this._workspace, name: rowName };
       // Re-point the workspace only when it was bound to the file that moved:
       // `documentPath` is the binding, and a workspace whose base is something
-      // else (a transient, a published example) must keep it.
+      // else (a transient) must keep it.
       if (target && this._workspace.documentPath === row.path) {
         const base: SceneBase = {
           kind: 'builtin',
@@ -2638,6 +2620,14 @@ export class SceneStore {
         this._saved = { ...this._saved, name: rowName };
         this._viewer.currentScene = this._saved;
       }
+      // The LIVING document carries the name too, and it is what both cards
+      // render (`snap.name` on the editor side, `draft.name` here). Renaming
+      // the row without it left the hero and the hierarchy card on the old
+      // title until the next reload (field finding 2026-08-26). Silently,
+      // because the file and the manifest row have already been written: this
+      // adopts a completed rename, it does not author a new one, and
+      // `renameDocument` would mark the document meta-dirty for it.
+      this._doc.setNameSilently(rowName);
       // The cross-mode handle carries the NAME beside the id; a stale one makes
       // the editor announce a document nobody can find under that title.
       this._publishDocumentIdentity();
@@ -2660,8 +2650,8 @@ export class SceneStore {
    * "My Workspace" — so the honest answer is an error the UI can show, not the
    * catalogue row this used to fall back to (plan-716 F1, Phase 6).
    */
-  async createEmpty(name = 'Untitled'): Promise<string> {
-    const created = await this._createDocument(name);
+  async createEmpty(name = 'Untitled', folder?: string): Promise<string> {
+    const created = await this._createDocument(name, undefined, folder);
     if (!created) throw new Error('There is no writable project to create a document in.');
     this._notify();
     return created.documentId;
@@ -3215,10 +3205,6 @@ export class SceneStore {
     this._builtins = (this._viewer.availableModels ?? []).map(m => ({ url: m.url, label: m.label }));
   }
 
-  private _refreshPublished(): void {
-    this._published = this._viewer.availablePublishedScenes ?? [];
-  }
-
   private _buildDraft(): RvScene | null {
     if (!this._workspace) return null;
     return {
@@ -3251,8 +3237,6 @@ export class SceneStore {
       draft,
       isDraft,
       builtins: this._builtins,
-      published: this._published,
-      activePublishedName: this._activePublishedName,
       transient: this._workspace?.transient === true,
       // The ONE deliberate override of the core. `busy` means something WIDER
       // here than the op queue: "the store is loading or saving", which is what

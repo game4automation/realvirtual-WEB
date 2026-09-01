@@ -2,24 +2,40 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-published-scenes — catalogue parser tests.
+ * rv-published-scenes — the `published:<urlName>` ALIAS (plan-731 Phase 2, F3).
  *
- * Covers the curated index.json parser, the glob-fallback entry builder and
- * the deep-link resolver that feed the Models panel's "Examples" section.
- * Examples are GLBs since plan-413 phase 3; the `.scene.json` spellings that
- * used to be asserted here are now the rejected case.
+ * This file used to specify a CATALOGUE: an `index.json` parser, a glob-fallback
+ * entry builder and a deep-link resolver that decided from the catalogue whether
+ * a name existed. All three were the second document identity space, and all
+ * three are gone — the parser survives only as a foreign-format reader inside
+ * `bundled-backend` (a system boundary, tested there with the `discover` path).
+ *
+ * What is specified here is what replaced them: a pure mapping from an old
+ * `published:<urlName>` link onto a row of `documents[]`. The rule to hold is
+ * "the manifest decides, and only the manifest" — the same authority `?doc=`
+ * answers to, which is the whole point of collapsing the two spaces into one.
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import {
-  parsePublishedIndex,
-  publishedEntryFromFile,
+  PUBLISHED_ID_PREFIX,
+  parsePublishedToken,
   publishedFileFromUrlName,
-  resolvePublishedDeepLink,
+  publishedTokenOf,
+  publishedUrlNameOf,
+  resolvePublishedAlias,
+  resolvePublishedSceneParam,
   urlNameFromFile,
-  type PublishedSceneEntry,
 } from '../src/core/hmi/scene/rv-published-scenes';
+import type { RvDocumentEntry } from '../src/core/project/rv-project-types';
 
-afterEach(() => { vi.restoreAllMocks(); });
+const doc = (id: string, path: string, name = id): RvDocumentEntry =>
+  ({ id, path, name });
+
+/** The demo's own rows, as `public/project.json` carries them. */
+const DEMO_DOCUMENTS: RvDocumentEntry[] = [
+  doc('doc_demorealvirtualweb_7l7hfw', 'DemoRealvirtualWeb.glb', 'realvirtual WEB Demo'),
+  doc('doc_demoplanner_gf4m6v', 'DemoPlanner.glb', 'Layout Planner Demo'),
+];
 
 describe('urlNameFromFile', () => {
   it('strips the .glb suffix', () => {
@@ -33,116 +49,110 @@ describe('urlNameFromFile', () => {
   });
 });
 
-describe('publishedEntryFromFile', () => {
-  it('derives urlName and label from the filename, no mode', () => {
-    expect(publishedEntryFromFile('DemoPlanner.glb')).toEqual({
-      file: 'DemoPlanner.glb',
-      urlName: 'DemoPlanner',
-      label: 'DemoPlanner',
-    });
+describe('publishedUrlNameOf / publishedTokenOf', () => {
+  it('is the path BASENAME without the extension', () => {
+    expect(publishedUrlNameOf({ path: 'DemoPlanner.glb' })).toBe('DemoPlanner');
+    expect(publishedUrlNameOf({ path: 'scenes/DemoPlanner.glb' })).toBe('DemoPlanner');
+  });
+
+  it('is the same name whichever folder the file sits in', () => {
+    // The load-bearing property of the whole alias: plan-731 2a moved the
+    // turntable fixture OUT of `scenes/`, and a link minted before that move
+    // must still find it.
+    expect(publishedUrlNameOf({ path: 'scenes/Test-DES-Turntable-Loop.glb' }))
+      .toBe(publishedUrlNameOf({ path: 'Test-DES-Turntable-Loop.glb' }));
+  });
+
+  it('a missing or empty path yields an empty name rather than throwing', () => {
+    expect(publishedUrlNameOf({})).toBe('');
+    expect(publishedUrlNameOf({ path: '' })).toBe('');
+  });
+
+  it('publishedTokenOf spells the legacy address of a row', () => {
+    expect(publishedTokenOf({ path: 'DemoPlanner.glb' })).toBe('published:DemoPlanner');
   });
 });
 
-describe('parsePublishedIndex', () => {
-  it('maps curated entries with name → label and carries mode', () => {
-    const out = parsePublishedIndex([
-      { file: 'DemoPlanner.glb', name: 'Planner Demo', mode: 'planner' },
-    ]);
-    expect(out).toEqual([
-      { file: 'DemoPlanner.glb', urlName: 'DemoPlanner', label: 'Planner Demo', mode: 'planner' },
-    ]);
+describe('parsePublishedToken', () => {
+  it('extracts the name from a published: value', () => {
+    expect(parsePublishedToken('published:DemoPlanner')).toBe('DemoPlanner');
   });
 
-  it('carries the classification level, and only a legal one (plan-413 phase 4)', () => {
-    // The catalogue is the classification CACHE for a bundled deploy: §2.5
-    // says a read-only source is never scanned, so this is where the level of
-    // an example comes from. A bad value is dropped rather than shown — the
-    // dashboard would otherwise offer a chip that matches one document and
-    // nothing else in the product knows the word.
-    const out = parsePublishedIndex([
-      { file: 'A.glb', level: 'scene' },
-      { file: 'B.glb', level: 'model' },        // the pre-413 spelling
-      { file: 'C.glb', level: 'nonsense' },
-      { file: 'D.glb' },
-    ]);
-    expect(out.map(e => e.level)).toEqual(['scene', 'plant', undefined, undefined]);
+  it('decodes percent-escapes so a name with a space survives the URL', () => {
+    expect(parsePublishedToken('published:My%20Demo')).toBe('My Demo');
   });
 
-  it('falls back to the url name when name is missing/blank', () => {
-    const out = parsePublishedIndex([
-      { file: 'A.glb' },
-      { file: 'B.glb', name: '   ' },
-    ]);
-    expect(out.map(e => e.label)).toEqual(['A', 'B']);
-    expect(out.every(e => e.mode === undefined)).toBe(true);
+  it('returns null for every other shape — the caller can chain it', () => {
+    expect(parsePublishedToken('builtin:Foo.glb')).toBeNull();
+    expect(parsePublishedToken('empty')).toBeNull();
+    expect(parsePublishedToken('scn_abc')).toBeNull();
+    expect(parsePublishedToken('doc_abc')).toBeNull();
+    expect(parsePublishedToken(null)).toBeNull();
+    expect(parsePublishedToken(undefined)).toBeNull();
   });
 
-  it('ignores non-array input', () => {
-    expect(parsePublishedIndex(null)).toEqual([]);
-    expect(parsePublishedIndex({})).toEqual([]);
-    expect(parsePublishedIndex('nope')).toEqual([]);
+  it('an empty name is not a name', () => {
+    expect(parsePublishedToken(PUBLISHED_ID_PREFIX)).toBeNull();
   });
 
-  it('skips entries without a valid .glb file field', () => {
-    const out = parsePublishedIndex([
-      { file: 'ok.glb' },
-      { file: 'bad.json' },
-      { file: 42 },
-      { name: 'no file' },
-      null,
-      'string',
-    ]);
-    expect(out.map(e => e.file)).toEqual(['ok.glb']);
-  });
-
-  it('drops a non-string mode', () => {
-    const out = parsePublishedIndex([{ file: 'A.glb', mode: 123 }]);
-    expect(out[0].mode).toBeUndefined();
-  });
-
-  it('skips a legacy .scene.json entry and says why', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const out = parsePublishedIndex([
-      { file: 'Old.scene.json', name: 'Old' },
-      { file: 'New.glb', name: 'New' },
-    ]);
-    expect(out.map(e => e.file)).toEqual(['New.glb']);
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(String(warn.mock.calls[0][0])).toMatch(/Old\.scene\.json/);
+  it('a malformed escape falls back to the literal rather than throwing', () => {
+    expect(parsePublishedToken('published:100%')).toBe('100%');
   });
 });
 
-// ─── 9.10: the deep-link half that is testable without the boot routine ───
-
-describe('resolvePublishedDeepLink', () => {
-  const catalogue: PublishedSceneEntry[] = [
-    { file: 'DemoPlanner.glb', urlName: 'DemoPlanner', label: 'Planner Demo', mode: 'planner' },
-  ];
-
-  it('resolves a catalogued name to its file, label and mode', () => {
-    expect(resolvePublishedDeepLink('DemoPlanner', catalogue)).toEqual({
-      file: 'DemoPlanner.glb',
-      label: 'Planner Demo',
-      mode: 'planner',
-      catalogued: true,
-    });
+describe('resolvePublishedAlias — the manifest decides', () => {
+  it('maps an old name onto the document row that carries it', () => {
+    const hit = resolvePublishedAlias('DemoPlanner', DEMO_DOCUMENTS);
+    expect(hit?.id).toBe('doc_demoplanner_gf4m6v');
+    expect(hit?.path).toBe('DemoPlanner.glb');
   });
 
-  it('an unknown name is not catalogued — the caller must probe or fall through', () => {
-    expect(resolvePublishedDeepLink('Nope', catalogue)).toEqual({
-      file: 'Nope.glb',
-      catalogued: false,
-    });
+  it('matches case-insensitively', () => {
+    expect(resolvePublishedAlias('demoplanner', DEMO_DOCUMENTS)?.id)
+      .toBe('doc_demoplanner_gf4m6v');
   });
 
-  it('never resolves to a .scene.json — the JSON deep link is gone', () => {
-    expect(resolvePublishedDeepLink('Anything', []).file).not.toMatch(/\.scene\.json$/i);
+  it('finds a row whose path still sits under scenes/', () => {
+    // A customer deploy that kept its examples in a folder resolves the same.
+    const rows = [doc('doc_x', 'scenes/DemoPlanner.glb')];
+    expect(resolvePublishedAlias('DemoPlanner', rows)?.id).toBe('doc_x');
   });
 
-  it('an empty catalogue still yields a probe candidate', () => {
-    expect(resolvePublishedDeepLink('DemoPlanner', [])).toEqual({
-      file: 'DemoPlanner.glb',
-      catalogued: false,
-    });
+  it('an unknown name is null — the caller falls through to its normal boot', () => {
+    // Replaces `catalogued: false` + a probe candidate. There is nothing to
+    // probe any more: a name the manifest does not carry is not a document.
+    expect(resolvePublishedAlias('Nope', DEMO_DOCUMENTS)).toBeNull();
+  });
+
+  it('an empty document list resolves nothing', () => {
+    expect(resolvePublishedAlias('DemoPlanner', [])).toBeNull();
+  });
+
+  it('an empty or absent name resolves nothing', () => {
+    expect(resolvePublishedAlias('', DEMO_DOCUMENTS)).toBeNull();
+    expect(resolvePublishedAlias(null, DEMO_DOCUMENTS)).toBeNull();
+  });
+
+  it('survives a malformed row instead of throwing on it', () => {
+    const rows = [
+      null, undefined, 'nonsense', doc('doc_ok', 'DemoPlanner.glb'),
+    ] as unknown as RvDocumentEntry[];
+    expect(resolvePublishedAlias('DemoPlanner', rows)?.id).toBe('doc_ok');
+  });
+});
+
+describe('resolvePublishedSceneParam — only a published: value resolves', () => {
+  it('resolves a legacy deep link to its document row', () => {
+    expect(resolvePublishedSceneParam('published:DemoPlanner', DEMO_DOCUMENTS)?.id)
+      .toBe('doc_demoplanner_gf4m6v');
+  });
+
+  it('does NOT resolve a bare name — that is a document id lookup, not this', () => {
+    expect(resolvePublishedSceneParam('DemoPlanner', DEMO_DOCUMENTS)).toBeNull();
+  });
+
+  it('leaves every other ?scene= shape to its own branch', () => {
+    expect(resolvePublishedSceneParam('empty', DEMO_DOCUMENTS)).toBeNull();
+    expect(resolvePublishedSceneParam('builtin:DemoPlanner.glb', DEMO_DOCUMENTS)).toBeNull();
   });
 });

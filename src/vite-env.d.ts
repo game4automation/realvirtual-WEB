@@ -11,6 +11,8 @@ interface ImportMeta {
 
 /** True when the private sibling folder (realvirtual-WebViewer-Private~) is present at build time. */
 declare const __RV_HAS_PRIVATE__: boolean;
+//! True only in the embed library build, which ships no model plugins.
+declare const __RV_EMBED__: boolean;
 
 /** True when building with RV_COMMERCIAL=1 env var. Hides AGPL watermark. */
 declare const __RV_COMMERCIAL__: boolean;

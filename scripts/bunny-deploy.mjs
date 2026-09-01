@@ -51,6 +51,8 @@ import {
   loadProject,
   sanitizeDemoName,
   applyPublicModelAllowlist,
+  publicDemoModelAllowlist,
+  publicDemoManifestMisses,
   assertNoDevArtifacts,
   PUBLIC_MODEL_PREFIX,
   applyPublicScenePruning,
@@ -313,14 +315,38 @@ async function deployPublic(cfg, opts) {
   // GLBs (and their hashed assets/ duplicates) before upload, and rewrite
   // models.json so the selector lists exactly what is shipped.
   const modelPrefix = (process.env.RV_PUBLIC_MODEL_PREFIX || PUBLIC_MODEL_PREFIX).trim() || PUBLIC_MODEL_PREFIX;
-  const allow = applyPublicModelAllowlist(distDir, { prefix: modelPrefix, dryRun: opts.dryRun });
-  log(`${DIM}Public model allowlist (prefix "${modelPrefix}*"): `
+  // ── Who curates: the manifest, unless it is absent or overridden ──────
+  //
+  // Precedence, and the reason for it (plan-726 Phase 3):
+  //
+  //  1. `RV_PUBLIC_MODEL_PREFIX` — an operator saying "this deploy, this once".
+  //     It stays the rollback lever of 5.6, so it has to outrank the file.
+  //  2. `dist/project.json` `documents[]` — the demo's own statement of what it
+  //     contains, and since plan-726 the same file the RUNTIME boots from.
+  //  3. the built-in prefix — for a dist/ that has no manifest at all.
+  //
+  // The bug this removes: `DemoRobotIK.glb` is a demo model, it is listed in
+  // the manifest, and it matches neither built-in prefix — so every public and
+  // `--demo` deploy so far has deleted it.
+  const manifestKeep = process.env.RV_PUBLIC_MODEL_PREFIX
+    ? null
+    : publicDemoModelAllowlist(distDir);
+  if (process.env.RV_PUBLIC_MODEL_PREFIX && publicDemoModelAllowlist(distDir)) {
+    log(`${DIM}RV_PUBLIC_MODEL_PREFIX is set — overriding the project.json document list${RESET}`);
+  }
+  const allow = applyPublicModelAllowlist(distDir, {
+    prefix: modelPrefix,
+    dryRun: opts.dryRun,
+    ...(manifestKeep ? { keep: manifestKeep } : {}),
+  });
+  const curator = manifestKeep ? 'project.json documents[]' : `prefix "${modelPrefix}*"`;
+  log(`${DIM}Public model allowlist (${curator}): `
     + `${allow.kept.length} kept, ${allow.dropped.length} pruned`
     + `${allow.droppedAssets.length ? ` (+${allow.droppedAssets.length} hashed)` : ''}${RESET}`);
   for (const f of allow.kept) log(`  ${GREEN}keep${RESET} models/${f}`);
   for (const f of allow.dropped) log(`  ${RED}prune${RESET} models/${f}`);
   if (allow.kept.length === 0) {
-    log(`  ${RED}⚠ no model matches prefix "${modelPrefix}*" — the public selector will be empty${RESET}`);
+    log(`  ${RED}⚠ no model matches ${curator} — the public selector will be empty${RESET}`);
   }
 
   // Test-scene guard: example scenes named "Test*" are repo/dev-only fixtures —
@@ -331,6 +357,35 @@ async function deployPublic(cfg, opts) {
     log(`${DIM}Public scene pruning (prefix "${scenePrefix}*"): `
       + `${scenes.kept.length} kept, ${scenes.dropped.length} pruned${RESET}`);
     for (const f of scenes.dropped) log(`  ${RED}prune${RESET} scenes/${f}`);
+  }
+
+  // ── The contradiction guard (plan-726 F5) ────────────────────────────
+  //
+  // Runs AFTER both pruning passes, because the question is about the artifact
+  // that is actually going to be uploaded — not about what the build produced.
+  // It covers `models/` and `scenes/` together: the two are pruned by two
+  // unrelated passes (an allowlist and a filename prefix), and a manifest names
+  // documents in both.
+  //
+  // It throws. A missing document is a 404 that only the visitor ever sees:
+  // the manifest boots the demo, so the very first thing a first-time visitor
+  // does is ask for `settings.defaultModel`. Shipping that broken is strictly
+  // worse than not shipping.
+  //
+  // PUBLIC path only, on purpose. A private customer deploy publishes no root
+  // `project.json` at all (its manifest travels through `private-assets/`), so
+  // the same call there would either be vacuous or, worse, start asserting
+  // things about a customer's manifest that this plan never reasoned about.
+  if (!opts.dryRun) {
+    const misses = publicDemoManifestMisses(distDir);
+    if (misses.length > 0) {
+      throw new Error(
+        'The deploy manifest names documents that are not in the build output:\n'
+        + misses.map((p) => `  - ${p}`).join('\n')
+        + '\n\nEither add them to public/, or remove them from public/project.json.'
+        + ' (A case-only mismatch counts: the storage zone is case-sensitive.)',
+      );
+    }
   }
 
   // Sign only the final public artifact set, after all allowlist/pruning

@@ -58,6 +58,13 @@ const KNOWN_FOLDERS = new Set([
   // it and unknown means zone C (`_vendor-merge.mjs`), so the only thing missing
   // was the spelling being recognised here.
   'local',
+  // plan-395: the internal Development project's two extra places. `fixtures/`
+  // holds the synthetic GLBs the test suites load, `scratch/` is the documented
+  // home for experiments (F10) — the folder that exists so `public/models/` does
+  // not become the dumping ground again. Neither is a document section, so
+  // neither appears in `documents[]`; they are working material, and without
+  // these two spellings the validator warns about them on every single run.
+  'fixtures', 'scratch',
 ]);
 
 // The list of secret-bearing filenames lives in scripts/_rv-guards.mjs and

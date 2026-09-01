@@ -32,7 +32,7 @@ import type { RVViewer } from '../src/core/rv-viewer';
 import '../src/core/engine/rv-lamp';
 import '../src/core/engine/rv-push-button3d';
 
-const DEMO_MODEL = '/models/DemoRealvirtualWeb.glb';
+const DEMO_MODEL = '/DemoRealvirtualWeb.glb';
 /**
  * The node from the user's screenshot, at its path in the shipping demo.
  *

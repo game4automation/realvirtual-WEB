@@ -35,7 +35,11 @@ import {
 } from '../../core/editor/rv-asset-material';
 import type { MaterialValue, NodeTransform } from '../../core/editor/rv-asset-ops';
 import type { ActiveAssetContext } from '../../core/editor/active-asset-store';
+// plan-713 F10 — the descend chain rides on the core view seam, not on the
+// private plugin's RvDocumentStack (see `_breadcrumbFields`).
+import { getActiveDocumentView } from '../../core/editor/active-document-view';
 import { libraryDocumentBase } from '../../core/editor/active-asset-store';
+import type { AssetBase } from '../../core/editor/rv-asset-document';
 // Type-only: the module itself is dynamically imported inside the mechanism
 // tools so the asset-editor chunk stays lazy (see the module header).
 import type {
@@ -116,6 +120,33 @@ const DRIVE_DIRECTIONS = ['LinearX', 'LinearY', 'LinearZ', 'RotationX', 'Rotatio
 /** rv_extras of a node ({} when absent). */
 function rvOf(node: Object3D): Record<string, unknown> {
   return (node.userData as Record<string, unknown>)?.['realvirtual'] as Record<string, unknown> ?? {};
+}
+
+/** Refuse authoring writes while an in-place TEST RUN owns the scene.
+ *
+ *  The test session freezes the document history at test start and puts it
+ *  back verbatim on stop (`restoreFromSnapshot` — plan-410 §2.4), so every op
+ *  recorded during the run is DISCARDED with the test scene. An edit accepted
+ *  now would report ok, verify ok against the live (test) scene, and silently
+ *  revert minutes later — the exact silent-loss shape Bug #9 is about.
+ *  `isAutosaveSuspended` is true exactly for the duration of a test run. */
+function testRunGuard(ctx: ActiveAssetContext): { error: string } | null {
+  if (!ctx.doc.isAutosaveSuspended) return null;
+  return {
+    error: 'A test run is active (in-place test session): edits made now are rolled back '
+      + 'together with the test scene when the run stops, so they would be lost silently. '
+      + 'Stop the test run first, then repeat the edit.',
+  };
+}
+
+/** Structural equality for a userData field read-back after a setField op.
+ *  Primitives via Object.is; objects/arrays via JSON round-trip — the values
+ *  compared here both came through JSON, so key order is stable enough. */
+function fieldValuesEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  try { return JSON.stringify(a) === JSON.stringify(b); }
+  catch { return false; }
 }
 
 /** Path of the node whose Kinematic component references `groupName`, or null. */
@@ -240,8 +271,10 @@ export class McpEditorTools {
     }
     if (policy === 'save') {
       const name = saveName?.trim() || ctx.doc.name;
-      if (!name || name === 'Untitled') {
-        return 'Document is Untitled — pass a name to save it, or use ifDirty=discard';
+      // "Untitled" saves like any other name (field decision 2026-08-19);
+      // only a nameless document has nowhere to go.
+      if (!name) {
+        return 'Document has no name — pass one to save it, or use ifDirty=discard';
       }
       const outcome = await mods.save.saveAssetAs(ctx, name);
       if (outcome.kind !== 'saved') {
@@ -291,27 +324,146 @@ export class McpEditorTools {
       opCount: snap.opCount,
       selectionCount: v?.selectionManager.getSnapshot().selectedPaths.length ?? 0,
       nodeCount,
+      // plan-713 F10 — the descend chain, from the ONE core seam both writers
+      // publish into. A depth of 1 is the root document, not "no stack".
+      ...this._breadcrumbFields(),
     });
+  }
+
+  /**
+   * The breadcrumb of the open document, as status fields.
+   *
+   * `RvDocumentStack.breadcrumb()` is what produces these, but the stack lives
+   * in the private editor plugin; the published `ActiveDocumentView` is the core
+   * seam it writes them into, and reading them there is what lets the status
+   * work in a build without that plugin. Never throws — a status that fails
+   * because a breadcrumb could not be read is worse than one without it.
+   */
+  private _breadcrumbFields(): {
+    depth?: number;
+    breadcrumb?: Array<{ index: number; label: string; occurrence: string; current: boolean; dirty: boolean; stale: boolean }>;
+  } {
+    try {
+      const crumbs = getActiveDocumentView()?.crumbs ?? [];
+      if (crumbs.length === 0) return {};
+      return {
+        depth: crumbs.length,
+        breadcrumb: crumbs.map(c => ({
+          index: c.index, label: c.label, occurrence: c.occurrence,
+          current: c.current, dirty: c.dirty, stale: c.stale,
+        })),
+      };
+    } catch { return {}; }
+  }
+
+  @McpTool('Descend INTO a referenced asset at path — opens that asset as its own document one level deeper, exactly like double-clicking the reference in the hierarchy. Editor mode only. The path must be a descendable reference; anything else is refused with the reason. Leave again with web_editor_back; the chain is in web_editor_status as depth + breadcrumb.', { readOnly: false, timeoutMs: 120_000 })
+  async webEditorDescend(
+    @McpParam('path', 'Node path of the referenced asset to enter') path: string,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const target = (path ?? '').trim();
+    if (!target) return JSON.stringify({ error: 'path is required.' });
+    const node = ctx.viewer.registry?.getNode(target);
+    if (!node) return JSON.stringify({ error: `Node not found: ${target}` });
+
+    const { canDescendInto, requestDescend } = await import('../../core/editor/rv-descend-request');
+    // `canDescend` FIRST so the refusal names the cause. `requestDescend`
+    // returning false is the same verdict with no explanation attached, and an
+    // agent that reads "nothing happened" retries the identical call.
+    if (!canDescendInto(target)) {
+      return JSON.stringify({
+        error: `"${target}" cannot be descended into — it is not a resolved asset reference. `
+          + 'Referenced assets appear in web_node_tree with a reference component; '
+          + 'a placeholder that has not resolved yet cannot be entered.',
+      });
+    }
+    const before = getActiveDocumentView()?.crumbs.length ?? 0;
+    if (!requestDescend(target)) {
+      return JSON.stringify({ error: `Descend into "${target}" was refused.` });
+    }
+    // The handler is fire-and-forget by design (it drives UI), so the depth
+    // change is what tells us it landed.
+    const after = await this._awaitDepth((d) => d > before, before);
+    if (after === null) {
+      return JSON.stringify({ error: `Descend into "${target}" did not complete in time.` });
+    }
+    return JSON.stringify({ descended: true, path: target, ...this._breadcrumbFields() });
+  }
+
+  @McpTool('Leave the current descend level and return to the document above it (the inverse of web_editor_descend). Refuses at the root, where there is nothing to go back to — close the document with web_editor_close instead.', { readOnly: false, timeoutMs: 120_000 })
+  async webEditorBack(): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const view = getActiveDocumentView();
+    const crumbs = view?.crumbs ?? [];
+    if (crumbs.length <= 1) {
+      return JSON.stringify({
+        error: 'Already at the root document — nothing to go back to. '
+          + 'Use web_editor_close to leave the editor.',
+      });
+    }
+    const parent = crumbs[crumbs.length - 2]!;
+    if (!view?.actions?.onCrumb) {
+      return JSON.stringify({ error: 'This document has no navigable stack.' });
+    }
+    const before = crumbs.length;
+    await view.actions.onCrumb(parent);
+    const after = await this._awaitDepth((d) => d < before, before);
+    if (after === null) return JSON.stringify({ error: 'Back did not complete in time.' });
+    return JSON.stringify({ back: true, to: parent.label, ...this._breadcrumbFields() });
+  }
+
+  /** Poll the published breadcrumb depth until `done`, or give up. Returns the depth. */
+  private async _awaitDepth(
+    done: (depth: number) => boolean, initial: number, timeoutMs = 110_000,
+  ): Promise<number | null> {
+    const t0 = Date.now();
+    for (;;) {
+      const depth = getActiveDocumentView()?.crumbs.length ?? initial;
+      if (done(depth)) return depth;
+      if (Date.now() - t0 > timeoutMs) return null;
+      await sleep(120);
+    }
   }
 
   // ═══ Lifecycle ════════════════════════════════════════════════════════
 
-  @McpTool('Open the ASSET EDITOR with a document: source=empty (fresh Untitled asset) or source=library with relPath (e.g. "Custom/MyAsset.glb", relative to <workfolder>/library/). When the editor is already open with unsaved changes, ifDirty decides: fail (default) | save (needs a saved name) | discard. Editing happens through the web_editor_* tools; finish with web_editor_save.', { readOnly: false, timeoutMs: 120_000 })
+  @McpTool('Open the ASSET EDITOR with a document: source=new (creates a NEW document in the open project and opens it) or source=library with relPath (e.g. "Custom/MyAsset.glb", relative to <workfolder>/library/). source=empty is a deprecated alias of source=new. When the editor is already open with unsaved changes, ifDirty decides: fail (default) | save (needs a saved name) | discard. Editing happens through the web_editor_* tools; finish with web_editor_save.', { readOnly: false, timeoutMs: 120_000 })
   async webEditorOpen(
-    @McpParam('source', 'empty | library.') source: string,
+    @McpParam('source', 'new | library. ("empty" is a deprecated alias of "new".)') source: string,
     @McpParam('relPath', 'Library-relative GLB path (source=library), e.g. "Custom/MyAsset.glb".', 'string', false) relPath: string,
     @McpParam('ifDirty', 'fail | save | discard — what to do with unsaved changes (default fail).', 'string', false) ifDirty: string,
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
-    const src = (source || '').toLowerCase();
-    if (src !== 'empty' && src !== 'library') {
-      return JSON.stringify({ error: 'source must be "empty" or "library"' });
+    const raw = (source || '').toLowerCase();
+    // plan-719 F10: `empty` named a base kind that no longer exists. It stays
+    // as an alias for ONE release because it is in recipes and transcripts,
+    // and it performs the new behaviour rather than the old one — there is no
+    // old behaviour left to perform.
+    const src = raw === 'empty' ? 'new' : raw;
+    if (src !== 'new' && src !== 'library') {
+      return JSON.stringify({ error: 'source must be "new" or "library"' });
     }
     if (src === 'library' && !relPath?.trim()) {
       return JSON.stringify({ error: 'source=library needs relPath (e.g. "Custom/MyAsset.glb")' });
     }
     const mods = await this._load();
+
+    // A new document is CREATED before the mode switch, not conjured by it
+    // (plan-719 F3): bytes and manifest row first, then the editor opens the
+    // real thing. That is also why this can fail with a sentence — a read-only
+    // project cannot take a new document, and saying so beats an editor that
+    // opens onto a stage nothing can be saved from.
+    let pending;
+    if (src === 'new') {
+      const created = await this._createProjectDocument();
+      if (typeof created === 'string') return JSON.stringify({ error: created });
+      pending = created;
+    } else {
+      pending = libraryDocumentBase(relPath.trim());
+    }
 
     let prevDocId: string | undefined;
     if (v.modes.activeMode === 'editor') {
@@ -325,17 +477,48 @@ export class McpEditorTools {
       v.modes.setMode(fallbackMode(v));
     }
 
-    mods.pending.setPendingAssetOpen(
-      src === 'empty'
-        ? { kind: 'empty' }
-        : libraryDocumentBase(relPath.trim()),
-    );
+    mods.pending.setPendingAssetOpen(pending);
     v.modes.setMode('editor');
     const ctx = await this._awaitEditorContext(prevDocId);
     if (!ctx) return JSON.stringify({ error: 'Editor did not activate (model load failed or timed out)' });
     const status = JSON.parse(await this._statusJson()) as Record<string, unknown>;
     status.next = 'Perceive first (web_node_tree, web_camera_focus, web_node_bounds); workflow guide: web_help("editor")';
     return JSON.stringify(status);
+  }
+
+  /**
+   * Create a document in the open project and answer its identity.
+   *
+   * The same `createDocument` the dashboard's New button and the editor's own
+   * "nothing to open" branch use — one creation mechanism, so an agent's new
+   * document is indistinguishable from a human's. Answers a STRING when it
+   * cannot: a read-only or absent project is an operator-fixable condition and
+   * deserves the sentence, not a stack trace.
+   */
+  private async _createProjectDocument(): Promise<AssetBase | string> {
+    try {
+      const [{ getProjectStore }, { createDocument }, docs] = await Promise.all([
+        import('../../core/project/project-store'),
+        import('../../core/project/rv-document-ops'),
+        import('../../core/hmi/projects/dashboard-documents'),
+      ]);
+      const store = getProjectStore();
+      if (!store.getBackend()?.writable) {
+        return 'No writable project is open — open or create one before making a document.';
+      }
+      const folder = docs.newDocumentFolderFor(store.getProject()?.id, null);
+      const target = await createDocument(store, docs.newDocumentNameFor(folder), { folder });
+      await store.rescanDocuments?.();
+      await store.flush?.();
+      return {
+        kind: 'document',
+        documentId: target.documentId,
+        path: target.relPath,
+        name: target.name,
+      };
+    } catch (e) {
+      return `The document could not be created: ${e instanceof Error ? e.message : String(e)}`;
+    }
   }
 
   @McpTool('Close the asset editor and return to the previous workspace. ifDirty: fail (default) | save (optionally pass name) | discard.', { readOnly: false })
@@ -393,6 +576,84 @@ export class McpEditorTools {
     });
   }
 
+  @McpTool('List the files the OPEN PROJECT owns, project-relative (path, name, sizeBytes, modified, section, documentId). Narrow with dir (folder prefix, e.g. "library/Custom") and glob ("*" and "?", matched over the whole path, e.g. "*.glb"). With no project open it answers with the same projectOpen:false shape as web_editor_project_info. Oversized listings are truncated and say by how much.', { readOnly: true, timeoutMs: 60_000 })
+  async webEditorProjectFiles(
+    @McpParam('dir', 'Project-relative folder prefix, e.g. "library/Custom"', 'string', false) dir?: string,
+    @McpParam('glob', 'Glob over the whole path, "*" and "?" only, e.g. "*.glb"', 'string', false) glob?: string,
+  ): Promise<string> {
+    const [{ getProjectStore }, listing, observe] = await Promise.all([
+      import('../../core/project/project-store'),
+      import('./rv-mcp-asset-listing'),
+      import('./rv-mcp-observe-tools'),
+    ]);
+    const store = getProjectStore();
+    const backend = store.getBackend();
+    const project = store.getProject();
+    // F4: the SAME refusal shape as `web_editor_project_info`, deliberately —
+    // an agent that learnt to branch on `projectOpen` for one of them must not
+    // have to learn a second shape for the other.
+    if (!backend || project === null) {
+      return JSON.stringify({
+        projectOpen: false, projectName: null, projectKind: backend?.kind ?? null,
+        writable: false, files: [], count: 0,
+        hint: 'No project is open — open one with web_project_open.',
+      });
+    }
+
+    // The backend has no generic directory walk, and inventing one here would be
+    // a filesystem surface on an interface that deliberately has none (see the
+    // header of project-backend.ts). The union of what it DOES list is the
+    // honest answer, and `statDocuments()` supplies the size/mtime the rows lack.
+    const [documents, models, library, stats] = await Promise.all([
+      backend.listDocuments().catch(() => []),
+      backend.listModels().catch(() => []),
+      backend.listLibrary().catch(() => []),
+      backend.statDocuments().catch(() => []),
+    ]);
+    const statByPath = new Map(stats.map(s => [s.path, s]));
+
+    interface FileRow {
+      path: string; name: string; sizeBytes: number | null;
+      modified: string | null; section: string | null; documentId: string | null;
+    }
+    const byPath = new Map<string, FileRow>();
+    const put = (path: string, name: string, section: string | null,
+                 documentId: string | null, sizeBytes: number | null,
+                 modified: string | null): void => {
+      if (!path || byPath.has(path)) return;
+      const stat = statByPath.get(path);
+      byPath.set(path, {
+        path, name,
+        sizeBytes: sizeBytes ?? stat?.size ?? null,
+        modified: modified ?? (stat?.mtime ? new Date(stat.mtime).toISOString() : null),
+        section, documentId,
+      });
+    };
+    for (const d of documents) {
+      put(d.path, d.name, d.section ?? null, d.id, d.sizeBytes ?? null, d.modifiedAt ?? null);
+    }
+    const fileStem = (p: string): string => (p.split('/').pop() ?? p).replace(/\.glb$/i, '');
+    for (const m of models) put(m.path, m.label || fileStem(m.path), 'models', m.id ?? null, m.sizeBytes ?? null, null);
+    for (const l of library) put(l.path, l.label || fileStem(l.path), 'library', l.id ?? null, l.sizeBytes ?? null, null);
+    for (const s of stats) put(s.path, fileStem(s.path), null, null, s.size, s.mtime ? new Date(s.mtime).toISOString() : null);
+
+    const rows = [...byPath.values()]
+      .filter(r => listing.inDirectory(r.path, dir) && listing.matchesGlob(r.path, glob))
+      .sort((a, b) => a.path.localeCompare(b.path));
+
+    const capped = listing.capRows(rows, observe.QUERY_RESULT_CAP,
+      'Narrow with dir= or glob=.');
+    return JSON.stringify({
+      projectOpen: true,
+      projectName: project.name ?? null,
+      projectKind: backend.kind,
+      writable: backend.writable === true,
+      count: rows.length,
+      files: capped.rows,
+      ...(capped.note ? { truncated: capped.note } : {}),
+    });
+  }
+
   @McpTool('Undo the last N editor operations (default 1).', { readOnly: false })
   async webEditorUndo(
     @McpParam('count', 'Number of undo steps (default 1).', 'integer', false) count: number,
@@ -419,27 +680,76 @@ export class McpEditorTools {
     return JSON.stringify({ redone: done, canUndo: snap.canUndo, canRedo: snap.canRedo });
   }
 
-  @McpTool('Save the asset as GLB into <workfolder>/library/Custom/. name is required for an Untitled document; the same name overwrites the existing file. Needs a configured work folder (File System Access).', { readOnly: false, timeoutMs: 60_000 })
+  @McpTool('Save the asset as GLB into <workfolder>/library/Custom/. The document saves under its current name whatever it is (an "Untitled" name is a name like any other); the same name overwrites the existing file. Needs a configured work folder (File System Access). Reports saveVerb — save (in place), save-into-project (this write COPIES the document into the project and changes its identity) or blocked with a reason.', { readOnly: false, timeoutMs: 60_000 })
   async webEditorSave(
     @McpParam('name', 'Asset name (default: current document name).', 'string', false) name: string,
   ): Promise<string> {
     const ctx = this._ctx();
     if (isGuardError(ctx)) return JSON.stringify(ctx);
     const finalName = name?.trim() || ctx.doc.name;
-    if (!finalName || finalName === 'Untitled') {
-      return JSON.stringify({ error: 'Document is Untitled — pass a name' });
+    // Only a document with NO name at all is refused. "Untitled" is a name
+    // like any other (field decision 2026-08-19) — the former guard here made
+    // every fresh document unsavable by MCP until renamed, a name-based
+    // special case the save semantics no longer have anywhere.
+    if (!finalName) {
+      return JSON.stringify({ error: 'Document has no name — pass one' });
     }
+    // F6 — the verb the SAVE CARD shows, reported by the tool that performs the
+    // same save. Taken before the write, because that is when it describes what
+    // is about to happen: after a `save-into-project` the document's identity is
+    // already the new one and the same call would answer `save`.
+    const decision = await this._saveVerb('asset', finalName);
     const mods = await this._load();
     const outcome = await mods.save.saveAssetAs(ctx, finalName);
     if (outcome.kind === 'saved') {
       return JSON.stringify({
-        saved: true, fileName: outcome.fileName, relPath: outcome.relPath,
+        saved: true, fileName: outcome.fileName, relPath: outcome.projectRelPath,
+        ...decision,
         next: 'web_editor_close to leave; reload the asset live to jog real drives as a smoke test',
       });
     }
+    // The outcome's OWN sentence, from the one place they are worded
+    // (plan-719 F4/F5). This used to print `Save unavailable: blocked` for
+    // everything that was not an error — the tool telling an agent the name of
+    // a branch instead of the reason the save could not happen, while the very
+    // same outcome was carrying that reason.
     return JSON.stringify({
-      error: outcome.kind === 'error' ? outcome.message : `Save unavailable: ${outcome.kind}`,
+      error: mods.save.describeSaveFailure(outcome),
+      outcome: outcome.kind,
+      ...decision,
     });
+  }
+
+  /**
+   * The save verb for the current document, as `{ saveVerb, saveReason?, copies? }`.
+   *
+   * One helper for both lineages because `decideSaveVerb` is one function since
+   * plan-710 — the whole point of F6 is that the MCP result cannot say something
+   * different from the card, and two call sites shaping the same decision
+   * differently is exactly how that would happen. Never throws: a verb is a
+   * label on a save, and a save must not fail because its label could not be
+   * computed.
+   */
+  private async _saveVerb(
+    lineage: 'asset', name: string,
+  ): Promise<{ saveVerb?: string; saveReason?: string; copies?: boolean }> {
+    try {
+      const ctx = this._ctx();
+      if (isGuardError(ctx)) return {};
+      const [{ getProjectStore }, { decideSaveVerb }] = await Promise.all([
+        import('../../core/project/project-store'),
+        import('../../core/editor/rv-save-document'),
+      ]);
+      const d = decideSaveVerb(
+        { lineage, base: ctx.doc.getSnapshot().base, name },
+        getProjectStore().getBackend(),
+      );
+      return {
+        saveVerb: d.verb,
+        ...(d.reason ? { saveReason: d.reason } : {}),
+        ...(d.copies ? { copies: true } : {}),
+      };
+    } catch { return {}; }
   }
 
   // ═══ Transform / pivot ════════════════════════════════════════════════
@@ -706,6 +1016,8 @@ export class McpEditorTools {
   ): Promise<string> {
     const ctx = this._ctx();
     if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const testRun = testRunGuard(ctx);
+    if (testRun) return JSON.stringify(testRun);
     if (!ctx.viewer.registry?.getNode(path)) return JSON.stringify({ error: `Node not found: ${path}` });
     const authorable = getTypesWithCapability('authorable');
     if (authorable.length > 0 && !authorable.includes(type)) {
@@ -735,6 +1047,8 @@ export class McpEditorTools {
   ): Promise<string> {
     const ctx = this._ctx();
     if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const testRun = testRunGuard(ctx);
+    if (testRun) return JSON.stringify(testRun);
     const node = ctx.viewer.registry?.getNode(path);
     if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
     if (!(componentType in rvOf(node))) {
@@ -745,7 +1059,7 @@ export class McpEditorTools {
     return JSON.stringify({ ok: true, path, removed: componentType });
   }
 
-  @McpTool('Set one field of a component on a node (undoable, live in the panels). valueJson is parsed as JSON (numbers/booleans/strings/objects; bare strings work too).', { readOnly: false })
+  @McpTool('Set one field of a component on a node (undoable, live in the panels). valueJson is parsed as JSON (numbers/booleans/strings/objects; bare strings work too). VERIFIED: ok is returned only after the value has been read back from the live scene — a dropped or refused op returns an error instead.', { readOnly: false })
   async webEditorSetField(
     @McpParam('path', 'Node path.') path: string,
     @McpParam('componentType', 'Concrete component key (e.g. Drive).') componentType: string,
@@ -760,13 +1074,52 @@ export class McpEditorTools {
     if (!comp || typeof comp !== 'object') {
       return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
     }
+    const testRun = testRunGuard(ctx);
+    if (testRun) return JSON.stringify(testRun);
     let value: unknown;
     try { value = JSON.parse(valueJson); }
     catch { value = valueJson; } // bare string
     const prev = comp[fieldName];
-    ctx.doc.setField(path, componentType, fieldName, value, prev);
-    await ctx.doc.whenIdle();
-    return JSON.stringify({ ok: true, path, componentType, fieldName, value, prev: prev ?? null });
+    // AWAITED, not detached: the detached path swallows an executor refusal
+    // outside a transaction, and this tool used to answer "ok" for an op that
+    // never landed (Bug #9 — fields silently reverting in the saved GLB).
+    try {
+      await ctx.doc.setFieldAwaited(path, componentType, fieldName, value, prev);
+    } catch (e) {
+      return JSON.stringify({
+        error: `setField failed: ${e instanceof Error ? e.message : String(e)}`,
+        path, componentType, fieldName,
+      });
+    }
+    // Read-back verification. A resolve alone is not proof: an op queued during
+    // a base swap is dropped inside the queue without an error, and a scene
+    // swap (editor re-activation, test-session restore) can replace the node
+    // between guard and write. What the export will serialize is the node's
+    // userData — so that is what "landed" means.
+    const nodeAfter = ctx.viewer.registry?.getNode(path);
+    const stored = nodeAfter
+      ? (rvOf(nodeAfter)[componentType] as Record<string, unknown> | undefined)?.[fieldName]
+      : undefined;
+    if (!fieldValuesEqual(stored, value)) {
+      return JSON.stringify({
+        error: `setField did not land: "${componentType}.${fieldName}" on ${path} still holds `
+          + `${JSON.stringify(stored ?? null)} after the op. The op was dropped or the scene changed `
+          + 'underneath (base swap, editor re-activation, test-session restore) — '
+          + 'check web_editor_status and retry.',
+        path, componentType, fieldName, value, stored: stored ?? null,
+      });
+    }
+    // Live-instance value for the agent (saves the manual web_component_get):
+    // may legitimately differ from `value` for componentRef fields, which the
+    // instance holds in RESOLVED form.
+    const instance = ctx.viewer.registry?.getByPath(componentType, path) as Record<string, unknown> | null;
+    const liveRaw = instance && fieldName in instance ? instance[fieldName] : undefined;
+    const live = (liveRaw === null || ['number', 'string', 'boolean'].includes(typeof liveRaw))
+      ? liveRaw : undefined;
+    return JSON.stringify({
+      ok: true, path, componentType, fieldName, value, prev: prev ?? null,
+      ...(live !== undefined ? { live } : {}),
+    });
   }
 
   // ── Rigid-body mechanisms (plan-404) ──────────────────────────────────

@@ -42,6 +42,21 @@ export interface ViewerEvents {
    *  load-time `LoadTrustContext`, which is restored the moment a load returns
    *  and is therefore never a valid source for anything the user sees. */
   'model-provenance-changed': { provenance: ModelProvenance };
+  /**
+   * A document's bytes reached the project (plan-719 F8).
+   *
+   * Fired after EVERY successful document write, whatever the path, and that
+   * "whatever the path" is the fix rather than a detail: the planner's decoded
+   * model cache used to be dropped by the save flow reaching into the planner
+   * and matching the saved path against its catalog, which only ever matched
+   * `library/**` — so a document under `models/` was placed from stale bytes
+   * after being saved. Subscribers invalidate what they hold for
+   * `documentId`/`relPath` and stay path-agnostic by construction.
+   *
+   * `relPath` is the project-relative path just written. It is the empty
+   * string for a slot-addressed document, which has no path of its own.
+   */
+  'document-saved': { documentId: string; relPath: string };
   'model-cleared': void;
   /** Fired when the asynchronous BVH build for the current model has completed
    *  (plan-240): all merged raycast geometries and per-mesh geometries now

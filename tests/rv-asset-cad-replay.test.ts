@@ -19,6 +19,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D, Mesh, BoxGeometry, MeshStandardMaterial } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -27,6 +28,7 @@ import { registerCadProvider } from '../src/core/editor/rv-cad-provider';
 import { objectToGlb } from '../src/core/import/rv-import-object';
 import { clearCadGlbCache, getCadGlb, putCadGlb } from '../src/core/import/rv-cad-glb-cache';
 import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
+import { loadDocumentDraft } from '../src/core/ops/rv-document-drafts';
 import type { CADLinkExtras } from '../src/core/editor/rv-asset-ops';
 
 function makeMockViewer() {
@@ -100,7 +102,7 @@ afterEach(() => registerCadProvider('step', null));
 describe('importCad → draft replay', () => {
   it('caches the GLB under (Sha256, Quality) before recording the op', async () => {
     const { viewer } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     await doc.importCad({ glb, cadlink: CADLINK });
     await doc.whenIdle();
@@ -111,7 +113,7 @@ describe('importCad → draft replay', () => {
 
   it('replays in a PUBLIC build (no CAD provider) and rebuilds the same tree', async () => {
     const first = makeMockViewer();
-    const doc = AssetDocument.newUntitled(first.viewer);
+    const doc = scratchAssetDocument(first.viewer);
     const rootPath = await doc.importCad({ glb, cadlink: CADLINK });
     await doc.whenIdle();
 
@@ -123,7 +125,7 @@ describe('importCad → draft replay', () => {
     // Fresh session: new viewer, new document, ONLY the op log — and crucially
     // no CadGeometryProvider at all. Geometry must still come back.
     const second = makeMockViewer();
-    const restored = new AssetDocument(second.viewer, { id: 'a', name: 'A', base: { kind: 'empty' } });
+    const restored = new AssetDocument(second.viewer, { id: 'a', name: 'A', base: { kind: 'document', documentId: 'doc_scratch', path: 'scratch.glb', name: 'Scratch' } });
     await restored.replayOps(ops);
     await restored.whenIdle();
 
@@ -135,7 +137,7 @@ describe('importCad → draft replay', () => {
 
   it('falls back to provider.retessellate when the GLB cache was evicted', async () => {
     const { viewer, model } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const rootPath = await doc.importCad({ glb, cadlink: CADLINK });
     await doc.whenIdle();
     const ops = doc.toDraft().ops;
@@ -150,7 +152,7 @@ describe('importCad → draft replay', () => {
     registerCadProvider('step', { importFile: async () => ({ glb, cadlink: CADLINK }), retessellate });
 
     const second = makeMockViewer();
-    const restored = new AssetDocument(second.viewer, { id: 'b', name: 'B', base: { kind: 'empty' } });
+    const restored = new AssetDocument(second.viewer, { id: 'b', name: 'B', base: { kind: 'document', documentId: 'doc_scratch', path: 'scratch.glb', name: 'Scratch' } });
     await restored.replayOps(ops);
     await restored.whenIdle();
 
@@ -165,7 +167,7 @@ describe('importCad → draft replay', () => {
 
   it('is deterministic: replay reproduces the ORIGINAL import tree exactly', async () => {
     const first = makeMockViewer();
-    const doc = AssetDocument.newUntitled(first.viewer);
+    const doc = scratchAssetDocument(first.viewer);
     const rootPath = await doc.importCad({ glb, cadlink: CADLINK });
     await doc.whenIdle();
     const before = subtreeNames(first.model, rootPath);
@@ -173,7 +175,7 @@ describe('importCad → draft replay', () => {
     doc.dispose();
 
     const second = makeMockViewer();
-    const restored = new AssetDocument(second.viewer, { id: 'd', name: 'D', base: { kind: 'empty' } });
+    const restored = new AssetDocument(second.viewer, { id: 'd', name: 'D', base: { kind: 'document', documentId: 'doc_scratch', path: 'scratch.glb', name: 'Scratch' } });
     await restored.replayOps(ops);
     await restored.whenIdle();
 
@@ -184,7 +186,7 @@ describe('importCad → draft replay', () => {
 
   it('surfaces unrecoverable geometry instead of silently dropping it', async () => {
     const { viewer } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     await doc.importCad({ glb, cadlink: CADLINK });
     await doc.whenIdle();
     const ops = doc.toDraft().ops;
@@ -193,7 +195,7 @@ describe('importCad → draft replay', () => {
     await clearCadGlbCache();
     // Public build: no provider, so no retessellate fallback either.
     const second = makeMockViewer();
-    const restored = new AssetDocument(second.viewer, { id: 'c', name: 'C', base: { kind: 'empty' } });
+    const restored = new AssetDocument(second.viewer, { id: 'c', name: 'C', base: { kind: 'document', documentId: 'doc_scratch', path: 'scratch.glb', name: 'Scratch' } });
     await restored.replayOps(ops);
     await restored.whenIdle();
 
@@ -205,9 +207,97 @@ describe('importCad → draft replay', () => {
     restored.dispose();
   });
 
+  // ─── plan-442 §9.3 / F5: what a DOUBLE replay does ──────────────────────
+  //
+  // The duplicate-scene bug had two overlapping editor activations replaying
+  // the same draft into one session. The SCENE half of that is fixed in the
+  // load path (tests/load-model-race.test.ts). These two measure the DOCUMENT
+  // half, so the fix cannot quietly move the duplication one layer down — and
+  // they measure it rather than assume it: the plan made this a verification
+  // step with a fixed oracle precisely because the answer was not known.
+
+  it('two documents replaying one draft leave the persisted draft unchanged (F5 oracle)', async () => {
+    // The shape plan-442 actually produces: each activation builds its OWN
+    // AssetDocument from the same draft, and both address the same frame key.
+    // The oracle is the plan's: op COUNT and op IDS unchanged.
+    const BASE = {
+      kind: 'document' as const,
+      documentId: 'doc_f5',
+      path: 'f5.glb',
+      name: 'F5',
+    };
+    const origin = makeMockViewer();
+    const doc = new AssetDocument(origin.viewer, { id: 'f5_origin', name: 'F5', base: BASE });
+    await doc.importCad({ glb, cadlink: CADLINK });
+    await doc.whenIdle();
+    const ops = doc.toDraft().ops;
+    await doc.flushDraft();
+    const before = await loadDocumentDraft(doc.draftFrame);
+    doc.dispose();
+
+    const runA = makeMockViewer();
+    const a = new AssetDocument(runA.viewer, { id: 'f5_a', name: 'F5', base: BASE });
+    await a.replayOps(ops);
+    await a.whenIdle();
+    await a.flushDraft();
+
+    const runB = makeMockViewer();
+    const b = new AssetDocument(runB.viewer, { id: 'f5_b', name: 'F5', base: BASE });
+    await b.replayOps(ops);
+    await b.whenIdle();
+    await b.flushDraft();
+
+    const after = await loadDocumentDraft(b.draftFrame);
+    expect(after?.ops.length).toBe(before?.ops.length);
+    expect(after?.ops.map((o) => o.id)).toEqual(before?.ops.map((o) => o.id));
+    expect(after?.ops.length).toBe(ops.length);
+    a.dispose();
+    b.dispose();
+  });
+
+  it('KNOWN GAP: replaying one op log twice into the SAME document appends it twice', async () => {
+    // Measured, not desired. This is NOT the activation race — that one builds
+    // a second document (test above) — but it is a real second way to double a
+    // document, and the plan is explicit that a positive finding here becomes
+    // its own follow-up plan rather than a fix smuggled into 442.
+    //
+    // The test asserts the CURRENT behaviour so the follow-up has a starting
+    // point and this file fails loudly when someone changes it: if you are here
+    // because this test broke, the fix landed — flip the expectations.
+    const { viewer } = makeMockViewer();
+    const doc = scratchAssetDocument(viewer);
+    const rootPath = await doc.importCad({ glb, cadlink: CADLINK });
+    await doc.whenIdle();
+    const ops = doc.toDraft().ops;
+    doc.dispose();
+
+    const second = makeMockViewer();
+    const restored = new AssetDocument(second.viewer, {
+      id: 'dbl', name: 'Dbl',
+      base: { kind: 'document', documentId: 'doc_dbl', path: 'dbl.glb', name: 'Dbl' },
+    });
+    await restored.replayOps(ops);
+    await restored.whenIdle();
+    await restored.flushDraft();
+    const afterOne = await loadDocumentDraft(restored.draftFrame);
+
+    await restored.replayOps(ops);
+    await restored.whenIdle();
+    await restored.flushDraft();
+    const afterTwo = await loadDocumentDraft(restored.draftFrame);
+
+    // The tree gains a second copy of the imported subtree …
+    expect(second.model.children.filter((c) => c.name === leaf(rootPath))).toHaveLength(2);
+    // … and the persisted draft gains a second copy of the op log, which the
+    // next crash recovery would replay as-is.
+    expect(afterOne?.ops.length).toBe(ops.length);
+    expect(afterTwo?.ops.length).toBe(ops.length * 2);
+    restored.dispose();
+  });
+
   it('undo parks the subtree; redo re-attaches it without touching the cache', async () => {
     const { viewer, model } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const rootPath = await doc.importCad({ glb, cadlink: CADLINK });
     await doc.whenIdle();
     expect(isAttached(model, rootPath)).toBe(true);

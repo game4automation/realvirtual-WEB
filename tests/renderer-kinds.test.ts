@@ -27,6 +27,15 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createTestViewer, type TestViewerHandle } from './helpers/create-test-viewer';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.europalletEmpty);
 
 const SMOKE_GLB_URL = DEV_GLB.europalletEmpty;
 const VIEWER_TEST_TIMEOUT = 60_000;
@@ -51,7 +60,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('renderer kinds (plan-271 phase 1)', () => {
+describe.skipIf(!DEV_ASSETS)('renderer kinds (plan-271 phase 1)', () => {
   it('webgl: classic WebGLRenderer — isWebGPU=false, hasCompute=false', async () => {
     handle = await createTestViewer('webgl');
     const { viewer } = handle;

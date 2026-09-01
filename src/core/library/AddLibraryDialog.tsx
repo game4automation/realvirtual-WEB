@@ -19,12 +19,18 @@
  * escape-hatch shape the planner extension already uses, minus the React
  * component hand-off.
  *
- * ## Origin is always `'user'` here
+ * ## Where an added library LANDS is the caller's choice
  *
- * Everything added through this dialog was typed by a human, which is the one
- * origin §2.6.3 persists globally. Config, URL-param and project-manifest
- * subscriptions arrive through other paths and must not be recorded as if the
- * user had asked for them.
+ * By default the dialog subscribes globally with origin `'user'` — everything
+ * typed here was typed by a human, which is the one origin §2.6.3 persists
+ * globally. Config and URL-param subscriptions arrive through other paths and
+ * must not be recorded as if the user had asked for them.
+ *
+ * The Projects dashboard passes `onAttach` and lands the library in the OPEN
+ * PROJECT instead: into `project.json.libraries[]`, so it travels with the
+ * project to whoever opens it next rather than living in one browser's
+ * localStorage. Nothing about the dialog changes but the destination, which is
+ * why this is one prop and not a second component.
  */
 
 import { useCallback, useState } from 'react';
@@ -58,6 +64,17 @@ export interface AddLibraryDialogProps {
   /** Called with the new library's URL/id once it has been added. */
   onAdded?: (idOrUrl: string) => void;
   /**
+   * Where a typed URL is attached, when it is NOT the global subscription list.
+   *
+   * The Projects dashboard attaches to the open project instead: the URL goes
+   * into `project.json.libraries[]` and travels with the project. Return an
+   * error message to show (the dialog stays open), or `null` on success.
+   * Without this prop the dialog subscribes globally, as before.
+   */
+  onAttach?: (url: string) => Promise<string | null>;
+  /** Caption under the tabs — says where an added library will land. */
+  attachHint?: string;
+  /**
    * Supplied only when the private Asset-Manager extension is present. Its
    * absence hides the tab — a public build offers no route it cannot honour.
    */
@@ -78,6 +95,8 @@ export function AddLibraryDialog({
   open,
   onClose,
   onAdded,
+  onAttach,
+  attachHint,
   onConnectAssetManager,
 }: AddLibraryDialogProps) {
   const store = getLibraryStore();
@@ -117,17 +136,41 @@ export function AddLibraryDialog({
     if (!value) return;
     setBusy(true);
     setError(null);
+    // Whether the subscription already existed decides whether a failure may
+    // roll it back below: re-adding a catalog that is already attached must not
+    // detach it just because this attempt could not reach the network.
+    const wasAttached = store.catalogUrls.includes(value);
     try {
+      if (onAttach) {
+        const failure = await onAttach(value);
+        if (failure) { setError(failure); return; }
+        finish(value);
+        return;
+      }
       await store.addCatalog(value, 'user');
+      // `addCatalog` RESOLVES on a failed fetch — the store records the reason
+      // in `catalogErrors` rather than throwing, so that one unreachable
+      // catalog cannot abort a boot restore looping over many. The catch below
+      // therefore never fires for the cases a user actually hits (a 404, a
+      // rate-limited GitHub API, a repo without .glb files) and the dialog
+      // closed as if the add had worked. Read the recorded reason instead.
+      const failure = store.catalogErrors.get(value);
+      if (failure) {
+        // Surfaced, never swallowed: a library that silently fails to appear is
+        // indistinguishable from one the user mistyped.
+        setError(failure);
+        // Leave no phantom root behind: a subscription that never loaded shows
+        // in the tree as an empty library with nothing saying why.
+        if (!wasAttached) store.removeCatalog(value);
+        return;
+      }
       finish(value);
     } catch (e) {
-      // Surfaced, never swallowed: a library that silently fails to appear is
-      // indistinguishable from one the user mistyped.
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
-  }, [store, finish]);
+  }, [store, finish, onAttach]);
 
   const connectAssetManager = useCallback(() => {
     if (!onConnectAssetManager) return;
@@ -204,6 +247,12 @@ export function AddLibraryDialog({
             <TextField size="small" fullWidth label="Secret Key" type="password" required
               value={amSecret} onChange={(e) => setAmSecret(e.target.value)} />
           </Box>
+        )}
+
+        {attachHint && (
+          <Typography variant="caption" sx={{ display: 'block', mt: 1.5, color: 'text.secondary' }}>
+            {attachHint}
+          </Typography>
         )}
 
         {error && (

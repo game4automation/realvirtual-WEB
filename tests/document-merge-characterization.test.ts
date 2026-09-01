@@ -40,6 +40,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -370,7 +371,7 @@ describe('characterization — ASSET lineage (AssetDocument)', () => {
   describe('golden path + undo/redo roundtrip, per op category', () => {
     it('field edit: forward writes userData, undo restores prev, redo re-applies', async () => {
       const { viewer, box, boxPath } = makeViewer();
-      const doc = AssetDocument.newUntitled(viewer);
+      const doc = scratchAssetDocument(viewer);
 
       doc.setField(boxPath, 'Drive', 'TargetSpeed', 200, 50);
       await doc.whenIdle();
@@ -388,7 +389,7 @@ describe('characterization — ASSET lineage (AssetDocument)', () => {
 
     it('node transform WITH scale writes the full TRS — the asset lineage authors scale', async () => {
       const { viewer, mirror, mirrorPath } = makeViewer();
-      const doc = AssetDocument.newUntitled(viewer);
+      const doc = scratchAssetDocument(viewer);
 
       doc.transformNode(
         mirrorPath,
@@ -407,7 +408,7 @@ describe('characterization — ASSET lineage (AssetDocument)', () => {
 
     it('rename: forward renames, undo restores the old name', async () => {
       const { viewer, box, boxPath } = makeViewer();
-      const doc = AssetDocument.newUntitled(viewer);
+      const doc = scratchAssetDocument(viewer);
 
       doc.renameNode(boxPath, 'Crate', 'Box');
       await doc.whenIdle();
@@ -420,7 +421,7 @@ describe('characterization — ASSET lineage (AssetDocument)', () => {
 
     it('structural: deleteNode detaches, undo re-attaches from the trash', async () => {
       const { viewer, box, boxPath, registry } = makeViewer();
-      const doc = AssetDocument.newUntitled(viewer);
+      const doc = scratchAssetDocument(viewer);
 
       doc.deleteNode(boxPath);
       await doc.whenIdle();
@@ -433,7 +434,7 @@ describe('characterization — ASSET lineage (AssetDocument)', () => {
 
     it('composite: a transaction is ONE undo unit', async () => {
       const { viewer, box, boxPath } = makeViewer();
-      const doc = AssetDocument.newUntitled(viewer);
+      const doc = scratchAssetDocument(viewer);
 
       await doc.withTransaction('Batch', async () => {
         doc.setField(boxPath, 'Drive', 'TargetSpeed', 900, 50);
@@ -457,7 +458,7 @@ describe('characterization — ASSET lineage (AssetDocument)', () => {
 
   it('coalescing: two field edits on the same target collapse to one undo step', async () => {
     const { viewer, box, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 100, 50);
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 150, 100);
@@ -473,7 +474,7 @@ describe('characterization — ASSET lineage (AssetDocument)', () => {
 
   it('NO undo floor — the asset lineage undoes all the way to zero', async () => {
     const { viewer, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 111, 50);
     await doc.whenIdle();
@@ -512,7 +513,7 @@ describe('characterization — autosave timing of the three active writers', () 
 
   it('WRITER 1 (an UNBOUND document): writes its OWN root frame after 2000 ms, not before', async () => {
     const { viewer, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     // Since Phase 2 an unbound document is not slot-less — it owns a root frame
     // keyed by its own id, which is what retired the shared legacy slot.
     const own = doc.draftFrame;
@@ -537,7 +538,7 @@ describe('characterization — autosave timing of the three active writers', () 
 
   it('WRITER 2 (a BOUND document): writes the frame it was bound to, and only that one', async () => {
     const { viewer, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const own = doc.draftFrame;
     doc.setDraftFrame(frameOf('ref-a'));
 
@@ -561,7 +562,7 @@ describe('characterization — autosave timing of the three active writers', () 
 
   it('the debounce RESTARTS on every edit — a typing run writes once, at the end', async () => {
     const { viewer, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const own = doc.draftFrame;
 
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 100, 50);

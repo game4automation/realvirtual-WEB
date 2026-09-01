@@ -124,8 +124,27 @@ export interface PublishedSceneIndexEntry {
 /** The Examples catalogue derived from `documents[]`, or null when none apply. */
 export function publishedSceneIndex(project: PrivateProjectLike | null): PublishedSceneIndexEntry[] | null;
 
-/** The GLBs a project publishes — folder-derived, never manifest-derived (P0-3). */
+/**
+ * The GLBs a project publishes: the union of `models/*.glb` on disk (P0-3 — the
+ * folder can never be shortened by the manifest) and the `documents[]` entries
+ * that name an existing root-level GLB (plan-720).
+ */
 export function projectModelNames(projectDir: string): string[];
+
+/** A manifest/folder disagreement `projectModelNamesWithReport()` reports instead of swallowing. */
+export interface ProjectModelDiscrepancy {
+  /** `missing-file` = declared but absent (not published); `unregistered` = on disk but undeclared (published). */
+  kind: 'missing-file' | 'unregistered';
+  path: string;
+  reason: string;
+}
+
+/** `projectModelNames()` plus the source paths staging needs and the discrepancy report. */
+export function projectModelNamesWithReport(projectDir: string): {
+  list: string[];
+  sources: Map<string, string>;
+  discrepancies: ProjectModelDiscrepancy[];
+};
 
 /** plan-267: optional AES-256-GCM encryption of GLBs at publish time. */
 export interface PrivateEncryptionOptions {
@@ -156,8 +175,44 @@ export interface PublicModelAllowlistResult {
 }
 export function applyPublicModelAllowlist(
   distDir: string,
-  opts?: { prefix?: string; dryRun?: boolean },
+  /**
+   * `keep` is the manifest-derived allowlist (plan-726). When present it
+   * REPLACES the prefix rule rather than adding to it — the manifest is what
+   * says what the demo contains. `prefix` remains the fallback for a dist/
+   * without a manifest and the `RV_PUBLIC_MODEL_PREFIX` override.
+   */
+  opts?: { prefix?: string; dryRun?: boolean; keep?: string[] | null },
 ): PublicModelAllowlistResult;
+
+/**
+ * The `models/` filenames the deploy manifest at `distDir` declares, or null
+ * when that root carries no readable `project.json`.
+ *
+ * Null and `[]` mean different things: null is "no manifest, use the prefix
+ * rule", `[]` is "the manifest declares no models" — a manifest worth failing
+ * on rather than silently reinterpreting.
+ */
+export function publicDemoModelAllowlist(distDir: string): string[] | null;
+
+/**
+ * Every `models/` and `scenes/` document the deploy manifest names that is NOT
+ * in the build output (plan-726 F5). Empty when the manifest is satisfied, and
+ * vacuously empty for a root without one.
+ *
+ * The comparison is case-SENSITIVE: a `Models/…` typo passes `existsSync` on
+ * Windows and 404s on the Linux storage zone.
+ */
+export function publicDemoManifestMisses(distDir: string): string[];
+
+/**
+ * A deploy-root `project.json`, read through the shared document projection —
+ * or null when it is absent or unparseable.
+ *
+ * The third read entry point for a manifest, next to `loadProject()` (which
+ * demands a `code` the public demo deliberately does not have) and the private
+ * project reader. Never throws.
+ */
+export function readDeployManifest(rootDir: string): Record<string, unknown> | null;
 
 export const PUBLIC_TEST_SCENE_PREFIX: string;
 

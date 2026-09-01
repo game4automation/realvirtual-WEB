@@ -100,6 +100,13 @@ export interface CoreSubsystemsHost {
   readonly sceneButtonManager?: { update(dt: number): boolean } | null;
   /** EnergyChain bone update. A true return means BOTH render and shadow dirty. */
   readonly energyChainManager: { update(dt: number): boolean } | null;
+  /** Chain element poses (plan-733). A true return means BOTH render and shadow
+   *  dirty.
+   *
+   *  OPTIONAL like `machiningManager`: hosts that never load a chain (the embed
+   *  runtime, unit-test fakes) simply omit it, so adding the subsystem does not
+   *  force a `null` on every existing host implementation. */
+  readonly chainManager?: { update(dt: number): boolean } | null;
   /** CSG machining tick (plan-405): submits tool poses and applies the chunk
    *  meshes that came back from the worker. A true return means BOTH render and
    *  shadow dirty — a machined chunk changes the silhouette.
@@ -259,6 +266,17 @@ export class CoreSubsystems {
     // neither raises the drive-loop shadow flag above — its shadow would
     // otherwise stay frozen in the rest pose.
     if (h.energyChainManager?.update(dt)) {
+      h.markRenderDirty();
+      h.markShadowsDirty();
+    }
+
+    // ── Chain element poses (plan-733). Placed here for the same reason as the
+    // energy chain: it must run AFTER the drive stage, because an element's pose
+    // is derived from `drive.currentPosition` and reading a stale value would put
+    // the whole chain one tick behind its own drive. Shadow dirty as well — the
+    // drive loop skips the shadow flag for transport-surface drives, and a chain
+    // hanging off one would otherwise drag a frozen shadow behind it.
+    if (h.chainManager?.update(dt)) {
       h.markRenderDirty();
       h.markShadowsDirty();
     }

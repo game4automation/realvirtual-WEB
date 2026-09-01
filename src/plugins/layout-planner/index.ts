@@ -54,6 +54,7 @@ import {
   type SignalMapping,
 } from './rv-layout-store';
 import { getLibraryStore } from '../../core/library/library-store-singleton';
+import { listLibrarySources } from '../../core/library/library-source-registry';
 // plan-410 F1: a tiny one-way registry module (same shape/direction as the
 // `pending-open-store` import in LayoutLibraryPanel) — the planner ANSWERS the
 // editor's question; it never imports the editor plugin itself.
@@ -68,7 +69,7 @@ import { mergeWithAutoBinds, type AutoBindSignal } from '../signal-bind/auto-bin
 // with existing external consumers.
 export type { PlacementsSnapshot } from '../../core/rv-shared-types';
 import type { PlacementsSnapshot } from '../../core/rv-shared-types';
-import { ModelCache, dropToSurface, dropPivotToSurface, collectDropTargets } from './model-cache';
+import { ModelCache, dropToSurface, dropPivotToSurface, collectDropTargets, resolvedCacheKey } from './model-cache';
 import { GhostManager, buildVirtualNode } from './ghost-manager';
 import { FloorGizmo } from './floor-gizmo';
 import { markNoAO } from '../../core/engine/rv-group-registry';
@@ -105,6 +106,8 @@ import {
   resolvePlacementUrl as plResolvePlacementUrl,
   waitForCloudReady as plWaitForCloudReady,
   refreshCloudGlbUrl as plRefreshCloudGlbUrl,
+  findRegistryOrigin,
+  PROJECT_PLACEMENT_PREFIX,
 } from './planner-persistence';
 
 import { LAYOUT_PANEL_WIDTH } from '../../core/hmi/layout-constants';
@@ -120,6 +123,7 @@ import { BoxSelectController } from './box-select-controller';
 // The library panel is code-split (plan-344 Phase 4); the host is the tiny
 // always-mounted gate that pulls its chunk on the first open.
 import { LayoutLibraryPanelHost } from './LayoutLibraryPanelHost';
+import { plannerThumbnailKey } from './planner-thumbnail-key';
 import { PendingLoadMessage } from './PendingLoadMessage';
 import { PlannerGridButton, PlannerDropToSurfaceButton, PlannerDeleteButton, PlannerSnapButton, PlannerChainModeButton, PlannerVanishMUsButton, PlannerDocModeButton, PlannerUndoButton, PlannerRedoButton, PlannerLibraryButton } from './PlannerToolbarButtons';
 import { SignalBadgeController } from '../signal-bind/SignalBadgeController';
@@ -500,14 +504,43 @@ function subtreeHasComponent(root: Object3D, type: string): boolean {
   return found;
 }
 
+/**
+ * The modes in which layout AUTHORING is available — the single place this set
+ * is written down.
+ *
+ * `'planner'` is the dedicated authoring workspace; `'des'` joined it because
+ * DES is where material-flow layouts are actually built, and everything that
+ * makes authoring work hangs off this plugin: the TransformControls drag, the
+ * `layout-drag-start/tick/end` broadcast that arms magnetic snap
+ * (snap-point/index.ts), the placement ops, the grid and the library panel.
+ * Without the plugin participating there is no drag in a mode, and therefore
+ * nothing for the snap system to attach to — gating the snap system alone
+ * would have been dead code.
+ *
+ * Note the two INDEPENDENT gates that both resolve from here (doc-ui-visibility.md):
+ *  - participation — `modes` → `pluginParticipatesInMode`, and the UI registry
+ *    turns it into `shownOnlyInAny: ['mode:planner', 'mode:des']` on every slot;
+ *  - the legacy `'planner'` UI CONTEXT, set by {@link LayoutPlannerPlugin.setActive}
+ *    and read by the toolbar slots, by snap-point's `_applyMode`, its magnetic
+ *    arming and its chain preview. It is a statement about "authoring is live",
+ *    not about which mode is selected, which is why it needs no per-mode variant.
+ */
+export const AUTHORING_MODES: readonly ModeId[] = ['planner', 'des'];
+
+/** True while `mode` is one of the layout-authoring workspaces. */
+export function isAuthoringMode(mode: ModeId | null | undefined): boolean {
+  return mode != null && AUTHORING_MODES.includes(mode);
+}
+
 export class LayoutPlannerPlugin implements RVViewerPlugin {
   readonly id = 'layout-planner';
   readonly order = 250;
 
   /** plan-198: the planner is a workspace mode. Entered via the TopBar mode
    *  dropdown (no standalone toolbar button). Its slot entries are auto-gated
-   *  to the `mode:planner` context by the UI registry. */
-  readonly modes: ModeId[] = ['planner'];
+   *  to the `mode:planner` / `mode:des` contexts by the UI registry.
+   *  SSOT for the set: {@link AUTHORING_MODES}. */
+  readonly modes: ModeId[] = [...AUTHORING_MODES];
 
   /** Self-register the overlay library panel + planner edit buttons. The panel
    *  is opened/closed by onModeActivate/onModeDeactivate; the buttons are gated
@@ -807,7 +840,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     // Builder-only: produces the raw node for the dragged entry. The planner
     // adopts + fully registers it on drag-enter (see `_startDraft`), so the
     // dragged object is a real, selectable, gizmo-bearing placement.
-    this._ghost = new GhostManager(this._modelCache);
+    this._ghost = new GhostManager(this._modelCache, (entry) => this.loadEntryModel(entry));
 
     // Whenever the preview appears, moves into view, hides, or is adopted,
     // update the aux emphasis so the ghost renders with the selection visual
@@ -1411,16 +1444,67 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       const lpmUnsub = lpm.subscribe(() => {
         if (this._active && !lpm.isOpen?.('layout-planner')) {
           // Panel closed or displaced by another plugin while planner was active.
-          // The library is OPTIONAL in planner mode: if we're in planner MODE,
-          // do NOTHING — stay in the mode with edit bindings active; the library
+          // The library is OPTIONAL in an authoring MODE: if we're in one, do
+          // NOTHING — stay in the mode with edit bindings active; the library
           // is simply hidden (toggle it back via the toolbar Library button).
           // Only in the pre-mode (standalone) path do we release the edit
           // bindings so the simulation isn't left frozen.
-          if (viewer.modes?.activeMode !== 'planner') this.setActive(false);
+          // Asks about the MODE, not the 'planner' context — the context is set
+          // by setActive itself, so reading it here would always be true and the
+          // standalone path could never release.
+          if (!isAuthoringMode(viewer.modes?.activeMode)) this.setActive(false);
         }
       });
       this._unsubs.push(lpmUnsub);
     }
+
+    // plan-719 F8 / Defect (b) — drop the DECODED copy of a document that was
+    // just written, so the next placement uses the new bytes.
+    //
+    // This used to be done TO the planner, from the editor's save flow: it
+    // reached in through a structural type, walked the catalogs and matched
+    // the saved path. That only ever matched `library/**`, which is why a
+    // document saved under `models/` kept being placed from pre-save geometry.
+    // Listening to the event instead makes it path-agnostic by construction —
+    // and puts the cache's invalidation where the cache is.
+    this._unsubs.push(viewer.on('document-saved', ({ relPath }) => {
+      if (!relPath) return;                  // slot-addressed: no file to match
+      // The catalog addresses library assets by their LIBRARY-relative path;
+      // everything else by the project-relative one. Both spellings are tried
+      // rather than guessed at, because a wrong guess here is silent.
+      const wanted = new Set([
+        relPath.toLowerCase(),
+        relPath.replace(/^library\//i, '').toLowerCase(),
+      ]);
+
+      // Registry sources first (plan-723 F10). A project document is cached
+      // under its STABLE key, which the catalog walk below cannot reach — the
+      // store knows nothing about it — so without this the next placement after
+      // a save served pre-save geometry, silently and for the whole session.
+      for (const { providerId, source } of listLibrarySources()) {
+        let entries: LibraryCatalogEntry[];
+        try { entries = source.listEntries(); } catch { continue; }
+        for (const entry of entries) {
+          if (!wanted.has((entry.localPath ?? '').toLowerCase())) continue;
+          this._modelCache.invalidate(resolvedCacheKey(providerId, source.id, entry.id));
+          viewer.thumbnails?.forget(plannerThumbnailKey(entry.id));
+          this.store.setEntryThumbnail(entry.id, '');
+        }
+      }
+
+      for (const catalog of this.store.getSnapshot().catalogs.values()) {
+        for (const entry of catalog.entries ?? []) {
+          if (!wanted.has((entry.localPath ?? '').toLowerCase())) continue;
+          if (entry.glbUrl) this._modelCache.invalidate(entry.glbUrl);
+          // The PREVIEW of the saved asset is as stale as its geometry was:
+          // forget the persistent cache entry and drop the stored picture, so
+          // the panel card re-enqueues and renders the new bytes.
+          viewer.thumbnails?.forget(plannerThumbnailKey(entry.id));
+          this.store.setEntryThumbnail(entry.id, '');
+          return;
+        }
+      }
+    }));
   }
 
   onModelCleared(_viewer: RVViewer): void {
@@ -2079,6 +2163,68 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   }
 
   /**
+   * Load the geometry of ONE catalog entry — the single door every placement
+   * path goes through (plan-723 F4).
+   *
+   * Two kinds of entry, one signature:
+   *  - a classic catalog entry carries a `glbUrl` and takes the untouched
+   *    URL-keyed fast path;
+   *  - a library-registry entry (a project document) carries `glbUrl: ''` and
+   *    is resolved through its OWNING source, cached under the asset's stable
+   *    identity rather than under the volatile `blob:` URL `resolveAsset` mints.
+   *
+   * The origin is looked up rather than threaded through the callers, because
+   * the planner's real drag channel is an in-memory entry reference that has no
+   * room for provenance — see `findRegistryOrigin`.
+   */
+  async loadEntryModel(entry: LibraryCatalogEntry, signal?: AbortSignal): Promise<Group> {
+    if (entry.glbUrl) return this._modelCache.getOrLoad(entry.glbUrl, { signal });
+
+    const origin = findRegistryOrigin(entry.id);
+    if (!origin) {
+      throw new Error(`Entry "${entry.id}" has no glbUrl and no registry origin.`);
+    }
+    return this._modelCache.getOrLoadResolved(
+      resolvedCacheKey(origin.providerId, origin.source.id, entry.id),
+      () => origin.source.resolveAsset(entry.id, 'place'),
+      { signal },
+    );
+  }
+
+  /**
+   * The stable cache key a `project:` PLACEMENT loads under, or `null` when the
+   * document is not in the active project any more (plan-723 F5).
+   *
+   * Reconstructed from the persisted `catalogId` — which is the entry id, so a
+   * single registry lookup is all it takes.
+   */
+  private _resolvedOriginFor(catalogId: string): { key: string; resolve: () => Promise<{ url: string; revokeUrl?(): void }> } | null {
+    const origin = findRegistryOrigin(catalogId);
+    if (!origin) return null;
+    return {
+      key: resolvedCacheKey(origin.providerId, origin.source.id, catalogId),
+      resolve: () => origin.source.resolveAsset(catalogId, 'place'),
+    };
+  }
+
+  /**
+   * Warm one library card's geometry — the hover-intent prefetch (plan-371 F8)
+   * extended to registry entries (plan-723).
+   *
+   * Registry entries warm under their STABLE key, so the drag that follows a
+   * rested hover joins the same promise instead of resolving the backend twice.
+   * Never throws and never rejects: a prefetch that fails is a prefetch that
+   * did not help.
+   */
+  prefetchEntry(entry: LibraryCatalogEntry): void {
+    if (entry.virtual === true || entry.splatUrl) return;
+    const url = entry.glbUrl?.trim();
+    if (url) { this._modelCache.prefetch(url); return; }
+    const origin = this._resolvedOriginFor(entry.id);
+    if (origin) this._modelCache.prefetchResolved(origin.key, origin.resolve);
+  }
+
+  /**
    * Await the decoded GLB for a pending placement and swap it in.
    *
    * Every result is validated against the generation token AND the placement's
@@ -2091,15 +2237,12 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     entry: LibraryCatalogEntry,
     generation: number,
   ): Promise<void> {
-    const url = entry.glbUrl;
-    if (!url) {
-      this._pending.fail(id, 'Catalog entry has no glbUrl');
-      this._markPendingFailed(id);
-      return;
-    }
-
     try {
-      const real = await this._modelCache.getOrLoad(url, { signal: this._pending.signalFor(id) });
+      // No fail-fast on an empty `glbUrl` any more: a registry entry legitimately
+      // has none, and `loadEntryModel` throws a described error for the entries
+      // that really cannot be loaded — which lands in the same pending-fail path
+      // one catch below, placeholder and message included.
+      const real = await this.loadEntryModel(entry, this._pending.signalFor(id));
       if (!this._pending.isCurrent(id, generation)) return;
 
       // The pulse gizmo is parented UNDER the placeholder root, and the swap
@@ -2403,8 +2546,9 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       // createGizmo() with a wireframe fallback + name/realvirtual stamping).
       node = await buildVirtualNode(entry);
     } else {
-      // Standard GLB-based component
-      node = await this._modelCache.getOrLoad(entry.glbUrl ?? '');
+      // Standard GLB-based component — or a registry entry with no glbUrl at
+      // all, which `loadEntryModel` resolves through its library source.
+      node = await this.loadEntryModel(entry);
     }
 
     const id = crypto.randomUUID();
@@ -2643,6 +2787,17 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         // copy would call `_modelCache.getOrLoad('')`, because virtual entries
         // carry no glbUrl (plan-376 F7).
         node = await this._buildVirtualDesNode(entry);
+      } else if (comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) {
+        // Project documents duplicate off the STABLE cache key (plan-723 F4).
+        // Going through `comp.glbUrl` here would reach for a blob URL that the
+        // ModelCache already revoked at the end of the original placement's
+        // decode — mid-session, and only for the copy.
+        const origin = this._resolvedOriginFor(comp.catalogId);
+        if (!origin) {
+          console.warn(`[LayoutPlanner] Cannot copy "${comp.label}" — ${comp.catalogId} is not in the active project.`);
+          return null;
+        }
+        node = await this._modelCache.getOrLoadResolved(origin.key, origin.resolve);
       } else if (!comp.glbUrl) {
         console.warn(`[LayoutPlanner] Cannot copy "${comp.label}" — no glbUrl and no virtual catalog entry.`);
         return null;
@@ -2936,6 +3091,25 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
   }
 
   /**
+   * The GLB half of a restore: URL-keyed for a classic placement, stable-key
+   * for a `project:` one (plan-723 F5).
+   *
+   * The `url` a caller hands in for a project placement is the liveness MARKER
+   * `resolvePlacementUrl` returns (the catalogId), not a fetchable address —
+   * which is why the prefix branch comes first and the marker is never read.
+   */
+  private async _loadPlacementGeometry(p: PlacedComponent, url?: string): Promise<Group> {
+    if (p.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) {
+      const origin = this._resolvedOriginFor(p.catalogId);
+      if (!origin) throw new Error(`Project asset "${p.catalogId}" is not in the active project.`);
+      // Warm from the restore prefetch when it ran: a hit here does NOT call
+      // `resolve()` again, which is the whole reason the key is stable.
+      return this._modelCache.getOrLoadResolved(origin.key, origin.resolve);
+    }
+    return this._modelCache.getOrLoad(url || p.glbUrl);
+  }
+
+  /**
    * Turn a `PlacedComponent` record into a living scene object — THE single
    * routine every restore path uses for the per-item body (plan-376 F1).
    *
@@ -2978,7 +3152,7 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     } else {
       node = entry?.virtual && entry.desType
         ? await this._buildVirtualDesNode(entry)
-        : await this._modelCache.getOrLoad(url || p.glbUrl);
+        : await this._loadPlacementGeometry(p, url);
       this._addPlacedToScene(node, p.id, p.label, p.catalogId);
     }
 
@@ -3197,15 +3371,29 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
       resolved.push({ comp, url, isSplat: !!comp.splatUrl });
     }
 
-    // Pre-fetch distinct GLBs in parallel (skip splats), then place sequentially
-    const distinctGlbUrls = [...new Set(
-      resolved
-        .filter(r => !r.isSplat && r.url != null)
-        .map(r => r.url as string),
-    )];
-    await Promise.all(distinctGlbUrls.map(url =>
-      this._modelCache.getOrLoad(url).catch(() => null),
-    ));
+    // Pre-fetch distinct GLBs in parallel (skip splats), then place sequentially.
+    //
+    // The partition is by PLACEMENT KIND, not by URL (plan-723 F5): a project
+    // document has no stable URL to key on, so it warms under its stable cache
+    // key instead. Warming it under the volatile blob URL would be worse than
+    // not warming it at all — the sequential pass below would miss the cache
+    // and decode the same asset a second time.
+    const warmable = resolved.filter(r => !r.isSplat && r.url != null);
+    const projectKeys = new Map<string, () => Promise<{ url: string; revokeUrl?(): void }>>();
+    const distinctGlbUrls = new Set<string>();
+    for (const r of warmable) {
+      if (r.comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) {
+        const origin = this._resolvedOriginFor(r.comp.catalogId);
+        if (origin && !projectKeys.has(origin.key)) projectKeys.set(origin.key, origin.resolve);
+      } else {
+        distinctGlbUrls.add(r.url as string);
+      }
+    }
+    await Promise.all([
+      ...[...distinctGlbUrls].map(url => this._modelCache.getOrLoad(url).catch(() => null)),
+      ...[...projectKeys].map(([key, resolve]) =>
+        this._modelCache.getOrLoadResolved(key, resolve).catch(() => null)),
+    ]);
     // Per-item `try/catch` is FAILURE ISOLATION, not placement code: without
     // it a single rejected promise aborts the whole restore loop and every
     // later placement silently disappears. It stays here even though the
@@ -3241,7 +3429,12 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
         // GLB placements, exactly as before — the splat branch never did this.
         // (Its effect is overwritten by the `setComponents` below; kept as a
         // deliberate non-change rather than a silent omission.)
-        if (!isSplat && url && url !== comp.glbUrl) {
+        //
+        // Project placements are excluded: their `url` is the liveness marker,
+        // not an address, and writing it into `glbUrl` would persist a string
+        // no loader can read.
+        if (!isSplat && url && url !== comp.glbUrl
+            && !comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) {
           this.store.updateGlbUrl(comp.id, url);
         }
       } catch (e) {
@@ -3522,14 +3715,18 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     ownSnapName: string,
   ): Promise<string | null> {
     if (!this._viewer) return null;
-    if (!entry.glbUrl) return null;
+    // No `!entry.glbUrl` guard any more (plan-723 F4): it silently returned
+    // null for every project document, which read as "the snap picker does
+    // nothing". `loadEntryModel` resolves those; a genuinely unloadable entry
+    // throws and surfaces to the caller instead of vanishing.
+    if (!entry.glbUrl && !findRegistryOrigin(entry.id)) return null;
 
     const snapPlugin = this._viewer.getPlugin<SnapPointPlugin>('snap-point');
     const snapRegistry = snapPlugin?.getRegistry();
     if (!snapRegistry) return null;
     if (target.occupied) return null;
 
-    const node = await this._modelCache.getOrLoad(entry.glbUrl);
+    const node = await this.loadEntryModel(entry);
     const id = crypto.randomUUID();
 
     const result = smPlaceAtSnapPoint(
@@ -3547,7 +3744,9 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     const comp: PlacedComponent = {
       id,
       catalogId: entry.id,
-      glbUrl: entry.glbUrl,
+      // Empty for a registry entry, exactly as `placeComponent` records it: the
+      // identity of such a placement is its `catalogId`, never a URL.
+      glbUrl: entry.glbUrl ?? '',
       label: entry.name,
       position: [node.position.x, node.position.y, node.position.z],
       rotation: [
@@ -3903,6 +4102,15 @@ export class LayoutPlannerPlugin implements RVViewerPlugin {
     }
 
     await this.store.restoreFromStorage();
+    // By the time this async path resumes, a GLB-scene adoption (or an op
+    // replay) may already OWN the layout — `adoptPlacements` runs right after
+    // `ensureAttached` returns, while the catalog fetches above are still in
+    // flight. The legacy localStorage autosave must not overwrite that:
+    // replacing an adopted store with an empty autosave left 13 perfectly
+    // visible placements with zero records behind them — selectable-looking,
+    // unmovable, unsaveable (2026-09-01, DemoPlanner). The autosave restore
+    // is for the standalone planner boot, where the store is still empty.
+    if (this.store.getSnapshot().placed.length > 0) return;
     this.store.loadAutoSave();
 
     // Re-place auto-saved components under model root

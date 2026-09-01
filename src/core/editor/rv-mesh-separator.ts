@@ -66,6 +66,43 @@ export const REASON_MISSING_MATERIAL = 'Geometry group references a missing mate
  */
 const MAX_GRID_COORD = 1 << 30;
 
+/**
+ * Smallest resolution the weld may use for a geometry, given its coordinate range.
+ *
+ * A CAD import in millimetres is routinely placed thousands of units from the origin;
+ * at the fixed {@link DEFAULT_WELD_THRESHOLD} such a coordinate quantizes past
+ * {@link MAX_GRID_COORD} and `weldVertexIds` throws. The whole separate then aborted
+ * with nothing but a console message — the user saw the dialog vanish and no parts.
+ *
+ * So the requested resolution is a **wish**, not a promise: it is raised (never lowered)
+ * to whatever keeps the grid inside its safe range. Half the range is the budget, so the
+ * rounding of the extreme coordinate cannot land on the boundary.
+ *
+ * Derived purely from the geometry, so the live run and a later replay — which resolves
+ * it again from the same geometry — always agree on the grid.
+ */
+export function resolveWeldResolution(
+  geom: BufferGeometry,
+  requested: number = DEFAULT_WELD_THRESHOLD,
+): number {
+  const pos = geom.getAttribute('position');
+  if (!pos || !Number.isFinite(requested) || requested <= 0) return requested;
+
+  let maxAbs = 0;
+  for (let i = 0; i < pos.count; i++) {
+    const x = Math.abs(pos.getX(i));
+    const y = Math.abs(pos.getY(i));
+    const z = Math.abs(pos.getZ(i));
+    if (x > maxAbs) maxAbs = x;
+    if (y > maxAbs) maxAbs = y;
+    if (z > maxAbs) maxAbs = z;
+  }
+  if (!Number.isFinite(maxAbs) || maxAbs === 0) return requested;
+
+  const minimum = maxAbs / (MAX_GRID_COORD / 2);
+  return requested >= minimum ? requested : minimum;
+}
+
 // ─── Types ──────────────────────────────────────────────────────────────
 
 /** The typed arrays a `BufferAttribute` can be backed by. */
@@ -365,9 +402,16 @@ export function triangleCount(geom: BufferGeometry): number {
  * Partitions are ordered by the first triangle that reaches them, which makes the result
  * deterministic — the generated child names depend on it.
  *
- * Fully degenerate triangles (all three vertices welding into the same cell) are dropped
- * before the union-find. They carry no surface and no connectivity, so the filter cannot
- * change the island count; it only keeps zero-area slivers out of the output.
+ * Fully degenerate triangles (all three vertices welding into the same cell) contribute
+ * no EDGES to the union-find, so they cannot change the island count — but they are still
+ * output, attached to the island their welded vertex belongs to. Only a degenerate island
+ * of its own is dropped. Every triangle of the source therefore reaches exactly one part:
+ * the parts reassemble the original mesh, which is what keeps sub-resolution CAD detail
+ * from disappearing.
+ *
+ * `resolution` is the REQUESTED grid; the effective one comes from
+ * {@link resolveWeldResolution}, which raises it when the coordinate range would overflow
+ * the integer grid.
  */
 export function computeMeshIslands(
   geom: BufferGeometry,
@@ -379,7 +423,8 @@ export function computeMeshIslands(
   const triCount = triangleCount(geom);
   if (triCount === 0) return [];
 
-  const canon = weldVertexIds(geom, resolution);
+  const grid = resolveWeldResolution(geom, resolution);
+  const canon = weldVertexIds(geom, grid);
   const vertexCount = pos.count;
   const indexArray = geom.index ? (geom.index.array as AttributeArray) : null;
 
@@ -405,8 +450,16 @@ export function computeMeshIslands(
   }
 
   // Pass 2 — bucket the triangles by their island root.
+  //
+  // Degenerate triangles carried no edges into the graph, but they are still part of the
+  // SOURCE surface: dropping them here silently deleted geometry, which is what made
+  // sub-resolution CAD detail (fillet strips, small chamfers) vanish from the parts. So
+  // they are bucketed too — after the real triangles, and only into a partition a real
+  // triangle already opened. That keeps the island count and the partition order exactly
+  // as before, while the sum of the partitions is again the whole mesh.
   const rootToPartition = new Map<number, number>();
   const partitions: number[][] = [];
+  const degenerate: number[] = [];
   for (let t = 0; t < triCount; t++) {
     const o = t * 3;
     const ia = indexArray ? indexArray[o] : o;
@@ -415,7 +468,10 @@ export function computeMeshIslands(
     if (ia >= vertexCount || ib >= vertexCount || ic >= vertexCount) continue;
 
     const ca = canon[ia];
-    if (ca === canon[ib] && canon[ib] === canon[ic]) continue;
+    if (ca === canon[ib] && canon[ib] === canon[ic]) {
+      degenerate.push(t);
+      continue;
+    }
 
     const root = ufFind(parent, ca);
     let slot = rootToPartition.get(root);
@@ -426,6 +482,16 @@ export function computeMeshIslands(
     }
     partitions[slot].push(t);
   }
+
+  // A degenerate triangle whose welded vertex no real triangle ever touched carries no
+  // surface at all and would only open a zero-area part — that one stays dropped.
+  for (const t of degenerate) {
+    const o = t * 3;
+    const ia = indexArray ? indexArray[o] : o;
+    const slot = rootToPartition.get(ufFind(parent, canon[ia]));
+    if (slot !== undefined) partitions[slot].push(t);
+  }
+  for (const partition of partitions) partition.sort((a, b) => a - b);
 
   return partitions.length <= 1 ? [] : partitions;
 }

@@ -15,7 +15,7 @@
 import { describe, expect, it, afterEach, vi } from 'vitest';
 import { useState } from 'react';
 import { render, fireEvent, cleanup, screen } from '@testing-library/react';
-import { Section } from '@rv-private/plugins/asset-editor/panel-primitives';
+import { ActionButton, Section } from '@rv-private/plugins/asset-editor/panel-primitives';
 
 afterEach(cleanup);
 
@@ -119,5 +119,26 @@ describe('Section — controlled', () => {
       <Section title="Mechanism" defaultOpen={false} open={true}><div>body</div></Section>,
     );
     expect(isExpanded(container)).toBe(true);
+  });
+});
+
+describe('ActionButton — pressed state', () => {
+  it('marks an armed mode button as pressed and keeps it clickable', () => {
+    const onClick = vi.fn();
+    render(<ActionButton label="Pivot to Circle" active onClick={onClick} />);
+    const button = screen.getByRole('button', { name: 'Pivot to Circle' });
+
+    // The panel greys everything else out while a mode is armed, so this one
+    // button carries both the state AND the way out of it.
+    expect(button.getAttribute('aria-pressed')).toBe('true');
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(button);
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves an ordinary action unpressed', () => {
+    render(<ActionButton label="To Ground" onClick={() => {}} />);
+    const button = screen.getByRole('button', { name: 'To Ground' });
+    expect(button.getAttribute('aria-pressed')).toBeNull();
   });
 });

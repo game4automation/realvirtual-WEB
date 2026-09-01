@@ -40,6 +40,26 @@ const DENIED_PATHS = [
   'tests/onboard-customer.node.test.ts',
   'tests/get-connect.node.test.ts',
   'tests/provision-influx.node.test.ts',
+  // CAD landing zones and design-tool state (2026-08-28). These folders are
+  // defined by what falls INTO them — import sessions and the impeccable
+  // skill — so any tracked file here is an accident. The 103 MB of customer
+  // geometry published in the Aug-15 snapshots got in exactly this way: the
+  // .gitignore deny-listed filenames, and new names walked past it.
+  '.impeccable/',
+  'public/models/library/Custom/',
+  'public/models/library/imports/',
+  // User decision 2026-08-30: these two are internal dev/test models and must not
+  // be republished. They still live in the internal tree because the IK/BVH/CSG
+  // suites load them — plan-395 phase 3 relocates them to the private Development
+  // project. Until that lands, this entry DELIBERATELY blocks /gitweb snapshots:
+  // publishing requires either running plan-395 or an explicit decision to ship them.
+  'public/models/DemoRobotIK.glb',
+  'public/models/DemoCSGMachining.glb',
+  // plan-307: Agents INTERNAL-ONLY (user decision 2026-07-22, reconfirmed 2026-08-30). The
+  // whole agents UI (provider seam, store, report parser, panels) lives in the
+  // private sibling under the same path and is restricted-tier in
+  // tier-manifest.json. A file reappearing here means the move was undone.
+  'src/plugins/agents/',
 ];
 
 //! Content markers that indicate internal infrastructure leaked into a file.

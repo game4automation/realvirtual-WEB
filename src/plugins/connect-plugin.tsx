@@ -30,6 +30,8 @@ import {
   isLocalGatewayTarget,
   isLoopbackOrigin,
   isSourceConnectedLive,
+  installConnectActiveDocumentNotifier,
+  uninstallConnectActiveDocumentNotifier,
   type ConnectInterface,
   type ConnectSnapshot,
 } from '../core/hmi/connect-store';
@@ -224,6 +226,10 @@ export class ConnectPlugin implements RVViewerPlugin {
     this.lastSeenServerUrl = snap.serverUrl;
     this.lastSeenState = snap.state;
     this.unsubscribe = subscribeConnectStore(() => this.onConnectStoreChanged());
+    // plan-725 §2.7 — the HMI half of the project store's dependency inversion.
+    // This plugin already knows both the gateway and the project, so it is where
+    // the two are introduced; the project store itself stays free of CONNECT.
+    installConnectActiveDocumentNotifier();
     // Coming back to the tab or regaining the network is the moment a gateway is
     // most likely to have appeared — probe then instead of waiting out the 60 s.
     if (typeof window !== 'undefined') window.addEventListener('online', this.handleWake);
@@ -548,6 +554,7 @@ export class ConnectPlugin implements RVViewerPlugin {
     }
     this.unsubscribe?.();
     this.unsubscribe = null;
+    uninstallConnectActiveDocumentNotifier();
     this.detachModel();
   }
 }

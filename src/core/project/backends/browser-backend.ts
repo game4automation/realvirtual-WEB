@@ -105,9 +105,11 @@ import {
 import {
   RV_PROJECT_SCHEMA_VERSION,
   canonicalNameOf,
+  sceneGlbRelPathFor,
   type RvDocumentEntry,
   type RvProject,
   type RvProjectAssetEntry,
+  type RvProjectSceneEntry,
 } from '../rv-project-types';
 import {
   assertWritable,
@@ -343,20 +345,84 @@ export class BrowserBackend implements ProjectBackend {
    * a compare-and-swap costs one `getItem`. What it protects against here is
    * the two-tab case: both tabs share this localStorage, so the second one to
    * save has a stale revision and is told so instead of quietly winning.
+   *
+   * ## `relPath` is validated, never reversed (plan-454)
+   *
+   * This used to derive the scene id back out of `relPath` and refuse the
+   * write when the two disagreed. That derivation **cannot exist**:
+   * `sceneIdToken()` replaces every character outside `[A-Za-z0-9_-]` with
+   * `_` on purpose, and `sceneGlbFileNameFor()` puts a name slug in front of
+   * it — so `<slug>-<token>.scene.glb` simply does not carry the id any more.
+   * For a builtin draft id (`draft/builtin:%2Fmodels%2F…`) that showed up as a
+   * failing autosave on every dirty workspace; for a plain `scn_…` id it only
+   * ever passed because nothing happened to be replaced.
+   *
+   * `write.meta.id` is the id, like in {@link FolderBackend.writeScene}, and
+   * `relPath` is checked for **belonging** instead — see
+   * {@link _assertPathBelongsToScene}.
    */
   async writeScene(relPath: string, write: SceneWrite): Promise<SceneRevision> {
     assertWritable(this);
     return this._writes.run(async () => {
-      const id = sceneIdOfPath(relPath) || write.meta?.id;
-      if (!id) throw new Error('writeScene needs a scene id.');
-      if (write.meta?.id && id !== write.meta.id) {
-        throw new Error(`"${relPath}" does not address scene ${write.meta.id}.`);
-      }
+      const id = write.meta?.id;
+      if (!id) throw new Error('writeScene needs meta.id.');
+      this._assertPathBelongsToScene(relPath, write.meta);
       assertRevisionPrecondition(relPath, write.expectedRevision, sceneGlbRevision(id));
       const revision = await writeSceneGlb(id, write.glb);
       noteSceneMembership(id, this._projectId);
       return revision;
     });
+  }
+
+  /**
+   * Refuse a `relPath` that does not belong to `meta.id` — in three stages,
+   * in this order (plan-454 §2.1).
+   *
+   *  1. **Who owns the path?** A row of a *different* document holding exactly
+   *     this path is refused, always — even when the path is the canonical one
+   *     for `meta` as well. This stage is not optional and not redundant:
+   *     `sceneIdToken()` is lossy, so `a:b` and `a/b` both become `a_b`, and
+   *     with an equal name the slug collides too — the whole filename is then
+   *     identical for two different scenes. Comparing only against *this*
+   *     scene's canonical path would happily accept a path another scene
+   *     already owns. This is the invariant `FolderBackend`'s
+   *     `_assertPathMatchesEntry` protects (the "RR1 collision").
+   *  2. **Does a row already exist for this id?** Then `relPath` has to be that
+   *     row's stored `path`, so an established document cannot acquire a second
+   *     home. A deliberate **browser-specific tightening** — the folder backend
+   *     checks foreign ownership only (§2.2).
+   *  3. **Only without a row** is a fresh path accepted, and only the canonical
+   *     `sceneGlbRelPathFor(meta)` or one of the id-addressing forms
+   *     {@link sceneIdOfPath} has always allowed (`<id>`, `scenes/<id>`,
+   *     `<id>.scene.glb`) — the browser backend keys its bodies by scene id, so
+   *     addressing one by its id is how most callers reach it.
+   */
+  private _assertPathBelongsToScene(relPath: string, meta: RvProjectSceneEntry): void {
+    const id = meta.id;
+    const rows = readDocuments(this._readStoredManifest()) ?? [];
+
+    // 1 — a path owned by somebody else, no matter how canonical it looks.
+    const owner = rows.find(e => e.path === relPath);
+    if (owner && owner.id !== id) {
+      throw new Error(`"${relPath}" belongs to scene ${owner.id}, not ${id}.`);
+    }
+
+    // 2 — an existing row pins the path.
+    const row = rows.find(e => e.id === id);
+    if (row) {
+      if (row.path !== relPath) {
+        throw new Error(`Scene ${id} is stored at "${row.path}" — refusing to write it to "${relPath}".`);
+      }
+      return;
+    }
+
+    // 3 — no row yet: the canonical path, or the scene's own id.
+    const canonical = sceneGlbRelPathFor({ id, name: meta.name });
+    if (relPath === canonical) return;
+    if (sceneIdOfPath(relPath) === id) return;
+    throw new Error(
+      `"${relPath}" does not belong to scene ${id} — expected "${canonical}" or its id.`,
+    );
   }
 
   /**
@@ -517,7 +583,21 @@ export class BrowserBackend implements ProjectBackend {
 // derives any more: every row in this backend's list is a document, and the
 // distinction it drew no longer has two sides.
 
-/** `scenes/<id>`, `<id>` and `<id>.scene.glb` all address the same scene. */
+/**
+ * `scenes/<id>`, `<id>` and `<id>.scene.glb` all address the same scene.
+ *
+ * A **convenience for callers**, and nothing more: this backend keys its
+ * bodies by scene id, so a caller holding an id, a folder-style path or a
+ * filename should not have to branch on which one it has.
+ *
+ * It is expressly **not** the inverse of the filename construction, and must
+ * never be used as one (plan-454). `sceneIdToken()` replaces every character
+ * outside `[A-Za-z0-9_-]` with `_` — deliberately lossy — and
+ * `sceneGlbFileNameFor()` prefixes a name slug that is not part of the id at
+ * all. From `<slug>-<token>.scene.glb` no id can be recovered; feeding one in
+ * here yields the whole basename, not an id. Ownership of a path is therefore
+ * *looked up* (see {@link BrowserBackend.writeScene}), never derived.
+ */
 export function sceneIdOfPath(relPath: string): string {
   const raw = (relPath ?? '').trim();
   if (!raw) return '';

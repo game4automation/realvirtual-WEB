@@ -126,6 +126,30 @@ export interface RVAppConfig {
     force?: boolean;
   };
 
+  /**
+   * Workspace-mode policy for this deployment (plan-721 F5).
+   *
+   * `lock` is the generic kiosk switch: the deployment comes up in that mode and
+   * cannot leave it — `ModeManager.lock()`, the same mechanism CONNECT-embed and
+   * the Mauser/Toray project plugins already use, but declared in configuration
+   * instead of in code. An appliance delivery sets `{ "lock": "hmi" }`; removing
+   * the key is how commissioning unlocks the box, and then the full resume
+   * cascade (URL deep links included) applies again.
+   *
+   * **Timing is the contract, not a detail.** It is wired in `main.ts` BEFORE
+   * the project resume resolves, following `connect-embed-store`, because
+   * `resolveResumeTarget` reads `modes.lockedMode` — a lock applied later (the
+   * model-plugin hook the project plugins use) is invisible to it and the kiosk
+   * rule silently does not apply.
+   *
+   * An unregistered mode id is ignored with a warning: refusing to lock is the
+   * safer half of a configuration that names a mode this build does not have.
+   */
+  mode?: {
+    /** Mode id to lock the deployment into, e.g. `"hmi"`. Omit for no lock. */
+    lock?: string;
+  };
+
   /** Simulation behavior toggles (deploy-config, never editable via UI). */
   simulation?: {
     /**
@@ -210,6 +234,25 @@ export function getAppConfig(): RVAppConfig {
 /** True when the entire settings dialog should be hidden. */
 export function isSettingsLocked(): boolean {
   return _config.lockSettings === true;
+}
+
+/**
+ * The mode this deployment is locked into, or null (plan-721 F5).
+ *
+ * A function rather than a field read, for two reasons: it is the ONE place the
+ * blank/whitespace case is decided (an empty string in a generated config means
+ * "no lock", not "lock to the mode called ''"), and it is the seam the wiring
+ * test asserts against — the boot itself is an 800-line async sequence, but the
+ * rule it applies is this one comparison.
+ *
+ * Takes the config explicitly instead of reading the singleton: `main.ts` wires
+ * the lock from its own local `appConfig` before anything else can observe it.
+ */
+export function lockedModeOf(config: RVAppConfig): string | null {
+  const id = config.mode?.lock;
+  if (typeof id !== 'string') return null;
+  const trimmed = id.trim();
+  return trimmed === '' ? null : trimmed;
 }
 
 /** True when a specific settings tab should be hidden/disabled. */

@@ -2,23 +2,32 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * plan-709 phase 0 — what the editor Save does TODAY, written down before it
- * is rebuilt.
+ * What the editor Save does — restated for plan-719's target semantics.
  *
- * This is a characterisation test, not a specification: every assertion here
- * describes behaviour that already exists, so that the phase-2 rewrite of the
- * save path (`saveDocument()`) has to keep it or say out loud that it does not.
- * The three promises the plan names are pinned:
+ * Written as a plan-709 characterisation of the pre-`saveDocument()` flow, and
+ * rebuilt here rather than patched, because two of its three original promises
+ * described cases that no longer exist:
  *
- *  1. an **Untitled** document asks for a name before anything is written, and
- *     cancelling the prompt writes nothing at all;
+ *  - the **Untitled** document that asked for a name before anything was
+ *    written is gone with base kind `'empty'` (F3): a document is created with
+ *    a path before the editor opens it, so an unnamed one saves to ITS OWN
+ *    file. What replaced that prompt is the one for a read-only source, and it
+ *    is pinned in `save-into-project-prompt.test.ts`;
+ *  - the planner-cache invalidation is no longer performed BY the save flow
+ *    (Defect b): it hangs off `viewer.emit('document-saved', …)`, so what this
+ *    file pins is that the event is emitted, not that a plugin was poked.
+ *
+ * What survives unchanged, and is still the reason this file exists:
+ *
+ *  1. a named document saves without asking anything, and "Save as…" is the
+ *     only thing that prompts;
  *  2. a save writes **two** blobs — the GLB and the thumbnail beside it in
- *     `library/.thumbnails/` — and the thumbnail failing does not fail the save;
- *  3. after a successful save the planner's decoded copy of the asset is
- *     dropped and the document is re-based onto a `libraryGlb` identity
- *     carrying the library-relative path.
+ *     `library/.thumbnails/` — and the thumbnail failing does not fail it;
+ *  3. live-preview holders get to restore before the tree is cloned;
+ *  4. after a successful save the document is re-based onto the identity it
+ *     now has.
  *
- * Plus one boundary the plan needs (§5, risk "Registry-Löschung bricht
+ * Plus one boundary (plan-709 §5, risk "Registry-Löschung bricht
  * Share-Overlay"): the share card hangs in the `'overlay'` UI slot and never
  * depended on the hierarchy-header registry that phase 6 deleted.
  */
@@ -59,19 +68,23 @@ const backend = {
 };
 
 import { runSaveFlow, saveAssetAs } from '@rv-private/plugins/asset-editor/save-flow';
+// The save prompt lives in the PUBLIC store since plan-719 §2.10 — one pending
+// slot per document, whichever entry point asks — so this is where the test
+// answers it from too.
 import {
-  getPendingDialog,
-  subscribeEditorDialogs,
-} from '@rv-private/plugins/asset-editor/editor-dialog-store';
+  getPendingSaveDialog,
+  resetSaveDialogsForTests,
+  subscribeSaveDialogs,
+} from '../src/core/hmi/scene/save-dialog-store';
 import { SharePlugin } from '../src/core/share/share-plugin';
 import hierarchyBrowserSource from '../src/core/hmi/rv-hierarchy-browser.tsx?raw';
 import type { AssetBase } from '../src/core/editor/rv-asset-document';
 import { libraryDocumentBase } from '../src/core/editor/active-asset-store';
 
-/** Answer the next dialog of `kind`; returns an unsubscribe. */
+/** Answer the next save dialog of `kind`; returns an unsubscribe. */
 function autoAnswer(kind: string, answer: unknown): () => void {
-  return subscribeEditorDialogs(() => {
-    const pending = getPendingDialog();
+  return subscribeSaveDialogs(() => {
+    const pending = getPendingSaveDialog();
     if (pending?.kind === kind) {
       (pending as unknown as { resolve: (v: unknown) => void }).resolve(answer);
     }
@@ -87,9 +100,10 @@ function context(name: string) {
   const emitted: string[] = [];
   const doc = {
     name,
-    // A fresh, unsaved asset: the shape the editor opens on and the one the
-    // name prompt exists for.
-    base: { kind: 'empty' } as AssetBase,
+    // A document of the project's Custom library. Since plan-719 F3 there is
+    // no other shape the editor can open on: every document has a path from
+    // the moment it is created.
+    base: libraryDocumentBase(`Custom/${name}.glb`) as AssetBase,
     dirty: true,
     // The implicit name prompt names the DOCUMENT (save-flow renames before
     // saving, so an unnamed document's first save stays in place).
@@ -132,30 +146,52 @@ beforeEach(() => {
 });
 
 describe('editor save flow — the name prompt', () => {
-  it('asks for a name when the document is Untitled', async () => {
-    const { ctx, saved } = context('Untitled');
-    const off = autoAnswer('name', 'Belt');
+  /**
+   * F1: a document saves to itself, in silence. This is the rule the whole
+   * plan collapses to, and the case that used to be a prompt.
+   */
+  it('a named document saves without asking anything', async () => {
+    let asked = 0;
+    const off = subscribeSaveDialogs(() => { if (getPendingSaveDialog()) asked++; });
+    const { ctx } = context('Gripper');
     try {
       expect(await runSaveFlow(ctx)).toBe(true);
     } finally { off(); }
-    expect(writes[0]).toBe('library/Custom/Belt.glb');
-    expect(saved[0].name).toBe('Belt');
+    expect(asked).toBe(0);
+    expect(writes[0]).toBe('library/Custom/Gripper.glb');
   });
 
-  it('cancelling the prompt writes NOTHING and reports failure', async () => {
-    const { ctx, saved } = context('Untitled');
+  it('"Save as…" is the one verb that prompts, and it names a new file', async () => {
+    const { ctx, saved } = context('Belt');
+    const off = autoAnswer('name', 'Belt v2');
+    try {
+      expect(await runSaveFlow(ctx, { forceNamePrompt: true })).toBe(true);
+    } finally { off(); }
+    expect(writes[0]).toBe('library/Custom/Belt v2.glb');
+    expect(saved[0].name).toBe('Belt v2');
+  });
+
+  it('cancelling that prompt writes NOTHING and reports failure', async () => {
+    const { ctx, saved } = context('Belt');
     const off = autoAnswer('name', null);
     try {
-      expect(await runSaveFlow(ctx)).toBe(false);
+      expect(await runSaveFlow(ctx, { forceNamePrompt: true })).toBe(false);
     } finally { off(); }
     expect(writes).toEqual([]);
     expect(saved).toEqual([]);
   });
 
-  it('a named document saves without asking', async () => {
-    const { ctx } = context('Gripper');
-    expect(await runSaveFlow(ctx)).toBe(true);
-    expect(writes[0]).toBe('library/Custom/Gripper.glb');
+  /**
+   * plan-719 §2.2, row 3. A name that merely DIFFERS from the document's own
+   * used to be read as a Save-As and forked a new file — so renaming a
+   * document and then saving it silently left the original behind and moved
+   * the session onto a copy nobody asked for.
+   */
+  it('a differing name alone does NOT fork a new file', async () => {
+    const { ctx } = context('Belt');
+    const outcome = await saveAssetAs(ctx, 'Belt renamed');
+    expect(outcome.kind).toBe('saved');
+    expect(writes[0]).toBe('library/Custom/Belt.glb');
   });
 });
 
@@ -192,16 +228,21 @@ describe('editor save flow — after the write', () => {
     expect(saved[0].base).toEqual(libraryDocumentBase('Custom/Belt.glb'));
   });
 
-  // The save used to end by re-scanning a local working folder so the new asset
-  // appeared in the planner. That folder is gone (plan-709 §2.6) and the save
-  // writes into the project's own library, so there is nothing to re-scan —
-  // only the planner's DECODED copy of the old bytes to drop, or the next
-  // placement would silently use the pre-save geometry.
-  it('drops the planner cache for the saved asset, and scans no folder', async () => {
-    const { ctx, refreshed, invalidated } = context('Belt');
+  /**
+   * plan-719 F8 / Defect (b). The save used to drop the planner's decoded copy
+   * itself, by reaching into the plugin and matching the saved path against
+   * its catalog — which only ever matched `library/**`, so a document under
+   * `models/` was placed from pre-save geometry afterwards. What the save flow
+   * owes the rest of the app is now an ANNOUNCEMENT; who listens is their
+   * business, and the planner's own subscription is pinned where the planner
+   * is.
+   */
+  it('announces the save and no longer reaches into the planner', async () => {
+    const { ctx, refreshed, invalidated, emitted } = context('Belt');
     await saveAssetAs(ctx, 'Belt');
+    expect(emitted).toContain('document-saved');
     expect(refreshed).toEqual([]);
-    expect(invalidated).toEqual(['Custom/Belt.glb']);
+    expect(invalidated).toEqual([]);
   });
 });
 

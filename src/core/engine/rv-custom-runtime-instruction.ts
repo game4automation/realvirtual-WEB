@@ -46,6 +46,7 @@ import {
 } from './rv-error-visual';
 import { showStatusOutline, hideStatusOutline } from './rv-status-outline';
 import { wireValueSignal } from './rv-signal-wiring';
+import { reportProblem } from '../hmi/problems-store';
 import type { InstructionEntry, InstructionStep } from './rv-instruction-runtime-store';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -260,6 +261,17 @@ export class RVCustomRuntimeInstruction implements RVComponent {
    *  Never throws (runOnSceneReady isolates per component, but be defensive). */
   onSceneReady(ctx: ComponentContext): void {
     this._ctx = ctx;
+    // Resolve the step targets HERE and nowhere earlier (plan-734 F6/F7). This
+    // is the first point at which the registry is final: node aliases are
+    // registered (Phase 6) and kinematic re-parenting has already recomputed
+    // the paths it moves (Phase 8b/8c). Both load paths — `loadGLB` and
+    // `processExtras` for placed assets — run onSceneReady after those phases.
+    //
+    // Doing it lazily in `highlightStep()` (the old behaviour) meant a dead
+    // target produced a console warning at most, on the step the operator
+    // happened to navigate to, and nothing at all in the UI.
+    this._resolveTargets(ctx);
+
     if (ctx.gizmoManager) {
       // Type-colored highlight on the owning node, hidden until active.
       this._highlightGizmo = createErrorHighlightGizmo(
@@ -273,6 +285,36 @@ export class RVCustomRuntimeInstruction implements RVComponent {
     } else if (this._signalHigh) {
       // Signal already high at load → active after onSceneReady (no rising edge fires).
       this._setActive(true);
+    }
+  }
+
+  /**
+   * Mark every step target that does not exist in the loaded model, and report
+   * each one to the Problems panel.
+   *
+   * `reportProblem` is called UNCONDITIONALLY, deliberately not gated on the
+   * module-level `warnedTargetPaths` set: that set is never cleared (not even
+   * by `dispose()`), so a path warned about during an earlier model would
+   * silently suppress the panel entry for the model actually on screen. The
+   * problems store has its own, correct retire mechanism.
+   */
+  private _resolveTargets(ctx: ComponentContext): void {
+    const registry = ctx.registry;
+    for (const step of this.steps) {
+      const unresolved = step.targetPaths.filter((p) => registry.getNode(p) === null);
+      step.unresolvedTargetPaths = unresolved;
+      for (const path of unresolved) {
+        reportProblem({
+          id: `unresolved-instruction-target:${this.path}:${path}`,
+          severity: 'warning',
+          code: 'unresolved-instruction-target',
+          title: 'Instruction target not found',
+          // F16: a problem must always name what was looked for, or the user is
+          // sent hunting through the hierarchy by eye.
+          detail: `No node at "${path}" — the highlight and camera focus for this step do nothing.`,
+          nodePath: this.path,
+        });
+      }
     }
   }
 
@@ -307,8 +349,14 @@ export class RVCustomRuntimeInstruction implements RVComponent {
     const comment = this._signalComment();
     if (!comment) return this.steps;
     if (this.steps.length === 0) {
-      return [{ instruction: comment, targetPath: null, targetPaths: [], url: null }];
+      return [{
+        instruction: comment, targetPath: null, targetPaths: [], url: null,
+        unresolvedTargetPaths: [],
+      }];
     }
+    // The spread carries `unresolvedTargetPaths` along — this path builds a NEW
+    // step literal, so a field the card reads has to survive it explicitly or
+    // it is simply `undefined` whenever a bound signal has a comment.
     return this.steps.map((s) =>
       s.instruction.trim().length === 0 ? { ...s, instruction: comment } : s,
     );

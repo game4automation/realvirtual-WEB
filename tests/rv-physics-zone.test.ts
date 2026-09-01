@@ -10,7 +10,7 @@
  * handover/plugin wiring lives in rv-physics-handover/-surface.test.ts.
  *
  * Also smoke-loads the programmatic E2E fixture
- * `public/models/physics-zone-test.glb` (scripts/build-physics-test-glb.mjs).
+ * `../realvirtual-WebViewer-Private~/projects/Development/fixtures/physics-zone-test.glb` (scripts/build-physics-test-glb.mjs).
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -26,6 +26,15 @@ import {
 } from '../src/core/engine/rv-component-registry';
 import type { PhysicsAABB } from '../src/core/engine/rv-physics-registry';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.physicsZone);
 
 // ─── Helpers (factory-driven construction, mirrors the scene loader) ────────
 
@@ -319,7 +328,7 @@ describe('RVPhysicsZone', () => {
 
 // ─── E2E fixture smoke test (scripts/build-physics-test-glb.mjs) ────────────
 
-describe('physics-zone-test.glb fixture', () => {
+describe.skipIf(!DEV_ASSETS)('physics-zone-test.glb fixture', () => {
   function getPath(node: Object3D): string {
     const parts: string[] = [];
     let current: Object3D | null = node;

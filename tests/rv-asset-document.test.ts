@@ -8,6 +8,7 @@
  * viewer (real NodeRegistry + three Scene, no renderer).
  */
 import { describe, it, expect, beforeEach } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -62,7 +63,7 @@ beforeEach(async () => {
 describe('AssetDocument ops', () => {
   it('setField writes userData; undo restores prev; redo re-applies', async () => {
     const { viewer, box, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 200, 50);
     await doc.whenIdle();
@@ -80,7 +81,7 @@ describe('AssetDocument ops', () => {
 
   it('transformNode applies TRS and undo restores it', async () => {
     const { viewer, box, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.transformNode(
       boxPath,
@@ -97,9 +98,39 @@ describe('AssetDocument ops', () => {
     doc.dispose();
   });
 
+  it('transformNode moves a loader-FROZEN node and its frozen child (matrixWorld follows)', async () => {
+    // Editor loads run `freezeStaticMatrices()`: static nodes get
+    // matrixWorldAutoUpdate=false, and `updateMatrixWorld(true)` deliberately
+    // skips them. Before the fix a transform op landed in the log and the
+    // local matrix while the RENDERED pose stayed baked — the Quick-Edit
+    // tools "only worked" on a node the gizmo had already unfrozen.
+    const { viewer, box, boxPath } = makeMockViewer();
+    const child = new Object3D();
+    child.name = 'Cap';
+    child.position.set(0, 1, 0);
+    box.add(child);
+    child.updateMatrix();
+    box.updateMatrixWorld(true);
+    box.matrixWorldAutoUpdate = false;
+    child.matrixWorldAutoUpdate = false;
+
+    const doc = scratchAssetDocument(viewer);
+    doc.transformNode(
+      boxPath,
+      { position: [5, 0, 0], quaternion: [0, 0, 0, 1], scale: [1, 1, 1] },
+      { position: [0, 0, 0], quaternion: [0, 0, 0, 1], scale: [1, 1, 1] },
+    );
+    await doc.whenIdle();
+
+    // The WORLD matrices are what render and pick — both must have followed.
+    expect([...box.matrixWorld.elements.slice(12, 15)]).toEqual([5, 0, 0]);
+    expect([...child.matrixWorld.elements.slice(12, 15)]).toEqual([5, 1, 0]);
+    doc.dispose();
+  });
+
   it('renameNode re-keys the registry; undo restores the old name', async () => {
     const { viewer, box, boxPath, registry } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.renameNode(boxPath, 'Crate', 'Box');
     await doc.whenIdle();
@@ -115,7 +146,7 @@ describe('AssetDocument ops', () => {
 
   it('deleteNode detaches to trash; undo re-attaches at the original index', async () => {
     const { viewer, model, box, boxPath, registry } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.deleteNode(boxPath);
     await doc.whenIdle();
@@ -133,7 +164,7 @@ describe('AssetDocument ops', () => {
 
   it('setNodeVisible hides the node + stamps rv.Hidden; undo/redo cycle it; no-op when unchanged', async () => {
     const { viewer, box, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     // Hiding an already-visible node records an op.
     doc.setNodeVisible(boxPath, false);
@@ -162,7 +193,7 @@ describe('AssetDocument ops', () => {
 
   it('setNodeVisible replays hidden state from a draft', async () => {
     const first = makeMockViewer();
-    const doc = AssetDocument.newUntitled(first.viewer);
+    const doc = scratchAssetDocument(first.viewer);
     doc.setNodeVisible(first.boxPath, false);
     await doc.whenIdle();
     const draft = doc.toDraft();
@@ -178,7 +209,7 @@ describe('AssetDocument ops', () => {
 
   it('importCad renames duplicate sibling part names so every instance gets its own registry path', async () => {
     const { viewer, model, registry } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     // CAD assemblies commonly repeat part names — 3× "Bolt" + a legitimate
     // pre-existing "Bolt_1" that renamed duplicates must not steal.
@@ -213,7 +244,7 @@ describe('AssetDocument ops', () => {
 
   it('structural ops emit editor-structure-changed (forward AND inverse); field ops do not', async () => {
     const { viewer, boxPath, emitted } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const structural = () => emitted.filter((e) => e.event === 'editor-structure-changed').length;
 
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 200, 50);
@@ -231,7 +262,7 @@ describe('AssetDocument ops', () => {
 
   it('markSaved re-bases dirty tracking and flushes the trash', async () => {
     const { viewer, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     doc.deleteNode(boxPath);
     await doc.whenIdle();
     expect(doc.dirty).toBe(true);
@@ -245,7 +276,7 @@ describe('AssetDocument ops', () => {
 
   it('withTransaction folds multiple ops into ONE undo step', async () => {
     const { viewer, box, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     await doc.withTransaction('Edit two fields', async () => {
       doc.setField(boxPath, 'Drive', 'TargetSpeed', 300, 50);
@@ -266,7 +297,7 @@ describe('AssetDocument ops', () => {
 describe('AssetDocument drafts (IndexedDB)', () => {
   it('draft write/load/clear round-trip preserves shell + ops', async () => {
     const { viewer, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 120, 50);
     await doc.whenIdle();
 
@@ -284,7 +315,7 @@ describe('AssetDocument drafts (IndexedDB)', () => {
 
   it('replayOps rebuilds the edited state from a draft', async () => {
     const first = makeMockViewer();
-    const doc = AssetDocument.newUntitled(first.viewer);
+    const doc = scratchAssetDocument(first.viewer);
     doc.setField(first.boxPath, 'Drive', 'TargetSpeed', 999, 50);
     await doc.whenIdle();
     const draft = doc.toDraft();
@@ -323,7 +354,7 @@ describe('AssetDocument draft frame', () => {
 
   it('ohne Stack-Frame schreibt das Dokument seinen EIGENEN Root-Frame', async () => {
     const { viewer, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     expect(doc.draftFrame).toEqual(rootFrame(null, doc.id));
 
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 120, 50);
@@ -338,7 +369,7 @@ describe('AssetDocument draft frame', () => {
 
   it('mit Frame schreibt es genau diesen Slot — und keinen zweiten', async () => {
     const { viewer, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     doc.setDraftFrame(frameOf('ref-a/ref-b'));
 
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 120, 50);
@@ -356,14 +387,14 @@ describe('AssetDocument draft frame', () => {
 
   it('zwei Frames schreiben in getrennte Slots — das Kind laesst den Eltern-Draft stehen', async () => {
     const parentEnv = makeMockViewer();
-    const parent = AssetDocument.newUntitled(parentEnv.viewer);
+    const parent = scratchAssetDocument(parentEnv.viewer);
     parent.setDraftFrame(frameOf(''));
     parent.setField(parentEnv.boxPath, 'Drive', 'TargetSpeed', 111, 50);
     await parent.whenIdle();
     await parent.flushDraft();
 
     const childEnv = makeMockViewer();
-    const child = AssetDocument.newUntitled(childEnv.viewer);
+    const child = scratchAssetDocument(childEnv.viewer);
     child.setDraftFrame(frameOf('ref-child'));
     child.setField(childEnv.boxPath, 'Drive', 'TargetSpeed', 222, 50);
     await child.whenIdle();
@@ -385,7 +416,7 @@ describe('AssetDocument draft frame', () => {
 
   it('ein sauberes Dokument raeumt seinen Frame-Slot, statt einen Draft zu hinterlassen', async () => {
     const { viewer, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     doc.setDraftFrame(frameOf('ref-a'));
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 120, 50);
     await doc.whenIdle();
@@ -402,7 +433,7 @@ describe('AssetDocument draft frame', () => {
 
   it('markSaved raeumt den Frame-Slot — auch fuer eine libraryGlb-Basis', async () => {
     const { viewer, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     doc.setDraftFrame(frameOf('ref-a'));
     doc.setField(boxPath, 'Drive', 'TargetSpeed', 120, 50);
     await doc.whenIdle();

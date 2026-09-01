@@ -11,7 +11,11 @@
 import { useViewerEvent } from './use-viewer-event';
 import { useViewer } from './use-viewer';
 import type { McpBridgePluginAPI } from '../core/types/plugin-types';
-import { DEFAULT_BRIDGE_PORT } from '../plugins/mcp-bridge-plugin';
+// plan-713 NF3 — the ONE value import that kept the ~168 kB MCP cluster in the
+// eager entry bundle, even though main.ts loads the bridge lazily. It points at
+// the leaf constants module now; the type import below is erased at compile time
+// and costs nothing.
+import { DEFAULT_BRIDGE_PORT } from '../plugins/mcp-bridge/rv-mcp-bridge-ports';
 import type { McpBridgeSnapshot, McpServerLogLine } from '../plugins/mcp-bridge-plugin';
 
 /** Default state when MCP plugin is not loaded or model not yet available. */

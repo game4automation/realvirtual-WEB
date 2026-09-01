@@ -15,6 +15,8 @@ import { describe, it, expect } from 'vitest';
 import {
   buildForceChartOption,
   pairForceSamples,
+  formatForceValue,
+  formatSiMagnitude,
   FORCE_PEAK_COLOR,
   FORCE_RMS_COLOR,
   FORCE_HOLDING_COLOR,
@@ -46,6 +48,30 @@ describe('pairForceSamples', () => {
     // The series was created one tick after the timestamp was pushed; the newer
     // samples are the ones that correspond.
     expect(pairForceSamples([0, 1, 2], [6, 7])).toEqual([[1, 6], [2, 7]]);
+  });
+});
+
+describe('SI value formatting', () => {
+  it('scales large magnitudes instead of printing digit walls', () => {
+    // The Delta run that motivated this printed "Peak 10632343.00 N·m".
+    expect(formatForceValue(10632343, 'N·m')).toBe('10.6 MN·m');
+    expect(formatForceValue(1710810.41, 'N·m')).toBe('1.71 MN·m');
+    expect(formatForceValue(14687.99, 'N·m')).toBe('14.7 kN·m');
+    expect(formatSiMagnitude(30000000)).toBe('30.0 M');
+  });
+
+  it('keeps small values plain and signs intact', () => {
+    expect(formatForceValue(2.4, 'N·m')).toBe('2.40 N·m');
+    expect(formatForceValue(-48.2, 'N·m')).toBe('-48.2 N·m');
+    expect(formatForceValue(248, 'N')).toBe('248 N');
+    // Sub-centinewton readings drop to milli instead of rounding to "0.00".
+    expect(formatForceValue(0.004, 'N·m')).toBe('4.00 mN·m');
+    expect(formatForceValue(0, 'N·m')).toBe('0.00 N·m');
+  });
+
+  it('reports a dash for non-finite values, never NaN text', () => {
+    expect(formatForceValue(Number.NaN, 'N')).toBe('—');
+    expect(formatSiMagnitude(Number.POSITIVE_INFINITY)).toBe('—');
   });
 });
 

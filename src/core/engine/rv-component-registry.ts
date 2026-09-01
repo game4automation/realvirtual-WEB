@@ -24,6 +24,7 @@ import type { GizmoOverlayManager } from './rv-gizmo-manager';
 import type { LampManager } from './rv-lamp-manager';
 import type { SceneButtonManager } from './rv-scene-button-manager';
 import type { EnergyChainManager } from './rv-energy-chain-manager';
+import type { ChainManager } from './rv-chain-manager';
 import type { MachiningManager } from './rv-machining-manager';
 import type { CollisionRoleRegistrar } from './rv-collision-role';
 import type { KinematicManagerLike } from './rv-kinematic-registry';
@@ -241,6 +242,13 @@ export interface ComponentContext {
    */
   energyChainManager?: EnergyChainManager;
   /**
+   * Optional viewer-owned registry for `Chain` components (plan-733). `RVChain`
+   * registers itself here so `CoreSubsystems.visuals()` can pose its elements
+   * after the drive stage, and so `resetSimulation()` can re-pose them AFTER the
+   * drive resets. Absent → the chain is built and placed but never ticks.
+   */
+  chainManager?: ChainManager;
+  /**
    * Optional viewer-owned CSG machining registry (plan-405). `MachiningVolume`
    * components register themselves here in `onSceneReady()` (after Kinematic
    * re-parenting, so tool nodes are in their final hierarchy position); every
@@ -288,6 +296,20 @@ export interface ComponentContext {
    * re-parenting left to happen, so they rig immediately in `init()`.
    */
   expectSceneReady?: boolean;
+  /**
+   * True on an AUTHORING load — the asset editor, which saves back the tree it
+   * sees (plan-733 R4). Fed from `preserveAuthoringHierarchy`, NOT from
+   * `preserveHierarchy`: that one is a mesh-bake flag which the simulating embed
+   * runtime sets too (see the note on `LoadGLBOptions.preserveAuthoringHierarchy`).
+   *
+   * Components that MATERIALISE runtime geometry from their configuration must
+   * skip that work here: `RVChain` would otherwise clone `NumberOfElements`
+   * copies of its template into the document, the save would bake them in, and
+   * the next round trip would clone N per baked copy. The prune allowlist in
+   * `rv-asset-glb-export.ts` is the second half of the defence, not a substitute
+   * — a marker only helps for geometry that reaches the export path at all.
+   */
+  authoring?: boolean;
 }
 
 /** Interface all auto-mapped components implement */

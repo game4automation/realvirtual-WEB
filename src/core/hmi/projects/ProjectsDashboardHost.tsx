@@ -20,8 +20,11 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { Alert, Box, Button, IconButton, ListItemText, Menu, MenuItem, Snackbar, Tooltip, Typography } from '@mui/material';
-import { Add, ChevronRight, DeleteOutline, MoreVert, Refresh } from '@mui/icons-material';
+import { Alert, Box, Button, Chip, Divider, IconButton, ListItemText, Menu, MenuItem, Snackbar, Tooltip, Typography } from '@mui/material';
+import { SectionHeader } from '../shared-components';
+import {
+  Add, ChevronRight, DeleteOutline, MoreVert, Refresh, SettingsEthernet,
+} from '@mui/icons-material';
 import type { LibraryCatalogEntry } from '../../library/library-types';
 import { debug } from '../../engine/rv-debug'; // TEMP open-perf instrumentation
 import {
@@ -49,9 +52,10 @@ import {
   probeOpenFolder,
   scanStoredWorkspace,
 } from '../../project/rv-project-workspace';
-import { detectOpenTarget, resolveResumeTarget } from '../../project/rv-project-open';
+import { detectOpenTarget, projectStartDocument, resolveResumeTarget } from '../../project/rv-project-open';
+import { findStartDocument } from '../../project/rv-project-documents';
 import { readRememberedSession, rememberSession } from '../../project/rv-project-resume-store';
-import { selectFolderForKey } from '../../engine/rv-local-filesystem';
+import { pickFolderForKey, type FolderPick } from '../../engine/rv-local-filesystem';
 import { exportProject, importProject, RVPROJECT_EXTENSION } from '../../project/rv-project-transport';
 import type { WorkspaceProjectEntry } from '../../project/rv-project-workspace';
 import { useMode } from '../../../hooks/use-mode';
@@ -78,6 +82,7 @@ import {
   documentBase,
   getOpenDocumentBase,
   projectDocumentBase,
+  sameDocumentBase,
   sceneDocumentBase,
   setOpenDocumentBase,
 } from '../../editor/active-asset-store';
@@ -85,6 +90,10 @@ import { NO_PROJECT } from '../../thumbnails';
 import type { ThumbnailKeyParts } from '../../thumbnails/thumbnail-key';
 import { AddLibraryDialog } from '../../library/AddLibraryDialog';
 import { getLibraryStore } from '../../library/library-store-singleton';
+import {
+  readProjectLibraries,
+  withProjectLibraries,
+} from '../../library/project-libraries';
 import { setPendingAssetOpen } from '@rv-private/plugins/asset-editor/pending-open-store';
 import { useViewer } from '../../../hooks/use-viewer';
 import { getSceneStore } from '../scene/scene-store-singleton';
@@ -98,20 +107,36 @@ import {
   buildDashboardTree,
   catalogRootId,
   type CatalogRootInput,
+  type TreeCatalogEntryInput,
 } from '../../project/rv-project-tree-sources';
 import {
   buildProjectTree,
   canRenameInTree,
   findTreeNode,
   folderContents,
+  isRenamableInTree,
   nearestFolderPath,
   planTreeMove,
   type ProjectTreeNode,
 } from '../../project/rv-project-tree';
+import { listProjectFiles } from '../../project/backends/project-backend';
+import {
+  BUILTIN_CATALOG_LABEL,
+  BUILTIN_CATALOG_PROVIDER_ID,
+  BUILTIN_CATALOG_SOURCE_ID,
+  bundledCatalogEntries,
+  dedupeBundledEntries,
+} from '../../project/backends/bundled-backend';
 import { ProjectFolderContents, type FolderCardModel } from './ProjectFolderContents';
 import { applyTreeMove, DOCS_INDEX_FILE, type TreeMoveIO } from '../../project/rv-project-tree-move';
 import { docsIndexPaths, parseDocsIndex, type DocsIndex } from '../../project/rv-docs-index';
 import { findLocalIdCollisions } from '../../project/rv-asset-identity';
+import {
+  isConnectConfigPath, isKnowledgeFilePath, readDocumentRef,
+  stripConnectConfigSuffix, stripKnowledgeFileSuffix,
+} from '../../project/rv-project-refs';
+import { CONNECT_CONFIG_DRAG_TYPE, KNOWLEDGE_FILE_DRAG_TYPE } from './connect-config-dnd';
+import { setDragChip } from './drag-chip';
 import { reportDocumentIdCollisions } from '../problems-store';
 import { selectionPointsIntoGroup, type SelectedAssetRef } from './assets-library-groups';
 import type { ProjectCardMenuAction } from './ProjectCard';
@@ -144,17 +169,67 @@ import {
   documentById,
   documentPickOptions,
   documentRoleBadge,
+  documentsUsingRef,
   documentTypeBadge,
   newDocumentFolderFor,
   newDocumentNameFor,
+  type RefUsage,
 } from './dashboard-documents';
+// plan-446: the two CONNECT bridges of the project browser — "Show in Explorer"
+// (a host action the gateway performs, gated to a local page) and "Open in
+// CONNECT" (the one place a configuration is written).
+import {
+  canRevealInExplorerNow,
+  getConnectSnapshot,
+  revealInExplorer,
+  subscribeConnectStore,
+} from '../connect-store';
+import { ConnectOptionsWindow } from '../ConnectOptionsWindow';
 import type { DocumentClassification } from '../../project/rv-document-classification';
-import { publishedScenePath } from '../scene/rv-published-scenes';
 import type { TieredDocumentEntry } from '../../project/rv-project-tiers';
 
 /** Display name for a manifest asset that carries no explicit `label`. */
 function baseNameOf(path: string): string {
   return (path.split('/').pop() ?? path).replace(/\.glb$/i, '');
+}
+
+/**
+ * The "Used by" block of a reference file's detail pane (plan-446 F4).
+ *
+ * Chips rather than the comma-joined sentence this used to be: the answer to
+ * "who uses this configuration" is almost always followed by "show me that
+ * one", and a click that selects the document in the dashboard is that step.
+ * The empty case keeps its sentence — a row of nothing would read as a loading
+ * state.
+ */
+function usedByChips(usedBy: readonly RefUsage[]) {
+  return (
+    <>
+      <Divider sx={{ my: 1.25, borderColor: 'rgba(255,255,255,0.06)' }} />
+      <SectionHeader>Used by</SectionHeader>
+      {usedBy.length === 0 ? (
+        <Typography
+          data-testid="usedby-empty"
+          sx={{ fontSize: 11, color: 'text.disabled', mt: 0.5 }}
+        >
+          Not referenced by any document
+        </Typography>
+      ) : (
+        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 0.5 }}>
+          {usedBy.map(doc => (
+            <Chip
+              key={doc.id}
+              data-testid={`usedby-chip-${doc.id}`}
+              label={doc.name}
+              size="small"
+              onClick={() => setProjectsSelection({ kind: 'document', documentId: doc.id })}
+              sx={{ fontSize: 10, height: 20, maxWidth: '100%' }}
+            />
+          ))}
+        </Box>
+      )}
+    </>
+  );
 }
 
 // `readRememberedSession` / `rememberSession` used to live here as private
@@ -188,10 +263,71 @@ function libraryRelPathOf(entry: LibraryCatalogEntry): string | null {
  * detail pane looks the row up by.
  */
 interface DocumentRow extends ClassifiedRow {
-  /** `scene:<id>`, `model:<path>` or `published:<urlName>`. */
+  /** `scene:<id>` or `model:<path>`. */
   key: string;
   /** The manifest document, when this row has one. Absent for a bare example. */
   doc?: TieredDocumentEntry;
+}
+
+/** What {@link openDocumentAsWorkingScene} needs of the viewer — the mode manager. */
+export interface WorkingSceneOpenModes {
+  activeMode: string | null;
+  list(): readonly { id: string }[];
+  setMode(id: string): void;
+  requestMode(id: string): unknown;
+}
+
+/**
+ * Open a document row as the working scene — including the EDITOR handoff.
+ *
+ * Exported (and separated from the host's `openScene` callback) so the handoff
+ * contract is testable; the host wraps it in its dirty guard and dashboard
+ * dismissal, which stay UI concerns.
+ *
+ * A double-click with the EDITOR active must put the clicked document INTO the
+ * editor. The editor resolves what it shows only on mode activation
+ * (`_resolveOpenPlan`), so with the mode already active the load would swap
+ * the viewport model while the editor kept its old document — header, op log
+ * and edits all pointing at the previous asset. Leave before the load
+ * (releases the old binding) and re-enter after the identity is published, so
+ * the open plan binds the document this click names — the same
+ * leave-and-re-enter `web_editor_open` uses. The re-entry carries the identity
+ * as an EXPLICIT pending open (same as `openAssetInEditor`): a plain re-entry
+ * lets a recoverable crash draft of ANOTHER document silently open instead of
+ * the document this click names; with the pending set, a conflicting draft is
+ * asked about instead of winning by default.
+ *
+ * After the load the identity is published exactly as `openModel` does
+ * (plan-711 F1): `SceneStore._loadIntoWorkspace` already recorded the same
+ * identity on the way through — this is the call site the plan names, written
+ * through the SAME constructor so the two can only agree. The name comes from
+ * the row the user clicked, read off THE one list since plan-716 Phase 5 (F8);
+ * without a row the funnel's write stands rather than being overwritten with a
+ * guess. The resume pair is NOT written here (plan-702 Phase 3): the
+ * `SceneStore.openDocument` funnel writes it itself, with alias tolerance this
+ * call site never had.
+ */
+export async function openDocumentAsWorkingScene(
+  viewer: { modes: WorkingSceneOpenModes },
+  sceneStore: { openScene(id: string): Promise<void> },
+  documents: readonly TieredDocumentEntry[],
+  id: string,
+): Promise<void> {
+  const modes = viewer.modes;
+  const wasEditor = modes.activeMode === 'editor';
+  if (wasEditor) {
+    const ids = modes.list().map((m) => m.id);
+    modes.setMode(ids.find((mid) => mid !== 'editor') ?? 'hmi');
+  }
+  await sceneStore.openScene(id);
+  const sceneRow = documentById(documents, id);
+  if (sceneRow) setOpenDocumentBase(sceneDocumentBase(id, sceneRow.name));
+  if (wasEditor) {
+    if (sceneRow) {
+      setPendingAssetOpen(documentBase(id, sceneRow.name, sceneRow.path));
+    }
+    void modes.requestMode('editor');
+  }
 }
 
 export function ProjectsDashboardHost() {
@@ -204,6 +340,11 @@ export function ProjectsDashboardHost() {
   // (plan-702 §2.9). Dropping it here brings back the pre-702 behaviour where
   // a new file in a local folder never appeared.
   const registryVersion = useSyncExternalStore(subscribeLibrarySources, getLibrarySourcesSnapshot);
+  // plan-446 F3. Read here rather than probed per menu open: the flag already
+  // travels on the `/health` this screen's gateway connection made, so the verb
+  // costs no request — and it re-appears by itself when a reconnect answers
+  // `revealSupported` again after a refusal cleared it.
+  const connectSnap = useSyncExternalStore(subscribeConnectStore, getConnectSnapshot);
 
   const [workspaceProjects, setWorkspaceProjects] = useState<WorkspaceProjectEntry[]>([]);
   const [recent, setRecent] = useState(() => readRecentProjects());
@@ -260,16 +401,31 @@ export function ProjectsDashboardHost() {
     if (autoOpenedRef.current) return;
     autoOpenedRef.current = true;
     const cfg = getAppConfig();
+    // Boot-restore failure (plan-702 Punkt 3): the last session's project did
+    // not come back — say so and open the list so one click re-grants it. Read
+    // once, here: the effect runs exactly once per session by design.
+    const failure = store.getSnapshot().restoreFailure;
+    if (failure) {
+      const name = failure.projectName ?? failure.projectId;
+      setMessage(failure.reason === 'permission'
+        ? `The project "${name}" could not be restored — the folder permission has expired. Open it again to re-grant access.`
+        : `The project "${name}" could not be restored — its folder is missing or unreadable. Open it again from its current location.`);
+    }
     if (shouldAutoOpenProjects({
       search: window.location.search,
       defaultModel: cfg.defaultModel,
+      // Read from the store rather than from `project` (the hook's snapshot):
+      // this effect runs exactly once, and it must see the project the boot
+      // resolved, not whatever the first render happened to hold (plan-726 F3).
+      projectStartDocument: projectStartDocument(store.getSnapshot().project),
       modeLocked,
       suppress: cfg.projects?.suppress,
       force: cfg.projects?.force,
+      restoreFailed: failure !== null,
     })) {
       openProjectsDashboard();
     }
-  }, [modeLocked]);
+  }, [modeLocked, store]);
 
   // A recent entry that is also a workspace subfolder would appear twice; the
   // workspace listing wins because it is the live, on-disk truth.
@@ -370,6 +526,28 @@ export function ProjectsDashboardHost() {
   const [fromScenes, setFromScenes] = useState<FromScenesRequest | null>(null);
   const [newProjectName, setNewProjectName] = useState<string | null>(null);
 
+  /**
+   * Show the folder picker and, when no folder comes back, say why.
+   *
+   * Only `cancelled` is silent — the user dismissed a dialog they opened, and
+   * narrating that is noise. Every other empty outcome used to look exactly
+   * like a cancel, which is how a browser without the File System Access API
+   * turned "Open workspace…" into a button that visibly did nothing.
+   */
+  const pickFolder = useCallback(async (
+    key: string,
+  ): Promise<FileSystemDirectoryHandle | null> => {
+    const pick: FolderPick = await pickFolderForKey(key);
+    if (pick.kind === 'picked') return pick.dir;
+    if (pick.kind === 'unsupported') {
+      setMessage('This browser cannot open local folders. '
+        + 'Folder projects need the File System Access API — use Chrome or Edge.');
+    } else if (pick.kind === 'blocked') {
+      setMessage(pick.reason);
+    }
+    return null;
+  }, []);
+
   /** Run a verb, surfacing failures instead of swallowing them. */
   const runVerb = useCallback(async (label: string, fn: () => Promise<unknown>) => {
     setBusy(true);
@@ -440,8 +618,8 @@ export function ProjectsDashboardHost() {
       // Picked under the project key rather than the workspace one: a folder we
       // have not classified yet must not become "the workspace" just by being
       // looked at. `adoptWorkspace` below is what promotes it, once we know.
-      const dir = await selectFolderForKey('rv-project-pick');
-      if (!dir) return;                // user cancelled the picker — not an error
+      const dir = await pickFolder('rv-project-pick');
+      if (!dir) return;                // cancelled, or already explained by pickFolder
       const target = detectOpenTarget(await probeOpenFolder(dir));
 
       if (target.kind === 'project') {
@@ -474,7 +652,7 @@ export function ProjectsDashboardHost() {
       // folder the user deliberately chose.
       setCreateHere({ dir, name: dir.name || 'New Project' });
     });
-  }, [runVerb, store]);
+  }, [runVerb, store, pickFolder]);
 
   /** Create a project in the folder the single "Open…" found empty. */
   const submitCreateHere = useCallback(() => {
@@ -535,7 +713,7 @@ export function ProjectsDashboardHost() {
       if (!file) return;                 // cancelled — not an error
       // Unpacked into a folder the user picks now — and that folder becomes the
       // workspace, which is where the import will be listed again next time.
-      const dir = await selectFolderForKey('rv-project-pick');
+      const dir = await pickFolder('rv-project-pick');
       if (!dir) return;
       await adoptWorkspace(dir);
       const result = await importProject(file, dir);
@@ -543,7 +721,7 @@ export function ProjectsDashboardHost() {
         'message' in result ? result.message : 'Import failed.');
       setMessage(`Imported "${result.project.name}" (${result.entryCount} files).`);
     });
-  }, [runVerb]);
+  }, [runVerb, pickFolder]);
 
   /**
    * Every document of the open project by path — the lookup the asset verbs need.
@@ -599,7 +777,10 @@ export function ProjectsDashboardHost() {
    * base routes Save through `save-into-project` with `copies: true`
    * (`decideSaveVerb`), which is the "make it mine" semantics a FOREIGN catalog
    * needs — applied to the project's own asset it wrote a second file
-   * (`Name_1.glb`) on every save instead of the one that was opened. Ownership
+   * (`Name_1.glb`) on every save instead of the one that was opened. Since
+   * plan-719 F2 that route also PROMPTS ("Save into project as…") rather than
+   * copying silently, which makes getting this wrong louder but no less wrong:
+   * the user would be asked to place a file they already own. Ownership
    * is the row, never the folder (plan-716/717: the section is a place, not a
    * type) — so the test is `documentByPath`, and the identity handed over is
    * the row itself: its id, its name, its path, wherever the file sits.
@@ -645,8 +826,7 @@ export function ProjectsDashboardHost() {
    * A mis-click must never delete, hence the confirmation; and a delete gesture
    * must never be terminal, hence `.trash/`.
    */
-  const handleDeleteAsset = useCallback((relPath: string, name: string) => {
-    const doc = documentByPath.get(`${LIBRARY_FOLDER}/${relPath}`);
+  const handleDeleteAsset = useCallback((doc: TieredDocumentEntry | undefined, name: string) => {
     setConfirmReq({
       title: 'Delete asset',
       message: `Delete "${name}"? It is moved to the project's trash folder.`,
@@ -665,7 +845,7 @@ export function ProjectsDashboardHost() {
         });
       },
     });
-  }, [runAssetOp, store, documentByPath]);
+  }, [runAssetOp, store]);
 
   // ── Cross-source copy / move (plan-413 §2.7, phase 5) ─────────────────
   const [transferReq, setTransferReq] = useState<TransferRequest | null>(null);
@@ -796,8 +976,21 @@ export function ProjectsDashboardHost() {
     if (!isProjectAsset || !writable) return actions;
     const relPath = libraryRelPathOf(entry);
     if (!relPath) return actions;
-    // No "Rename" action: the pane's title edits inline on click, through the
-    // same `renameLibraryAsset` commit this button used to reach via a dialog.
+    // The row behind this card. Since plan-716 the provider lists EVERY document
+    // and `localPath` is the row's full project-relative path — `models/X.glb`
+    // as much as `library/X.glb`. Re-prefixing `library/` unconditionally (the
+    // pre-716 spelling) made every non-library card's Delete/Duplicate resolve
+    // to nothing and fail with "not registered"; try the row's own spelling
+    // first, the historical library-relative one second.
+    const doc = entry.localPath
+      ? documentByPath.get(entry.localPath)
+        ?? documentByPath.get(`${LIBRARY_FOLDER}/${entry.localPath}`)
+      : documentByPath.get(`${LIBRARY_FOLDER}/${relPath}`);
+    // No "Rename" entry in THIS list, and that is not the same as no Rename
+    // verb: the pane synthesises one from `onRename` (plan-450 §2.2) and places
+    // it after the last `primary` action. The commit is the `renameLibraryAsset`
+    // below — the same one the pre-717 dialog reached, minus the dialog. Adding
+    // it here would produce two buttons for one verb.
     actions.push({
       key: 'dup',
       label: 'Duplicate',
@@ -806,7 +999,6 @@ export function ProjectsDashboardHost() {
       // — the same inheritance `duplicateAsset` gave through the sidecar, now
       // from the one place the filing lives.
       onClick: () => {
-        const doc = documentByPath.get(`${LIBRARY_FOLDER}/${relPath}`);
         void runAssetOp('Duplicate asset', async () => {
           if (!doc) {
             return {
@@ -829,17 +1021,17 @@ export function ProjectsDashboardHost() {
       onClick: () => setAssetDialog({
         kind: 'collections',
         relPath,
-        value: (documentByPath.get(`${LIBRARY_FOLDER}/${relPath}`)?.collections ?? []).join(', '),
+        value: (doc?.collections ?? []).join(', '),
       }),
     });
-    // The cross-source verbs (§2.7). The library asset IS a document — the
-    // manifest lists it under `library/` — so the lookup is by its path.
-    actions.push(...transferActionsFor(documentByPath.get(`${LIBRARY_FOLDER}/${relPath}`)));
+    // The cross-source verbs (§2.7). The asset IS a document — wherever its
+    // file sits — so the lookup is by its row, resolved above.
+    actions.push(...transferActionsFor(doc));
     actions.push({
       key: 'delete',
       label: 'Delete',
       destructive: true,
-      onClick: () => handleDeleteAsset(relPath, entry.name),
+      onClick: () => handleDeleteAsset(doc, entry.name),
     });
     return actions;
   }, [openAssetInEditor, runAssetOp, handleDeleteAsset, transferActionsFor, documentByPath, store]);
@@ -938,37 +1130,25 @@ export function ProjectsDashboardHost() {
 
   const openScene = useCallback((id: string) => {
     if (!sceneStore) return;
+    // Opening the document that is ALREADY open means one thing: the dashboard
+    // is the only thing between the user and it. Close it and touch nothing —
+    // no reload, no dirty guard, no editor leave/re-enter, unsaved edits
+    // intact. `sameDocumentBase` compares by documentId alone (a rename is the
+    // same document), and a false negative here merely reloads — the
+    // conservative side of plan-711 risk 8.
+    if (sameDocumentBase(getOpenDocumentBase(), documentBase(id, ''))) {
+      closeProjectsDashboard();
+      return;
+    }
     trySwitch(async () => {
       // Close BEFORE the await, as `openAssetInEditor` does: the dashboard sits
       // at PROJECTS_DASHBOARD_ZINDEX (10500) above the info overlay (10000), so
       // closing it after the load means the "Loading…" overlay the SceneStore
       // shows is covered for its entire lifetime and the click appears dead.
       closeProjectsDashboard();
-      await sceneStore.openScene(id);
-      // Say WHAT is now open, exactly as `openModel` does below (plan-711 F1).
-      // `SceneStore._loadIntoWorkspace` already recorded the same identity on
-      // the way through — this is the call site the plan names, and it is
-      // written through the SAME constructor so the two can only agree. The
-      // name comes from the row the user clicked; without a row we leave the
-      // funnel's write standing rather than overwrite it with a guess.
-      //
-      // Read off THE one list since plan-716 Phase 5 (F8). It used to read
-      // `project.scenes`, a projection that showed the `scenes/` section only —
-      // so opening a document that lived anywhere else published no name at all
-      // and the funnel's guess stood. One list, one lookup, every section.
-      const sceneRow = documentById(project.documents, id);
-      if (sceneRow) setOpenDocumentBase(sceneDocumentBase(id, sceneRow.name));
-      // The resume pair used to be written here too. It is gone (plan-702
-      // Phase 3): `openScene` forwards every id that names a document onto
-      // `SceneStore.openDocument`, which writes the pair itself, so this call
-      // could only ever repeat what the funnel had already done — and it did
-      // strictly less. It looked the row up as `documents.find(d => d.id === id)`
-      // without the alias tolerance, so a pre-§2.3 `scn_` id found no path,
-      // `rememberSession` returned early and the session was NOT recorded; the
-      // funnel resolves the alias first and records it. Nothing is lost by the
-      // removal: in the one case this call wrote, the funnel writes as well.
+      await openDocumentAsWorkingScene(viewer, sceneStore, project.documents, id);
     });
-  }, [sceneStore, trySwitch, project.documents]);
+  }, [sceneStore, trySwitch, project.documents, viewer]);
 
   /**
    * Create a project in the workspace, give it a scene, and open it.
@@ -1012,7 +1192,7 @@ export function ProjectsDashboardHost() {
       await store.rescanDocuments();
       await listLibrarySources()
         .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
-      setProjectsSelection({ kind: 'scene', sceneId: created.documentId });
+      setProjectsSelection({ kind: 'document', documentId: created.documentId });
       await store.flush();
 
       // The load runs behind the dashboard. No dirty guard is needed and none is
@@ -1023,11 +1203,15 @@ export function ProjectsDashboardHost() {
   }, [newProjectName, runVerb, store, sceneStore]);
 
   /**
-   * Open a base GLB or a published example.
+   * Open a base GLB.
    *
-   * Both go through the same dirty guard as a scene: switching away from an
-   * edited draft without asking is the same data loss whichever list the click
-   * came from.
+   * Goes through the same dirty guard as a scene: switching away from an edited
+   * draft without asking is the same data loss whichever list the click came
+   * from.
+   *
+   * It used to take a `published` flag and fork to `openPublishedExample()` for
+   * the second identity space's rows. plan-731 2d removed both: an example is a
+   * document, and a document opens the one way.
    */
   /**
    * Open a model card.
@@ -1039,35 +1223,48 @@ export function ProjectsDashboardHost() {
    * backend's `release()`, so every model opened from this list left its bytes
    * resident for the life of the tab.
    */
-  const openModel = useCallback((modelId: string, label: string, published: boolean) => {
+  /**
+   * @param sourceUrl a URL the caller has already resolved, used INSTEAD of
+   *   `rvproject:<path>`. The built-in demos (plan-445 F6) need it: their bytes
+   *   come from the deploy root, not from the open project's backend, so the
+   *   `rvproject:` sentinel would resolve them against the wrong folder. It is
+   *   also why such an open records no document identity and no session
+   *   memory — a demo is not a document of the project the user has open, and
+   *   remembering it would send the next reload somewhere they never saved.
+   */
+  const openModel = useCallback((
+    modelId: string,
+    label: string,
+    sourceUrl?: string,
+  ) => {
     if (!sceneStore) return;
+    // Same rule as `openScene`: the already-open model just closes the
+    // dashboard. Compared through the path-derived id this verb itself records
+    // below, so the two sides of the comparison can only agree or genuinely
+    // differ.
+    if (!sourceUrl
+      && sameDocumentBase(getOpenDocumentBase(), projectDocumentBase(modelId, label))) {
+      closeProjectsDashboard();
+      return;
+    }
     trySwitch(async () => {
       // Close first — same reason as `openScene` above: the load's own
       // "Loading…" overlay is invisible under the still-open dashboard.
       closeProjectsDashboard();
-      if (published) {
-        const entry = sceneSnap?.published.find(e => 'published:' + e.urlName === modelId);
-        if (entry) await sceneStore.openPublishedExample(entry);
-      } else {
-        await sceneStore.openBuiltin(projectAssetUrl(modelId), label);
-      }
+      await sceneStore.openBuiltin(sourceUrl ?? projectAssetUrl(modelId), label);
       // Say WHAT is now open, so a mode that takes over later opens the same
-      // thing instead of starting from nothing. A published example has no
-      // project-relative path, so it stays unidentified for now and the editor
-      // falls back to its own chain — better than naming it wrongly.
+      // thing instead of starting from nothing.
       // This one STAYS, unlike `openScene`'s (plan-702 Phase 3). The funnel
       // covers only what reaches `openDocument`, and this verb reaches it for
-      // exactly one of its three outcomes: a manifest path that HAS a document
-      // row. A published example goes to `openPublishedExample` (transient, and
-      // deliberately not a document), and a model path without a row stays a
-      // `builtin` base — neither passes the funnel, so neither would record that
-      // the session moved here. Removing this call would leave the previous
-      // document's pair standing and send the next reload back to a document the
-      // user had already navigated away from.
-      setOpenDocumentBase(published ? null : projectDocumentBase(modelId, label));
-      rememberSession(project.project?.id, modelId, viewer.modes.activeMode);
+      // exactly one of its outcomes: a manifest path that HAS a document row. A
+      // model path without a row stays a `builtin` base and does not pass the
+      // funnel, so it would not record that the session moved here. Removing
+      // this call would leave the previous document's pair standing and send the
+      // next reload back to a document the user had already navigated away from.
+      setOpenDocumentBase(sourceUrl ? null : projectDocumentBase(modelId, label));
+      if (!sourceUrl) rememberSession(project.project?.id, modelId, viewer.modes.activeMode);
     });
-  }, [sceneStore, trySwitch, sceneSnap?.published, store, project.project?.id, viewer]);
+  }, [sceneStore, trySwitch, store, project.project?.id, viewer]);
 
   const deleteScene = useCallback((id: string, name: string) => {
     if (!sceneStore) return;
@@ -1080,15 +1277,28 @@ export function ProjectsDashboardHost() {
         void runVerb('Delete scene', async () => {
           await sceneStore.delete(id);
           setProjectsSelection({ kind: 'none' });
+          // Same two refreshes as `renameDocumentRow`, for the same field
+          // finding: the tree and the cards render the document SCAN, not the
+          // manifest — without the rescan the deleted card stands until the
+          // next reload (2026-08-19 — "delete leaves the card").
+          await store.rescanDocuments();
+          await listLibrarySources()
+            .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
         });
       },
     });
-  }, [sceneStore, runVerb]);
+  }, [sceneStore, runVerb, store]);
 
   const duplicateScene = useCallback((id: string) => {
     if (!sceneStore) return;
-    void runVerb('Duplicate scene', async () => { await sceneStore.duplicate(id); });
-  }, [sceneStore, runVerb]);
+    void runVerb('Duplicate scene', async () => {
+      await sceneStore.duplicate(id);
+      // The copy's card has the same scan dependency as the deleted card above.
+      await store.rescanDocuments();
+      await listLibrarySources()
+        .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
+    });
+  }, [sceneStore, runVerb, store]);
 
   /**
    * Rename a document ROW — through `runVerb` and BOTH listing refreshes,
@@ -1130,19 +1340,26 @@ export function ProjectsDashboardHost() {
   // second tab. `sources` is the memoised registry read, so `registryVersion`
   // already rides in through it — see the binding note at the top.
   //
-  // **Attached, not merely connected.** The registry also carries catalogs the
-  // running session wired up on its own: `_restorePlacements` adds every
-  // catalog a scene references with origin `config` so the placements resolve,
-  // and a deep link does the same with `urlParam`. Both are declared
-  // non-persisting at the call site, and neither is a library of *this
-  // project* — showing them made opening a GLB in the planner grow a root in
-  // the dashboard that was not there before. The origin ladder already ranks
-  // exactly this distinction (`config` < `urlParam` < `projectManifest` <
-  // `user`), so the cut is at "deliberately attached", not at "persisted":
-  // a `projectManifest` library is not stored globally but plainly belongs to
-  // the project. Project and local sources come from other providers and are
-  // never filtered here.
-  const catalogRoots = useMemo<CatalogRootInput[]>(() => sources.filter(({ providerId, source }) => {
+  // **Every attached library, whatever attached it.**
+  //
+  // This list used to be filtered by origin: `config` (the catalogs
+  // `_restorePlacements` wires up so a restored scene's placements resolve)
+  // and `urlParam` (a `?library=` deep link) were hidden, on the reasoning
+  // that neither is a library of *this project* and showing them made opening
+  // a GLB in the planner grow a root that was not there before.
+  //
+  // The cost of that rule was worse than the problem it solved: the planner's
+  // library window lists the store's catalogs unfiltered, so the two surfaces
+  // disagreed about which libraries exist. A user who could see a library,
+  // browse it and drag out of it in the planner found nothing under Libraries
+  // here, with no error and nothing to act on — which reads as the dashboard
+  // being broken, not as a policy. Provenance is worth showing; it is not
+  // worth hiding a library over. One store, one list, both windows.
+  //
+  // The origin ladder still does its real job untouched — deciding what is
+  // PERSISTED (`_persistUrls`) and what a project switch may swap out
+  // (`applyProjectLibraries`). It just no longer decides what is VISIBLE.
+  const catalogRoots = useMemo<CatalogRootInput[]>(() => sources.filter(({ providerId }) => {
     // The open project's OWN `library/` folder, published as a source so the
     // planner can browse it. Under the tabs it was a grid on the Assets tab;
     // as a tree root it is the project a second time — same name, same
@@ -1150,9 +1367,7 @@ export function ProjectsDashboardHost() {
     // dropped here rather than at the provider because the planner and the
     // asset picker still need the source.
     if (providerId === PROJECT_LIBRARY_PROVIDER_ID) return false;
-    if (providerId !== GLOBAL_LIBRARY_PROVIDER_ID) return true;
-    const origin = getLibraryStore().getOrigin(source.id);
-    return origin !== 'config' && origin !== 'urlParam';
+    return true;
   }).map(({ providerId, source }) => {
     let entries: LibraryCatalogEntry[] = [];
     try {
@@ -1164,7 +1379,13 @@ export function ProjectsDashboardHost() {
     return {
       providerId,
       sourceId: source.id,
-      label: source.label,
+      // A catalog that failed to load says so IN ITS ROW. `LibrarySource`
+      // has carried `error` since plan-702, and the tree dropped it: a
+      // rate-limited GitHub scan or a 404 arrived as a root with a name and
+      // no children, indistinguishable from an empty library. The tree model
+      // has no error channel of its own, so the reason rides in the label —
+      // the one field that is guaranteed to reach the user's eye.
+      label: source.error ? `${source.label} — ${source.error}` : source.label,
       // **Never writable, whatever the source says.** `writable` on a
       // `LibrarySource` means "assets can be written into it"; in the tree it
       // means "its folder structure can be rearranged", and no provider offers
@@ -1184,6 +1405,47 @@ export function ProjectsDashboardHost() {
   const sourceOfRoot = useCallback((rootId: string) => sources.find(
     s => catalogRootId(s.providerId, s.source.id) === rootId) ?? null, [sources]);
 
+  /**
+   * Attach a library TO THE OPEN PROJECT — the dashboard's only destination.
+   *
+   * A library added here belongs to the project, not to this browser: the URL
+   * goes into `project.json.libraries[]` and travels with the project to
+   * whoever opens it next. The global `user` list still exists (the planner
+   * subscribes into it), but nothing on this screen writes to it.
+   *
+   * Order matters. The catalog is loaded FIRST and the manifest is written
+   * only once it resolved: a URL that 404s or is rate-limited must not be
+   * committed to someone's project.json, where it would fail again for every
+   * person who opens it. Returns the reason to show, or null on success.
+   */
+  const attachLibraryToProject = useCallback(async (url: string): Promise<string | null> => {
+    const libStore = getLibraryStore();
+    const wasAttached = libStore.catalogUrls.includes(url);
+    await libStore.addCatalog(url, 'projectManifest');
+    // `addCatalog` resolves on a failed fetch and records the reason instead.
+    const failure = libStore.catalogErrors.get(url);
+    if (failure) {
+      if (!wasAttached) libStore.removeCatalog(url);
+      return failure;
+    }
+
+    // `applyManifestDelta` returns null on a project it cannot write — a
+    // read-only backend, or none at all. Roll the subscription back rather
+    // than leave a library that is attached but not recorded anywhere.
+    const next = await store.applyManifestDelta(current =>
+      withProjectLibraries(current, [...readProjectLibraries(current), url]));
+    if (!next) {
+      if (!wasAttached) libStore.removeCatalog(url);
+      return 'This project is read-only, so a library cannot be added to it.';
+    }
+
+    // Re-declare the project level from what was just written, so the store's
+    // `_projectUrls` matches the manifest and the next project switch can swap
+    // it out again.
+    await libStore.applyProjectLibraries(readProjectLibraries(next));
+    return null;
+  }, [store]);
+
   /** Detach a library through whatever route its provider exposes. */
   const handleRemoveLibrary = useCallback((rootId: string, label: string) => {
     const registered = sourceOfRoot(rootId);
@@ -1196,6 +1458,15 @@ export function ProjectsDashboardHost() {
       onConfirm: () => {
         void runVerb('Remove library', async () => {
           await source.remove!();
+          // A project library lives in `project.json`, so detaching it from
+          // the store alone would bring it straight back on the next open.
+          if (registered.providerId === GLOBAL_LIBRARY_PROVIDER_ID
+            && readProjectLibraries(store.getProject()).includes(source.id)) {
+            await store.applyManifestDelta(current => withProjectLibraries(
+              current,
+              readProjectLibraries(current).filter(u => u !== source.id),
+            ));
+          }
           // A selection pointing into the library that just went away would
           // leave the detail pane describing a dead source (plan-702 §2.7/R5).
           const group = { providerId: registered.providerId, sourceId: source.id };
@@ -1206,7 +1477,7 @@ export function ProjectsDashboardHost() {
         });
       },
     });
-  }, [sourceOfRoot, runVerb, dash.selection]);
+  }, [sourceOfRoot, runVerb, dash.selection, store]);
 
   /** Re-scan a library that offers it. */
   const handleRefreshLibrary = useCallback((rootId: string) => {
@@ -1248,37 +1519,30 @@ export function ProjectsDashboardHost() {
    */
   const documentRows = useMemo<DocumentRow[]>(() => {
     const rows: DocumentRow[] = [];
-    const seenPaths = new Set<string>();
 
     for (const doc of project.documents) {
-      seenPaths.add(doc.path);
       rows.push({
         name: doc.name,
         classification: doc.classification,
         doc,
         // One key shape for every document — the row is addressed by its id,
-        // wherever the file sits (placeless, plan-716/717). 'scene:' is kept as
-        // the historical prefix; only 'published:' rows are keyed differently.
+        // wherever the file sits (placeless, plan-716/717). 'scene:' is the
+        // historical prefix and is now the ONLY one: the 'published:' keys that
+        // used to sit beside it were the second identity space plan-731 melted
+        // into this very list.
         key: 'scene:' + doc.id,
       });
     }
 
-    // Examples the manifest does not already list. On our own deploy it lists
-    // all of them (the bundled backend builds its scenes[] from this very
-    // catalogue), so this loop normally adds nothing — it exists for a customer
-    // deploy whose own project.json owns scenes[] and whose examples therefore
-    // reach the dashboard only through the catalogue.
-    for (const e of project.backendKind === 'bundled' ? sceneSnap?.published ?? [] : []) {
-      if (seenPaths.has(publishedScenePath(e.file))) continue;
-      rows.push({
-        name: e.label,
-        classification: e.level ? { v: 1, level: e.level } : undefined,
-        key: 'published:' + e.urlName,
-      });
-    }
+    // ONE list, one identity (plan-731 2d). A second loop used to append the
+    // published-example catalogue here whenever `backendKind === 'bundled'`, so
+    // a row could arrive from either of two sources under either of two key
+    // shapes. Both examples are `documents[]` rows now — including the dev-only
+    // turntable fixture, which is why nothing disappeared from the dev
+    // checkout's list when the loop went.
 
     return rows;
-  }, [project.documents, project.backendKind, sceneSnap?.published]);
+  }, [project.documents]);
 
   /**
    * Every tag anybody in this project used — the autocomplete source (F13).
@@ -1327,6 +1591,118 @@ export function ProjectsDashboardHost() {
     return () => { alive = false; };
   }, [dash.open, store, project.project?.id, project.documents]);
 
+  /**
+   * The project's CONNECT configuration files (`*.connect.json`), from the
+   * backend's suffix walk. A config is a config by its file ENDING, never by
+   * the folder it sits in (plan-718 reference model) — this listing is what
+   * lets one show up as a card even though it is neither a manifest document
+   * nor a docs-index target. Best-effort like the attachments above: a backend
+   * without the walk (bundled, HTTP) simply reports none.
+   */
+  const [connectConfigs, setConnectConfigs] = useState<string[]>([]);
+  /** The knowledge twin (`*.knowledge.md`) — same listing, same rules. */
+  const [knowledgeFiles, setKnowledgeFiles] = useState<string[]>([]);
+  /**
+   * Everything else the project folder holds — the inert rows of the full view
+   * (plan-445 F1/F2).
+   */
+  const [plainFiles, setPlainFiles] = useState<string[]>([]);
+  /** Bumped by a write that changes the folder without changing a document. */
+  const [listingBump, setListingBump] = useState(0);
+  useEffect(() => {
+    const backend = store.getBackend();
+    if (!dash.open || !backend) {
+      setConnectConfigs([]); setKnowledgeFiles([]); setPlainFiles([]);
+      return;
+    }
+    let alive = true;
+    // ONE walk for all three lists (plan-445 §5.1): the two per-ending walks
+    // that used to stand here were two full traversals of the project folder
+    // per dashboard open, and the full view would have made it three.
+    void listProjectFiles(backend).then(listing => {
+      if (!alive) return;
+      setConnectConfigs(listing.configs);
+      setKnowledgeFiles(listing.knowledge);
+      setPlainFiles(listing.plainFiles);
+    });
+    return () => { alive = false; };
+  }, [dash.open, store, project.project?.id, project.documents, listingBump]);
+
+  /**
+   * Per-document mtimes — the content VERSION of every card preview.
+   *
+   * The thumbnail cache is persistent and keyed by identity; without a
+   * version segment the first render ever made was served forever, saves
+   * included (defect 2026-08-19). The mtime is the honest version: it changes
+   * exactly when the bytes do. Re-statted on every dashboard open and
+   * whenever a save lands (`document-saved`), so the very next card render
+   * misses the old cache entry and draws the new bytes.
+   */
+  const [docStats, setDocStats] = useState<ReadonlyMap<string, number>>(new Map());
+  const [statsBump, setStatsBump] = useState(0);
+  useEffect(
+    () => viewer.on('document-saved', () => setStatsBump(t => t + 1)),
+    [viewer],
+  );
+  useEffect(() => {
+    const backend = store.getBackend();
+    if (!dash.open || !backend) { setDocStats(new Map()); return; }
+    let alive = true;
+    void backend.statDocuments()
+      .then(stats => {
+        if (!alive) return;
+        setDocStats(new Map(stats.flatMap(s =>
+          typeof s.mtime === 'number' ? [[s.path, s.mtime] as const] : [])));
+      })
+      .catch(() => { if (alive) setDocStats(new Map()); });
+    return () => { alive = false; };
+  }, [dash.open, store, project.project?.id, project.documents, statsBump]);
+
+  /**
+   * The demo models the build ships, as a read-only catalog root (plan-445 F6).
+   *
+   * Read once per dashboard open off the bundled backend — the same instance
+   * `main.ts` filled during boot, so this is a listing, not a second discovery.
+   * Skipped when the OPEN project IS the bundled demo project: the demos are
+   * then already its own rows, and a "Built-in demos" root beside them would
+   * show every model twice.
+   */
+  const [builtinEntries, setBuiltinEntries] = useState<readonly TreeCatalogEntryInput[]>([]);
+  useEffect(() => {
+    if (!dash.open || project.backendKind === 'bundled') { setBuiltinEntries([]); return; }
+    let alive = true;
+    void bundledCatalogEntries(store.getBundledBackend())
+      .then(entries => { if (alive) setBuiltinEntries(entries); })
+      .catch(() => { if (alive) setBuiltinEntries([]); });
+    return () => { alive = false; };
+  }, [dash.open, store, project.backendKind]);
+
+  /** Tree id of the built-in root — the rootId its rows and selections carry. */
+  const builtinRootId = useMemo(
+    () => catalogRootId(BUILTIN_CATALOG_PROVIDER_ID, BUILTIN_CATALOG_SOURCE_ID), []);
+
+  /**
+   * The catalogs, plus the built-ins — deduped against what the project itself
+   * holds, because a dev checkout carries the demo GLBs in both places and the
+   * writable copy is the one worth showing.
+   */
+  const treeCatalogs = useMemo<CatalogRootInput[]>(() => {
+    const deduped = dedupeBundledEntries(
+      builtinEntries, project.documents.map(d => d.path));
+    if (deduped.length === 0) return catalogRoots;
+    return [...catalogRoots, {
+      providerId: BUILTIN_CATALOG_PROVIDER_ID,
+      sourceId: BUILTIN_CATALOG_SOURCE_ID,
+      label: BUILTIN_CATALOG_LABEL,
+      // The one flag the whole read-only story hangs off: `canMoveInTree` and
+      // `canRenameInTree` refuse every row of a root that is not writable.
+      writable: false,
+      remote: false,
+      entries: deduped,
+      refKind: 'bundledDocument',
+    }];
+  }, [catalogRoots, builtinEntries, project.documents]);
+
   const tree = useMemo(() => buildDashboardTree({
     project: project.project
       ? {
@@ -1335,12 +1711,15 @@ export function ProjectsDashboardHost() {
           writable: project.writable,
           documents: project.documents,
           attachments,
+          configs: connectConfigs,
+          knowledge: knowledgeFiles,
+          plainFiles,
           folders: readProjectFolders(project.project),
         }
       : null,
-    catalogs: catalogRoots,
+    catalogs: treeCatalogs,
   }), [project.project, project.writable, project.documents, attachments,
-      catalogRoots]);
+      connectConfigs, knowledgeFiles, plainFiles, treeCatalogs]);
 
   const treeRoots = useMemo(() => buildProjectTree(tree.roots), [tree.roots]);
 
@@ -1374,9 +1753,20 @@ export function ProjectsDashboardHost() {
       if (sel.kind === 'asset' && ref.kind === 'catalogAsset'
         && ref.providerId === sel.providerId && ref.sourceId === sel.sourceId
         && ref.assetId === sel.assetId) return path;
-      if (sel.kind === 'model' && ref.kind === 'document' && ref.path === sel.modelId) return path;
-      if (sel.kind === 'scene' && ref.kind === 'document'
-        && ref.documentId === sel.sceneId) return path;
+      if (sel.kind === 'documentPath' && ref.kind === 'document' && ref.path === sel.path) return path;
+      if (sel.kind === 'document' && ref.kind === 'document'
+        && ref.documentId === sel.documentId) return path;
+      // File selections (attachments, CONNECT configs) highlight their row
+      // too — the hero chip's "reveal" ping needs the selected card to light
+      // up, exactly like clicking an object field pings the asset in Unity.
+      // Every non-document leaf answers to a `file` selection — the four
+      // reference kinds, the inert plain files of the full view, and a built-in
+      // demo row (whose rootId is the built-in catalog's, not the project's).
+      if (sel.kind === 'file'
+        && (ref.kind === 'attachment' || ref.kind === 'connectConfig'
+          || ref.kind === 'knowledgeFile' || ref.kind === 'plainFile'
+          || ref.kind === 'bundledDocument')
+        && path === `${sel.rootId}/${sel.relPath}`) return path;
     }
     return null;
   }, [dash.selection, tree.refs]);
@@ -1397,7 +1787,9 @@ export function ProjectsDashboardHost() {
       });
       return;
     }
-    if (ref.kind === 'attachment') {
+    if (ref.kind === 'attachment' || ref.kind === 'connectConfig'
+      || ref.kind === 'knowledgeFile' || ref.kind === 'plainFile'
+      || ref.kind === 'bundledDocument') {
       setProjectsSelection({ kind: 'file', rootId: node.rootId, relPath: node.relPath });
       return;
     }
@@ -1405,9 +1797,9 @@ export function ProjectsDashboardHost() {
     // document selection with the document verbs, wherever the file sits.
     const doc = documentByPath.get(ref.path);
     if (doc) {
-      setProjectsSelection({ kind: 'scene', sceneId: doc.id });
+      setProjectsSelection({ kind: 'document', documentId: doc.id });
     } else {
-      setProjectsSelection({ kind: 'model', modelId: ref.path });
+      setProjectsSelection({ kind: 'documentPath', path: ref.path });
     }
   }, [tree.refs, documentByPath]);
 
@@ -1421,6 +1813,17 @@ export function ProjectsDashboardHost() {
     });
     if (!ref) return;                                  // a folder just expands
     if (ref.kind === 'attachment') return;             // nothing opens a PDF here
+    if (ref.kind === 'connectConfig') return;          // a config is inspected, not opened
+    if (ref.kind === 'knowledgeFile') return;          // knowledge too — the pane describes it
+    if (ref.kind === 'plainFile') return;              // inert (plan-445 F2) — no verb at all
+    if (ref.kind === 'bundledDocument') {
+      // A built-in demo loads exactly as the `?model=` deep link loads it —
+      // `openBuiltin` on the deploy URL — and NOT through the catalog-asset
+      // branch below, which would open the asset EDITOR on a demo scene.
+      // The open project is untouched: nothing here switches it.
+      openModel(ref.url, node.name, ref.url);
+      return;
+    }
     if (ref.kind === 'catalogAsset') {
       const source = sources.find(
         s => s.providerId === ref.providerId && s.source.id === ref.sourceId)?.source;
@@ -1437,7 +1840,7 @@ export function ProjectsDashboardHost() {
     // double-click means. `openModel` is left for what has no row at all.
     const doc = documentByPath.get(ref.path);
     if (doc) openScene(doc.id);
-    else openModel(ref.path, node.name, false);
+    else openModel(ref.path, node.name);
   }, [tree.refs, sources, documentByPath, openAssetInEditor, openScene, openModel]);
 
   // ── The folder's contents, as cards (Lauf 13) ─────────────────────────
@@ -1493,7 +1896,7 @@ export function ProjectsDashboardHost() {
       await store.rescanDocuments();
       await listLibrarySources()
         .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
-      setProjectsSelection({ kind: 'scene', sceneId: created.documentId });
+      setProjectsSelection({ kind: 'document', documentId: created.documentId });
       // The manifest write is queued by the folder writer; wait for it so a
       // reload right after the click cannot lose the row.
       await store.flush();
@@ -1549,13 +1952,38 @@ export function ProjectsDashboardHost() {
           category: 'custom',
           ...(doc?.thumbnail ? { thumbnailUrl: doc.thumbnail } : {}),
         };
-        const menuActions: ProjectCardMenuAction[] = [
-          { key: 'open', label: 'Open', onClick: () => handleTreeActivate(node) },
-        ];
+        // A CONNECT config / knowledge file is what its ENDING says (plan-718):
+        // it gets the stated glyph tile instead of a preview, and no Open verb
+        // — the detail pane is where it is inspected, double-click opens
+        // nothing.
+        const isConnectConfig = ref?.kind === 'connectConfig';
+        const isKnowledgeFile = ref?.kind === 'knowledgeFile';
+        const isRefFile = isConnectConfig || isKnowledgeFile;
+        // Defence line 1 of three (plan-445 §2.4): an inert row gets an EMPTY
+        // verb set, so the card shows no menu at all rather than a menu whose
+        // every entry refuses.
+        const isInert = node.inert === true;
+        const isBundled = ref?.kind === 'bundledDocument';
+        const menuActions: ProjectCardMenuAction[] = isRefFile || isInert
+          ? []
+          : [{ key: 'open', label: 'Open', onClick: () => handleTreeActivate(node) }];
         // Rename left the tree with the row it belonged to; the card is where
         // it lives now. Folders keep F2 in the tree — the verb did not move,
-        // only the thing it acts on did.
-        if (node.writable && node.rootId === project.project?.id) {
+        // only the thing it acts on did. Config cards rename too (their names
+        // are minted at creation): the tree move repoints `connectRef`s, and
+        // CONNECT recomputes a profile's internal `Ref` from the path it
+        // discovered the file at.
+        // Since plan-725 that discovery is a project-wide `*.connect.json` walk
+        // and it happens again on notify, so a rename reaches a RUNNING gateway
+        // — which is what makes "nothing goes stale" true. Before plan-725 the
+        // discovery was a `connect/`-folder scan performed once at startup, and
+        // the sentence quietly meant "nothing goes stale after the next
+        // restart". The write path that carries this is `replaceManifest`
+        // (§2.7, F7); without its notify the claim above is false again.
+        // Offered exactly where the commit would be accepted — `isRenamableInTree`
+        // is the name-independent half of `canRenameInTree` itself, so a card
+        // can no longer offer a rename the write path then refuses (F4).
+        if (isRenamableInTree(treeRoots, path) && node.rootId === project.project?.id) {
           menuActions.push({
             key: 'rename',
             label: 'Rename…',
@@ -1585,6 +2013,12 @@ export function ProjectsDashboardHost() {
               providerId: 'project-document',
               sourceId: node.rootId,
               assetId: path,
+              // The content version (file mtime): a saved document gets a NEW
+              // key, so the persistent cache misses and re-renders instead of
+              // serving the pre-save picture forever.
+              ...(docStats.get(node.relPath) !== undefined
+                ? { version: String(docStats.get(node.relPath)) }
+                : {}),
             }
             : undefined;
         const resolveThumbnail = ref?.kind === 'catalogAsset'
@@ -1603,21 +2037,47 @@ export function ProjectsDashboardHost() {
           entry,
           thumbnailKey,
           resolveThumbnail,
-          tier: doc?.tier === 'bundled' ? 'bundled' : 'user',
+          ...(isConnectConfig ? { glyph: 'connect' as const } : {}),
+          ...(isKnowledgeFile ? { glyph: 'knowledge' as const } : {}),
+          // A built-in demo wears the same read-only mark a bundled document
+          // does — one affordance for one fact, not a second one beside it.
+          tier: isBundled || doc?.tier === 'bundled' ? 'bundled' : 'user',
           selected: selectedTreePath === path,
           onSelect: () => handleTreeSelect(node),
           onOpen: () => handleTreeActivate(node),
           menuActions,
-          draggable: node.writable,
+          // A config/knowledge card is draggable even when its FILE may not
+          // move (a reserved-folder row): the drag then carries only the
+          // reference payload for the hero card's Unity-style assignment,
+          // never a tree move.
+          // …but never an inert one, and never a built-in: neither has a move
+          // to offer, and a drag that can only be refused is a broken promise.
+          draggable: (node.writable || isRefFile) && !isInert && !isBundled,
           onDragStart: (e: React.DragEvent) => {
-            setCardDragPath(path);
-            e.dataTransfer.effectAllowed = 'move';
+            // What travels under the cursor is the collapsed chip — type icon
+            // + name — not a ghost of the whole card.
+            setDragChip(e.dataTransfer, {
+              label: node.name,
+              kind: isConnectConfig ? 'connect' : isKnowledgeFile ? 'knowledge' : 'document',
+            });
+            if (isConnectConfig) {
+              e.dataTransfer.setData(CONNECT_CONFIG_DRAG_TYPE, node.relPath);
+            }
+            if (isKnowledgeFile) {
+              e.dataTransfer.setData(KNOWLEDGE_FILE_DRAG_TYPE, node.relPath);
+            }
+            if (node.writable) {
+              setCardDragPath(path);
+              e.dataTransfer.effectAllowed = isRefFile ? 'all' : 'move';
+            } else {
+              e.dataTransfer.effectAllowed = 'link';
+            }
           },
           onDragEnd: () => setCardDragPath(null),
         };
       }),
     [folderRows, documentFilter, sources, selectedTreePath, project.project?.id,
-      store, handleTreeSelect, handleTreeActivate],
+      store, docStats, handleTreeSelect, handleTreeActivate, treeRoots],
   );
 
   // ── The move write path (plan-703 Phase 5 rest, F12/F13) ──────────────
@@ -1704,6 +2164,51 @@ export function ProjectsDashboardHost() {
   }, [runVerb, treeMoveIO, treeRoots, project.project?.id, store]);
 
   /**
+   * Create a CONNECT configuration in the folder in view — the sibling of
+   * `handleNewDocument`, with the same minted-name philosophy as folders:
+   * `connect`, `connect-2`, … and rename-in-place afterwards. The file is a
+   * minimal, valid profile in exactly the shape CONNECT's
+   * `ProjectConnectStore.WriteProfile` produces, written create-only
+   * (`expectedRevision: null`) so a race with an existing file refuses
+   * instead of overwriting.
+   */
+  const handleNewConnectConfig = useCallback(() => {
+    const folder = newDocumentFolderFor(project.project?.id, selectedFolderPath);
+    void runVerb('New CONNECT configuration', async () => {
+      const backend = store.getBackend();
+      const rootId = project.project?.id;
+      if (!backend?.writable || !rootId) throw new Error('This project is read-only.');
+      const taken = new Set(connectConfigs.map(p => p.toLowerCase()));
+      const relFor = (name: string) =>
+        folder ? `${folder}/${name}.connect.json` : `${name}.connect.json`;
+      let name = 'connect';
+      for (let n = 2; taken.has(relFor(name).toLowerCase()); n++) name = `connect-${n}`;
+      const rel = relFor(name);
+      const payload = {
+        $schema: 'rv-connect-config/1.0',
+        Name: name,
+        Interfaces: [],
+        Mirrors: [],
+        Mappings: [],
+      };
+      await backend.writeBlob(
+        rel,
+        new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }),
+        { expectedRevision: null },
+      );
+      // Show it NOW — the listing effect re-scans later and merely confirms.
+      setConnectConfigs(prev => (prev.includes(rel) ? prev : [...prev, rel]));
+      setProjectsSelection({ kind: 'file', rootId, relPath: rel });
+      // plan-725 §2.7 — this is the ONE config-bearing write in the app that
+      // never touches the manifest: a raw `writeBlob` and nothing else. No
+      // notify site in the project store can see it, so it says so itself, or
+      // the file a user just made stays invisible to a running gateway until
+      // some unrelated write or a restart happens to reveal it.
+      store.notifyProjectChanged();
+    });
+  }, [runVerb, store, project.project?.id, selectedFolderPath, connectConfigs]);
+
+  /**
    * Create a folder inside `parent` — the right-click verb.
    *
    * The name is minted rather than asked for: a folder is cheap, F2 renames it
@@ -1745,6 +2250,89 @@ export function ProjectsDashboardHost() {
   const handleTreeContextMenu = useCallback((node: ProjectTreeNode, e: React.MouseEvent) => {
     setTreeMenu({ node, x: e.clientX, y: e.clientY });
   }, []);
+
+  // ── "Show in Explorer" (plan-446 Phase 2) ────────────────────────────
+  /**
+   * Whether the verb exists AT ALL on this screen — capability plus local
+   * origin. Not "may this row be revealed": a row of somebody else's catalog
+   * root fails a second, per-node condition below.
+   */
+  const revealAvailable = useMemo(
+    // The store-integrated helper, not a second copy of the rule: the memo's
+    // dependencies are exactly the three snapshot fields it reads, so a
+    // refusal that clears `revealSupported` retires the verb on the next
+    // render without a reload.
+    () => canRevealInExplorerNow(),
+    [connectSnap.state, connectSnap.revealSupported, connectSnap.serverUrl],
+  );
+
+  /**
+   * Reveal a row of the OPEN project. Failures are silent by design (§Phase 2):
+   * the gateway's refusal clears the capability inside the store, so the entry
+   * is simply gone the next time the menu opens — a dialog for a convenience
+   * the user can retry by looking at the folder themselves would cost more than
+   * it explains.
+   */
+  const handleRevealInExplorer = useCallback((node: ProjectTreeNode) => {
+    void revealInExplorer(node.relPath ?? '');
+  }, []);
+
+  /**
+   * The CONNECT settings window, opened from a `*.connect.json` row with that
+   * file preselected (plan-446 Phase 3). A path, not a profile NAME: the
+   * manifest binds documents to FILES, and the window resolves the file to
+   * whichever profile the gateway loaded from it.
+   */
+  const [connectOptions, setConnectOptions] = useState<{ ref: string | null } | null>(null);
+
+  /**
+   * The verbs the right-clicked row can actually perform — and only those.
+   *
+   * Refused verbs are ABSENT, not disabled (plan-445 F4). A greyed-out entry is
+   * a promise the row cannot keep, and on a read-only catalog or an inert
+   * full-view file the entire menu would have consisted of them; the empty list
+   * therefore also suppresses the menu itself, which is defence line 1 of the
+   * inert rule (§2.4).
+   *
+   * Rename asks {@link isRenamableInTree} — the name-independent half of
+   * `canRenameInTree` — so the verb appears exactly where the commit is
+   * accepted, rather than restating the rule in a second place that can drift.
+   *
+   * "Show in Explorer" (plan-446 F3, merged into this list on 2026-08-24)
+   * follows the same absence rule: it appears only when CONNECT can do it AND
+   * this page is local — a viewer opened from another machine would otherwise
+   * open a window on the plant PC nobody is standing at. Rows of a CATALOG
+   * root are excluded (not inside the project CONNECT serves), and inert
+   * full-view rows keep their no-verbs guarantee from plan-445.
+   */
+  const treeMenuVerbs = useMemo<Array<{ key: string; label: string; run: () => void }>>(() => {
+    const node = treeMenu?.node;
+    if (!node) return [];
+    const verbs: Array<{ key: string; label: string; run: () => void }> = [];
+    const ownProject = node.rootId === project.project?.id;
+    if (ownProject && project.writable && node.writable
+      && (node.kind === 'root' || node.kind === 'folder'
+        || node.kind === 'document' || node.kind === 'file')
+      && !node.inert) {
+      verbs.push({ key: 'newFolder', label: 'New Folder', run: () => handleNewFolder(node) });
+    }
+    if (ownProject && isRenamableInTree(treeRoots, node.path)) {
+      verbs.push({
+        key: 'rename',
+        label: 'Rename…',
+        run: () => setAssetDialog({ kind: 'renameNode', relPath: node.path!, value: node.name }),
+      });
+    }
+    if (revealAvailable && ownProject && !node.inert) {
+      verbs.push({
+        key: 'reveal',
+        label: 'Show in Explorer',
+        run: () => handleRevealInExplorer(node),
+      });
+    }
+    return verbs;
+  }, [treeMenu, treeRoots, project.project?.id, project.writable, handleNewFolder,
+    revealAvailable, handleRevealInExplorer]);
 
   const handleTreeMove = useCallback(
     (node: ProjectTreeNode, to: string) => runTreeEdit('Move', node, to),
@@ -1885,16 +2473,28 @@ export function ProjectsDashboardHost() {
     const target = resolveResumeTarget({
       search: window.location.search,
       remembered: readRememberedSession(projectId),
-      defaultModel: getAppConfig().defaultModel,
+      // What the project itself last had open. Without it a switch into a
+      // project this browser has never opened has nothing to resume and lands
+      // on the deployer's `defaultModel` — a document out of another project.
+      projectActive: project.project?.activeSceneId ?? null,
+      // plan-721 §2.4: the PROJECT's own start document beats the global
+      // `settings.json` one, and the rule is identical at BOTH call sites of
+      // `resolveResumeTarget` — this one and the boot in `main.ts`. On an
+      // appliance the dashboard is unreachable under the kiosk lock, but the
+      // lock is a config flag a commissioning session can drop, and a rule
+      // that held in only one of the two places would be a rule that depends
+      // on how the project was opened.
+      defaultModel: projectStartDocument(project.project) ?? getAppConfig().defaultModel,
       modeLocked,
     });
     if (!target.asset) return;
 
     // Addressed by path or by id: a URL names a path, a remembered pair may
     // hold either, and refusing one of the two would make the rule depend on
-    // which spelling happened to be stored.
-    const doc = project.documents.find(
-      d => d.path === target.asset || d.id === target.asset);
+    // which spelling happened to be stored. The rule itself lives in
+    // `findStartDocument` (plan-726 F12) — this is one of THREE call sites that
+    // had it inline, and three copies is how three answers start to differ.
+    const doc = findStartDocument(project.documents, target.asset);
     if (!doc) return;
 
     // The mode is restored ONLY from the remembered pair — `resolveResumeTarget`
@@ -1903,7 +2503,8 @@ export function ProjectsDashboardHost() {
     if (target.mode) void viewer.modes.requestMode(target.mode);
     // Same rule as the tree: a document is a document, wherever it sits.
     openScene(doc.id);
-  }, [project.project?.id, project.documents, modeLocked, viewer, openScene, openModel]);
+  }, [project.project?.id, project.project?.activeSceneId, project.documents,
+      modeLocked, viewer, openScene, openModel]);
 
   // ── The hero band (plan-709 F3, project screen only) ──────────────────
   /**
@@ -1936,13 +2537,13 @@ export function ProjectsDashboardHost() {
     // catalog search the former `libraryGlb` branch ended in.
     if (base.kind === 'document') {
       if (!base.path) {
-        setProjectsSelection({ kind: 'scene', sceneId: base.documentId });
+        setProjectsSelection({ kind: 'document', documentId: base.documentId });
         return;
       }
       const doc = documentByPath.get(base.path);
       if (doc) {
         // Placeless like the tree: a row reveals as a document, wherever it sits.
-        setProjectsSelection({ kind: 'scene', sceneId: doc.id });
+        setProjectsSelection({ kind: 'document', documentId: doc.id });
         return;
       }
       const libraryRelative = base.path.startsWith('library/')
@@ -1962,7 +2563,7 @@ export function ProjectsDashboardHost() {
         }
         return;
       }
-      setProjectsSelection({ kind: 'model', modelId: base.path });
+      setProjectsSelection({ kind: 'documentPath', path: base.path });
       return;
     }
     if (base.kind === 'providerAsset') {
@@ -2013,21 +2614,105 @@ export function ProjectsDashboardHost() {
     );
   }, [documentTags, busy, project.writable, changeClassification]);
 
+  // ── Markdown preview + editor (plan-445 F7) ───────────────────────────
+  /**
+   * Which `.md` file the detail pane is showing, and its text.
+   *
+   * `text: null` means "still reading" — the pane says so rather than
+   * flashing an empty document. Keyed by path so a stale read that lands after
+   * the user moved on is dropped instead of overwriting the new selection.
+   */
+  const [mdFile, setMdFile] = useState<{ path: string; text: string | null } | null>(null);
+  /** The selected file's path when it is Markdown, else null. */
+  const selectedMdPath = useMemo(() => {
+    const sel = dash.selection;
+    if (sel.kind !== 'file' || sel.rootId !== project.project?.id) return null;
+    return /\.md$/i.test(sel.relPath) ? sel.relPath : null;
+  }, [dash.selection, project.project?.id]);
+
+  useEffect(() => {
+    if (!selectedMdPath) { setMdFile(null); return; }
+    const backend = store.getBackend();
+    if (!backend) { setMdFile(null); return; }
+    let alive = true;
+    setMdFile({ path: selectedMdPath, text: null });
+    void backend.readBlobBytes(selectedMdPath)
+      .then(bytes => {
+        if (!alive) return;
+        setMdFile({
+          path: selectedMdPath,
+          text: bytes ? new TextDecoder().decode(bytes) : '',
+        });
+      })
+      .catch(() => { if (alive) setMdFile({ path: selectedMdPath, text: '' }); });
+    return () => { alive = false; };
+  }, [selectedMdPath, store, listingBump]);
+
+  /**
+   * Write an edited Markdown body back, through the SAME `writeBlob` seam every
+   * other file write in this file uses — no second storage path for text.
+   *
+   * Unconditional (no `expectedRevision`): the alternative would be to hash the
+   * bytes we read and refuse on a mismatch, and there is nothing on this screen
+   * that could then resolve the conflict. The listing bump afterwards is what
+   * makes the preview show what was actually stored.
+   */
+  const saveMarkdown = useCallback((relPath: string, next: string) => {
+    void runVerb('Save file', async () => {
+      const backend = store.getBackend();
+      if (!backend?.writable) throw new Error('This project is read-only.');
+      await backend.writeBlob(
+        relPath, new Blob([next], { type: 'text/markdown' }));
+      setMdFile({ path: relPath, text: next });
+      setListingBump(n => n + 1);
+    });
+  }, [runVerb, store]);
+
+  /** The pane's Markdown block for the selected `.md` file, or undefined. */
+  const markdownPane = useMemo(() => {
+    if (!selectedMdPath || mdFile?.path !== selectedMdPath) return undefined;
+    return {
+      text: mdFile.text,
+      editable: project.writable,
+      onSave: (next: string) => saveMarkdown(selectedMdPath, next),
+    };
+  }, [selectedMdPath, mdFile, project.writable, saveMarkdown]);
+
   // ── Detail pane for the current selection (§3.6) ──────────────────────
   const detail = useMemo(() => {
     const sel = dash.selection;
 
-    if (sel.kind === 'scene') {
+    if (sel.kind === 'document') {
       // THE one list (plan-716 F8). `scenes` was the `scenes/`-section
       // projection of exactly this array, so the lookup is the same lookup
       // against a superset — a selection that names a `library/` document now
       // gets the pane it always should have had instead of an empty column.
-      const scene = documentById(project.documents, sel.sceneId);
+      const scene = documentById(project.documents, sel.documentId);
       if (!scene) return { title: null };
       const bundled = scene.tier === 'bundled';
       const fields: DetailField[] = [];
       if (scene.modifiedAt) fields.push({ label: 'Modified', value: scene.modifiedAt });
       if (project.project?.name) fields.push({ label: 'Project', value: project.project.name });
+      // The document's CONNECT binding (`documents[].connectRef`, plan-718 §3).
+      // Shown whenever set — and marked when the file it names is not in the
+      // config listing, because a dead reference is exactly what this row
+      // exists to surface.
+      const connectRef = readDocumentRef(scene, 'connectRef');
+      if (connectRef) {
+        const shown = stripConnectConfigSuffix(connectRef);
+        fields.push({
+          label: 'CONNECT',
+          value: connectConfigs.includes(connectRef) ? shown : `${shown} — missing`,
+        });
+      }
+      const knowledgeRef = readDocumentRef(scene, 'knowledgeRef');
+      if (knowledgeRef) {
+        const shown = stripKnowledgeFileSuffix(knowledgeRef);
+        fields.push({
+          label: 'Knowledge',
+          value: knowledgeFiles.includes(knowledgeRef) ? shown : `${shown} — missing`,
+        });
+      }
       const actions: DetailAction[] = [
         { key: 'open', label: 'Open', primary: true, onClick: () => openScene(scene.id) },
       ];
@@ -2040,9 +2725,10 @@ export function ProjectsDashboardHost() {
           onClick: () => duplicateScene(scene.id),
         });
       } else {
-        // No "Rename" action: the title itself edits on click (the pane's
-        // inline rename), and a second entry point for the same commit was
-        // one more than the verb needed.
+        // No "Rename" entry here either: the pane derives it from `onRename`
+        // below (plan-450 §2.2), so a writable scene gets the button without
+        // this list restating the permission — and a bundled one, which never
+        // supplies `onRename`, gets no button at all rather than a dead one.
         actions.push({ key: 'dup', label: 'Duplicate', onClick: () => duplicateScene(scene.id) });
         // `scene` IS the document row now — the second lookup that used to
         // stand here asked the same array for the same id.
@@ -2075,46 +2761,65 @@ export function ProjectsDashboardHost() {
       };
     }
 
-    if (sel.kind === 'model') {
-      const published = sel.modelId.startsWith('published:');
+    if (sel.kind === 'documentPath') {
+      // No `published:` shape reaches this branch any more (plan-731 2c). A
+      // path selection is a path selection: an example is an ordinary document
+      // row and answers through `documentByPath` like every other one.
+      //
       // `models[]` paths can carry a leading slash (the bundled manifest
       // declares them URL-style, `/models/x.glb`) while the tree's document
       // paths never do — compare with it stripped, or a bundled project's
       // model row answers with an empty detail pane.
-      const model = published
-        ? null
-        : project.models.find(m => m.path.replace(/^\/+/, '') === sel.modelId);
+      const model = project.models.find(m => m.path.replace(/^\/+/, '') === sel.path);
       // `models[]` carries only the `models/` section — a document in
       // `library/` (or anywhere else) is still a selectable asset and answers
       // through the one document list instead of an empty pane.
-      const doc = published ? undefined : documentByPath.get(sel.modelId);
-      const label = published
-        ? sceneSnap?.published.find(e => 'published:' + e.urlName === sel.modelId)?.label
-        : (model && (model.label ?? baseNameOf(model.path))) ?? doc?.name ?? baseNameOf(sel.modelId);
+      const doc = documentByPath.get(sel.path);
+      const label = (model && (model.label ?? baseNameOf(model.path)))
+        ?? doc?.name ?? baseNameOf(sel.path);
       if (!label) return { title: null };
-      const row = documentRows.find(r => r.key === (published
-        ? sel.modelId
-        : doc ? 'scene:' + doc.id : 'model:' + sel.modelId));
-      const readOnly = published || (model?.tier ?? doc?.tier) === 'bundled';
+      const row = documentRows.find(
+        r => r.key === (doc ? 'scene:' + doc.id : 'model:' + sel.path),
+      );
+      const readOnly = (model?.tier ?? doc?.tier) === 'bundled';
       return {
         title: label,
         // Same rule as the branch above: the subtitle carries only what no
-        // badge shows. A published example is a SOURCE, not a document (§2.6
-        // decision log), so it keeps its sentence and gets no badges — there
-        // is no folder of ours that holds it.
-        ...(published
-          ? { subtitle: 'Example (read-only)' }
-          : readOnly ? { subtitle: 'Read-only' } : {}),
-        badges: published || !doc ? [] : [documentTypeBadge(doc), documentRoleBadge(doc)],
-        fields: published ? [] : [{ label: 'Source', value: sel.modelId }],
+        // badge shows.
+        ...(readOnly ? { subtitle: 'Read-only' } : {}),
+        badges: !doc ? [] : [documentTypeBadge(doc), documentRoleBadge(doc)],
+        fields: [
+          { label: 'Source', value: sel.path },
+          // Same reference rows as the id-selected branch — one fact, both routes.
+          ...(() => {
+            const rows: DetailField[] = [];
+            const connectRef = readDocumentRef(doc, 'connectRef');
+            if (connectRef) {
+              const shown = stripConnectConfigSuffix(connectRef);
+              rows.push({
+                label: 'CONNECT',
+                value: connectConfigs.includes(connectRef) ? shown : `${shown} — missing`,
+              });
+            }
+            const knowledgeRef = readDocumentRef(doc, 'knowledgeRef');
+            if (knowledgeRef) {
+              const shown = stripKnowledgeFileSuffix(knowledgeRef);
+              rows.push({
+                label: 'Knowledge',
+                value: knowledgeFiles.includes(knowledgeRef) ? shown : `${shown} — missing`,
+              });
+            }
+            return rows;
+          })(),
+        ],
         actions: [
           {
             key: 'open',
             label: 'Open',
             primary: true,
-            onClick: () => openModel(sel.modelId, label, published),
+            onClick: () => openModel(sel.path, label),
           },
-          ...(readOnly ? [] : transferActionsFor(documentByPath.get(sel.modelId))),
+          ...(readOnly ? [] : transferActionsFor(documentByPath.get(sel.path))),
         ] as DetailAction[],
         extra: classificationFor(row),
         // Inline title rename runs the SAME gate and write path as F2 on the
@@ -2131,7 +2836,7 @@ export function ProjectsDashboardHost() {
               return;
             }
             runTreeEdit('Rename', node, verdict.to, (to) => {
-              setProjectsSelection({ kind: 'model', modelId: to });
+              setProjectsSelection({ kind: 'documentPath', path: to });
             });
           },
         }),
@@ -2172,6 +2877,89 @@ export function ProjectsDashboardHost() {
 
     // ── A tree row that is not a document (plan-703 Phase 6) ──
     if (sel.kind === 'folder' || sel.kind === 'file') {
+      // A CONNECT configuration / knowledge file DOES earn a pane: which
+      // documents reference it is a fact nothing else on this screen states,
+      // and the N:1 reverse direction is a scan of the manifest's ref fields
+      // (plan-718) — computed here, never stored.
+      const refFilePane = (
+        field: 'connectRef' | 'knowledgeRef',
+        subtitle: string,
+        badge: string,
+        strip: (path: string) => string,
+        actions: DetailAction[] = [],
+      ) => {
+        // The reverse direction, computed — never a stored `usedBy` array.
+        // `documentsUsingRef` carries the id as well as the label, which is
+        // what turns the list from a sentence into navigation (plan-446 F4).
+        const usedBy = documentsUsingRef(project.documents, field, sel.relPath);
+        return {
+          // The ending is the classifier, never part of the name — stripped
+          // here like everywhere else (the badge already says what this is).
+          title: baseNameOf(strip(sel.relPath)),
+          subtitle,
+          badges: [badge],
+          fields: [
+            { label: 'Path', value: strip(sel.relPath) },
+          ],
+          extra: usedByChips(usedBy),
+          actions,
+        };
+      };
+      // A built-in demo row (plan-445 F6). Its own branch and not the project
+      // one below: it belongs to no project, so "used by" and "path" would both
+      // be answers about the wrong thing. One verb, and it says what it is.
+      if (sel.kind === 'file' && sel.rootId === builtinRootId) {
+        const node = selectedTreePath ? findTreeNode(treeRoots, selectedTreePath) : null;
+        const ref = selectedTreePath ? tree.refs.get(selectedTreePath) : undefined;
+        if (!node || ref?.kind !== 'bundledDocument') return { title: null };
+        return {
+          title: node.name,
+          subtitle: 'Built-in — read-only',
+          badges: ['Built-in'],
+          fields: [{ label: 'Source', value: ref.path }],
+          actions: [{
+            key: 'open',
+            label: 'Open',
+            primary: true,
+            onClick: () => openModel(ref.url, node.name, ref.url),
+          }] as DetailAction[],
+        };
+      }
+      if (sel.kind === 'file' && sel.rootId === project.project?.id) {
+        if (isConnectConfigPath(sel.relPath)) {
+          return refFilePane(
+            'connectRef', 'CONNECT configuration', 'Connect', stripConnectConfigSuffix,
+            // Read-only in the browser by decision (LOP-120): the verb hands
+            // the file over to CONNECT rather than opening a second editor
+            // beside CONNECT's live working set.
+            [{
+              key: 'open-in-connect',
+              label: 'Open in CONNECT',
+              onClick: () => setConnectOptions({ ref: sel.relPath }),
+            }],
+          );
+        }
+        if (isKnowledgeFilePath(sel.relPath)) {
+          return {
+            ...refFilePane(
+              'knowledgeRef', 'Knowledge file', 'Knowledge', stripKnowledgeFileSuffix),
+            // Preview always, Edit only where the project can be written
+            // (plan-445 F7) — the pane decides the chrome, this decides the offer.
+            ...(markdownPane ? { markdown: markdownPane } : {}),
+          };
+        }
+        // Any OTHER file of the full view (plan-445 F1/F2). It earns a pane
+        // for exactly one reason: a `.md` is readable, and reading it is the
+        // whole point of listing it. No verbs — the row is inert.
+        if (markdownPane) {
+          return {
+            title: baseNameOf(sel.relPath),
+            subtitle: 'Markdown',
+            fields: [{ label: 'Path', value: sel.relPath }],
+            markdown: markdownPane,
+          };
+        }
+      }
       // A library root's verbs (Refresh, Remove) sit on its tree row now.
       // A plain folder or attachment earns no pane — the folder header's
       // breadcrumb already says where the user is, and a pane restating the
@@ -2188,12 +2976,13 @@ export function ProjectsDashboardHost() {
     // the dashboard header and its verbs in the header menu; a pane that
     // repeated them here would make "no selection" look like a selection.
     return { title: null };
-  }, [dash.selection, project, sources, store, runVerb,
+  }, [dash.selection, project, sources, store, runVerb, connectConfigs, knowledgeFiles,
       openScene, duplicateScene, deleteScene, buildAssetActions, openModel,
-      sceneSnap?.published, project.models, documentRows, classificationFor,
+      project.models, documentRows, classificationFor,
       transferActionsFor, documentByPath, sourceOfRoot, treeRoots, catalogRoots,
       handleRefreshLibrary, handleRemoveLibrary,
-      sceneStore, selectedTreePath, runTreeEdit, renameLibraryAsset, renameDocumentRow]);
+      sceneStore, selectedTreePath, runTreeEdit, renameLibraryAsset, renameDocumentRow,
+      builtinRootId, tree.refs, markdownPane]);
 
   const handleForget = useCallback((id: string) => {
     forgetRecentProject(id);
@@ -2299,6 +3088,8 @@ export function ProjectsDashboardHost() {
       <AddLibraryDialog
         open={addLibraryOpen}
         onClose={() => setAddLibraryOpen(false)}
+        onAttach={attachLibraryToProject}
+        attachHint={'Added to this project ' + '—' + ' the reference is stored in project.json and travels with the project.'}
         onConnectAssetManager={cloudStore
           ? (req) => cloudStore.addConnection(req.label, {
               projectId: req.projectId,
@@ -2342,45 +3133,32 @@ export function ProjectsDashboardHost() {
           row, so the menu opens where the click was — and carries only the
           verbs the clicked row can actually perform. */}
       <Menu
-        open={treeMenu !== null}
+        open={treeMenuVerbs.length > 0}
         onClose={() => setTreeMenu(null)}
         anchorReference="anchorPosition"
         anchorPosition={treeMenu ? { top: treeMenu.y, left: treeMenu.x } : undefined}
       >
-        <MenuItem
-          disabled={!project.writable || treeMenu?.node.rootId !== project.project?.id}
-          onClick={() => {
-            const node = treeMenu?.node;
-            setTreeMenu(null);
-            if (node) handleNewFolder(node);
-          }}
-          sx={{ fontSize: 13 }}
-        >
-          New Folder
-        </MenuItem>
-        {/* The discoverable half of F2. The tree can rename in place, but a
-            keystroke on an unlabelled row is not something anybody finds — and
-            the same prompt already serves the cards, so this is one more entry
-            into an existing verb rather than a second rename path. A root and
-            the System node are not renamable (the folder IS the project). */}
-        <MenuItem
-          disabled={
-            !project.writable
-            || treeMenu?.node.rootId !== project.project?.id
-            || !treeMenu?.node.writable
-            || treeMenu?.node.kind === 'root'
-            || treeMenu?.node.kind === 'system'
-          }
-          onClick={() => {
-            const node = treeMenu?.node;
-            setTreeMenu(null);
-            if (node) setAssetDialog({ kind: 'renameNode', relPath: node.path!, value: node.name });
-          }}
-          sx={{ fontSize: 13 }}
-        >
-          Rename…
-        </MenuItem>
+        {treeMenuVerbs.map(verb => (
+          <MenuItem
+            key={verb.key}
+            data-testid={`tree-menu-${verb.key}`}
+            onClick={() => { setTreeMenu(null); verb.run(); }}
+            sx={{ fontSize: 13 }}
+          >
+            {verb.label}
+          </MenuItem>
+        ))}
       </Menu>
+      {/* plan-446 F4. The CONNECT settings window, opened from a config row
+          with that file preselected. Deliberately the SAME window the CONNECT
+          panel mounts and not a second editor: CONNECT stays the one place a
+          configuration is written (decision log 2026-08-23). */}
+      <ConnectOptionsWindow
+        open={connectOptions !== null}
+        initialProfile={connectOptions?.ref ?? null}
+        onClose={() => setConnectOptions(null)}
+        onProfileSwitched={() => { /* no bridge list on this screen to reload */ }}
+      />
       {/* These three were imported and their state managed since Phase 13,
           but never rendered — "Rename" set state into the void. */}
       <AssetPromptDialog
@@ -2556,10 +3334,12 @@ export function ProjectsDashboardHost() {
               and what is attached to it. Each verb sits under the header it
               belongs to — "add library" is a libraries verb, so it moved off
               the panel title and onto the Libraries header. */}
+          {/* All three column headers share ONE height (32px) and type
+              (12px semibold) — this one is the reference. */}
           <Box
             sx={{
               display: 'flex', alignItems: 'center', gap: 0.5,
-              px: 1.25, py: 0.5, flexShrink: 0,
+              px: 1.25, minHeight: 32, flexShrink: 0,
               borderBottom: '1px solid rgba(255,255,255,0.06)',
             }}
           >
@@ -2589,7 +3369,7 @@ export function ProjectsDashboardHost() {
           <Box
             sx={{
               display: 'flex', alignItems: 'center', gap: 0.5,
-              px: 1.25, py: 0.5, flexShrink: 0,
+              px: 1.25, minHeight: 32, flexShrink: 0,
               borderTop: '1px solid rgba(255,255,255,0.06)',
               borderBottom: '1px solid rgba(255,255,255,0.06)',
             }}
@@ -2609,7 +3389,7 @@ export function ProjectsDashboardHost() {
           </Box>
           {/* Takes the space the project left over, so the panel has no dead
               gap between the two sections. */}
-          <Box sx={{ flex: 1, minHeight: 0, display: 'flex' }}>
+          <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
             <ProjectTree
               roots={libraryTreeRoots}
               height="100%"
@@ -2632,7 +3412,7 @@ export function ProjectsDashboardHost() {
           <Box
             sx={{
               display: 'flex', alignItems: 'center', gap: 0.5,
-              px: 1.5, py: 0.5, flexShrink: 0,
+              px: 1.5, minHeight: 32, flexShrink: 0,
               borderBottom: '1px solid rgba(255,255,255,0.06)',
             }}
           >
@@ -2676,6 +3456,12 @@ export function ProjectsDashboardHost() {
               })}
             </Box>
             {/*
+              The PRIMARY way in (plan-445 F5). "New document" was a 16px plus
+              among three other icon buttons — the single most-used verb on the
+              screen, and the one nobody found. Contained and in the accent
+              colour, it is now the one thing in this header that reads as an
+              offer.
+
               One button, no type menu: the folder in view decides where the
               new document lands (plan-716 §2.6). The tooltip names the folder
               so the target is visible before the click, not after it.
@@ -2686,13 +3472,45 @@ export function ProjectsDashboardHost() {
                 : 'This project is read-only.'}
             >
               <span>
-                <IconButton
+                <Button
                   size="small"
-                  aria-label="New document"
+                  variant="contained"
+                  startIcon={<Add sx={{ fontSize: 14 }} />}
                   disabled={!project.writable}
                   onClick={handleNewDocument}
+                  sx={{
+                    fontSize: 11,
+                    textTransform: 'none',
+                    whiteSpace: 'nowrap',
+                    py: 0.25,
+                    // Instrument Blue — the one working accent of DESIGN.md.
+                    bgcolor: '#4fc3f7',
+                    color: 'rgba(0,0,0,0.87)',
+                    '&:hover': { bgcolor: '#81d4fa' },
+                  }}
                 >
-                  <Add sx={{ fontSize: 16 }} />
+                  New document
+                </Button>
+              </span>
+            </Tooltip>
+            {/* The one OTHER creatable thing (plan-718): a CONNECT
+                configuration. Its own quiet button rather than a type menu —
+                the document button keeps its no-menu decision
+                (plan-716 §2.6), and the icon is the same glyph every config
+                card and chip already carries. */}
+            <Tooltip
+              title={project.writable
+                ? `New CONNECT configuration in ${newDocumentFolder === '' ? 'the project root' : `${newDocumentFolder}/`}`
+                : 'This project is read-only.'}
+            >
+              <span>
+                <IconButton
+                  size="small"
+                  aria-label="New CONNECT configuration"
+                  disabled={!project.writable}
+                  onClick={handleNewConnectConfig}
+                >
+                  <SettingsEthernet sx={{ fontSize: 16 }} />
                 </IconButton>
               </span>
             </Tooltip>
@@ -2715,6 +3533,15 @@ export function ProjectsDashboardHost() {
   // Search is offered only once there is a list worth filtering; on the empty
   // state it would be a control that can only ever return nothing.
   const hasWorkspace = workspaceMeta !== null || workspaceProjects.length > 0;
+  // The kiosk gate is a statement about the DEPLOYMENT, not about the model
+  // that happens to be open. A project plugin may lock the mode — Mauser and
+  // Toray both do, to make their model a single-purpose 3D-HMI — while the very
+  // same build sits in a dev workspace next to a dozen other projects. Reading
+  // `modeLocked` alone told that developer "This deployment opens a single
+  // fixed project" and took the list away. So the screen closes only when the
+  // lock is backed by there being nothing else to offer: no workspace, and at
+  // most the one project the box was given (plan-721 §2.13).
+  const kioskSingleProject = modeLocked && !hasWorkspace && projectRows.length <= 1;
   return (
     <ProjectsDashboard
       title="Projects"
@@ -2724,7 +3551,7 @@ export function ProjectsDashboardHost() {
           {/* ONE "Open…" (decision 1). It used to be two — "Open folder…" and
               "Switch workspace" — which made the user classify their own
               folder before they were allowed to open it. */}
-          {!modeLocked && (
+          {!kioskSingleProject && (
             <Button
               size="small"
               variant="outlined"
@@ -2734,7 +3561,7 @@ export function ProjectsDashboardHost() {
               Open…
             </Button>
           )}
-          {hasWorkspace && !modeLocked && (
+          {hasWorkspace && !kioskSingleProject && (
             <Button
               size="small"
               variant="contained"
@@ -2753,7 +3580,7 @@ export function ProjectsDashboardHost() {
         workspaceName={workspaceMeta?.folderName ?? null}
         rows={projectRows}
         activeProjectId={project.project?.id ?? null}
-        modeLocked={modeLocked}
+        modeLocked={kioskSingleProject}
         onOpenProject={handleOpenProject}
         onOpenWorkspace={handleOpen}
         onOpenFolder={handleOpen}

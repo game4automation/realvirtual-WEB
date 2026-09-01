@@ -110,7 +110,9 @@
  */
 
 import { expect, test, type Page } from 'playwright/test';
+ import { scratchAssetDocument } from '../tests/helpers/scratch-asset-document';
 import { DEV_GLB } from '../tests/fixtures/glb-paths.mjs';
+import { HAS_PRIVATE_SOURCE, privateModuleUrl } from './private-module-url';
 
 // ─── Matrix definition ──────────────────────────────────────────────────────
 
@@ -391,10 +393,12 @@ const BASE_MODEL = DEV_GLB.mechanismScissor;
 // mechanism UI bridge.
 
 /** Paths the harness dynamically imports (kept in variables so TS does not try
- *  to resolve them at compile time — the same trick signal-link-mode.spec uses). */
+ *  to resolve them at compile time — the same trick signal-link-mode.spec uses).
+ *  `authoring` lives in the PRIVATE sibling repository, outside the dev-server
+ *  root, so it goes through `/@fs/<abs>` — see `e2e/private-module-url.ts`. */
 const MODULE_PATHS = {
   doc: '/src/core/editor/rv-asset-document.ts',
-  authoring: '/src/plugins/asset-editor/mechanism/mechanism-authoring.ts',
+  authoring: privateModuleUrl('plugins/asset-editor/mechanism/mechanism-authoring.ts'),
   registry: '/src/core/engine/rv-kinematic-registry.ts',
   glbExport: '/src/core/editor/rv-asset-glb-export.ts',
   loader: '/src/core/engine/rv-scene-loader.ts',
@@ -461,7 +465,7 @@ async function installHarness(page: Page): Promise<void> {
        */
       async author(spec: any) {
         const viewer = w.viewer;
-        const doc = docMod.AssetDocument.newUntitled(viewer);
+        const doc = docMod.scratchAssetDocument(viewer);
         w.__rvT10._doc = doc;
 
         const readField = (nodePath: string, componentType: string, fieldName: string) => {
@@ -697,6 +701,10 @@ function dist(a: number[], b: number[]): number {
 test.describe.configure({ mode: 'serial' });
 
 test.describe('plan-404 T10 — mechanism authoring matrix (Quick Edit)', () => {
+  // Mechanism authoring is commercial source; without the private sibling repo
+  // there is nothing to drive here.
+  test.skip(!HAS_PRIVATE_SOURCE, 'needs the private sibling repository (asset-editor source)');
+
   let page: Page;
 
   test.beforeAll(async ({ browser }) => {

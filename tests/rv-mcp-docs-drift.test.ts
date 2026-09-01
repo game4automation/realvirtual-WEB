@@ -57,6 +57,12 @@ const SOURCES: Record<string, string> = {
 const schemas = allSchemas();
 const blocks = renderDocBlocks(schemas);
 
+/** A document with every `<!-- BEGIN/END GENERATED -->` region removed. */
+function stripGeneratedBlocks(source: string): string {
+  return source.replace(
+    /<!-- BEGIN GENERATED:[\s\S]*?<!-- END GENERATED:[^>]*-->/g, '');
+}
+
 /**
  * Offer the rendered block to the Node-side writer.
  *
@@ -124,6 +130,44 @@ describe('MCP documentation drift gate', () => {
   it('the roster counts what the schema list holds', () => {
     const roster = blocks.find((b) => b.marker === 'tool-domains')!.body;
     expect(roster).toContain(`${schemas.length} tools across`);
+  });
+
+  /**
+   * plan-724 T4 — the PROSE, which the generator deliberately never touches.
+   *
+   * The generated tables above are pinned byte for byte; the hand-written
+   * sections around them are not, and that is where a retired tool survives.
+   * `web_editor_list_circles` had a whole recipe paragraph in `help/editor.md`
+   * outside the fences — regenerating the tables would have removed its row and
+   * left the recipe telling agents to call a tool that no longer exists. That is
+   * worse than no documentation: the tool is described as working.
+   *
+   * So every `web_editor_*` name mentioned in the hand-written parts of ANY
+   * guide must still be a live schema — not just `help/editor.md`, since the
+   * editor tools are cross-referenced from the other guides too. The scope stops
+   * at `web_editor_*` on purpose: the other domains carry deliberate "this is
+   * retired, use X instead" notes, which this rule would forbid outright.
+   */
+  it('no guide names an editor tool that no longer exists — the prose included', () => {
+    const live = new Set(schemas.map((s) => s.name));
+    const offenders: string[] = [];
+    for (const [file, source] of Object.entries(SOURCES)) {
+      // Everything OUTSIDE the fences. Inside them the byte-exact comparison
+      // above already holds, and their descriptions are ellipsis-truncated, so
+      // scanning them would only manufacture half-names like
+      // `web_editor_mechanism_s`.
+      for (const match of stripGeneratedBlocks(source).matchAll(/\bweb_editor_[a-z0-9_]+\b/g)) {
+        const name = match[0];
+        // A trailing underscore is a wildcard (`web_editor_*`) or a family
+        // ("the web_editor_mechanism_ tools"), never a tool name.
+        if (name.endsWith('_') || live.has(name)) continue;
+        offenders.push(`${file}: ${name}`);
+      }
+    }
+    expect(
+      [...new Set(offenders)].sort(),
+      'these names are documented in prose but no longer announced — rewrite the passage',
+    ).toEqual([]);
   });
 
   it('renders identically twice — the gate cannot flap (R5)', () => {

@@ -52,9 +52,10 @@ export function selectionPointsIntoGroup(
 /**
  * Canonical cross-source identity of an entry, or null when it has none.
  *
- * The path below the last `library/` segment is the one thing both spellings
- * share (`library/Conveyors/Belt.glb` vs
- * `https://…/models/library/Conveyors/Belt.glb`). Entries whose URLs carry no
+ * The path below the LAST `library/` segment is the one thing every spelling
+ * shares — a project-relative `library/Conveyors/Belt.glb`, a deployed
+ * `https://…/library/Conveyors/Belt.glb`, and the pre-plan-716 nesting
+ * `…/models/library/…` an old catalogue may still carry. Entries whose URLs carry no
  * `library/` folder deliberately return null and are never deduplicated — a
  * coincidental basename match between two genuinely different libraries must
  * not hide a card.

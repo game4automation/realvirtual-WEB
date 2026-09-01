@@ -1,6 +1,6 @@
 {
   "name": "Conveyor + MUs + sensors",
-  "source": "public/models/DemoRealvirtualWeb.glb",
+  "source": "public/DemoRealvirtualWeb.glb",
   "output": "public/embed/vignettes/conveyor-sensor.glb",
   "budgetBytes": 3145728,
   "selection": [

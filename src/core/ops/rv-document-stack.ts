@@ -339,12 +339,18 @@ export class RvDocumentStack {
    * the address, and every frame's occurrence is a prefix of it by construction
    * ({@link _assertChain} proves that in debug builds). What this adds is only
    * what a chip needs on top of the id — the label and the two flags.
+   *
+   * The label comes from the DOCUMENT, not from `frame.name`. `frame.name` is
+   * the name the frame was pushed under, and it doubles as the frame's address
+   * segment ({@link occurrenceSegments}), so it must not follow a rename — but
+   * the chip is the only place the hierarchy header prints the open document's
+   * name, and it went on showing the old one after a rename or a "Save as…".
    */
   breadcrumb(): RvStackCrumb[] {
     const last = this._frames.length - 1;
     return this._frames.map((f, i) => ({
       index: i,
-      label: f.name,
+      label: f.doc.document.name || f.name,
       occurrence: f.occurrence,
       referenceNodeId: f.referenceNodeId,
       dirty: f.doc.document.dirty,

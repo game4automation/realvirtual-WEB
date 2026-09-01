@@ -29,6 +29,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Mesh, BoxGeometry, MeshStandardMaterial, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -98,7 +99,7 @@ function makeEnv(): Env {
     refitRaycastSubtrees() {},
   } as unknown as RVViewer;
 
-  const doc = AssetDocument.newUntitled(viewer);
+  const doc = scratchAssetDocument(viewer);
   setActiveAssetContext({ viewer, doc });
   const tools = new McpEditorTools(() => viewer);
 

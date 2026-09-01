@@ -15,6 +15,7 @@
  *
  *   - no `?project=`, `?scene=` or `?model=` in the URL
  *   - no `defaultModel` in settings.json
+ *   - the active project's manifest names no start document (plan-726 F3)
  *   - the mode is not locked (kiosk)
  *   - `projects.suppress` is not set
  *
@@ -33,12 +34,36 @@ export interface AutoOpenInputs {
   search: string;
   /** `settings.json` `defaultModel`, if any. */
   defaultModel?: string | null | undefined;
+  /**
+   * The ACTIVE PROJECT's own start document (`project.settings.defaultModel`),
+   * if it names one (plan-726 F3).
+   *
+   * The second way a session says what to show, and it had to become one: since
+   * plan-726 the public demo carries no global `defaultModel` at all — its
+   * `project.json` is the boot SSOT — so the `defaultModel` field above is
+   * empty on precisely the deployment that must never open a file browser.
+   *
+   * Treated exactly like `defaultModel` and checked in the same place, because
+   * it answers the same question. The consequence is deliberate and wider than
+   * the demo: ANY active project whose manifest names a start document now
+   * keeps the dashboard shut, and eight private project manifests set that
+   * field. Internal dev and QA flows that relied on the dashboard appearing by
+   * itself will need `projects.force` or the dashboard button instead.
+   */
+  projectStartDocument?: string | null | undefined;
   /** True when the workspace mode is locked (kiosk deployment). */
   modeLocked: boolean;
   /** `projects.suppress` — never auto-open. */
   suppress?: boolean | undefined;
   /** `projects.force` — auto-open even with a default model. */
   force?: boolean | undefined;
+  /**
+   * The last session's project could not be restored at boot (grant lapsed or
+   * folder unreadable — plan-702 Punkt 3). The user has to re-open it by hand,
+   * so the dashboard opens even when the session otherwise said what to show:
+   * whatever it said referred to a project that is not there.
+   */
+  restoreFailed?: boolean | undefined;
 }
 
 /** URL parameters that mean "the session already knows what to show". */
@@ -56,11 +81,13 @@ export function shouldAutoOpenProjects(inputs: AutoOpenInputs): boolean {
   if (inputs.suppress) return false;
   if (inputs.modeLocked) return false;
   if (inputs.force) return true;
+  if (inputs.restoreFailed) return true;
 
   const params = new URLSearchParams(inputs.search);
   if (ROUTING_PARAMS.some(p => (params.get(p) ?? '').trim() !== '')) return false;
 
   if ((inputs.defaultModel ?? '').trim() !== '') return false;
+  if ((inputs.projectStartDocument ?? '').trim() !== '') return false;
 
   return true;
 }

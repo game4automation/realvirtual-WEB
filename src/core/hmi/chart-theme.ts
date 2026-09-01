@@ -25,8 +25,9 @@ export const DARK_TITLE_STYLE = {
 /** Dark-theme axis line style. */
 export const DARK_AXIS_LINE = { lineStyle: { color: 'rgba(255,255,255,0.1)' } } as const;
 
-/** Dark-theme axis label style. */
-export const DARK_AXIS_LABEL = { color: 'rgba(255,255,255,0.3)', fontSize: 10 } as const;
+/** Dark-theme axis label style. 0.5 alpha is the contrast floor for 10px text
+ *  on the near-opaque panel glass (≈5:1); the previous 0.3 sat at ≈2.7:1. */
+export const DARK_AXIS_LABEL = { color: 'rgba(255,255,255,0.5)', fontSize: 10 } as const;
 
 /** Dark-theme split line style. */
 export const DARK_SPLIT_LINE = { lineStyle: { color: 'rgba(255,255,255,0.04)' } } as const;

@@ -573,6 +573,24 @@ When registering a signal, the name is determined by priority:
 2. Node alias (handles Three.js name deduplication like `Sensor_1`, `Sensor_2`)
 3. Node name (fallback)
 
+**Step 2 uses the RAW glTF name** — the spelling the file authored, before Three.js sanitized
+it. That is the spelling the live interface (MQTT / realvirtual CONNECT) addresses, so a
+Siemens symbol `MC04.01I00W` on a node Three.js had to deduplicate registers as `MC04.01I00W`
+and not `MC0401I00W`.
+
+> **Behaviour change (plan-734, was a bug).** Before this, step 2 handed over the *sanitized*
+> spelling, so a deduplicated signal node with an empty `Name` field registered under a name the
+> PLC could never write to. A signal is affected only if all three hold: no explicit `Name`
+> field, its node name collides file-globally after sanitization, **and** the raw name contains
+> whitespace or one of `[ ] . : /`. Measured across all 25 private project GLBs: **zero**
+> signals change name.
+>
+> If such a signal did exist, one thing would not follow it: a layout-planner binding saved
+> *before* the fix stores the SignalStore **name** (`SignalMapping.signal`,
+> `carrierSignalName`), and the store has a path alias but no *name* alias. The binding would be
+> reported as orphaned — fail-closed, no data loss, no crash — and has to be re-bound once. The
+> raw name is the correct one; the old binding pointed at a name that never worked.
+
 ---
 
 ## 3. SignalStore — Central Signal Bus

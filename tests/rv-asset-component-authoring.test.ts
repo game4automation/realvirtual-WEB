@@ -7,6 +7,7 @@
  * fields) and the `authorable` capability wiring.
  */
 import { describe, it, expect } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -57,7 +58,7 @@ describe('authorable capability', () => {
 describe('addComponent / removeComponent ops', () => {
   it('addComponent writes userData with schema fields; undo removes it', async () => {
     const { viewer, box, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const key = doc.addComponent(boxPath, 'Sensor', { Limit: 5 });
     await doc.whenIdle();
@@ -74,7 +75,7 @@ describe('addComponent / removeComponent ops', () => {
 
   it('duplicate adds get deterministic _N suffixed keys', async () => {
     const { viewer, box, boxPath } = makeMockViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const k1 = doc.addComponent(boxPath, 'Sensor', {});
     await doc.whenIdle();
@@ -90,7 +91,7 @@ describe('addComponent / removeComponent ops', () => {
   it('removeComponent deletes the entry; undo restores the exact prev fields', async () => {
     const { viewer, box, boxPath } = makeMockViewer();
     box.userData.realvirtual = { Drive: { Direction: 'LinearX', TargetSpeed: 250 } };
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.removeComponent(boxPath, 'Drive');
     await doc.whenIdle();

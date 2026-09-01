@@ -17,6 +17,7 @@
 
 import { test, expect } from 'playwright/test';
 import { DEV_GLB } from '../tests/fixtures/glb-paths.mjs';
+import { DEV_ASSETS_SKIP_REASON, HAS_DEV_ASSETS } from './dev-assets';
 
 /**
  * Derived from `baseURL` rather than hardcoded: the share fetch demands an
@@ -39,6 +40,10 @@ async function waitForViewer(page: import('playwright/test').Page): Promise<void
 }
 
 test.describe('plan-386 §9.7 — shared GLB link', () => {
+  // plan-395: the model is in the private Development project, so a public
+  // checkout has nothing to load. Playwright reports this as `skipped`.
+  test.skip(!HAS_DEV_ASSETS, DEV_ASSETS_SKIP_REASON);
+
   test('e2e_ShareLink_OpensInViewer', async ({ page, baseURL }) => {
     test.setTimeout(90_000);
 

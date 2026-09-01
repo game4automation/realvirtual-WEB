@@ -117,6 +117,19 @@ export function useAssetThumbnail<E extends HTMLElement>(
         if (!source) throw new Error('asset could not be resolved');
         try {
           const gltf = await gltfLoader.loadAsync(source.url);
+          // A scene document carries its placements as geometry-less
+          // `AssetReference` nodes (plan-397 phase 6) — compose them exactly
+          // like the loader does, or every planner scene's tile reads "EMPTY"
+          // while the scene itself is full (2026-08-31 DemoPlanner finding).
+          // Best-effort: an unresolvable reference leaves its labelled
+          // placeholder behind, and rendering that beats rendering nothing.
+          const { hasReferences, compose } = await import('../engine/rv-glb-compose');
+          if (hasReferences(gltf.scene)) {
+            try {
+              const { createReferenceResolver } = await import('../engine/rv-glb-reference-resolver');
+              await compose(gltf.scene, { resolve: createReferenceResolver(), baseUrl: source.url });
+            } catch { /* render whatever resolved */ }
+          }
           // Nothing renderable — a freshly created asset. Report it as a fact
           // and skip the render: a picture of nothing is a blank square, and
           // a blank square reads as a bug.

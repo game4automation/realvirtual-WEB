@@ -360,7 +360,9 @@ export function documentLocationCrumbs(base: AssetBase | null | undefined): stri
       // was resolvable; without one the honest statement is that we are inside
       // another file, not a folder we cannot name.
       return base.path ? folderSegments(base.path) : ['Referenced'];
-    case 'empty':           return ['Unsaved'];
+    // There is no `'empty'` case any more (plan-719 F3): an asset that lived
+    // nowhere and printed "Unsaved" as its location cannot occur, because a
+    // document is created with a folder before it is ever opened.
     default:                return [];
   }
 }

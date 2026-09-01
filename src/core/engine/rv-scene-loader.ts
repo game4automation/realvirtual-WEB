@@ -3,11 +3,13 @@
 
 import { Scene, Object3D, Box3, BufferAttribute, Mesh, BufferGeometry, Material } from 'three';
 import { RVDrive } from './rv-drive';
+import { disposeModelSubtree } from './rv-dispose-subtree';
 import { AABB } from './rv-aabb';
 import { registerSignal, constructDrive, SIGNAL_TYPES, DRIVE_BEHAVIOR_MAP } from './rv-signal-construction';
 import {
   gltfLoader, detectRenamedNodes, collectRenamedNodes, collectGltfNodeIndices, collectGltfNodeNames, type GltfParserLike,
 } from './rv-glb-parse';
+import { sanitizeLikeThree } from './rv-three-names';
 import { classifyShadows } from './rv-mesh-classifier';
 import {
   compose, hasReferences, collectGatedNodes, isFrameGated,
@@ -34,6 +36,7 @@ import './rv-push-button3d';
 import './rv-emergency-button3d';
 import './rv-handle-switch3d';
 import './rv-energy-chain';
+import './rv-chain';
 import './rv-safety-door';
 import './rv-physics-zone';
 import './rv-collision-role';
@@ -66,6 +69,7 @@ import type { GizmoOverlayManager } from './rv-gizmo-manager';
 import type { LampManager } from './rv-lamp-manager';
 import type { SceneButtonManager } from './rv-scene-button-manager';
 import type { EnergyChainManager } from './rv-energy-chain-manager';
+import type { ChainManager } from './rv-chain-manager';
 import type { MachiningManager } from './rv-machining-manager';
 import type { CollisionRoleRegistrar } from './rv-collision-role';
 // plan-404: the rigid-body mechanism manager is a PRIVATE implementation behind
@@ -168,6 +172,27 @@ export interface RecorderSettings {
 }
 
 import type { ModelConfig } from './rv-model-config';
+import { isFetchableUrl } from './rv-model-config';
+
+/**
+ * What `registerNodeAliases` did during a load (plan-734 F8).
+ *
+ * Alias registration is the one load phase whose cost scales with how badly the
+ * source CAD reused names — 43k deduplicated nodes in a customer model are not
+ * unusual — and until now it reported a single line with two numbers and no
+ * timing, so it was impossible to say whether it mattered. `droppedAliases` is
+ * the correctness signal of the three: it counts alias paths that were thrown
+ * away because something already occupied the path.
+ */
+export interface AliasStats {
+  nodeAliases: number;
+  signalAliases: number;
+  /** Alias registrations `registerAlias` silently discarded (path already taken). */
+  droppedAliases: number;
+  /** The alias leaf name claimed most often — the registry's worst suffix scan. */
+  largestSuffixBucket: { suffix: string; count: number };
+  ms: number;
+}
 
 export interface LoadResult {
   /** The GLB root Object3D added to `scene` by `loadGLB`. Lets the caller
@@ -220,6 +245,11 @@ export interface LoadResult {
     aabbBuildMs: number;
     hoverableFaceRanges: number;
   };
+  /**
+   * Node/signal path aliases published for Three.js-deduplicated nodes
+   * (plan-734 F8). OPTIONAL so LoadResult mocks in tests stay robust.
+   */
+  aliasStats?: AliasStats;
   /** rv_sig verification result obtained from the raw GLB before GLTF parsing. */
   signatureState: SignatureState;
   /** True whenever the normative default-scene extras contained rv_sig. */
@@ -304,6 +334,8 @@ export interface LoadGLBOptions {
   /** Optional viewer-owned manager for 3D scene buttons (plan-417). */
   sceneButtonManager?: SceneButtonManager;
   energyChainManager?: EnergyChainManager;
+  /** plan-733 - so a Chain reaches the per-tick pose registry. */
+  chainManager?: ChainManager;
   /** Optional viewer-owned CSG machining registry (plan-405) — passed into
    *  ComponentContext so `MachiningVolume` components can register themselves. */
   machiningManager?: MachiningManager;
@@ -348,6 +380,22 @@ export interface LoadGLBOptions {
    * mega-mesh, making eye toggles and gizmo transforms visually dead.
    */
   preserveHierarchy?: boolean;
+  /**
+   * plan-727 — AUTHORING load: never mutate the GLB node hierarchy.
+   * Skips kinematic re-parenting (Phase 8b) so the CAD tree survives
+   * save/reload and CAD re-import keeps matching. Without it, every editor
+   * reload moves group members under their Kinematic node and the next save
+   * bakes that restructuring permanently into the GLB — after which
+   * `relativePathMap()` in rv-cadlink-reimport.ts no longer traverses them and
+   * they vanish from the re-import SILENTLY, components and all.
+   *
+   * Deliberately SEPARATE from `preserveHierarchy`: that flag is about mesh
+   * baking and pickability, and `RVEmbedViewer` (a simulating production
+   * runtime, src/embed/rv-embed-viewer.ts:291) sets it while still requiring
+   * the re-parenting — gating Phase 8b on it would freeze embed kinematics
+   * with no error and no log. Only the asset editor sets this one.
+   */
+  preserveAuthoringHierarchy?: boolean;
   /**
    * Abort predicate (plan-274 B3/F7) — checked after every await of the async
    * merge phases (10c/10d). RVViewer.loadModel() passes a load-generation
@@ -500,9 +548,15 @@ export function processMeshes(root: Object3D): MeshProcessResult {
   // twice over: `matrixAutoUpdate = false` below meant the solver's writes never
   // reached matrixWorld, and `driveAnchor()` put them in the root-parented
   // static arena, which cannot move by construction. Symptom: a mechanism that
-  // jogs perfectly in the asset editor (`preserveHierarchy` skips both passes)
-  // while in every merged load — the F5 test run, HMI, planner — the driven arms
-  // move and the rods and platform hang frozen in mid-air.
+  // jogs perfectly in the asset editor while in every merged load — the F5 test
+  // run, HMI, planner — the driven arms move and the rods and platform hang
+  // frozen in mid-air. ("The asset editor is fine" because `preserveHierarchy`
+  // skips the two MERGE passes — 10c/10d — so the static arena never claims the
+  // links. It is emphatically NOT because the editor skips this classification:
+  // the freeze below runs on EVERY load, in every mode. Reading that comment as
+  // "the editor is exempt from load-time structure work" is what let the
+  // kinematic re-parenting of Phase 8b stay ungated for so long; see plan-727
+  // and `reclassifyKinematicGroupsDynamic`.)
   //
   // This mirrors MOVER_KEY in rv-freeze-static.ts, which already keeps
   // `Kinematic` subtrees matrix-dynamic; the two classifications disagreeing was
@@ -644,12 +698,21 @@ export function buildGroups(
  * After re-parenting, fixes Drive base transforms and matrixAutoUpdate on affected subtrees.
  *
  * Returns the list of kinematic group names for UI exclusion.
+ *
+ * `skipReparent` (plan-727) is the AUTHORING mode: both passes still resolve
+ * names and `GroupNamePrefix` exactly as before — so `groupNames` (and with it
+ * `GroupRegistry.isKinematic()`, which feeds the editor's group-assignment
+ * menu) is populated identically — but nothing is attached and
+ * `affectedSubtrees` comes back empty, which turns Phase 8c into a no-op by
+ * itself. Name resolution and mutation share a loop, so this cannot be done by
+ * gating the call site.
  */
 export function applyKinematicParenting(
   kinematicNodes: KinematicNodeEntry[],
   groups: GroupRegistry | null,
   registry: NodeRegistry,
   root: Object3D,
+  skipReparent = false,
 ): { groupNames: string[]; affectedSubtrees: Object3D[] } {
   if (kinematicNodes.length === 0) return { groupNames: [], affectedSubtrees: [] };
 
@@ -706,16 +769,23 @@ export function applyKinematicParenting(
       return true;
     });
 
-    for (const groupNode of nodesToReparent) {
-      kinNode.attach(groupNode);
-      reparentedRoots.push(groupNode);
+    if (!skipReparent) {
+      for (const groupNode of nodesToReparent) {
+        kinNode.attach(groupNode);
+        reparentedRoots.push(groupNode);
+      }
+      affectedSubtrees.push(kinNode);
     }
 
+    // Outside the gate on purpose (plan-727 F9): the resolved name must flow in
+    // BOTH modes so markAsKinematic()/isKinematic() behave identically.
     kinematicGroupNames.push(resolvedName);
-    affectedSubtrees.push(kinNode);
     debug('loader',
-      `[Kinematic] ${kinNode.name}: attached ${nodesToReparent.length} node(s) from group "${resolvedName}"` +
-      (simplify ? ' (mesh-only)' : '')
+      skipReparent
+        ? `[Kinematic] ${kinNode.name}: authoring load — resolved group "${resolvedName}" ` +
+          `(${nodesToReparent.length} node(s)), NOT re-parenting`
+        : `[Kinematic] ${kinNode.name}: attached ${nodesToReparent.length} node(s) from group "${resolvedName}"` +
+          (simplify ? ' (mesh-only)' : '')
     );
   }
 
@@ -730,6 +800,12 @@ export function applyKinematicParenting(
     const parentNode = registry.getNode(parentPath);
     if (!parentNode) {
       debug('loader', `[Kinematic] ${kinNode.name}: parent "${parentPath}" not found, skipping`);
+      continue;
+    }
+
+    if (skipReparent) {
+      debug('loader',
+        `[Kinematic] ${kinNode.name}: authoring load — resolved parent "${parentNode.name}", NOT re-parenting`);
       continue;
     }
 
@@ -770,6 +846,63 @@ export function applyKinematicParenting(
   }
 
   return { groupNames: kinematicGroupNames, affectedSubtrees };
+}
+
+/**
+ * Phase 8a-bis (plan-727): group-aware dynamic reclassification.
+ *
+ * `processMeshes()` classifies a mesh as static by walking the PHYSICAL parent
+ * chain (`isUnderDrive`). A kinematic group member carries only `Group`, not
+ * `Kinematic`, so without re-parenting the driven axis is not one of its
+ * ancestors and the mesh is frozen with `matrixAutoUpdate = false` — after
+ * which three.js never rebuilds its matrix from the quaternion a drive writes,
+ * and the drive "runs" while the geometry stands still (the failure the comment
+ * above `processMeshes`'s isStatic branch describes verbatim).
+ *
+ * Until plan-727 the only corrector was Pass 3 of `applyKinematicParenting()`,
+ * which exists only where re-parenting actually happened. This asks the semantic
+ * question instead — "is this mesh MOVED by a drive?" rather than "does it hang
+ * under one?" — and therefore runs in ALL modes (root fix). In runtime loads it
+ * is idempotent to Pass 3; in an authoring load it is the only corrector.
+ *
+ * It is deliberately NOT in `processMeshes()`: groups (and with them
+ * `GroupNamePrefix`, which needs `registry.getNode()`) are resolved only much
+ * later in the phase order, so a classification there would either miss
+ * prefixed groups entirely or match the wrong instance by raw name.
+ *
+ * MONOTONE: only ever sets `matrixAutoUpdate = true`, never `false` — it can
+ * only add dynamic nodes, never take one away.
+ */
+export function reclassifyKinematicGroupsDynamic(
+  groupNames: readonly string[],
+  groups: GroupRegistry | null,
+): void {
+  for (const member of collectKinematicGroupMembers(groupNames, groups)) {
+    member.traverse((n: Object3D) => { n.matrixAutoUpdate = true; });
+  }
+}
+
+/**
+ * The member nodes of the given (already resolved) kinematic group names.
+ *
+ * These are the nodes a drive moves WITHOUT owning them in the node tree — the
+ * exact set every physical-parent-chain classification gets wrong once the
+ * authoring load stops re-parenting (plan-727). Used by the `matrixAutoUpdate`
+ * reclassification above and, for the same reason, by the Phase-11
+ * `matrixWorldAutoUpdate` freeze.
+ */
+export function collectKinematicGroupMembers(
+  groupNames: readonly string[],
+  groups: GroupRegistry | null,
+): Object3D[] {
+  if (!groups || groupNames.length === 0) return [];
+  const out: Object3D[] = [];
+  for (const name of groupNames) {
+    const info = groups.get(name);
+    if (!info) continue;
+    out.push(...info.nodes);
+  }
+  return out;
 }
 
 // ─── Unity marker key normalization (plan-419) ──────────────────────────
@@ -1176,26 +1309,55 @@ export function reconcileOverlayOverrides(
  * Cost control: the renamed set is reduced to its TOPMOST members first, then
  * each of those subtrees is walked exactly once behind a shared visited set —
  * nested renames cannot make this quadratic.
+ *
+ * BOTH spellings are published (plan-734 F3). `renamedNodes` now carries the
+ * RAW glTF name, so the reconstructed path is the one the file authored — but
+ * already-delivered content, exported overlays and internal callers may address
+ * the SANITIZED spelling that this function used to be the only source of.
+ * Registering both costs one extra Map entry per affected node and removes a
+ * whole class of "resolves on my machine" differences.
+ *
+ * @returns Counters for the load diagnosis (plan-734 F8). `droppedAliases`
+ *   matters more than it looks: {@link NodeRegistry.registerAlias} gives up
+ *   silently when the path is already taken, and publishing two spellings
+ *   doubles the surface for that — a dropped alias that shadows a real node is
+ *   otherwise completely invisible.
  */
 export function registerNodeAliases(
   renamedNodes: Map<Object3D, string>,
   registry: NodeRegistry,
   signalStore: SignalStore,
-): void {
-  if (renamedNodes.size === 0) return;
+): AliasStats {
+  const t0 = performance.now();
+  const empty = (): AliasStats => ({
+    nodeAliases: 0,
+    signalAliases: 0,
+    droppedAliases: 0,
+    largestSuffixBucket: { suffix: '', count: 0 },
+    ms: performance.now() - t0,
+  });
+  if (renamedNodes.size === 0) return empty();
 
   // Original path = current path with every renamed ANCESTOR (and the node
   // itself) spelled the way the glTF file spelled it.
-  const computeOriginalPath = (node: Object3D): string => {
+  //
+  // `spell` picks which spelling a renamed segment contributes: the raw glTF
+  // name, or the form Three.js sanitized it to. Un-renamed ancestors always
+  // fall back to `current.name` in BOTH passes — they were never touched, so
+  // there is nothing to spell differently.
+  const computeOriginalPath = (node: Object3D, spell: (raw: string) => string): string => {
     const parts: string[] = [];
     let current: Object3D | null = node;
     while (current && current.parent) {
-      parts.unshift(renamedNodes.get(current) ?? current.name);
+      const raw = renamedNodes.get(current);
+      parts.unshift(raw !== undefined ? spell(raw) : current.name);
       current = current.parent;
       if (!current.parent) break;
     }
     return parts.join('/');
   };
+
+  const asRaw = (raw: string): string => raw;
 
   // Topmost renamed nodes only: a renamed node below another renamed node is
   // reached by the ancestor's traversal anyway.
@@ -1213,6 +1375,10 @@ export function registerNodeAliases(
   const visited = new Set<Object3D>();
   let nodeAliases = 0;
   let signalAliases = 0;
+  let droppedAliases = 0;
+  // Largest suffix bucket across the aliases we add — the cost signal for the
+  // registry's O(bucket) suffix scan (plan-734 F8).
+  const suffixCounts = new Map<string, number>();
 
   for (const root of roots) {
     root.traverse((node: Object3D) => {
@@ -1220,30 +1386,60 @@ export function registerNodeAliases(
       visited.add(node);
 
       const currentPath = NodeRegistry.computeNodePath(node);
-      const origPath = computeOriginalPath(node);
-      if (origPath === currentPath) return;
+      // Both historical spellings, de-duplicated: a segment without reserved
+      // characters or whitespace spells the same either way, which is the
+      // common case and must not cost a second registration.
+      const origPaths = [...new Set([
+        computeOriginalPath(node, asRaw),
+        computeOriginalPath(node, sanitizeLikeThree),
+      ])].filter((p) => p !== currentPath);
+      if (origPaths.length === 0) return;
 
-      registry.registerAlias(origPath, node);
-      nodeAliases++;
-      debugVerbose('loader', `Node alias: "${origPath}" → "${currentPath}"`);
+      for (const origPath of origPaths) {
+        // registerAlias() gives up when the path is already claimed — count
+        // that, because a dropped alias shadowing a live node is otherwise
+        // completely invisible.
+        if (!registry.registerAlias(origPath, node)) { droppedAliases++; continue; }
+        nodeAliases++;
+        const suffix = origPath.slice(origPath.lastIndexOf('/') + 1);
+        suffixCounts.set(suffix, (suffixCounts.get(suffix) ?? 0) + 1);
+        debugVerbose('loader', `Node alias: "${origPath}" → "${currentPath}"`);
+      }
 
       // Signal alias — exact lookup only. `nameForPath()` would suffix-scan and
       // negative-cache once per plain geometry node in the subtree; a signal's
       // canonical registration path is by definition an exact hit.
       const sigName = signalStore.exactNameForPath(currentPath);
       if (sigName === undefined) return;
-      // ADDITIVE alias (plan-381 F11): `register()` would repoint the canonical
-      // name→path mapping at this historical spelling.
-      if (signalStore.registerPathAlias(sigName, origPath)) {
-        signalAliases++;
-        debugVerbose('loader', `Signal alias: "${origPath}" → signal "${sigName}"`);
+      for (const origPath of origPaths) {
+        // ADDITIVE alias (plan-381 F11): `register()` would repoint the canonical
+        // name→path mapping at this historical spelling.
+        if (signalStore.registerPathAlias(sigName, origPath)) {
+          signalAliases++;
+          debugVerbose('loader', `Signal alias: "${origPath}" → signal "${sigName}"`);
+        }
       }
     });
   }
 
-  if (nodeAliases > 0) {
-    debug('loader', `Aliases registered: ${nodeAliases} node path(s), ${signalAliases} signal path(s) — ?debug=loader,verbose lists them`);
+  let largestSuffixBucket = { suffix: '', count: 0 };
+  for (const [suffix, count] of suffixCounts) {
+    if (count > largestSuffixBucket.count) largestSuffixBucket = { suffix, count };
   }
+
+  const stats: AliasStats = {
+    nodeAliases, signalAliases, droppedAliases, largestSuffixBucket,
+    ms: performance.now() - t0,
+  };
+
+  if (nodeAliases > 0) {
+    debug('loader',
+      `Aliases registered: ${nodeAliases} node path(s), ${signalAliases} signal path(s), `
+      + `${droppedAliases} dropped (path already taken); largest suffix bucket `
+      + `"${largestSuffixBucket.suffix}" ×${largestSuffixBucket.count}; `
+      + `${stats.ms.toFixed(1)} ms — ?debug=loader,verbose lists them`);
+  }
+  return stats;
 }
 
 /**
@@ -1362,6 +1558,8 @@ export interface RuntimeNodeDeps {
   /** plan-417 — so a runtime-placed scene button animates and is torn down. */
   sceneButtonManager?: SceneButtonManager;
   energyChainManager?: EnergyChainManager;
+  /** plan-733 - so a Chain reaches the per-tick pose registry. */
+  chainManager?: ChainManager;
   /** plan-405 — so a runtime-created `MachiningVolume` reaches the manager. */
   machiningManager?: MachiningManager;
   /** plan-394 — so a runtime-created `CollisionRole` reaches the manager. */
@@ -1447,6 +1645,7 @@ export function createRuntimeNode(deps: RuntimeNodeDeps, spec: RuntimeNodeSpec):
     gizmoManager: deps.gizmoManager, lampManager: deps.lampManager,
     sceneButtonManager: deps.sceneButtonManager,
     energyChainManager: deps.energyChainManager,
+    chainManager: deps.chainManager,
     machiningManager: deps.machiningManager,
     collisionManager: deps.collisionManager,
     outlineManager: deps.outlineManager,
@@ -1540,6 +1739,7 @@ function runtimeComponentContext(deps: RuntimeNodeDeps, root: Object3D): Compone
     gizmoManager: deps.gizmoManager, lampManager: deps.lampManager,
     sceneButtonManager: deps.sceneButtonManager,
     energyChainManager: deps.energyChainManager,
+    chainManager: deps.chainManager,
     machiningManager: deps.machiningManager,
     collisionManager: deps.collisionManager,
     outlineManager: deps.outlineManager,
@@ -1986,21 +2186,53 @@ export function buildLogicEngine(
  *
  * Exported for testing.
  */
+/**
+ * Session cache of sidecar probe results, keyed by sidecar URL.
+ *
+ * Negative results included: a layout that places the same library item five
+ * times used to probe the same absent `.kin.json` five times per load — five
+ * red 404 lines in every visitor's console. Positive entries hold the raw
+ * TEXT and are re-parsed per consumer, so no caller can mutate another's spec.
+ */
+const _sidecarProbeCache = new Map<string, string | null>();
+
+/** Test seam: forget all cached sidecar probe results. */
+export function resetSidecarProbeCache(): void {
+  _sidecarProbeCache.clear();
+}
+
 export async function tryFetchSidecarSpec(glbUrl: string): Promise<import('../behavior-runtime').KinematicsSpec | null> {
   if (!glbUrl) return null;
+  // `rvproject:` (a project document opened by path) is not fetchable — the
+  // browser logs a loud error for the attempt before any catch runs.
+  if (!isFetchableUrl(glbUrl)) return null;
   const [base, query] = glbUrl.split('?', 2);
   if (!/\.glb$/i.test(base)) return null;
   const sidecarUrl = base.replace(/\.glb$/i, '.kin.json') + (query ? `?${query}` : '');
-  let resp: Response;
-  try {
-    resp = await fetch(sidecarUrl);
-  } catch {
-    return null; // network error — silent
+
+  let text: string | null;
+  if (_sidecarProbeCache.has(sidecarUrl)) {
+    text = _sidecarProbeCache.get(sidecarUrl) ?? null;
+  } else {
+    text = await (async () => {
+      let resp: Response;
+      try {
+        resp = await fetch(sidecarUrl);
+      } catch {
+        return null; // network error — silent
+      }
+      if (!resp.ok) return null; // 404 / 403 — silent
+      try {
+        return await resp.text();
+      } catch {
+        return null;
+      }
+    })();
+    _sidecarProbeCache.set(sidecarUrl, text);
   }
-  if (!resp.ok) return null; // 404 / 403 — silent
+
+  if (!text || !text.trim()) return null;
   try {
-    const text = await resp.text();
-    if (!text.trim()) return null;
     return JSON.parse(text) as import('../behavior-runtime').KinematicsSpec;
   } catch (e) {
     console.warn(`[sidecar] parse error for ${sidecarUrl}:`, e);
@@ -2201,7 +2433,10 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
   prof.mark('traverseAndRegister');
 
   // Phase 6: Register node aliases for renamed nodes
-  registerNodeAliases(renamedNodes, registry, signalStore);
+  const aliasStats = registerNodeAliases(renamedNodes, registry, signalStore);
+  // Own marker (plan-734): the time used to fall into the NEXT phase's mark, so
+  // a model whose CAD reused 40k names looked like a slow component init.
+  prof.mark('registerNodeAliases');
 
   // Phase 6b: unresolved references become entries in the Problems panel
   // (plan-703 §2.8, F16). Here and not right after `compose` on purpose — the
@@ -2224,6 +2459,14 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
     gizmoManager: options?.gizmoManager, lampManager: options?.lampManager,
     sceneButtonManager: options?.sceneButtonManager,
     energyChainManager: options?.energyChainManager, expectSceneReady: true,
+    chainManager: options?.chainManager,
+    // plan-733 R4 - the asset editor saves the tree it sees, so components that
+    // materialise runtime geometry (RVChain element clones) must not build it.
+    // Keyed to `preserveAuthoringHierarchy`, NOT `preserveHierarchy`: the latter
+    // is a mesh-bake flag that `RVEmbedViewer` — a simulating PRODUCTION runtime
+    // — also sets, and gating on it would silently leave every embedded chain
+    // without its elements. Only the asset editor sets this one.
+    authoring: options?.preserveAuthoringHierarchy === true,
     machiningManager: options?.machiningManager,
     collisionManager: options?.collisionManager,
     outlineManager: options?.outlineManager,
@@ -2287,17 +2530,32 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
   }
   root.updateMatrixWorld(true);
 
-  // Phase 8b: kinematic structure.
+  // Phase 8b: kinematic structure. In an authoring load (plan-727) both passes
+  // still resolve names and prefixes, but nothing is moved — the GLB hierarchy
+  // is never mutated, so a save/reload cycle is a fixpoint and the CAD
+  // re-import keeps finding every node under its CAD root.
   const kinResult = applyKinematicParenting(
     traverseResult.kinematicNodes, groups, registry, root,
+    options?.preserveAuthoringHierarchy === true,
   );
   const kinematicGroupNames = kinResult.groupNames;
-  // Mark kinematic groups in registry and auto-exclude from overlay
+  // Mark kinematic groups in registry and auto-exclude from overlay.
+  // OUTSIDE any authoring gate: `isKinematic()` feeds the editor's group
+  // assignment menu and must answer identically in both modes (plan-727 F9).
   if (groups && kinematicGroupNames.length > 0) {
     for (const name of kinematicGroupNames) {
       groups.markAsKinematic(name);
     }
   }
+
+  // Phase 8a-bis: group-aware dynamic reclassification (plan-727 F8).
+  // Placed AFTER 8b rather than after buildGroups() as the plan sketched: the
+  // resolved (prefix-expanded) group names are produced by Pass 1 of
+  // applyKinematicParenting, and duplicating that resolution would be the very
+  // drift the prefix mechanism is fragile to. Position is behaviourally free —
+  // the pass only ever sets matrixAutoUpdate to true — and running it after 8b
+  // keeps the runtime path bit-identical to before (Pass 3 already covered it).
+  reclassifyKinematicGroupsDynamic(kinematicGroupNames, groups);
 
   // Phase 8c: Recompute registry paths for re-parented subtrees + signal paths
   if (kinResult.affectedSubtrees.length > 0) {
@@ -2384,27 +2642,9 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
     // cache free those resources itself — is what keeps the sweep below from
     // disposing a buffer another occurrence (or a later load) still renders.
     composition?.dispose();
-    const disposedMaterials = new Set<Material>();
-    root.traverse((node: Object3D) => {
-      const mesh = node as unknown as {
-        geometry?: { dispose(): void; disposeBoundsTree?: () => void };
-        material?: Material | Material[];
-      };
-      if (mesh.geometry) {
-        mesh.geometry.disposeBoundsTree?.();
-        mesh.geometry.dispose();
-      }
-      if (mesh.material) {
-        const disposeMat = (m: Material): void => {
-          if (disposedMaterials.has(m)) return;
-          disposedMaterials.add(m);
-          if (m.userData?._rvShared) return;
-          m.dispose();
-        };
-        if (Array.isArray(mesh.material)) mesh.material.forEach(disposeMat);
-        else disposeMat(mesh.material);
-      }
-    });
+    // The shared traversal primitive (plan-442). The two lines above are this
+    // caller's OWN teardown and stay here for exactly that reason.
+    disposeModelSubtree(root);
     throw new LoadAbortedError(url);
   };
 
@@ -2456,7 +2696,12 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
   // last word on matrixWorldAutoUpdate — a component that thaws itself in init()
   // is overwritten here. Anything that moves must be a MOVER_KEY in
   // rv-freeze-static.ts (plan-417: SceneButtonMoveable learned that the hard way).
-  const freezeResult = freezeStaticMatrices(root);
+  // plan-727: kinematic group members are handed in explicitly. In a runtime
+  // load they sit under the axis anyway and this changes nothing; in an
+  // authoring load they are the only nodes the mover closure cannot see.
+  const freezeResult = freezeStaticMatrices(
+    root, collectKinematicGroupMembers(kinematicGroupNames, groups),
+  );
   debug('loader', `[Freeze] static matrixWorldAutoUpdate=false on ${freezeResult.frozen}/${freezeResult.total} nodes (${freezeResult.dynamic} kept dynamic)`);
 
   // Phase 12: Bounding box (after merge — merged geometry changes bounds)
@@ -2589,6 +2834,7 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
         [...(raycastGeometrySet?.kinematicGroups.values() ?? [])]
           .reduce((n, g) => n + g.faceRanges.length, 0),
     },
+    aliasStats,
     signatureState,
     signaturePresent,
     signerOrganization,
@@ -2619,6 +2865,17 @@ export interface ProcessExtrasOptions {
   collisionManager?: CollisionRoleRegistrar;
   /** plan-405 — so a placed asset's `MachiningVolume` reaches the manager. */
   machiningManager?: MachiningManager;
+  /** plan-733 - so a placed Chain reaches the per-tick pose registry. */
+  chainManager?: ChainManager;
+  /**
+   * plan-727 — AUTHORING call: never mutate the subtree's hierarchy. Same
+   * meaning as {@link LoadGLBOptions.preserveAuthoringHierarchy}, for the
+   * second re-parenting site. Set by the asset editor's `_rebuildComponents()`
+   * (rv-asset-executors.ts), which runs on every separateMesh/mergeMesh
+   * undo/redo and would otherwise re-parent live during a normal editing
+   * session. The Layout Planner's placement calls deliberately leave it unset.
+   */
+  preserveAuthoringHierarchy?: boolean;
 }
 
 /**
@@ -2748,6 +3005,10 @@ export function processExtras(
     registry, signalStore, scene, transportManager, root,
     gizmoManager, lampManager, outlineManager, events, errorStore, instructionStore,
     energyChainManager, sceneButtonManager, expectSceneReady: true,
+    chainManager: options?.chainManager,
+    // plan-733 R4 — same authoring gate as loadGLB above; the asset editor's
+    // `_rebuildComponents()` is the caller that sets it here.
+    authoring: options?.preserveAuthoringHierarchy === true,
     machiningManager: options?.machiningManager,
     collisionManager: options?.collisionManager,
     kinematicManager: getKinematicManager() ?? undefined,
@@ -2780,10 +3041,17 @@ export function processExtras(
     }
     root.updateMatrixWorld(true);
 
-    const kinResult = applyKinematicParenting(kinematicNodes, groups, registry, root);
+    const kinResult = applyKinematicParenting(
+      kinematicNodes, groups, registry, root,
+      options?.preserveAuthoringHierarchy === true,
+    );
     if (groups) {
       for (const name of kinResult.groupNames) groups.markAsKinematic(name);
     }
+
+    // Phase 8a-bis equivalent (plan-727 F8): group members are dynamic because a
+    // drive moves them, not because they hang under one. Monotone — only adds.
+    reclassifyKinematicGroupsDynamic(kinResult.groupNames, groups);
 
     // Phase 8c equivalent: recompute registry paths for the moved subtrees,
     // remap signal paths, and alias the authoring-hierarchy paths so

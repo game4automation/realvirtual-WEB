@@ -26,19 +26,31 @@
  */
 
 /**
- * Phase 1: the root still points at `/models` — plan-395 phase 3 switches it to
- * `/private-assets/Development` (§2.3). Introducing the module and switching the
- * value are deliberately two steps: phase 1 stays behaviour-neutral.
+ * The internal assets live in the private Development project and are served
+ * by the dev server's `/private-assets/<project>/<path...>` route (§2.5) — the
+ * EXISTING recursive route, hardened rather than duplicated.
+ *
+ * Introducing this module and switching this value were deliberately two
+ * steps: phase 1 pointed it at `/models` and changed ~27 files while nothing
+ * moved, so the switch here could be the one line it is.
+ *
+ * A checkout without the private sibling serves none of these. That is
+ * expected, and it is why every consumer pairs `DEV_GLB` with the probe in
+ * `dev-asset-available.ts` (browser) or `HAS_DEV_ASSETS` (Playwright).
  */
-const DEV = '/models';
+const DEV = '/private-assets/Development';
 
 /** Absolute URL paths (not file names) of the internal GLB assets. */
 export const DEV_GLB = {
-  tests: `${DEV}/tests.glb`,
-  physicsZone: `${DEV}/physics-zone-test.glb`,
-  mechanismDelta: `${DEV}/mechanism-delta.glb`,
-  mechanismFourbar: `${DEV}/mechanism-fourbar.glb`,
-  mechanismScissor: `${DEV}/mechanism-scissor.glb`,
-  robotIK: `${DEV}/DemoRobotIK.glb`,
-  europalletEmpty: `${DEV}/EuropalletEmpty.glb`,
+  tests: `${DEV}/fixtures/tests.glb`,
+  physicsZone: `${DEV}/fixtures/physics-zone-test.glb`,
+  mechanismDelta: `${DEV}/fixtures/mechanism-delta.glb`,
+  mechanismFourbar: `${DEV}/fixtures/mechanism-fourbar.glb`,
+  mechanismScissor: `${DEV}/fixtures/mechanism-scissor.glb`,
+  robotIK: `${DEV}/models/DemoRobotIK.glb`,
+  europalletEmpty: `${DEV}/models/EuropalletEmpty.glb`,
+  // Added 2026-08-30: DemoCSGMachining is internal too (it replaced plan-430's
+  // demo). It used to be reached as `?scene=builtin:DemoCSGMachining.glb`,
+  // which stopped resolving when it left `public/project.json`'s documents[].
+  csgMachining: `${DEV}/models/DemoCSGMachining.glb`,
 };

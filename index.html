@@ -9,6 +9,28 @@
   <link rel="icon" type="image/png" href="/favicon.png" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="manifest" href="/manifest.json" />
+  <!-- The boot manifest, fetched before anything else can be decided (plan-731 5a).
+
+       `readManifest()` is awaited before the SceneStore exists and before the
+       start document is even known (`main.ts`), so this request sits at the
+       head of a strictly serial chain: manifest → start document → GLB. Warming
+       it costs nothing and saves one round trip off the critical path.
+
+       The options must MATCH `BundledBackend._fetchJson()`, which issues
+       `fetch(url, { cache: 'no-cache' })`, or the browser treats the preload as
+       a different request and downloads the file twice — worse than not
+       preloading at all:
+
+         - `as="fetch"` because a `fetch()` is what consumes it. Without `as`
+           Chrome discards the entry with "preload not used".
+         - `crossorigin` because a `fetch()` without an explicit `credentials`
+           option is `same-origin`, which in preload terms is the anonymous
+           mode. Omitting it mismatches on a CDN sub-domain — which is exactly
+           where our public demo is served from.
+
+       Deliberately NOT `no-store`-shaped: the whole point of plan-726 §8 was
+       that an unchanged manifest costs a conditional request, not a download. -->
+  <link rel="preload" href="/project.json" as="fetch" type="application/json" crossorigin />
   <title>realvirtual WEB — Browser-based 3D HMI & Digital Twin Viewer</title>
   <meta name="description" content="realvirtual WEB is the open, browser-based 3D HMI and digital twin viewer for industrial automation. Explore live demos of conveyor simulation, robotics and PLC-connected 3D visualization — no installation, right in the browser." />
   <!-- URL-bound SEO tags (canonical, og:url, og:image, twitter:card) are injected

@@ -430,9 +430,12 @@ export function FloatingPanel({
         overflow: 'hidden',
         pointerEvents: 'auto',
         transition: expanded ? 'all 0.25s ease' : undefined,
-        // No background override: draggable windows sit on the theme's default
-        // Paper glass (rgba(30,30,30,0.6) + blur) — the same surface as the
-        // error/alarm tiles — so every floating window shares one tier.
+        // DESIGN.md, FloatingPanel rule: draggable windows carry text and
+        // values that must stay readable over ANY scene brightness, so they sit
+        // on the darkest near-opaque glass — not the lighter floating tier the
+        // theme's Paper default provides. A chart floating over a white floor
+        // on 60 % glass put its own axis labels below 3:1.
+        backgroundColor: 'rgba(15,15,15,0.92)',
       }}
     >
       {/* ── Draggable title bar ── */}

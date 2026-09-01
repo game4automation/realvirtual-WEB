@@ -7,6 +7,7 @@
  * The pivot tools' contract: the NODE moves, every child keeps its WORLD pose.
  */
 import { describe, it, expect } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D, Mesh, BoxGeometry, Vector3, Quaternion, Euler } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -55,7 +56,7 @@ describe('zeroLocalPosition / rotate90', () => {
     node.position.set(3, 4, 5);
     model.add(node);
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     await zeroLocalPosition(viewer, doc, ['Asset/Part']);
     await doc.whenIdle();
@@ -71,7 +72,7 @@ describe('zeroLocalPosition / rotate90', () => {
     node.name = 'Part';
     model.add(node);
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     rotate90(viewer, doc, 'Asset/Part', 'y', 1);
     await doc.whenIdle();
@@ -95,7 +96,7 @@ describe('toGround', () => {
     model.add(rig);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     toGround(viewer, doc, 'Asset/Rig');
     await doc.whenIdle();
@@ -116,7 +117,7 @@ describe('pivot tools (child world pose preserved)', () => {
     model.add(rig);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const meshWorldBefore = mesh.getWorldPosition(new Vector3()).clone();
     await pivotToBottom(viewer, doc, 'Asset/Rig');
@@ -146,7 +147,7 @@ describe('pivot tools (child world pose preserved)', () => {
     model.add(rig);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const meshWorldBefore = mesh.getWorldPosition(new Vector3()).clone();
     await alignYUp(viewer, doc, 'Asset/Rig');
@@ -182,7 +183,7 @@ describe('centerKinematicToGroup', () => {
     groups.register('AxisGrp', m2);
     (viewer as unknown as { groups: GroupRegistry }).groups = groups;
 
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const m1Before = m1.getWorldPosition(new Vector3()).clone();
     const m2Before = m2.getWorldPosition(new Vector3()).clone();
 
@@ -228,7 +229,7 @@ describe('centerKinematicToGroup', () => {
     groups.register('G', m2);
     (viewer as unknown as { groups: GroupRegistry }).groups = groups;
 
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const childBefore = child.getWorldPosition(new Vector3()).clone();
 
     await centerKinematicToGroup(viewer, doc, 'Asset/Axis');
@@ -252,7 +253,7 @@ describe('centerKinematicToGroup', () => {
     model.updateMatrixWorld(true);
     (viewer as unknown as { groups: GroupRegistry }).groups = new GroupRegistry();
 
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     await centerKinematicToGroup(viewer, doc, 'Asset/Axis');
     await doc.whenIdle();
     expect(axis.position.toArray()).toEqual([5, 6, 7]);
@@ -276,7 +277,7 @@ describe('pivotToObjectCenter', () => {
     model.add(source);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const childBefore = child.getWorldPosition(new Vector3()).clone();
     const targetBefore = target.getWorldPosition(new Vector3()).clone();
@@ -306,7 +307,7 @@ describe('pivotToObjectCenter', () => {
     const { viewer, model, register } = makeViewer();
     model.add(boxMesh('Only', [0, 0, 0]));
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     await pivotToObjectCenter(viewer, doc, 'Asset/Missing', 'Asset/Only');
     await doc.whenIdle();
     expect(doc.dirty).toBe(false);

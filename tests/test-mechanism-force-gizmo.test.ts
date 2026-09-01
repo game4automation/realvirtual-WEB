@@ -36,11 +36,11 @@ function snapshot(overrides: Partial<MechanismForcesSnapshot> = {}): MechanismFo
     dynamicsValid: true,
     redundant: false,
     channels: [
-      { id: 'Cell/Lift|dof0', label: 'Lift', kind: 'drive', unit: 'N·m', value: 12 },
-      { id: 'Cell/Lift|joint0|F', label: 'J0 · bearing force', kind: 'joint-force', unit: 'N', value: 5 },
-      { id: 'Cell/Lift|joint0|M', label: 'J0 · bearing moment', kind: 'joint-torque', unit: 'N·m', value: 1 },
-      { id: 'Cell/Lift|joint1|F', label: 'J1 · bearing force', kind: 'joint-force', unit: 'N', value: 13 },
-      { id: 'Cell/Lift|joint1|M', label: 'J1 · bearing moment', kind: 'joint-torque', unit: 'N·m', value: 2 },
+      { id: 'Cell/Lift|dof0', label: 'Lift', kind: 'drive', unit: 'N·m', value: 12, linkPath: null },
+      { id: 'Cell/Lift|joint0|F', label: 'J0 · bearing force', kind: 'joint-force', unit: 'N', value: 5, linkPath: null },
+      { id: 'Cell/Lift|joint0|M', label: 'J0 · bearing moment', kind: 'joint-torque', unit: 'N·m', value: 1, linkPath: null },
+      { id: 'Cell/Lift|joint1|F', label: 'J1 · bearing force', kind: 'joint-force', unit: 'N', value: 13, linkPath: null },
+      { id: 'Cell/Lift|joint1|M', label: 'J1 · bearing moment', kind: 'joint-torque', unit: 'N·m', value: 2, linkPath: null },
     ],
     joints: [
       {

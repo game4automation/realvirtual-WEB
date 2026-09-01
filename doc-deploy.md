@@ -86,10 +86,10 @@ The remote path comes from `BUNNY_REMOTE_PATH` (default empty = storage-zone roo
 
 What happens, in order:
 
-1. **Stage** — `stageFilteredSourceTree()` (`scripts/_workspace-lib.mjs`) copies an allowlisted source tree into a fresh temp directory (`rv-customer-workspace-*` under the system temp folder). Only the public demo profile (core tier, no project) carries `public/scenes/` and `public/aasx/` along; see [What the public demo ships extra](#what-the-public-demo-ships-extra).
+1. **Stage** — `stageFilteredSourceTree()` (`scripts/_workspace-lib.mjs`) copies an allowlisted source tree into a fresh temp directory (`rv-customer-workspace-*` under the system temp folder). Only the public demo profile (core tier, no project) carries the demo documents and `public/aasx/` along; see [What the public demo ships extra](#what-the-public-demo-ships-extra).
 2. **Build in the staging workspace** — `npm ci` **inside that temp workspace**, then `npm run build` with `VITE_PUBLIC_BUILD=1`. The fresh `npm ci` installs into an empty `node_modules` and routinely runs for **several minutes with no output** — that silence is the install, not a hang. The build output is stamped with `.rv-build-provenance.json` (source-tree hash, mode, project) and re-checked by `assertBuildProvenance()` before a single byte is uploaded. Your working `dist/` is neither read nor written.
 3. **Model allowlist** — the public CDN ships **only the official demo models**: top-level `models/*.glb` whose filename starts with `DemoRealvirtual` are kept, the planner library under `models/library/**` is always kept, and every other top-level GLB (test fixtures, helper/MU GLBs, stray models) is pruned together with its hashed `assets/` duplicate. `models.json` is rewritten to the kept models so the model selector lists exactly what is shipped. See [Public model allowlist](#public-model-allowlist).
-4. **Test-scene prune** — example scenes named `Test*` are dropped from `dist/scenes/` and from the Examples `index.json`. See [Public test-scene prune](#public-test-scene-prune).
+4. **Dev-only prune** — documents the manifest marks `devOnly: true` are dropped from `dist/`, file and manifest row alike. See [Public dev-only prune](#public-dev-only-prune).
 5. **Sign + inject** — GLBs are signed when `RV_SIGN_PRIVATE_KEY` is configured (see [GLB signing](#glb-signing-and-password-protection)), then the GA id, the news feed URL and the SEO tags are written into the built artifact only.
 6. **Diff** — the remote file list is fetched; unchanged files (same size) are skipped. `*.html`, `settings.json`, `models.json` and `manifest.json` are always re-uploaded, and so is every GLB once signing is active (re-signing is size-preserving, so a size diff would skip it). `*.map` files are never uploaded.
 7. **Upload** — changed files are uploaded; assets first, `index.html` last, so the live site never points at missing assets mid-deploy. Remote files that no longer exist locally are then deleted, so the zone matches the build.
@@ -99,25 +99,176 @@ What happens, in order:
 
 ### What the public demo ships extra
 
-`includePublicDemoContent` (`scripts/_workspace-lib.mjs`) is the one staging switch that separates realvirtual's own demo from a customer artifact. It is on for the two **hosted demo** forms — the plain public deploy (core tier, no project key) and `--demo` (commercial tier, no project key), which passes it explicitly — and it is what lets `public/scenes/` (the curated Examples, including DemoPlanner) and `public/aasx/` (the AAS supplier demos: Festo, SEW, Bosch) into the staged tree. Every customer delivery and every private project deploy filters both out: they are demo content, not product.
+`includePublicDemoContent` (`scripts/_workspace-lib.mjs`) is the one staging switch that separates realvirtual's own demo from a customer artifact. It is on for the two **hosted demo** forms — the plain public deploy (core tier, no project key) and `--demo` (commercial tier, no project key), which passes it explicitly — and it is what lets the demo **documents** — `public/*.glb` named by `public/project.json`, DemoRealvirtualWeb and DemoPlanner among them — and `public/aasx/` (the AAS supplier demos: Festo, SEW, Bosch) into the staged tree. (`public/scenes/` was a second, curated Examples catalogue beside the manifest; plan-731 removed the folder and its `index.json`.) Every customer delivery and every private project deploy filters both out: they are demo content, not product.
 
 The `--demo` staging differs from a customer delivery in one more way: `workspaceFiles: false`. A CDN deploy publishes code, not a repository, so no README, setup/start scripts, recipes or CONNECT helpers are generated — and the core `public/settings.json` survives untouched, which is the artifact the GA and news injection then writes into.
 
+### Every channel ships a manifest (plan-735)
+
+There is no longer any channel on which the viewer works out what it has by looking around. Each one publishes a `project.json` at its deploy root, and that file is the only statement of what the delivery contains:
+
+| Channel | Where its `project.json` comes from |
+| --- | --- |
+| Dev checkout | `public/project.json`, checked in (plan-726) |
+| Bunny public / `--demo` | `public/project.json` → `dist/project.json` |
+| CONNECT embed | `public/project.json` → payload root |
+| Customer, project-bearing | `projects/<key>/project.json`, plus their own `models.json` on a CDN deploy |
+| Customer, projectless (`kind: standard`) | **generated at staging time** into `realvirtual-web/public/project.json` |
+| Foreign host (`discover: true`) | its own `project.json` — otherwise there is no project (see below) |
+
+Two consequences worth knowing before you touch a staging script:
+
+- **The build-time glob is gone.** `import.meta.glob('/public/models/*.glb')` used to seed the model catalogue from whatever sat in the dev checkout, and `BundledBackend` used to turn that into a synthetic project when a deploy had no manifest. Both are removed. A deploy root that serves no readable `project.json` has **no project**: `readManifest()` returns `null` and logs a named line naming the three causes it cannot tell apart (404, CORS, `file://`). This includes a *foreign* host that publishes `models.json` but no manifest — a deliberate, accepted narrowing of plan-700 F12.
+- **The generated projectless manifest is vendor-owned and lives in Zone A.** It is written by `writeGeneratedDeliveryManifest()` in `scripts/_workspace-lib.mjs`, *after* `copyCore()` has filtered the demo's own `public/project.json` out of the delivery — the order is load-bearing, since generating it earlier would delete it. It carries a `_generated` header saying so, the delivered README repeats it, and every update replaces it wholesale. There is no sidecar protection and none is intended: a standard customer who wants documents of their own creates a project under `projects/`, which is the only place an update never touches.
+
 ### Public model allowlist
 
-A public deploy publishes only the official demo models. `public/models/` in the dev tree may hold test fixtures, helper GLBs, and work-in-progress models; none of those should reach the public CDN.
+A public deploy publishes only the official demo models. `public/models/` in the dev tree may hold test fixtures, helper GLBs, and work-in-progress models; none of those should reach the public CDN. (Since plan-735 they are also simply invisible to the viewer unless a manifest declares them — the folder is storage, not a catalogue.)
+
+**Since plan-726 the curator is the demo's own manifest**, `public/project.json`. Its `documents[]` is the single source of truth for what the demo contains, on every channel — the hosted site, the CONNECT bundle and the dev checkout all boot from that one file — so the deploy reads it instead of keeping a second, independent list. The old filename prefix survives underneath it, in two roles that are still needed: as the answer for a `dist/` that carries no manifest, and as the `RV_PUBLIC_MODEL_PREFIX` override.
+
+Precedence, highest first:
+
+1. `RV_PUBLIC_MODEL_PREFIX` — an operator overriding one deploy. It stays on top so it remains a usable rollback lever.
+2. `dist/project.json` `documents[]` — the demo's own statement of what it is.
+3. The built-in prefix list — only for a `dist/` with no manifest at all.
+
+> This fixed a live defect. `DemoRobotIK.glb` is a demo model and is listed in the manifest, but it matches neither built-in prefix — so every public and `--demo` deploy before plan-726 silently deleted it before upload.
 
 The rule, applied to the built `dist/` after the build and before upload:
 
-- **Kept** — top-level `models/*.glb` whose filename starts with `DemoRealvirtual` (case-insensitive), plus the entire planner standard library under `models/library/**`.
+- **Kept** — the `models/*.glb` the manifest declares (or, without a manifest, top-level `models/*.glb` whose filename starts with `DemoRealvirtual`), plus the entire planner standard library under `models/library/**`.
 - **Pruned** — every other top-level `models/*.glb` and the content-hashed copy Vite also emits under `assets/`. The hyphen-boundary match means pruning e.g. `EuropalletEmpty` never touches the library's `Europallet*` assets.
 - **`models.json`** — rewritten to the kept models so the model selector shows exactly what is shipped (the build-time glob otherwise bakes every dev GLB filename into the selector, leaving 404 ghost entries).
 
-The prune is logged (`keep` / `prune` lines). To ship a model on the public demo, name it `DemoRealvirtual<Something>.glb`. Override the prefix for one deploy with the `RV_PUBLIC_MODEL_PREFIX` environment variable. This applies to the **public** deploy only — private projects already stage their own models, and a plain `npm run build` for self-hosting keeps every model. (A public `--dry-run` never reaches this step, see the tip above.)
+The prune is logged (`keep` / `prune` lines), with the curator named on the header line so it is visible which of the three rules applied. **To ship a model on the public demo, add it to `public/project.json`** — the filename no longer matters. Override the manifest for one deploy with the `RV_PUBLIC_MODEL_PREFIX` environment variable. This applies to the **public** deploy only — private projects already stage their own models, and a plain `npm run build` for self-hosting keeps every model. (A public `--dry-run` never reaches this step, see the tip above.)
 
-### Public test-scene prune
+### The demo manifest is a deploy artifact
 
-The same rule applies to example scenes. `public/scenes/Test*.scene.json` are repo fixtures: they belong in the dev Examples list and must never appear on the public demo. `applyPublicScenePruning` therefore deletes every `dist/scenes/<prefix>*.scene.json` **and** removes the matching entries from the curated `dist/scenes/index.json`, so the public Examples list neither shows nor 404s on a test scene.
+`public/project.json` ships to the deploy root and is read there by
+`BundledBackend.readManifest()`. Three consequences worth knowing:
+
+- **It is never cached like a build asset.** It lives at a fixed URL and a
+  curator's edit — renaming a document, swapping the start document — routinely
+  leaves the byte count unchanged, so a size-only diff would skip it. It is in
+  `ALWAYS_UPLOAD_FILES` and the pull zone is purged after the upload. The client
+  fetches it with `cache: "no-cache"` (revalidate, 304 on an unchanged file) —
+  never `immutable`.
+- **A contradiction aborts the deploy.** After both pruning passes,
+  `publicDemoManifestMisses()` checks that every `models/` and `scenes/`
+  document the manifest names is actually in `dist/`. The comparison is
+  case-sensitive, because the storage zone is: a `Models/…` typo passes on a
+  Windows dev machine and 404s on the CDN. This runs on the **public** path only
+  — a private customer deploy publishes no root manifest.
+- **It never reaches a customer delivery.** `copyCore()` filters it out
+  alongside `scenes/` and `aasx/` unless `includePublicDemoContent` is set. It
+  needed its own filter branch: every other exclusion there matches a
+  subdirectory, and a top-level file would sail straight past them onto the
+  customer's deploy root — where it would be read as *their* project.
+
+**Rollback** is cheap for content mistakes and expensive for code ones. The
+difference matters enough to have its own runbook — see below.
+
+### Rolling back the demo
+
+Since plan-726 the demo boots from `project.json` on every channel, so a bad
+demo is no longer one deploy shape but four. The cost of undoing it depends
+entirely on **which layer** is wrong, and the three layers have nothing in
+common: one is a file you can replace in seconds, one is an environment
+variable, one needs the whole bundle back.
+
+Work out which row you are in first — the wrong lever is slower than no lever.
+
+| Symptom | Layer | Cost |
+|---|---|---|
+| Demo opens the wrong document, shows an empty viewport, or lists documents that 404 | Manifest content | **Seconds** |
+| A demo model is missing from the site, or a model that should not be public got published | Deploy allowlist | **One redeploy** |
+| Boot opens nothing at all, dashboard opens on every visit, CONNECT embed stays gated | Code (Phase 2 / Phase 4) | **Full redeploy of the previous version** |
+
+#### 1. Manifest content — replace the one file
+
+The manifest is the only part of the demo that is *not* immutable, and that is
+deliberate. It is in `ALWAYS_UPLOAD_FILES`, so it bypasses the size diff, and
+the pull zone is purged after upload; the client fetches it with
+`cache: "no-cache"`. A correction therefore lands on the next deploy without
+touching the bundle.
+
+```bash
+# Fix public/project.json, then:
+npm run deploy                       # re-uploads project.json + purges
+curl -s https://web.realvirtual.io/project.json | head -20    # verify what is live
+```
+
+To fall back to **no** curated demo at all, delete `public/project.json` and
+deploy: step 7 removes remote files that no longer exist locally, and
+`BundledBackend.readManifest()` then serves `_syntheticManifest()` — the demo
+project assembled from whatever the deploy discovered. Visibly degraded (no
+curated names, no start document) but never a white page, and reversible by
+restoring the file.
+
+> Confirm it is really the manifest before reaching for the bundle. Open the
+> browser console: an invalid manifest logs a `[bundled] … is not a valid v2
+> project manifest` warning and says it is falling back. No warning means the
+> manifest was accepted and the fault is downstream.
+
+#### 2. Deploy allowlist — the env override outranks the manifest
+
+`RV_PUBLIC_MODEL_PREFIX` sits **above** `dist/project.json` in the precedence
+list precisely so it stays usable as a rollback lever. Use it when the manifest
+is right but the shipped model set is not, or to get a correct site out while
+the manifest question is still open.
+
+```bash
+RV_PUBLIC_MODEL_PREFIX='DemoRealvirtual,DemoCSGMachining' npm run deploy
+```
+
+The prune header names the curator that applied, so the log tells you whether
+the override took effect. This is a **stopgap, not a fix** — it re-opens the
+`DemoRobotIK` defect the manifest closed, so remove it once the manifest is
+correct.
+
+#### 3. A deploy that aborts on the manifest guard is not a rollback case
+
+`publicDemoManifestMisses()` failing means the guard did its job: the manifest
+names a document that is not in `dist/`. Nothing was uploaded and the live site
+is untouched, so there is nothing to roll back — fix forward. Either add the
+missing file to `public/` or remove the row from the manifest, then deploy
+again. Check the spelling case-first: the comparison is case-sensitive because
+the storage zone is, and a `Models/…` typo passes on Windows and fails here.
+
+#### 4. Code regression — the previous version, in full
+
+There is no feature flag and no kill switch for the boot switch (Phase 2) or the
+CONNECT embed gate (Phase 4). The JS bundle is content-hashed and immutable, so
+the only way back is to build and deploy the previous commit:
+
+```bash
+git log --oneline -- public/project.json src/main.ts   # find the last good commit
+git checkout <sha> -- <the files>                      # or: git revert <sha>
+npm run typecheck && npm test
+npm run deploy
+```
+
+This is a **deliberately accepted** cost, recorded in plan-726 §5.6: whoever
+ships a boot-behaviour change keeps the previous version ready. Two practical
+consequences:
+
+- **Reverting `public/settings.json`'s `defaultModel` alone does not help.** It
+  and the manifest start document are one decision now. Putting the value back
+  without reverting `main.ts` reintroduces the split that made Phase 2 atomic.
+- **CONNECT ships from the sibling checkout, not a published package.** A web
+  rollback that touches the embed path needs `Assets/realvirtual-Connect~`
+  moved in the same step, or the bundle it stages goes out of sync.
+
+### Public dev-only prune
+
+The same rule applies to example scenes, and since **plan-731** the manifest says which ones. A repo fixture belongs in the dev checkout and must never appear on the public demo, so its `documents[]` row carries `devOnly: true` — and `applyPublicScenePruning` deletes both the FILE and the ROW from `dist/`, wherever in the deploy the file sits.
+
+That replaced a filename convention: anything under `dist/scenes/` starting with `Test`. Two things were wrong with it. It could not say "this is a fixture" about a file whose name does not begin with Test, and it could not be seen from the manifest at all — so no release gate could check that it had done its job. `devOnly` says it once, in the place the app and the gate both read.
+
+The old rule survives as a **fallback** for a `dist/` built from an older source tree, whose manifest carries no `devOnly` anywhere: the prefix pass still deletes `dist/scenes/<prefix>*.glb` and rewrites the curated `dist/scenes/index.json` that such a tree still ships. It matches the pre-plan-413 `.scene.json` spelling too — pruning a file that is not there costs nothing, while dropping the pattern would leak a fixture out of an old `dist/`.
+
+Whether the prune actually worked is no longer taken on trust: `assertManifestResolves()` (`tests/helpers/`) runs over the STAGED output of every channel and refuses a `devOnly` row that survived, a document whose file did not travel, or a start document that resolves to nothing.
 
 The prefix defaults to `Test` and is overridable per deploy with `RV_PUBLIC_TEST_SCENE_PREFIX`. The step is idempotent and public-only; private projects ship the scenes their manifest declares.
 
@@ -212,8 +363,8 @@ What comes from where:
 
 | Published file | Source |
 |----------------|--------|
-| `models.json` | **The `models/` folder**, listed directly. The manifest's `models[]` is a metadata overlay and is deliberately not consulted — every GLB in the folder belongs to the project, and nobody should have to register one |
-| `scenes/index.json` | The manifest's `scenes[]`, for entries marked `baseKind: "published"`. A project whose manifest lists none keeps whatever `index.json` its `scenes/` folder already had |
+| `models.json` | **The `models/` folder UNION the manifest's root-level GLB documents** (`projectModelNames()`, plan-720). The folder can never be shortened by the manifest — every GLB in `models/` belongs to the project and nobody should have to register one (plan-700 P0-3). It can only be LENGTHENED, by a `documents[]` entry naming an existing root-level `.glb`, which is the layout the viewer writes today and which the folder glob structurally cannot see. Entries under `scenes/`/`library/` are excluded — those folders are staged whole. A declared file that is missing, or a folder GLB with no manifest row, is logged rather than silently dropped |
+| `scenes/index.json` | The manifest's scene-section documents (`documentsInSection(project, "scenes")`), for entries marked `baseKind: "published"` whose `path` is a `.glb` directly under `scenes/`. A project whose manifest lists none keeps whatever `index.json` its `scenes/` folder already had. **Legacy since plan-731:** realvirtual's own deploys ship no such file — their examples are ordinary `documents[]` rows. It is still written for a customer project that keeps its scenes in a folder, and still READ by a `discover` backend pointed at a foreign root |
 | `settings.json` | Generated, on top of the project's own `settings/project-settings.json` when it has one. The project file is a **base**: `projectAssetsPath`, `analytics`, `encryption` and `generated` are written afterwards and always win, so a project file can add settings but can never re-enable analytics or aim the assets path elsewhere |
 
 Every private deploy — and every public one, and every CONNECT embed — runs `validate-project.mjs`
@@ -279,8 +430,8 @@ All credentials come from environment variables — there is no key stored in th
 | `GA_MEASUREMENT_ID` | no | GA4 id injected into the deployed `settings.json` (default empty = no analytics) |
 | `NEWS_API_URL` | no | Overrides the news feed injected into the deployed public `settings.json` (default `https://download.realvirtual.io/news/api/v1`) |
 | `NEWS_DISABLE` | no | `1` injects no news feed at all. Private/customer paths never inject one anyway |
-| `RV_PUBLIC_MODEL_PREFIX` | no | Public-deploy model allowlist prefix (default `DemoRealvirtual`). Only top-level `models/*.glb` starting with it are published |
-| `RV_PUBLIC_TEST_SCENE_PREFIX` | no | Public-deploy test-scene prune prefix (default `Test`) |
+| `RV_PUBLIC_MODEL_PREFIX` | no | Overrides the `project.json` document list for one public deploy (default `DemoRealvirtual,DemoCSGMachining`). Only top-level `models/*.glb` starting with it are published |
+| `RV_PUBLIC_TEST_SCENE_PREFIX` | no | Fallback prune prefix for a `dist/` whose manifest has no `devOnly` rows (default `Test`) |
 | `RV_SIGN_PRIVATE_KEY` | no | Ed25519 PKCS#8 key (PEM or base64 PEM) used to sign every published GLB. Unset = models ship unsigned |
 | `RV_SIGN_CUSTOMER_CERT` | no | Path to an `RV-KEY-V1` customer certificate, so signatures are attributed to the customer org |
 | `RV_DEPLOY_PASSWORD` | no | Private deploys: AES-256-GCM password protection for the project's GLBs. Env only — never a CLI argument |
@@ -298,7 +449,7 @@ These mirror the values configured in the Unity Editor under **Tools > realvirtu
 
 ## 5. Continuous deployment
 
-There is none — deliberately. All deploys run locally via the CLI (`npm run deploy`, `scripts/embed-deploy.mjs`); the runner-based `.github/workflows/` were removed 2026-08-28. A fork that wants CI deployment writes its own workflow around `npm run deploy` with its own Bunny credentials as repository secrets.
+There is none — deliberately. All deploys run locally via the CLI (`npm run deploy`, `scripts/embed-deploy.mjs`, the deploy skills); the runner-based `.github/workflows/` were removed 2026-08-28. They dated from the retired github-dev repo, only ever executed (and failed) on the public mirror, and Forgejo — today's integration remote — does not run them. A fork that wants CI deployment writes its own workflow around `npm run deploy` with its own Bunny credentials as repository secrets.
 
 ---
 
@@ -310,6 +461,45 @@ There is none — deliberately. All deploys run locally via the CLI (`npm run de
 | **CLI — `npm run deploy`** | No Unity needed; for the console, CI/CD, and automation |
 
 Both produce identical CDN output. The CLI is the Unity-independent path; pick whichever fits the situation.
+
+---
+
+## 6b. The four deploy targets
+
+The two paths above are two ways of reaching the **CDN**. There are four targets in total, and
+they differ in one thing that matters more than the transport: **where the project lives, and
+therefore what a project update costs.**
+
+| Target | Where the project lives | A project update is | Docs |
+|---|---|---|---|
+| **CDN** (`web.realvirtual.io`) | inside the published bundle | a re-publish | this file, §2 / §3 |
+| **CONNECT embed** | inside the delivered `.exe` | a new build | `Assets/realvirtual-Connect~/doc-connect.md` |
+| **Customer workspace** | the customer's own repo, built locally | `npm run build` | §"Customer source delivery" |
+| **Appliance** (on-premise box) | served as a **folder**, fed by `git push` | **a push — no build** | `../realvirtual-WebViewer-Private~/appliance/doc-appliance.md` |
+
+The appliance is the odd one out, and deliberately so (plan-721). It serves an immutable
+runtime under `app/<version>/` and the project separately under `p/<code>/`, with a generated
+~1 KB loader at the origin root pinning exactly one runtime version:
+
+```
+/                    -> generated loader:  /app/<version>/?projectUrl=/p/<code>/
+/app/<version>/      -> immutable runtime  (Cache-Control: immutable, one year)
+/p/<code>/           -> the project tree   (git push -> export -> atomic symlink swap)
+```
+
+Two consequences worth knowing even if you never touch a box:
+
+- **The appliance ships NO global `defaultModel`.** Its `project.json` names the start
+  document, and the kiosk boot reads it from there (`project.settings.defaultModel`). Every
+  other target keeps the baked value, and in a delivered build the two are identical anyway —
+  `bareDefaultModel()` derives the global one from the manifest.
+- **`generatedSettings()` in `scripts/_workspace-lib.mjs` takes options for this**:
+  `omitDefaultModel` leaves the key out entirely, `modeLock` writes the kiosk lock. Both are
+  opt-in; without them the function produces exactly the file it always did.
+
+This is the first deploy target of the project-based model, which is why it gets a section
+here rather than only in the appliance runbook: the direction of travel is that a project is a
+folder with a manifest, not a bundle with a model baked into it.
 
 ---
 
@@ -502,6 +692,63 @@ Customer source repositories are generated snapshots, not development mirrors. T
 `realvirtual-web-pro/`, the customer's `projects/<key>/` directories, and the pinned `connect/` RAG
 pair. Internal source and unlicensed restricted features are physically absent.
 
+### Customer register
+
+Who a customer is, what they are entitled to, and where their delivery goes is stated **once**, in
+`customers/<slug>.json` in the private WebViewer repository. It is a superset of the older
+`delivery/<config>.json` recipe and replaces it: the delivery resolves the register first and only
+falls back to a legacy `delivery/` config, with a deprecation warning, while one still exists.
+
+The loader and its invariants live in the public core (`scripts/_rv-customers.mjs`) because the
+delivery needs them; the CLI around it stays private. Shape, in short:
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "customer": "acme",             // == the file name (slug), == the hub team name
+  "displayName": "ACME GmbH",
+  "kind": "development",          // development = own repo, at least one project
+                                  // standard    = shared repo, projects MUST be empty
+  "support": "basic",             // basic | managed
+  "status": "active",
+  "forgejo": { "org": "…", "repo": "…", "team": "…", "permission": "write" },
+  "contacts": [{ "login": "…", "email": "…", "role": "developer", "status": "active" }],
+  "licensing": { "connect": { "issuer": "portal", "keyRef": "connectLicenseKey" } },
+  "delivery": {
+    "channel": "git-workspace",   // git-workspace | hosted-link
+    "tier": "commercial",         // entitlement profile out of tier-manifest.json
+    "restrictedFeatures": [],     // extra restricted features this customer is entitled to
+    "projects": ["acme-line1"],   // empty for a `standard` customer
+    "connectChannel": "stable"    // CONNECT lane pinned for this customer
+  },
+  "secretsRef": "customers/acme.secrets.json"
+}
+```
+
+`kind` and the hub grant are coupled and validated: `development` needs at least one project and
+`permission: "write"` in its own `rv-<slug>/rv-project-<slug>` repository; `standard` must have an
+empty `projects` array and `permission: "read"`, and is the only kind allowed to share the common
+`rv-commercial/realvirtual-commercial` repository — one team per customer, named after the slug.
+
+Secret values are **never** in the register: `connectLicenseKey`, `requestyApiKey` and
+`requestyBaseUrl` resolve from the environment first, then from the gitignored
+`customers/<slug>.secrets.json` (`secretsRef`). A credential-shaped value found inside the register
+itself is a hard error, not a warning. The remote URL is assembled from `forgejo.org` /
+`forgejo.repo` plus a hub base URL the caller supplies (`RV_FORGEJO_HUB_URL`) — the register holds
+no host name.
+
+Check the register against the file system before delivering — exit 1 means a real contradiction,
+warnings do not gate:
+
+```bash
+node ../realvirtual-WebViewer-Private~/scripts/rv-customers.mjs doctor
+node ../realvirtual-WebViewer-Private~/scripts/rv-customers.mjs list
+```
+
+The full command surface (`list`, `show`, `doctor`, `forgejo-sync`) is documented in
+`.claude/commands/customers.md` in the Unity project; onboarding a contact is
+`.claude/commands/onboard-customer.md`.
+
 ### The three zones
 
 A customer repository is not one block. Since plan-700 it has three zones, each with its own update
@@ -616,7 +863,9 @@ CONNECT build.
 ### Release constraints
 
 Every WebViewer release used for delivery must be a clean Git commit tagged
-`viewer-v<major>.<minor>.<patch>` (for example, `viewer-v6.3.0`). The private repository must also be
+`realvirtual-v<major>.<minor>.<patch>` (for example, `realvirtual-v6.3.0`). The pre-6.3.16 prefix
+`viewer-v` is still accepted by the tag pattern so older releases stay deliverable, but every new tag
+uses `realvirtual-v`. The private repository must also be
 clean. The generated `delivery-manifest.json` records both commits, the entitlement profile, the
 project tree hash, and the immutable CONNECT pin. A customer delivery is dry-run by default; a remote
 push requires the explicit `--push` option after review.

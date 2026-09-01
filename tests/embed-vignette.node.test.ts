@@ -99,6 +99,9 @@ describe('rv-embed AP3 vignette pipeline', () => {
     ], {
       cwd: ROOT,
       stdio: 'pipe',
+      // The embed build's warning output has outgrown execFileSync's 1 MB
+      // default buffer (ENOBUFS kills the child mid-build otherwise).
+      maxBuffer: 64 * 1024 * 1024,
     });
 
     for (const file of DRACO_FILES) {
@@ -116,7 +119,9 @@ describe('rv-embed AP3 vignette pipeline', () => {
       ));
     expect(decoderOwner, 'missing module-relative Draco URL').toBeTruthy();
     expect(resolve(dirname(decoderOwner!), '../draco')).toBe(resolve(DIST, 'draco'));
-  }, 120_000);
+    // The full embed build runs inside this test (~80 s alone, more under
+    // parallel suite load) — 120 s was regularly exceeded.
+  }, 420_000);
 });
 
 interface GlbNode {

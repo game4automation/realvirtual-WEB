@@ -577,6 +577,32 @@ export function projectKindOf(projectsDir, name) {
  */
 export const CUSTOMER_OWNED_FOLDERS = Object.freeze(['scenes', 'settings', 'layouts']);
 
+//! The zones a default vendor block claims. Named so the handover globs below
+//! cannot drift out of step with the `managed` list they must sit inside.
+export const DEFAULT_MANAGED_ZONES = Object.freeze([
+  'models', 'library', 'docs', 'connect', 'plugins', 'rag',
+]);
+
+/**
+ * Handover globs that keep a customer's CONNECT configuration theirs (plan-725 F8).
+ *
+ * Since plan-725 CONNECT finds `*.connect.json` anywhere in the project, not only
+ * in `connect/` — so a signal configuration the customer wrote can now sit next to
+ * the model it belongs to, inside a vendor-managed zone. Without these globs the
+ * next delivery would treat it as ours and overwrite it.
+ *
+ * Two entries per zone, deliberately: `<zone>/*.connect.json` for a file directly
+ * in the zone, `<zone>/**\/*.connect.json` for one further down. Both shorter forms
+ * were measured against the real validator and rejected — a blanket
+ * `**\/*.connect.json` fails {@link vendorGlobProblems} (its probe
+ * `probe/probe/probe.connect.json` lies outside every `managed` glob), and
+ * `<zone>/**.connect.json` only validates because `**` happens to match *inside* a
+ * path segment here, which a hardening of the matcher would silently take away.
+ */
+export const CONNECT_CONFIG_HANDOVER_GLOBS = Object.freeze(
+  DEFAULT_MANAGED_ZONES.flatMap((zone) => [`${zone}/*.connect.json`, `${zone}/**/*.connect.json`]),
+);
+
 /**
  * The conservative `vendor` block a migrated project starts with.
  *
@@ -585,8 +611,12 @@ export const CUSTOMER_OWNED_FOLDERS = Object.freeze(['scenes', 'settings', 'layo
  * superfluous one is customer data. Only the first is repairable.
  */
 export const DEFAULT_VENDOR_BLOCK = Object.freeze({
-  managed: Object.freeze(['models/**', 'library/**', 'docs/**', 'connect/**', 'plugins/**', 'rag/**']),
-  handover: Object.freeze(['connect/secrets.local.json', 'models/custom/**']),
+  managed: Object.freeze(DEFAULT_MANAGED_ZONES.map((zone) => `${zone}/**`)),
+  handover: Object.freeze([
+    'connect/secrets.local.json',
+    'models/custom/**',
+    ...CONNECT_CONFIG_HANDOVER_GLOBS,
+  ]),
 });
 
 //! Probe paths used to prove a glob cannot reach customer-owned territory.

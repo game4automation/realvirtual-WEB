@@ -66,6 +66,30 @@ export class ZoneRegistry {
     z.capacity = z.capacity === undefined ? c : Math.max(z.capacity, c);
   }
 
+  /**
+   * LIVE-EDIT redefinition (plan-447): HARD-overwrite the declared capacity and
+   * keep every current holder.
+   *
+   * Why a second entry point next to {@link define}:
+   * - `define` is MAX-WINS (several paths declaring the same zone), so a
+   *   capacity SHRINK during a live geometry/field edit would be silently
+   *   ignored — before plan-447 the shrink only "worked" because
+   *   `reapplyConfig` called {@link undefine} first, which also dropped every
+   *   active claim (two vehicles could then enter one exclusive zone).
+   * - `redefine` therefore overwrites `capacity` unconditionally and leaves
+   *   `holders` untouched: a claim held across the edit SURVIVES.
+   *
+   * `capacity === undefined` (or non-finite) resets the zone to "undeclared"
+   * → {@link DEFAULT_ZONE_CAPACITY}. Model-clear keeps using {@link undefine}.
+   */
+  redefine(zoneId: string, capacity?: number): void {
+    const z = this.zone(zoneId);
+    z.capacity =
+      capacity === undefined || !Number.isFinite(capacity)
+        ? undefined
+        : Math.max(0, Math.floor(capacity));
+  }
+
   /** Drop a zone entirely (definition AND holders) — model-cleared path dispose. */
   undefine(zoneId: string): void {
     const z = this.zones.get(zoneId);

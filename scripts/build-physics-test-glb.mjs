@@ -3,7 +3,7 @@
 
 /**
  * build-physics-test-glb.mjs — writes the plan-276 physics-zone E2E fixture
- * `public/models/physics-zone-test.glb` as a hand-built glTF 2.0 binary
+ * into the private Development project as a hand-built glTF 2.0 binary
  * (JSON chunk + BIN chunk with one shared unit-cube mesh).
  *
  * Follows the established programmatic fixture pattern of
@@ -25,18 +25,56 @@
  * Re-run after changing the scene:  node scripts/build-physics-test-glb.mjs
  */
 
-import { writeFileSync, mkdirSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEV_GLB } from '../tests/fixtures/glb-paths.mjs';
 
 // The output path is DERIVED from the one asset-path source of truth
-// (`tests/fixtures/glb-paths.mjs`) so generator and consumers cannot drift apart
-// (plan-395 §2.3, R3). In phase 1 that URL is still served straight out of
-// `public/`, so the URL path is also the path below `public/`.
-const outPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'public',
-  ...DEV_GLB.physicsZone.split('/').filter(Boolean));
+// (`tests/fixtures/glb-paths.mjs`) so generator and consumers cannot drift
+// apart (plan-395 §2.3, R3). Since phase 3 that URL is
+// `/private-assets/<project>/<path...>`, which the dev server maps onto the
+// private sibling's `projects/` directory - so the same mapping is done here,
+// against the same candidate list `vite.config.ts` uses.
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PROJECTS_DIR = [
+  resolve(HERE, '../../realvirtual-WebViewer-Private~/projects'),
+  resolve(HERE, '../../realvirtual-web-pro/projects'),
+].find((candidate) => existsSync(candidate)) ?? null;
+
+const [, project, ...rest] = DEV_GLB.physicsZone.split('/').filter(Boolean);
+
+// Fail LOUDLY without the private sibling rather than creating the directory
+// (plan-395 R12). Silently writing a 3 KB fixture into a path nobody serves
+// produces a generator that 'worked' and a suite that skips - the two
+// symptoms furthest apart from the one cause.
+// Fail LOUDLY without the private sibling rather than creating the directory
+// (plan-395 R12). Silently writing a 3 KB fixture into a path nobody serves
+// produces a generator that 'worked' and a suite that skips - the two
+// symptoms furthest apart from the one cause.
+if (!PROJECTS_DIR) {
+  console.error(`
+build-physics-test-glb: the private sibling repository is not next to this one, so
+there is nowhere to write the fixture. It belongs to the internal Development
+project (plan-395):
+  <workspace>/realvirtual-WebViewer-Private~/projects/Development/fixtures/
+Clone the private repository beside this one and run this script again.`);
+  process.exit(1);
+}
+
+const projectDir = join(PROJECTS_DIR, project);
+if (!existsSync(projectDir)) {
+  console.error(`
+build-physics-test-glb: the sibling is there but ${projectDir} is not.
+This script does not create projects. Create it (project.json + fixtures/), or
+check that tests/fixtures/glb-paths.mjs still names the right one.`);
+  process.exit(1);
+}
+
+const outPath = join(projectDir, ...rest);
 const outDir = dirname(outPath);
+// `fixtures/` inside an existing project is ours to create; a missing PROJECT
+// is the case that fails above.
 mkdirSync(outDir, { recursive: true });
 
 // ─── Unit-cube geometry (centered at origin, size 1) ────────────────────────

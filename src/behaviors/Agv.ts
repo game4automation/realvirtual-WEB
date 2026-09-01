@@ -69,7 +69,7 @@
  * silent — the live values are authoritative.
  */
 
-import { Quaternion, Vector3 } from 'three';
+import { Matrix4, Quaternion, Vector3 } from 'three';
 import { defineLibraryComponent, type RV } from './_shared/behavior-kit';
 import { pathFromNode, type RVPath } from '../core/engine/rv-path';
 import { getDefaultPathNetwork } from '../core/engine/rv-path-network';
@@ -171,6 +171,8 @@ interface AgvLocal {
   // Pre-allocated pose temps + zone scratch buffers — no GC in the tick.
   _pos: Vector3;
   _quat: Quaternion;
+  /** Parent world orientation, for the world->parent-local pose conversion. */
+  _parentQuat: Quaternion;
   _relevantZones: string[];
   _heldScratch: string[];
 }
@@ -200,12 +202,52 @@ function applyPose(self: AgvSelf): void {
   const l = self.local;
   const t = l.traveler;
   if (!t || !t.path) return;
+  // The traveler reports a WORLD pose (the path network is global), while
+  // `root.position`/`root.quaternion` are read in the PARENT frame. The two
+  // coincide only when the parent's world transform is identity — true for a
+  // vehicle placed at scene level, false the moment one is bound from rv_extras
+  // somewhere inside a moved or rotated subtree (plan-455 F8). So convert.
   t.getPose(l._pos, l._quat);
-  // Phase 1: pose is applied in the root's PARENT frame (identity-parent
-  // assumption — scene-level placement). World→local conversion is Phase 2+.
-  self.root.position.copy(l._pos);
-  self.root.quaternion.copy(l._quat);
+  const parent = self.root.parent;
+  if (!parent) {
+    self.root.position.copy(l._pos);
+    self.root.quaternion.copy(l._quat);
+    return;
+  }
+  // Order matters: refresh the parent's world matrix BEFORE reading it.
+  // `worldToLocal` uses `matrixWorld` as-is and would otherwise silently apply a
+  // stale frame for one tick after the parent moved.
+  parent.updateWorldMatrix(true, false);
+  if (isIdentityMatrix(parent.matrixWorld)) {
+    // Fast path — taken on the strength of the MEASURED transform, never on the
+    // assumption that a scene-level parent must be identity.
+    self.root.position.copy(l._pos);
+    self.root.quaternion.copy(l._quat);
+    return;
+  }
+  // Position: world point through the inverse parent transform. `worldToLocal`
+  // rewrites `_pos` in place — safe, because all three temps are per-call
+  // scratch that `getPose`/`getWorldQuaternion` refill at the top of every tick.
+  self.root.position.copy(parent.worldToLocal(l._pos));
+  // Orientation: local = inverse(parentWorld) * world, in that order.
+  parent.getWorldQuaternion(l._parentQuat);
+  self.root.quaternion.copy(l._parentQuat.invert().multiply(l._quat));
 }
+
+/** True when `m` is (numerically) the identity — the guard for applyPose's
+ *  no-conversion fast path. Compares against the exact identity elements with a
+ *  tight epsilon; allocation-free. */
+function isIdentityMatrix(m: Matrix4): boolean {
+  const e = m.elements;
+  const EPS = 1e-9;
+  for (let i = 0; i < 16; i++) {
+    const want = IDENTITY_ELEMENTS[i];
+    if (Math.abs(e[i] - want) > EPS) return false;
+  }
+  return true;
+}
+
+const IDENTITY_ELEMENTS = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] as const;
 
 /** Remaining distance (mm) to a positional stop — the end of a TERMINAL path.
  *  ∞ while the graph continues (successors exist) or the path is closed, so
@@ -479,6 +521,7 @@ const def = {
     desCacheSpeed: 0,
     _pos: new Vector3(),
     _quat: new Quaternion(),
+    _parentQuat: new Quaternion(),
     _relevantZones: [],
     _heldScratch: [],
   }),

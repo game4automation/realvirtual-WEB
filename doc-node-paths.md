@@ -70,6 +70,16 @@ axis, used wherever an address has to survive somebody renaming a node in a file
 Implementation: [`rv-node-id.ts`](src/core/engine/rv-node-id.ts); the composite runtime index
 lives in `NodeRegistry` (`registerNodeId` / `getNodeByAddress`).
 
+**A transform override is addressed by NodeId only — there is deliberately no `trsByPath`.**
+`AssetOverrides` on a reference node keys its component patches two ways, `byNodeId` and a
+`byPath` fallback, but the transform block plan-444 added beside them
+(`trsByNodeId`, see [doc-persistence.md](doc-persistence.md) §2.0-0a) has no path-keyed twin,
+and `applyAssetOverrides` never falls through to one. The reason is that `byPath` exists purely
+as a bridge for files written before NodeIds existed — and no such file can carry a transform
+override, because the field did not exist then either. A path-keyed twin would therefore add a
+second spelling for something nothing writes, in the one place where resolving to the wrong
+node does not mis-set a value but moves geometry.
+
 ### 1a. The occurrence chain is also the breadcrumb address
 
 `childOccurrence(parent, referenceNodeId)` appends one reference node's id per
@@ -161,6 +171,22 @@ original name — that case is safe because a pure sanitization implies the name
 When a real `_N` dedup suffix is present, the name **cannot** be restored without reintroducing
 a clash, so the node keeps its rewritten name and gets an alias path instead (section 4).
 
+**Sanitization and deduplication are independent, and a node can suffer both.** This is the
+distinction that matters most in practice and the one that is easiest to lose:
+
+| Raw glTF name | Sanitized | Collides? | `Object3D.name` | Reachable under the raw name via |
+|---|---|---|---|---|
+| `Pusher` | `Pusher` | no | `Pusher` | nothing needed |
+| `MC04.01I00W` | `MC0401I00W` | no | `MC04.01I00W` (restored) | the restore |
+| `Pusher` | `Pusher` | yes | `Pusher_1` | the alias (raw == sanitized) |
+| `-Kettenrad 201:1` | `-Kettenrad_2011` | yes | `-Kettenrad_2011_1` | **the alias — and only if the alias carries the RAW spelling** |
+
+The last row is the case that broke: `detectRenamedNodes()` used to record the *sanitized*
+spelling for a deduplicated node, so the reconstructed alias read
+`-Kettenrad_2011` where the GLB had written `-Kettenrad 201:1`, and the authored path resolved
+to nothing. It now records the raw name and `registerNodeAliases()` publishes **both**
+spellings (plan-734).
+
 ---
 
 ## 3. How the exporter builds paths
@@ -228,7 +254,9 @@ Resolution proceeds in this order, in both `getNode()` and `getByPath()`:
    look the component up under that node's canonical path. This is what lets a reference
    authored before a re-parent still find its target.
 4. **Unique suffix match** — any registered path ending in `/<query>`.
-5. **Scoped name match** (`resolve()` only, when a scope is passed) — the first descendant of
+5. **Sanitize-normalized full-path match** — the query and every registered path are run
+   through `sanitizeLikeThree()`; a unique hit resolves. See below.
+6. **Scoped name match** (`resolve()` only, when a scope is passed) — the first descendant of
    the scope whose *name* equals the query's last segment and which carries the requested
    component type.
 
@@ -248,6 +276,37 @@ and its canonical path both match but denote one node, and in `getByPath()` only
 actually carry the requested component type compete. The internal probe in step 3 is silent,
 because an ambiguous *node* there is not yet a failed *component* lookup.
 
+### Step 5 — the sanitize-normalized last resort
+
+Aliases fix models loaded by a viewer that knows about them. They do nothing for a GLB that was
+delivered and is being opened by a build whose alias registration wrote the wrong spelling, and
+for a customer model there is often no re-delivery coming. Step 5 closes that gap without a
+re-export: `sanitizeLikeThree()` is the one transform that maps the authored spelling and the
+loader-assigned spelling onto the same key, so an index over
+`sanitizeLikeThree(registeredPath)` finds the node from either side.
+
+Three rules keep it from becoming a guessing machine:
+
+- **It runs only after step 4 found *nothing*.** A step-4 *refusal* — several distinct
+  candidates, "refusing to guess" — returns immediately and is never revisited. A refusal is a
+  decision, not a miss.
+- **It has its own ambiguity refusal.** Sanitization *removes* `[ ] . : /` rather than replacing
+  them, so `A.B` and `A:B` both become `AB`. A key claimed by more than one distinct node
+  resolves to `null` with one warning per key, never to "the first one".
+- **Its index is maintained incrementally and never rebuilt.** It is built once, lazily, on the
+  first lookup that reaches step 5 — a model whose paths all resolve exactly never pays for it —
+  and after that `registerNode()` / `registerAlias()` add a key and
+  `unregisterSubtree()` / `recomputePathsForSubtrees()` remove one. A dirty-flag-plus-rebuild
+  scheme would be a trap here: `MuReconciler.reconcile()` registers and unregisters nodes on
+  **every frame** while the layout planner runs, so the index would be discarded several times a
+  second and each following miss would pay an O(nodes) rebuild.
+  `NodeRegistry.sanitizedIndexBuildCount()` exposes the counter; anything above 1 in a running
+  session means a rebuild was reintroduced.
+
+One consequence worth knowing: a path that step 5 rescues no longer looks "missing" to code that
+uses `getNode(...) === null` as an existence test — `orphaned-bindings.ts` in particular reports
+one fewer orphan. That is the intended trade.
+
 ### Aliases for deduplicated nodes
 
 When `GLTFLoader` renames a node, its authored path no longer exists in the scene.
@@ -257,8 +316,14 @@ an alias pointing at the renamed node. `registerAlias()` writes to `nodes`, `suf
 `aliasPaths` but deliberately **not** to `nodePaths`, so the canonical reverse lookup stays
 truthful. It never overwrites an existing entry.
 
-Four properties matter:
+Five properties matter:
 
+- **Both spellings are registered.** `renamedNodes` carries the **raw** glTF name, so the
+  reconstructed path is the one the file authored; the sanitized spelling is derived from it and
+  registered as well. Only a name containing whitespace or one of `[ ] . : /` differs at all
+  between the two — for every other name the second registration is de-duplicated away and costs
+  nothing. Registering both means content exported against the historical (sanitized) spelling
+  keeps resolving alongside the authored one.
 - **The whole subtree is aliased, not just the renamed node.** Every descendant gets its own
   pre-dedup path, so `Kinematics_MC07/Pusher/vertical` resolves even though only `Pusher` was
   renamed. Without this, the suffix fallback cannot help: it matches whole path suffixes, and
@@ -286,9 +351,24 @@ Debug output makes this visible — load with `?debug=loader,verbose` and look f
 
 ```
 N node(s) renamed by Three.js (name dedup)
-Aliases registered: 12 node path(s), 3 signal path(s)
+Aliases registered: 12 node path(s), 3 signal path(s), 0 dropped (path already taken);
+  largest suffix bucket "Volumenkörper1" ×3279; 41.2 ms
 Node alias: "Kinematics_MC07/Pusher/vertical" → "Kinematics_MC07/Pusher_1/vertical"
 ```
+
+The same four numbers ride along on `LoadResult.aliasStats` and are shown in DevTools ▸ *Scene
+(from GLB)*. **Dropped** is the one to watch: `registerAlias()` correctly refuses to overwrite an
+existing registration, but a dropped alias is precisely how a node stops being reachable under
+its authored path — and until it was counted, that was completely invisible.
+
+### Checking a GLB before it ships
+
+`npm run audit:instruction-targets -- <model.glb>` resolves every `CustomRuntimeInstruction`
+target offline, straight from the glTF JSON chunk, and exits non-zero if any of them is
+unreachable. It reports two numbers — how many the *current* viewer cannot resolve (the shipping
+gate) and how many a pre-plan-734 viewer could not (the blast radius of the alias bug in that
+particular model) — plus, for a broken target, which path segment Three.js both deduplicated and
+sanitized. `auditGlb()` is exported for callers that would rather not parse stdout.
 
 ---
 
@@ -331,6 +411,20 @@ Rename the colliding nodes in Unity, then re-export.
 
   - Kinematics_MC07/Pusher/vertical      (ancestor "Pusher" occurs 2x)
 ```
+
+### 5.3b An instruction target is resolved once, at load
+
+`RVCustomRuntimeInstruction` resolves its step targets in `onSceneReady()` — the first moment
+the registry is final, after alias registration and after kinematic re-parenting has recomputed
+the paths it moves. Whatever does not resolve there is marked on the step
+(`InstructionStep.unresolvedTargetPaths`), shown on the card and reported to the Problems panel
+as `unresolved-instruction-target`.
+
+The resolution is **not** repeated. If the layout planner places the missing asset *after* the
+load, the step stays marked for the life of that component instance. This is a deliberate
+non-goal, not an oversight: a model switch runs `init()` + `onSceneReady()` afresh and gets it
+right there, and re-resolving on every scene mutation would put a registry lookup per target on
+a path that mutates every frame.
 
 ### 5.4 An unresolved signal reference still returns the raw path
 

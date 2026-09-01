@@ -23,7 +23,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   detectOpenTarget,
+  diagnoseKioskBoot,
   parseRememberedSession,
+  projectStartDocument,
   rememberedSessionOf,
   resolveResumeTarget,
   resumeStorageKey,
@@ -210,6 +212,165 @@ describe('§9.15 — a locked deployment always takes defaultModel', () => {
   it('answers "nothing" when a locked deployment configured no default', () => {
     expect(resolveResumeTarget({ search: '?scene=x.glb', modeLocked: true }))
       .toEqual({ asset: null, mode: null, source: 'none' });
+  });
+});
+
+// ─── The appliance kiosk boot (plan-721 §2.4, F1) ────────────────────────
+
+/**
+ * The regression these guard is subtle: the kiosk branch of
+ * `resolveResumeTarget` has never actually run in production. CONNECT-embed
+ * never reaches the function, and the Mauser/Toray project plugins lock in the
+ * model-plugin hook, i.e. AFTER the boot resolved — so `modeLocked` was always
+ * false at that point. plan-721 is the first deployment to run this branch for
+ * real, which is why the order below is asserted stage by stage rather than
+ * as one happy path.
+ */
+describe('appliance kiosk boot (plan-721)', () => {
+  it('locked mode resolves the manifest start document, not null', () => {
+    const t = resolveResumeTarget({
+      search: '?model=evil.glb',
+      modeLocked: true,
+      remembered: { asset: 'x', mode: 'planner' },
+      projectActive: 'doc-7',
+      // Fed by the call sites as `project.settings.defaultModel`, not from
+      // settings.json — the appliance ships no global value at all.
+      defaultModel: 'Machine.glb',
+    });
+    expect(t).toMatchObject({ asset: 'Machine.glb', mode: null, source: 'defaultModel' });
+  });
+
+  it('locked mode falls back to projectActive when the manifest field is empty', () => {
+    const t = resolveResumeTarget({
+      search: '', modeLocked: true, projectActive: 'doc-7', defaultModel: '',
+    });
+    expect(t).toEqual({ asset: 'doc-7', mode: null, source: 'projectActive' });
+  });
+
+  it('still discards the URL and the remembered pair at BOTH new stages', () => {
+    // Stage 1 (defaultModel) is covered above; this is stage 2, where the old
+    // code returned `none` and the boot fell into the legacy catalogue block.
+    const t = resolveResumeTarget({
+      search: '?scene=pasted.glb',
+      modeLocked: true,
+      remembered: { asset: 'remembered.glb', mode: 'editor' },
+      projectActive: 'doc-7',
+    });
+    expect(t.asset).toBe('doc-7');
+    expect(t.mode).toBeNull();
+  });
+
+  it('a project naming neither still answers "nothing", never a guess', () => {
+    expect(resolveResumeTarget({
+      search: '', modeLocked: true, projectActive: '   ', defaultModel: '  ',
+    })).toEqual({ asset: null, mode: null, source: 'none' });
+  });
+
+  it('the unlocked cascade is untouched — projectActive still sits below remembered', () => {
+    // The one thing that must NOT change: adding a kiosk stage for
+    // `projectActive` must not promote it on the normal path.
+    expect(resolveResumeTarget({
+      search: '',
+      remembered: { asset: 'remembered.glb' },
+      projectActive: 'doc-7',
+      defaultModel: 'd.glb',
+    }).source).toBe('remembered');
+  });
+});
+
+// ─── The call-site input rule (plan-721 §2.4) ────────────────────────────
+
+describe('plan-721 — the manifest start document beats the global one', () => {
+  it('reads project.settings.defaultModel, defensively', () => {
+    expect(projectStartDocument({ settings: { defaultModel: 'Machine.glb' } }))
+      .toBe('Machine.glb');
+    expect(projectStartDocument({ settings: { defaultModel: '  Padded.glb  ' } }))
+      .toBe('Padded.glb');
+  });
+
+  it('a missing, blank or non-string field is "the project names none"', () => {
+    // `settings` is Record<string, unknown> from a FOREIGN deploy manifest, so
+    // every one of these is a shape that can actually arrive over HTTP.
+    expect(projectStartDocument(null)).toBeNull();
+    expect(projectStartDocument(undefined)).toBeNull();
+    expect(projectStartDocument({})).toBeNull();
+    expect(projectStartDocument({ settings: {} })).toBeNull();
+    expect(projectStartDocument({ settings: { defaultModel: '   ' } })).toBeNull();
+    expect(projectStartDocument({ settings: { defaultModel: 42 } })).toBeNull();
+    expect(projectStartDocument({ settings: { defaultModel: null } })).toBeNull();
+  });
+
+  it('composes with the global value exactly as both call sites do', () => {
+    const globalValue = 'models/Demo.glb';
+    const withManifest = { settings: { defaultModel: 'Machine.glb' } };
+    const withoutManifest = { settings: {} };
+    expect(projectStartDocument(withManifest) ?? globalValue).toBe('Machine.glb');
+    // The appliance ships no global value; every other delivered build ships
+    // the same value in both places (`bareDefaultModel()` derives it from the
+    // manifest), so this branch is what keeps them bit-compatible.
+    expect(projectStartDocument(withoutManifest) ?? globalValue).toBe(globalValue);
+  });
+});
+
+// ─── No silent misboot (plan-721 F8, test 9.2) ───────────────────────────
+
+/**
+ * The seam for test 9.2. Every cause below is silent in production today: a
+ * 404, a 500 and a corrupt `project.json` are swallowed identically by the
+ * bundled backend, which then answers with the synthetic demo manifest — so a
+ * mistyped `?projectUrl=` looks exactly like a working box that happens to show
+ * the wrong machine, on a panel with no keyboard and no DevTools.
+ */
+describe('§9.2 — a kiosk boot that lands nowhere says so (plan-721 F8)', () => {
+  const OK = {
+    projectUrl: '/p/mauser/',
+    hasDeployedManifest: true,
+    documentCount: 3,
+    resolvedAsset: 'models/Machine.glb',
+    assetExists: true,
+  };
+
+  it('passes a boot that resolved a real document', () => {
+    expect(diagnoseKioskBoot(OK)).toEqual({ ok: true, reason: null, detail: '' });
+  });
+
+  it('no served project.json is a failure, not the synthetic demo manifest', () => {
+    const v = diagnoseKioskBoot({ ...OK, hasDeployedManifest: false });
+    expect(v.ok).toBe(false);
+    expect(v.reason).toBe('no-manifest');
+    // The URL is IN the message: on a kiosk that sentence is the only
+    // diagnostic anybody will ever see.
+    expect(v.detail).toContain('/p/mauser/');
+  });
+
+  it('an empty documents[] is a failure, not an empty viewport', () => {
+    expect(diagnoseKioskBoot({ ...OK, documentCount: 0 }).reason).toBe('no-documents');
+  });
+
+  it('naming no start document at all is a failure', () => {
+    const v = diagnoseKioskBoot({ ...OK, resolvedAsset: null });
+    expect(v.reason).toBe('no-start-document');
+  });
+
+  it('a start document that is not in the manifest is a failure', () => {
+    const v = diagnoseKioskBoot({ ...OK, resolvedAsset: 'Gone.glb', assetExists: false });
+    expect(v.reason).toBe('start-document-missing');
+    expect(v.detail).toContain('Gone.glb');
+  });
+
+  it('is scoped to the served boot — every other deployment is none of its business', () => {
+    // Without a `?projectUrl=` this is not an appliance boot. The verdict must
+    // stay a diagnosis rather than becoming a new gate on the CDN/dev paths.
+    expect(diagnoseKioskBoot({ hasDeployedManifest: false }).ok).toBe(true);
+    expect(diagnoseKioskBoot({ projectUrl: '   ', documentCount: 0 }).ok).toBe(true);
+    expect(diagnoseKioskBoot({}).ok).toBe(true);
+  });
+
+  it('reports the FIRST cause, so the message names what to fix', () => {
+    // A box with no manifest also has no documents and no start document.
+    // Reporting "no documents" there would send the operator after the wrong
+    // thing entirely.
+    expect(diagnoseKioskBoot({ projectUrl: '/p/x/' }).reason).toBe('no-manifest');
   });
 });
 

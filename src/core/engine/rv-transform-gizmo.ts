@@ -32,7 +32,7 @@ import {
   type BufferGeometry, type Camera, type Object3D, type Scene,
 } from 'three';
 import { HIGHLIGHT_OVERLAY_LAYER } from './rv-group-registry';
-import { ensureMovableTransform } from './rv-node-transform';
+import { ensureMovableTransform, refreshWorldMatricesDeep } from './rv-node-transform';
 import { disposeSubtree } from './rv-traverse-utils';
 
 export type TransformGizmoHandle = 'x' | 'y' | 'z' | 'center' | 'rx' | 'ry' | 'rz';
@@ -422,9 +422,12 @@ export class TransformGizmo {
     node.position.copy(worldPos).applyMatrix4(b.parentInv);
     if (worldQuat) node.quaternion.copy(b.parentQuatInv).multiply(worldQuat);
     node.updateMatrix();
-    // Recurse with force so child matrixWorlds follow (editor assets load with
-    // preserveHierarchy — subtrees are not frozen).
-    node.updateMatrixWorld(true);
+    // NOT `updateMatrixWorld(true)`: editor loads freeze static subtrees too
+    // (`freezeStaticMatrices`, loader Phase 11), and the force flag never
+    // reaches a node whose `matrixWorldAutoUpdate` is off — frozen children
+    // would stand still while their parent moves. The deep refresh recomposes
+    // the whole subtree from its (still valid) local matrices.
+    refreshWorldMatricesDeep(node);
   }
 
   private readonly _onPointerUp = (e: PointerEvent): void => {

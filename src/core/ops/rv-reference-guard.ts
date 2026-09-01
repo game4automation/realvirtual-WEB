@@ -30,6 +30,26 @@
  * {@link writeOverride} here are the live-tree half of the same addressing, which
  * is what the inspector's badge and its Revert read and write.
  *
+ * ## `transformNode` is structural HERE and writable in the SCENE bake
+ *
+ * The asymmetry is deliberate (plan-444) and reading it as a bug would undo the
+ * feature. Two different documents are being guarded:
+ *
+ *  - **The scene bake** writes the file the reference node lives in. Since
+ *    plan-444 that file has a vocabulary for a foreign node's transform —
+ *    `AssetOverrides.trsByNodeId`, a sibling of `byNodeId` — so a part moved
+ *    after a CAD import is saved as an override instead of refused. That is F3,
+ *    and it is the whole point of the plan.
+ *  - **This guard** protects the ASSET EDITOR's op log, which edits one asset
+ *    document at a time. There the reference in question is an INNER one, so
+ *    the patch would have to be written into a file that is itself referenced —
+ *    the case `ReferencedFileWriteError` refuses and plan-444 explicitly left
+ *    refused (F5). `transformNode` therefore stays in the structural set.
+ *
+ * The general sentence above ("structural overrides do not exist") still holds
+ * for every other kind in the list: none of them has a vocabulary in the
+ * override schema, and `transformNode` now has one only at the outermost level.
+ *
  * Pure module: no Three.js beyond the `Object3D` type, no registry, no storage.
  */
 
@@ -58,6 +78,10 @@ import { getNodeId } from '../engine/rv-node-id';
  * `setMaterial` is structural for the same reason: it rewrites the mesh's
  * material assignment in the file, and `AssetOverrides` patches components, not
  * materials.
+ *
+ * `transformNode` stays here even though the SCENE bake can now write a
+ * transform override — see the module doc's "asymmetry" section for why the two
+ * verdicts are about two different documents.
  */
 export const RV_STRUCTURAL_OP_KINDS: ReadonlySet<RvOpKind> = new Set<RvOpKind>([
   'addNode',
@@ -247,6 +271,12 @@ export function overriddenFieldsOf(
  *
  * Empty containers are pruned on the way out so a revert leaves no husk behind:
  * an `AssetOverrides` with an empty patch would keep the badge lit at zero.
+ *
+ * `byPath` and `trsByNodeId` are carried through untouched. This is a
+ * read-modify-write over the WHOLE component, so a block this function does not
+ * know about is a block it deletes: before plan-444 added the carry for
+ * `trsByNodeId`, editing any field on any node of a referenced asset would have
+ * silently thrown away every part the user had moved in it.
  */
 export function writeOverride(
   referenceNode: Object3D,
@@ -269,7 +299,11 @@ export function writeOverride(
   if (Object.keys(patch).length === 0) delete byNodeId[nodeId];
   else byNodeId[nodeId] = patch;
 
-  const next = { byNodeId, ...(current?.byPath ? { byPath: current.byPath } : {}) };
+  const next = {
+    byNodeId,
+    ...(current?.byPath ? { byPath: current.byPath } : {}),
+    ...(current?.trsByNodeId ? { trsByNodeId: current.trsByNodeId } : {}),
+  };
   // `setAssetOverrides` removes the key entirely when nothing is left.
   setAssetOverrides(referenceNode, next);
 }

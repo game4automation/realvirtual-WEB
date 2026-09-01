@@ -28,6 +28,7 @@ import {
   Box3,
   Object3D,
   Mesh,
+  type Material,
   MeshStandardMaterial,
   NoToneMapping,
   CanvasTexture,
@@ -84,15 +85,16 @@ import {
   removeRuntimeNode,
   initializeComponents,
   runOnSceneReady,
+  LoadAbortedError,
   type DeferredLogic,
   type LoadResult,
   type RuntimeNodeSpec,
 } from './engine/rv-scene-loader';
+import { disposeModelSubtree } from './engine/rv-dispose-subtree';
 import { BatchVisibilityService } from './engine/rv-batch-visibility';
 import { createBVHPort, type BVHBuildPort } from './engine/rv-bvh-build-port';
 import type { RVExtrasOverlay } from './engine/rv-extras-overlay-store';
 import type { RvScene } from './hmi/scene/rv-scene-types';
-import type { PublishedSceneEntry } from './hmi/scene/rv-published-scenes';
 import type { PlacementsSnapshot } from './rv-shared-types';
 import type { MultiuserSnapshot } from '../plugins/multiuser-plugin';
 import type { McpBridgeSnapshot } from '../plugins/mcp-bridge-plugin';
@@ -135,6 +137,7 @@ import { showStatusOutline, hideStatusOutline } from './engine/rv-status-outline
 import { RVOutlineManager } from './engine/rv-outline-manager';
 import { RaycastManager, type ObjectHoverData, type ObjectUnhoverData, type ObjectClickData, type HoverableType } from './engine/rv-raycast-manager';
 import type { RVDrive } from './engine/rv-drive';
+import { resetSmoothMotionDegradation } from './engine/rv-smooth-motion-port';
 import type { RVTransportManager } from './engine/rv-transport-manager';
 import type { SignalStore } from './engine/rv-signal-store';
 import type { RVDrivesPlayback } from './engine/rv-drives-playback';
@@ -154,6 +157,7 @@ import {
   getActiveSignalReapplyRegistry,
 } from './engine/rv-signal-reapply-registry';
 import { EnergyChainManager } from './engine/rv-energy-chain-manager';
+import { ChainManager } from './engine/rv-chain-manager';
 import { MachiningManager } from './engine/rv-machining-manager';
 import {
   registerOverlayProducer, resetOverlayProducers,
@@ -457,6 +461,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   readonly sceneButtonManager: SceneButtonManager;
   /** Viewer-owned registry for EnergyChain rigs and their per-frame bone update. */
   readonly energyChainManager: EnergyChainManager;
+  /** Viewer-owned registry for Chain components and their per-tick element poses
+   *  (plan-733). Ticked from CoreSubsystems.visuals() AFTER the drive stage and
+   *  re-posed from resetSimulation() AFTER the drive resets. */
+  readonly chainManager: ChainManager;
   /** Viewer-owned registry for CSG machining volumes and their per-tick cut +
    *  chunk-mesh apply (plan-405). Survives model loads; `clear()` on every
    *  model switch destroys the worker-side grids and the chunk geometries,
@@ -860,6 +868,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       get lampManager() { return viewer.lampManager; },
       get sceneButtonManager() { return viewer.sceneButtonManager; },
       get energyChainManager() { return viewer.energyChainManager; },
+      get chainManager() { return viewer.chainManager; },
       get machiningManager() { return viewer.machiningManager; },
       get collisionManager() { return viewer.collisionManager; },
       markRenderDirty: () => viewer.markRenderDirty(),
@@ -931,9 +940,15 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.emit('models-changed', payload);
   }
 
-  /** Read-only "Example" scenes of the DemoRealvirtual project (Examples section). */
-
-  availablePublishedScenes: PublishedSceneEntry[] = [];
+  /*
+   * `availablePublishedScenes` used to sit here (removed in plan-731 2.3).
+   *
+   * It carried the `scenes/index.json` catalogue from boot to the SceneStore
+   * constructor, and by naming a `PublishedSceneEntry` on the viewer facade it
+   * declared the second document identity space as part of the public API.
+   * Examples are `documents[]` rows now, read from the project store where
+   * every other document is read.
+   */
 
   /** UI plugin registry for React slot rendering. */
   readonly uiRegistry = new UIPluginRegistry();
@@ -1647,6 +1662,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       transportManager: this.transportManager, gizmoManager: this.gizmoManager,
       lampManager: this.lampManager, sceneButtonManager: this.sceneButtonManager,
       energyChainManager: this.energyChainManager,
+      chainManager: this.chainManager,
       machiningManager: this.machiningManager,
       collisionManager: this.collisionManager,
       errorStore: this.errorStore,
@@ -2206,6 +2222,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // running like a freshly-loaded scene — see RVDrive.reset().
     for (const drive of this.drives) drive.reset();
 
+    // plan-733 F4: chain element poses follow the drives, so this MUST run after
+    // the loop above. Deliberately not hooked to 'simulation-reset' — that event
+    // is emitted at the top of this method, BEFORE the drives are reset, so a
+    // chain reacting to it would re-pose from the stale drive position and stay
+    // visibly offset until the next movement.
+    this.chainManager.resetAll();
+
     // Engine-level clear: live MUs, sensor occupancy, sources, grips, counters,
     // plus per-surface texture/transform accumulators.
     if (this.transportManager) this.transportManager.reset();
@@ -2420,6 +2443,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     const index = this.drives.indexOf(drive);
     if (index < 0) return false;
     this.drives.splice(index, 1);
+    // Editor delete / undo of an add: the drive leaves the scene here and
+    // clearModel() will never see it again, so its solver context is freed now.
+    drive.dispose();
     if (this.focusedDrive === drive) this.clearFocus();
     this._onDrivesChanged(null, drive);
     return true;
@@ -2669,6 +2695,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.lampManager = new LampManager();
     this.sceneButtonManager = new SceneButtonManager();
     this.energyChainManager = new EnergyChainManager();
+    this.chainManager = new ChainManager();
     this.machiningManager = new MachiningManager();
     // plan-394: collided bodies get the OutlinePass STATUS outline — the same
     // pulsing severity silhouette the error-message system uses (user decision
@@ -3494,6 +3521,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     overlay?: RVExtrasOverlay;
     data?: ArrayBuffer;
     preserveHierarchy?: boolean;
+    /**
+     * plan-727 — AUTHORING load: never mutate the GLB node hierarchy (skips
+     * kinematic re-parenting). See LoadGLBOptions.preserveAuthoringHierarchy.
+     * Deliberately separate from `preserveHierarchy`, which the embed viewer
+     * sets for pickability while still needing the re-parenting.
+     */
+    preserveAuthoringHierarchy?: boolean;
     /** Stable local filename or URL-derived identity for signature unlock persistence. */
     modelName?: string;
     /** Provenance of these bytes. Defaults to trusted — see {@link LoadTrustContext}. */
@@ -3525,6 +3559,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     overlay?: RVExtrasOverlay;
     data?: ArrayBuffer;
     preserveHierarchy?: boolean;
+    preserveAuthoringHierarchy?: boolean;
     modelName?: string;
     trust?: LoadTrustContext;
     provenance?: ModelProvenance;
@@ -3540,6 +3575,22 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Snapshot AFTER clearModel() — it bumps the generation once more; the
     // snapshot must reflect the generation THIS load runs under.
     const loadGeneration = this._loadGeneration;
+    /**
+     * Latest-wins guard (plan-442 F1/F3). Called after EVERY `await` in this
+     * method, so a run that has been overtaken cannot write another viewer-
+     * global, register another pick structure or emit another event.
+     *
+     * It throws the load path's EXISTING cancellation contract rather than
+     * returning a sentinel: `loadGLB`'s own `shouldAbort` path already rejects
+     * stale runs with `LoadAbortedError`, and callers already have to treat
+     * that as a cancellation rather than a failure.
+     *
+     * An integer compare — free in the non-overlapping case, which is every
+     * ordinary model switch.
+     */
+    const abortIfSuperseded = (): void => {
+      if (this._loadGeneration !== loadGeneration) throw new LoadAbortedError(url);
+    };
     // `url` is where the bytes come from; `identityUrl` is what they ARE. They
     // differ exactly when a scene resumes from a stored body — see the option's
     // docs. Only `loadGLB` below gets the raw `url`.
@@ -3564,14 +3615,24 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
         } catch { /* skip silently */ }
       };
       await tryPreloadPlugin('./project-plugin.js');
+      abortIfSuperseded();
       await tryPreloadPlugin(`./models/${modelBaseName}/model-plugin.js`);
+      abortIfSuperseded();
     }
     if (this.modelPluginManager) {
+      // A hook that hangs here is the widest pre-load window there is: a newer
+      // load can run its whole clearModel + parse while this one waits. Whatever
+      // side effects the hook already had are the newer load's problem to
+      // overwrite; what must not happen is this run carrying on afterwards.
       await this.modelPluginManager.onModelLoading(identity, this);
+      abortIfSuperseded();
     }
 
     // Wait for any load gate (e.g. login) before heavy GLB parsing
-    if (this.loadGate) await this.loadGate;
+    if (this.loadGate) {
+      await this.loadGate;
+      abortIfSuperseded();
+    }
 
     const result = await loadGLB(url, this.scene, {
       isWebGPU: this.isWebGPU,
@@ -3580,6 +3641,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       lampManager: this.lampManager,
       sceneButtonManager: this.sceneButtonManager,
       energyChainManager: this.energyChainManager,
+      chainManager: this.chainManager,
       machiningManager: this.machiningManager,
       collisionManager: this.collisionManager,
       outlineManager: this.outlineManager,
@@ -3590,10 +3652,37 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       overlay: options?.overlay,
       data: options?.data,
       preserveHierarchy: options?.preserveHierarchy,
+      preserveAuthoringHierarchy: options?.preserveAuthoringHierarchy,
       allowUntrustedLogic: isSignatureUnlocked(this._signatureModelName),
       // Async batch phases — stale-load abort (plan-274 pattern).
       shouldAbort: () => this._loadGeneration !== loadGeneration,
     });
+
+    /**
+     * The duplicate-root guard for the window between `loadGLB` returning and
+     * the root being adopted (plan-442 F1).
+     *
+     * In that window the root is parented but NOT yet tagged `_rvModelRoot` and
+     * NOT yet `currentModel`, so a newer load's `clearModel()` sweep cannot see
+     * it — this run has to take it out itself. Detaching comes first and
+     * disposal second on purpose: while the subtree is still parented, ANY
+     * other run's `renderer.compileAsync(this.scene, …)` walks it, and one with
+     * freed buffers takes the renderer down with it.
+     */
+    const abortIfSupersededBeforeAdoption = (): void => {
+      if (this._loadGeneration === loadGeneration) return;
+      this.scene.remove(result.root);
+      // The batch arenas are this result's own; nothing else will ever see it
+      // (it never became `_lastLoadResult`), so this run frees them itself.
+      result.batchTable?.dispose();
+      disposeModelSubtree(result.root);
+      throw new LoadAbortedError(url);
+    };
+    // Checked BEFORE the compile below, not only before the adoption: compiling
+    // is minutes of pointless GPU work for a load nobody will see, and it is
+    // exactly what would drag a concurrently-disposed sibling subtree into the
+    // renderer.
+    abortIfSupersededBeforeAdoption();
 
     // Profile the expensive post-loadGLB steps separately (gated on ?debug=perf).
     const prof = createLoadProfiler('loadModel');
@@ -3607,6 +3696,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     }
     prof.mark('compileAsync');
 
+    // The last moment the root is still nobody's: overtaken DURING the compile
+    // above, and the two lines below would hand the scene a second model that
+    // draws on top of the one the user is actually looking at. That is what put
+    // 87 meshes into the scene twice, with parts of the machine invisible.
+    abortIfSupersededBeforeAdoption();
     // GLB root is reported deterministically by loadGLB (LoadResult.root) —
     // no diffing scene.children. The `_rvModelRoot` userData tag stays as
     // defence-in-depth so clearModel's tag-sweep can recover from any
@@ -3801,6 +3895,20 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       // incrementally by the asset-op executors, so NO full rebuild exists
       // in editor mode. No proxy provider either — editor highlights run on
       // real meshes (OutlinePass / legacy overlay pairs).
+      //
+      // "No proxy provider" is ENFORCED here, not assumed (devtodo 2026-08-24):
+      // a provider left over from a previous RUNTIME load (a clearModel that
+      // never ran, a superseded load) is still asked unconditionally by
+      // `HighlightManager._resolve`, and its face windows describe the PREVIOUS
+      // model's merge buffers — the first selection then renders scene-sized
+      // transparent ghost overlays (`__hlProxyFill`/`__hlProxyEdge`) instead of
+      // the node's highlight. Same retire order as `_retireRaycastGeometry`:
+      // provider first, so no render can touch the stale shared attributes.
+      if (this._highlightProxyProvider) {
+        this.highlighter.setProxyProvider(null);
+        this._highlightProxyProvider.dispose();
+        this._highlightProxyProvider = null;
+      }
       const index = new InstancePickIndex(result.registry);
       index.addSubtree(result.root);
       this._instancePickIndex = index;
@@ -3905,6 +4013,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       Promise.resolve(extractGlbPluginConfig(this.scene)),
       loadModelSettingsConfig(url),
     ]);
+    // From here on the root IS tagged, so a newer load's clearModel sweep has
+    // already taken it away — nothing left to dispose, only writes to stop.
+    abortIfSuperseded();
     const settingsConfig: ModelConfig = {};
     const appConfig = getAppConfig();
     if (appConfig.plugins) settingsConfig.plugins = appConfig.plugins;
@@ -3931,6 +4042,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // onModelLoaded. Selective rv_plugins eligibility is enforced before a
     // plugin is recorded as having missed the lifecycle callback.
     await this._notifyPluginsModelLoaded(result);
+    abortIfSuperseded();
 
     // Re-evaluate _physicsPluginActive — plugins may have changed handlesTransport in onModelLoaded
     this._recomputePhysicsPluginActive();
@@ -3972,6 +4084,10 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // `await viewer.loadModel(...)` only resolves once the scene is fully
     // ready to be revealed.
     await this.whenLoadingIdle();
+    // Last window: a load started during the drain owns the scene now, so this
+    // result no longer describes what is on screen — do not hand it back as if
+    // it did (plan-442 F3).
+    abortIfSuperseded();
     prof.mark('whenLoadingIdle');
     prof.report();
     return result;
@@ -4025,6 +4141,32 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
         console.warn('[viewer] async BVH build failed:', e);
       }
     })();
+  }
+
+  /**
+   * Count the model roots parented to the scene, and warn in dev when there is
+   * more than one (plan-442 F4).
+   *
+   * A second `_rvModelRoot` child is never legitimate: it means a superseded
+   * load left its subtree behind, and the symptom the user sees is doubled
+   * geometry with parts of it z-fighting itself into invisibility. Cheap
+   * enough to call at the end of a mode activation — it walks
+   * `scene.children`, not the model — and deliberately NOT wired into the
+   * frame loop.
+   *
+   * @param context Where the check ran, for the log line.
+   * @returns the number of model roots currently in the scene.
+   */
+  checkSingleModelRoot(context: string): number {
+    let count = 0;
+    for (const child of this.scene.children) {
+      if (child.userData?._rvModelRoot) count++;
+    }
+    if (count > 1 && import.meta.env.DEV) {
+      debug('loader', `[viewer] ${count} model roots in the scene after ${context} — `
+        + 'a superseded load left its subtree behind (plan-442).');
+    }
+    return count;
   }
 
   /** Remove the current model and reset all simulation state. */
@@ -4140,6 +4282,9 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Same for EnergyChain rigs: dispose restores the original meshes and drops
     // the skinned sidecars BEFORE their shared geometry/materials are freed.
     this.energyChainManager.clear();
+    // Same for Chain elements: dispose removes the runtime clones BEFORE the
+    // shared template geometry/materials they reference are freed.
+    this.chainManager.clear();
     // plan-405: destroy the worker-side SDF grids (frees their WASM linear
     // memory and unsubscribes every grid-bound listener) and dispose the chunk
     // geometries — BEFORE the generic geometry teardown below, which would
@@ -4149,45 +4294,37 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // After material deduplication, multiple meshes share the same material
     // instance. Use a Set to avoid disposing the same material/texture twice
     // across all roots being torn down in this pass.
-    const disposedMaterials = new Set<MeshStandardMaterial>();
+    // ONE dedup set across all roots of this pass — deduplicated materials are
+    // shared between them (plan-442: the traversal itself is the shared
+    // primitive, the texture slots below are this caller's own teardown).
+    const disposedMaterials = new Set<Material>();
     for (const root of modelRootsToClear) {
       this.scene.remove(root);
-      root.traverse((node) => {
-        const mesh = node as {
-          geometry?: { dispose(): void; disposeBoundsTree?: () => void };
-          material?: (MeshStandardMaterial & { dispose(): void }) | (MeshStandardMaterial & { dispose(): void })[];
-        };
-        if (mesh.geometry) {
-          // Free the three-mesh-bvh tree explicitly — geometry.dispose() only
-          // releases GPU buffers, the CPU-side BVH would otherwise linger as
-          // long as anything still references the geometry object.
-          mesh.geometry.disposeBoundsTree?.();
-          mesh.geometry.dispose();
-        }
-        if (mesh.material) {
-          const disposeMat = (m: MeshStandardMaterial & { dispose(): void }) => {
-            if (disposedMaterials.has(m)) return;
-            disposedMaterials.add(m);
-            // Shared fixtures (e.g. RVUberMaterial singleton) survive clearModel —
-            // they outlive individual model loads and are reused on the next load.
-            if (m.userData?._rvShared) return;
-            m.map?.dispose();
-            m.normalMap?.dispose();
-            m.roughnessMap?.dispose();
-            m.aoMap?.dispose();
-            m.emissiveMap?.dispose();
-            m.metalnessMap?.dispose();
-            m.alphaMap?.dispose();
-            m.envMap?.dispose();
-            m.dispose();
-          };
-          if (Array.isArray(mesh.material)) mesh.material.forEach(disposeMat);
-          else disposeMat(mesh.material);
-        }
+      disposeModelSubtree(root, {
+        disposedMaterials,
+        onMaterial: (material) => {
+          const m = material as MeshStandardMaterial;
+          m.map?.dispose();
+          m.normalMap?.dispose();
+          m.roughnessMap?.dispose();
+          m.aoMap?.dispose();
+          m.emissiveMap?.dispose();
+          m.metalnessMap?.dispose();
+          m.alphaMap?.dispose();
+          m.envMap?.dispose();
+        },
       });
     }
     this.currentModel = null;
+    // plan-281 F12 / Finding #3: a smooth drive holds a context in the solver's
+    // WASM linear memory. Dropping the JavaScript reference does NOT free it, so
+    // every model switch would leak one context per smooth drive. clearModel()
+    // is the only place that sees the whole population, so it is the place that
+    // frees them. `dispose()` is idempotent and a no-op for non-smooth drives.
+    for (const drive of this.drives) drive.dispose();
     this.drives = [];
+    // Re-arm the once-per-model smooth-motion degradation warning.
+    resetSmoothMotionDegradation();
     this.ikPaths = [];
     if (this.playback) {
       this.playback.stop();
@@ -4423,6 +4560,16 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       });
     }
 
+    // Latest-wins for the phases BELOW (plan-442 F3). The `await` above only
+    // covers overtaking up to its own resolution; everything from here on is
+    // scene mutation that a newer load must not see. Capturing the generation
+    // AFTER the load is what makes this run's own bump irrelevant — only a
+    // LATER load moves it again.
+    const sceneGeneration = this._loadGeneration;
+    const abortIfSuperseded = (): void => {
+      if (this._loadGeneration !== sceneGeneration) throw new LoadAbortedError(url);
+    };
+
     // Phase 4 — planner placements
     if (materialised.placements.length > 0) {
       if (!planner?.applyPlacements) {
@@ -4434,6 +4581,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
         catalogUrls: scene.edits.settings.catalogUrls,
         gridSizeMm: scene.edits.settings.gridSizeMm,
       });
+      abortIfSuperseded();
     }
 
     // Phase 4b — keep the planner's authoring floor (`_layoutFloor`) hidden.
@@ -4467,6 +4615,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // applyLocalPose rebuilds the local TRS from the baked matrices first.
     if (materialised.nodeTransforms.length > 0) {
       const { applyLocalPose } = await import('./engine/rv-node-transform');
+      abortIfSuperseded();
       for (const t of materialised.nodeTransforms) {
         const node = this.registry?.getNode(t.nodePath);
         if (node) applyLocalPose(node, t.position, t.quaternion);
@@ -4478,6 +4627,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // additional cascading work after that point. Cheap when the queue is
     // empty; ensures `scene-loaded` only fires once the scene is fully ready.
     await this.whenLoadingIdle();
+    abortIfSuperseded();
 
     // Camera: the camera-startpos plugin already applied any preset during
     // onModelLoaded (per-scene op → user override → GLB author default). When
@@ -5731,6 +5881,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
   private _shadowPadMax = 100;
   /** Render dirty flag — when false, renderer.render() is skipped (Phase 4: render-on-demand). */
   private _renderDirty = true;
+  /** Consecutive main-render failures — see {@link _recoverFromRenderException}. */
+  private _renderFailStreak = 0;
   /**
    * Snapshot of the most recent main-scene render's draw-call and triangle
    * counts. Captured immediately after `renderer.render()` / `composer.render()`
@@ -5948,6 +6100,63 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.render();
   }
 
+  /**
+   * Keep the viewer alive when a render pass throws mid-frame. The aborted
+   * frame stops at the crashing object, so everything sorted after it is
+   * missing from the presented image — repeated crashes look like "parts of
+   * the model disappeared" and, once the loop dies, a frozen/blank viewport.
+   *
+   * Known signature: `… toArray is not a function` from three's
+   * PureArrayUniform.setValueV4fArray — a material's `clippingPlanes`
+   * uniform received the raw Plane[] instead of the projected Float32Array
+   * (race between the Section tool's plane attach and the material's
+   * program/uniform rebuild; seen on GLB assets whose materials carry
+   * section planes at load, delta-robot bug #10). Self-heal: force a
+   * program + clipping-uniform rebuild on every material that carries
+   * section planes; if the crash persists, strip the planes entirely —
+   * losing the section cut beats a dead viewport.
+   *
+   * Returns true when the frame is worth retrying on the next tick.
+   */
+  private _recoverFromRenderException(err: unknown): boolean {
+    this._renderFailStreak++;
+    const msg = String((err as Error | undefined)?.message ?? err);
+    const isClippingUniformCrash = msg.includes('toArray is not a function');
+    if (this._renderFailStreak <= 3 || this._renderFailStreak % 300 === 0) {
+      console.error(
+        `[RVViewer] render pass failed (streak ${this._renderFailStreak})`
+        + (isClippingUniformCrash ? ' — clipping-uniform corruption, self-healing' : ''),
+        err,
+      );
+    }
+    // The frame aborted mid-pass: bound program / blend / depth state can be
+    // stale. Reset three's GL state cache so the next frame starts clean.
+    (this.renderer as unknown as WebGLRenderer).state?.reset?.();
+
+    if (isClippingUniformCrash) {
+      const strip = this._renderFailStreak >= 3;
+      this.scene.traverse((o) => {
+        const mat = (o as Mesh).material as
+          | { clippingPlanes?: Plane[] | null; needsUpdate: boolean }
+          | { clippingPlanes?: Plane[] | null; needsUpdate: boolean }[]
+          | undefined;
+        if (!mat) return;
+        for (const m of Array.isArray(mat) ? mat : [mat]) {
+          if (m.clippingPlanes && m.clippingPlanes.length > 0) {
+            if (strip) m.clippingPlanes = null;
+            m.needsUpdate = true; // rebuild program, re-wire the clipping uniform
+          }
+        }
+      });
+      // Aux gbuffer / outline / AO override materials mirror the planes.
+      if (strip) this.setSectionClippingPlanes(null);
+      return this._renderFailStreak <= 6; // a few healed retries, then give up
+    }
+    // Unknown crash: retry once (transient), then wait for the next
+    // invalidation instead of burning a crash loop.
+    return this._renderFailStreak <= 1;
+  }
+
   private render(): void {
     // Render-pause / non-Three backend (plan-256): skip ALL Three GPU work and
     // the per-frame plugin `onRender` dispatch below. This is the render-loop
@@ -6056,6 +6265,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       const prevLayerMask = this.camera.layers.mask;
       const glForClearState = this.renderer as unknown as WebGLRenderer;
       const prevAutoClear = glForClearState.autoClear;
+      let renderFailed = false;
+      let retryRender = false;
       try {
         // XR sessions must always go through the direct renderer path —
         // EffectComposer renders to its own offscreen render targets, and
@@ -6128,6 +6339,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
           disableOverlayLayers(this.camera);
           this.renderer.render(this.scene, this.camera);
         }
+      } catch (err) {
+        // three re-arms setAnimationLoop only AFTER the callback returns —
+        // an uncaught exception here would kill the loop for good (frozen
+        // or blank viewport). Recover instead of rethrowing.
+        renderFailed = true;
+        retryRender = this._recoverFromRenderException(err);
       } finally {
         this.camera.layers.mask = prevLayerMask;
         glForClearState.autoClear = prevAutoClear;
@@ -6140,7 +6357,8 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       };
       this._lastFrameStats.drawCalls = r.calls;
       this._lastFrameStats.triangles = r.triangles;
-      this._renderDirty = false;
+      this._renderDirty = renderFailed ? retryRender : false;
+      if (!renderFailed) this._renderFailStreak = 0;
     }
 
     // ── Plugins Render ──

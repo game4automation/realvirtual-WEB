@@ -66,6 +66,7 @@ import { tooltipStore } from './tooltip/tooltip-store';
 import './rv-metadata-field-renderer';
 import './rv-ik-path-field-renderer';
 import './rv-custom-runtime-instruction-field-renderer';
+import './rv-node-knowledge-field-renderer';
 
 // Context menu (plugin-extensible right-click / long-press menu)
 import { ContextMenuLayer } from './ContextMenuLayer';

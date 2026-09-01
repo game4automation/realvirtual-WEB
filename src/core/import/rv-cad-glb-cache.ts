@@ -67,7 +67,7 @@ const CAD_GLB_BUCKET = 'rv-cad-glbs';
  * Without this, a stale GLB tessellated with the old numbers would be served for
  * a preset the user believes they changed.
  */
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v2';
 
 /** Byte budget for the Cache-API tier. The OPFS tier is effectively unbounded. */
 const MAX_CACHE_BYTES = 512 * 1024 * 1024;

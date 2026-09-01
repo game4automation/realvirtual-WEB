@@ -49,9 +49,10 @@ describe('feature matrix visibility', () => {
     for (const feature of Object.keys(manifest.registrations)) {
       expect(matrix, `${feature} missing from the internal report`).toContain(`| ${feature} |`);
     }
-    // 17 since plan-434 moved the asset editor UI out of the AGPL core into a
-    // licensed feature of its own.
-    expect(Object.keys(manifest.registrations)).toHaveLength(17);
+    // 18 since plan-281 added the jerk-limited smooth-motion core as a licensed
+    // feature of its own (17 came from plan-434 moving the asset editor UI out
+    // of the AGPL core).
+    expect(Object.keys(manifest.registrations)).toHaveLength(18);
     // The internal report still shows what an unentitled restricted feature costs: a "no".
     expect(matrix).toMatch(/\| agents \| restricted \| stable \| no \|/);
   });

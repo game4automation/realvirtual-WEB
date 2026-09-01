@@ -19,7 +19,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group } from 'three';
+import type { Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
@@ -66,8 +68,8 @@ function snapshot(mechanismPath: string, value = 0): MechanismForcesSnapshot {
   return {
     mechanismPath, status: 0, statusText: 'Ok', dynamicsValid: true, redundant: false,
     channels: [
-      { id: `${mechanismPath}|dof0`, label: 'Axis 1', kind: 'drive', unit: 'N·m', value },
-      { id: `${mechanismPath}|joint0|F`, label: 'Joint 1 F', kind: 'joint-force', unit: 'N', value: 12 },
+      { id: `${mechanismPath}|dof0`, label: 'Axis 1', kind: 'drive', unit: 'N·m', value, linkPath: `${mechanismPath}/Arm` },
+      { id: `${mechanismPath}|joint0|F`, label: 'Joint 1 F', kind: 'joint-force', unit: 'N', value: 12, linkPath: `${mechanismPath}/Arm` },
     ],
     joints: [{
       jointPath: `${mechanismPath}/Joint1`, name: 'Joint1',
@@ -80,6 +82,7 @@ function snapshot(mechanismPath: string, value = 0): MechanismForcesSnapshot {
 class FakeBridge implements MechanismUiBridge {
   armed = new Map<string, boolean>();
   jogCalls = 0;
+  solveCalls = 0;
   staticsCalls = 0;
   resetCalls = 0;
   current = 0;
@@ -95,6 +98,7 @@ class FakeBridge implements MechanismUiBridge {
   }
   validate() { return []; }
   jog() { this.jogCalls++; return { converged: true, residualError: 0 }; }
+  solve() { this.solveCalls++; return { converged: true, residualError: 0 }; }
   rebuild(): void {}
   suggestFix(): null { return null; }
   setForceAnalysis(path: string, enabled: boolean): void { this.armed.set(path, enabled); }
@@ -106,6 +110,7 @@ class FakeBridge implements MechanismUiBridge {
     return this.paths.includes(path) ? snapshot(path, 95) : null;
   }
   resetForces(): void { this.resetCalls++; }
+  linkNodes(): { path: string; node: Object3D }[] { return []; }
 }
 
 // ─── Fixture ────────────────────────────────────────────────────────────────
@@ -149,7 +154,7 @@ function makeEnv(): Env {
     rebuildGroupedBvh() {}, refitRaycastSubtrees() {},
   } as unknown as RVViewer;
 
-  const doc = AssetDocument.newUntitled(viewer);
+  const doc = scratchAssetDocument(viewer);
   setActiveAssetContext({ viewer, doc });
   return { viewer, doc, tools: new McpEditorTools(() => viewer), plugins };
 }
@@ -181,7 +186,7 @@ describe('T7 — peak, RMS and holding per channel', () => {
       const value = i % 2 === 0 ? 340 : 0;
       recorder.sample(0.1, () => [{
         ...snapshot('Mech'),
-        channels: [{ id: 'ch', label: 'Axis', kind: 'drive', unit: 'N·m', value }],
+        channels: [{ id: 'ch', label: 'Axis', kind: 'drive', unit: 'N·m', value, linkPath: null }],
       }]);
     }
     const m = recorder.metrics('ch');
@@ -198,7 +203,7 @@ describe('T7 — peak, RMS and holding per channel', () => {
     recorder.start();
     recorder.sample(0.2, () => [{
       ...snapshot('Mech'),
-      channels: [{ id: 'ch', label: 'Axis', kind: 'drive', unit: 'N·m', value: 10 }],
+      channels: [{ id: 'ch', label: 'Axis', kind: 'drive', unit: 'N·m', value: 10, linkPath: null }],
     }]);
     expect(recorder.metrics('ch').holding).toBeNull();
     recorder.setHolding('ch', -95);

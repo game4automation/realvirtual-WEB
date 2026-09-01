@@ -136,26 +136,17 @@ function setupPlugin() {
   (plugin as unknown as { viewer: MockViewer }).viewer = viewer as unknown as MockViewer;
 
   // Build the dispatcher manually — normally done in _sendDiscover(). Decorator
-  // metadata lives per-prototype, so the tools are spread over five decorated
-  // instances (the plugin plus the four delegate-object tool classes it owns).
-  // Dispatching over the plugin alone would silently lose every delegated tool.
-  // Mirrors mcp-bridge-plugin.ts::_sendDiscover — keep the list in step with it.
-  const delegates = plugin as unknown as {
-    _viewTools: object; _observeTools: object; _editorTools: object;
-    _knowledgeTools: object; _describeTool: object; _helpTool: object;
-  };
+  // metadata lives per-prototype, so the tools are spread over a dozen decorated
+  // instances; dispatching over the plugin alone would silently lose every
+  // delegated tool, and most of the tools this file exercises left the plugin
+  // with plan-713 Phase 1.
+  //
+  // This used to be a hand-copied SUBSET of `_sendDiscover`'s list, and it had
+  // drifted: `_signalBindTools` was missing, so four announced tools were
+  // undispatchable here. Reading `mcpToolInstances` makes that class of drift
+  // impossible rather than fixing this one instance of it.
   (plugin as unknown as { _dispatcher: ReturnType<typeof buildMultiDispatcher> })._dispatcher =
-    buildMultiDispatcher([
-      plugin,
-      delegates._viewTools,
-      delegates._observeTools,
-      delegates._editorTools,
-      // `_signalBindTools` is absent here, and was absent before plan-394 too —
-      // pre-existing drift, deliberately not extended to the new delegate.
-      delegates._knowledgeTools,
-      delegates._describeTool,
-      delegates._helpTool,
-    ]);
+    buildMultiDispatcher(plugin.mcpToolInstances);
 
   return { plugin, viewer };
 }
@@ -641,14 +632,33 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
    */
   type ToolKey = 'webSignalSetBool' | 'webSignalSetFloat';
 
+  /**
+   * The instance that OWNS a tool method.
+   *
+   * The signal tools sat on the plugin until plan-713 Phase 1 moved them into
+   * `McpRuntimeTools`, so patching `plugin[key]` silently patched `undefined`.
+   * Asking the announced instance list which object carries the method keeps
+   * this test indifferent to where the tools live next.
+   */
+  function ownerOf(plugin: McpBridgePlugin, key: ToolKey):
+  Record<string, (...a: unknown[]) => Promise<string>> {
+    for (const instance of plugin.mcpToolInstances) {
+      if (typeof (instance as Record<string, unknown>)[key] === 'function') {
+        return instance as Record<string, (...a: unknown[]) => Promise<string>>;
+      }
+    }
+    throw new Error(`no announced instance owns ${key}`);
+  }
+
   function nestCalls(plugin: McpBridgePlugin, outerKey: ToolKey, innerKey: ToolKey = outerKey) {
-    const target = plugin as unknown as Record<string, (...a: unknown[]) => Promise<string>>;
+    const target = ownerOf(plugin, outerKey);
+    const innerTarget = ownerOf(plugin, innerKey);
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
 
     if (outerKey === innerKey) {
       // Same tool twice: the roles are told apart by invocation order.
-      const original = target[outerKey].bind(plugin);
+      const original = target[outerKey].bind(target);
       let seen = 0;
       target[outerKey] = async (...args: unknown[]) => {
         if (++seen === 1) {
@@ -662,10 +672,10 @@ describe('McpBridgePlugin - verified effect delta (plan-707)', () => {
       return;
     }
 
-    const outer = target[outerKey].bind(plugin);
-    const inner = target[innerKey].bind(plugin);
+    const outer = target[outerKey].bind(target);
+    const inner = innerTarget[innerKey].bind(innerTarget);
     target[outerKey] = async (...args: unknown[]) => { await gate; return outer(...args); };
-    target[innerKey] = async (...args: unknown[]) => {
+    innerTarget[innerKey] = async (...args: unknown[]) => {
       const out = await inner(...args);
       release();
       return out;

@@ -142,9 +142,11 @@ describe('AssetActiveCard parity — the view', () => {
     expect(dirty.actions.menu?.find(v => v.id === 'discard')?.disabled).toBe(false);
   });
 
-  it('an untitled document offers no name to share', () => {
+  it('a document called Untitled shares under its name like any other (2026-08-19)', () => {
+    // "Untitled" is a name, not a state — no surface may treat the string
+    // specially, the share prefill included.
     const view = editorDocumentView(stubAssetContext({ name: 'Untitled' }));
-    expect(view.actions.share?.suggestedName).toBe('');
+    expect(view.actions.share?.suggestedName).toBe('Untitled');
   });
 
   it('routes a library asset back to its own path — Save, not a copy', () => {

@@ -101,7 +101,7 @@ function fakeSceneStore(identity: AssetBase, opts: { refuse?: boolean } = {}) {
 
 function makeDraft(id: string, name: string, opCount = 2): AssetDraft {
   return {
-    shell: { id, name, base: { kind: 'empty' }, createdAt: 1000 },
+    shell: { id, name, base: { kind: 'document', documentId: 'doc_scratch', path: 'scratch.glb', name: 'Scratch' }, createdAt: 1000 },
     ops: Array.from({ length: opCount }, (_, i) => ({
       id: `${id}-op${i}`, kind: 'setField', nodePath: 'Box', componentType: 'Drive',
       fieldName: 'TargetSpeed', value: i, prev: 0,
@@ -539,30 +539,19 @@ describe('open chain: the document already on screen', () => {
     expect(plan.base).toEqual(LAST_EDITED);
   });
 
-  it('does NOT silently discard a crash draft — it raises the same question', async () => {
+  it('continues the draft without asking — a reload is not a conflict', async () => {
     await seedDraft(makeDraft('doc-1', 'Unsaved work'));
     setOpenDocumentBase(ON_SCREEN);
 
     const plugin = new AssetEditorPlugin();
-    unsubDialog = autoAnswer('draft-conflict', 'continue-draft' satisfies DraftConflictChoice);
+    // No dialog answer is armed on purpose: raising one here would hang, which
+    // is exactly the regression this pins. Only an explicit "Edit asset" click
+    // may ask; the document that merely sits on screen yields to the draft.
     const plan = await resolveOpenPlan(plugin);
 
-    // The draft was chosen, so the document on screen steps aside — the point
-    // is that the choice happened at all rather than the draft vanishing.
     expect(plan.draft?.shell.name).toBe('Unsaved work');
     expect(plan.base).toBeNull();
-  });
-
-  it('shelving the draft opens the document on screen', async () => {
-    await seedDraft(makeDraft('doc-1', 'Unsaved work'));
-    setOpenDocumentBase(ON_SCREEN);
-
-    const plugin = new AssetEditorPlugin();
-    unsubDialog = autoAnswer('draft-conflict', 'open-requested' satisfies DraftConflictChoice);
-    const plan = await resolveOpenPlan(plugin);
-
-    expect(plan.base).toEqual(ON_SCREEN);
-    expect(await listShelvedDocumentDrafts()).toHaveLength(1);
+    expect(await listShelvedDocumentDrafts()).toHaveLength(0);
   });
 
   // ── plan-711 §9.8: the same chain when the document can be BOUND ──────

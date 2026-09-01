@@ -357,6 +357,12 @@ The interface system emits events on the `RVViewer` event bus:
 | `interface-error` | `{ interfaceId, error }` | Protocol or connection error |
 | `interface-data` | `{ interfaceId, signals }` | Raw data received (before buffer flush) |
 
+Document lifecycle events on the same bus:
+
+| Event | Payload | When |
+|-------|---------|------|
+| `document-saved` | `{ documentId, relPath }` | After EVERY successful document write, whatever the path. `relPath` is project-relative, and the empty string for a slot-addressed document. Subscribe to drop anything cached against a document's bytes — this is the path-agnostic replacement for reaching into a plugin and matching `library/**` (plan-719 F8). |
+
 Use the `useInterfaceStatus` React hook for UI integration:
 
 ```typescript

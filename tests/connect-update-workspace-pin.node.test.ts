@@ -168,20 +168,35 @@ describeWithPrivate('CONNECT self-update and the workspace pin (plan-343 Phase 4
     expect(existsSync(join(space.connectDir, `realvirtual-Connect-${NEW_VERSION}+12.exe`))).toBe(false);
   });
 
-  it('refuses a pin that names a mutable artifact URL', async () => {
+  it('redirects a mutable artifact URL to the immutable /versions/ copy of the same build', async () => {
+    // The contract changed with `withImmutableUrl` (get-connect afdbc5f): a pin
+    // naming a mutable file (the stable manifest advertises exactly that) is no
+    // longer refused — the URL is rebuilt from version(+build) under
+    // /download/versions/ and THAT copy is fetched. The mutable URL itself must
+    // never be requested: it is overwritten by every deploy, so its bytes could
+    // silently disagree with the pinned sha256.
     const getConnect = await loadGetConnect();
     const space = workspace(OLD_VERSION, 10, OLD_BYTES);
-    const { fetchImpl } = downloadDouble();
+    const mutableUrl = 'https://web.realvirtual.io/download/realvirtual-Connect-beta.exe';
+    const immutableUrl = 'https://web.realvirtual.io/download/versions/realvirtual-Connect-0.4.0-beta2.exe';
 
-    // Why the beta channel must publish under /download/versions/ (Phase 5): a manifest pointing at
-    // an overwritten file name would produce a pin no workspace start accepts.
+    const requested: string[] = [];
+    const fetchImpl = (async (input: unknown) => {
+      const url = String(input);
+      requested.push(url);
+      if (url !== immutableUrl) return { ok: false, status: 404 } as Response;
+      return { ok: true, status: 200, arrayBuffer: async () => Buffer.from(NEW_BYTES) } as unknown as Response;
+    }) as typeof fetch;
+
     writeFileSync(space.pinPath, JSON.stringify({
       channel: 'beta', version: '0.4.0-beta2',
-      url: 'https://web.realvirtual.io/download/realvirtual-Connect-beta.exe',
+      url: mutableUrl,
       sha256: sha256(NEW_BYTES),
     }));
 
-    await expect(getConnect({ workspaceRoot: space.root, platform: 'win-x64', fetchImpl }))
-      .rejects.toThrow(/immutable \/versions\/ URL/);
+    await getConnect({ workspaceRoot: space.root, platform: 'win-x64', fetchImpl });
+
+    expect(requested).toEqual([immutableUrl]);
+    expect(readFileSync(space.target, 'utf8')).toBe(NEW_BYTES);
   });
 });

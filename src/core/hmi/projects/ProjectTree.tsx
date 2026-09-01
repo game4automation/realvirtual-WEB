@@ -54,6 +54,7 @@ import {
   Folder,
   FolderOutlined,
   InsertDriveFileOutlined,
+  LockOutlined,
   PublicOutlined,
   SettingsOutlined,
   ViewInArOutlined,
@@ -67,6 +68,7 @@ import {
   findTreeNode,
   flattenProjectTree,
   foldersOnlyTree,
+  isRenamableInTree,
   type ProjectTreeNode,
   type ProjectTreeRow,
 } from '../../project/rv-project-tree';
@@ -219,10 +221,15 @@ const ProjectTreeRowView = memo(function ProjectTreeRowView({
   // the header's own. Kept apart from `isCatalogRoot`, which still decides the
   // row's weight, colour and verbs: this is only about the divider.
   const drawsSeam = isCatalogRoot && !(row.depth === 0 && row.posInSet === 1);
-  // A root, the System node and everything inside a read-only catalog refuse
-  // both verbs. Checked here only to decide what to RENDER — the authority is
-  // `canMoveInTree` / `canRenameInTree`, which run again before anything commits.
-  const editable = node.writable && node.kind !== 'root' && node.kind !== 'system';
+  // A root, the System node, everything inside a read-only catalog and every
+  // INERT full-view row (plan-445 F2) refuse both verbs. Checked here only to
+  // decide what to RENDER — the authority is `canMoveInTree` /
+  // `canRenameInTree`, which run again before anything commits. `inert` has to
+  // be part of it and not only part of the context menu: without it F2 still
+  // opened an inline editor on a plain file and the row was still a drag
+  // source, both of which then failed at the commit instead of never offering.
+  const editable = node.writable && !node.inert
+    && node.kind !== 'root' && node.kind !== 'system';
 
   // A top-level row sits on a band a shade darker than the panel — the project
   // and each attached library. With the seam above it and its own icon, that is
@@ -387,6 +394,19 @@ const ProjectTreeRowView = memo(function ProjectTreeRowView({
         </Tooltip>
       )}
 
+      {/* A read-only catalog says so with a padlock rather than with the word
+          "read-only": the row is 22px tall and the words crowded out the verbs
+          that used to live beside them. The tooltip carries the sentence
+          (plan-445 F6) — colour alone is never the message (DESIGN.md). */}
+      {isCatalogRoot && !node.writable && (
+        <Tooltip title={`${node.name} — read-only`} placement="top">
+          <LockOutlined
+            data-testid={`project-tree-lock-${path}`}
+            aria-label={`${node.name} — read-only`}
+            sx={{ fontSize: 12, flexShrink: 0, ml: 0.5, color: 'rgba(255,255,255,0.45)' }}
+          />
+        </Tooltip>
+      )}
       {/* The origin words ("remote · read-only") are gone — the cloud icon
           already says remote, and the row's verbs sit here instead. */}
       {isCatalogRoot && renderRootActions?.(node)}
@@ -548,8 +568,12 @@ export function ProjectTree({
       // was already in place.
       onKeyDown={(e) => {
         if (e.key !== 'F2' || renamingPath) return;
-        const node = selectedPath ? findTreeNode(roots, selectedPath) : null;
-        if (!node || !node.writable || node.kind === 'root' || node.kind === 'system') return;
+        // The keyboard route asks the model, not the row: the selection can be
+        // a CARD (a document, an inert plain file) that this tree never
+        // rendered, so a check copied off the row would not cover it.
+        if (!selectedPath || !isRenamableInTree(roots, selectedPath)) return;
+        const node = findTreeNode(roots, selectedPath);
+        if (!node) return;
         e.preventDefault();
         startRename(node);
       }}

@@ -10,7 +10,7 @@
  * Relies on LayoutStore (useSyncExternalStore) for reactive state.
  */
 
-import { useState, useCallback, useEffect, useSyncExternalStore, memo, useRef, type ReactNode } from 'react';
+import { useState, useCallback, useEffect, useMemo, useSyncExternalStore, memo, useRef, type ReactNode } from 'react';
 import {
   Box,
   Paper,
@@ -50,7 +50,7 @@ import { setPendingAssetOpen } from '@rv-private/plugins/asset-editor/pending-op
 import { libraryDocumentBase } from '../../core/editor/active-asset-store';
 import type { LayoutPlannerPlugin } from './index';
 import type { LibraryCatalogEntry, LayoutSnapshot } from './rv-layout-store';
-import { isGitHubRepoScanUrl } from './rv-layout-store';
+
 import { setLayoutDragData, suppressDragImage } from './drag-types';
 import { matchMaterialFlows } from '../../core/material-flow/registry';
 
@@ -65,11 +65,22 @@ function behaviorDescription(entry: LibraryCatalogEntry): string | null {
   return null;
 }
 import { CatalogBrowser } from './CatalogBrowser';
-import { LibrarySelector, type LibraryItem } from './LibrarySelector';
+import { LibrarySelector, type LibraryItem, type LibraryKind } from './LibrarySelector';
+import {
+  listLibrarySources,
+  subscribeLibrarySources,
+  getLibrarySourcesSnapshot,
+  type LibrarySource,
+  type RegisteredLibrarySource,
+} from '../../core/library/library-source-registry';
+import { PROJECT_LIBRARY_PROVIDER_ID } from '../../core/library/project-library-provider';
+import { GLOBAL_LIBRARY_PROVIDER_ID } from '../../core/library/global-library-provider';
+import { crossSourceKeyOf } from '../../core/hmi/projects/assets-library-groups';
+import { PROJECT_PLACEMENT_PREFIX } from './planner-persistence';
 import { deriveChips, filterByChip } from '../../core/library/library-chips';
 import { AssetCard } from '../../core/library/AssetCard';
 import { openProjectsDashboard } from '../../core/hmi/projects/projects-dashboard-store';
-import { buildThumbnailKey } from '../../core/thumbnails/thumbnail-key';
+import { plannerThumbnailKey } from './planner-thumbnail-key';
 import { useThumbnailVisibility } from '../../core/thumbnails/use-thumbnail-visibility';
 import { getProjectStore } from '../../core/project/project-store';
 // Lives in its own module so the lazy-loading host (LayoutLibraryPanelHost) can
@@ -107,6 +118,202 @@ function prefetchableUrl(entry: LibraryCatalogEntry): string | null {
   return url ? url : null;
 }
 
+/** Warm one card's geometry. A registry entry has no URL to key on, so the
+ *  plugin warms it under its stable key instead (plan-723). */
+function warmEntry(plugin: LayoutPlannerPlugin, entry: LibraryCatalogEntry): void {
+  const url = prefetchableUrl(entry);
+  if (url) { plugin.modelCache.prefetch(url); return; }
+  if (entry.virtual === true || entry.splatUrl) return;
+  plugin.prefetchEntry(entry);
+}
+
+// ─── Tab construction (plan-723 §2.3) ───────────────────────────────────
+//
+// Pure and exported on purpose: the panel has no mount precedent in the suite,
+// and the interesting rules — project first, provider filter, dedup, the
+// persistence read/write split — are all decisions about a LIST, not about a
+// rendered tree. Testing them through a React mount would test MUI.
+
+/** Provider id of the private Asset-Manager bridge. Rendered from `cloudStore`
+ *  instead, so it is filtered OUT of the registry feed — otherwise every AM
+ *  connection would appear twice. Symmetrical to the dashboard, which filters
+ *  the project provider out of its catalog roots. */
+const CLOUD_PROVIDER_ID = 'unity-asset-manager';
+
+const AM_TAB_PREFIX = 'am:';
+const GLOBAL_TAB_PREFIX = `${GLOBAL_LIBRARY_PROVIDER_ID}:`;
+
+/** Panel-local record of the picked library. The store's own `activeTabUrl`
+ *  can only hold a catalog URL, so it cannot express "the project" or "an AM
+ *  connection" — but it stays the SSOT for catalog picks (plan-723 §2.4). */
+export const LS_KEY_PLANNER_ACTIVE_LIBRARY = 'rv-planner-active-library';
+
+export interface LibraryTab {
+  /** `'<providerId>:<sourceId>'` for a registry tab, `'am:<connId>'` for cloud. */
+  id: string;
+  kind: LibraryKind;
+  label: string;
+  /** Registry provenance. Absent on `am:` tabs, which have no registry source. */
+  providerId?: string;
+  sourceId?: string;
+  error?: string | null;
+  loaded?: boolean;
+  cloudStatus?: LibraryItem['cloudStatus'];
+}
+
+/** The half of an AM connection state this module reads. */
+export interface AmConnectionLike {
+  conn: { id: string; label: string };
+  connected: boolean;
+  connecting: boolean;
+}
+
+/** One broken provider must not blank the whole panel (plan-702 §5.1 R4). */
+function safeListEntries(source: LibrarySource): LibraryCatalogEntry[] {
+  try { return source.listEntries(); } catch { return []; }
+}
+
+export function registryTabId(providerId: string, sourceId: string): string {
+  return `${providerId}:${sourceId}`;
+}
+
+/**
+ * Canonical keys of everything the project already offers — or `null` when
+ * there is no project, or its listing has not landed yet (F6).
+ *
+ * `null` means "do not dedup, do not hide anything". That is the whole reason
+ * the loaded-gate exists: deduplicating against a half-filled project source
+ * would make catalog cards blink out and back in during the async load.
+ */
+export function projectDedupKeys(sources: readonly RegisteredLibrarySource[]): Set<string> | null {
+  const projectSources = sources.filter(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID);
+  if (projectSources.length === 0) return null;
+  if (!projectSources.every(s => s.source.loaded)) return null;
+
+  const keys = new Set<string>();
+  for (const { source } of projectSources) {
+    for (const entry of safeListEntries(source)) {
+      const key = crossSourceKeyOf(entry);
+      if (key !== null) keys.add(key);
+    }
+  }
+  return keys;
+}
+
+/**
+ * The entries a tab shows: everything the source lists, minus what the project
+ * already offers under the same canonical key ("project wins", F6).
+ *
+ * Entries without a `library/` segment have no cross-source identity and are
+ * never deduplicated — a coincidental name match between two genuinely
+ * different libraries must not hide a card.
+ */
+export function dedupedEntries(
+  registered: RegisteredLibrarySource,
+  dedupKeys: Set<string> | null,
+): LibraryCatalogEntry[] {
+  const entries = safeListEntries(registered.source);
+  if (dedupKeys === null || registered.providerId === PROJECT_LIBRARY_PROVIDER_ID) return entries;
+  return entries.filter(entry => {
+    const key = crossSourceKeyOf(entry);
+    return key === null || !dedupKeys.has(key);
+  });
+}
+
+/**
+ * The library dropdown, in display order: the active project first, then the
+ * subscribed catalogs, then the Asset-Manager connections (F1).
+ *
+ * A catalog tab whose every entry was deduplicated away disappears entirely —
+ * an empty tab is worse than no tab. A tab that is merely still LOADING has no
+ * entries either and must stay, which is why the rule tests `loaded` and the
+ * pre-dedup count before it hides anything.
+ */
+export function buildLibraryTabs(
+  sources: readonly RegisteredLibrarySource[],
+  amConnections: readonly AmConnectionLike[],
+): LibraryTab[] {
+  const dedupKeys = projectDedupKeys(sources);
+  const registry = sources.filter(s => s.providerId !== CLOUD_PROVIDER_ID);
+  const ordered = [
+    ...registry.filter(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID),
+    ...registry.filter(s => s.providerId !== PROJECT_LIBRARY_PROVIDER_ID),
+  ];
+
+  const tabs: LibraryTab[] = [];
+  for (const registered of ordered) {
+    const { providerId, source } = registered;
+    if (providerId !== PROJECT_LIBRARY_PROVIDER_ID && dedupKeys !== null && source.loaded) {
+      const raw = safeListEntries(source);
+      if (raw.length > 0 && dedupedEntries(registered, dedupKeys).length === 0) continue;
+    }
+    tabs.push({
+      id: registryTabId(providerId, source.id),
+      kind: source.kind,
+      label: source.label,
+      providerId,
+      sourceId: source.id,
+      error: source.error ?? null,
+      loaded: source.loaded,
+    });
+  }
+
+  for (const cs of amConnections) {
+    tabs.push({
+      id: AM_TAB_PREFIX + cs.conn.id,
+      kind: 'cloud',
+      label: cs.conn.label,
+      loaded: true,
+      cloudStatus: cs.connected ? 'connected' : cs.connecting ? 'connecting' : 'error',
+    });
+  }
+
+  return tabs;
+}
+
+/**
+ * Bring a persisted selection into the tab-id namespace.
+ *
+ * Two records exist and the panel key wins: it can express every tab, the
+ * store's legacy `activeTabUrl` only a catalog URL. A legacy value is a bare
+ * URL, so it is re-prefixed; an unrecognisable one simply fails to match a tab
+ * and falls through to the default (best-effort migration, never a throw).
+ */
+export function normalizePersistedTab(
+  panelValue: string | null,
+  legacyActiveTabUrl: string | null | undefined,
+): string | null {
+  if (panelValue) return panelValue;
+  if (!legacyActiveTabUrl) return null;
+  const alreadyPrefixed =
+    legacyActiveTabUrl.startsWith(GLOBAL_TAB_PREFIX) ||
+    legacyActiveTabUrl.startsWith(PROJECT_PLACEMENT_PREFIX) ||
+    legacyActiveTabUrl.startsWith(AM_TAB_PREFIX);
+  return alreadyPrefixed ? legacyActiveTabUrl : GLOBAL_TAB_PREFIX + legacyActiveTabUrl;
+}
+
+/**
+ * The active tab: the persisted pick when it still exists, otherwise the first
+ * tab — which is the project whenever there is one (F2).
+ */
+export function resolveDefaultTab(tabs: readonly LibraryTab[], persisted: string | null): string | null {
+  if (persisted && tabs.some(t => t.id === persisted)) return persisted;
+  return tabs[0]?.id ?? null;
+}
+
+/**
+ * The catalog URL a selection should write into the LibraryStore, or `null`
+ * when the tab is not store-backed.
+ *
+ * The `null` case is the bypass: `LibraryStore.setActiveTab` silently ignores
+ * anything that is not a known catalog URL, so a project or AM tab handed to it
+ * would leave the store pointing at the PREVIOUS catalog — a selection that
+ * looks persisted and is not.
+ */
+export function storeTabUrlOf(tabId: string): string | null {
+  return tabId.startsWith(GLOBAL_TAB_PREFIX) ? tabId.slice(GLOBAL_TAB_PREFIX.length) : null;
+}
+
 // ─── Panel Component ────────────────────────────────────────────────────
 
 // Stable fallback for the cloud store's useSyncExternalStore snapshot. Must be
@@ -142,8 +349,24 @@ export function LayoutLibraryPanel() {
     cloudStore?.getSnapshot ?? (() => EMPTY_CLOUD_SNAPSHOT),
   );
 
-  // Active tab: either a catalog URL or "am:<connectionId>"
-  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  // The registry is the listing feed for the project and every subscribed
+  // catalog (plan-723 §2.1). Read through the VERSION COUNTER, never through a
+  // freshly built object — see the note on `getLibrarySourcesSnapshot`.
+  const registryVersion = useSyncExternalStore(subscribeLibrarySources, getLibrarySourcesSnapshot);
+  const registrySources = useMemo(() => listLibrarySources(), [registryVersion]);
+  const dedupKeys = useMemo(() => projectDedupKeys(registrySources), [registrySources]);
+  const amConnections = cloudSnapshot.connections;
+  const tabs = useMemo(
+    () => buildLibraryTabs(registrySources, amConnections),
+    [registrySources, amConnections],
+  );
+
+  // Active tab: a registry tab id ("<provider>:<source>") or "am:<connectionId>".
+  // Seeded from the panel key so the first paint after a reload already shows
+  // the library the user last picked, rather than flashing the default.
+  const [activeTabId, setActiveTabId] = useState<string | null>(() => {
+    try { return localStorage.getItem(LS_KEY_PLANNER_ACTIVE_LIBRARY); } catch { return null; }
+  });
 
   const [searchText, setSearchText] = useState('');
   // Save / Load / Clear dialogs were removed when those actions migrated
@@ -173,7 +396,13 @@ export function LayoutLibraryPanel() {
   const switchToLibrary = useCallback((id: string) => {
     setActiveTabId(id);
     setSelectedChip(null);
-    if (!id.startsWith('am:')) store?.setActiveTab(id);
+    // Panel key first — it is the only record that can express every tab kind.
+    try { localStorage.setItem(LS_KEY_PLANNER_ACTIVE_LIBRARY, id); } catch { /* ignore */ }
+    // Store second, and ONLY for a store-backed catalog: handing it a project
+    // or AM id would be silently dropped and leave the store pointing at the
+    // previously picked catalog (plan-723 §2.4).
+    const storeUrl = storeTabUrlOf(id);
+    if (storeUrl !== null) store?.setActiveTab(storeUrl);
   }, [store]);
 
   /**
@@ -201,30 +430,24 @@ export function LayoutLibraryPanel() {
     return null;
   }
 
-  // Build unified tab list: [catalog URLs...] + [AM connections...]
-  const visibleCatalogUrls = snapshot.catalogUrls.filter(u => u !== 'bundled://unity-cloud');
-  const amConnections = cloudSnapshot.connections;
+  // Resolve the active tab: panel key → legacy store selection (re-prefixed) →
+  // the first tab, which is the project whenever there is one (F2).
+  const resolvedActiveTabId = resolveDefaultTab(
+    tabs,
+    normalizePersistedTab(activeTabId, snapshot.activeTabUrl),
+  );
+  const activeTab = tabs.find(t => t.id === resolvedActiveTabId) ?? null;
+  const isAmTab = resolvedActiveTabId?.startsWith(AM_TAB_PREFIX) ?? false;
 
-  // All tab IDs in order
-  const allTabIds: string[] = [
-    ...visibleCatalogUrls,
-    ...amConnections.map(c => `am:${c.conn.id}`),
-  ];
-
-  // Resolve active tab
-  const resolvedActiveTabId = activeTabId && allTabIds.includes(activeTabId)
-    ? activeTabId
-    : (snapshot.activeTabUrl && visibleCatalogUrls.includes(snapshot.activeTabUrl))
-      ? snapshot.activeTabUrl
-      : allTabIds[0] ?? null;
-  const isAmTab = resolvedActiveTabId?.startsWith('am:') ?? false;
-
-  // Active (non-AM) catalog + the shared chip/filter pipeline. Every public
-  // tab — remote URL, GitHub scan — now runs through the same CatalogBrowser
-  // shell driven by these values.
-  const activeError = resolvedActiveTabId ? snapshot.catalogErrors.get(resolvedActiveTabId) : null;
-  const activeCatalog = !isAmTab && resolvedActiveTabId ? snapshot.catalogs.get(resolvedActiveTabId) : null;
-  const fullEntries = activeCatalog?.entries ?? [];
+  // Active (non-AM) source + the shared chip/filter pipeline. Every public
+  // tab — the project, a remote URL, a GitHub scan — now runs through the same
+  // CatalogBrowser shell driven by these values.
+  const activeSource = activeTab && !isAmTab
+    ? registrySources.find(s =>
+        s.providerId === activeTab.providerId && s.source.id === activeTab.sourceId) ?? null
+    : null;
+  const activeError = activeTab?.error ?? null;
+  const fullEntries = activeSource ? dedupedEntries(activeSource, dedupKeys) : [];
   // Chips/counts use the UNFILTERED entries so totals stay stable while the
   // user types in the search field (matching the prior Local/Cloud UX).
   const chips = deriveChips(fullEntries);
@@ -240,27 +463,15 @@ export function LayoutLibraryPanel() {
     : fullEntries;
   const displayedEntries = filterByChip(searchedEntries, selectedChip);
 
-  // Library dropdown items — catalog URLs (url / github) + Asset
-  // Manager connections, each carrying the kind/status the selector needs to
-  // render its icon and per-row remove/refresh actions.
-  const libraryItems: LibraryItem[] = [
-    ...visibleCatalogUrls.map((url): LibraryItem => {
-      const catalog = snapshot.catalogs.get(url);
-      const err = snapshot.catalogErrors.get(url);
-      return {
-        id: url,
-        label: catalog?.name ?? (err ? 'Error' : 'Loading…'),
-        kind: isGitHubRepoScanUrl(url) ? 'github' : 'url',
-        error: !!err,
-      };
-    }),
-    ...amConnections.map((cs): LibraryItem => ({
-      id: `am:${cs.conn.id}`,
-      label: cs.conn.label,
-      kind: 'cloud',
-      cloudStatus: cs.connected ? 'connected' : cs.connecting ? 'connecting' : 'error',
-    })),
-  ];
+  // Library dropdown items — one per tab, carrying the kind/status the selector
+  // needs to render its icon.
+  const libraryItems: LibraryItem[] = tabs.map((tab): LibraryItem => ({
+    id: tab.id,
+    label: tab.label,
+    kind: tab.kind,
+    ...(tab.cloudStatus ? { cloudStatus: tab.cloudStatus } : {}),
+    error: !!tab.error,
+  }));
 
   const handleSelectLibrary = (id: string): void => {
     switchToLibrary(id);
@@ -273,7 +484,7 @@ export function LayoutLibraryPanel() {
   // Resolve the single "empty" state shown instead of the card grid (null =>
   // render the grid). Order: no libraries → load error → no results.
   let emptyContent: ReactNode = null;
-  if (allTabIds.length === 0) {
+  if (tabs.length === 0) {
     emptyContent = (
       <Box sx={{ p: 2, textAlign: 'center' }}>
         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
@@ -291,10 +502,13 @@ export function LayoutLibraryPanel() {
     );
   } else if (displayedEntries.length === 0) {
     const filtering = searchText.trim() !== '' || selectedChip !== null;
+    // A source that has not published its listing yet is LOADING, not empty —
+    // the distinction is what keeps a slow project from reading as a broken one.
+    const loading = activeTab?.loaded === false;
     emptyContent = (
       <Box sx={{ p: 2, textAlign: 'center' }}>
         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-          {filtering ? 'No matching components' : 'Loading...'}
+          {filtering ? 'No matching components' : loading ? 'Loading…' : 'No components'}
         </Typography>
       </Box>
     );
@@ -556,22 +770,25 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
     prefetchTimer.current = null;
   }, []);
 
+  // Virtual/DES and splat entries never take the placeholder path, so warming
+  // them buys nothing — and a registry entry has no URL to test, which is why
+  // the gate is on the entry KIND rather than on `prefetchableUrl` (plan-723).
+  const warmable = entry.virtual !== true && !entry.splatUrl;
+
   const startPrefetchIntent = useCallback(() => {
-    const url = prefetchableUrl(entry);
-    if (!url) return;
+    if (!warmable) return;
     cancelPrefetchIntent();
     prefetchTimer.current = setTimeout(() => {
       prefetchTimer.current = null;
-      plugin.modelCache.prefetch(url);
+      warmEntry(plugin, entry);
     }, PREFETCH_INTENT_MS);
-  }, [entry, plugin, cancelPrefetchIntent]);
+  }, [entry, plugin, warmable, cancelPrefetchIntent]);
 
   const prefetchNow = useCallback(() => {
-    const url = prefetchableUrl(entry);
-    if (!url) return;
+    if (!warmable) return;
     cancelPrefetchIntent();
-    plugin.modelCache.prefetch(url);
-  }, [entry, plugin, cancelPrefetchIntent]);
+    warmEntry(plugin, entry);
+  }, [entry, plugin, warmable, cancelPrefetchIntent]);
 
   useEffect(() => cancelPrefetchIntent, [cancelPrefetchIntent]);
 
@@ -580,7 +797,12 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
   // enters the prefetch band and withdraws the request when it leaves. The
   // service de-duplicates by key, so re-entering the viewport is free.
   const { ref: cardRef, visible } = useThumbnailVisibility<HTMLDivElement>();
-  const needsPreview = !entry.thumbnailUrl && !entry.virtual && !!entry.glbUrl;
+  // A project document has no `glbUrl` and its picture is written by the SAVE
+  // path, not here — but until one exists the card may still render an
+  // in-memory preview through the resolve path (plan-723 F9).
+  const isProjectEntry = entry.id.startsWith(PROJECT_PLACEMENT_PREFIX);
+  const needsPreview = !entry.thumbnailUrl && !entry.virtual && !entry.splatUrl
+    && (!!entry.glbUrl || isProjectEntry);
 
   useEffect(() => {
     if (!needsPreview || !viewer) return;
@@ -590,23 +812,14 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
     // better outcome than a broken library panel.
     const service = viewer.thumbnails;
     if (!service?.isAvailable) return;  // WebGPU / unavailable — manual button remains
-    const glbUrl = entry.glbUrl!;
-    const key = buildThumbnailKey({
-      projectId: getProjectStore().getProject()?.id ?? '',
-      providerId: 'layout-planner',
-      // Entry ids are unique across the planner's catalogs, which is what the
-      // previous glbUrl-wide lookup already relied on. Phase 10 replaces this
-      // with the real (providerId, sourceId) pair from the source registry.
-      sourceId: 'catalogs',
-      assetId: entry.id,
-    });
+    const key = plannerThumbnailKey(entry.id);
 
     let cancelled = false;
     if (!visible) { service.cancel(key); return; }
 
     plugin.store.setThumbnailPending(entry.id, true);
     void service
-      .enqueue(key, () => plugin.modelCache.getOrLoad(glbUrl), 1)
+      .enqueue(key, () => plugin.loadEntryModel(entry), 1)
       .then((blob) => {
         if (cancelled || !blob) return;
         plugin.store.setEntryThumbnail(entry.id, URL.createObjectURL(blob));
@@ -616,7 +829,7 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
       });
 
     return () => { cancelled = true; };
-  }, [visible, needsPreview, viewer, plugin, entry.id, entry.glbUrl]);
+  }, [visible, needsPreview, viewer, plugin, entry]);
 
   // Preview generation state — kept local because it only matters for the
   // single card showing the camera button. Multiple cards can generate in
@@ -735,7 +948,12 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
       onMouseEnter={() => { setHovered(true); startPrefetchIntent(); }}
       onMouseLeave={() => { setHovered(false); cancelPrefetchIntent(); }}
       onPointerDown={prefetchNow}
-      placeholderAction={
+      // No manual "Generate preview" for a project document: its thumbnail is
+      // written by the SAVE path (`doc.thumbnail`), and this button's only
+      // persistence route is the dev-server catalog middleware, which would
+      // never reach the project (plan-723 F9). The automatic in-memory preview
+      // above still fills the card.
+      placeholderAction={isProjectEntry ? undefined : (
         <Tooltip
           title={
             (generating || isPending) ? 'Generating preview…'
@@ -764,7 +982,7 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
             </IconButton>
           </Box>
         </Tooltip>
-      }
+      )}
     />
     <Menu
       open={ctxPos !== null}
@@ -772,18 +990,21 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
       anchorReference="anchorPosition"
       anchorPosition={ctxPos ? { top: ctxPos.y, left: ctxPos.x } : undefined}
     >
-      <MenuItem
-        onClick={handleCtxUpdate}
-        disabled={generating || !entry.glbUrl}
-        sx={{ fontSize: 12 }}
-      >
-        <CameraAlt sx={{ fontSize: 14, mr: 1 }} />
-        {entry.thumbnailUrl ? 'Update Preview' : 'Generate Preview'}
-      </MenuItem>
+      {!isProjectEntry && (
+        <MenuItem
+          onClick={handleCtxUpdate}
+          disabled={generating || !entry.glbUrl}
+          sx={{ fontSize: 12 }}
+        >
+          <CameraAlt sx={{ fontSize: 14, mr: 1 }} />
+          {entry.thumbnailUrl ? 'Update Preview' : 'Generate Preview'}
+        </MenuItem>
+      )}
       {/* Local work-folder GLBs can be opened in the asset editor. Saving
           always lands in library/Custom/, regardless of where the source
-          asset lives. */}
-      {entry.localPath && entry.glbUrl && !entry.splatUrl && !entry.localPath.startsWith('splats/') && (
+          asset lives. A project document has no `glbUrl` and is opened by its
+          own path — hence the `isProjectEntry` arm (plan-723). */}
+      {entry.localPath && (entry.glbUrl || isProjectEntry) && !entry.splatUrl && !entry.localPath.startsWith('splats/') && (
         <MenuItem
           onClick={() => {
             setCtxPos(null);

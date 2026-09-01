@@ -24,6 +24,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -121,7 +122,7 @@ describe('mutators construct RvOp — nothing converts at the boundary', () => {
 
   it('an asset edit lands in the document with the asset lineage intact', async () => {
     const { viewer, boxPath } = makeViewer();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     doc.transformNode(
       boxPath,

@@ -33,6 +33,12 @@ const PRIVATE_DEPENDENT_TESTS: string[] = HAS_PRIVATE
   : JSON.parse(readFileSync(resolve(__dirname, 'tests/private-dependent-tests.json'), 'utf8'));
 
 export default defineConfig({
+  // Same build-time flag vite.config.ts defines for the app bundle: node tests
+  // that (transitively) import rv-model-plugin-manager need it resolved too.
+  define: {
+    __RV_HAS_PRIVATE__: JSON.stringify(HAS_PRIVATE),
+    __RV_EMBED__: 'false',
+  },
   resolve: {
     alias: {
       '@rv': resolve(__dirname, 'src'),

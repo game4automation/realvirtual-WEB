@@ -12,6 +12,7 @@
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import {
   BufferAttribute,
   BufferGeometry,
@@ -149,7 +150,7 @@ describe('9.16 hierarchy right-click without a selection', () => {
   it('acts on the CLICKED row, not on the current selection', async () => {
     const harness = makeHarness();
     const { viewer, registry, assembly } = harness;
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     setActiveAssetContext({ viewer, doc });
 
     const item = buildMergeMenuItem(viewer);
@@ -186,7 +187,7 @@ describe('9.16 hierarchy right-click without a selection', () => {
   it('reports an ineligible subtree in the dialog and creates no op', async () => {
     const harness = makeHarness();
     const { viewer, registry } = harness;
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     setActiveAssetContext({ viewer, doc });
 
     const decoy = registry.getNode('Asset/Decoy')!; // one mesh only
@@ -209,7 +210,7 @@ describe('9.16 hierarchy right-click without a selection', () => {
   it('cancel leaves the tree untouched', async () => {
     const harness = makeHarness();
     const { viewer, registry, assembly } = harness;
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     setActiveAssetContext({ viewer, doc });
 
     const item = buildMergeMenuItem(viewer);

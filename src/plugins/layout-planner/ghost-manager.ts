@@ -17,12 +17,16 @@ import { Group, Object3D, BoxGeometry, EdgesGeometry, LineSegments, LineBasicMat
 import type { ModelCache } from './model-cache';
 import type { LibraryCatalogEntry } from './rv-layout-store';
 
+/** Turns one catalog entry into geometry — see the {@link GhostManager} ctor. */
+export type EntryLoader = (entry: LibraryCatalogEntry) => Promise<Object3D>;
+
 export class GhostManager {
   private _ghost: Object3D | null = null;
   private _entryId: string | null = null;
   private _loading = false;
   private _readyPromise: Promise<void> | null = null;
   private _modelCache: ModelCache;
+  private _loadEntry: EntryLoader;
 
   /**
    * Optional callback invoked whenever the built node is replaced or adopted.
@@ -30,8 +34,16 @@ export class GhostManager {
    */
   onGhostStateChange: (() => void) | null = null;
 
-  constructor(modelCache: ModelCache) {
+  /**
+   * `loadEntry` is the planner's `_loadEntryModel` (plan-723 F4): the ONE door
+   * that knows how to turn any catalog entry — URL-backed or library-registry
+   * — into geometry. Injected rather than imported so this module keeps its
+   * single dependency on the cache; the default preserves the pre-723 behaviour
+   * for the standalone construction path.
+   */
+  constructor(modelCache: ModelCache, loadEntry?: EntryLoader) {
     this._modelCache = modelCache;
+    this._loadEntry = loadEntry ?? ((entry) => this._modelCache.getOrLoad(entry.glbUrl ?? ''));
   }
 
   /** Whether a preview is currently visible. */
@@ -89,7 +101,7 @@ export class GhostManager {
         // preview is byte-identical to the committed object.
         node = await buildVirtualNode(entry);
       } else {
-        const clone = await this._modelCache.getOrLoad(entry.glbUrl ?? '');
+        const clone = await this._loadEntry(entry);
         // The user may have switched entries while the GLB was decoding.
         if (this._entryId !== entry.id) return;
         node = clone;

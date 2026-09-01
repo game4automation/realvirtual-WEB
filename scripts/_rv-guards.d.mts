@@ -46,6 +46,8 @@ export function projectKindOf(projectsDir: string, name: string): ProjectKind | 
 export function knownProjectKeys(privateRoot: string, options?: { kind?: ProjectKind }): string[];
 
 export const CUSTOMER_OWNED_FOLDERS: readonly string[];
+export const DEFAULT_MANAGED_ZONES: readonly string[];
+export const CONNECT_CONFIG_HANDOVER_GLOBS: readonly string[];
 export const DEFAULT_VENDOR_BLOCK: { readonly managed: readonly string[]; readonly handover: readonly string[] };
 export function vendorGlobProblems(vendor: unknown): string[];
 export function assertVendorGlobs(vendor: unknown, label?: string): void;

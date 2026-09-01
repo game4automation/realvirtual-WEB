@@ -20,6 +20,8 @@ import type { UISlotEntry, UISlotProps } from '../../core/rv-ui-plugin';
 import type { ModeId } from '../../core/rv-mode-manager';
 import type { LayoutPlannerPlugin } from '../layout-planner';
 import { SnapPointRegistry } from '../../core/engine/rv-snap-point-registry';
+import { PathSnapSource, PATH_SNAP_ID_PREFIX } from './path-snap-source';
+import { flowsCompatible, type SnapFlow } from './snap-name-parser';
 import { SnapPointController } from './snap-point-controller';
 import { SnapMarkerRenderer } from './snap-marker-renderer';
 import { SnapPlacementService } from './snap-placement-service';
@@ -28,7 +30,7 @@ import { SnapChainPreview } from './snap-chain-preview';
 import { scanAndRegisterSnaps } from './snap-scanner';
 import { snapHoverStore } from './snap-hover-store';
 import { snapToolbarStore } from './snap-toolbar-store';
-import type { Object3D } from 'three';
+import { Vector3, type Object3D } from 'three';
 import {
   _subscribe as subscribeUiContext,
   isContextActive,
@@ -68,6 +70,10 @@ export class SnapPointPlugin implements RVViewerPlugin {
   ];
 
   private registry: SnapPointRegistry | null = null;
+  /** DES/AGV path ends as data-bound snappoints (plan-447 F2). */
+  private pathSnaps: PathSnapSource | null = null;
+  /** Unregisters the station-snap candidate source from the path visualizer (F4). */
+  private unsubscribePathCandidates: (() => void) | null = null;
   private controller: SnapPointController | null = null;
   private markerRenderer: SnapMarkerRenderer | null = null;
   private placement: SnapPlacementService | null = null;
@@ -95,6 +101,11 @@ export class SnapPointPlugin implements RVViewerPlugin {
     this.placement = new SnapPlacementService(viewer, this.registry);
     this.magnetic = new SnapMagneticController(this.registry);
     this.chainPreview = new SnapChainPreview(viewer, this.registry);
+    // Path ends (rv_extras.Path) join the SAME registry as GLB-authored snaps.
+    // The source subscribes to the path network's change channel itself, so a
+    // planner drag re-registers them without anyone here knowing (plan-447).
+    this.pathSnaps = new PathSnapSource(this.registry);
+    this.wirePathDragCandidates(viewer);
 
     // Drag-time magnetic snap: the layout-planner emits the lifecycle on
     // the viewer's event bus. We listen here so the planner doesn't have to
@@ -240,12 +251,17 @@ export class SnapPointPlugin implements RVViewerPlugin {
 
     // Scan the new model root
     scanAndRegisterSnaps(result.root, this.registry, result.root);
+    // Path ends of the freshly loaded model (registry.clear() above dropped the
+    // previous ones, so the source must re-derive its bookkeeping too).
+    this.pathSnaps?.clear();
+    this.pathSnaps?.syncAll();
 
     // Recreate marker mesh sized to the new snap count
     this.markerRenderer.rebuild(this.registry.size);
   }
 
   onModelCleared?(): void {
+    this.pathSnaps?.clear();
     this.registry?.clear();
     snapHoverStore.reset();
     this.markerRenderer?.rebuild(0);
@@ -284,9 +300,58 @@ export class SnapPointPlugin implements RVViewerPlugin {
     this.placement = null;
     this.magnetic?.cancel();
     this.magnetic = null;
+    this.pathSnaps?.dispose();
+    this.pathSnaps = null;
+    this.unsubscribePathCandidates?.();
+    this.unsubscribePathCandidates = null;
     this.registry?.clear();
     this.registry = null;
     snapHoverStore.reset();
+  }
+
+  /**
+   * Feed STATION snappoints into the path-endpoint rastung of the path
+   * visualizer (plan-447 F4). The visualizer knows the free ends of every path
+   * by itself; everything else lives in this registry, which core must not
+   * import — so we push a candidate source into its tiny registry instead.
+   * Looked up by plugin id with a structural type (same shape as the `fpv`
+   * lookup in rv-viewer.ts): neither plugin imports the other's module.
+   *
+   * Path-end snaps are skipped here — the visualizer enumerates those itself
+   * and must keep excluding the end currently being dragged.
+   */
+  private wirePathDragCandidates(viewer: RVViewer): void {
+    // Defensive: several suites hand `init()` a hand-rolled viewer stub that
+    // carries only what the snap plugin used to touch. A missing optional
+    // wiring seam must not take the whole plugin down.
+    if (typeof viewer.getPlugin !== 'function') return;
+    const viz = viewer.getPlugin<{
+      id: string;
+      addSnapCandidateSource(
+        source: (q: { pathId: string; handleId: string }) => readonly {
+          id: string;
+          position: [number, number, number];
+        }[],
+      ): () => void;
+    }>('path-visualizer');
+    if (!viz?.addSnapCandidateSource) return;
+    const world = new Vector3();
+    this.unsubscribePathCandidates = viz.addSnapCandidateSource((q) => {
+      const registry = this.registry;
+      if (!registry) return [];
+      // A path START consumes (flow 'in'), a path END emits ('out') — handle
+      // `v0` is the start, the other free vertex is the end.
+      const draggedFlow: SnapFlow = q.handleId === 'v0' ? 'in' : 'out';
+      const out: { id: string; position: [number, number, number] }[] = [];
+      for (const sp of registry.getAll()) {
+        if (sp.id.startsWith(`${PATH_SNAP_ID_PREFIX}:`)) continue;
+        if (sp.occupied) continue;
+        if (!flowsCompatible(draggedFlow, sp.flow)) continue;
+        sp.object3D.getWorldPosition(world);
+        out.push({ id: sp.id, position: [world.x, world.y, world.z] });
+      }
+      return out;
+    });
   }
 
   // Public accessors for other modules (scene-mutations, picker)

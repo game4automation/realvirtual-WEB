@@ -25,6 +25,31 @@
  * writes into a fresh KinematicsSpec, deep-merged into `userData.realvirtual`
  * via `applyKinematicsSpec`. All hooks/subscriptions are tracked per-bind and
  * auto-disposed on `model-cleared` (or `disposeObject` on removal).
+ *
+ * ── Payload discovery (plan-455) ────────────────────────────────────────────
+ *
+ * Name matching alone cannot see a component that lives INSIDE a scene: the
+ * `AGV_1/2/3` of a saved layout carry a complete `rv_extras.Agv` config, are not
+ * placements, and match no filename — so nothing ever bound them and nothing
+ * drove. A third dispatch step therefore walks the loaded scene and binds every
+ * node whose `userData.realvirtual` carries a registered material-flow type,
+ * AT that node (`dispatchExtrasIn`). This is the same dual discovery the DES
+ * scene binding has used since Plan 194 §2.6, now shared out of
+ * `material-flow/registry.ts` so both kernels resolve identically.
+ *
+ * Two identities are tracked per bind, and they are NOT the same key:
+ *   - **bind identity** `(node.uuid, type)` — the de-dupe. A node that matches
+ *     by glob AND by payload binds exactly once per type.
+ *   - **owner identity** — the nearest enclosing LayoutObject's placement key,
+ *     or (no such ancestor) the scene lifecycle. This is what `disposeObject`
+ *     removes by, so removing a placement also tears down the payload binds of
+ *     its INNER nodes instead of leaving them ticking.
+ *
+ * Precedence: payload wins over the scene-root FILENAME glob for the same type
+ * (`bindForRoot`'s `suppressTypes`). The filename glob exists for geometry-only
+ * standalone assets; once a scene ships explicit payloads for a type, the
+ * filename is a spent signal and would only add a ghost instance. Placement
+ * globs are untouched.
  */
 
 import { Object3D } from 'three';
@@ -43,6 +68,10 @@ import { NodeRegistry } from './engine/rv-node-registry';
 // Glob matcher lives in its own dependency-free module (cycle break — see the
 // re-export note below). Imported here for this module's own internal use.
 import { matchesAny, extractGlbName } from './glob-match';
+// Payload discovery (plan-455). Safe direction: registry.ts reaches the glob
+// matcher through `glob-match.ts` and never imports THIS module, so the eager
+// behavior glob above stays out of its initialisation order.
+import { extrasMaterialFlowTypes, isEngineOwnedFlowType } from './material-flow/registry';
 
 /** Name of the synthetic, render-free container that holds materialised
  *  behavior-signal nodes under a bind root — mirrors the GLB `Signals` group. */
@@ -60,6 +89,21 @@ export interface Behavior {
    *   - wildcard:       `'*'` (applies to every loaded model)
    */
   models: string[];
+
+  /**
+   * The material-flow `type` this behavior is the continuous adapter for —
+   * stamped by `defineLibraryComponent` / `toBehavior`, absent on hand-written
+   * behaviors.
+   *
+   * The registry stores `MaterialFlowDefinition`s and holds NO reference to the
+   * executable adapter built around them, so a payload hit (`rv_extras.Agv`)
+   * yields a type with no way back to the thing that can bind it. Carrying the
+   * type on the adapter closes that gap: `BehaviorManager.register` indexes by
+   * it, and the payload dispatch binds the very same adapter the glob path would
+   * have bound. Deliberately the declared TYPE, never the module filename — the
+   * two are free to differ.
+   */
+  type?: string;
 
   /** Called once per matching model load. All subscriptions are auto-disposed. */
   bind(rv: RVBindContext): void;
@@ -82,8 +126,19 @@ export { compileGlob, matchesAny, extractGlbName } from './glob-match';
 interface ActiveBind {
   behaviorId: string;
   handle: BindContextHandle;
-  /** Set when bound to a placed LayoutObject subtree (its placement id) — null for whole-scene binds. */
+  /**
+   * OWNER identity — the placement whose removal disposes this bind. The placed
+   * LayoutObject's own key for a glob bind, the NEAREST enclosing LayoutObject's
+   * key for a payload bind on an inner node, `undefined` when no placement
+   * encloses it (then only `model-cleared` disposes it).
+   */
   objectKey?: string;
+  /** BIND identity — `${node.uuid}::${type ?? behaviorId}`. De-dupes glob and
+   *  payload discovery against each other; released again on dispose. */
+  bindKey: string;
+  /** Scene path of the node this bind is scoped to — diagnostics only, so a
+   *  payload bind on an inner node is distinguishable from a whole-scene one. */
+  nodePath: string;
   /** Synthetic `Signals` container this bind materialised (if any) — its
    *  NodeRegistry entries are unregistered on dispose to avoid a registry leak. */
   signalsContainer?: Object3D;
@@ -93,8 +148,16 @@ interface ActiveBind {
  * BehaviorManager — owns the registered behaviors, dispatches them on
  * model-load and disposes them on model-clear.
  */
+/** A registered behavior together with the id it was registered under. */
+interface BehaviorEntry { id: string; behavior: Behavior }
+
 export class BehaviorManager {
-  private behaviors: Array<{ id: string; behavior: Behavior }> = [];
+  private behaviors: BehaviorEntry[] = [];
+  /** Material-flow `type` → its adapter. The bridge from a payload key to the
+   *  executable behavior; see {@link Behavior.type}. */
+  private byType = new Map<string, BehaviorEntry>();
+  /** Live bind identities `${uuid}::${type}` — the glob/payload de-dupe (F3). */
+  private boundKeys = new Set<string>();
   private active: ActiveBind[] = [];
   private modelLoadedOff: (() => void) | null = null;
   private modelClearedOff: (() => void) | null = null;
@@ -115,7 +178,11 @@ export class BehaviorManager {
       console.warn(`[behaviors] '${id}' is not a valid Behavior (must have models[] + bind())`);
       return;
     }
-    this.behaviors.push({ id, behavior });
+    const entry: BehaviorEntry = { id, behavior };
+    this.behaviors.push(entry);
+    // Index by material-flow type so a payload key resolves to this adapter.
+    // Last registration wins (HMR re-evaluation replaces, never duplicates).
+    if (behavior.type) this.byType.set(behavior.type, entry);
   }
 
   /** Total number of registered behaviors (for diagnostics / tests). */
@@ -127,9 +194,16 @@ export class BehaviorManager {
   /** Number of currently active (post-load, pre-clear) bind contexts. */
   get activeCount(): number { return this.active.length; }
 
-  /** Read-only snapshot of `{behaviorId, objectKey}` for active binds — for the layout-graph debug page. */
-  getActiveBinds(): ReadonlyArray<{ behaviorId: string; objectKey: string | undefined }> {
-    return this.active.map(a => ({ behaviorId: a.behaviorId, objectKey: a.objectKey }));
+  /**
+   * Read-only snapshot of the active binds — for the layout-graph debug page
+   * and for tests that need to see WHERE a behavior bound.
+   *
+   * `nodePath` is what makes a payload bind observable: `behaviorId` +
+   * `objectKey` alone cannot tell a whole-scene bind from one on an inner node,
+   * which is exactly the distinction plan-455 turns on.
+   */
+  getActiveBinds(): ReadonlyArray<{ behaviorId: string; objectKey: string | undefined; nodePath: string }> {
+    return this.active.map(a => ({ behaviorId: a.behaviorId, objectKey: a.objectKey, nodePath: a.nodePath }));
   }
 
   /**
@@ -153,11 +227,18 @@ export class BehaviorManager {
       const root = getCurrentRoot();
       if (!root) return;
       this.disposeAll();
-      // 1. Whole scene vs. the loaded GLB filename (a standalone asset GLB).
-      this.bindForRoot(root, extractGlbName(getCurrentModelUrl()));
+      // 3. FIRST, though it is the newest step: every node carrying a
+      //    registered material-flow payload binds AT that node. It runs ahead of
+      //    the filename bind so the latter can stand down for types the scene
+      //    has already claimed explicitly (precedence, F5).
+      const payloadTypes = this.dispatchExtrasIn(root);
+      // 1. Whole scene vs. the loaded GLB filename (a standalone asset GLB),
+      //    minus any type already bound from a payload.
+      this.bindForRoot(root, extractGlbName(getCurrentModelUrl()), undefined, payloadTypes);
       // 2. Each placed LayoutObject subtree vs. its asset name, so library
       //    items embedded in a scene get their behavior even though the
-      //    scene's filename doesn't match (see dispatchPlaced).
+      //    scene's filename doesn't match (see dispatchPlaced). Order relative
+      //    to step 3 is immaterial — the bind-identity de-dupe is commutative.
       this.dispatchPlacedObjectsIn(root);
     });
 
@@ -183,32 +264,84 @@ export class BehaviorManager {
   /**
    * Bind every behavior whose `models[]` match `matchName`, scoped to `root`.
    * Bound contexts join `active[]` (so they tick and dispose with the scene).
-   * Returns the number of behaviors bound.
+   *
+   * `suppressTypes` (scene-root call only) lists the material-flow types this
+   * scene already binds from an explicit payload — the filename glob yields for
+   * those (F5). Returns the number of behaviors ACTUALLY bound: a match that the
+   * bind-identity de-dupe or a bind error rejects is not counted.
    */
-  private bindForRoot(root: Object3D, matchName: string, objectKey?: string): number {
+  private bindForRoot(
+    root: Object3D,
+    matchName: string,
+    objectKey?: string,
+    suppressTypes?: ReadonlySet<string>,
+  ): number {
     if (!this.host) return 0;
     const matched: string[] = [];
-    for (const { id, behavior } of this.behaviors) {
-      if (!matchesAny(behavior.models, matchName)) continue;
-      matched.push(id);
-      try {
-        const accum: KinematicsSpec = {};
-        const { ctx, handle } = createBindContext(root, this.host, accum);
-        behavior.bind(ctx);
-        const report = applyKinematicsSpec(root, accum);
-        if (report.warnings.length > 0) {
-          console.warn(`[behaviors] '${id}' for '${matchName}': ${report.warnings.length} warning(s)`);
-        }
-        const signalsContainer = this.registerBehaviorSignals(accum, root);
-        this.active.push({ behaviorId: id, handle, objectKey, signalsContainer: signalsContainer ?? undefined });
-      } catch (e) {
-        console.error(`[behaviors] '${id}' bind error for '${matchName}':`, e);
+    for (const entry of this.behaviors) {
+      if (!matchesAny(entry.behavior.models, matchName)) continue;
+      const type = entry.behavior.type;
+      // F5 — this scene binds `type` from an explicit payload somewhere, so the
+      // filename glob has nothing left to say about it. Logged, never silent:
+      // if this ever suppresses something real, the log is the evidence.
+      if (type && suppressTypes?.has(type)) {
+        console.info(
+          `[behaviors] '${entry.id}' NOT bound for '${matchName}': ` +
+          `'${type}' is bound from rv_extras in this scene (filename glob yields to payload)`,
+        );
+        continue;
       }
+      if (this.bindOne(root, entry, matchName, objectKey)) matched.push(entry.id);
     }
     if (matched.length > 1) {
       console.warn(`[behaviors] multiple behaviors matched '${matchName}': ${matched.join(', ')}`);
     }
     return matched.length;
+  }
+
+  /**
+   * Bind ONE registered behavior at `root` — the shared core of both discovery
+   * paths. The glob path arrives here after its `models[]` match; the payload
+   * path arrives here with the adapter already resolved by type, since the
+   * payload key IS the match and there is no name to test.
+   *
+   * Returns false when the bind identity is already live (de-dupe) or the bind
+   * threw; true when a context joined `active[]`.
+   */
+  private bindOne(root: Object3D, entry: BehaviorEntry, matchLabel: string, objectKey?: string): boolean {
+    if (!this.host) return false;
+    const { id, behavior } = entry;
+    const bindKey = `${root.uuid}::${behavior.type ?? id}`;
+    if (this.boundKeys.has(bindKey)) return false;
+    try {
+      const accum: KinematicsSpec = {};
+      const { ctx, handle } = createBindContext(root, this.host, accum);
+      behavior.bind(ctx);
+      const report = applyKinematicsSpec(root, accum);
+      if (report.warnings.length > 0) {
+        console.warn(`[behaviors] '${id}' for '${matchLabel}': ${report.warnings.length} warning(s)`);
+      }
+      const signalsContainer = this.registerBehaviorSignals(accum, root);
+      this.boundKeys.add(bindKey);
+      this.active.push({
+        behaviorId: id,
+        handle,
+        objectKey,
+        bindKey,
+        nodePath: this.nodePathOf(root),
+        signalsContainer: signalsContainer ?? undefined,
+      });
+      return true;
+    } catch (e) {
+      console.error(`[behaviors] '${id}' bind error for '${matchLabel}':`, e);
+      return false;
+    }
+  }
+
+  /** Scene path of a node — registry-resolved when available, computed otherwise. */
+  private nodePathOf(node: Object3D): string {
+    return this.host?.registry?.getPathForNode?.(node)
+      ?? (NodeRegistry.computeNodePath(node) || node.name);
   }
 
   /**
@@ -365,6 +498,65 @@ export class BehaviorManager {
   }
 
   /**
+   * OWNER key for a bind at `node`: the nearest enclosing LayoutObject's
+   * placement key (the node itself counts), or `undefined` when no placement
+   * encloses it — then the scene lifecycle owns it.
+   *
+   * This is what keeps a payload bind on an INNER node from outliving the
+   * placement it sits in: `disposeObject` matches on exactly this key.
+   */
+  private ownerKeyFor(node: Object3D): string | undefined {
+    let cur: Object3D | null = node;
+    while (cur) {
+      if (this.isLayoutObjectRoot(cur)) return this.layoutKey(cur);
+      cur = cur.parent;
+    }
+    return undefined;
+  }
+
+  /**
+   * Bind every node in `subtree` that carries a registered material-flow type
+   * as `rv_extras` payload, AT that node (plan-455 F1). Returns the set of types
+   * that were found with a usable adapter — the scene-root filename bind stands
+   * down for those (F5).
+   *
+   * ── Why engine-owned types step aside ───────────────────────────────────────
+   *
+   * `Source` and `Sink` already have ENGINE component factories: the scene
+   * loader constructs a real `RVSource`/`RVSink` for every `rv_extras[type]` it
+   * meets, and that component — not the behavior — is the continuous driver.
+   * Their behaviors are `inert:true` for precisely that reason (see the
+   * double-spawn guard in `behaviors/Source.ts`, whose contract states the
+   * behavior never binds against an arbitrary inner-node payload). Binding them
+   * from a payload here would put a second, badge-stamping, signal-writing
+   * instance on nodes all over the shipped demo library while adding no
+   * behaviour at all. So the payload dispatch covers the types the engine does
+   * NOT own — the same ownership split `registerMaterialFlow` already makes when
+   * it skips its schema adapter for factory-owned types. The DES kernel has no
+   * such engine driver and therefore keeps binding every type (Plan 194 §2.6).
+   */
+  private dispatchExtrasIn(subtree: Object3D): Set<string> {
+    const payloadTypes = new Set<string>();
+    if (!this.host) return payloadTypes;
+    subtree.traverse((node) => {
+      const types = extrasMaterialFlowTypes(node);
+      if (types.length === 0) return;
+      for (const type of types) {
+        if (isEngineOwnedFlowType(type)) continue;
+        const entry = this.byType.get(type);
+        if (!entry) continue;
+        // Counted whether or not THIS call bound it: an already-live bind of the
+        // same type at the same node is still a payload claim on that type.
+        payloadTypes.add(type);
+        if (this.bindOne(node, entry, type, this.ownerKeyFor(node))) {
+          console.info(`[behaviors] rv_extras '${type}' → '${entry.id}' bound at "${node.name}"`);
+        }
+      }
+    });
+    return payloadTypes;
+  }
+
+  /**
    * Dispatch behaviors for a single placed LayoutObject subtree — called by the
    * layout planner right after a library asset is added to a scene. Idempotent
    * per object (keyed by placement id). Bound contexts join `active[]`, so they
@@ -384,6 +576,10 @@ export class BehaviorManager {
     this.dispatchedObjects.add(key);
     const matchName = this.layoutMatchName(root);
     const matched = this.bindForRoot(root, matchName, key);
+    // Payload-carrying nodes INSIDE the placement bind too, so an asset added
+    // after load behaves like one that was present at load — and so a
+    // remove/re-add cycle binds them again (they own-key to this placement).
+    this.dispatchExtrasIn(root);
     console.info(`[behaviors] dispatchPlaced("${root.name}" → match "${matchName}"): ${matched} behavior(s) bound`);
   }
 
@@ -400,9 +596,17 @@ export class BehaviorManager {
   private disposeBind(a: ActiveBind): void {
     try { a.handle.dispose(); } catch { /* ignore */ }
     if (a.signalsContainer) this.host?.registry?.unregisterSubtree?.(a.signalsContainer);
+    // Release the bind identity so a re-add of the same object binds again.
+    this.boundKeys.delete(a.bindKey);
   }
 
-  /** Dispose the behavior contexts bound to a placed object (call on removal). */
+  /**
+   * Dispose the behavior contexts OWNED by a placed object (call on removal).
+   *
+   * Ownership, not location: this also removes the payload binds of the
+   * placement's inner nodes, which carry its key precisely so their tick
+   * callbacks and signal subscriptions leave with it.
+   */
   disposeObject(root: Object3D): void {
     const key = this.layoutKey(root);
     const remaining: ActiveBind[] = [];
@@ -425,7 +629,9 @@ export class BehaviorManager {
         const { ctx, handle } = createBindContext(root, host, accum);
         behavior.bind(ctx);
         reports.push(applyKinematicsSpec(root, accum));
-        this.active.push({ behaviorId: id, handle });
+        const bindKey = `${root.uuid}::${behavior.type ?? id}`;
+        this.boundKeys.add(bindKey);
+        this.active.push({ behaviorId: id, handle, bindKey, nodePath: this.nodePathOf(root) });
       } catch (e) {
         console.error(`[behaviors] '${id}' bind error for '${modelName}':`, e);
       }
@@ -438,12 +644,14 @@ export class BehaviorManager {
     for (const a of this.active) this.disposeBind(a);
     this.active.length = 0;
     this.dispatchedObjects.clear();
+    this.boundKeys.clear();
   }
 
   /** For tests: clear registered behaviors. */
   clearRegistry(): void {
     this.disposeAll();
     this.behaviors.length = 0;
+    this.byType.clear();
   }
 }
 

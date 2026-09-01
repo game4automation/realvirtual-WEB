@@ -35,7 +35,11 @@
  *
  * Needs the DemoRealvirtual project's DemoRobotIK.glb (served by the vitest browser
  * server via the rv-private-models middleware) and the private WASM solver.
- * Skips with a warning when either is absent.
+ * Skips when either is absent - which, until plan-395, this comment only
+ * CLAIMED: the guard below tested `head.ok`, true for the SPA fallback, and a
+ * `return` out of `beforeAll` reports `passed`, not `skipped`. Both halves are
+ * real now: the content-type probe in `describe.skipIf` decides, and the model
+ * lives in the private Development project.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -46,6 +50,15 @@ import type { RVRobotIK } from '../src/core/engine/rv-robot-ik';
 import type { RVIKTarget } from '../src/core/engine/rv-ik-target';
 import { WasmIKSolver } from '@rv-private/ik-solver/rv-ik-solver-provider';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.robotIK);
 
 const GLB_URL = DEV_GLB.robotIK;
 
@@ -127,10 +140,12 @@ let targets: RVIKTarget[] = [];
 
 beforeAll(async () => {
   try {
-    const head = await fetch(GLB_URL, { method: 'HEAD' });
-    if (!head.ok) return;
+    // The two dead guards this replaces (plan-395 §2.6): `!head.ok` never fired,
+    // because the SPA fallback is a 200; and `byteLength < 100` never fired either,
+    // because the index.html it returned is far bigger than that. Availability is
+    // settled by the `skipIf` on the suite, so reaching this line means the bytes
+    // are a GLB and a short read is a real defect rather than an absent file.
     const bytes = await (await fetch(GLB_URL)).arrayBuffer();
-    if (bytes.byteLength < 100) return;
     const scene = new Scene();
     // preserveHierarchy: skip the uber/merge bakes so local transforms stay
     // authored — the drive-application check below recomputes world matrices.
@@ -161,7 +176,7 @@ function ready(): boolean {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-describe('Cobot joint chain from the real GLB (FANUC CRX)', () => {
+describe.skipIf(!DEV_ASSETS)('Cobot joint chain from the real GLB (FANUC CRX)', () => {
   it('resolves the serialized TCP (plain node-path string) into the chain', () => {
     if (!ready()) return;
     const chain = robot!.getJointChain();

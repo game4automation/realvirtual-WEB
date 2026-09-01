@@ -165,7 +165,12 @@ describe.skipIf(!HAS_PRIVATE)('customer register — the real files', () => {
     // rule cannot hide behind the derived check above.
     expect(enumerated).toEqual(expect.arrayContaining(['mauser', 'wmyb']));
     expect(enumerated).toContain('hs-heilbronn'); // standard, git-workspace, projectless
-    expect(enumerated).not.toContain('toray');    // hosted-link
+    expect(enumerated).toContain('toray');        // development, git-workspace since ea3b919
+    // No negative pin any more: since Toray moved off hosted-link, today's
+    // register has no non-git-workspace customer left to name. The derived
+    // check above is the real guard - it asserts BOTH directions for every
+    // entry, so a hosted-link customer that slipped into the enumeration
+    // still fails here.
   });
 
   it('delivers a standard customer projectlessly', () => {

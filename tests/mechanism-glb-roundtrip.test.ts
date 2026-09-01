@@ -8,7 +8,7 @@
  * suite, which builds its rigs by hand in `_mechanism-rigs.ts`, these run
  * against REAL Unity artefacts produced by plan-404 Phase 0:
  *
- *   T6  `public/models/mechanism-{fourbar,scissor,delta}.glb` — the reference
+ *   T6  `../realvirtual-WebViewer-Private~/projects/Development/fixtures/mechanism-{fourbar,scissor,delta}.glb` — the reference
  *       scenes exported through the normative
  *       `GLBManager.GetStandardExportSettings()` → `GLTFSceneExporter.SaveGLB()`
  *       chain, i.e. exactly what `WebViewerToolbar.ExportSceneToWebViewer()`
@@ -50,6 +50,15 @@ import {
 } from '@rv-private/features/kinematic-mechanism.register';
 import type { RVKinematicMechanism } from '@rv-private/kinematic-mechanism/rv-kinematic-mechanism';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetsAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetsAvailable(DEV_GLB.mechanismFourbar, DEV_GLB.mechanismScissor, DEV_GLB.mechanismDelta);
 
 /** True when a fixture/GLB asset is actually served (not an SPA fallback). */
 async function assetExists(url: string): Promise<boolean> {
@@ -187,7 +196,7 @@ function stepTo(mech: RVKinematicMechanism, drive: RVDrive, value: number): void
   void mech;
 }
 
-describe('T6 — GLB round-trip against real Unity exports', () => {
+describe.skipIf(!DEV_ASSETS)('T6 — GLB round-trip against real Unity exports', () => {
   for (const glb of REFERENCE_GLBS) {
     it(`loads ${nameOf(glb)}, resolves BodyA/BodyB/DrivenBy and solves`, async (ctx) => {
       if (!await requireArtefacts(ctx, glb)) return;
@@ -284,7 +293,7 @@ describe('T6 — GLB round-trip against real Unity exports', () => {
   }, 60_000);
 });
 
-describe('T3 — forward parity against the Unity golden trajectory', () => {
+describe.skipIf(!DEV_ASSETS)('T3 — forward parity against the Unity golden trajectory', () => {
   it('tracks a 200-step drive ramp within 1e-3 mm', async (ctx) => {
     if (!await requireArtefacts(ctx, REFERENCE_GLBS[0], TRAJECTORY_URL)) return;
 
@@ -342,7 +351,7 @@ describe('T3 — forward parity against the Unity golden trajectory', () => {
   }, 120_000);
 });
 
-describe('T11 — live-mode signal drive', () => {
+describe.skipIf(!DEV_ASSETS)('T11 — live-mode signal drive', () => {
   it('signal-driven drives move the mechanism identically to standalone', async (ctx) => {
     if (!await requireArtefacts(ctx, REFERENCE_GLBS[0], TRAJECTORY_URL)) return;
 

@@ -14,6 +14,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import {
   BufferAttribute,
   BufferGeometry,
@@ -248,7 +249,7 @@ describe('9.8 undo, redo and replay', () => {
     const mock = makeMockViewer();
     const { root, a } = simpleAssembly(mock);
     const { viewer, scene, model, registry } = mock;
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const plan = await doc.mergeMesh('Asset/Assembly');
     expect(plan).not.toBeNull();
@@ -281,7 +282,7 @@ describe('9.8 undo, redo and replay', () => {
   it('replays from a recorded op onto a freshly loaded base', async () => {
     const mock = makeMockViewer();
     simpleAssembly(mock);
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     const plan = planMergeMesh(mock.viewer, 'Asset/Assembly')!;
     const op: MergeMeshOp = {
       ...assetOpHeader(), kind: 'mergeMesh', rootPath: 'Asset/Assembly',
@@ -301,7 +302,7 @@ describe('9.8 undo, redo and replay', () => {
     // one bucket in two as soon as a setMaterial op ran between recording and replay.
     const mock = makeMockViewer();
     const { a } = simpleAssembly(mock);
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     const plan = planMergeMesh(mock.viewer, 'Asset/Assembly')!;
     expect(plan.outputs).toHaveLength(1);
 
@@ -329,7 +330,7 @@ describe('9.9 no geometry or BVH leak', () => {
   it('disposes only the geometries the merge built, never the originals', async () => {
     const mock = makeMockViewer();
     const { a, b } = simpleAssembly(mock);
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
 
     const disposed: BufferGeometry[] = [];
     const boundsDisposed: BufferGeometry[] = [];
@@ -389,7 +390,7 @@ describe('9.11 GLB export round-trip', () => {
     mock.register();
     mock.model.updateMatrixWorld(true);
 
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     await doc.mergeMesh('Asset/Assembly');
 
     const glb = await exportAssetGlb(mock.model);
@@ -421,7 +422,7 @@ describe('9.12 ineligibility', () => {
     mock.model.add(root);
     addMesh(root, 'Only');
     mock.register();
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
 
     expect(await doc.mergeMesh('Asset/Assembly')).toBeNull();
     expect(doc.getSnapshot().opCount).toBe(0);
@@ -441,7 +442,7 @@ describe('9.12 ineligibility', () => {
     root.add(multi);
     addMesh(root, 'Base', triangleGeometry(5));
     mock.register();
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
 
     const plan = planMergeMesh(mock.viewer, 'Asset/Assembly')!;
     expect(plan.ineligibleReason).toMatch(/Separate/);
@@ -475,7 +476,7 @@ describe('9.13 BVH abort', () => {
   it('the executor hands a predicate that goes false when the trash is flushed', async () => {
     const mock = makeMockViewer();
     simpleAssembly(mock);
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
 
     await doc.mergeMesh('Asset/Assembly');
     const call = mock.bvhCalls.at(-1)!;
@@ -520,7 +521,7 @@ describe('9.14 runtime lifecycle symmetry', () => {
     mock.register();
     mock.model.updateMatrixWorld(true);
 
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     const tm = mock.viewer.transportManager as unknown as { sensors: unknown[] };
 
     await doc.mergeMesh('Asset/Assembly');
@@ -538,7 +539,7 @@ describe('9.14 runtime lifecycle symmetry', () => {
   it('drops a torn-down drive out of viewer.drives', async () => {
     const mock = makeMockViewer({ runtime: true });
     const { a } = simpleAssembly(mock);
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     (mock.viewer.drives as unknown[]).push({ node: a });
 
     await doc.mergeMesh('Asset/Assembly');
@@ -568,7 +569,7 @@ describe('9.14 runtime lifecycle symmetry', () => {
       addSubtree: () => { calls.push('add'); return 1; },
     };
 
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     await doc.mergeMesh('Asset/Assembly');
     expect(calls).toEqual(['remove', 'add']);
     await doc.undo();
@@ -604,7 +605,7 @@ describe('9.15 replay divergence is a collected failure, never a no-op', () => {
     it(`reports ${testCase.name} and leaves the draft intact`, async () => {
       const mock = makeMockViewer();
       const { root } = simpleAssembly(mock);
-      const doc = AssetDocument.newUntitled(mock.viewer);
+      const doc = scratchAssetDocument(mock.viewer);
       const plan = planMergeMesh(mock.viewer, 'Asset/Assembly')!;
       const op: MergeMeshOp = {
         ...assetOpHeader(), kind: 'mergeMesh', rootPath: 'Asset/Assembly',
@@ -654,7 +655,7 @@ describe('9.17 owner zones (regression gate)', () => {
     mock.register();
     mock.model.updateMatrixWorld(true);
 
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     const plan = await doc.mergeMesh('Asset/Assembly');
     expect(plan).not.toBeNull();
     // One output per zone: the root replacement and the anchor's own mesh.
@@ -711,7 +712,7 @@ describe('9.18 bit-exact undo of the surviving nodes', () => {
       anchorChildren: childNames(anchor),
     };
 
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     await doc.mergeMesh('Asset/Assembly');
 
     // While merged, the sensor is a child of the ANCHOR (its owner zone) …
@@ -749,7 +750,7 @@ describe('9.18 bit-exact undo of the surviving nodes', () => {
     mock.register();
     mock.model.updateMatrixWorld(true);
 
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     await doc.mergeMesh('Asset/Assembly');
     const forwardRoot = childNames(mock.registry.getNode('Asset/Assembly')!);
     const forwardAnchor = childNames(anchor);
@@ -778,7 +779,7 @@ describe('9.19 Group membership survives the merge', () => {
     mock.register();
     mock.model.updateMatrixWorld(true);
 
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     await doc.mergeMesh('Asset/Assembly');
 
     const merged = mock.registry.getNode('Asset/Assembly') as Mesh;
@@ -826,7 +827,7 @@ describe('9.20 property parity', () => {
     root.matrixWorldAutoUpdate = false;
     const bakedWorld = root.matrixWorld.clone();
 
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     await doc.mergeMesh('Asset/Assembly');
 
     const merged = mock.registry.getNode('Asset/Assembly') as Mesh;
@@ -868,7 +869,7 @@ describe('9.20 property parity', () => {
 
     const worldBefore = a.localToWorld(new Vector3(1, 0, 0));
 
-    const doc = AssetDocument.newUntitled(mock.viewer);
+    const doc = scratchAssetDocument(mock.viewer);
     await doc.mergeMesh('Asset/Assembly');
 
     const merged = mock.registry.getNode('Asset/Assembly') as Mesh;

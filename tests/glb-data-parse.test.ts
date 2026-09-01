@@ -11,13 +11,22 @@
  * `parseAsync(data)` path produces the same scene graph as the `loadAsync(url)`
  * path, so the memory-saving change is behaviourally transparent.
  *
- * Needs the demo GLB at public/models/tests.glb (served by the vitest browser
+ * Needs the demo GLB at ../realvirtual-WebViewer-Private~/projects/Development/fixtures/tests.glb (served by the vitest browser
  * server). When absent the test no-ops with a warning, matching glb-extras.test.
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { Scene, Object3D } from 'three';
 import { loadAndPrepareGLTF } from '../src/core/engine/rv-scene-loader';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.tests);
 
 const GLB_URL = DEV_GLB.tests;
 let available = false;
@@ -42,7 +51,7 @@ function countNodes(root: Object3D): number {
   return n;
 }
 
-describe('loadAndPrepareGLTF data (ArrayBuffer) path', () => {
+describe.skipIf(!DEV_ASSETS)('loadAndPrepareGLTF data (ArrayBuffer) path', () => {
   it('parses pre-downloaded bytes into a non-empty scene graph', async () => {
     if (!available || !bytes) {
       console.warn(`${GLB_URL} not available — skipping data-parse test`);

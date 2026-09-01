@@ -124,6 +124,17 @@ export class ThumbnailCache {
     }
   }
 
+  /**
+   * Drop one cached preview — the save-path invalidation (an asset whose bytes
+   * just changed must not keep serving its old picture). A miss is fine.
+   */
+  async delete(key: string): Promise<void> {
+    try {
+      const cache = await caches.open(this._bucket);
+      await cache.delete(this._key(key));
+    } catch { /* unsupported — nothing cached to drop */ }
+  }
+
   /** Wipe the persistent bucket (tooling / "regenerate all"). */
   async clear(): Promise<void> {
     try { await caches.delete(this._bucket); } catch { /* ignore */ }

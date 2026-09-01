@@ -58,6 +58,60 @@ export type DocumentRefField = (typeof DOCUMENT_REF_FIELDS)[number];
  */
 export const DEFAULT_SECRETS_REF = 'connect/secrets.local.json';
 
+/**
+ * The file ending that makes a file a CONNECT configuration.
+ *
+ * The ENDING is the classification, never the folder: `connect/` is merely the
+ * conventional place CONNECT writes its profiles to, and a config that a user
+ * keeps next to its model is exactly as much a config. Anything that wants to
+ * treat CONNECT configs specially (cards, badges, ref pickers) must ask
+ * {@link isConnectConfigPath} instead of looking at the directory.
+ */
+export const CONNECT_CONFIG_SUFFIX = '.connect.json';
+
+/** Is this path a CONNECT configuration file — by ending, wherever it sits? */
+export function isConnectConfigPath(path: string | null | undefined): boolean {
+  return typeof path === 'string'
+    && path.trim().toLowerCase().endsWith(CONNECT_CONFIG_SUFFIX);
+}
+
+/**
+ * The file ending that makes a file a knowledge document (plan-718
+ * `knowledgeRef`). Same rule as {@link CONNECT_CONFIG_SUFFIX}: the ENDING is
+ * the classification, never the folder — a machine's knowledge file may sit
+ * right next to its model.
+ */
+export const KNOWLEDGE_FILE_SUFFIX = '.knowledge.md';
+
+/** Is this path a knowledge file — by ending, wherever it sits? */
+export function isKnowledgeFilePath(path: string | null | undefined): boolean {
+  return typeof path === 'string'
+    && path.trim().toLowerCase().endsWith(KNOWLEDGE_FILE_SUFFIX);
+}
+
+/**
+ * The DISPLAY form of a config path: the `.connect.json` ending removed.
+ *
+ * The ending is machinery — it is how a config is recognised, not part of its
+ * name — so no user-visible string ever shows it (user decision 2026-08-19).
+ * The full path stays the identity everywhere else; this is presentation only.
+ * A non-config path passes through unchanged, so callers may apply it blindly.
+ */
+export function stripConnectConfigSuffix(path: string): string {
+  const trimmed = String(path ?? '').trim();
+  return isConnectConfigPath(trimmed)
+    ? trimmed.slice(0, -CONNECT_CONFIG_SUFFIX.length)
+    : trimmed;
+}
+
+/** {@link stripConnectConfigSuffix}'s knowledge twin — presentation only. */
+export function stripKnowledgeFileSuffix(path: string): string {
+  const trimmed = String(path ?? '').trim();
+  return isKnowledgeFilePath(trimmed)
+    ? trimmed.slice(0, -KNOWLEDGE_FILE_SUFFIX.length)
+    : trimmed;
+}
+
 // ─── Paths ──────────────────────────────────────────────────────────────
 
 /**
@@ -317,6 +371,15 @@ export function repointDocumentRefs(
  * Durable first, then in-memory: the caller re-reads the returned project rather
  * than patching its own copy, so a conflict retry cannot leave the two
  * disagreeing (plan-717 R2-F3).
+ *
+ * @deprecated **Dead as of plan-725 §2.7 — verified, not assumed.**
+ * `grep -rn "setDocumentRef\b" src tests` finds only this definition and the
+ * doc reference at the top of this file: nothing calls it. Every live write of
+ * a document reference goes through `ProjectStore._setDocumentRefField`, which
+ * also updates the in-memory rows and — since plan-725 — tells a running
+ * CONNECT gateway. This second door does neither, so a caller that found it
+ * would get a manifest the app does not know it wrote. Delete it or route it
+ * through the store; do not build on it.
  */
 export async function setDocumentRef(
   dir: FileSystemDirectoryHandle,

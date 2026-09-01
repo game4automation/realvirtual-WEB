@@ -472,7 +472,53 @@ export class RaycastManager {
     pointerToNDC(e.clientX, e.clientY, this.renderer.domElement, this.pointer);
 
     this.raycaster.setFromCamera(this.pointer, this.getCamera());
-    const hits = this._timedIntersect();
+    return this._resolveFirstEnabledHit(this._timedIntersect());
+  }
+
+  /**
+   * Pick along an ARBITRARY ray instead of a screen position (plan-705).
+   *
+   * Runs through the SAME resolution chain as raycastForRVNodeDetailed
+   * (_timedIntersect → _isExcluded → _resolveHit → _isTypeEnabled) so the
+   * visibility, isolation and hover-type gates cannot drift apart
+   * (doc-render-picking.md §2.4 contract 4: do not bypass the resolution
+   * pipeline; contract 2: never raycast render meshes or arenas directly).
+   * Changes NO hover state and adds no per-frame work — one call per use.
+   *
+   * Used by `web_camera_fly` (ground=true) to find the surface below the camera.
+   */
+  raycastRay(origin: Vector3, direction: Vector3, far?: number): {
+    path: string;
+    hitPoint: [number, number, number];
+    hitNormal: [number, number, number];
+  } | null {
+    if (!this.registry || (this._targets.length === 0 && !this._backend)) return null;
+    const dir = direction.clone();
+    if (dir.lengthSq() === 0) return null;
+    dir.normalize();
+    const prevFar = this.raycaster.far;
+    const prevNear = this.raycaster.near;
+    try {
+      this.raycaster.set(origin, dir);
+      if (typeof far === 'number' && Number.isFinite(far) && far > 0) this.raycaster.far = far;
+      return this._resolveFirstEnabledHit(this._timedIntersect());
+    } finally {
+      // setFromCamera writes near/far for the ortho camera, so both are restored.
+      this.raycaster.far = prevFar;
+      this.raycaster.near = prevNear;
+    }
+  }
+
+  /**
+   * Shared hit-selection tail: first non-excluded, resolvable, type-enabled hit.
+   * Extracted (plan-705) so the screen pick and the ray pick cannot grow two
+   * different copies of the gate order.
+   */
+  private _resolveFirstEnabledHit(hits: Intersection<Object3D>[]): {
+    path: string;
+    hitPoint: [number, number, number];
+    hitNormal: [number, number, number];
+  } | null {
     const resolveStart = this._metrics ? performance.now() : 0;
 
     for (const hit of hits) {

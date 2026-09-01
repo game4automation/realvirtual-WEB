@@ -15,6 +15,13 @@ import { deriveWireType, type S7Tag, type ParsedTopic } from '../import/s7-tag-t
 import { connectRestFetch } from './connect-rest';
 import { clearLicenseStatus, fetchLicenseStatus } from './license-store';
 import { fetchConnectNews } from '../news-store';
+import { getProjectStore } from '../project/project-store';
+import { getOpenDocumentBase } from '../editor/active-asset-store';
+import { subscribeActiveDocumentView } from '../editor/active-document-view';
+import {
+  createGenerationGuard,
+  createTrailingEdgeDebounce,
+} from '../../plugins/diagnose/debounce';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -393,6 +400,16 @@ export interface ConnectSnapshot {
    */
   updateReason: string | null;
   /**
+   * Can the connected gateway open a project path in the host's file manager
+   * (`revealSupported` from `/health`, plan-446 F1)?
+   *
+   * False for every gateway that omits the flag — an older CONNECT, one running headless on Linux,
+   * or one serving no project at all. It is a CAPABILITY, not a permission: whether the verb may be
+   * shown also depends on the page origin ({@link canRevealInExplorer}), because a remotely opened
+   * viewer would otherwise open a window on somebody else's desk.
+   */
+  revealSupported: boolean;
+  /**
    * AI-diagnosis (RAG/LLM) status from `GET /diagnose/status` (plan-284). `undefined` until the
    * first poll completes; `{ supported: false }` for gateways without the endpoint.
    */
@@ -554,6 +571,7 @@ const _store = createStore<ConnectSnapshot>({
   discoveryLoading: false,
   updateSupported: false,
   updateReason: null,
+  revealSupported: false,
 });
 
 // ── React Integration (useSyncExternalStore) ───────────────────────────
@@ -721,6 +739,90 @@ export function isLocalGatewayTarget(url: string): boolean {
   }
 }
 
+// ── "Show in Explorer" (plan-446 F1/F3) ────────────────────────────────
+
+/** The part of `window.location` {@link canRevealInExplorer} reads — injectable for tests. */
+export interface RevealPageLocation {
+  hostname: string;
+  origin: string;
+}
+
+/**
+ * May the "Show in Explorer" verb be offered right now?
+ *
+ * ## Two independent conditions, and the second is not about permission
+ *
+ * The gateway's `revealSupported` says the ACTION exists (a file manager, a project root). It says
+ * nothing about *whose screen* the window would appear on — and that is the failure this rule
+ * exists for: CONNECT refuses every non-loopback PEER, but a viewer opened over Tailscale on a
+ * tablet still reaches its CONNECT through a locally-forwarded port and would get a 204 for a
+ * window that opens on the machine in the plant. So the page itself must be local too:
+ *
+ * - `location.hostname` is `localhost` / `127.0.0.1` — the page runs on the gateway's machine, or
+ * - the gateway origin IS the page origin — CONNECT served this very page, which is the plan-363
+ *   embedded/dev-proxy arrangement and the same machine by construction.
+ *
+ * Deliberately NOT {@link isLocalGatewayTarget}: that predicate answers "does Chrome's Local
+ * Network Access prompt apply", and it says yes for a whole `192.168.x` LAN — every one of which
+ * is a different desk.
+ */
+export function canRevealInExplorer(
+  revealSupported: boolean,
+  gatewayUrl: string,
+  loc: RevealPageLocation,
+): boolean {
+  if (!revealSupported) return false;
+  if (loc.hostname === 'localhost' || loc.hostname === '127.0.0.1') return true;
+  try {
+    return new URL(gatewayUrl).origin === loc.origin;
+  } catch {
+    return false;
+  }
+}
+
+/** {@link canRevealInExplorer} against the live snapshot and the live page origin. */
+export function canRevealInExplorerNow(): boolean {
+  const snap = _store.getSnapshot();
+  if (snap.state !== 'connected') return false;
+  try {
+    return canRevealInExplorer(snap.revealSupported, snap.serverUrl, window.location);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ask the gateway to open `path` (project-relative) in the host's file manager.
+ *
+ * ## Every refusal retires the verb, and none of them opens a dialog
+ *
+ * A reveal is a convenience, so a failure may cost the user nothing but the entry disappearing
+ * (plan-446 Phase 2). Any answer other than 204 therefore clears {@link ConnectSnapshot.revealSupported}
+ * — 403 (the page moved to a remote origin between render and click), 404 (an older gateway with no
+ * such route, or a file that is gone), 409 (the project root was dropped). The flag comes back on
+ * the next `/health`, which is what makes this a probe rather than a permanent opt-out.
+ *
+ * A NETWORK failure is deliberately not one of those cases: it says nothing about the capability,
+ * and the gateway-unreachable state already has an owner.
+ *
+ * @returns true when the gateway confirmed the reveal.
+ */
+export async function revealInExplorer(path: string): Promise<boolean> {
+  const baseUrl = _store.getSnapshot().serverUrl;
+  let resp: Response;
+  try {
+    resp = await connectRestFetch(`${baseUrl}/project/reveal`, {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    });
+  } catch {
+    return false;
+  }
+  if (resp.status === 204) return true;
+  _store.set({ revealSupported: false });
+  return false;
+}
+
 /**
  * True when the page-load auto-probe of the stored gateway URL cannot surface
  * Chrome's Local Network Access permission prompt: loopback page origin,
@@ -754,7 +856,13 @@ export function setServerUrl(url: string): void {
   try {
     localStorage.setItem(LS_KEY_URL, url);
   } catch { /* ignore */ }
-  if (_store.getSnapshot().serverUrl !== url) clearLicenseStatus();
+  if (_store.getSnapshot().serverUrl !== url) {
+    clearLicenseStatus();
+    // A different gateway gets its own verdict on the active-document route,
+    // and owes the card nothing the previous one reported.
+    _activeDocumentUnsupported = false;
+    clearActiveDocumentState();
+  }
   _store.set({ serverUrl: url });
 }
 
@@ -926,6 +1034,11 @@ interface GatewayHealth {
   updateSupported?: boolean;
   /** Why it may not — a token from the closed `UpdateReasons` set (plan-363 Phase 8). */
   updateReason?: string | null;
+  /**
+   * Can this gateway reveal a project path in the host's file manager (plan-446 F1)? Absent on
+   * every gateway older than that plan, and false on one without a project root.
+   */
+  revealSupported?: boolean;
 }
 
 /**
@@ -1026,6 +1139,9 @@ export async function connectToServer(opts?: { explicit?: boolean }): Promise<vo
       lastStatusUpdate: Date.now(),
       updateSupported: health.updateSupported === true,
       updateReason: health.updateReason ?? null,
+      // Strict `=== true`, like `updateSupported` beside it: an older gateway omits the field, and
+      // `undefined` must read as "cannot", never as "unknown, try anyway".
+      revealSupported: health.revealSupported === true,
     });
 
     if (opts?.explicit) _recordUserConnected();
@@ -1116,6 +1232,10 @@ export function disconnectFromServer(): void {
   _statusFailCount = 0;
   _setAutoConnectOptOut(true);
   clearLicenseStatus();
+  // The "no such route" latch belongs to a gateway, not to the session: the next
+  // connect may be to an updated one, and it deserves to be asked again.
+  _activeDocumentUnsupported = false;
+  clearActiveDocumentState();
   _store.set({
     state: 'disconnected',
     errorMessage: '',
@@ -1134,6 +1254,7 @@ export function disconnectFromServer(): void {
     discoveryLoading: false,
     updateSupported: false,
     updateReason: null,
+    revealSupported: false,
   });
 }
 
@@ -2129,10 +2250,430 @@ export async function fetchLogs(
   return _fetchJson<{ latest: number; interfaces?: string[]; entries: ConnectLogEntry[] }>(`/logs?${params.toString()}`);
 }
 
+// ── Active document → live configuration (plan-725 §2.7) ───────────────
+
+/** `POST /project/active-document` route, as one constant both halves read. */
+const ACTIVE_DOCUMENT_ROUTE = '/project/active-document';
+
+/**
+ * How long a burst of manifest writes has to come to rest before CONNECT is
+ * told. Long enough that a drag, a rename or an adopt run is one call; short
+ * enough that a hero drop feels immediate (plan-725 §2.7).
+ */
+export const ACTIVE_DOCUMENT_DEBOUNCE_MS = 400;
+
+/** What the gateway names when it refuses to cut a live plant's connection (F13). */
+export interface ConnectPendingActivation {
+  profile: string;
+  connectRef: string;
+  connectedInterfaces: string[];
+}
+
+/** The 200 body of `POST /project/active-document` (plan-725 §2.3). */
+export interface ConnectActiveDocumentResult {
+  activeProfile: string | null;
+  connectRef: string | null;
+  /** A configuration CONNECT created beside this document — the viewer writes the ref back (F4). */
+  created: string | null;
+  reloaded: boolean;
+  pending: ConnectPendingActivation | null;
+  activationError: string | null;
+}
+
+/**
+ * Every way the call can end — and NONE of them is a thrown error.
+ *
+ * The caller is the tail of a write the user is waiting on (F12), so the result
+ * type carries the failure instead of the control flow. `unsupported` is the
+ * one that matters for compatibility: an older gateway has no such route (404),
+ * and a bare Vite dev server answers the SPA's `index.html` with a 200 — both
+ * mean "this feature is not there", not "something went wrong".
+ */
+export type ConnectActiveDocumentOutcome =
+  | { kind: 'ok'; result: ConnectActiveDocumentResult }
+  | { kind: 'unsupported'; reason: string }
+  | { kind: 'mismatch'; servedProject: string | null; message: string }
+  | { kind: 'error'; message: string };
+
+/** The request body (plan-725 §2.3). */
+export interface ConnectActiveDocumentRequest {
+  projectId: string | null;
+  /** `documents[].id` of the open document. **null never deactivates anything.** */
+  id: string | null;
+  path?: string | null;
+  /** Switch even though interfaces are connected — the F13 confirmation. */
+  force?: boolean;
+}
+
+/**
+ * Tell the gateway which document is open, and let it re-read the project.
+ *
+ * A trigger, not a data channel: the body names an identity and nothing else,
+ * and every value that matters is read from disk on the other side.
+ *
+ * ## Nothing here throws
+ *
+ * 404 (older gateway), a `text/html` 200 (a web server on the configured port),
+ * 401 (no key configured yet) and 503 (`CONFIG_BUSY`) are all reported as
+ * outcomes, because none of them is a reason to fail the manifest write this
+ * call is trailing (F9, F12). A network failure is the same.
+ */
+export async function postActiveDocument(
+  request: ConnectActiveDocumentRequest,
+): Promise<ConnectActiveDocumentOutcome> {
+  const baseUrl = _store.getSnapshot().serverUrl;
+  let resp: Response;
+  try {
+    resp = await connectRestFetch(`${baseUrl}${ACTIVE_DOCUMENT_ROUTE}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        projectId: request.projectId,
+        id: request.id,
+        path: request.path ?? null,
+        force: request.force ?? false,
+      }),
+    });
+  } catch (e) {
+    return { kind: 'error', message: e instanceof Error ? e.message : String(e) };
+  }
+
+  if (resp.status === 404) {
+    return { kind: 'unsupported', reason: 'This gateway is older than the active-document endpoint.' };
+  }
+  if (resp.status === 401 || resp.status === 403) {
+    return { kind: 'error', message: `The gateway refused the call (HTTP ${resp.status}).` };
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = await _readGatewayJson<Record<string, unknown>>(resp, baseUrl);
+  } catch (e) {
+    // A non-JSON body on THIS route means whatever answered is not a gateway.
+    // Treating it as "unsupported" rather than as an error is what keeps a
+    // bare-Vite dev session from reporting a failure once per write.
+    if (e instanceof NonGatewayResponseError) return { kind: 'unsupported', reason: e.message };
+    return { kind: 'error', message: e instanceof Error ? e.message : String(e) };
+  }
+
+  if (resp.status === 409) {
+    const code = typeof body.code === 'string' ? body.code
+      : typeof body.error === 'string' ? body.error : '';
+    // NO_PROJECT is the projectless gateway — the supported standard install,
+    // not a fault. PROJECT_MISMATCH is a real disagreement and must be seen (F6).
+    if (code === 'PROJECT_MISMATCH') {
+      return {
+        kind: 'mismatch',
+        servedProject: typeof body.servedProject === 'string' ? body.servedProject : null,
+        message: typeof body.message === 'string'
+          ? body.message
+          : 'This gateway serves a different project than the one this page has open.',
+      };
+    }
+    return { kind: 'unsupported', reason: code || 'This gateway serves no project.' };
+  }
+  if (!resp.ok) {
+    const message = typeof body.message === 'string' ? body.message
+      : typeof body.error === 'string' ? body.error
+        : `HTTP ${resp.status}: ${resp.statusText}`;
+    return { kind: 'error', message };
+  }
+
+  const pending = body.pending as Record<string, unknown> | null | undefined;
+  return {
+    kind: 'ok',
+    result: {
+      activeProfile: typeof body.activeProfile === 'string' ? body.activeProfile : null,
+      connectRef: typeof body.connectRef === 'string' ? body.connectRef : null,
+      created: typeof body.created === 'string' ? body.created : null,
+      reloaded: body.reloaded === true,
+      pending: pending && typeof pending.profile === 'string'
+        ? {
+          profile: pending.profile,
+          connectRef: typeof pending.connectRef === 'string' ? pending.connectRef : '',
+          connectedInterfaces: Array.isArray(pending.connectedInterfaces)
+            ? (pending.connectedInterfaces as unknown[]).filter((s): s is string => typeof s === 'string')
+            : [],
+        }
+        : null,
+      activationError: typeof body.activationError === 'string' ? body.activationError : null,
+    },
+  };
+}
+
+/**
+ * What the hero card has to SAY about the last notify — and nothing else.
+ *
+ * Three states, all of which would otherwise be silence: a switch the gateway
+ * held back (F13), a gateway serving a different project (F6), and a `created`
+ * configuration whose binding could not be written back (F4). The last one is
+ * the reason this is surfaced at all: without it a file appears in the project
+ * that nothing points at and whose origin the operator cannot reconstruct.
+ */
+export interface ConnectActiveDocumentState {
+  pending: (ConnectPendingActivation & { documentId: string | null }) | null;
+  /** Set while the confirmation is being sent, so the button can say so. */
+  confirming: boolean;
+  mismatch: string | null;
+  writeBackError: string | null;
+}
+
+const _activeDocStore = createStore<ConnectActiveDocumentState>({
+  pending: null,
+  confirming: false,
+  mismatch: null,
+  writeBackError: null,
+});
+
+export function subscribeActiveDocumentState(listener: () => void): () => void {
+  return _activeDocStore.subscribe(listener);
+}
+
+export function getActiveDocumentState(): ConnectActiveDocumentState {
+  return _activeDocStore.getSnapshot();
+}
+
+/** Dismiss whatever the card is currently reporting. */
+export function clearActiveDocumentState(): void {
+  _activeDocStore.set({ pending: null, confirming: false, mismatch: null, writeBackError: null });
+}
+
+/**
+ * The identity of what is open — read synchronously, from the same two seams
+ * the hero card reads (plan-725 §2.7). Null when nothing is open, which is a
+ * legitimate call: it asks for the rescan without naming a document.
+ */
+function _activeDocumentIdentity(): { projectId: string | null; id: string | null; path: string | null } {
+  const snapshot = getProjectStore().getSnapshot();
+  const projectId = snapshot.project?.id ?? null;
+  const base = getOpenDocumentBase();
+  if (!base || base.kind !== 'document') return { projectId, id: null, path: null };
+  const doc = snapshot.documents.find(d => d.id === base.documentId)
+    ?? (base.path ? snapshot.documents.find(d => d.path === base.path) : undefined);
+  return {
+    projectId,
+    id: typeof doc?.id === 'string' && doc.id !== '' ? doc.id : base.documentId ?? null,
+    path: doc?.path ?? base.path ?? null,
+  };
+}
+
+/**
+ * True once this gateway has told us the route is not there.
+ *
+ * Latched rather than re-probed per write: an older gateway would otherwise
+ * collect one 404 per burst for the rest of the session. Cleared on disconnect
+ * and on a server-URL change, which is what makes it a latch and not an opt-out.
+ */
+let _activeDocumentUnsupported = false;
+
+/** Suppresses the notify the `created` write-back would otherwise trigger. */
+let _writingBackCreatedRef = false;
+
+const _activeDocumentGuard = createGenerationGuard();
+
+const _activeDocumentDebounce = createTrailingEdgeDebounce<void>(
+  ACTIVE_DOCUMENT_DEBOUNCE_MS,
+  () => { void _sendActiveDocument({}); },
+);
+
+/**
+ * May anything go on the wire right now?
+ *
+ * The `connected` gate is F12's other half: it is what keeps a notify from
+ * firing at a gateway that is not there — and it is also what makes the roughly
+ * ten existing ProjectStore write-path tests, which run with no gateway and no
+ * `fetch` mock, into no-ops instead of real requests against a dead URL.
+ */
+function _mayNotifyConnect(): boolean {
+  if (_activeDocumentUnsupported) return false;
+  return _store.getSnapshot().state === 'connected';
+}
+
+async function _sendActiveDocument(opts: { force?: boolean }): Promise<void> {
+  if (!_mayNotifyConnect()) return;
+  const identity = _activeDocumentIdentity();
+  const generation = _activeDocumentGuard.next();
+  const outcome = await postActiveDocument({ ...identity, force: opts.force ?? false });
+  // An answer that a newer notify has already overtaken describes a state that
+  // is no longer the one on disk — applying it would undo the newer one.
+  if (!_activeDocumentGuard.isCurrent(generation)) return;
+
+  if (outcome.kind === 'unsupported') {
+    _activeDocumentUnsupported = true;
+    return;
+  }
+  if (outcome.kind === 'error') {
+    console.info('[connect] active-document notify did not reach the gateway:', outcome.message);
+    return;
+  }
+  if (outcome.kind === 'mismatch') {
+    _activeDocStore.set({ pending: null, confirming: false, mismatch: outcome.message });
+    return;
+  }
+
+  const result = outcome.result;
+  _activeDocStore.set({
+    mismatch: null,
+    confirming: false,
+    pending: result.pending ? { ...result.pending, documentId: identity.id } : null,
+  });
+  if (result.activeProfile !== undefined) {
+    _store.set({ activeProfile: result.activeProfile });
+  }
+  if (result.activationError) {
+    console.warn(
+      `[connect] the configuration bound to the open document was not activated: ${result.activationError}`);
+  }
+  if (result.created) await _writeBackCreatedRef(identity.id, result.created);
+}
+
+/**
+ * Answer a `created` by writing `documents[].connectRef` — CONNECT may not
+ * write `project.json` itself (plan-718 F1/R1, plan-725 §2.6).
+ *
+ * A failure here is REPORTED, never swallowed: the file exists on disk and
+ * nothing points at it, and an operator who is not told has no way to tell that
+ * configuration apart from one they created by hand and forgot to bind.
+ */
+async function _writeBackCreatedRef(documentId: string | null, created: string): Promise<void> {
+  if (!documentId) {
+    _activeDocStore.set({
+      writeBackError:
+        `CONNECT created "${created}", but no open document could take the binding — bind it by hand.`,
+    });
+    return;
+  }
+  _writingBackCreatedRef = true;
+  try {
+    await getProjectStore().setDocumentConnectRef(documentId, created);
+    _activeDocStore.set({ writeBackError: null });
+  } catch (e) {
+    const why = e instanceof Error ? e.message : String(e);
+    _activeDocStore.set({
+      writeBackError: `CONNECT created "${created}", but the binding could not be saved: ${why}`,
+    });
+  } finally {
+    _writingBackCreatedRef = false;
+  }
+}
+
+/**
+ * The callback the project store calls after a config-bearing write.
+ *
+ * Debounced on the TRAILING edge on purpose: the point is to describe the state
+ * a burst of writes left behind, and a leading call would describe the state
+ * before the last one landed.
+ */
+function _onProjectChanged(): void {
+  // The write-back of a `created` ref is itself a manifest write; without this
+  // the answer to a notify would schedule the next one, forever one round-trip
+  // behind. CONNECT already knows about that file — it made it.
+  if (_writingBackCreatedRef) return;
+  if (!_mayNotifyConnect()) return;
+  _activeDocumentDebounce.schedule(undefined);
+}
+
+/**
+ * Push a pending notify out before the page goes away (F10).
+ *
+ * `sendBeacon` rather than a `fetch`, because it is the only transport the
+ * browser promises to finish after the document is gone. It cannot carry the
+ * `X-API-Key` header — which is exactly why this is a best-effort flush of
+ * something already scheduled and never the normal path: on a loopback gateway
+ * the peer rule admits it, and anywhere else the worst case is the state the
+ * missing notify would have left anyway.
+ *
+ * `pagehide` and `visibilitychange`, explicitly NOT `beforeunload`/`unload` —
+ * those two are unreliable on mobile and are the documented wrong choice (MDN).
+ */
+function _flushActiveDocumentOnHide(): void {
+  if (!_activeDocumentDebounce.hasPending()) return;
+  _activeDocumentDebounce.cancel();
+  if (!_mayNotifyConnect()) return;
+  if (typeof navigator === 'undefined' || typeof navigator.sendBeacon !== 'function') return;
+  const identity = _activeDocumentIdentity();
+  try {
+    navigator.sendBeacon(
+      `${_store.getSnapshot().serverUrl}${ACTIVE_DOCUMENT_ROUTE}`,
+      new Blob([JSON.stringify({ ...identity, force: false })], { type: 'application/json' }),
+    );
+  } catch {
+    // A refused beacon costs a rescan the next notify will do anyway.
+  }
+}
+
+const _onPageHide = (): void => { _flushActiveDocumentOnHide(); };
+const _onVisibilityChange = (): void => {
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+    _flushActiveDocumentOnHide();
+  }
+};
+
+let _notifierInstalled = false;
+let _unsubscribeDocumentView: (() => void) | null = null;
+
+/**
+ * The open document changed — the second trigger beside the write paths (F2).
+ *
+ * Debounced through the same window rather than sent at once: opening a
+ * document republishes this seam several times (the base, then the view), and
+ * a burst of identical notifications is what the trailing edge is for.
+ */
+function _onOpenDocumentChanged(): void {
+  if (!_mayNotifyConnect()) return;
+  _activeDocumentDebounce.schedule(undefined);
+}
+
+/**
+ * Wire the project store's change notifier to this gateway — the HMI half of
+ * the dependency inversion in `project-store.setProjectChangeNotifier`.
+ *
+ * Called from the CONNECT plugin's `init()`, which is where both halves are
+ * already known. Idempotent, and returns its own undo.
+ */
+export function installConnectActiveDocumentNotifier(): () => void {
+  if (!_notifierInstalled) {
+    getProjectStore().setProjectChangeNotifier(_onProjectChanged);
+    _unsubscribeDocumentView = subscribeActiveDocumentView(_onOpenDocumentChanged);
+    if (typeof window !== 'undefined') window.addEventListener('pagehide', _onPageHide);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', _onVisibilityChange);
+    }
+    _notifierInstalled = true;
+  }
+  return uninstallConnectActiveDocumentNotifier;
+}
+
+export function uninstallConnectActiveDocumentNotifier(): void {
+  if (!_notifierInstalled) return;
+  getProjectStore().setProjectChangeNotifier(null);
+  _unsubscribeDocumentView?.();
+  _unsubscribeDocumentView = null;
+  if (typeof window !== 'undefined') window.removeEventListener('pagehide', _onPageHide);
+  if (typeof document !== 'undefined') {
+    document.removeEventListener('visibilitychange', _onVisibilityChange);
+  }
+  _activeDocumentDebounce.cancel();
+  _notifierInstalled = false;
+}
+
+/** Repeat the held-back switch with `force: true` — the hero card's confirm (F13). */
+export async function confirmPendingActivation(): Promise<void> {
+  if (!_activeDocStore.getSnapshot().pending) return;
+  _activeDocStore.set({ confirming: true });
+  _activeDocumentDebounce.cancel();
+  await _sendActiveDocument({ force: true });
+  _activeDocStore.set({ confirming: false });
+}
+
 // ── Test Helpers ───────────────────────────────────────────────────────
 
 /** @internal Reset store state (for testing only). */
 export function _resetConnectStore(): void {
+  _activeDocumentUnsupported = false;
+  _writingBackCreatedRef = false;
+  _activeDocumentGuard.invalidate();
+  _activeDocumentDebounce.cancel();
+  clearActiveDocumentState();
   _statusFailCount = 0;
   hasFetchedConnectThisSession = false;
   connectNewsFetchInFlight = false;
@@ -2155,5 +2696,6 @@ export function _resetConnectStore(): void {
     discoveryLoading: false,
     updateSupported: false,
     updateReason: null,
+    revealSupported: false,
   });
 }

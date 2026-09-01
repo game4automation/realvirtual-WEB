@@ -16,6 +16,7 @@
  * out of order, neither of which is a working store (SOL-Runde 2, Finding 5).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -101,7 +102,7 @@ describe('bulk edit notifications', () => {
     const target = new Group(); target.name = 'Link'; model.add(target);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const seq: StoreState[] = [];
     doc.subscribe(() => {
@@ -140,7 +141,7 @@ describe('bulk edit notifications', () => {
     const target = new Group(); target.name = 'Link'; model.add(target);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     let notifies = 0;
     doc.subscribe(() => { notifies++; });
@@ -161,7 +162,7 @@ describe('bulk edit notifications', () => {
     const { viewer, model, register } = makeMockViewer();
     addParts(model, 3);
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     let notifies = 0;
     doc.subscribe(() => { notifies++; });

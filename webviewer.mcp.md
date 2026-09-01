@@ -20,8 +20,8 @@ Names follow `web_<domain>_<action>`:
 | (root) | `web_status`, `web_logs`, `web_errors`, `web_help`, `web_describe`, `web_measure`, `web_render`, `web_ping` | Orientation, console logs, alarms, guides; `web_measure` = distances/gaps BETWEEN parts, `web_render` = offscreen render from any camera pose (`beauty` or `idmask` segmentation + color→path legend), never touching the user's viewport; `web_ping` is the timer-free liveness probe to reach for when other tools time out |
 | `node` | `web_node_find`, `web_node_tree`, `web_node_bounds`, `web_node_shape` | Scene-graph search, structure, measurement — the source of the node paths all other tools take; `_shape` gives PCA shape class + functional (rotation) axis |
 | `component` | `web_component_get`, `_get_all`, `_list`, `_set` | Read/write component config (rv_extras) |
-| `view` | `web_view_pick`, `_gaze`, `_isolate`, `_source_markers` | Point at things (pick/gaze also select the hit node), de-clutter, overlays |
-| `camera` | `web_camera_get`, `_set`, `_focus`, `_orbit`, `_projection` | Drive the real viewport camera (animated), incl. perspective/iso switch |
+| `view` | `web_view_pick`, `_gaze`, `_isolate`, `_source_markers`, `_sweep` | Point at things (pick/gaze also select the hit node), de-clutter, overlays; `_sweep` returns ONE contact sheet of 4–8 views around a part plus a note per view — understanding an unknown assembly in a single call |
+| `camera` | `web_camera_get`, `_set`, `_focus`, `_orbit`, `_projection`, `_fly` | Drive the real viewport camera (animated), incl. perspective/iso switch; `_fly` moves RELATIVE (forward/right/up in metres, yaw/pitch in degrees, `ground=true` to walk) — use it to travel THROUGH a long line, where orbiting a fixed point is the wrong metaphor |
 | `select` | `web_select`, `web_selection_get`, `web_select_similar` | Selection = same highlights/panels as user clicks |
 | `screenshot` | `web_screenshot`, `_burst`, `_annotated`, `_analyze` | Single frame, motion montage, labelled markers, 4-view shape analysis |
 | `drive`/`signal`/`sensor` | `web_drive_list/_jog/_stop/_speed_override`, `web_signal_list/_status/_set_bool/_set_float`, `web_sensor_list` | Runtime actuation & diagnosis |
@@ -29,13 +29,14 @@ Names follow `web_<domain>_<action>`:
 | `sim` | `web_sim_play_pause`, `web_sim_reset`, `web_transport_status`, `web_logic_flow` | Simulation control & material flow |
 | `mode` | `web_mode_set` | Switch workspace: hmi / planner / des |
 | `layout` | `web_layout_place/_move/_remove/_list`, `web_layout_snap_list/_suggest/_attach` | Build layouts (planner mode) |
-| `library` | `web_library_list`, `web_library_describe` | Parts catalog |
-| `model` | `web_model_list`, `web_model_open` | **THE one document list.** Every GLB the open project owns — `scenes/`, `models/`, `library/` alike, each row carrying its `section` — plus the read-only built-in and published SOURCES. `_open` loads any of them into the viewport |
-| `project` | `web_project_list`, `web_project_open` | Which project the project-relative paths (`cad/`, `library/`, `knowledge/`, `models/`) resolve against; `_open` switches IN PLACE, so the bridge connection survives |
-| `scene` | `web_scene_new/_save/_open/_list/_export`, `web_scene_query` | **Deprecated aliases** of the `model` domain, kept so existing prompts and scripts keep working — the names say "scene", the ops are document ops. `_query` is the exception and is not deprecated: it runs a READ-ONLY JS expression over a frozen scene snapshot, the escape hatch for geometry/material questions no dedicated tool answers |
+| `catalog` | `web_catalog_list`, `web_catalog_describe` | Parts catalog of the layout planner — placeable TEMPLATES (`catalogId`), not project documents |
+| `document` | `web_document_list`, `web_document_open`, `_save`, `_new`, `_update` | **THE document family.** Asset = document = model — one concept, the GLB document of the open project; `scenes/`, `models/`, `library/` are storage places, not types. `_list` is the one list (every GLB the project owns with sizes, plus the read-only built-in SOURCES and, under `published`, the dev-only documents no delivered channel ships); `_open` loads any of them into the viewport; `_save`/`_new` write; `_update` deletes/renames saved custom documents |
+| `project` | `web_project_list`, `web_project_open`, `web_project_tree`, `web_project_folder` | Which project the project-relative paths (`cad/`, `library/`, `knowledge/`, `models/`) resolve against; `_open` switches IN PLACE, so the bridge connection survives. `_tree` navigates the project's folder/document tree exactly as the dashboard shows it; `_folder` creates/renames/moves folders through the same tree verdicts, so document ids never change and references keep resolving |
+| `scene` | `web_scene_query` | READ-ONLY JS expression over a frozen scene snapshot — the escape hatch for geometry/material questions no dedicated tool answers. (The old `web_scene_new/_save/_export` document verbs are retired: they are `web_document_new/_save` and `web_layout_export` now) |
 | `editor` | `web_editor_*` (~30 tools) | Asset Editor: op-logged GLB authoring — lifecycle, transforms, pivots, kinematics, materials, `_kinematize`, `_materialize`, `_verify_drive`, `_shortcut` (keyboard chords: "S>I", "K", "H", …) |
 | `des`/`plc` | `web_des_*`, `web_plc_*` | Event simulation / virtual PLC (internal builds) |
 | `knowledge` | `web_knowledge_set`, `web_knowledge_get`, `web_knowledge_list` | Your memory of this machine, one Markdown note per node, stored inside the GLB — see *Remember what you worked out* below |
+| `link` | `web_link_compose` | Hand out a URL instead of just opening things: with no arguments it snapshots what is open (document/model + active mode + option) into a shareable deep link; with arguments it validates each against the live catalogues and composes one. Read-only, mints no share, and copies nothing from the current address bar — access keys never leak into a composed link |
 
 ### Full roster
 
@@ -43,26 +44,27 @@ The table above says what each domain is FOR; the one below is the complete inve
 from the decorators so it cannot fall behind the code. Parameters per tool: `web_help(topic)`.
 
 <!-- BEGIN GENERATED: tool-domains — do not edit; run `npm run gen:mcp-docs` -->
-_137 tools across 24 domains, generated from the @McpTool decorators — do not edit by hand. Purpose and workflow live in the prose above and in `web_help(topic)`._
+_145 tools across 25 domains, generated from the @McpTool decorators — do not edit by hand. Purpose and workflow live in the prose above and in `web_help(topic)`._
 
 | Domain | # | Tools |
 |--------|---|-------|
 | `(root)` | 8 | `web_describe`, `web_errors`, `web_help`, `web_logs`, `web_measure`, `web_ping`, `web_render`, `web_status` |
-| `camera` | 5 | `web_camera_focus`, `web_camera_get`, `web_camera_orbit`, `web_camera_projection`, `web_camera_set` |
+| `camera` | 7 | `web_camera_fly`, `web_camera_focus`, `web_camera_get`, `web_camera_orbit`, `web_camera_projection`, `web_camera_set`, `web_camera_view` |
+| `catalog` | 2 | `web_catalog_describe`, `web_catalog_list` |
 | `component` | 4 | `web_component_get`, `web_component_get_all`, `web_component_list`, `web_component_set` |
 | `des` | 6 | `web_des_bottleneck`, `web_des_components`, `web_des_set_mode`, `web_des_stats`, `web_des_status`, `web_des_step` |
+| `document` | 5 | `web_document_list`, `web_document_new`, `web_document_open`, `web_document_save`, `web_document_update` |
 | `drive` | 4 | `web_drive_jog`, `web_drive_list`, `web_drive_speed_override`, `web_drive_stop` |
-| `editor` | 55 | `web_editor_add_component`, `web_editor_add_logic_step`, `web_editor_add_signal`, `web_editor_assign_material`, `web_editor_assign_to_kinematic`, `web_editor_close`, `web_editor_convert_signal`, `web_editor_create_empty`, `web_editor_create_kinematic`, `web_editor_delete`, `web_editor_import_cad`, `web_editor_import_glb`, `web_editor_kinematize`, `web_editor_list_kinematics`, `web_editor_material_presets`, `web_editor_material_stats`, `web_editor_materialize`, `web_editor_mechanism_add_body`, `web_editor_mechanism_add_joint`, `web_editor_mechanism_assign_drive`, `web_editor_mechanism_create`, `web_editor_mechanism_fix`, `web_editor_mechanism_forces`, `web_editor_mechanism_inspect`, `web_editor_mechanism_jog`, `web_editor_mechanism_set_anchor`, `web_editor_mechanism_set_anchor_snap`, `web_editor_mechanism_set_axis`, `web_editor_mechanism_set_limits`, `web_editor_mechanism_set_mass`, `web_editor_mechanism_snap_list`, `web_editor_mechanism_statics`, `web_editor_mechanism_validate`, `web_editor_open`, `web_editor_pivot`, `web_editor_project_info`, `web_editor_redo`, `web_editor_remove_component`, `web_editor_rename`, `web_editor_reparent`, `web_editor_rotate90`, `web_editor_save`, `web_editor_separate`, `web_editor_set_field`, `web_editor_set_visible`, `web_editor_shortcut`, `web_editor_status`, `web_editor_test_start`, `web_editor_test_stop`, `web_editor_to_ground`, `web_editor_toggle_signal_direction`, `web_editor_transform`, `web_editor_undo`, `web_editor_verify_drive`, `web_editor_zero_position` |
+| `editor` | 58 | `web_editor_add_component`, `web_editor_add_logic_step`, `web_editor_add_signal`, `web_editor_assign_material`, `web_editor_assign_to_kinematic`, `web_editor_back`, `web_editor_close`, `web_editor_convert_signal`, `web_editor_create_empty`, `web_editor_create_kinematic`, `web_editor_delete`, `web_editor_descend`, `web_editor_import_cad`, `web_editor_import_glb`, `web_editor_kinematize`, `web_editor_list_kinematics`, `web_editor_material_presets`, `web_editor_material_stats`, `web_editor_materialize`, `web_editor_mechanism_add_body`, `web_editor_mechanism_add_joint`, `web_editor_mechanism_assign_drive`, `web_editor_mechanism_create`, `web_editor_mechanism_fix`, `web_editor_mechanism_forces`, `web_editor_mechanism_inspect`, `web_editor_mechanism_jog`, `web_editor_mechanism_set_anchor`, `web_editor_mechanism_set_anchor_snap`, `web_editor_mechanism_set_axis`, `web_editor_mechanism_set_limits`, `web_editor_mechanism_set_mass`, `web_editor_mechanism_snap_list`, `web_editor_mechanism_statics`, `web_editor_mechanism_validate`, `web_editor_open`, `web_editor_pivot`, `web_editor_project_files`, `web_editor_project_info`, `web_editor_redo`, `web_editor_remove_component`, `web_editor_rename`, `web_editor_reparent`, `web_editor_rotate90`, `web_editor_save`, `web_editor_separate`, `web_editor_set_field`, `web_editor_set_visible`, `web_editor_shortcut`, `web_editor_status`, `web_editor_test_start`, `web_editor_test_stop`, `web_editor_to_ground`, `web_editor_toggle_signal_direction`, `web_editor_transform`, `web_editor_undo`, `web_editor_verify_drive`, `web_editor_zero_position` |
 | `knowledge` | 3 | `web_knowledge_get`, `web_knowledge_list`, `web_knowledge_set` |
-| `layout` | 7 | `web_layout_list`, `web_layout_move`, `web_layout_place`, `web_layout_remove`, `web_layout_snap_attach`, `web_layout_snap_list`, `web_layout_snap_suggest` |
-| `library` | 2 | `web_library_describe`, `web_library_list` |
+| `layout` | 8 | `web_layout_export`, `web_layout_list`, `web_layout_move`, `web_layout_place`, `web_layout_remove`, `web_layout_snap_attach`, `web_layout_snap_list`, `web_layout_snap_suggest` |
+| `link` | 1 | `web_link_compose` |
 | `logic` | 1 | `web_logic_flow` |
 | `mode` | 1 | `web_mode_set` |
-| `model` | 2 | `web_model_list`, `web_model_open` |
 | `node` | 4 | `web_node_bounds`, `web_node_find`, `web_node_shape`, `web_node_tree` |
 | `plc` | 4 | `web_plc_deploy`, `web_plc_run`, `web_plc_status`, `web_plc_stop` |
-| `project` | 2 | `web_project_list`, `web_project_open` |
-| `scene` | 6 | `web_scene_export`, `web_scene_list`, `web_scene_new`, `web_scene_open`, `web_scene_query`, `web_scene_save` |
+| `project` | 4 | `web_project_folder`, `web_project_list`, `web_project_open`, `web_project_tree` |
+| `scene` | 1 | `web_scene_query` |
 | `screenshot` | 4 | `web_screenshot`, `web_screenshot_analyze`, `web_screenshot_annotated`, `web_screenshot_burst` |
 | `select` | 2 | `web_select`, `web_select_similar` |
 | `selection` | 1 | `web_selection_get` |
@@ -70,7 +72,7 @@ _137 tools across 24 domains, generated from the @McpTool decorators — do not 
 | `signal` | 8 | `web_signal_bind`, `web_signal_bindings_list`, `web_signal_list`, `web_signal_set_bool`, `web_signal_set_float`, `web_signal_sources_list`, `web_signal_status`, `web_signal_unbind` |
 | `sim` | 2 | `web_sim_play_pause`, `web_sim_reset` |
 | `transport` | 1 | `web_transport_status` |
-| `view` | 4 | `web_view_gaze`, `web_view_isolate`, `web_view_pick`, `web_view_source_markers` |
+| `view` | 5 | `web_view_gaze`, `web_view_isolate`, `web_view_pick`, `web_view_source_markers`, `web_view_sweep` |
 <!-- END GENERATED: tool-domains -->
 
 ## Hard rules
@@ -116,7 +118,7 @@ _137 tools across 24 domains, generated from the @McpTool decorators — do not 
   and an explicit request always outranks what is on screen. So do not expect scene edits made
   with `web_component_set` / `web_layout_*` to appear in the editor session you open, or editor
   edits to show up in the scene afterwards — they are two documents. Edit the scene with the
-  scene tools and save it (`web_scene_save`), or edit the asset in the editor and save it
+  scene tools and save it (`web_document_save`), or edit the asset in the editor and save it
   (`web_editor_save`); pick one per task rather than mixing them and assuming continuity.
 - `web_layout_place` drops parts on the ground (`y` ignored) — heights via `web_layout_move`
   (rules: `web_help("layout")`).
@@ -133,9 +135,18 @@ _137 tools across 24 domains, generated from the @McpTool decorators — do not 
   `web_editor_mechanism_jog`. Use this for closed loops (four-bar, scissor, Delta) —
   NOT for a single hinge or carriage, which is a kinematic axis (`web_editor_kinematize`).
   `_validate` and `_jog` are transient: no ops, no undo entries.
-- **Build a layout** (`web_help("layout")`): `web_mode_set(planner)` → `web_library_list` →
+- **Understand an unknown assembly:** `web_view_sweep(paths)` — ONE contact sheet of 4–8 views
+  plus a note per view (visible top nodes with coverage, background share, measured camera
+  position) → pick the interesting cell → `web_camera_set(<its cameraPosition>)` →
+  `web_screenshot`. Replaces the orbit → screenshot → orbit loop at roughly a fifth of the
+  vision tokens. `topNodes` is a raycast SAMPLE, so thin parts (railings, cable trays) can be
+  missed — check `samples` and `background` before concluding something is absent.
+- **Travel through a long line:** `web_camera_fly(forward, right, up, yawDeg, pitchDeg)` moves
+  RELATIVE to where the camera is, and `ground=true` walks at eye height over the surface
+  below. `web_camera_orbit` circles a fixed point and is the wrong tool for an 80 m line.
+- **Build a layout** (`web_help("layout")`): `web_mode_set(planner)` → `web_catalog_list` →
   `web_layout_place` → `web_layout_snap_attach` chain → `web_component_set` →
-  `web_sim_play_pause` → `web_scene_save`.
+  `web_sim_play_pause` → `web_document_save`.
 - **Debug motion/flow** (`web_help("simulation")`): `web_drive_list` → `web_signal_status` →
   actuate (`web_drive_jog` / `web_signal_set_*`) → `web_screenshot_burst`.
 - **Bind a PLC to a model:** `web_signal_bindings_list` (what slots exist, what is on them) →
@@ -179,6 +190,13 @@ _137 tools across 24 domains, generated from the @McpTool decorators — do not 
     invisible to `web_component_get` (no live instance is created for it) — read it with
     `web_knowledge_get`. A Unity re-export of the model DROPS notes; see `doc-ai-integration.md`.
   - `web_knowledge_set` needs CONNECT's write switch; `_get` and `_list` do not.
+- **Check a model before it ships** (offline — no viewer, no MCP, no three.js):
+  `npm run audit:instruction-targets -- <model.glb> [--json]` resolves every
+  `CustomRuntimeInstruction` step target straight from the GLB's JSON chunk and reports each as
+  `resolvable`, `unresolvable` or `path not in GLB`. It counts twice — under the pre-plan-734
+  alias rule and under the current one — so a single run shows before and after. Exit 0 = clean,
+  1 = unresolvable targets, 2 = the file is missing or not a GLB. Run it before a customer
+  delivery; details in `doc-node-paths.md` § *Checking a GLB before it ships*.
 
 ## Connection
 

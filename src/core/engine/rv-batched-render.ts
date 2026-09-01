@@ -122,7 +122,21 @@ const FILL_YIELD_VERTEX_BUDGET = 500_000;
  *  every time the CSG kernel re-tessellates a dirty chunk. The batcher bakes
  *  the HOME pose into a static arena exactly once, so a batched workpiece would
  *  keep showing its uncut shape forever. */
-const EXCLUDED_SUBTREE_KEYS = ['TransportSurface', 'Source', 'Sink', 'MU', 'Cam', 'MachiningVolume'] as const;
+/** `PlacementMeta` marks a planner placement (plan-397 phase 6): the user can
+ *  move and delete it at runtime, exactly like a freshly dragged-in library
+ *  object — which renders per-object because it arrives AFTER the batch build.
+ *  Baking a placement into a static arena froze its frame at the load pose:
+ *  dragging moved only the drive-anchored (kinematic) parts — "only the rolls
+ *  move" — and deletion would leave the baked geometry behind (2026-09-01,
+ *  DemoPlanner). Same rule as the place path, so behavior is identical. */
+/** `Chain` (plan-733) is the mover case, not a material case: the component
+ *  clones its element template N times at load and writes each clone's position
+ *  and rotation every tick. The clones are created in the loader's onSceneReady
+ *  pass — BEFORE the batch build — so they would be legitimate candidates, and a
+ *  static arena would freeze the whole chain at its start pose. Excluding the
+ *  subtree keeps the elements individual meshes, exactly like MU/TransportSurface
+ *  geometry; an instanced fast path is a separate follow-up, not a batch entry. */
+const EXCLUDED_SUBTREE_KEYS = ['TransportSurface', 'Source', 'Sink', 'MU', 'Cam', 'MachiningVolume', 'PlacementMeta', 'Chain'] as const;
 
 function isSkinnedOrMorphed(mesh: Mesh): boolean {
   if ((mesh as Mesh & { skeleton?: unknown }).skeleton) return true;

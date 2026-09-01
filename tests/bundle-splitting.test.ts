@@ -196,8 +196,107 @@ const distFiles = import.meta.glob('../dist/**/*.{html,js}', {
  *
  *    Re-pinned just above the measurement (+0.39 %), same convention as every
  *    entry above.
+ *  - 17.08.2026 (plan-713 NF3): the standing candidate above was TAKEN. Both
+ *    stands built in this worktree, minutes apart, off the same node_modules,
+ *    differing in exactly one line — where `src/hooks/use-mcp-bridge.ts` imports
+ *    `DEFAULT_BRIDGE_PORT` from:
+ *
+ *      from '../plugins/mcp-bridge-plugin'              3_649_550
+ *      from '../plugins/mcp-bridge/rv-mcp-bridge-ports' 3_299_001   (−350_549, −9.6 %)
+ *
+ *    The constant moved into a leaf module of its own; nothing else about the
+ *    bridge changed. `main.ts` already loaded the plugin through `await
+ *    import(...)`, and with the last value import gone the whole cluster finally
+ *    lands where it was always meant to: its own lazy chunk,
+ *    `assets/mcp-bridge-plugin-*.js` at 342_169 B, downloaded only when someone
+ *    actually turns the bridge on in the Settings AI tab.
+ *
+ *    Note what the first number says: trunk had ALREADY drifted 129 kB past the
+ *    3_520_000 pin and nothing had caught it, because a budget is only checked
+ *    when the test runs. Re-pinned DOWNWARD to just above the new measurement
+ *    (+0.33 %) so the win cannot be quietly spent — the whole point of taking a
+ *    documented candidate is to keep the room it freed.
+ *  - 31.08.2026 (trunk maintenance, no feature): the pin was red, and measuring
+ *    it properly turned up something this file has been doing silently for a
+ *    year — it pins ONE BUILD FLAVOUR without ever saying which. Three stands,
+ *    all built on the same machine off the same `node_modules`, hidden source
+ *    maps, `git worktree add` checkouts so the canonical tree stayed clean:
+ *
+ *      A  6becdc2 (the 17.08 pin commit) + private sibling   3_440_229
+ *      B  94331d7 main, 91 commits later + same private      3_492_403  (+52_174, +1.52 %)
+ *      C  94331d7 main, PUBLIC build (no private sibling)    3_349_809  (−142_594 vs B)
+ *
+ *    Stand A measures 141_228 MORE than the 3_299_001 plan-713 recorded for the
+ *    very same commit. That is not drift and not code: `package-lock.json` has
+ *    97 changed entries since, but every one of them is an ADDITION (the
+ *    react-markdown stack) — not a single package the base tree imports was
+ *    upgraded. The gap is the private DES cluster, 114_931 B of it attributed
+ *    directly (see the split candidate below) and the rest what it drags in.
+ *    Cross-check: C − 3_299_001 = 50_808 against B − A = 52_174 — two
+ *    independent deltas agreeing within 1.4 kB. So the 17.08 measurement was a
+ *    PUBLIC build, and this file's history is a public-build history, while the
+ *    default `npm run build` of an internal checkout (private sibling present)
+ *    has always been ~142 kB larger and never once been the number written down.
+ *
+ *    Real trunk growth over those 91 commits is therefore +52_174, not the
+ *    +182 kB the red test suggested. Source-map attributed per module group:
+ *      plan-447 path network as planner objects  +16_499  (path-visualizer 8_784,
+ *                                                 rv-path-edit, path-snap-source,
+ *                                                 rv-path-network, Agv, rv-erratic)
+ *      plan-719 unified save + scene store       +11_566  (SaveDialogs +
+ *                                                 save-dialog-store new, DocumentCard
+ *                                                 +3_678, rv-scene-glb-bake, scene-store)
+ *      plan-716 project model + backends          +9_475  (project-store +3_492,
+ *                                                 four backends, project refs/documents)
+ *      CONNECT panel + store + embed              +6_650  (connect-store +5_291)
+ *      core viewer / loader / misc                +5_949
+ *      plan-431 node-knowledge field renderer     +5_002  (the react-markdown
+ *                                                 pipeline itself stays lazy —
+ *                                                 rv-markdown-lazy costs 305 B here)
+ *      layout planner + snap points               +4_268
+ *      node_modules + unmapped + rest             +1_805
+ *      demo GLBs no longer inlined                −8_863
+ *    All of it is ordinary feature weight spread over eight plans; nothing in
+ *    this delta is a regression and nothing in it is worth a split of its own.
+ *
+ *    The −8_863 is the 08.08 entry's second follow-up closing itself, but NOT in
+ *    the way that entry proposed. `assetsInlineLimit` was never lowered and
+ *    main.ts still does `import.meta.glob('/public/models/*.glb', {eager:true})`
+ *    — the demo models simply LEFT `public/models/` (9 GLBs at 6becdc2, 1 today,
+ *    plan-716 moved documents into the projects). mechanism-scissor (4_129) and
+ *    physics-zone-test (4_337) stopped being base64'd because they are gone, not
+ *    because the hazard was fixed. Drop a sub-4 kB GLB in that folder and it is
+ *    back, silently.
+ *
+ *    plan-386's share links, flagged in the 08.08 entry as "never re-pinned":
+ *    settled. `src/core/share/*` + SharedViewBanner is 35_556 B in the entry and
+ *    IDENTICAL in stands A and B, so it has been inside the pinned base since
+ *    17.08 and owes nothing. It stays a candidate, not a debt.
+ *
+ *    SPLIT CANDIDATE (named, deliberately NOT implemented): the private DES
+ *    cluster, ~114_931 B — by far the largest single block in an internal build's
+ *    entry and, unlike ConnectPanel or layout-planner, not a defended
+ *    non-target. `src/core/rv-viewer.ts:231` statically imports `createDesRunner`
+ *    from `@rv-private/plugins/des/register-des-runner`, so des-runner (28_886),
+ *    rv-des-component, rv-des-manager, material-flow-adapter, rv-des-snapshot and
+ *    the experiment store all land in the startup path although DES is an opt-in
+ *    mode nobody enters on first frame. Public builds already resolve that
+ *    specifier to a `null` stub, so making the factory `await import()` on first
+ *    DES activation costs public builds nothing and would give internal builds
+ *    back what the mcp-bridge split gave everyone on 17.08 — a plan-713-shaped
+ *    fix: one static import, one lazy chunk. Second, smaller and public: the
+ *    save pipeline imports `SDK_API_VERSION` from `rv-sdk-dts` (17_756 B in the
+ *    entry), a d.ts GENERATOR that only the Monaco script editor needs — the
+ *    same one-constant-drags-a-module shape as `DEFAULT_BRIDGE_PORT` was.
+ *
+ *    Re-pinned to 3_515_000, which is +0.65 % over the INTERNAL build (B), not
+ *    over the public one — deliberately, because the internal build is what
+ *    `npm run build` produces in this checkout and a budget nobody's build can
+ *    satisfy is a budget that gets ignored. Public builds keep ~165 kB of headroom
+ *    under it; if that slack ever matters, split the number in two rather than
+ *    pinning the smaller flavour and calling the larger one broken.
  */
-const ENTRY_BUDGET_BYTES = 3_520_000;
+const ENTRY_BUDGET_BYTES = 3_515_000;
 
 /** Panels that MUST have their own chunk and be gone from the entry.
  *  `marker` is a literal that only exists in the panel's IMPLEMENTATION — the
@@ -318,13 +417,17 @@ describe('bundle splitting — panel chunks', () => {
  * plan-707 NF4 — the self-describing MCP tooling must not grow the startup path.
  *
  * One honest correction to the plan's assumption, made here rather than in a
- * comment nobody reads: the MCP bridge is NOT lazy today. `main.ts` loads it
- * through `await import(...)`, but a single value import in
- * `src/hooks/use-mcp-bridge.ts` (`DEFAULT_BRIDGE_PORT`) drags the whole cluster
- * back into the entry — documented at length in the ENTRY_BUDGET_BYTES history
- * above. So "the delta probes are not in the entry" is not an assertion that
- * can be true while the bridge itself is there, and pretending otherwise would
- * be a green tick over a false statement.
+ * comment nobody reads: the MCP bridge was NOT lazy when plan-707 landed.
+ * `main.ts` loaded it through `await import(...)`, but a single value import in
+ * `src/hooks/use-mcp-bridge.ts` (`DEFAULT_BRIDGE_PORT`) dragged the whole
+ * cluster back into the entry. So "the delta probes are not in the entry" was
+ * not an assertion that could be true while the bridge itself was there, and
+ * pretending otherwise would have been a green tick over a false statement.
+ *
+ * plan-713 NF3 fixed it — the constant lives in `rv-mcp-bridge-ports.ts` now and
+ * the bridge finally has its own lazy chunk (see the 17.08.2026 entry in the
+ * ENTRY_BUDGET_BYTES history). The assertions below were written to be true
+ * either way and are left exactly as they were.
  *
  * What IS assertable, and what NF4 actually cares about:
  *   1. The documentation renderer is test-only and reaches NO shipped chunk.

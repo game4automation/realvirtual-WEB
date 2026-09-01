@@ -18,12 +18,14 @@
  * the document, its op log, its undo/redo — is real.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { AssetDocument } from '../src/core/editor/rv-asset-document';
 import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
 import { InPlaceTestSession } from '@rv-private/plugins/asset-editor/in-place-test-session';
+import { saveAssetAs } from '@rv-private/plugins/asset-editor/save-flow';
 import { _resetSceneTransition } from '../src/core/hmi/scene-transition-store';
 import { projectDocumentBase } from '../src/core/editor/active-asset-store';
 
@@ -44,7 +46,7 @@ vi.mock('../src/core/editor/rv-asset-glb-export', async (importOriginal) => {
   };
 });
 
-interface LoadCall { url: string; options?: { preserveHierarchy?: boolean } }
+interface LoadCall { url: string; options?: { preserveHierarchy?: boolean; preserveAuthoringHierarchy?: boolean } }
 
 function makeEnv(opts?: { loadImpl?: (call: LoadCall) => Promise<void> }) {
   const scene = new Scene();
@@ -86,7 +88,7 @@ function makeEnv(opts?: { loadImpl?: (call: LoadCall) => Promise<void> }) {
       set.add(fn);
       return () => { set!.delete(fn); };
     },
-    async loadModel(url: string, options?: { preserveHierarchy?: boolean }) {
+    async loadModel(url: string, options?: { preserveHierarchy?: boolean; preserveAuthoringHierarchy?: boolean }) {
       const call = { url, options };
       loads.push(call);
       hooks.order.push('load');
@@ -140,7 +142,7 @@ afterEach(() => {
 describe('InPlaceTestSession — start', () => {
   it('materialises through the export path, loads the blob and attaches the runtime', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session, swaps } = makeSession(env, doc);
 
     await session.start();
@@ -152,13 +154,16 @@ describe('InPlaceTestSession — start', () => {
     // The TEST load uses the default (runtime) configuration, not the
     // authoring one — it must behave like the planner/HMI after a save.
     expect(env.loads[0].options?.preserveHierarchy).toBeUndefined();
+    // plan-727: the test run must see the RUNTIME view — including the kinematic
+    // re-parenting a planner/HMI would see after a save. Neither flag is set.
+    expect(env.loads[0].options?.preserveAuthoringHierarchy).toBeUndefined();
     expect(swaps).toHaveLength(1);
     doc.dispose();
   });
 
   it('emits asset-editor-pre-export BEFORE the export, and a preview actually restores', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
 
     // Stand-in for DriveDragPreview/JogController: holds a preview pose and
@@ -184,7 +189,7 @@ describe('InPlaceTestSession — start', () => {
 
   it('drains the op queue before exporting', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const original = doc.whenIdle.bind(doc);
     doc.whenIdle = () => { hooks.order.push('whenIdle'); return original(); };
     const { session } = makeSession(env, doc);
@@ -201,7 +206,7 @@ describe('InPlaceTestSession — start', () => {
 
   it('a second start while running is a no-op with a warning', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -217,7 +222,7 @@ describe('InPlaceTestSession — start', () => {
 
   it('suspends autosave for the duration of the run', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
 
     await session.start();
@@ -232,7 +237,7 @@ describe('InPlaceTestSession — start', () => {
 describe('InPlaceTestSession — stop restores the authoring state', () => {
   it('re-loads the frozen blob with the authoring configuration and never replays ops', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const replaySpy = vi.spyOn(doc, 'replayOps');
     const { session, reinits } = makeSession(env, doc);
 
@@ -243,6 +248,9 @@ describe('InPlaceTestSession — stop restores the authoring state', () => {
     expect(env.runtimeCalls).toEqual(['begin', 'end']);
     expect(env.loads).toHaveLength(2);
     expect(env.loads[1].options?.preserveHierarchy).toBe(true);
+    // plan-727: the restore returns to the authoring view, which never mutates
+    // the hierarchy.
+    expect(env.loads[1].options?.preserveAuthoringHierarchy).toBe(true);
     // The restore is a blob re-load + metadata hand-back (R1-2).
     expect(replaySpy).not.toHaveBeenCalled();
     expect(reinits).toHaveLength(1);
@@ -251,7 +259,7 @@ describe('InPlaceTestSession — stop restores the authoring state', () => {
 
   it('edit → save → test → stop leaves the document CLEAN', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
 
     doc.setField(env.boxPath, 'Drive', 'TargetSpeed', 200, 50);
@@ -276,7 +284,7 @@ describe('InPlaceTestSession — stop restores the authoring state', () => {
 
   it('edit → undo → test → stop keeps the redo stack intact', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
 
     doc.setField(env.boxPath, 'Drive', 'TargetSpeed', 200, 50);
@@ -299,7 +307,7 @@ describe('InPlaceTestSession — stop restores the authoring state', () => {
 
   it('a dirty document stays dirty across the round trip', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
 
     doc.setField(env.boxPath, 'Drive', 'TargetSpeed', 200, 50);
@@ -316,7 +324,7 @@ describe('InPlaceTestSession — stop restores the authoring state', () => {
 
   it('stop without a run is a no-op', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
 
     await session.stop();
@@ -330,7 +338,7 @@ describe('InPlaceTestSession — stop restores the authoring state', () => {
 describe('InPlaceTestSession — cancellation', () => {
   it('abortSync during a SLOW EXPORT: the stale continuation loads and attaches nothing', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
 
     let releaseExport!: () => void;
@@ -357,7 +365,7 @@ describe('InPlaceTestSession — cancellation', () => {
     const env = makeEnv({
       loadImpl: () => new Promise<void>((resolve) => { releaseLoad = resolve; }),
     });
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
 
     const started = session.start();
@@ -374,7 +382,7 @@ describe('InPlaceTestSession — cancellation', () => {
 
   it('abortSync detaches and does NOT restore the scene (that owner is _deactivate)', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
 
     await session.start();
@@ -390,7 +398,7 @@ describe('InPlaceTestSession — cancellation', () => {
 
   it('dispose is an abort that leaves nothing attached', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
 
     await session.start();
@@ -409,7 +417,7 @@ describe('InPlaceTestSession — failure paths', () => {
         if (failNext) { failNext = false; throw new Error('parse error'); }
       },
     });
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session, errors } = makeSession(env, doc);
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -421,13 +429,16 @@ describe('InPlaceTestSession — failure paths', () => {
     // The snapshot existed already, so the authoring scene was put back.
     expect(env.loads).toHaveLength(2);
     expect(env.loads[1].options?.preserveHierarchy).toBe(true);
+    // plan-727: the restore returns to the authoring view, which never mutates
+    // the hierarchy.
+    expect(env.loads[1].options?.preserveAuthoringHierarchy).toBe(true);
     error.mockRestore();
     doc.dispose();
   });
 
   it('a failing export ends in failed without touching the scene', async () => {
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session, errors } = makeSession(env, doc);
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     hooks.exportImpl = async () => { throw new Error('non-serialisable userData'); };
@@ -457,7 +468,7 @@ describe('InPlaceTestSession — failure paths', () => {
   it('every blob URL is revoked — success, cancellation and failure alike', async () => {
     // Success round trip.
     const env = makeEnv();
-    const doc = AssetDocument.newUntitled(env.viewer);
+    const doc = scratchAssetDocument(env.viewer);
     const { session } = makeSession(env, doc);
     await session.start();
     await session.stop();
@@ -467,7 +478,7 @@ describe('InPlaceTestSession — failure paths', () => {
     const env2 = makeEnv({
       loadImpl: async () => { if (failNext) { failNext = false; throw new Error('boom'); } },
     });
-    const doc2 = AssetDocument.newUntitled(env2.viewer);
+    const doc2 = scratchAssetDocument(env2.viewer);
     const { session: session2 } = makeSession(env2, doc2);
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     await session2.start();
@@ -476,5 +487,30 @@ describe('InPlaceTestSession — failure paths', () => {
     expect(revokeSpy.mock.calls.length).toBe(createSpy.mock.calls.length);
     doc.dispose();
     doc2.dispose();
+  });
+});
+
+describe('saveAssetAs — test-run guard', () => {
+  // During a test run `viewer.currentModelRoot` is the materialised test scene
+  // with runtime poses; a save accepted then bakes those poses into the GLB as
+  // the authored zero position (the 2026-08-22 delta robot incident). The save
+  // must refuse for the same span the edit guard covers: while
+  // `isAutosaveSuspended` marks the document as held by a test run.
+  it('refuses a save while a test run holds the document', async () => {
+    const env = makeEnv();
+    const doc = scratchAssetDocument(env.viewer);
+    const { session } = makeSession(env, doc);
+    await session.start();
+    expect(doc.isAutosaveSuspended).toBe(true);
+
+    const outcome = await saveAssetAs({ viewer: env.viewer, doc }, doc.name || 'Asset');
+
+    expect(outcome.kind).toBe('blocked');
+    if (outcome.kind === 'blocked') {
+      expect(outcome.reason).toMatch(/test run/i);
+    }
+    await session.stop();
+    expect(doc.isAutosaveSuspended).toBe(false);
+    doc.dispose();
   });
 });

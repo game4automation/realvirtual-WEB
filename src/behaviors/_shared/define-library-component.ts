@@ -141,6 +141,10 @@ export function defineLibraryComponent<
 
   return {
     models: def.models ?? [`*${def.type}*`],
+    // The payload→adapter bridge (plan-455): carrying the declared TYPE lets the
+    // BehaviorManager bind this exact adapter for an `rv_extras[type]` hit, with
+    // no detour through the module filename.
+    type: def.type,
     bind(rv: RVBindContext): void {
       // Plan 201 — per-component state statistics, fed by `self.setState` and
       // aggregated by the viewer's shared StatisticsManager. Created up front so

@@ -14,3 +14,4 @@
 
 export default {};
 export const saveAssetAs: any = () => undefined;
+export const describeSaveFailure: any = () => 'Save unavailable in this build';

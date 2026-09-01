@@ -11,6 +11,13 @@
  * settings; publishing
  * also records per-target provenance instead of one shared `lastPublished`.
  *
+ * plan-720 develops P0-3 rather than reversing it: the list became a UNION.
+ * "The manifest must not win" still holds in the only direction it was ever
+ * about — a manifest can never HIDE a GLB that sits in `models/`. What it may
+ * now do is ADD one the glob structurally cannot see, namely a root-level
+ * document (`wmyb/P1002_SAIER.glb`), which published an empty `models.json` for
+ * as long as the glob was the whole answer.
+ *
  * Runner: `npm run test:node` (vitest.node.config.ts, environment: node).
  */
 
@@ -25,6 +32,7 @@ import {
   readProjectSettingsFile,
   publishedSceneIndex,
   projectModelNames,
+  projectModelNamesWithReport,
   stagePrivateProject,
   loadProject,
   SETTINGS_RESERVED_KEYS,
@@ -44,10 +52,13 @@ function tempDir(prefix: string): string {
 function makeProject(root: string, manifest: Record<string, unknown>, opts: {
   models?: string[];
   scenes?: string[];
+  rootGlbs?: string[];
   settings?: unknown;
+  noManifest?: boolean;
 } = {}): string {
   mkdirSync(root, { recursive: true });
-  writeFileSync(join(root, 'project.json'), JSON.stringify(manifest, null, 2));
+  if (!opts.noManifest) writeFileSync(join(root, 'project.json'), JSON.stringify(manifest, null, 2));
+  for (const g of opts.rootGlbs ?? []) writeFileSync(join(root, g), 'glb-bytes');
   if (opts.models) {
     mkdirSync(join(root, 'models'), { recursive: true });
     for (const m of opts.models) writeFileSync(join(root, 'models', m), 'glb-bytes');
@@ -102,6 +113,126 @@ describe('models.json stays folder-derived (P0-3)', () => {
       const staged = await stagePrivateProject({ distDir, projectDir });
       expect(JSON.parse(readFileSync(join(staged, 'models.json'), 'utf8')))
         .toEqual(projectModelNames(projectDir));
+      rmSync(staged, { recursive: true, force: true });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+// plan-720: the manifest may only LENGTHEN the list, never shorten it.
+describe('models.json is a union of folder and manifest (plan-720)', () => {
+  const rootDoc = (path: string) => ({
+    id: `doc_${path}`, name: path.replace(/\.glb$/, ''), path, section: 'library',
+  });
+
+  it('adds manifest-declared root-level GLBs to the folder list (wmyb layout)', () => {
+    const dir = tempDir('rv-union-');
+    try {
+      const p = makeProject(join(dir, 'p'), {
+        name: 'P', code: 'c1', canonicalName: 'p',
+        documents: [rootDoc('P1002_SAIER.glb')],
+      }, { models: ['a.glb'], rootGlbs: ['P1002_SAIER.glb'] });
+      expect(projectModelNames(p).sort()).toEqual(['P1002_SAIER.glb', 'a.glb']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('publishes a root-only project that used to get an empty models.json', () => {
+    const dir = tempDir('rv-union-');
+    try {
+      const p = makeProject(join(dir, 'p'), {
+        name: 'P', code: 'c1', canonicalName: 'p',
+        documents: [rootDoc('Machine.glb')],
+      }, { rootGlbs: ['Machine.glb'] });
+      expect(projectModelNames(p)).toEqual(['Machine.glb']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a manifest entry whose file is missing is reported, not published', () => {
+    const dir = tempDir('rv-union-');
+    try {
+      const p = makeProject(join(dir, 'p'), {
+        name: 'P', code: 'c1', canonicalName: 'p',
+        documents: [rootDoc('ghost.glb')],
+      }, { models: ['a.glb'] });
+      const { list, discrepancies } = projectModelNamesWithReport(p);
+      expect(list).not.toContain('ghost.glb');
+      expect(discrepancies).toContainEqual(
+        expect.objectContaining({ kind: 'missing-file', path: 'ghost.glb' }));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('reports a folder GLB the manifest does not know — and publishes it anyway (P0-3)', () => {
+    const dir = tempDir('rv-union-');
+    try {
+      const p = makeProject(join(dir, 'p'), {
+        name: 'P', code: 'c1', canonicalName: 'p',
+        documents: [rootDoc('Machine.glb')],
+      }, { models: ['stray.glb'], rootGlbs: ['Machine.glb'] });
+      const { list, discrepancies } = projectModelNamesWithReport(p);
+      expect(list).toContain('stray.glb');
+      expect(discrepancies).toContainEqual(
+        expect.objectContaining({ kind: 'unregistered', path: 'models/stray.glb' }));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('never pulls scenes/ or library/ documents into models.json', () => {
+    // Those folders are staged wholesale and catalogued elsewhere; listing them
+    // here would duplicate their bytes and call a library part a machine model.
+    const dir = tempDir('rv-union-');
+    try {
+      const p = makeProject(join(dir, 'p'), {
+        name: 'P', code: 'c1', canonicalName: 'p',
+        documents: [
+          { id: 'd1', name: 'A', path: 'scenes/A.glb', section: 'scenes' },
+          { id: 'd2', name: 'B', path: 'library/B.glb', section: 'library' },
+        ],
+      }, { models: ['a.glb'], scenes: ['A.glb'] });
+      expect(projectModelNames(p)).toEqual(['a.glb']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a project without project.json falls back to the folder glob', () => {
+    const dir = tempDir('rv-union-');
+    try {
+      const p = makeProject(join(dir, 'p'), {}, { models: ['a.glb', 'b.glb'], noManifest: true });
+      expect(projectModelNames(p).sort()).toEqual(['a.glb', 'b.glb']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a manifest with empty documents[] equals the plain folder glob', () => {
+    const dir = tempDir('rv-union-');
+    try {
+      const p = makeProject(join(dir, 'p'), {
+        name: 'P', code: 'c1', canonicalName: 'p', documents: [],
+      }, { models: ['a.glb', 'b.glb'] });
+      expect(projectModelNamesWithReport(p)).toMatchObject({
+        list: expect.arrayContaining(['a.glb', 'b.glb']), discrepancies: [],
+      });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('does not throw on a manifest that would fail loadProject validation', () => {
+    // okok has no `code`. Deriving a file list is not the deploy gate's job.
+    const dir = tempDir('rv-union-');
+    try {
+      const p = makeProject(join(dir, 'p'), { name: 'okok', documents: [rootDoc('empty.glb')] },
+        { rootGlbs: ['empty.glb'] });
+      expect(projectModelNames(p)).toEqual(['empty.glb']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('stages a root-level document into models/ under its bare name', async () => {
+    const dir = tempDir('rv-union-stage-');
+    try {
+      const projectDir = makeProject(join(dir, 'p'), {
+        name: 'P', code: 'code1', canonicalName: 'p',
+        documents: [rootDoc('Machine.glb')],
+        settings: { defaultModel: 'Machine.glb' },
+      }, { rootGlbs: ['Machine.glb'] });
+      const staged = await stagePrivateProject({ distDir: makeDist(join(dir, 'dist')), projectDir });
+      expect(JSON.parse(readFileSync(join(staged, 'models.json'), 'utf8'))).toEqual(['Machine.glb']);
+      expect(readFileSync(join(staged, 'models', 'Machine.glb'), 'utf8')).toBe('glb-bytes');
+      expect(JSON.parse(readFileSync(join(staged, 'settings.json'), 'utf8')).defaultModel)
+        .toBe('models/Machine.glb');
       rmSync(staged, { recursive: true, force: true });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

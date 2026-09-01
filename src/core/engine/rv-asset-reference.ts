@@ -124,12 +124,130 @@ export function parseReferenceBounds(raw: unknown): RvReferenceBounds | null {
  */
 export type ComponentPatch = Record<string, Record<string, unknown>>;
 
-/** On the same reference node: what this file changes in the referenced subtree. */
+/**
+ * A local transform this file gives one node of the referenced subtree.
+ *
+ * glTF-native local TRS of the TARGET node, in the referenced file's own frame
+ * — exactly the numbers the editor produces when the user drags a part, so
+ * applying it is a `set`, never a conversion. Every field is optional and
+ * independent: an override that only moves a part leaves its rotation and
+ * scale as the asset authored them.
+ */
+export interface TrsOverride {
+  position?: [number, number, number];
+  quaternion?: [number, number, number, number];
+  scale?: [number, number, number];
+}
+
+/**
+ * On the same reference node: what this file changes in the referenced subtree.
+ *
+ * `trsByNodeId` is a SIBLING of `byNodeId`, not a key inside it, and that is a
+ * correctness point rather than a layout preference: `byNodeId[nodeId]` IS the
+ * flat `ComponentPatch` map, so a `trs` key living in there would be handed to
+ * {@link applyComponentPatch} as a component type and written into the target's
+ * `extras.realvirtual.trs` — a fake component in every file we save. A sibling
+ * field is invisible to the patch path by construction, which is what makes the
+ * addition genuinely additive (proven by `rv-asset-override-compat.test.ts`,
+ * not asserted here).
+ */
 export interface AssetOverrides {
   /** NodeId within the referenced file → patch. The primary addressing. */
   byNodeId: Record<string, ComponentPatch>;
   /** Fallback: path RELATIVE TO THE REFERENCE NODE → patch. */
   byPath?: Record<string, ComponentPatch>;
+  /**
+   * NodeId within the referenced file → local transform (plan-444 F3/F4).
+   *
+   * The answer to "I moved a part after importing CAD and could not save".
+   * A transform is glTF-native data on `nodes[i]` rather than an
+   * `extras.realvirtual` component, so it could not ride in a `ComponentPatch`
+   * and used to be refused outright (`UnwritableTransformError`). It is stored
+   * on the reference node, so the referenced asset still stays untouched and
+   * ten instances of the same assembly still move independently.
+   *
+   * Absent in every file written before this existed — which is the default,
+   * and means "no override" (F6).
+   */
+  trsByNodeId?: Record<string, TrsOverride>;
+}
+
+/**
+ * A scale component this close to zero collapses the node's matrix.
+ *
+ * A zero scale makes `matrixWorld` singular: raycasting inverts it, and the
+ * NaNs that come back poison every picking test for the rest of the session
+ * with no error anywhere near the cause. A degenerate scale in a file is a
+ * writer bug, so the scale is REJECTED (the asset's own stays) rather than
+ * clamped to a number nobody asked for — see {@link parseTrsOverride}.
+ */
+const MIN_ABS_SCALE = 1e-6;
+
+function readQuad(v: unknown): [number, number, number, number] | null {
+  if (!Array.isArray(v) || v.length !== 4) return null;
+  const out = v.map(n => (typeof n === 'number' && Number.isFinite(n) ? n : NaN));
+  if (out.some(Number.isNaN)) return null;
+  return [out[0], out[1], out[2], out[3]];
+}
+
+/**
+ * Parse one `trsByNodeId` entry, or null when nothing usable is in it.
+ *
+ * Per-field defence, not all-or-nothing: a malformed rotation must not throw
+ * away a perfectly good position, because the two were written by the same
+ * save and the position is what the user actually moved. A quaternion of
+ * length ~0 is rejected — normalising it would invent a rotation, and applying
+ * it verbatim produces a NaN matrix.
+ */
+export function parseTrsOverride(raw: unknown): TrsOverride | null {
+  if (!isPlainObject(raw)) return null;
+  const out: TrsOverride = {};
+
+  const position = readTriple(raw.position);
+  if (position) out.position = position;
+
+  const quaternion = readQuad(raw.quaternion);
+  if (quaternion) {
+    const lengthSq = quaternion[0] ** 2 + quaternion[1] ** 2 + quaternion[2] ** 2 + quaternion[3] ** 2;
+    if (lengthSq > 1e-12) out.quaternion = quaternion;
+  }
+
+  const scale = readTriple(raw.scale);
+  if (scale && scale.every(s => Math.abs(s) >= MIN_ABS_SCALE)) out.scale = scale;
+
+  return out.position || out.quaternion || out.scale ? out : null;
+}
+
+/** Parse a whole `trsByNodeId` block, dropping entries that carry nothing. */
+function parseTrsByNodeId(raw: unknown): Record<string, TrsOverride> | undefined {
+  if (!isPlainObject(raw)) return undefined;
+  const out: Record<string, TrsOverride> = {};
+  for (const [nodeId, value] of Object.entries(raw)) {
+    const trs = parseTrsOverride(value);
+    if (trs) out[nodeId] = trs;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Apply one `TrsOverride` to a node's LOCAL transform.
+ *
+ * `updateMatrix` right here rather than leaving it to the render loop: the
+ * composition hands the tree to bounds computation, auto-align and the node
+ * registry before a frame is ever drawn, and each of those reads `matrix`.
+ *
+ * @returns true when anything was set.
+ */
+export function applyTrsOverride(node: Object3D, trs: TrsOverride): boolean {
+  let changed = false;
+  if (trs.position) { node.position.set(trs.position[0], trs.position[1], trs.position[2]); changed = true; }
+  if (trs.quaternion) {
+    node.quaternion.set(trs.quaternion[0], trs.quaternion[1], trs.quaternion[2], trs.quaternion[3]);
+    changed = true;
+  }
+  if (trs.scale) { node.scale.set(trs.scale[0], trs.scale[1], trs.scale[2]); changed = true; }
+  if (changed) node.updateMatrix();
+  return changed;
 }
 
 /**
@@ -232,28 +350,52 @@ export function collectReferenceNodes(root: Object3D): Array<{ node: Object3D; r
 
 // ─── AssetOverrides ──────────────────────────────────────────────────────
 
-/** The `AssetOverrides` on a node, or null when it carries none. */
+/**
+ * The `AssetOverrides` on a node, or null when it carries none.
+ *
+ * "Carries none" counts all THREE blocks: a node whose only override is a
+ * transform still has overrides. Answering null there is what would make the
+ * compose hook skip the block entirely and a moved part snap back on reload.
+ */
 export function getAssetOverrides(node: Object3D): AssetOverrides | null {
   const raw = extrasOf(node)?.[RV_ASSET_OVERRIDES_KEY];
   if (!isPlainObject(raw)) return null;
   const byNodeId = isPlainObject(raw.byNodeId) ? (raw.byNodeId as Record<string, ComponentPatch>) : {};
   const byPath = isPlainObject(raw.byPath) ? (raw.byPath as Record<string, ComponentPatch>) : undefined;
-  if (Object.keys(byNodeId).length === 0 && (!byPath || Object.keys(byPath).length === 0)) return null;
-  return byPath ? { byNodeId, byPath } : { byNodeId };
+  const trsByNodeId = parseTrsByNodeId(raw.trsByNodeId);
+  if (Object.keys(byNodeId).length === 0
+    && (!byPath || Object.keys(byPath).length === 0)
+    && !trsByNodeId) return null;
+
+  const out: AssetOverrides = { byNodeId };
+  if (byPath) out.byPath = byPath;
+  if (trsByNodeId) out.trsByNodeId = trsByNodeId;
+  return out;
 }
 
-/** Write `AssetOverrides` onto a node; an empty override set removes the key. */
+/**
+ * Write `AssetOverrides` onto a node; an empty override set removes the key.
+ *
+ * Every read-modify-write in the codebase runs through this pair, so a block
+ * missing HERE is a block silently dropped on the next unrelated field edit
+ * ({@link writeOverride} in rv-reference-guard is exactly that pattern) — which
+ * is why `trsByNodeId` is carried through both halves and not only the reader.
+ */
 export function setAssetOverrides(node: Object3D, overrides: AssetOverrides | null): void {
   const rv = ensureExtras(node);
   const empty = !overrides
     || (Object.keys(overrides.byNodeId ?? {}).length === 0
-      && Object.keys(overrides.byPath ?? {}).length === 0);
+      && Object.keys(overrides.byPath ?? {}).length === 0
+      && Object.keys(overrides.trsByNodeId ?? {}).length === 0);
   if (empty) {
     delete rv[RV_ASSET_OVERRIDES_KEY];
     return;
   }
   const out: Record<string, unknown> = { byNodeId: overrides!.byNodeId ?? {} };
   if (overrides!.byPath && Object.keys(overrides!.byPath).length > 0) out.byPath = overrides!.byPath;
+  if (overrides!.trsByNodeId && Object.keys(overrides!.trsByNodeId).length > 0) {
+    out.trsByNodeId = overrides!.trsByNodeId;
+  }
   rv[RV_ASSET_OVERRIDES_KEY] = out;
 }
 
@@ -352,8 +494,16 @@ export function applyOverrideLayers(node: Object3D, layers: OverrideLayer[]): bo
 
 /** An override whose target no longer exists. Reported, never silently dropped. */
 export interface OrphanedOverride {
-  /** How it addressed its target. */
-  addressing: 'nodeId' | 'path';
+  /**
+   * How it addressed its target.
+   *
+   * `'trs'` is a NodeId-addressed TRANSFORM override (plan-444) and is kept
+   * apart from `'nodeId'` on purpose: the two orphan for the same reason but
+   * read completely differently to a user. "Drive.TargetSpeed no longer has a
+   * target" is a setting that will not apply; "the part you moved is gone" is a
+   * hole in the layout. One shared label would have described neither.
+   */
+  addressing: 'nodeId' | 'path' | 'trs';
   /** The NodeId or relative path that did not resolve. */
   key: string;
   /** Occurrence address of the reference node the override sits on. */
@@ -369,6 +519,15 @@ export interface ApplyOverridesResult {
   applied: number;
   /** Overrides that found no target. Never empty-and-ignored — F9. */
   orphaned: OrphanedOverride[];
+  /**
+   * How many of `applied` were TRANSFORM overrides (plan-444).
+   *
+   * Reported separately because the caller has to do something extra for
+   * exactly these: a component patch changes data, a transform changes the
+   * matrix, and the grafted subtree's `matrixWorld` has to be refreshed before
+   * anything measures it. Zero means the caller can skip that walk entirely.
+   */
+  transformsApplied: number;
 }
 
 /** How a target is looked up inside one referenced subtree. */
@@ -426,6 +585,7 @@ export function applyAssetOverrides(
 ): ApplyOverridesResult {
   const orphaned: OrphanedOverride[] = [];
   let applied = 0;
+  let transformsApplied = 0;
 
   for (const [nodeId, patch] of Object.entries(overrides.byNodeId ?? {})) {
     const target = resolvers.byNodeId(nodeId);
@@ -457,12 +617,38 @@ export function applyAssetOverrides(
     if (applyComponentPatch(target, patch)) applied++;
   }
 
-  return { applied, orphaned };
+  // Transforms LAST, and NodeId-addressed only. Last because a component patch
+  // must never be able to overwrite the position the user dragged a part to;
+  // NodeId-only because `byPath` exists as a bridge for files written before
+  // ids existed, and no such file can carry a transform override.
+  for (const [nodeId, trs] of Object.entries(overrides.trsByNodeId ?? {})) {
+    const target = resolvers.byNodeId(nodeId);
+    if (!target) {
+      orphaned.push({
+        addressing: 'trs',
+        key: nodeId,
+        occurrence: context.occurrence,
+        assetId: context.assetId,
+        componentTypes: [],
+      });
+      continue;
+    }
+    if (applyTrsOverride(target, trs)) { applied++; transformsApplied++; }
+  }
+
+  return { applied, orphaned, transformsApplied };
 }
 
 /** One line per orphan, for the non-blocking status row (§3.2 of the plan). */
 export function describeOrphanedOverride(o: OrphanedOverride): string {
   const where = o.occurrence ? ` in occurrence ${o.occurrence}` : '';
+  if (o.addressing === 'trs') {
+    // Said as a fact about the layout, not about the storage: the user moved a
+    // part, the part is no longer in the asset, and the move therefore has
+    // nowhere to land. Naming the asset is what makes it actionable.
+    return `moved part → node "${o.key}" no longer exists in asset "${o.assetId}"${where}`
+      + ' — its saved position was dropped';
+  }
   const what = o.componentTypes.length > 0 ? o.componentTypes.join(', ') : 'override';
   return `${what} → ${o.addressing === 'nodeId' ? 'node' : 'path'} "${o.key}" no longer exists `
     + `in asset "${o.assetId}"${where}`;

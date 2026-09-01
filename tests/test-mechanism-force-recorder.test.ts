@@ -31,7 +31,7 @@ function channel(
   id: string, value: number, unit: 'N' | 'N·m' = 'N·m',
   kind: MechanismForceChannelView['kind'] = 'drive',
 ): MechanismForceChannelView {
-  return { id, label: id, kind, unit, value };
+  return { id, label: id, kind, unit, value, linkPath: null };
 }
 
 function snapshot(
@@ -170,7 +170,30 @@ describe('peak and time-weighted RMS', () => {
   it('reports nothing for a series that was never recorded', () => {
     const rec = directRecorder();
     const m = rec.metrics('nope');
-    expect(m).toMatchObject({ peak: 0, rms: 0, holding: null, sampleCount: 0 });
+    expect(m).toMatchObject({ peak: 0, peakTime: null, rms: 0, holding: null, sampleCount: 0 });
+  });
+
+  it('dates the peak — the panel jumps the zoom window to this moment', () => {
+    const rec = directRecorder();
+    rec.start();
+    // t:   0.5   1.0   2.0   4.0 — the magnitude peak (−4) is at t = 1.0.
+    feed(rec, 0.5, 2);
+    feed(rec, 0.5, -4);
+    feed(rec, 1.0, 3);
+    feed(rec, 2.0, -1);
+    expect(rec.metrics('Mech|dof0').peakTime).toBe(1.0);
+  });
+
+  it('dates an all-zero recording to its first sample, never to null', () => {
+    // A valid run whose channel is genuinely unloaded still has a peak OF ZERO
+    // at a real moment; null is reserved for "no finite sample at all".
+    const rec = directRecorder();
+    rec.start();
+    feed(rec, 0.5, 0);
+    feed(rec, 0.5, 0);
+    const m = rec.metrics('Mech|dof0');
+    expect(m.peak).toBe(0);
+    expect(m.peakTime).toBe(0.5);
   });
 });
 

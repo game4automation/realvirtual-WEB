@@ -20,7 +20,7 @@
 import { Object3D, Group } from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
-import { sanitizeLikeThree, isPureSanitization } from './rv-three-names';
+import { isPureSanitization } from './rv-three-names';
 import { unwrapGltfRoot } from './rv-gltf-unwrap';
 import { debug } from './rv-debug';
 
@@ -53,9 +53,11 @@ gltfLoader.setDRACOLoader(dracoLoader);
 // ─── Renamed-node reconciliation ─────────────────────────────────────────
 
 /**
- * `userData` key carrying a node's glTF name BEFORE Three.js' file-global dedup
- * appended its `_N` suffix (already sanitized, so it is comparable to
- * `Object3D.name`). Written by {@link detectRenamedNodes}, read by
+ * `userData` key carrying a node's RAW glTF name — the spelling the file
+ * authored, before Three.js sanitized it and before its file-global dedup
+ * appended an `_N` suffix (plan-734; it used to hold the sanitized form, which
+ * made the alias unusable for any name containing `[ ] . : /` or whitespace).
+ * Written by {@link detectRenamedNodes}, read by
  * {@link collectRenamedNodes} on every path that registers a subtree into an
  * existing scene. Leading `_` is load-bearing: `sanitizeUserDataForExport`
  * strips exactly those keys, so the marker never reaches a saved GLB.
@@ -107,8 +109,10 @@ export interface GltfParserLike {
  *    alias is needed and none is recorded.
  *  - **Genuine dedup** (Three appended `_N` to resolve a real collision):
  *    leave `obj.name` untouched (restoring would re-collide) and record the
- *    sanitized original in `renamedNodes` so `registerNodeAliases` can still
- *    publish a best-effort path/name alias, exactly as before.
+ *    RAW original in `renamedNodes` (plan-734) so `registerNodeAliases` can
+ *    publish the authored path spelling as an alias — and so a signal on that
+ *    node registers under the name the PLC actually addresses. The sanitized
+ *    spelling is derived from it where it is still wanted; it is NOT stored.
  *
  * This is also what keeps the asset editor's op log stable across a reload: an
  * import and its later replay both go through the same GLB bytes, so both see
@@ -142,9 +146,26 @@ export function detectRenamedNodes(gltfParser: GltfParserLike | undefined): Map<
           restoredCount++;
         } else {
           // Real Three.js dedup suffix (`_N`) or otherwise non-reversible →
-          // keep the sanitized form as an alias for path-based lookups.
-          const sanitized = sanitizeLikeThree(origName);
-          renamedNodes.set(obj, sanitized);
+          // record the RAW original name as the alias source (plan-734).
+          //
+          // This used to store `sanitizeLikeThree(origName)`, which silently
+          // destroyed the alias for every node that Three BOTH deduplicated AND
+          // sanitized: `registerNodeAliases` builds its path from exactly this
+          // value, so `-Kettenrad 201-201-026-STD-005333:1` was published as
+          // `-Kettenrad_201-201-026-STD-0053331` — a spelling nothing ever
+          // queries. The authored glTF path then resolved to nothing and the
+          // instruction highlight/camera silently did nothing. The same value
+          // is the `signalNameOverride` at rv-scene-loader.ts, so a deduplicated
+          // Siemens symbol also registered as `MC0401I00W` instead of
+          // `MC04.01I00W` — the very bug the file header of rv-three-names.ts
+          // describes as solved.
+          //
+          // The RESTORE rule above is deliberately untouched: restoring
+          // `obj.name` in the dedup case would re-introduce the collision Three
+          // resolved. Only what we REMEMBER changes; the sanitized spelling is
+          // re-derived (cheaply, `sanitizeLikeThree` is pure) wherever it is
+          // still wanted — see `registerNodeAliases`, which now publishes BOTH.
+          renamedNodes.set(obj, origName);
           // Stamp the pre-dedup name onto the node as well (plan-381 F5). The
           // in-memory Map only survives as long as the parser result: every
           // path that adds a subtree INTO an existing scene either drops it
@@ -154,7 +175,12 @@ export function detectRenamedNodes(gltfParser: GltfParserLike | undefined): Map<
           // survives `Object3D.copy` (three JSON-clones userData) and is
           // stripped again on export by `sanitizeUserDataForExport`, which
           // drops every `_`-prefixed key.
-          (obj.userData as Record<string, unknown>)[RV_ORIG_NAME_KEY] = sanitized;
+          //
+          // Carries the RAW name too (plan-734): the placed-asset path rebuilds
+          // its map from this stamp via `collectRenamedNodes`, so a stamp that
+          // still held the sanitized spelling would make the two load paths
+          // publish DIFFERENT aliases for the same tree.
+          (obj.userData as Record<string, unknown>)[RV_ORIG_NAME_KEY] = origName;
         }
       }
     }

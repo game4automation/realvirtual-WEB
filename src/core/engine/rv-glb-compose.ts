@@ -56,8 +56,10 @@ import {
   applyAssetOverrides,
   collectReferenceNodes,
   getAssetOverrides,
+  getPlacementMeta,
   makeSubtreeResolvers,
 } from './rv-asset-reference';
+import { pivotToFloorCenter } from './rv-placement-pivot';
 import {
   buildMissingReferencePlaceholder,
   missingReferenceLabel,
@@ -152,7 +154,13 @@ export function resolveReferencePath(baseUrl: string, path: string): string {
     // resolver's assetId/library step is the real lookup there, and a path that
     // stays unresolved becomes a labelled placeholder instead of a crash.
     if (/^(blob|data):/i.test(baseUrl)) return normalizeSegments(path);
-    return new URL(path, baseUrl).href;
+    // Any other opaque base throws the same TypeError — `rvproject:` is the one
+    // that actually reaches here (a document resolved to bytes keeps its
+    // sentinel as the base). Same posture as blob:/data:: pass the path through
+    // normalized so the assetId/library step stays the real lookup, instead of
+    // one stale reference killing the whole composition.
+    try { return new URL(path, baseUrl).href; }
+    catch { return normalizeSegments(path); }
   }
   if (path.startsWith('/')) return normalizeSegments(path);
   const cut = baseUrl.lastIndexOf('/');
@@ -650,6 +658,19 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
       referenceNode.add(clone);
       grafted.push({ parent: referenceNode, child: clone });
 
+      // A PLANNER placement (marked by PlacementMeta) stores no geometry — its
+      // content is exactly this graft — so the place-time pivot normalization
+      // has to be reproduced here, or a library file whose own root sits
+      // off-origin comes back shifted by that internal offset (the "scattered
+      // DemoPlanner" failure). Gated on the marker on purpose: a hand-authored
+      // reference (a CAD assembly referencing its parts) keeps the file's own
+      // child transforms, which are meaningful there. Idempotent for content
+      // that is already pivot-correct.
+      if (getPlacementMeta(referenceNode)) {
+        pivotToFloorCenter(referenceNode);
+        referenceNode.updateMatrixWorld(true);
+      }
+
       const overrides = getAssetOverrides(referenceNode);
       if (overrides) {
         const result = applyAssetOverrides(overrides, makeSubtreeResolvers(clone), {
@@ -657,6 +678,12 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
           assetId: ref.assetId,
         });
         orphanedOverrides.push(...result.orphaned);
+        // A transform override changed a LOCAL matrix inside a subtree that is
+        // already grafted (plan-444 F4). Everything downstream of composition —
+        // bounds, auto-align, the first raycast — reads `matrixWorld`, and none
+        // of it waits for a render, so the refresh happens once here. Skipped
+        // entirely when no transform was applied, which is the normal case.
+        if (result.transformsApplied > 0) clone.updateMatrixWorld(true);
       }
 
       const updated = !!ref.sha256 && !!template.sha256 && ref.sha256 !== template.sha256;

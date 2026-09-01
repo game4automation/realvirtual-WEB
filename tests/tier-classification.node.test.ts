@@ -39,6 +39,16 @@ const INTERNAL_FILES = [
   'plugins/import-providers/register-import-providers.ts',
 ];
 
+/** Internal-tier FEATURE files (not aggregates): the AutomationML importer is
+ *  deliberately internal until proven against files from more than one
+ *  authoring tool (plan-420) — a half importer at a customer is a negative
+ *  proof of "realvirtual reads AutomationML". Mirrors the two manifest rules
+ *  `src/features/aml-import.register.ts` and `src/plugins/import-providers/aml-*`. */
+const INTERNAL_PREFIXES = [
+  'features/aml-import.register.ts',
+  'plugins/import-providers/aml-',
+];
+
 type Profile = { tier: 'commercial' | 'core'; restrictedFeatures: string[] };
 
 /** Mirrors the generator's `sourceAllowed`, which is module-private. */
@@ -63,6 +73,8 @@ function listSources(directory = sourceRoot, prefix = ''): string[] {
 const ALL_SOURCES = listSources();
 const isRestricted = (rel: string) => RESTRICTED_PREFIXES.some(
   (prefix) => prefix.endsWith('/') ? rel.startsWith(prefix) : rel === prefix);
+const isInternal = (rel: string) => INTERNAL_FILES.includes(rel)
+  || INTERNAL_PREFIXES.some((prefix) => prefix.endsWith('-') ? rel.startsWith(prefix) : rel === prefix);
 
 describe('private source tier classification', () => {
   it('has private sources to classify at all', () => {
@@ -86,11 +98,11 @@ describe('private source tier classification', () => {
 
     expect(byTier.restricted.sort()).toEqual(ALL_SOURCES.filter(isRestricted).sort());
     expect(byTier.restricted.length).toBeGreaterThan(0);
-    expect(byTier.internal.sort()).toEqual([...INTERNAL_FILES].sort());
+    expect(byTier.internal.sort()).toEqual(ALL_SOURCES.filter(isInternal).sort());
     // The remainder is the commercial standard - stated as a set difference, so a new
-    // file lands here only because it is neither restricted nor an internal entry point.
+    // file lands here only because it is neither restricted nor a named internal file.
     expect(byTier.commercial.sort()).toEqual(
-      ALL_SOURCES.filter((rel) => !isRestricted(rel) && !INTERNAL_FILES.includes(rel)).sort());
+      ALL_SOURCES.filter((rel) => !isRestricted(rel) && !isInternal(rel)).sort());
   });
 
   it('names the owning feature on every restricted file', () => {
@@ -105,7 +117,7 @@ describe('private source tier classification', () => {
     for (const rel of ALL_SOURCES.filter(isRestricted)) {
       expect(sourceAllowed(rel, profile), `${rel} must not be staged`).toBe(false);
     }
-    for (const rel of INTERNAL_FILES) {
+    for (const rel of ALL_SOURCES.filter(isInternal)) {
       expect(sourceAllowed(rel, profile), `${rel} must not be staged`).toBe(false);
     }
     // The positive half: a plain commercial file DOES ship, so the assertions above

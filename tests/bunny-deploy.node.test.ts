@@ -34,6 +34,8 @@ import {
   mimeType,
   ALWAYS_UPLOAD_FILES,
   applyPublicModelAllowlist,
+  publicDemoModelAllowlist,
+  publicDemoManifestMisses,
   PUBLIC_MODEL_PREFIX,
   applyPublicScenePruning,
   PUBLIC_TEST_SCENE_PREFIX,
@@ -44,6 +46,7 @@ import {
 } from '../scripts/_bunny-lib.mjs';
 // @ts-expect-error — plain JS Node module, no type declarations by design.
 import { generateFragmentSecret, isEncryptedEnvelope, decryptGlb } from '../scripts/lib/rv-crypto.mjs';
+import { assertManifestResolves } from './helpers/assert-manifest-resolves';
 
 // ─── 9.1 buildUploadUrl ──────────────────────────────────────────────────
 
@@ -314,8 +317,23 @@ describe('applyPublicModelAllowlist', () => {
     expect(res.droppedAssets).toEqual([]);
   });
 
-  it('default prefix is DemoRealvirtual', () => {
+  it('default prefix is DemoRealvirtual only (user decision 2026-08-30: RobotIK + CSGMachining are internal dev/test models)', () => {
     expect(PUBLIC_MODEL_PREFIX).toBe('DemoRealvirtual');
+  });
+
+  it('comma-separated prefix list keeps a model matching ANY prefix', () => {
+    // Mechanic test with an explicit two-prefix list — the DEFAULT list is a
+    // single prefix since the 2026-08-30 decision (CSGMachining internal), so
+    // the multi-prefix behaviour is exercised via the override parameter.
+    const dist = makeDist();
+    writeFileSync(join(dist, 'models', 'DemoCSGMachining.glb'), 'GLB');
+    writeFileSync(join(dist, 'assets', 'DemoCSGMachining-DwwnP9kU.glb'), 'X');
+    const res = applyPublicModelAllowlist(dist, { prefix: 'DemoRealvirtual,DemoCSGMachining' });
+    expect(res.kept).toEqual(['DemoCSGMachining.glb', 'DemoRealvirtualWeb.glb']);
+    expect(existsSync(join(dist, 'models', 'DemoCSGMachining.glb'))).toBe(true);
+    expect(existsSync(join(dist, 'assets', 'DemoCSGMachining-DwwnP9kU.glb'))).toBe(true);
+    expect(JSON.parse(readFileSync(join(dist, 'models.json'), 'utf8')))
+      .toEqual(['DemoCSGMachining.glb', 'DemoRealvirtualWeb.glb']);
   });
 });
 
@@ -326,9 +344,40 @@ describe('applyPublicScenePruning', () => {
   beforeEach(() => { work = mkdtempSync(join(tmpdir(), 'rvscene-')); });
   afterEach(() => { rmSync(work, { recursive: true, force: true }); });
 
-  /** dist/scenes/ with a curated demo, two Test fixtures, and an index.json
-   *  listing all three (mirroring a real public build of public/scenes/).
-   *  Examples are GLBs since plan-413 phase 3. */
+  /**
+   * A dist as a CURRENT build produces it (plan-731): the documents are
+   * `project.json` rows at the deploy root, and the dev-only one is marked
+   * `devOnly` rather than named "Test*".
+   *
+   * The fixture deliberately gives the dev-only document a name that the OLD
+   * filename rule would not have caught, and puts it outside `scenes/` — which
+   * is where plan-731 2a moved the real one. If the manifest pass were missing,
+   * this fixture would ship.
+   */
+  function makeManifestDist(): string {
+    const dist = join(work, 'mdist');
+    mkdirSync(dist, { recursive: true });
+    writeFileSync(join(dist, 'DemoRealvirtualWeb.glb'), 'glTF');
+    writeFileSync(join(dist, 'DemoPlanner.glb'), 'glTF');
+    writeFileSync(join(dist, 'Turntable-Loop-Fixture.glb'), 'glTF');
+    writeFileSync(join(dist, 'project.json'), JSON.stringify({
+      schemaVersion: 2,
+      id: 'prj_sample',
+      name: 'DemoRealvirtual',
+      settings: { defaultModel: 'DemoRealvirtualWeb.glb' },
+      documents: [
+        { id: 'doc_a', name: 'Demo', path: 'DemoRealvirtualWeb.glb', section: 'models' },
+        { id: 'doc_b', name: 'Planner', path: 'DemoPlanner.glb', section: 'scenes' },
+        {
+          id: 'doc_fix', name: 'Fixture', path: 'Turntable-Loop-Fixture.glb',
+          section: 'scenes', devOnly: true,
+        },
+      ],
+    }, null, 2));
+    return dist;
+  }
+
+  /** A dist from an OLDER source tree: a curated index.json, no devOnly rows. */
   function makeDist(): string {
     const dist = join(work, 'dist');
     mkdirSync(join(dist, 'scenes'), { recursive: true });
@@ -343,12 +392,56 @@ describe('applyPublicScenePruning', () => {
     return dist;
   }
 
-  it('deletes Test* scene files and keeps the curated demo', () => {
+  it('deletes the devOnly document and its row, wherever the file sits', () => {
+    // plan-731 2k: the manifest decides. The fixture's NAME would not have
+    // matched the old "Test*" rule and it does not live in scenes/ — so this
+    // passes only because the row said so.
+    const dist = makeManifestDist();
+    const res = applyPublicScenePruning(dist, { prefix: 'Test' });
+
+    expect(res.dropped).toEqual(['Turntable-Loop-Fixture.glb']);
+    expect(res.kept).toEqual(['DemoPlanner.glb', 'DemoRealvirtualWeb.glb']);
+
+    expect(existsSync(join(dist, 'Turntable-Loop-Fixture.glb'))).toBe(false);
+    expect(existsSync(join(dist, 'DemoPlanner.glb'))).toBe(true);
+    expect(existsSync(join(dist, 'DemoRealvirtualWeb.glb'))).toBe(true);
+
+    // The SHIPPED manifest no longer names it — a row without a file is the
+    // 404 only the visitor ever sees.
+    const shipped = JSON.parse(readFileSync(join(dist, 'project.json'), 'utf8'));
+    expect(shipped.documents.map((d: { id: string }) => d.id)).toEqual(['doc_a', 'doc_b']);
+    // Everything else about the manifest is carried through untouched.
+    expect(shipped.settings.defaultModel).toBe('DemoRealvirtualWeb.glb');
+    expect(shipped.id).toBe('prj_sample');
+  });
+
+  it('is idempotent over the manifest pass', () => {
+    const dist = makeManifestDist();
+    applyPublicScenePruning(dist, { prefix: 'Test' });
+    const again = applyPublicScenePruning(dist, { prefix: 'Test' });
+    expect(again.dropped).toEqual([]);
+    expect(again.kept).toEqual(['DemoPlanner.glb', 'DemoRealvirtualWeb.glb']);
+  });
+
+  it('dry-run over a manifest dist reports without deleting or rewriting', () => {
+    const dist = makeManifestDist();
+    const res = applyPublicScenePruning(dist, { prefix: 'Test', dryRun: true });
+    expect(res.dropped).toEqual(['Turntable-Loop-Fixture.glb']);
+    expect(existsSync(join(dist, 'Turntable-Loop-Fixture.glb'))).toBe(true);
+    const shipped = JSON.parse(readFileSync(join(dist, 'project.json'), 'utf8'));
+    expect(shipped.documents).toHaveLength(3);
+  });
+
+  it('the filename fallback still catches a dist from an older source tree', () => {
+    // No devOnly anywhere in this dist — the defensive pass is all there is,
+    // and a pruner that silently stopped pruning is how a fixture reaches the
+    // public CDN.
     const dist = makeDist();
     const res = applyPublicScenePruning(dist, { prefix: 'Test' });
 
-    expect(res.kept).toEqual(['DemoPlanner.glb']);
-    expect(res.dropped).toEqual(['Test-DES-Turntable-Loop.glb', 'test-lowercase.glb']);
+    expect(res.kept).toEqual(['scenes/DemoPlanner.glb']);
+    expect(res.dropped)
+      .toEqual(['scenes/Test-DES-Turntable-Loop.glb', 'scenes/test-lowercase.glb']);
 
     expect(existsSync(join(dist, 'scenes', 'DemoPlanner.glb'))).toBe(true);
     expect(existsSync(join(dist, 'scenes', 'Test-DES-Turntable-Loop.glb'))).toBe(false);
@@ -363,7 +456,7 @@ describe('applyPublicScenePruning', () => {
     writeFileSync(join(dist, 'scenes', 'Test-Old.scene.json'), '{}');
     writeFileSync(join(dist, 'scenes', 'DemoPlanner.scene.json'), '{}');
     const res = applyPublicScenePruning(dist, { prefix: 'Test' });
-    expect(res.dropped).toEqual(['Test-Old.scene.json']);
+    expect(res.dropped).toEqual(['scenes/Test-Old.scene.json']);
     expect(existsSync(join(dist, 'scenes', 'Test-Old.scene.json'))).toBe(false);
     expect(existsSync(join(dist, 'scenes', 'DemoPlanner.scene.json'))).toBe(true);
   });
@@ -378,7 +471,8 @@ describe('applyPublicScenePruning', () => {
   it('dry-run reports without deleting or rewriting', () => {
     const dist = makeDist();
     const res = applyPublicScenePruning(dist, { prefix: 'Test', dryRun: true });
-    expect(res.dropped).toEqual(['Test-DES-Turntable-Loop.glb', 'test-lowercase.glb']);
+    expect(res.dropped)
+      .toEqual(['scenes/Test-DES-Turntable-Loop.glb', 'scenes/test-lowercase.glb']);
     expect(existsSync(join(dist, 'scenes', 'Test-DES-Turntable-Loop.glb'))).toBe(true); // not deleted
     const idx = JSON.parse(readFileSync(join(dist, 'scenes', 'index.json'), 'utf8'));
     expect(idx).toHaveLength(3);                                                        // not rewritten
@@ -389,7 +483,7 @@ describe('applyPublicScenePruning', () => {
     applyPublicScenePruning(dist, { prefix: 'Test' });
     const res = applyPublicScenePruning(dist, { prefix: 'Test' });
     expect(res.dropped).toEqual([]);
-    expect(res.kept).toEqual(['DemoPlanner.glb']);
+    expect(res.kept).toEqual(['scenes/DemoPlanner.glb']);
 
     const empty = join(work, 'empty-dist');
     mkdirSync(empty, { recursive: true });
@@ -656,5 +750,270 @@ describe('SEO artifacts', () => {
     writeSeoArtifacts(dist, { pageUrl: PAGE_URL, dryRun: true });
     expect(existsSync(join(dist, 'sitemap.xml'))).toBe(false);
     expect(existsSync(join(dist, 'robots.txt'))).toBe(false);
+  });
+});
+
+// ─── 9.5 plan-726: the manifest curates the public deploy ────────────────
+
+/**
+ * Before plan-726 the only curator of the public demo was a filename prefix
+ * (`DemoRealvirtual,DemoCSGMachining`), and the demo's own `project.json` had
+ * no say. That had a live consequence: `DemoRobotIK.glb` is a demo model, it is
+ * listed in the manifest, and it matches NEITHER prefix — so every public and
+ * `--demo` deploy silently deleted it before upload.
+ *
+ * These nets pin the three parts of the fix: the manifest is read, it wins over
+ * the prefix, and a manifest that names something the build does not contain
+ * stops the deploy instead of shipping a 404 the visitor finds first.
+ */
+describe('publicDemoModelAllowlist (plan-726)', () => {
+  let work: string;
+  beforeEach(() => { work = mkdtempSync(join(tmpdir(), 'rv726-allow-')); });
+  afterEach(() => { rmSync(work, { recursive: true, force: true }); });
+
+  const manifest = (documents: unknown[]) => JSON.stringify({
+    schemaVersion: 2, id: 'prj_sample', name: 'DemoRealvirtual', documents,
+  });
+
+  it('is null for a dist/ with no manifest — the prefix rule still applies', () => {
+    // Null and [] are different answers and the caller branches on it: null is
+    // "no manifest, use the prefix", [] is "the manifest declares no models".
+    expect(publicDemoModelAllowlist(work)).toBeNull();
+  });
+
+  it('reads only models/ documents, ignoring scenes and library', () => {
+    writeFileSync(join(work, 'project.json'), manifest([
+      { id: 'a', path: 'models/DemoRealvirtualWeb.glb', section: 'models' },
+      { id: 'b', path: 'models/DemoRobotIK.glb', section: 'models' },
+      { id: 'c', path: 'scenes/DemoPlanner.glb', section: 'scenes' },
+      { id: 'd', path: 'library/PalletHandling/Europallet.glb', section: 'library' },
+    ]));
+    const models = publicDemoModelAllowlist(work);
+    // Not null: the manifest was just written. The distinction matters — null
+    // would mean "no manifest, fall back to the prefix rule".
+    expect(models).not.toBeNull();
+    expect(models!.sort()).toEqual(['DemoRealvirtualWeb.glb', 'DemoRobotIK.glb']);
+  });
+
+  it('KEEPS DemoRobotIK.glb, which every prefix deploy deletes today', () => {
+    const dist = join(work, 'dist');
+    mkdirSync(join(dist, 'models'), { recursive: true });
+    for (const f of ['DemoRealvirtualWeb.glb', 'DemoRobotIK.glb', 'tests.glb']) {
+      writeFileSync(join(dist, 'models', f), 'GLB');
+    }
+    writeFileSync(join(dist, 'project.json'), manifest([
+      { id: 'a', path: 'models/DemoRealvirtualWeb.glb', section: 'models' },
+      { id: 'b', path: 'models/DemoRobotIK.glb', section: 'models' },
+    ]));
+
+    // The bug, restated: the built-in prefixes drop it.
+    expect(applyPublicModelAllowlist(dist, { prefix: PUBLIC_MODEL_PREFIX, dryRun: true }).dropped)
+      .toContain('DemoRobotIK.glb');
+
+    // The manifest keeps it, and still prunes the scratch fixture.
+    const res = applyPublicModelAllowlist(dist, { keep: publicDemoModelAllowlist(dist) });
+    expect(res.kept).toEqual(['DemoRealvirtualWeb.glb', 'DemoRobotIK.glb']);
+    expect(res.dropped).toEqual(['tests.glb']);
+    expect(existsSync(join(dist, 'models', 'DemoRobotIK.glb'))).toBe(true);
+    expect(existsSync(join(dist, 'models', 'tests.glb'))).toBe(false);
+  });
+
+  it('an explicit keep list REPLACES the prefix rather than adding to it', () => {
+    const dist = join(work, 'dist');
+    mkdirSync(join(dist, 'models'), { recursive: true });
+    for (const f of ['DemoRealvirtualWeb.glb', 'DemoCSGMachining.glb']) {
+      writeFileSync(join(dist, 'models', f), 'GLB');
+    }
+    // `DemoCSGMachining` matches a built-in prefix but is NOT in the keep list.
+    const res = applyPublicModelAllowlist(dist, { keep: ['DemoRealvirtualWeb.glb'] });
+    expect(res.kept).toEqual(['DemoRealvirtualWeb.glb']);
+    expect(res.dropped).toEqual(['DemoCSGMachining.glb']);
+  });
+
+  it('the pre-726 signature still works — no keep, prefix as before', () => {
+    // The existing net calls `applyPublicModelAllowlist(dist)` with no options
+    // at all; the new parameter had to be additive.
+    const dist = join(work, 'dist');
+    mkdirSync(join(dist, 'models'), { recursive: true });
+    writeFileSync(join(dist, 'models', 'DemoRealvirtualWeb.glb'), 'GLB');
+    writeFileSync(join(dist, 'models', 'tests.glb'), 'GLB');
+    expect(applyPublicModelAllowlist(dist).kept).toEqual(['DemoRealvirtualWeb.glb']);
+  });
+});
+
+describe('publicDemoManifestMisses — the contradiction guard (plan-726 F5)', () => {
+  let work: string;
+  beforeEach(() => { work = mkdtempSync(join(tmpdir(), 'rv726-guard-')); });
+  afterEach(() => { rmSync(work, { recursive: true, force: true }); });
+
+  function distWith(documents: unknown[], files: string[]): string {
+    const dist = join(work, 'dist');
+    mkdirSync(join(dist, 'models'), { recursive: true });
+    mkdirSync(join(dist, 'scenes'), { recursive: true });
+    for (const rel of files) {
+      mkdirSync(join(dist, rel.split('/').slice(0, -1).join('/')), { recursive: true });
+      writeFileSync(join(dist, rel), 'GLB');
+    }
+    writeFileSync(join(dist, 'project.json'), JSON.stringify({
+      schemaVersion: 2, id: 'prj_sample', name: 'DemoRealvirtual', documents,
+    }));
+    return dist;
+  }
+
+  const FOUR = [
+    { id: 'a', path: 'models/DemoRealvirtualWeb.glb', section: 'models' },
+    { id: 'b', path: 'models/DemoRobotIK.glb', section: 'models' },
+    { id: 'c', path: 'models/DemoCSGMachining.glb', section: 'models' },
+    { id: 'd', path: 'scenes/DemoPlanner.glb', section: 'scenes' },
+  ];
+  const FOUR_FILES = [
+    'models/DemoRealvirtualWeb.glb', 'models/DemoRobotIK.glb',
+    'models/DemoCSGMachining.glb', 'scenes/DemoPlanner.glb',
+  ];
+
+  it('passes when every declared document is in the build', () => {
+    expect(publicDemoManifestMisses(distWith(FOUR, FOUR_FILES))).toEqual([]);
+  });
+
+  it('reports a model the pruning removed', () => {
+    const dist = distWith(FOUR, FOUR_FILES.filter(f => !f.endsWith('DemoRobotIK.glb')));
+    expect(publicDemoManifestMisses(dist)).toEqual(['models/DemoRobotIK.glb']);
+  });
+
+  it('reports a SCENE too — the pass that prunes those is a different one', () => {
+    // The guard had to span both sections: `scenes/` is pruned by the
+    // prefix-based `applyPublicScenePruning`, so a guard hanging off the model
+    // allowlist would never have looked at the fourth document of the demo.
+    const dist = distWith(FOUR, FOUR_FILES.filter(f => !f.startsWith('scenes/')));
+    expect(publicDemoManifestMisses(dist)).toEqual(['scenes/DemoPlanner.glb']);
+  });
+
+  it('catches a case-only mismatch, which the storage zone would 404 on', () => {
+    // `existsSync('Models/x.glb')` answers true on Windows and macOS and the
+    // Linux CDN then serves nothing. This is the typo that survives every
+    // local check.
+    const dist = distWith(
+      [{ id: 'a', path: 'Models/DemoRealvirtualWeb.glb', section: 'models' }],
+      ['models/DemoRealvirtualWeb.glb'],
+    );
+    expect(publicDemoManifestMisses(dist)).toEqual(['Models/DemoRealvirtualWeb.glb']);
+  });
+
+  it('ignores library documents, which are staged by another step', () => {
+    const dist = distWith(
+      [{ id: 'l', path: 'library/PalletHandling/Europallet.glb', section: 'library' }],
+      [],
+    );
+    expect(publicDemoManifestMisses(dist)).toEqual([]);
+  });
+
+  it('is vacuously satisfied for a dist/ with no manifest', () => {
+    // A private customer deploy publishes no root manifest at all, and the
+    // guard must not invent an opinion about it.
+    expect(publicDemoManifestMisses(work)).toEqual([]);
+  });
+});
+
+describe('project.json cache posture (plan-726 Phase 3)', () => {
+  it('is an always-upload file, so an edit of equal size still ships', () => {
+    // It lives at a FIXED url and the runtime boots from it, so it must never
+    // be diffed by size like a hashed build asset — a renamed document or a
+    // swapped start document routinely leaves the byte count untouched.
+    expect(ALWAYS_UPLOAD_FILES.has('project.json')).toBe(true);
+  });
+});
+
+// ─── plan-731 Phase 4 (F6): the release gate on the public dist ───────────
+
+/**
+ * The `dist/` this channel is about to upload must fully resolve.
+ *
+ * `demo-manifest-invariants` makes the same assertion about the SOURCE TREE,
+ * and the source tree is not what anybody downloads: between it and the CDN sit
+ * the model allowlist and the scene prune, either of which can leave the
+ * manifest naming something that is no longer there. This is that assertion
+ * moved onto the artefact.
+ *
+ * Both public shapes are covered — the ordinary public demo and `--demo` — via
+ * the same helper, so neither can end up checking less than the other.
+ */
+describe('the public dist passes the release gate (plan-731 F6)', () => {
+  let gwork: string;
+  beforeEach(() => { gwork = mkdtempSync(join(tmpdir(), 'rvgate-')); });
+  afterEach(() => { rmSync(gwork, { recursive: true, force: true }); });
+
+  /** A dist as a build produces it: documents at the root, fixture marked. */
+  function makeDeployDist(name: string): string {
+    const dist = join(gwork, name);
+    mkdirSync(dist, { recursive: true });
+    for (const f of [
+      'DemoRealvirtualWeb.glb', 'DemoRealvirtualWeb.settings.json',
+      'DemoPlanner.glb', 'Turntable-Fixture.glb',
+    ]) writeFileSync(join(dist, f), 'glTF');
+    writeFileSync(join(dist, 'project.json'), JSON.stringify({
+      schemaVersion: 2,
+      id: 'prj_sample',
+      name: 'DemoRealvirtual',
+      canonicalName: 'demorealvirtual',
+      settings: { defaultModel: 'DemoRealvirtualWeb.glb' },
+      documents: [
+        {
+          id: 'doc_a', name: 'Demo', path: 'DemoRealvirtualWeb.glb', section: 'models',
+          settingsPath: 'DemoRealvirtualWeb.settings.json',
+        },
+        { id: 'doc_b', name: 'Planner', path: 'DemoPlanner.glb', section: 'scenes' },
+        {
+          id: 'doc_f', name: 'Fixture', path: 'Turntable-Fixture.glb',
+          section: 'scenes', devOnly: true,
+        },
+      ],
+    }, null, 2));
+    return dist;
+  }
+
+  it('an unpruned dist FAILS the gate — the fixture is still declared', () => {
+    // The negative half (4f), and the proof the positive half below means
+    // something: run the gate before the prune and it must refuse.
+    const dist = makeDeployDist('unpruned');
+    expect(() => assertManifestResolves(dist)).toThrow(/dev-only/);
+  });
+
+  it('the pruned dist passes, with the fixture gone from files AND manifest', () => {
+    const dist = makeDeployDist('public');
+    applyPublicScenePruning(dist, { prefix: PUBLIC_TEST_SCENE_PREFIX });
+
+    const gate = assertManifestResolves(dist);
+    expect(gate.documents.map((d) => d.path))
+      .toEqual(['DemoRealvirtualWeb.glb', 'DemoPlanner.glb']);
+    expect(gate.start.path).toBe('DemoRealvirtualWeb.glb');
+    // The sidecar travelled — F5's half of the same gate.
+    expect(gate.sidecars).toEqual(['DemoRealvirtualWeb.settings.json']);
+    expect(existsSync(join(dist, 'Turntable-Fixture.glb'))).toBe(false);
+  });
+
+  it('the --demo dist is held to the same rule, by the same helper', () => {
+    // `--demo` differs from the public deploy only in its remote prefix; a
+    // second, slightly weaker gate for it is exactly how one channel ends up
+    // shipping what the other refuses.
+    const dist = makeDeployDist('demo');
+    applyPublicScenePruning(dist, { prefix: PUBLIC_TEST_SCENE_PREFIX });
+    expect(() => assertManifestResolves(dist)).not.toThrow();
+  });
+
+  it('a dist whose manifest names a pruned MODEL fails the gate', () => {
+    // The other prune. The allowlist deletes model files without touching the
+    // manifest, so this is the case the source-tree assertion structurally
+    // cannot see.
+    const dist = makeDeployDist('pruned-model');
+    applyPublicScenePruning(dist, { prefix: PUBLIC_TEST_SCENE_PREFIX });
+    rmSync(join(dist, 'DemoRealvirtualWeb.glb'), { force: true });
+    expect(() => assertManifestResolves(dist)).toThrow(/DemoRealvirtualWeb\.glb/);
+  });
+
+  it('a dist whose sidecar did not travel fails the gate', () => {
+    const dist = makeDeployDist('no-sidecar');
+    applyPublicScenePruning(dist, { prefix: PUBLIC_TEST_SCENE_PREFIX });
+    rmSync(join(dist, 'DemoRealvirtualWeb.settings.json'), { force: true });
+    expect(() => assertManifestResolves(dist)).toThrow(/did not travel/);
   });
 });

@@ -69,6 +69,8 @@ export interface ForceSeries {
   label: string;
   kind: 'drive' | 'joint-force' | 'joint-torque';
   unit: 'N' | 'N·m';
+  /** Link node path this channel belongs to (chart↔3D hover link), or null. */
+  linkPath: string | null;
   /** Samples, aligned index-for-index with {@link MechanismForceRecorder.timeBuffer}. */
   readonly values: RingBuffer<number>;
 }
@@ -77,6 +79,9 @@ export interface ForceSeries {
 export interface ForceMetrics {
   /** `max |τ|` over the window. */
   peak: number;
+  /** Simulation second the peak occurred at, or null with no finite sample —
+   *  the panel's "jump to the moment it happened" anchor. */
+  peakTime: number | null;
   /** Time-weighted `sqrt( Σ τᵢ²·Δtᵢ / Σ Δtᵢ )`. */
   rms: number;
   /** From the statics export only — never from a dynamic zero crossing. */
@@ -87,7 +92,7 @@ export interface ForceMetrics {
 }
 
 const EMPTY_METRICS: ForceMetrics = {
-  peak: 0, rms: 0, holding: null, sampleCount: 0, unit: 'N·m',
+  peak: 0, peakTime: null, rms: 0, holding: null, sampleCount: 0, unit: 'N·m',
 };
 
 /**
@@ -172,7 +177,7 @@ export class MechanismForceRecorder {
       // silently re-date the whole curve.
       for (const channel of snapshot.channels) {
         const series = this._ensureSeries(snapshot.mechanismPath, channel.id, channel.label,
-          channel.kind, channel.unit);
+          channel.kind, channel.unit, channel.linkPath);
         series.values.push(snapshot.dynamicsValid ? channel.value : Number.NaN);
         seen.add(channel.id);
       }
@@ -230,6 +235,7 @@ export class MechanismForceRecorder {
     const vOffset = values.length - n;
 
     let peak = 0;
+    let peakTime: number | null = null;
     let weighted = 0;
     let totalDt = 0;
     let count = 0;
@@ -241,7 +247,7 @@ export class MechanismForceRecorder {
       if (!Number.isFinite(v)) { lastTime = Number.isFinite(t) ? t : lastTime; continue; }
       count++;
       const abs = Math.abs(v);
-      if (abs > peak) peak = abs;
+      if (abs > peak || peakTime === null) { peak = abs; peakTime = t; }
       if (lastTime !== null) {
         const dt = t - lastTime;
         if (dt > 0) {
@@ -257,6 +263,7 @@ export class MechanismForceRecorder {
     const rms = totalDt > 0 ? Math.sqrt(weighted / totalDt) : peak;
     return {
       peak,
+      peakTime,
       rms: count === 0 ? 0 : rms,
       holding: this._holding.get(seriesId) ?? null,
       sampleCount: count,
@@ -277,15 +284,17 @@ export class MechanismForceRecorder {
   private _ensureSeries(
     mechanismPath: string, id: string, label: string,
     kind: ForceSeries['kind'], unit: ForceSeries['unit'],
+    linkPath: string | null = null,
   ): ForceSeries {
     const existing = this._byId.get(id);
     if (existing) {
       existing.label = label;
       existing.unit = unit;
+      existing.linkPath = linkPath;
       return existing;
     }
     const series: ForceSeries = {
-      id, mechanismPath, label, kind, unit,
+      id, mechanismPath, label, kind, unit, linkPath,
       values: new RingBuffer<number>(this._capacity),
     };
     // A series discovered mid-run is padded so index i still means time[i].

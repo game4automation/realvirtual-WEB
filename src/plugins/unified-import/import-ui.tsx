@@ -11,18 +11,18 @@
  * DIALOG FOOTER — tabs register their hidden input via
  * `useRegisterFilePicker` instead of rendering their own button.
  *
- * Two of them serve the "I just downloaded a part from a catalog" path:
- * `FileDropZone` (drag the file straight onto the tab) and `PartSourceLinks`
- * (plain hyperlinks to the public catalogs — see its doc comment for why it is
- * links and nothing more).
+ * `FileDropZone` serves the "I just downloaded a part from a catalog" path:
+ * drag the file straight onto the tab. The tabs deliberately carry NO pointer
+ * to the public catalogs any more (plan-444 F1, LOP-124) — a permanent advert
+ * for someone else's site is not what an import dialog is for, and the user
+ * who has a file already does not need it.
  *
  * Private providers import from here (they already import the provider
  * contract from this package), so the vocabulary is a single source.
  */
 
 import { useCallback, useEffect, useRef, useState, type DragEvent, type ReactNode, type RefObject } from 'react';
-import { Box, Checkbox, Link, MenuItem, Select, Tooltip, Typography, type SxProps, type Theme } from '@mui/material';
-import { OpenInNew } from '@mui/icons-material';
+import { Box, Checkbox, MenuItem, Select, Tooltip, Typography, type SxProps, type Theme } from '@mui/material';
 import type { ImportProviderContext } from '../../core/import/rv-import-provider';
 
 /** Standard column layout of one provider tab: consistent rhythm across tabs. */
@@ -303,34 +303,13 @@ export function FileDropZone({ accept, multiple = true, onFiles, children }: {
 }
 
 // ─── Where to get parts ─────────────────────────────────────────────────
-
-/**
- * Quiet pointer to the public part catalogs, for the tabs that take a CAD
- * download (GLB, STEP, JT).
- *
- * These are PLAIN HYPERLINKS to the catalogs' own sites, and deliberately
- * nothing more: the user searches, configures and downloads there under the
- * catalog's own terms, then brings the file here. realvirtual never talks to a
- * catalog server. Anything closer than a link — proxying their search, or
- * pulling geometry out of their web app's internal endpoints — needs a written
- * agreement with that catalog, so it is not something a UI component may grow
- * into by accident.
- */
-export function PartSourceLinks() {
-  const sx = { fontSize: 11, display: 'inline-flex', alignItems: 'center', gap: 0.25 } as const;
-  return (
-    <Typography sx={{ fontSize: 11, lineHeight: 1.7, color: 'text.secondary' }}>
-      Need a standard part?{' '}
-      <Link href="https://www.3dfindit.com/" target="_blank" rel="noopener noreferrer" sx={sx}>
-        3Dfindit<OpenInNew sx={{ fontSize: 11 }} />
-      </Link>
-      {' · '}
-      <Link href="https://www.traceparts.com/" target="_blank" rel="noopener noreferrer" sx={sx}>
-        TraceParts<OpenInNew sx={{ fontSize: 11 }} />
-      </Link>
-    </Typography>
-  );
-}
+//
+// `PartSourceLinks` — a one-line pointer to 3Dfindit / TraceParts — used to
+// live here and rendered on the GLB, STEP and JT tabs. It was REMOVED in
+// plan-444 (F1, LOP-124) rather than hidden behind a flag: the dialog's job is
+// to import a file the user already has, and standing advertising for a third
+// party's catalog is not part of that job. If a catalog integration ever comes
+// back it will be an actual integration under a written agreement, not a link.
 
 /**
  * The picked-file list: one inset panel, one monospace row per file with the

@@ -125,6 +125,18 @@ export class ThumbnailService {
   }
 
   /**
+   * Drop the CACHED preview for `key` so the next `enqueue` re-renders from
+   * fresh bytes — the save-path invalidation. Deliberately not a `cancel`: an
+   * in-flight job may still land its (pre-save) result, which the next
+   * enqueue then replaces; racing a save against a render is rare enough that
+   * one extra render beats a hard-abort pathway.
+   */
+  forget(key: string): void {
+    this._pending.delete(key);
+    void this._cache.delete(key);
+  }
+
+  /**
    * Drop a queued request. Per §2.8 this is a de-prioritisation, not a hard
    * abort: a job that already started keeps running (its result still lands in
    * the cache, so scrolling back is instant), only a job still waiting is

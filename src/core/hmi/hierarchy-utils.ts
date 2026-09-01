@@ -23,7 +23,7 @@ import type { RVExtrasOverlay } from '../engine/rv-extras-overlay-store';
 import type { SignalStore } from '../engine/rv-signal-store';
 import type { RVLogicEngine, StepStateInfo } from '../engine/rv-logic-engine';
 import { StepState } from '../engine/rv-logic-step';
-import { extractComponentTypes } from './rv-inspector-helpers';
+import { extractComponentTypes, baseComponentType } from './rv-inspector-helpers';
 import { STEP_STATE_COLORS, STEP_STATE_LABELS } from './rv-logic-step-colors';
 import { componentColor } from './rv-inspector-helpers';
 import {
@@ -581,11 +581,22 @@ export function isBoolSignal(type: string): boolean {
   return type.includes('Bool');
 }
 
-/** Split types into [nonSignals, signals] so signals render last (right-most). */
+/**
+ * Ambient metadata types that are dropped from the hierarchy badge row.
+ * They end up on nearly every node of an authored asset (agent knowledge,
+ * mechanism mass bodies), so as badges they carry no scanning information —
+ * they only crowd out the node name. The inspector still shows them in full.
+ * Matched via {@link baseComponentType}, so numbered duplicates count too.
+ */
+const AMBIENT_BADGE_TYPES = new Set(['NodeKnowledge', 'MechanismBody']);
+
+/** Split types into [nonSignals, signals] so signals render last (right-most).
+ *  Badge-row specific: ambient metadata types are dropped entirely. */
 export function splitTypes(types: string[]): [string[], string[]] {
   const nonSignals: string[] = [];
   const signals: string[] = [];
   for (const t of types) {
+    if (AMBIENT_BADGE_TYPES.has(baseComponentType(t))) continue;
     if (isSignalType(t)) signals.push(t);
     else nonSignals.push(t);
   }
@@ -691,6 +702,14 @@ export function badgeLabel(type: string, stepState?: StepState): string {
   if (type === 'PLCInputInt') return 'InInt';
   if (type.startsWith('PLCOutput')) return 'Out:' + type.replace('PLCOutput', '');
   if (type.startsWith('PLCInput')) return 'In:' + type.replace('PLCInput', '');
+  // Mechanism root keeps a badge; the "(Rigid-Body)" displayName suffix is
+  // inspector detail, not badge material.
+  if (type === 'KinematicMechanism') return 'Mechanism';
+  // Long drive behaviors get explicit short forms; the generic D: prefix rule
+  // below covers the already-short remainder (D:Speed, D:Gear, D:CAM, …).
+  if (type === 'Drive_ErraticPosition') return 'D:Erratic';
+  if (type === 'Drive_DestinationMotor') return 'D:DestMotor';
+  if (type === 'Drive_FollowPosition') return 'D:Follow';
   if (type.startsWith('Drive_')) return type.replace('Drive_', 'D:');
   // Components can declare a custom display name via registerComponent({ displayName })
   return getDisplayName(type);

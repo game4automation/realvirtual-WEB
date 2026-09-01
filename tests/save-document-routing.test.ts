@@ -215,12 +215,15 @@ describe('decideSaveVerb', () => {
   });
 
   it('is blocked — with a reason — when there is nowhere to write', () => {
+    // Any identity does here: the refusal is about the PROJECT, not the
+    // document, which is exactly why both lineages share these three sentences.
+    const someDocument = projectDocumentBase('models/Cell.glb', 'Cell');
     expect(decideSaveVerb(
-      { lineage: 'asset', base: { kind: 'empty' }, name: 'X' }, null,
+      { lineage: 'asset', base: someDocument, name: 'X' }, null,
     )).toMatchObject({ verb: 'blocked' });
     const readOnly = { ...backend, writable: false, kind: 'bundled' as const };
     const decision = decideSaveVerb(
-      { lineage: 'asset', base: { kind: 'empty' }, name: 'X' }, readOnly as never,
+      { lineage: 'asset', base: someDocument, name: 'X' }, readOnly as never,
     );
     expect(decision.verb).toBe('blocked');
     expect(decision.reason).toMatch(/ships with the application/i);
@@ -281,12 +284,30 @@ describe('saveDocument — routing by identity', () => {
     expect(result.kind === 'saved' && result.copied).toBe(false);
   });
 
-  it('a new Untitled asset lands in the project Custom library', async () => {
-    const doc = makeDoc({ kind: 'empty' }, 'Untitled');
+  /**
+   * plan-719 F2/F3 — what this test used to say went with the case it
+   * described. There is no "new Untitled asset" that has to invent a home at
+   * its first save: a document is created WITH a path before the editor opens
+   * it. The prompt that survived is the one for a READ-ONLY source, and this
+   * is its routing half — the copy lands under the name the user confirmed,
+   * and it becomes a document, which is what makes every later save silent.
+   */
+  it('a read-only source is copied in under the confirmed name', async () => {
+    const doc = makeDoc(
+      { kind: 'builtinModel', url: '/models/Demo.glb', name: 'Demo' }, 'Demo');
     const result = await save(doc, makeViewer(), { requestName: async () => 'Gripper' });
+    expect(writes[0].path).toBe('models/Gripper.glb');
+    expect(result.kind === 'saved' && result.base)
+      .toMatchObject({ kind: 'document', path: 'models/Gripper.glb' });
+    expect(result.kind === 'saved' && result.copied).toBe(true);
+  });
+
+  it('"Save as…" still names a NEW asset in the project Custom library', async () => {
+    const doc = makeDoc(libraryDocumentBase('Custom/Belt.glb'));
+    const result = await save(doc, makeViewer(), {
+      forceNamePrompt: true, requestName: async () => 'Gripper',
+    });
     expect(writes[0].path).toBe('library/Custom/Gripper.glb');
-    // plan-716 §2.6: one kind, and the `library/` folder shows in the PATH now
-    // rather than in the kind name.
     expect(result.kind === 'saved' && result.base)
       .toMatchObject({ kind: 'document', path: 'library/Custom/Gripper.glb' });
   });
@@ -315,11 +336,21 @@ describe('saveDocument — routing by identity', () => {
 
 // ─── §2.4 — read-only source becomes a copy in the project ────────────────
 
+/**
+ * plan-719 F2 changed HOW this copy is reached, not what it produces: the
+ * destination is confirmed in one "Save into project as…" prompt instead of
+ * being chosen silently. Every assertion below is unchanged; what each test
+ * gained is the `requestName` that answers that prompt. A save with no way to
+ * ask is now `blocked` rather than a silent copy, which is pinned separately
+ * in `save-into-project-prompt.test.ts`.
+ */
+const confirmName = (name: string) => ({ requestName: async () => name });
+
 describe('saveDocument — "save into project" (§2.4)', () => {
   it('copies under models/ and MOVES the identity onto the copy', async () => {
     const doc = makeDoc({ kind: 'builtinModel', url: '/models/Demo.glb', name: 'Demo' }, 'Demo');
 
-    const result = await save(doc);
+    const result = await save(doc, makeViewer(), confirmName('Demo'));
 
     expect(writes[0].path).toBe('models/Demo.glb');
     // "create only" — the copy must never land on top of an existing document.
@@ -336,7 +367,7 @@ describe('saveDocument — "save into project" (§2.4)', () => {
     h.files.set('models/Demo.glb', 'somebody else');
     const doc = makeDoc({ kind: 'builtinModel', url: '/models/Demo.glb', name: 'Demo' }, 'Demo');
 
-    const result = await save(doc);
+    const result = await save(doc, makeViewer(), confirmName('Demo'));
 
     expect(result.kind === 'saved' && result.relPath).toBe('models/Demo_1.glb');
     // The namesake is untouched — the whole point of the dedup.
@@ -347,9 +378,22 @@ describe('saveDocument — "save into project" (§2.4)', () => {
     const doc = makeDoc({
       kind: 'providerAsset', providerId: 'p', sourceId: 's', assetId: 'a', label: 'Roller',
     } as AssetBase, 'Roller');
-    const result = await save(doc);
+    const result = await save(doc, makeViewer(), confirmName('Roller'));
     expect(result.kind === 'saved' && result.copied).toBe(true);
     expect(writes[0].path).toBe('models/Roller.glb');
+  });
+
+  /**
+   * F2's other half, stated where the routing lives: without a way to ask, the
+   * copy does NOT happen. A silent copy was the old behaviour, and reverting
+   * to it "just for callers that cannot prompt" would put the surprise back
+   * for exactly the callers least able to notice it.
+   */
+  it('refuses to copy silently when there is no way to ask', async () => {
+    const doc = makeDoc({ kind: 'builtinModel', url: '/models/Demo.glb', name: 'Demo' }, 'Demo');
+    const result = await save(doc);
+    expect(result.kind).toBe('blocked');
+    expect(writes).toHaveLength(0);
   });
 });
 

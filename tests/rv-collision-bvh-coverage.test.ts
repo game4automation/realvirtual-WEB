@@ -8,7 +8,7 @@
  * exist for practically every mesh" vs. "only for the merged pick geometry").
  * The answer decides whether the narrowphase needs its own BVH build path.
  *
- * Reference model: `public/models/DemoRobotIK.glb` — a robot inside a machine
+ * Reference model: `../realvirtual-WebViewer-Private~/projects/Development/models/DemoRobotIK.glb` — a robot inside a machine
  * environment, i.e. exactly the geometry class this feature targets. A real
  * customer model is not available in the worktree; this is the documented
  * substitute (the largest demo GLB, DemoRealvirtualWeb.glb at 34 MB, is not
@@ -26,13 +26,28 @@ import type { BufferGeometry } from 'three';
 import { computeBVHAsync } from '../src/core/engine/rv-scene-loader';
 import { createInlineBVHPort } from '../src/core/engine/rv-bvh-build-port';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.robotIK);
 
 const MODEL = DEV_GLB.robotIK;
 
-describe('BVH coverage on the reference model (plan-394 Phase 0)', () => {
+describe.skipIf(!DEV_ASSETS)('BVH coverage on the reference model (plan-394 Phase 0)', () => {
   it('builds a boundsTree for every non-skipped mesh geometry', async () => {
+    // plan-395 §2.6: this used to be `expect(head.ok).toBe(true)`, which PASSED
+    // when the model was absent - the dev server answers an unknown path with the
+    // SPA fallback, a 200. The suite then ran on an HTML document. Availability is
+    // now decided once, by content type, in the `skipIf` above; what is asserted
+    // here is the property that actually matters to this test.
     const head = await fetch(MODEL, { method: 'HEAD' });
-    expect(head.ok, `${MODEL} must be served by the test server`).toBe(true);
+    expect(head.headers.get('content-type') ?? '', `${MODEL} must be served as a GLB`)
+      .toMatch(/gltf-binary|octet-stream/);
 
     const gltf = await new GLTFLoader().loadAsync(MODEL);
     const root = gltf.scene;

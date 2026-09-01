@@ -73,6 +73,14 @@ interface DevStats {
   metadataAabbCount: number;
   metadataAabbMs: string;
   hoverableRanges: number;
+  // Node/signal path aliases for Three.js-deduped nodes (LoadResult.aliasStats).
+  aliasNodes: number;
+  aliasSignals: number;
+  /** Alias registrations discarded because the path was already claimed. */
+  aliasDropped: number;
+  /** "<leaf> ×<count>" — the most-claimed alias leaf, i.e. the worst suffix scan. */
+  aliasLargestBucket: string;
+  aliasMs: string;
 }
 
 /** Display label per pick-path highlight strategy id. */
@@ -353,6 +361,9 @@ export function DevToolsTab() {
         : undefined;
       const pick = viewer.getPickMetrics();
       const metaStats = viewer.getMetadataLoadStats();
+      // Read off the load result directly — alias registration has no dedicated
+      // accessor and does not need one; the getter already exposes the record.
+      const aliasStats = viewer.lastLoadResult?.aliasStats ?? null;
       // Pre-format ms to 0.01 precision — the formatted strings feed both the
       // change-hash (bounded churn) and the rendered rows.
       const pickFmt = {
@@ -366,7 +377,11 @@ export function DevToolsTab() {
         highlightLast: pick.lastHighlightMs.toFixed(2),
       };
       const hash = `${viewer.currentFps}|${info.triangles}|${info.drawCalls}|${info.programs}|${info.materialsUnique}|${heapMB}|${viewer.drives.length}|${gpuActive}|${gpuHighPerf ?? ''}|${gpuLowPower ?? ''}|${analysis?.severity ?? ''}|${analysis?.tier ?? ''}`
-        + `|${pickFmt.raycast}|${pickFmt.raycastLast}|${pickFmt.highlight}|${pickFmt.highlightLast}|${pickFmt.resolve}|${pick.strategy}|${pick.raycastCount}|${pick.bvhPending}|${pick.overlayObjects}`;
+        + `|${pickFmt.raycast}|${pickFmt.raycastLast}|${pickFmt.highlight}|${pickFmt.highlightLast}|${pickFmt.resolve}|${pick.strategy}|${pick.raycastCount}|${pick.bvhPending}|${pick.overlayObjects}`
+        // Alias stats change only on a model load, but they must be IN the hash:
+        // without them a load whose other counters happen to match would leave
+        // the previous model's alias numbers on screen.
+        + `|${aliasStats?.nodeAliases ?? -1}|${aliasStats?.signalAliases ?? -1}|${aliasStats?.droppedAliases ?? -1}`;
       if (hash === prevStatsHashRef.current) return;
       prevStatsHashRef.current = hash;
       setStats({
@@ -423,6 +438,13 @@ export function DevToolsTab() {
         metadataAabbCount: metaStats?.aabbCount ?? 0,
         metadataAabbMs: metaStats ? metaStats.aabbBuildMs.toFixed(1) : '--',
         hoverableRanges: metaStats?.hoverableFaceRanges ?? 0,
+        aliasNodes: aliasStats?.nodeAliases ?? 0,
+        aliasSignals: aliasStats?.signalAliases ?? 0,
+        aliasDropped: aliasStats?.droppedAliases ?? 0,
+        aliasLargestBucket: aliasStats && aliasStats.largestSuffixBucket.count > 0
+          ? `${aliasStats.largestSuffixBucket.suffix} ×${aliasStats.largestSuffixBucket.count.toLocaleString()}`
+          : '--',
+        aliasMs: aliasStats ? aliasStats.ms.toFixed(1) : '--',
       });
     }, 200);
     return () => clearInterval(interval);
@@ -467,6 +489,15 @@ export function DevToolsTab() {
           <StatRow label="Metadata Nodes" value={s ? s.metadataNodes.toLocaleString() : '--'} />
           <StatRow label="AABB Build" value={s ? `${s.metadataAabbCount.toLocaleString()} in ${s.metadataAabbMs} ms` : '--'} />
           <StatRow label="Hoverable Ranges" value={s ? s.hoverableRanges.toLocaleString() : '--'} />
+          <StatRow
+            label="Path Aliases"
+            value={s ? `${s.aliasNodes.toLocaleString()} node / ${s.aliasSignals.toLocaleString()} signal in ${s.aliasMs} ms` : '--'}
+          />
+          <StatRow
+            label="Aliases Dropped"
+            value={s ? s.aliasDropped.toLocaleString() : '--'}
+          />
+          <StatRow label="Largest Alias Bucket" value={s?.aliasLargestBucket ?? '--'} />
         </Box>
       </SettingsSection>
 

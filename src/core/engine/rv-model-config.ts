@@ -30,6 +30,21 @@ export interface ModelConfig {
 // ─── Loading ───────────────────────────────────────────────────────────
 
 /**
+ * Whether `fetch()` can load this URL at all.
+ *
+ * Sidecar probes derive their URL from the model URL — and since plan-709 a
+ * project document's model URL is the `rvproject:` sentinel, which fetch()
+ * rejects with a LOUD console error before any catch sees it. A relative URL
+ * (no scheme) is fetchable; a scheme is fetchable only when the browser knows
+ * it. A sidecar for a project document travels as a project file and is read
+ * by the backend, never by these HTTP probes.
+ */
+export function isFetchableUrl(url: string): boolean {
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url);
+  return !scheme || /^(https?|blob|data)$/i.test(scheme[1]);
+}
+
+/**
  * Fetch the companion `modelname.json` sidecar file for a GLB model.
  * Returns empty config on 404 or parse error (no throw).
  */
@@ -37,6 +52,7 @@ export async function loadModelJsonConfig(
   modelUrl: string,
   signal?: AbortSignal,
 ): Promise<ModelConfig> {
+  if (!isFetchableUrl(modelUrl)) return {};
   const configUrl = modelUrl.replace(/\.glb$/i, '.json');
   try {
     const resp = await fetch(configUrl, { signal });

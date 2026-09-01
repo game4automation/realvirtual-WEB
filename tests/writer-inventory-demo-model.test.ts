@@ -5,7 +5,7 @@
  * Plan-320 Phase 1 — headless telemetry validation of the Phase-0 writer
  * inventory against the demo model.
  *
- * Loads public/models/tests.glb through the full loadGLB pipeline, runs a few
+ * Loads ../realvirtual-WebViewer-Private~/projects/Development/fixtures/tests.glb through the full loadGLB pipeline, runs a few
  * seconds of standalone simulation (logic engine → drives → transport, the
  * CoreSubsystems order) and asserts the abort criterion of Phase 1: a full
  * demo run produces NO `unknown` writer entry — every SignalStore write is
@@ -21,6 +21,15 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Scene } from 'three';
 import { loadGLB, type LoadResult } from '../src/core/engine/rv-scene-loader';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.tests);
 
 const GLB_URL = DEV_GLB.tests;
 const DT = 1 / 60;
@@ -46,7 +55,7 @@ afterAll(() => {
   result = null;
 });
 
-describe('writer inventory on the demo model (plan-320 Phase 1)', () => {
+describe.skipIf(!DEV_ASSETS)('writer inventory on the demo model (plan-320 Phase 1)', () => {
   it('a simulated demo run records no unknown writer', () => {
     if (!result) {
       console.warn(`${GLB_URL} not available — skipping demo-model telemetry run`);

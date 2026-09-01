@@ -25,6 +25,7 @@ import { defineConfig } from 'vite';
 import {
   existsSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
 } from 'node:fs';
@@ -34,9 +35,14 @@ import { stageFilteredSourceTree } from './scripts/_workspace-lib.mjs';
 
 const SOURCE_ROOT = __dirname;
 const PRIVATE_ROOT = resolve(SOURCE_ROOT, '..', 'realvirtual-WebViewer-Private~');
-const FILTERED_STAGE_ROOT = resolve(
-  SOURCE_ROOT,
-  'node_modules/.cache/rv-embed-filtered-stage',
+// The staging root must be a REAL path: the community precheck stages the
+// tracked tree into a temp dir whose node_modules is a symlink back into the
+// primary checkout. Vite/Rollup resolve importers through realpath, so a
+// symlink-spelled staging root would mix two spellings of the same tree and
+// dynamic imports (the model-plugin glob) fail to resolve.
+const FILTERED_STAGE_ROOT = join(
+  realpathSync(resolve(SOURCE_ROOT, 'node_modules')),
+  '.cache/rv-embed-filtered-stage',
 );
 
 // This is a public CDN artifact. Set the public build flag before any source is
@@ -55,7 +61,7 @@ const BUILD_ROOT = staged.coreRoot;
 const stagedNodeModules = resolve(BUILD_ROOT, 'node_modules');
 if (!existsSync(stagedNodeModules)) {
   symlinkSync(
-    resolve(SOURCE_ROOT, 'node_modules'),
+    realpathSync(resolve(SOURCE_ROOT, 'node_modules')),
     stagedNodeModules,
     process.platform === 'win32' ? 'junction' : 'dir',
   );
@@ -196,6 +202,9 @@ export default defineConfig({
     // AP1), but define them anyway so a future engine-side gate cannot break
     // the lib build silently.
     __RV_HAS_PRIVATE__: 'false',
+    // Drops the model-plugin glob: its lazy chunks would otherwise be emitted
+    // into dist-embed, React and all (plan-326 AP1 guard).
+    __RV_EMBED__: 'true',
     __RV_INTERNAL__: 'false',
     __RV_COMMERCIAL__: 'false',
     __RV_VERSION__: JSON.stringify(RV_VERSION),

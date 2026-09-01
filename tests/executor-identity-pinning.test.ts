@@ -20,6 +20,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Group, Object3D, Scene } from 'three';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { RvDocument } from '../src/core/ops/rv-document';
@@ -67,7 +68,7 @@ const setField = (value: number): RvPrimitiveOp => ({
 
 describe('doc.executor === AssetDocument.executor', () => {
   it('holds for a freshly constructed document', () => {
-    const doc = AssetDocument.newUntitled(makeViewer());
+    const doc = scratchAssetDocument(makeViewer());
     expect(assetSideOf(doc)).toBe(doc.executor);
     doc.dispose();
   });

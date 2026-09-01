@@ -19,7 +19,9 @@
  */
 
 import { expect, test, type Page } from 'playwright/test';
+ import { scratchAssetDocument } from '../tests/helpers/scratch-asset-document';
 import { DEV_GLB } from '../tests/fixtures/glb-paths.mjs';
+import { HAS_PRIVATE_SOURCE, privateModuleUrl } from './private-module-url';
 
 const RIGS = [
   { id: 'four-bar', url: DEV_GLB.mechanismFourbar },
@@ -32,9 +34,11 @@ const BUDGET_MS = 0.2;
 const WARMUP_TICKS = 100;
 const MEASURED_TICKS = 1000;
 
+// `authoring` lives in the PRIVATE sibling repository, outside the dev-server
+// root, and is addressed through `/@fs/<abs>` — see `e2e/private-module-url.ts`.
 const MODULE_PATHS = {
   doc: '/src/core/editor/rv-asset-document.ts',
-  authoring: '/src/plugins/asset-editor/mechanism/mechanism-authoring.ts',
+  authoring: privateModuleUrl('plugins/asset-editor/mechanism/mechanism-authoring.ts'),
   registry: '/src/core/engine/rv-kinematic-registry.ts',
 };
 
@@ -63,7 +67,7 @@ async function installHarness(page: Page): Promise<void> {
       async prepare() {
         const viewer = w.viewer;
         const bridge = kinRegistry.getMechanismUiBridge();
-        const doc = docMod.AssetDocument.newUntitled(viewer);
+        const doc = docMod.scratchAssetDocument(viewer);
         const readField = (p: string, c: string, f: string) => {
           const node = viewer.registry?.getNode(p);
           return node ? rvOf(node)[c]?.[f] : undefined;
@@ -118,6 +122,10 @@ async function installHarness(page: Page): Promise<void> {
 test.describe.configure({ mode: 'serial' });
 
 test.describe('plan-412 §9.8 — inverse dynamics benchmark', () => {
+  // Mechanism authoring is commercial source; without the private sibling repo
+  // there is nothing to benchmark here.
+  test.skip(!HAS_PRIVATE_SOURCE, 'needs the private sibling repository (asset-editor source)');
+
   let page: Page;
   const results: string[] = [];
 

@@ -120,7 +120,7 @@ const PART: DocumentClassification = { v: 1, level: 'part', tags: ['gripper'] };
 function bundled(): BundledBackend {
   return new BundledBackend({
     models: [{ url: DEMO_URL, label: 'Demo' }],
-    publishedScenes: [],
+    // `publishedScenes` is gone with the synthetic manifest (plan-735 3b).
     fetchImpl: (async () => (
       { ok: false, status: 404, json: async () => null } as unknown as Response
     )) as typeof fetch,
@@ -451,15 +451,34 @@ describe('plan-716 Phase 1 — the workspace registers as a library source', () 
 // ─── The bundled demo is a source, not the default ──────────────────────
 
 describe('plan-716 Phase 1 — explicit demo opening still works', () => {
-  it('resolves the bundled Sample project when it is asked for', async () => {
+  // Re-sourced by plan-735, same claim. It used to point at a 404 deploy root
+  // and expect `prj_sample` — the SYNTHETIC manifest, which is exactly what
+  // plan-735 removed. The deploy's own manifest is where a bundled project
+  // comes from now, so the fixture that publishes one is the one that shows
+  // "the bundled project is still reachable when it is asked for".
+  it('resolves the bundled deploy project when it is asked for', async () => {
+    const store = new ProjectStore();
+    const resolved = await store.resolveActiveProject({
+      workspaceDefault: false,
+      bundledBackend: deployed(),
+    });
+
+    expect(resolved.kind).toBe('bundled');
+    expect(resolved.project?.id).toBe('prj_customer_deploy');
+    await store.closeProject();
+  });
+
+  // The other half, and the one plan-735 changed: a deploy root that publishes
+  // NO manifest has no project to resolve. Before plan-735 this same call
+  // answered with an invented `prj_sample`.
+  it('has no bundled project when the deploy publishes no manifest', async () => {
     const store = new ProjectStore();
     const resolved = await store.resolveActiveProject({
       workspaceDefault: false,
       bundledBackend: bundled(),
     });
 
-    expect(resolved.kind).toBe('bundled');
-    expect(resolved.project?.id).toBe(SAMPLE_PROJECT_ID);
+    expect(resolved.project?.id).not.toBe(SAMPLE_PROJECT_ID);
     await store.closeProject();
   });
 
@@ -509,12 +528,13 @@ describe('plan-716 Phase 1 — the verbs still work, now inside My Workspace', (
 
     const docs = workspaceDocuments(project);
     expect(docs).toHaveLength(1);
-    expect(docs[0]!.path).toBe('scenes/Demo.glb');
+    // User decision 2026-08-30 (plan-719 residual): new documents save to the project root
+    expect(docs[0]!.path).toBe('Demo.glb');
     expect(store.getSnapshot().isDraft).toBe(false);
     // RE-PINNED: no catalogue row anywhere. The document IS the artefact.
     expect(listMetas()).toEqual([]);
     // The bytes really landed in the project the boot opened.
-    expect(await project.getBackend()!.readBlobBytes('scenes/Demo.glb')).not.toBeNull();
+    expect(await project.getBackend()!.readBlobBytes('Demo.glb')).not.toBeNull();
     store.dispose();
     await project.closeProject();
   });

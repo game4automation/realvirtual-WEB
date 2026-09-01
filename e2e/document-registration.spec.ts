@@ -32,6 +32,20 @@
  * has to handle. The folder backend's own contract is covered by the
  * `describe.each` fixtures in `adopt-discovered-documents.test.ts`.
  *
+ * **The workspace project is now opened explicitly** (plan-726). A bare boot
+ * used to fall through to *My Workspace*, so `bootBare()` alone left a WRITABLE
+ * project open and the plant below just worked. The deploy publishes its own
+ * `public/project.json` now, so a bare boot resolves to the READ-ONLY bundled
+ * demo instead — and `plantUnregisteredFile()` would have found
+ * `backend.writable === false` and returned `{ planted: false }`, which this
+ * spec turns into `test.skip`. It would have gone green while proving nothing.
+ *
+ * `openWorkspaceProject()` re-creates the pre-726 condition through the option
+ * the store already has for it: a bundled backend pointed at a base URL that
+ * serves no `project.json`. With no deployed manifest to prefer, the resolution
+ * falls through to *My Workspace* exactly as it always did — no test-only
+ * production API, and the branch under test is the real one.
+ *
  * **The rename runs the dashboard's modules, not its React callback.** A
  * `useCallback` closure is not reachable from `page.evaluate`, so the four calls
  * `renameLibraryAsset` composes — `buildDashboardTree` → `buildProjectTree` →
@@ -50,6 +64,7 @@ const RENAMED_PATH = 'library/E2E Renamed Roller.glb';
 
 const MODULE_PATHS = {
   projectStore: '/src/core/project/project-store.ts',
+  bundledBackend: '/src/core/project/backends/bundled-backend.ts',
   identity: '/src/core/project/rv-asset-identity.ts',
   documents: '/src/core/project/rv-project-documents.ts',
   emptyGlb: '/src/core/hmi/scene/empty-glb.ts',
@@ -67,6 +82,39 @@ async function bootBare(page: Page): Promise<void> {
     { timeout: 30_000 },
   );
   await page.waitForTimeout(2_000);
+}
+
+/**
+ * Make "My Workspace" the active project again (plan-726).
+ *
+ * The deploy root publishes a `project.json`, which the resolution prefers over
+ * the implicit workspace. Pointing the bundled backend at a base URL that has
+ * none removes that preference — the same `bundledBackend` option the unit nets
+ * use — and the workspace branch wins as it did before. Nothing test-only is
+ * added to the store for this.
+ *
+ * Returns false when storage is unavailable, so the caller can skip with a real
+ * reason instead of asserting against a project that is not writable.
+ */
+async function openWorkspaceProject(page: Page): Promise<boolean> {
+  return page.evaluate(async (paths) => {
+    const [projectStore, backends] = await Promise.all([
+      import(/* @vite-ignore */ paths.projectStore),
+      import(/* @vite-ignore */ paths.bundledBackend),
+    ]);
+    try {
+      const store = projectStore.getProjectStore();
+      await store.resolveActiveProject({
+        // A base that answers 404 for project.json — so `hasDeployedManifest()`
+        // is false and the deployed-manifest branch is skipped.
+        bundledBackend: new backends.BundledBackend({ baseUrl: '/__rv726_no_manifest__/' }),
+      });
+      await store.hydrateProjectScenes();
+      return store.getBackend()?.writable === true;
+    } catch {
+      return false;
+    }
+  }, MODULE_PATHS);
 }
 
 interface PlantResult {
@@ -227,6 +275,13 @@ test.describe('an unregistered library file, adopted and then renamed (plan-717)
 
     // ── 1. bytes under library/, no row ───────────────────────────────────
     await bootBare(page);
+    // plan-726: a bare boot lands in the read-only demo project now, so the
+    // writable project this spec is about has to be named explicitly — without
+    // it the plant below silently skips the whole spec.
+    const workspaceOpen = await openWorkspaceProject(page);
+    if (!workspaceOpen) {
+      test.skip(true, 'My Workspace could not be opened (storage unavailable)');
+    }
     const planted = await plantUnregisteredFile(page);
     if (!planted.planted) test.skip(true, planted.why ?? 'the file could not be planted');
 

@@ -4,7 +4,7 @@
 /**
  * Test 9.9 of plan-362 — rv_extras round trip against a REAL Unity export.
  *
- * SKIPPED until `EnergyChain.cs` ships and `public/models/tests.glb` is
+ * SKIPPED until `EnergyChain.cs` ships and `../realvirtual-WebViewer-Private~/projects/Development/fixtures/tests.glb` is
  * re-exported with a chain in it. Same pattern as
  * `tests/glb-web-diagnostics.test.ts`.
  *
@@ -20,7 +20,7 @@ import { describe, expect, it } from 'vitest';
 
 describe.skip('EnergyChain Unity GLB fixture', () => {
   it('parses EnergyChain rv_extras from a Unity-exported GLB', () => {
-    // Load public/models/tests.glb, find the EnergyChain node, and assert:
+    // Load ../realvirtual-WebViewer-Private~/projects/Development/fixtures/tests.glb, find the EnergyChain node, and assert:
     //   - Anchor/Follower arrive as ComponentReference objects
     //   - their componentType is exactly 'UnityEngine.Transform'
     //   - both resolve to real nodes through NodeRegistry.resolve()

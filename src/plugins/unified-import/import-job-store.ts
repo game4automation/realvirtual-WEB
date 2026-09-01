@@ -90,9 +90,23 @@ export function useImportJob(): ImportJobSnapshot {
 
 // ─── Actions ─────────────────────────────────────────────────────────────
 
-/** Abort the running job (the Cancel button in dialog and tile). No-op when idle. */
+/**
+ * Abort the running job (the Cancel button in dialog and tile). No-op when idle.
+ *
+ * The store goes to `cancelled` HERE, not when the provider's promise finally
+ * settles (plan-444 F2). Signalling alone left the UI in its busy state for as
+ * long as the abort took to reach whatever was awaiting — an in-flight upload,
+ * a poll interval, or an occt tessellation that cannot be interrupted at all —
+ * so a click on Cancel looked like nothing had happened. The job is over the
+ * moment the user says it is; what is still unwinding in the background is
+ * bookkeeping, and {@link _finish} ignores it because the controller it belongs
+ * to is no longer the current one.
+ */
 export function abortImportJob(): void {
-  _abort?.abort();
+  const controller = _abort;
+  if (!controller) return;
+  controller.abort();
+  _finish({ kind: 'cancelled', errors: [], warnings: [], importedNames: [] });
 }
 
 /** Clear the last outcome (tile dismissed / dialog consumed the result). */
@@ -133,11 +147,15 @@ export function startImportJob(
     try {
       const result = await resolveProviderSafe(
         provider, input,
-        (p) => { _progress = p; _notify(); },
+        // A progress report from a job the user already cancelled must not
+        // repaint the bar the cancel just took down.
+        (p) => { if (_abort === controller) { _progress = p; _notify(); } },
         controller.signal,
       );
       if (controller.signal.aborted) {
-        _finish({ kind: 'cancelled', errors: [], warnings: [], importedNames: [] });
+        // `abortImportJob` already published the cancelled outcome; this is the
+        // path for an abort that came from somewhere else (reset for tests).
+        _finish({ kind: 'cancelled', errors: [], warnings: [], importedNames: [] }, controller);
         return;
       }
       errors = result.failed.map(f => `${f.id}: ${f.error}`);
@@ -166,17 +184,27 @@ export function startImportJob(
       _finish({
         kind: errors.length > 0 ? 'error' : warnings.length > 0 ? 'warning' : 'success',
         errors, warnings, importedNames,
-      });
+      }, controller);
     } catch (e) {
       errors.push(e instanceof Error ? e.message : String(e));
-      _finish({ kind: 'error', errors, warnings, importedNames });
+      _finish({ kind: 'error', errors, warnings, importedNames }, controller);
     }
   })();
 
   return true;
 }
 
-function _finish(outcome: ImportJobOutcome): void {
+/**
+ * Publish the end of a job.
+ *
+ * `owner` is the controller the outcome belongs to. A job that was cancelled —
+ * or superseded by a later start — is no longer the current one, and its late
+ * outcome is DROPPED rather than allowed to overwrite what the user already
+ * sees. Without that, a Cancel during a slow conversion would flash "cancelled"
+ * and then be replaced by the stale result seconds later.
+ */
+function _finish(outcome: ImportJobOutcome, owner?: AbortController): void {
+  if (owner && _abort !== owner) return;
   _abort = null;
   _status = 'idle';
   _progress = null;

@@ -162,6 +162,28 @@ export class SpacingController {
     return n;
   }
 
+  /**
+   * Visit every traveler currently ON path `pathId` (plan-447 F6). The
+   * controller is the ONLY fleet-wide registry of live travelers, so it owns
+   * the iteration the live-edit re-projection needs — `entries` itself stays
+   * private. Returns the number of visited travelers.
+   *
+   * `fn` may reassign `traveler.path` / `traveler.s` (that IS the
+   * re-projection); the entry list is not structurally modified during the
+   * walk, and the next `gapOf` re-sorts because the visit marks the controller
+   * dirty. Allocation-free.
+   */
+  forEachOnPath(pathId: string, fn: (traveler: PathTraveler) => void): number {
+    let n = 0;
+    for (const e of this.entries) {
+      if (e.traveler.path?.id !== pathId) continue;
+      fn(e.traveler);
+      n++;
+    }
+    if (n > 0) this.dirty = true;
+    return n;
+  }
+
   /** Drop every traveler (model switch / test reset). */
   clear(): void {
     this.entries.length = 0;

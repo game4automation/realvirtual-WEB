@@ -28,6 +28,7 @@
 
 import type { TieredDocumentEntry } from '../../project/rv-project-tiers';
 import { DEFAULT_DOCUMENT_FOLDER } from '../../project/rv-document-ops';
+import { readDocumentRef, normalizeRefPath, type DocumentRefField } from '../../project/rv-project-refs';
 
 /** One row of the "pick documents" list a create-from dialog renders. */
 export interface DocumentPickOption {
@@ -151,4 +152,52 @@ export function newDocumentFolderFor(
  */
 export function newDocumentNameFor(_folder: string): string {
   return 'Untitled';
+}
+
+/** One document that points at a reference file — enough to render a chip and select the row. */
+export interface RefUsage {
+  /** Manifest document id — what a click selects in the dashboard. */
+  id: string;
+  /** What the chip reads; the file's base name when the row carries no name. */
+  name: string;
+}
+
+/**
+ * The documents whose `field` reference names `refPath` — the N:1 direction of plan-718 §2.2,
+ * read out of the manifest that is already loaded (plan-446 F4).
+ *
+ * ## A query, never a stored back-reference
+ *
+ * The manifest has ONE author (realvirtual WEB) and ONE direction: a document names its
+ * configuration. A `usedBy` array on the config file would be the same fact written twice, and the
+ * second copy is the one that goes stale when a document is deleted outside the app. So the reverse
+ * direction is computed on every render — the list is a handful of rows, and being derived is what
+ * makes it impossible to disagree with the forward reference.
+ *
+ * Comparison follows the reference model: normalized separators, no leading `./`, and
+ * case-insensitive, which is what CONNECT's own `NormalizeModelPath` + `OrdinalIgnoreCase` lookup
+ * does — a `Connect/Line1.connect.json` in the manifest and a `connect/line1.connect.json` in the
+ * tree are one file on Windows, and a "Used by" list that disagreed with the gateway about that
+ * would be worse than none.
+ *
+ * Returns the empty array for an unknown path, a `null` path and a document set without matches
+ * alike: "not referenced by anything" is a normal, displayable state, not an error.
+ */
+export function documentsUsingRef(
+  documents: readonly TieredDocumentEntry[],
+  field: DocumentRefField,
+  refPath: string | null | undefined,
+): RefUsage[] {
+  if (typeof refPath !== 'string' || refPath.trim() === '') return [];
+  const wanted = normalizeRefPath(refPath).toLowerCase();
+  if (!wanted) return [];
+  const out: RefUsage[] = [];
+  for (const doc of documents) {
+    const ref = readDocumentRef(doc, field);
+    if (!ref || ref.toLowerCase() !== wanted) continue;
+    const path = typeof doc.path === 'string' ? doc.path : '';
+    const leaf = path.replace(/\\/g, '/').split('/').pop() ?? '';
+    out.push({ id: doc.id, name: doc.name?.trim() || leaf || doc.id });
+  }
+  return out;
 }

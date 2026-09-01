@@ -314,14 +314,14 @@ export class AssetDocument {
    */
   get document(): RvDocument { return this._doc; }
 
-  /** Fresh "Untitled" document. */
-  static newUntitled(viewer: RVViewer): AssetDocument {
-    return new AssetDocument(viewer, {
-      id: 'asset_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
-      name: 'Untitled',
-      base: { kind: 'empty' },
-    });
-  }
+  // `static newUntitled(viewer)` lived here until plan-719 F3. It minted a
+  // document over `{ kind: 'empty' }` — an asset with no file, no row and no
+  // place — and everything downstream then had to carry a branch for the one
+  // identity that could not answer "where do my bytes go". Creation now goes
+  // through `createDocument()`, which writes the bytes and the manifest row
+  // before the document is opened, so every AssetDocument has a home from its
+  // first moment. A caller that needs a document needs a base; there is no
+  // factory that can invent one for it.
 
   // ─── Metadata ───────────────────────────────────────────────────────
 
@@ -560,6 +560,25 @@ export class AssetDocument {
 
   setField(nodePath: string, componentType: string, fieldName: string, value: unknown, prev: unknown): void {
     this._voidApply({ ...assetOpHeader(), kind: 'setField', nodePath, componentType, fieldName, value, prev });
+  }
+
+  /**
+   * Awaited variant of {@link setField} for callers that must OBSERVE the
+   * outcome (the MCP tools): resolves once the op has actually applied and been
+   * recorded, rejects when the executor refused it. The detached path swallows
+   * a failure outside a transaction (`applyOpDetached` catches it), so a caller
+   * that reports success to an agent must not use it — a tool that answers
+   * "ok" for an op that never landed is how edits get lost in silence.
+   *
+   * NOTE: a resolve is necessary but not sufficient — an op queued during a
+   * base swap is dropped inside the queue without an error (see
+   * {@link beginBaseSwap}). Callers that need certainty read the field back
+   * after the resolve.
+   */
+  setFieldAwaited(
+    nodePath: string, componentType: string, fieldName: string, value: unknown, prev: unknown,
+  ): Promise<void> {
+    return this.applyOp({ ...assetOpHeader(), kind: 'setField', nodePath, componentType, fieldName, value, prev });
   }
 
   unsetField(nodePath: string, componentType: string, fieldName: string, prev: unknown): void {

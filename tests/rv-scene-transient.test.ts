@@ -305,8 +305,9 @@ describe('plan-386 §9.4 — transient workspace', () => {
 
       expect(store.isTransient()).toBe(false);
       expect(documentsOf(project.project())).toHaveLength(1);
+      // User decision 2026-08-30 (plan-719 residual): new documents save to the project root
       expect(project.writes.map(w => w.relPath))
-        .toEqual(['scenes/Pick & Place Cell.glb']);
+        .toEqual(['Pick & Place Cell.glb']);
     } finally {
       project.restore();
       resetProjectStore();

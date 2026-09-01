@@ -37,13 +37,20 @@
  * cases apart, and a reference node that itself lives in a referenced file is a
  * refusal ({@link ReferencedFileWriteError}) rather than a guess.
  *
+ * A MOVED node of a referenced file takes the same road since plan-444: its
+ * local TRS becomes an `AssetOverrides.trsByNodeId` entry — a sibling block, not
+ * a component patch — on the same reference node. Before that it was refused
+ * outright, which made "import a STEP, drag a part into place, save" impossible;
+ * a transform is glTF-native data on `nodes[i]` and simply had no home in a
+ * componentType → fields map.
+ *
  * ## What it refuses, and why refusing is the feature
  *
  * A bake that half-succeeds produces a file that looks complete and silently is
  * not — the one outcome worth preventing. Hence hard errors for a changed source
- * file, a value JSON would mangle, a transform on a node inside a referenced
- * asset (no rv-ODT component expresses a foreign node's TRS), and a reference
- * that would make the saved file reference itself.
+ * file, a value JSON would mangle, an edit (component or transform) whose owning
+ * reference node itself lives in a referenced file, and a reference that would
+ * make the saved file reference itself.
  */
 
 import { Euler, Matrix4, Object3D, Quaternion, Vector3 } from 'three';
@@ -111,19 +118,31 @@ export class ReferencedFileWriteError extends Error {
 }
 
 /**
- * A node inside a referenced asset was moved.
+ * A moved node lies too deep for any file we may write.
  *
- * A transform is glTF-native data on `nodes[i]`, not an `extras.realvirtual`
- * component, so the override mechanism cannot carry it. Moving the reference
- * node itself — the whole assembly — is a root-file edit and works normally;
- * only moving a part INSIDE the referenced file is unrepresentable.
+ * Since plan-444 this is the RESIDUAL case, not the common one. Moving a part
+ * inside a referenced asset is now saved as an `AssetOverrides.trsByNodeId`
+ * entry on the reference node — that was F3, and it is what makes "import a
+ * STEP, drag a part, save" work at all. What is still refused is the NESTED
+ * case: the part sits in an asset that is itself referenced from another
+ * referenced asset, so the reference node that would have to hold the override
+ * does not live in the file being written. Writing into the referenced asset
+ * instead is what the user ruled out (it would move the part in every other
+ * instance too), and dropping the move quietly is what F9 exists to prevent.
+ *
+ * The message names the way out because the dialog shows it verbatim
+ * (`SaveDialogs.tsx` renders the reason it is handed, and a raw
+ * "cannot be stored as an override" told the user nothing they could act on).
  */
 export class UnwritableTransformError extends Error {
   constructor(public readonly paths: string[]) {
     super(
-      `${paths.length} moved node(s) live inside a referenced asset — a transform cannot be `
-      + 'stored as an override: ' + paths.slice(0, 8).join(', ')
-      + (paths.length > 8 ? `, … (+${paths.length - 8} more)` : ''),
+      `${paths.length} moved part(s) sit inside an asset that is itself referenced by another `
+      + 'asset, so this file has nowhere to record the move: '
+      + paths.slice(0, 8).join(', ')
+      + (paths.length > 8 ? `, … (+${paths.length - 8} more)` : '')
+      + '.\nOpen the referenced asset (double-click it) and move the part there — '
+      + 'the change then applies to every instance. Or undo the move and save again.',
     );
     this.name = 'UnwritableTransformError';
   }
@@ -262,8 +281,17 @@ export interface BakeResult {
   placements: number;
   /** Nodes created from `addNode` specs. */
   addedNodes: number;
-  /** Node transforms written as glTF-native TRS. */
+  /** Node transforms written as glTF-native TRS on this file's own nodes. */
   transforms: number;
+  /**
+   * Moved nodes of a REFERENCED asset, written as `AssetOverrides.trsByNodeId`
+   * entries on their reference node (plan-444 F3).
+   *
+   * Counted apart from {@link transforms} because they are a different write in
+   * a different place, and a save summary that added them together would say
+   * "12 transforms" for a file whose own nodes never moved.
+   */
+  referenceTransforms: number;
   connections: number;
   connectionTypes: number;
   /** True when a `SceneCamera` was written (false also when one was removed). */
@@ -518,6 +546,37 @@ function applyRoutedOverrides(
     }
   }
   return fields;
+}
+
+/**
+ * Merge moved-node transforms into a reference node's `AssetOverrides.trsByNodeId`.
+ *
+ * A SIBLING of `byNodeId`, never a key inside it (plan-444 §2.3). `byNodeId` is
+ * a componentType → fields map, so a `trs` entry in there would come back out of
+ * the file as a component called "trs" and be written into the target node's
+ * `extras.realvirtual` on every load. The sibling block is invisible to the
+ * component patch path by construction.
+ *
+ * Last write wins per node id, which is the same "the file states the current
+ * position" rule the root-file branch follows: two saves of the same moved part
+ * leave one entry, not a history.
+ */
+function applyRoutedTransformOverrides(
+  node: GltfNode,
+  block: Record<string, Record<string, number[]>>,
+): void {
+  const rv = rvExtrasOf(node);
+  const overrides = (rv[RV_ASSET_OVERRIDES_KEY] ??= {}) as Record<string, unknown>;
+  // The reader tolerates a missing `byNodeId`, but every writer before this one
+  // established the key; keeping the shape uniform means one less variant for
+  // an older viewer to meet.
+  if (!isPlainObject(overrides.byNodeId)) overrides.byNodeId = {};
+  const trsByNodeId = isPlainObject(overrides.trsByNodeId)
+    ? overrides.trsByNodeId as Record<string, Record<string, number[]>>
+    : {};
+  overrides.trsByNodeId = trsByNodeId;
+
+  for (const [nodeId, trs] of Object.entries(block)) trsByNodeId[nodeId] = trs;
 }
 
 // ─── Category 5: node transforms → glTF-native TRS ──────────────────────
@@ -832,6 +891,7 @@ interface NodeLevelCounts {
   fields: number;
   referenceOverrides: number;
   transforms: number;
+  referenceTransforms: number;
 }
 
 /** Categories 1 and 5 — everything that patches an EXISTING `nodes[]` entry. */
@@ -866,28 +926,79 @@ function writeNodeLevel(
     fields += applyRoutedOverrides(gltfNodes[index], block);
   }
 
-  // Category 5. A transform on a node inside a referenced file has no home.
+  // Category 5. Three outcomes, and which one applies is decided the same way
+  // category 1 decides it — by where the node lives (plan-444):
+  //
+  //  - own file          → glTF-native TRS on `nodes[i]`, as it always was;
+  //  - referenced, owned → `AssetOverrides.trsByNodeId` on the reference node,
+  //                        which is what makes a part moved after a CAD import
+  //                        saveable at all (F3);
+  //  - nested            → still refused ({@link UnwritableTransformError}, F5).
+  //
+  // The nodeTransforms array is ALREADY coalesced to the final TRS per node —
+  // `materialise` keys it by nodePath — so moving one part ten times produces
+  // one override, not ten.
   const unwritable: string[] = [];
+  /** Reference node index → `trsByNodeId` block to merge into its overrides. */
+  const routedTrs = new Map<number, Record<string, Record<string, number[]>>>();
   let transforms = 0;
+  let referenceTransforms = 0;
   for (const entry of edits.nodeTransforms) {
     const location = resolver.locate(entry.nodePath);
     if (!location) { unwritable.push(entry.nodePath); continue; }
-    if (location.kind !== 'root' || !gltfNodes[location.index]) {
+
+    if (location.kind === 'root') {
+      if (!gltfNodes[location.index]) { unwritable.push(entry.nodePath); continue; }
+      if (expected && gltfNodes[location.index].name !== expected[location.index]) {
+        throw new ModelSourceChangedError(
+          `node ${location.index} is now "${gltfNodes[location.index].name ?? '<unnamed>'}" `
+          + `instead of "${expected[location.index] ?? '<unnamed>'}"`,
+        );
+      }
+      writeNodeTransform(gltfNodes[location.index], entry.position, entry.quaternion);
+      transforms++;
+      continue;
+    }
+
+    // A node out of a referenced file: the move belongs on the reference node,
+    // which must itself live in the file being written — the identical
+    // ownership rule `splitOverlay` applies to component overrides.
+    const owner = resolver.locate(location.referenceNodePath);
+    if (!owner || owner.kind !== 'root' || !gltfNodes[owner.index]) {
       unwritable.push(entry.nodePath);
       continue;
     }
-    if (expected && gltfNodes[location.index].name !== expected[location.index]) {
+    if (expected && gltfNodes[owner.index].name !== expected[owner.index]) {
       throw new ModelSourceChangedError(
-        `node ${location.index} is now "${gltfNodes[location.index].name ?? '<unnamed>'}" `
-        + `instead of "${expected[location.index] ?? '<unnamed>'}"`,
+        `node ${owner.index} is now "${gltfNodes[owner.index].name ?? '<unnamed>'}" `
+        + `instead of "${expected[owner.index] ?? '<unnamed>'}"`,
       );
     }
-    writeNodeTransform(gltfNodes[location.index], entry.position, entry.quaternion);
-    transforms++;
+    const block = routedTrs.get(owner.index) ?? {};
+    // `NodeTransformEntry` carries no scale, and neither does the entry written
+    // here: the referenced asset owns its scale (a GLB node may carry mirror
+    // scale), and a save that invented one would silently change geometry the
+    // user never touched.
+    block[location.nodeId] = {
+      position: [entry.position[0], entry.position[1], entry.position[2]],
+      quaternion: [entry.quaternion[0], entry.quaternion[1], entry.quaternion[2], entry.quaternion[3]],
+    };
+    routedTrs.set(owner.index, block);
+    referenceTransforms++;
   }
   if (unwritable.length > 0) throw new UnwritableTransformError(unwritable);
 
-  return { nodes, fields, referenceOverrides: split.routedEntries, transforms };
+  for (const [index, block] of routedTrs) {
+    applyRoutedTransformOverrides(gltfNodes[index], block);
+  }
+
+  return {
+    nodes,
+    fields,
+    referenceOverrides: split.routedEntries,
+    transforms,
+    referenceTransforms,
+  };
 }
 
 // ─── Full path: structural categories 2 and 4 ───────────────────────────
@@ -1174,6 +1285,7 @@ export async function bakeIntoGlb(
       placementsUpdated: reconciled.updated,
       addedNodes: 0,
       transforms: counts.transforms,
+      referenceTransforms: counts.referenceTransforms,
       connections: edits.connections.length,
       connectionTypes: edits.connectionTypes.length,
       cameraWritten: fileLevel.cameraWritten,
@@ -1251,6 +1363,7 @@ export async function bakeIntoGlb(
     placementsUpdated: reconciled.updated,
     addedNodes,
     transforms: counts.transforms,
+    referenceTransforms: counts.referenceTransforms,
     connections: edits.connections.length,
     connectionTypes: edits.connectionTypes.length,
     cameraWritten: fileLevel.cameraWritten,

@@ -30,6 +30,7 @@ import { useState } from 'react';
 import { Box, Button, ButtonBase, IconButton, Menu, MenuItem, Stack, Tooltip, Typography } from '@mui/material';
 import { ChevronRight, Close, FolderOpen, MoreVert } from '@mui/icons-material';
 import { RV_SCROLL_CLASS } from '../shared-sx';
+import { isSupported as isFolderPickerSupported } from '../../engine/rv-local-filesystem';
 
 /** Where a row came from — recents are forgettable, workspace entries are not. */
 export type ProjectOrigin = 'workspace' | 'recent';
@@ -119,6 +120,17 @@ export function ProjectsList({
             A workspace is one folder that holds your projects. Every direct
             subfolder with a <code>project.json</code> shows up here.
           </Typography>
+          {/* Said before the click, not after it: on a browser without the
+              File System Access API the picker cannot open at all, and an
+              empty state that only offers a dead button reads as a fault in
+              realvirtual rather than a limit of the browser. */}
+          {!isFolderPickerSupported() && (
+            <Typography
+              sx={{ fontSize: 11, color: 'warning.main', mt: 1.5, lineHeight: 1.5 }}
+            >
+              This browser cannot open local folders. Workspaces need Chrome or Edge.
+            </Typography>
+          )}
           <Button
             variant="contained"
             size="small"

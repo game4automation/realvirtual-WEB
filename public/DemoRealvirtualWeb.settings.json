@@ -1,0 +1,150 @@
+{
+  "$schema": "rv-settings-bundle/1.0",
+  "exportedAt": "2026-04-19T17:11:59.021Z",
+  "modelUrl": "/DemoRealvirtualWeb.glb",
+  "settings": {
+    "visual": {
+      "lightingMode": "default",
+      "modeSettings": {
+        "simple": {
+          "lightIntensity": 1,
+          "toneMapping": "none",
+          "toneMappingExposure": 1,
+          "ambientColor": "#ffffff",
+          "ambientIntensity": 1,
+          "dirLightEnabled": false,
+          "dirLightColor": "#ffffff",
+          "dirLightIntensity": 1.5,
+          "shadowEnabled": false,
+          "shadowIntensity": 0.5,
+          "shadowQuality": "medium"
+        },
+        "default": {
+          "lightIntensity": 0.8,
+          "toneMapping": "none",
+          "toneMappingExposure": 1,
+          "ambientColor": "#404040",
+          "ambientIntensity": 0.75,
+          "dirLightEnabled": true,
+          "dirLightColor": "#ffffff",
+          "dirLightIntensity": 1.5,
+          "shadowEnabled": true,
+          "shadowIntensity": 1,
+          "shadowQuality": "high"
+        }
+      },
+      "projection": "perspective",
+      "fov": 60,
+      "cameras": [
+        null,
+        null,
+        null
+      ],
+      "antialias": false,
+      "shadowMapSize": 2048,
+      "shadowRadius": 2,
+      "maxDpr": 1.5,
+      "fpvSpeed": 2.5,
+      "fpvSprintSpeed": 5,
+      "fpvSensitivity": 0.002,
+      "fpvEyeHeight": 1.7,
+      "aoMode": "gtao",
+      "ssaoIntensity": 1,
+      "ssaoRadius": 0.1,
+      "bloomEnabled": true,
+      "bloomIntensity": 0.2,
+      "bloomThreshold": 0.85,
+      "bloomRadius": 0.4,
+      "groundEnabled": true,
+      "groundBrightness": 1,
+      "groundColor": "#ffffff",
+      "backgroundBrightness": 1,
+      "checkerContrast": 0.5,
+      "uiZoom": 0.75,
+      "orbitRotateSpeed": 1,
+      "orbitPanSpeed": 1,
+      "orbitZoomSpeed": 1,
+      "orbitDampingFactor": 0.08
+    },
+    "interface": {
+      "activeType": "none",
+      "autoConnect": false,
+      "reconnectIntervalMs": 3000,
+      "wsAddress": "localhost",
+      "wsPort": 7000,
+      "wsUseSSL": false,
+      "wsPath": "/",
+      "wsAuthToken": "",
+      "mqttBrokerUrl": "ws://localhost:8080/mqtt",
+      "mqttUsername": "",
+      "mqttPassword": "",
+      "mqttTopicPrefix": "rv/"
+    },
+    "search": {
+      "highlightEnabled": true,
+      "nodesEnabled": true,
+      "disabledTypes": []
+    },
+    "multiuser": {
+      "enabled": true,
+      "connectionMode": "local",
+      "serverUrl": "",
+      "relayUrl": "wss://download.realvirtual.io/relay",
+      "displayName": "Browser",
+      "role": "observer",
+      "joinCode": ""
+    },
+    "groupVisibility": {
+      "hiddenGroups": [],
+      "isolatedGroup": null,
+      "excludedFromOverlay": [
+        "TransportSystem",
+        "Gripper Prefab",
+        "Module_3_Table_Horizontal",
+        "Module_3_Gear",
+        "Module_3_Table_Up_Down",
+        "Arrestor_1_Downstream",
+        "Arrestor_1_Upstream",
+        "Arrestor_2_Downstream",
+        "Arrestor_2_Upstream",
+        "Arrestor_3_Downstream",
+        "Arrestor_3_Upstream",
+        "Module_3_Swedger",
+        "Module_3_Downholder_Swedger",
+        "Module_3_Swedger_Clamp_Downstream",
+        "Module_3_Swedger_Clamp_Upstream",
+        "Module_3_Preorientation",
+        "Module_3_Preorientation_Gripper_Downstream",
+        "Module_3_Preorientation_Gripper_Upstream",
+        "Module_3_Knife",
+        "Module_3_Knife_Downholder",
+        "Door_1",
+        "Door_2",
+        "Door_3",
+        "Door_4",
+        "Door_5",
+        "Door_6_1",
+        "Door_6_2",
+        "Door_7",
+        "Door_8"
+      ],
+      "defaultHiddenGroups": [],
+      "hiddenAutoFilters": [],
+      "isolatedAutoFilter": null
+    },
+    "panelLayouts": {
+      "groups": {
+        "x": 1274,
+        "y": 75,
+        "w": 280,
+        "h": 260
+      },
+      "tank-fill-history": {
+        "x": 1288.5,
+        "y": -224,
+        "w": 760,
+        "h": 420
+      }
+    }
+  }
+}

@@ -17,7 +17,7 @@ import type {
   ImportResultItem,
 } from '../../core/import/rv-import-provider';
 import {
-  FileDropZone, HintCode, PartSourceLinks, PickedFileList, TAB_PANE_SX, TabHint,
+  FileDropZone, HintCode, PickedFileList, TAB_PANE_SX, TabHint,
   useRegisterFilePicker, type PickedFile,
 } from './import-ui';
 
@@ -76,7 +76,6 @@ function GlbFileTab({ ctx }: { ctx: ImportProviderContext }) {
       </TabHint>
       <FileDropZone accept={['.glb']} onFiles={selectFiles} />
       <PickedFileList files={picked} placeholder="No files selected — drop them above or use Choose files… below." />
-      <PartSourceLinks />
       <input
         ref={inputRef}
         type="file"

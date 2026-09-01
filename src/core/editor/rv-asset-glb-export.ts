@@ -34,6 +34,7 @@ import { objectToGlb } from '../import/rv-import-object';
 import { isGltfWrapperName } from '../engine/rv-gltf-unwrap';
 import { isUnresolvedReferenceNode } from '../engine/rv-asset-reference';
 import {
+  RV_CHAIN_ELEMENT,
   RV_CHAIN_PROXY,
   RV_CHAIN_SKIN,
   RV_CHAIN_SOURCE,
@@ -109,6 +110,14 @@ export function pruneRuntimeHelpers(root: Object3D): void {
       // `isBone` instead would be over-broad: an imported skinned GLB may carry
       // legitimate authored bones that must survive a save.
       || node.name === '__rvEnergyChainBones'
+      // Chain element clones (plan-733). `RVChain` builds `NumberOfElements`
+      // copies of its template at load; they are deterministically reproducible
+      // from the rv_extras, so the file must keep the TEMPLATE only. The primary
+      // defence is that an authoring load never clones at all
+      // (`ComponentContext.authoring`) — this is the second half, for a tree that
+      // reached the export from a simulating load. Without it a save would bake
+      // in N copies, and the next round trip N per copy.
+      || ud[RV_CHAIN_ELEMENT]
     ) junk.push(node);
   });
   for (const node of junk) node.removeFromParent();

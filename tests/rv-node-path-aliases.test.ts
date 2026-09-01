@@ -141,7 +141,7 @@ describe('9.8 alias registration covers descendants of a renamed node', () => {
     const realRegisterAlias = registry.registerAlias.bind(registry);
     vi.spyOn(registry, 'registerAlias').mockImplementation((aliasPath, node) => {
       visits.set(node, (visits.get(node) ?? 0) + 1);
-      realRegisterAlias(aliasPath, node);
+      return realRegisterAlias(aliasPath, node);
     });
 
     registerNodeAliases(
@@ -480,5 +480,104 @@ describe('9.13 unresolved signal reference warns instead of silently falling bac
     // Resolves to the CANONICAL path, not the authored alias.
     expect(result.signalAddress).toBe('Line/Kinematics_MC07/Pusher_1/vertical');
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+// ─── plan-734 — BOTH spellings, and the two load paths agree ──────
+
+describe('plan-734 both alias spellings (F3)', () => {
+  /**
+   * A deduped node whose RAW name carries reserved characters — the case the
+   * fixtures above deliberately avoid, and the only one where the raw and the
+   * sanitized spelling differ at all. In every fixture built from plain names
+   * the two collapse into one alias, which is why this whole class of failure
+   * went unnoticed for so long.
+   *
+   *   Line
+   *    ├─ MC06 ─ "-Kettenrad 201:1"    (won the name, restored by the loader)
+   *    └─ MC07 ─ "-Kettenrad_2011"     (deduped → carries the `_1` in reality;
+   *                                     modelled here as the loader left it)
+   */
+  function buildReservedCharScene(): {
+    line: Object3D; renamed: Object3D; leaf: Object3D; rawName: string;
+  } {
+    const scene = new Scene();
+    const line = child(scene, 'Line');
+    const mc07 = child(line, 'Kinematics_MC07');
+    const renamed = child(mc07, '-Kettenrad_2011_1');
+    const leaf = child(renamed, 'Volumen');
+    return { line, renamed, leaf, rawName: '-Kettenrad 201:1' };
+  }
+
+  it('registers the RAW authored spelling as a node alias', () => {
+    const { line, renamed, leaf, rawName } = buildReservedCharScene();
+    const registry = new NodeRegistry();
+    registerAll(registry, line);
+
+    registerNodeAliases(new Map([[renamed, rawName]]), registry, new SignalStore());
+
+    expect(registry.getNode(`Line/Kinematics_MC07/${rawName}`)).toBe(renamed);
+    expect(registry.getNode(`Line/Kinematics_MC07/${rawName}/Volumen`)).toBe(leaf);
+  });
+
+  it('registers the SANITIZED spelling as a node alias as well', () => {
+    const { line, renamed, leaf, rawName } = buildReservedCharScene();
+    const registry = new NodeRegistry();
+    registerAll(registry, line);
+
+    registerNodeAliases(new Map([[renamed, rawName]]), registry, new SignalStore());
+
+    // What the pre-plan-734 loader published alone. Content and overlays
+    // exported against that spelling must keep resolving.
+    expect(registry.getNode('Line/Kinematics_MC07/-Kettenrad_2011')).toBe(renamed);
+    expect(registry.getNode('Line/Kinematics_MC07/-Kettenrad_2011/Volumen')).toBe(leaf);
+  });
+
+  it('does not double-register when raw and sanitized are identical', () => {
+    // The plain-name case: one alias per node, exactly as before plan-734.
+    const { line, renamedPusher } = buildDedupedScene();
+    const registry = new NodeRegistry();
+    const stats = (() => {
+      registerAll(registry, line);
+      return registerNodeAliases(new Map([[renamedPusher, 'Pusher']]), registry, new SignalStore());
+    })();
+
+    // Pusher + its `vertical` child = 2 aliases, not 4.
+    expect(stats.nodeAliases).toBe(2);
+    expect(stats.droppedAliases).toBe(0);
+  });
+
+  it('the placed-asset path produces the SAME aliases as the load path', () => {
+    // The `_rvOrigName` stamp and the in-memory map must carry the same value.
+    // If only one of the two rv-glb-parse writes had been changed, these two
+    // paths would publish different aliases for an identical tree and the
+    // divergence would only ever show up in a customer's planner session.
+    const { line, renamed, rawName } = buildReservedCharScene();
+
+    const viaMap = new NodeRegistry();
+    registerAll(viaMap, line);
+    registerNodeAliases(new Map([[renamed, rawName]]), viaMap, new SignalStore());
+
+    // Under a Scene, like the map fixture: computeNodePath drops the root, so
+    // an unparented 'Line' would silently yield paths without the 'Line/'.
+    const stamped = child(new Scene(), 'Line');
+    const mc07 = child(stamped, 'Kinematics_MC07');
+    const part = child(mc07, '-Kettenrad_2011_1');
+    part.userData[RV_ORIG_NAME_KEY] = rawName;
+    child(part, 'Volumen');
+
+    const viaStamp = new NodeRegistry();
+    registerAll(viaStamp, stamped);
+    registerNodeAliases(collectRenamedNodes(stamped), viaStamp, new SignalStore());
+
+    for (const path of [
+      `Line/Kinematics_MC07/${rawName}`,
+      `Line/Kinematics_MC07/${rawName}/Volumen`,
+      'Line/Kinematics_MC07/-Kettenrad_2011',
+      'Line/Kinematics_MC07/-Kettenrad_2011/Volumen',
+    ]) {
+      expect(viaMap.getNode(path), `map path: ${path}`).not.toBeNull();
+      expect(viaStamp.getNode(path), `stamp path: ${path}`).not.toBeNull();
+    }
   });
 });

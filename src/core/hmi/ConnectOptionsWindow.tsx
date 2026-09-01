@@ -14,7 +14,7 @@
  * Sections 2-4 require a connected gateway and collapse to a hint otherwise.
  */
 
-import { useState, useCallback, useEffect, useSyncExternalStore } from 'react';
+import { useState, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
 import {
   Box,
   Typography,
@@ -168,7 +168,28 @@ function ConnectionSection() {
 // always runs with its profile". Switching is lossless: the gateway writes the
 // live set back into the previous profile first.
 
-function ProfileSection({ onSwitched }: { onSwitched: () => void }) {
+/**
+ * Normalized comparison key for a `documents[].connectRef` / `profile.connectRef` path.
+ *
+ * The same rule CONNECT applies server-side (`ProjectManifest.NormalizeModelPath` plus an
+ * OrdinalIgnoreCase lookup): separators unified, a leading `./` dropped, case folded. A
+ * preselection that disagreed with the gateway about whether `Connect/Line1.connect.json` and
+ * `connect/line1.connect.json` are one file would silently show "not among the profiles" for a
+ * profile that is right there.
+ */
+function refKey(ref: string | null | undefined): string {
+  return typeof ref === 'string'
+    ? ref.trim().replace(/\\/g, '/').replace(/^\.?\//, '').toLowerCase()
+    : '';
+}
+
+function ProfileSection({
+  onSwitched,
+  initialProfile,
+}: {
+  onSwitched: () => void;
+  initialProfile?: string | null;
+}) {
   const [profiles, setProfiles] = useState<ConnectProfileInfo[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [supported, setSupported] = useState(false);
@@ -222,6 +243,18 @@ function ProfileSection({ onSwitched }: { onSwitched: () => void }) {
     });
   }, [active, reload]);
 
+  /**
+   * The profile the caller preselected, resolved against the loaded list:
+   * `undefined` = nothing was preselected, `null` = preselected but this
+   * gateway has no profile from that file (a project copied to a machine whose
+   * CONNECT never read it), otherwise the profile itself.
+   */
+  const preselected = useMemo(() => {
+    const wanted = refKey(initialProfile);
+    if (!wanted) return undefined;
+    return profiles.find(p => refKey(p.connectRef) === wanted) ?? null;
+  }, [initialProfile, profiles]);
+
   if (!supported) return null;
 
   return (
@@ -273,6 +306,38 @@ function ProfileSection({ onSwitched }: { onSwitched: () => void }) {
           </Tooltip>
         )}
       </Box>
+      {/* The preselection of plan-446 F4: the window was opened FROM a project
+          configuration file, so it says what that file is here and offers the
+          switch — it never performs one. Activating on open would make a
+          navigation verb write to the gateway, and a profile switch restarts
+          workers. */}
+      {preselected !== undefined && (
+        <Box data-testid="profile-preselection" sx={{ mt: 0.75 }}>
+          {preselected === null ? (
+            <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.6)', lineHeight: 1.5 }}>
+              The project references <code>{initialProfile}</code>, but this gateway has no profile
+              from that file.
+            </Typography>
+          ) : (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.75)', flex: 1, minWidth: 0 }}>
+                From the project: <strong>{preselected.name}</strong>
+                {preselected.name === active ? ' · active' : ''}
+              </Typography>
+              {preselected.name !== active && (
+                <Button
+                  size="small"
+                  disabled={busy}
+                  onClick={() => void handleActivate(preselected.name)}
+                  sx={{ fontSize: 10, textTransform: 'none', minWidth: 0 }}
+                >
+                  Activate
+                </Button>
+              )}
+            </Box>
+          )}
+        </Box>
+      )}
       <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.6)', mt: 0.75, lineHeight: 1.5 }}>
         A profile is a named snapshot of all interfaces and bridges (including per-signal
         historian recording). A model-bound profile activates automatically with its model.
@@ -502,9 +567,24 @@ export interface ConnectOptionsWindowProps {
   onClose: () => void;
   /** Bridges etc. changed with a swapped profile — panel reloads them. */
   onProfileSwitched: () => void;
+  /**
+   * A project-relative `*.connect.json` path to preselect (plan-446 F4) — the value of a
+   * `documents[].connectRef`, NOT a profile name: the manifest binds documents to files, and which
+   * profile a file became is the gateway's answer to give.
+   *
+   * Preselecting SHOWS, it does not switch. The window names the profile that file holds and offers
+   * an explicit Activate; opening a settings window must never restart a gateway's workers as a
+   * side effect. Absent/null (the default) leaves the section exactly as it was before this plan.
+   */
+  initialProfile?: string | null;
 }
 
-export function ConnectOptionsWindow({ open, onClose, onProfileSwitched }: ConnectOptionsWindowProps) {
+export function ConnectOptionsWindow({
+  open,
+  onClose,
+  onProfileSwitched,
+  initialProfile = null,
+}: ConnectOptionsWindowProps) {
   const snap = useSyncExternalStore(subscribeConnectStore, getConnectSnapshot);
   const isConnected = snap.state === 'connected';
 
@@ -529,7 +609,7 @@ export function ConnectOptionsWindow({ open, onClose, onProfileSwitched }: Conne
               <LicenseSection serverUrl={snap.serverUrl} />
             </Box>
             <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)' }} />
-            <ProfileSection onSwitched={onProfileSwitched} />
+            <ProfileSection onSwitched={onProfileSwitched} initialProfile={initialProfile} />
             <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)' }} />
             <HistorianSettingsSection />
           </>

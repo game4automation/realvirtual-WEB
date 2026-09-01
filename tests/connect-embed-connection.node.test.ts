@@ -37,6 +37,13 @@ vi.mock('../src/core/hmi/connect-store', () => ({
   // faithful stand-in: it reproduces exactly the pre-opt-out gating this file
   // was written against, so neither test's statement changes. (plan-375 phase 0)
   hasAutoConnectOptOut: () => false,
+  // Same story one plan later: `connect-plugin.tsx` now installs the active-document
+  // notifier in `init()` and tears it down in `dispose()`. The real pair wires the
+  // PROJECT store and window/document listeners — none of which this file's
+  // model-independent lifecycle statements are about — so a no-op is the faithful
+  // stand-in, and the exhaustive factory needs both halves or nothing runs at all.
+  installConnectActiveDocumentNotifier: () => () => {},
+  uninstallConnectActiveDocumentNotifier: () => {},
 }));
 
 vi.mock('../src/interfaces/websocket-realtime-interface', () => ({
@@ -78,7 +85,10 @@ describe('CONNECT plugin model-independent lifecycle', () => {
       setSignalMeta: vi.fn(),
       registerSignalProvider: vi.fn(),
     };
-    const viewer = { signalStore };
+    // plan-386 F17: onModelLoaded refuses untrusted loads before touching the
+    // stream — the mock must present a trusted load context to exercise the
+    // attach/detach lifecycle at all.
+    const viewer = { signalStore, loadTrust: { trusted: true } };
     const result = {};
     plugin.init();
     plugin.onModelLoaded(result as never, viewer as never);

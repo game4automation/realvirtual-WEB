@@ -69,19 +69,25 @@ describe('BundledBackend against a foreign baseUrl', () => {
     expect(models[0]!.label).toBe('Press');
   });
 
-  it('discovers the Examples catalogue from scenes/index.json', async () => {
+  // plan-735 3b: `scenes/index.json` is no longer read, here or anywhere. It fed
+  // `_publishedEntries()`, which fed the synthetic manifest, which is gone — so
+  // the last reader of that format went with it. A foreign deploy's example
+  // scenes are `documents[]` rows of its own `project.json`, exactly like ours.
+  it('ignores a foreign scenes/index.json — scenes come from the manifest', async () => {
     const backend = remoteBackend({
-      [`${REMOTE}project.json`]: DEPLOYED_MANIFEST,
-      // Examples are GLBs since plan-413 phase 3.
-      [`${REMOTE}scenes/index.json`]: [{ file: 'A.glb', name: 'Line A', mode: 'planner' }],
+      [`${REMOTE}project.json`]: {
+        ...DEPLOYED_MANIFEST,
+        schemaVersion: 2,
+        documents: [{ id: 'doc_a', name: 'Line A', path: 'scenes/A.glb', section: 'scenes' }],
+      },
+      [`${REMOTE}scenes/index.json`]: [{ file: 'Ghost.glb', name: 'Ghost', mode: 'planner' }],
     });
     const scenes = sceneDocumentsOf(await backend.readManifest());
     expect(scenes).toHaveLength(1);
-    // Plain `scenes/<file>` — `_url()` roots it on the remote base, so a local
-    // dev mount must never leak into the path.
     expect(scenes[0]!.path).toBe('scenes/A.glb');
     expect(scenes[0]!.name).toBe('Line A');
-    expect(scenes[0]!.id).toBe('published:A');
+    // The catalogue entry is not merged in beside it.
+    expect(scenes.map(s => s.name)).not.toContain('Ghost');
   });
 
   it('lets a manifest that lists its own models keep them', async () => {
@@ -97,12 +103,33 @@ describe('BundledBackend against a foreign baseUrl', () => {
     expect((await backend.readBlobUrl('models/Press.glb'))?.url).toBe(`${REMOTE}models/Press.glb`);
   });
 
-  it('says so when the base URL serves no project at all', async () => {
-    const backend = remoteBackend({});
-    // A manifest still comes back — the synthetic demo one — which is why
-    // `hasDeployedManifest()` and not `!== null` is the question to ask.
-    expect(await backend.readManifest()).not.toBeNull();
-    expect(backend.hasDeployedManifest()).toBe(false);
+  // ── plan-735 R1: the deliberate degradation of plan-700 F12 ─────────────
+  //
+  // This case is where the decision is written down. A foreign deploy root that
+  // publishes `models.json` but NO `project.json` used to be answered with the
+  // synthetic demo project — the viewer inventing a project for a host that had
+  // never published one. It is now `null` plus a named log line.
+  //
+  // That is a real capability loss and it was chosen, not overlooked: a host
+  // nobody has ever built against is a worse thing to guess about than to
+  // refuse, and a foreign host that wants to be readable publishes a
+  // `project.json` like every other channel does. What the decision buys is
+  // audibility — the failure has a sentence now instead of a plausible-looking
+  // demo project.
+  it('has no project when the base URL serves none, and says so out loud', async () => {
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+    try {
+      const backend = remoteBackend({ [`${REMOTE}models.json`]: ['Press.glb'] });
+      expect(await backend.readManifest()).toBeNull();
+      expect(backend.hasDeployedManifest()).toBe(false);
+      // `models.json` alone is NOT a project — that is the whole degradation.
+      expect(await backend.listModels()).toEqual([]);
+      expect(warnings.join('\n')).toMatch(/project\.json could not be read/);
+    } finally {
+      console.warn = warn;
+    }
   });
 
   it('refuses every write', async () => {
@@ -129,14 +156,20 @@ describe('without the option, nothing changes', () => {
     expect(asked).toEqual(['/project.json']);
   });
 
-  it('still yields the synthetic demo project from injected sources', async () => {
+  // The SECOND synthetic case (plan-735 5b): the OWN deploy root, without
+  // `discover`. It asserted that injected models alone produced a project, and
+  // it is the same removal as the foreign one above seen from the other side —
+  // rewriting only one of the two would have left the other red or senselessly
+  // green. Injected sources are a CATALOGUE; the project comes from the
+  // manifest, and no manifest means no project on either path.
+  it('yields no project from injected sources alone', async () => {
     const backend = new BundledBackend({
       baseUrl: '/',
       models: [{ url: '/models/Demo.glb', label: 'Demo' }],
       fetchImpl: (async () => new Response('', { status: 404 })) as typeof fetch,
     });
-    const project = await backend.readManifest();
-    expect(assetDocumentsOf(project, 'models').map(m => m.path)).toEqual(['/models/Demo.glb']);
+    expect(await backend.readManifest()).toBeNull();
+    expect(assetDocumentsOf(await backend.readManifest(), 'models')).toEqual([]);
   });
 });
 
@@ -175,5 +208,77 @@ describe('ProjectStore registers it as a second read-only backend', () => {
     // instead of a read-only demo, which is the better of the two answers.
     expect(resolved.backend.kind).toBe('browser');
     expect(resolved.project?.id).toBe(WORKSPACE_DEFAULT_PROJECT_ID);
+  });
+});
+
+// ─── The third vector: the OWN deploy root, at runtime (plan-735 5g, R6) ───
+//
+// plan-735's two named regression vectors are both about what a delivery ships.
+// This is the one that is about neither: the deploy DID publish a manifest and
+// the browser cannot get it — a CORS rejection, a transient network failure, a
+// CDN answering with an HTML error page, a `file://` page whose `fetch` refuses
+// outright. Before plan-735 `_syntheticManifest()` absorbed all of that in
+// silence and the visitor got a plausible-looking demo project. Now it is
+// `null`, so the two things worth pinning are that the boot SURVIVES it and
+// that it is not silent.
+//
+// `diagnoseKioskBoot()` does not cover this: it is scoped to `?projectUrl=` by
+// its own contract, and the failures here happen on a deploy's own root.
+describe('the deploy root has a manifest but the fetch fails (plan-735 R6)', () => {
+  /** Every way `_fetchJson()` can come back empty, including the throwing ones. */
+  const failures: Array<[string, typeof fetch]> = [
+    ['a CORS rejection (fetch throws)',
+      (async () => { throw new TypeError('Failed to fetch'); }) as typeof fetch],
+    ['a file:// reject (fetch throws)',
+      (async () => { throw new TypeError('URL scheme "file" is not supported'); }) as typeof fetch],
+    ['a CDN HTML error page served with 200',
+      (async () => new Response('<html>502</html>', {
+        status: 200, headers: { 'content-type': 'text/html' },
+      })) as typeof fetch],
+    ['a plain 404',
+      (async () => new Response('', { status: 404 })) as typeof fetch],
+  ];
+
+  it.each(failures)('%s yields null and never throws', async (_label, fetchImpl) => {
+    const backend = new BundledBackend({ baseUrl: '/', fetchImpl });
+    // The boot awaits this on its critical path; a throw here is a white page.
+    await expect(backend.readManifest()).resolves.toBeNull();
+    expect(backend.hasDeployedManifest()).toBe(false);
+    expect(await backend.listDocuments()).toEqual([]);
+  });
+
+  it('the boot resolution survives a THROWING manifest fetch (project-store 3d)', async () => {
+    // `resolveActiveProject()` called `bundled.readManifest()` on its main path
+    // with no try/catch — the `remoteBaseUrl` branch had one, this one never
+    // did. It was survivable only because a synthetic manifest made throwing
+    // effectively impossible; with `null` a normal outcome, the throw beside it
+    // has to be one too.
+    const store = new ProjectStore();
+    const resolved = await store.resolveActiveProject({
+      bundled: { fetchImpl: (async () => { throw new TypeError('Failed to fetch'); }) as typeof fetch },
+    });
+    // Not a crashed boot: the visitor lands in their own workspace.
+    expect(resolved.project).not.toBeNull();
+    expect(resolved.backend.kind).toBe('browser');
+    expect(resolved.project?.id).toBe(WORKSPACE_DEFAULT_PROJECT_ID);
+  });
+
+  it('says which failure it was, in one line per cause', async () => {
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+    try {
+      // Unreadable body: the server ANSWERED, so this is the "not valid JSON"
+      // sentence, distinct from the "could not be read" one.
+      const html = new BundledBackend({
+        baseUrl: '/',
+        fetchImpl: (async () => new Response('<html>502</html>', { status: 200 })) as typeof fetch,
+      });
+      expect(await html.readManifest()).toBeNull();
+      expect(warnings.join('\n')).toMatch(/is not valid JSON/);
+      expect(warnings.join('\n')).toMatch(/could not be read/);
+    } finally {
+      console.warn = warn;
+    }
   });
 });

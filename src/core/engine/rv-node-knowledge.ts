@@ -15,7 +15,12 @@
  *
  * The note is written and read exclusively through the `web_knowledge_*` MCP
  * tools (`src/plugins/mcp-bridge/rv-mcp-knowledge-tools.ts`) and is fed into the
- * "Ask AI" prompt by `search-ai-context.ts`. There is no HMI panel for it.
+ * "Ask AI" prompt by `search-ai-context.ts`.
+ *
+ * Since plan-431 the note is also VISIBLE in the Property Inspector — rendered
+ * as Markdown by `rv-node-knowledge-field-renderer.tsx`, read-only. There is
+ * still no write path in the UI: `web_knowledge_set` remains the only way to
+ * store a note.
  *
  * ## Deliberately registered WITHOUT a create-factory
  *
@@ -83,6 +88,22 @@ export const NODE_KNOWLEDGE_FIELDS = [
   'Note', 'UpdatedAt', 'Author', 'Confidence', 'NodeIdAtWrite',
 ] as const;
 
+/**
+ * The four provenance fields — everything except the note body.
+ *
+ * The inspector's field renderer draws these in its header, so they are hidden
+ * from the generic field list via `HIDDEN_FIELDS_PER_TYPE`
+ * (`rv-inspector-helpers.ts`) and must not also appear as rows (plan-431 F6).
+ *
+ * Listed explicitly rather than derived as "all fields minus Note" on purpose: a
+ * derivation would silently hide any field added later, without anyone having
+ * decided how — or whether — it is shown. Add a field here AND to the header, or
+ * test 9.5c fails.
+ */
+export const NODE_KNOWLEDGE_PROVENANCE_FIELDS = [
+  'UpdatedAt', 'Author', 'Confidence', 'NodeIdAtWrite',
+] as const;
+
 /** Who wrote the note. Provenance, not access control. */
 export type NodeKnowledgeAuthor = 'agent' | 'user';
 
@@ -145,6 +166,25 @@ export function asConfidence(value: unknown): NodeKnowledgeConfidence {
  * (`schema/v1/rv-odt.json`) describes types that exist on BOTH sides, and this
  * one is WEB-only. `doc-extending-webviewer.md` allows inline schemas for
  * exactly that case.
+ */
+/**
+ * NEVER mark a field here `readonly: true`.
+ *
+ * It reads like the natural way to stop the inspector editing a provenance
+ * field, and it would switch `web_knowledge_set` off completely.
+ * `updateOverlayField` (`rv-extras-editor.tsx`) uses `isFieldDisplayReadonly` —
+ * the SAME predicate the inspector's editability gate uses — as a write guard,
+ * and `rv-mcp-knowledge-tools.ts` writes all five fields through exactly that
+ * function, failing the whole call if any of them is refused.
+ *
+ * Measured during plan-431 Phase 1: `readonly: true` on `Note` alone turned 20
+ * of the 31 `mcp-knowledge-tools` tests red with "[rvExtrasEditor] Refusing to
+ * edit readonly field NodeKnowledge.Note".
+ *
+ * Read-only for the reader is achieved in the UI instead: the note is drawn by
+ * `rv-node-knowledge-field-renderer.tsx` (no editor) and the four provenance
+ * fields are hidden via `HIDDEN_FIELDS_PER_TYPE`. What is never rendered as an
+ * editor cannot be edited, and the write path stays open. Test 9.5a pins this.
  */
 export const NODE_KNOWLEDGE_SCHEMA: ComponentSchema = {
   Note: { type: 'string', default: DEFAULTS.Note },

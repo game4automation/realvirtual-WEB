@@ -16,7 +16,8 @@
  * subtree) in the automatic world-matrix update. A node is kept DYNAMIC iff it,
  * one of its ancestors, or one of its descendants carries a motion / MU-spawn
  * component (see {@link MOVER_KEY}): Drive(*), Kinematic, Grip, TransportSurface,
- * Source, Sink, MU, Cam, SceneButtonMoveable. That closure keeps alive:
+ * Source, Sink, MU, Cam, SceneButtonMoveable, Chain(Element). That closure keeps
+ * alive:
  *   - Drive-driven subtrees (the Drive node + everything under it),
  *   - the chain of ancestors above each Drive (needed so the recursion can reach
  *     it — including the always-dynamic model root, under which runtime MUs are
@@ -54,7 +55,7 @@ import type { Object3D } from 'three';
  * visibly moves. Being on this list makes the cap dynamic regardless of when it
  * is bound.
  */
-const MOVER_KEY = /^(Drive|Kinematic|Grip|TransportSurface|Source|Sink|MU|Cam|SceneButtonMoveable)/i;
+const MOVER_KEY = /^(Drive|Kinematic|Grip|TransportSurface|Source|Sink|MU|Cam|SceneButtonMoveable|Chain)/i;
 
 export interface FreezeStaticResult {
   /** Nodes whose matrixWorldAutoUpdate was turned off. */
@@ -84,7 +85,10 @@ function isMoverNode(node: Object3D): boolean {
  * for diagnostics. Pure with respect to the graph topology — only the
  * `matrixWorldAutoUpdate` flags change. See the file header for the contract.
  */
-export function freezeStaticMatrices(root: Object3D): FreezeStaticResult {
+export function freezeStaticMatrices(
+  root: Object3D,
+  extraMovers?: readonly Object3D[],
+): FreezeStaticResult {
   // Compute every world matrix once so frozen nodes keep their final transform.
   root.updateMatrixWorld(true);
 
@@ -92,13 +96,23 @@ export function freezeStaticMatrices(root: Object3D): FreezeStaticResult {
   // descendants live. Ancestor walks short-circuit once they hit a node already
   // marked dynamic, so the whole pass stays ~O(nodes).
   const dynamic = new Set<Object3D>();
-  root.traverse((node) => {
-    if (!isMoverNode(node)) return;
+  const keepAlive = (node: Object3D): void => {
     for (let a: Object3D | null = node; a && !dynamic.has(a); a = a.parent) {
       dynamic.add(a);
     }
     node.traverse((c) => dynamic.add(c));
+  };
+  root.traverse((node) => {
+    if (isMoverNode(node)) keepAlive(node);
   });
+  // plan-727: kinematic group members handed in by the caller. The closure above
+  // asks a PHYSICAL question — is a mover in my parent chain or my subtree? — and
+  // an authoring load answers "no" for a group member, because nothing was
+  // re-parented under the axis. The member is still moved by that axis (rigidly,
+  // by world delta), so freezing it — or any of its ancestors, which are the
+  // recursion gate — would leave the drive running and the geometry standing
+  // still. Purely additive: this can only keep MORE nodes dynamic.
+  if (extraMovers) for (const node of extraMovers) keepAlive(node);
 
   let frozen = 0;
   let total = 0;

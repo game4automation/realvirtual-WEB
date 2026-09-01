@@ -8,7 +8,7 @@ import {
   MAX_CHART_SERIES,
   MAX_CHART_STRING,
   validateAgentChartSpec,
-} from '../src/plugins/agents/agent-report';
+} from '../../realvirtual-WebViewer-Private~/src/plugins/agents/agent-report';
 
 describe('agent report chart limits', () => {
   it('rejects non-finite values and caps series, points, and strings', () => {

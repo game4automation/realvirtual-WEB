@@ -57,7 +57,7 @@ function makeAssetLikeDocument(delayMs = 40) {
     shell: () => ({
       id: frame.rootDocumentId,
       name: 'Gripper',
-      base: { kind: 'empty' },
+      base: { kind: 'document', documentId: 'doc_scratch', path: 'scratch.glb', name: 'Scratch' },
       createdAt: Date.now(),
     }),
     delayMs,

@@ -19,6 +19,8 @@ import {
   stageFilteredSourceTree,
 } from '../scripts/_workspace-lib.mjs';
 import { knownProjectKeys } from '../scripts/_rv-guards.mjs';
+import { findStartDocument } from '../src/core/project/rv-project-documents';
+import { assertManifestResolves } from './helpers/assert-manifest-resolves';
 
 const temporary: string[] = [];
 afterEach(() => temporary.splice(0).forEach(path => rmSync(path, { recursive: true, force: true })));
@@ -120,6 +122,12 @@ function fixture() {
   write(join(core, 'src', 'main.ts'), 'export {};');
   write(join(core, 'public', 'settings.json'), '{}');
   write(join(core, 'public', 'aasx', 'demo.aasx'), 'fixture');
+  // The DEMO project's manifest (plan-726). Demo content exactly like scenes/
+  // and aasx/, and — unlike those two — a TOP-LEVEL FILE, which is why it needs
+  // a filter branch of its own in `copyCore()`.
+  write(join(core, 'public', 'project.json'), JSON.stringify({
+    schemaVersion: 2, id: 'prj_sample', name: 'DemoRealvirtual', documents: [],
+  }));
   write(join(core, 'package.json'), '{"name":"core","version":"1.0.0"}');
   write(join(core, 'package-lock.json'), '{"lockfileVersion":3}');
   write(join(core, 'tsconfig.json'), JSON.stringify({ compilerOptions: { paths: {} } }));
@@ -218,7 +226,10 @@ function fixture() {
       { path: 'src/multiuser/**', tier: 'restricted', feature: 'multiuser' },
     ],
     registrations: {
-      'commercial-feature': { adapter: './commercial/register', requires: [] },
+      // `status: 'beta'` is carried by the ONE feature this delivery selects, so both
+      // renderings of it — the README list and the FEATURES.md matrix — are asserted
+      // against a real generated workspace rather than against the renderer in isolation.
+      'commercial-feature': { adapter: './commercial/register', requires: [], status: 'beta' },
       premium: { adapter: './restricted/register', requires: [] },
       'layout-planner': { adapter: './layout/register', requires: [] },
       multiuser: { adapter: './multiuser/register', requires: [] },
@@ -467,6 +478,10 @@ describe('customer workspace generator', () => {
     expect(readme).toContain('Every delivery includes the AGPL core');
     expect(readme).toContain('**Licensed features**');
     expect(readme).toContain('`commercial-feature`');
+    // A feature the manifest still calls beta says so where the customer reads it.
+    // Before this, only FEATURES.md carried the Status column and the README —
+    // the file the delivery actually points at — presented beta work as finished.
+    expect(readme).toContain('- `commercial-feature` (BETA)');
     expect(readme).toContain('**Your project**');
     expect(readme).toContain('`chart` (chart.tsx)');
     expect(readme).toContain('`energy-chart` (energy-chart.tsx)');
@@ -486,7 +501,7 @@ describe('customer workspace generator', () => {
     // shared repository deliberately departs from.
     expect(featuresMatrix).toContain('| Feature | Tier | Status | ACME |');
     expect(readme.startsWith('# ACME\n')).toBe(true);
-    expect(featuresMatrix).toContain('| commercial-feature | commercial | stable | yes |');
+    expect(featuresMatrix).toContain('| commercial-feature | commercial | beta | yes |');
     // A customer matrix lists only that customer's entitled features, so the unassigned
     // restricted ones do not appear at all - not even as a "no" row (plan-434 Phase 2b).
     expect(featuresMatrix).not.toContain('| premium |');
@@ -588,6 +603,89 @@ describe('customer workspace generator', () => {
     expect(catalog.entries.map((entry: { id: string }) => entry.id)).toEqual(['pallethandling-roll-conveyor-1m']);
     expect(readFileSync(join(staged.workspaceRoot, '.gitattributes'), 'utf8'))
       .toContain('realvirtual-web/public/models/*.glb filter=lfs diff=lfs merge=lfs -text');
+  });
+
+  // ── plan-726 F13: the demo manifest must not leak into a delivery ─────
+  //
+  // `public/project.json` is the DEMO project's manifest, and a customer deploy
+  // that carries it at its root gets it read by `BundledBackend.readManifest()`
+  // — which is the same code path that reads the customer's own project. The
+  // customer would see realvirtual's demo project instead of their machine.
+  //
+  // It needed its own filter branch because every pre-existing exclusion in
+  // `copyCore()` filters a SUBDIRECTORY (`scenes/`, `aasx/`, `library/`), and a
+  // top-level file sails straight past all of them.
+  it('never delivers the demo project manifest to a customer workspace', () => {
+    const { core, privateRoot, delivery } = fixture();
+    const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
+    temporary.push(staged.workspaceRoot);
+
+    expect(existsSync(join(staged.coreRoot, 'public', 'project.json'))).toBe(false);
+    // The neighbours it is filtered alongside, restated so a regression that
+    // widened the filter the wrong way is visible here too.
+    expect(existsSync(join(staged.coreRoot, 'public', 'aasx'))).toBe(false);
+    expect(existsSync(join(staged.coreRoot, 'public', 'scenes'))).toBe(false);
+    // …and the file the customer DOES get at that level still arrives.
+    expect(existsSync(join(staged.coreRoot, 'public', 'settings.json'))).toBe(true);
+  });
+
+  it('DOES stage the demo manifest for the public demo build', () => {
+    // The other side of the same switch: `bunny-deploy --demo` and the public
+    // deploy both pass `includePublicDemoContent`, and for them the manifest is
+    // the point — it is what the hosted demo boots from.
+    const { core, privateRoot } = fixture();
+    const staged = stageFilteredSourceTree({
+      coreRoot: core,
+      privateRoot,
+      profile: { tier: 'commercial', restrictedFeatures: [] },
+      includePublicDemoContent: true,
+      workspaceFiles: false,
+    });
+    temporary.push(staged.workspaceRoot);
+
+    expect(existsSync(join(staged.coreRoot, 'public', 'project.json'))).toBe(true);
+    expect(existsSync(join(staged.coreRoot, 'public', 'aasx', 'demo.aasx'))).toBe(true);
+  });
+
+  // The plan-735 regression, pinned: `--demo` is ALSO projectless and ALSO
+  // commercial-tier, so it reaches the branch that generates the vendor delivery
+  // manifest — and that generator overwrote the very file `copyCore()` had just
+  // been told to keep. The hosted demo then booted `prj_delivery_standard`
+  // (kind `delivery`, reference model only) instead of the authored demo
+  // project. Existence alone did not catch it; the IDENTITY has to be asserted.
+  it('keeps the AUTHORIZED demo manifest for the public demo build', () => {
+    const { core, privateRoot } = fixture();
+    write(join(core, 'public', 'scenes', 'DemoPlanner.glb'), 'fixture:planner');
+    write(join(core, 'public', 'project.json'), JSON.stringify({
+      schemaVersion: 2,
+      id: 'prj_sample',
+      name: 'DemoRealvirtual',
+      kind: 'demo',
+      settings: { defaultModel: 'models/DemoRealvirtualWeb.glb' },
+      documents: [
+        { id: 'doc_a', name: 'Demo', path: 'models/DemoRealvirtualWeb.glb', section: 'models' },
+        { id: 'doc_d', name: 'Layout Planner Demo', path: 'scenes/DemoPlanner.glb', section: 'scenes' },
+      ],
+    }));
+
+    const staged = stageFilteredSourceTree({
+      coreRoot: core,
+      privateRoot,
+      profile: { tier: 'commercial', restrictedFeatures: [] },
+      includePublicDemoContent: true,
+      workspaceFiles: false,
+    });
+    temporary.push(staged.workspaceRoot);
+
+    const manifest = JSON.parse(
+      readFileSync(join(staged.coreRoot, 'public', 'project.json'), 'utf8'));
+    expect(manifest.id).toBe('prj_sample');
+    expect(manifest.kind).toBe('demo');
+    expect(manifest.documents.map((d: { path: string }) => d.path))
+      .toContain('scenes/DemoPlanner.glb');
+    // …and not a trace of the generated one.
+    expect(manifest.id).not.toMatch(/^prj_delivery_/);
+    expect(manifest._generated).toBeUndefined();
   });
 
   it('omits the bundled library when the layout planner is not part of the core', () => {
@@ -725,7 +823,9 @@ describe('customer workspace generator', () => {
 
     const attributes = readFileSync(join(staged.workspaceRoot, '.gitattributes'), 'utf8');
     expect(attributes).toContain('connect/rag.zip filter=lfs diff=lfs merge=lfs -text');
-    expect(attributes).toContain('projects/*/models/*.glb filter=lfs diff=lfs merge=lfs -text');
+    // plan-716: the folder is a place, not a type — any GLB anywhere inside a
+    // project is tracked, not only a mandated models/ subfolder.
+    expect(attributes).toContain('projects/**/*.glb filter=lfs diff=lfs merge=lfs -text');
     const attr = execFileSync('git', ['check-attr', 'filter', '--', 'projects/acme/models/machine.glb'], {
       cwd: staged.workspaceRoot,
       encoding: 'utf8',
@@ -894,7 +994,7 @@ describe('customer workspace generator', () => {
     const root = mkdtempSync(join(tmpdir(), 'rv-snapshot-push-test-'));
     temporary.push(root);
     const staged = join(root, 'staged');
-    write(join(staged, '.gitattributes'), 'projects/*/models/*.glb filter=lfs diff=lfs merge=lfs -text\n');
+    write(join(staged, '.gitattributes'), 'projects/**/*.glb filter=lfs diff=lfs merge=lfs -text\n');
     write(join(staged, 'realvirtual-web', 'src', 'main.ts'), 'export {};');
     write(join(staged, 'projects', 'acme', 'models', 'machine.glb'), 'large-binary-model-fixture-payload');
     // A core repository whose HEAD moves between the two deliveries below.
@@ -1415,6 +1515,57 @@ describe('projectless customer workspace', () => {
     expect(existsSync(join(staged.privateRoot!, 'src', 'commercial', 'safe.ts'))).toBe(true);
   });
 
+  // ── plan-735 F2/F3: the projectless delivery carries a real manifest ─────
+  //
+  // The regression this closes (Vektor A, §2.1): a standard customer's
+  // workspace shipped the reference model in `public/models/` and NOTHING that
+  // declared it. `public/project.json` is filtered out of every customer
+  // delivery (the demo manifest must not leak, plan-726 F13), so the deploy root
+  // had no manifest at all and the viewer papered over it with a synthetic
+  // project assembled from a build-time glob. Both are gone; this is what took
+  // their place.
+  it('generates a vendor-owned project.json declaring the reference model', () => {
+    const { staged } = stageProjectless();
+    const manifestPath = join(staged.coreRoot, 'public', 'project.json');
+    expect(existsSync(manifestPath)).toBe(true);
+
+    // The gate from plan-731 Phase 4, applied to this channel's deploy root:
+    // valid v2, every row resolves to bytes, sidecars travelled, a start
+    // document that is one of the rows. This is the F1/F2 acceptance.
+    const gate = assertManifestResolves(join(staged.coreRoot, 'public'));
+    expect(gate.documents.map(d => d.path)).toContain('models/DemoRealvirtualWeb.glb');
+    expect(gate.start.path).toBe('models/DemoRealvirtualWeb.glb');
+
+    // F3, asserted as a STRING and not merely implied: the generated file says
+    // out loud that it is vendor-owned and replaced by every update. It sits in
+    // Zone A (§3.2) and has no sidecar protection — visibility IS the mitigation
+    // (user decision), so it has to be visible.
+    const raw = readFileSync(manifestPath, 'utf8');
+    expect(raw).toMatch(/GENERATED BY realvirtual/);
+    expect(raw).toMatch(/replaced in full by every delivery update/);
+
+    // …and the README carries the same sentence, next to the Zone-A rule.
+    const readme = readFileSync(join(staged.workspaceRoot, 'README.md'), 'utf8');
+    expect(readme).toMatch(/realvirtual-web\/public\/project\.json/);
+    expect(readme).toMatch(/generated by realvirtual/i);
+  });
+
+  // The 1d collision, pinned from the other side: the DEMO manifest still must
+  // not reach a customer (the plan-726 F13 test above), while the GENERATED one
+  // must. They are the same path in the same tree, and the only thing keeping
+  // them apart is the order — the generator writes after `copyCore()`'s filter.
+  it('generates its own manifest without letting the demo manifest through', () => {
+    const { core, staged } = stageProjectless();
+    const generated = JSON.parse(
+      readFileSync(join(staged.coreRoot, 'public', 'project.json'), 'utf8'));
+    const demo = JSON.parse(readFileSync(join(core, 'public', 'project.json'), 'utf8'));
+    expect(generated.id).not.toBe(demo.id);
+    expect(generated.id).toMatch(/^prj_delivery_/);
+    // None of the demo's own documents came along with it.
+    const demoPaths = new Set((demo.documents ?? []).map((d: { path: string }) => d.path));
+    for (const doc of generated.documents) expect(demoPaths.has(doc.path)).toBe(false);
+  });
+
   it('generates settings without a default model, and keeps the rest of the profile', () => {
     const { staged } = stageProjectless({
       connectPin: {
@@ -1426,6 +1577,14 @@ describe('projectless customer workspace', () => {
 
     // Empty, not absent and not invented: there is no project, so there is no
     // model to open by default — the viewer offers the selector instead.
+    //
+    // NOT touched by plan-735 1b, and the distinction is easy to get wrong:
+    // `public/settings.json` and `public/project.json` are different files with
+    // different owners. This one is the GLOBAL default of the deployment and
+    // stays empty for a standard customer. The generated `project.json` above
+    // carries its own `settings.defaultModel`, which is the PROJECT's start
+    // document, and that one DOES name the reference model. Whoever changes
+    // either must not "fix" the other to match.
     expect(settings.defaultModel).toBe('');
     expect(settings.connectChannel).toBe('stable');
     expect(settings.connectLicensePrefill).toBe('RVC1-PLACEHOLDER');
@@ -1687,7 +1846,7 @@ describe('projectless customer workspace', () => {
     // Git agrees: not one path under projects/ is modified or deleted.
     //
     // The GLB is excluded from this Git-level check on purpose. The delivered
-    // `.gitattributes` puts `projects/*/models/*.glb` under the LFS filter, so a
+    // `.gitattributes` puts `projects/**/*.glb` under the LFS filter, so a
     // GLB the customer committed BEFORE that attribute reached their repository
     // re-reads as "modified" the first time — an attribute effect on their own
     // file, not a change the merge made to it. The byte comparison above is the
@@ -1699,5 +1858,163 @@ describe('projectless customer workspace', () => {
     expect(status).toEqual([]);
     // And zone A did happen: the delivered README replaced the old one.
     expect(readFileSync(join(clone, 'README.md'), 'utf8')).toContain('Create your first project');
+  });
+});
+
+// ─── plan-726 F12: every delivered manifest still resolves its own start ──
+//
+// The regression this guards is the one the plan review found and the reason
+// `findStartDocument()` is tolerant at all: `settings.defaultModel` was NEVER
+// consumed on the unlocked boot, so nothing ever checked that it matched the
+// manifest's own document paths — and in five delivered customer projects it
+// does not (a bare filename against a `models/` path).
+//
+// plan-726 switches that branch on. From here the invariant has to hold for
+// every manifest we ship, not just for the demo, and this sweep is what says
+// so over the REAL files rather than over a fixture. It also catches a
+// mis-generated CONNECT demo manifest (Phase 4), which is how the private
+// demo-realvirtual manifest was found to be broken in the first place.
+describe('every private project manifest resolves its own start document', () => {
+  const projectsRoot = join(__dirname, '..', '..', 'realvirtual-WebViewer-Private~', 'projects');
+  const projectKeys = existsSync(projectsRoot)
+    ? readdirSync(projectsRoot, { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => entry.name)
+      .filter(name => existsSync(join(projectsRoot, name, 'project.json')))
+    : [];
+
+  it('found the private projects to sweep', () => {
+    // A silent empty sweep is the failure mode here: it would report green
+    // while checking nothing at all.
+    expect(projectKeys.length).toBeGreaterThan(0);
+  });
+
+  it.each(projectKeys)('%s', (key) => {
+    const manifest = JSON.parse(readFileSync(join(projectsRoot, key, 'project.json'), 'utf8'));
+    const start = manifest?.settings?.defaultModel;
+    // A project that names no start document is fine — it resumes from its own
+    // `activeSceneId` or falls through to the deploy's catalogue.
+    if (typeof start !== 'string' || start.trim() === '') return;
+
+    // ── The short-circuit is GONE (plan-735 2c, R7) ────────────────────────
+    //
+    // This used to return early for a manifest that declared no `models`
+    // section, on the grounds that `_withBundledSections()` would fill it from
+    // the deploy's runtime discovery — so the file on disk could not answer
+    // whether its start document resolved. That branch was a FALSE-GREEN
+    // WINDOW: a manifest with a dangling `defaultModel` fell through it and was
+    // never checked at all, on disk or anywhere else, until a live boot came up
+    // with an empty viewport. `demo-process-industry` and `wmyb` were both
+    // sitting in it.
+    //
+    // Since plan-735 Phase 2 there is no runtime fill to defer to: every private
+    // manifest declares its own `models` section, so the file on disk IS the
+    // final word and this is an unconditional check. A project that names no
+    // start document (the early return above) is still fine — it resumes from
+    // its own `activeSceneId` or offers the selector.
+    expect(
+      findStartDocument(manifest, start),
+      `${key}: settings.defaultModel "${start}" matches no document in documents[] — `
+      + 'declare the model in documents[] or clear settings.defaultModel. There is no '
+      + 'runtime fill behind this any more (plan-735).',
+    ).not.toBeNull();
+  });
+});
+
+// ─── plan-731 Phase 4 (F6): the release gate on a delivered project ───────
+
+/**
+ * A project-bearing delivery must ship a project whose manifest resolves.
+ *
+ * This is the channel where the gap was widest. The other three stage OUR demo
+ * and were at least checked against it; a customer workspace stages the
+ * CUSTOMER's project, and nothing ever asked whether the `documents[]` it
+ * carries still name files that travelled. A missing row here is not a broken
+ * demo — it is a delivered product that opens nothing, discovered by the
+ * customer.
+ *
+ * Only the project-bearing case is covered. A PROJECTLESS delivery ships no
+ * `projects/<key>/project.json` at all, so there is no manifest to resolve;
+ * asserting one there would be plan-735's F2, not this plan's F6.
+ */
+describe('a delivered project passes the release gate (plan-731 F6)', () => {
+  /**
+   * The staged project root of a project-bearing delivery, with a manifest we
+   * control — the fixture's own `acme/project.json` is a bare v1 shape that
+   * predates `documents[]`, and rewriting it would change what a dozen other
+   * assertions in this file are about.
+   */
+  function deliveredProject(manifest: unknown, files: string[]): string {
+    const { core, privateRoot, delivery } = fixture();
+    write(join(privateRoot, 'projects', 'acme', 'project.json'), JSON.stringify(manifest));
+    for (const rel of files) {
+      write(join(privateRoot, 'projects', 'acme', ...rel.split('/')), rel);
+    }
+    const staged = stageFilteredSourceTree({
+      coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery,
+    });
+    temporary.push(staged.workspaceRoot);
+    return join(staged.workspaceRoot, 'projects', 'acme');
+  }
+
+  const HEALTHY = {
+    schemaVersion: 2,
+    id: 'prj_acme',
+    name: 'ACME',
+    settings: { defaultModel: 'models/machine.glb' },
+    documents: [
+      {
+        id: 'doc_machine', name: 'Machine', path: 'models/machine.glb', section: 'models',
+        settingsPath: 'models/machine.settings.json',
+      },
+      { id: 'doc_cell', name: 'Cell', path: 'scenes/cell.glb', section: 'scenes' },
+    ],
+  };
+
+  it('the delivered manifest resolves every document it declares', () => {
+    const root = deliveredProject(HEALTHY, [
+      'models/machine.glb', 'models/machine.settings.json', 'scenes/cell.glb',
+    ]);
+    const gate = assertManifestResolves(root);
+    expect(gate.documents.map((d) => d.path))
+      .toEqual(['models/machine.glb', 'scenes/cell.glb']);
+    expect(gate.start.path).toBe('models/machine.glb');
+    expect(gate.sidecars).toEqual(['models/machine.settings.json']);
+  });
+
+  it('a delivery whose document did not travel FAILS the gate', () => {
+    // The negative case (4f): the row is there, the bytes are not. Without this
+    // the customer is the one who finds out.
+    const root = deliveredProject(HEALTHY, [
+      'models/machine.glb', 'models/machine.settings.json',
+    ]);
+    expect(() => assertManifestResolves(root)).toThrow(/scenes\/cell\.glb/);
+  });
+
+  it('a delivery whose start document matches nothing FAILS the gate', () => {
+    const root = deliveredProject(
+      { ...HEALTHY, settings: { defaultModel: 'models/gone.glb' } },
+      ['models/machine.glb', 'models/machine.settings.json', 'scenes/cell.glb'],
+    );
+    expect(() => assertManifestResolves(root)).toThrow(/start document/);
+  });
+
+  it('a delivery carrying a devOnly row FAILS the gate', () => {
+    // A fixture has no business in a customer's product, and `devOnly` is what
+    // makes that checkable from the manifest (plan-731 2k).
+    const root = deliveredProject(
+      {
+        ...HEALTHY,
+        documents: [
+          ...HEALTHY.documents,
+          { id: 'doc_fix', name: 'Fixture', path: 'scenes/fixture.glb', section: 'scenes', devOnly: true },
+        ],
+      },
+      [
+        'models/machine.glb', 'models/machine.settings.json',
+        'scenes/cell.glb', 'scenes/fixture.glb',
+      ],
+    );
+    expect(() => assertManifestResolves(root)).toThrow(/dev-only/);
   });
 });

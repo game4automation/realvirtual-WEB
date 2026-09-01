@@ -38,6 +38,15 @@ import {
 } from '../src/core/engine/rv-slot-authority';
 import { createTestViewer, type TestViewerHandle } from './helpers/create-test-viewer';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetsAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetsAvailable(DEV_GLB.tests, DEV_GLB.physicsZone);
 
 const GLB_URL = DEV_GLB.tests;
 const SMALL_GLB_URL = DEV_GLB.physicsZone;
@@ -59,7 +68,7 @@ async function glbAvailable(url: string): Promise<boolean> {
   }
 }
 
-describe('model switch cleanup (9.8)', () => {
+describe.skipIf(!DEV_ASSETS)('model switch cleanup (9.8)', () => {
   it('reloading the same model with an active force starts clean', async () => {
     if (!(await glbAvailable(GLB_URL))) {
       console.warn(`${GLB_URL} not available — skipping real model-switch test`);

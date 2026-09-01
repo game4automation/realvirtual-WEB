@@ -5,6 +5,7 @@ import type { Object3D } from 'three';
 import type { RVDrive } from './rv-drive';
 import type { RVSensor } from './rv-sensor';
 import { lastPathSegment } from './rv-constants';
+import { sanitizeLikeThree } from './rv-three-names';
 import { tooltipRegistry } from '../hmi/tooltip/tooltip-registry';
 import { ROOT_OCCURRENCE, ROOT_SOURCE_KEY, fullNodeAddress, getNodeId } from './rv-node-id';
 
@@ -113,6 +114,29 @@ export class NodeRegistry {
    * remove), handing callers a detached Object3D.
    */
   private aliasPaths = new Map<Object3D, string[]>();
+  /**
+   * `sanitizeLikeThree(path)` → the registered path(s) that sanitize to it —
+   * the index behind resolution stage 4 (plan-734 F4).
+   *
+   * Values are a bare string for the overwhelmingly common single-claimant case
+   * and only grow into an array when a second path collides, which keeps the
+   * per-key cost at one reference for a 65k-node model. Paths (not nodes) are
+   * stored so a removal is an exact splice by path: an alias and its canonical
+   * path denote ONE node, and the ambiguity check has to be over distinct
+   * nodes, which is resolved at query time against `nodes`.
+   *
+   * `null` until the first stage-4 lookup — a model whose paths all resolve
+   * exactly never pays for it. Once built it is maintained INCREMENTALLY and is
+   * never rebuilt: `MuReconciler.reconcile()` calls `registerNode` /
+   * `unregisterSubtree` every frame while the layout planner runs, so a
+   * dirty-flag + rebuild scheme would throw the index away several times a
+   * second and pay O(nodes) on the next miss.
+   */
+  private sanitizedPathIndex: Map<string, string | string[]> | null = null;
+  /** How often the stage-4 index was built from scratch. Must stay 1 in a session. */
+  private _sanitizedIndexBuilds = 0;
+  /** Stage-4 keys already warned about as ambiguous (once per key per registry). */
+  private _warnedSanitizedKeys = new Set<string>();
   /** targetPath → Set of {sourcePath, fieldName, componentType} (reverse ref index) */
   private reverseRefs = new Map<string, Array<{ sourcePath: string; fieldName: string; componentType: string }>>();
   /** Whether the reverse-ref index has been built (built lazily on first getReferencesTo). */
@@ -163,16 +187,26 @@ export class NodeRegistry {
       this.suffixMap.set(suffix, arr);
     }
     arr.push(path);
+
+    // Incremental stage-4 maintenance — never a rebuild (see sanitizedPathIndex).
+    this._indexSanitizedPath(path);
   }
 
   /**
    * Register an alias path for a node (e.g. original GLTF name before Three.js dedup).
    * Adds to path→node and suffixMap but does NOT update nodePaths (reverse lookup),
    * so the canonical path remains the primary identifier for the node.
+   *
+   * @returns `false` when the path was already claimed and the alias was
+   *   therefore discarded. Giving up silently is the right behaviour — a real
+   *   registration must win over a historical spelling — but it used to be
+   *   completely unobservable, and a discarded alias that shadows a live node
+   *   is exactly the kind of thing that shows up as "highlight does nothing"
+   *   three customers later (plan-734 F8).
    */
-  registerAlias(aliasPath: string, node: Object3D): void {
+  registerAlias(aliasPath: string, node: Object3D): boolean {
     const existing = this.nodes.get(aliasPath);
-    if (existing) return; // Don't overwrite an existing node registration
+    if (existing) return false; // Don't overwrite an existing node registration
 
     this.nodes.set(aliasPath, node);
 
@@ -184,6 +218,8 @@ export class NodeRegistry {
     }
     arr.push(aliasPath);
 
+    this._indexSanitizedPath(aliasPath);
+
     // Remember the alias so unregisterSubtree can take it down with the node.
     let aliases = this.aliasPaths.get(node);
     if (!aliases) {
@@ -191,6 +227,7 @@ export class NodeRegistry {
       this.aliasPaths.set(node, aliases);
     }
     aliases.push(aliasPath);
+    return true;
   }
 
   /**
@@ -252,7 +289,7 @@ export class NodeRegistry {
     if (direct) return direct;
 
     // Normalize path: Three.js GLTF loader sanitizes names (spaces → underscores)
-    const normalized = path.replace(/ /g, '_');
+    const [, normalized] = this._lookupSpellings(path);
     if (normalized !== path) {
       const normDirect = this.nodes.get(normalized);
       if (normDirect) return normDirect;
@@ -294,7 +331,121 @@ export class NodeRegistry {
       }
       if (found) return found;
     }
-    return null;
+
+    // Stage 4: sanitize-normalized full-path match (plan-734 F4).
+    //
+    // Reached ONLY after stage 3 found nothing. A stage-3 *refusal* (several
+    // distinct candidates → the F10 "refusing to guess" warning) returns above
+    // and never gets here: a refusal is a decision, not a miss, and letting a
+    // later stage overturn it would break exactly the guarantee the earlier
+    // stages exist to give.
+    //
+    // What it buys: an ALREADY-DELIVERED GLB, loaded by a viewer whose alias
+    // registration predates plan-734, still resolves its authored paths —
+    // `sanitizeLikeThree` is the one transform that maps both the authored and
+    // the loader-assigned spelling onto the same key.
+    return this._resolveSanitized(path, warnOnAmbiguity);
+  }
+
+  /**
+   * The spellings a lookup tries, in order: the path as given, then with
+   * whitespace collapsed to `_` the way Three.js' loader does.
+   *
+   * Shared by {@link _getNode} and {@link getByPath}, which each carried their
+   * own copy of the normalization — and only one of them was ever updated.
+   */
+  private _lookupSpellings(path: string): [string, string] {
+    return [path, path.replace(/ /g, '_')];
+  }
+
+  /**
+   * Stage 4: find a node whose registered path sanitizes to the same string as
+   * the queried path.
+   *
+   * Has its OWN ambiguity refusal, and needs one: `sanitizeLikeThree` REMOVES
+   * `[ ] . : /` rather than replacing them, so two genuinely different authored
+   * paths can collapse onto one key. Returning "the first" there would be the
+   * silent wrong-node resolution that stages 1-3 were hardened against.
+   */
+  private _resolveSanitized(path: string, warnOnAmbiguity: boolean): Object3D | null {
+    const index = this._ensureSanitizedIndex();
+    const key = sanitizeLikeThree(path);
+    const entry = index.get(key);
+    if (entry === undefined) return null;
+
+    if (typeof entry === 'string') return this.nodes.get(entry) ?? null;
+
+    let found: Object3D | null = null;
+    const matched: string[] = [];
+    for (const registeredPath of entry) {
+      const node = this.nodes.get(registeredPath);
+      if (!node) continue;
+      if (found === null) { found = node; matched.push(registeredPath); } else if (node !== found) {
+        matched.push(registeredPath);
+      }
+    }
+    if (matched.length > 1) {
+      if (warnOnAmbiguity && !this._warnedSanitizedKeys.has(key)) {
+        this._warnedSanitizedKeys.add(key);
+        console.warn(
+          `[NodeRegistry] Ambiguous sanitize-normalized match for "${path}": ${matched.length} candidates `
+          + `(${matched.map((p) => `"${p}"`).join(', ')}) — refusing to guess.`,
+        );
+      }
+      return null;
+    }
+    return found;
+  }
+
+  /** Build the stage-4 index once, on the first lookup that needs it. */
+  private _ensureSanitizedIndex(): Map<string, string | string[]> {
+    if (this.sanitizedPathIndex) return this.sanitizedPathIndex;
+    const index = new Map<string, string | string[]>();
+    this.sanitizedPathIndex = index;
+    this._sanitizedIndexBuilds++;
+    for (const path of this.nodes.keys()) this._indexSanitizedPath(path);
+    return index;
+  }
+
+  /**
+   * How often the stage-4 index was built from scratch (0 = never needed).
+   *
+   * A diagnostics hook, and the assertion of the incremental-maintenance test:
+   * anything above 1 in a running session means something reintroduced a
+   * rebuild on invalidation — the failure mode 2.4 of plan-734 forbids, because
+   * the MU reconciler mutates the registry every frame.
+   */
+  sanitizedIndexBuildCount(): number {
+    return this._sanitizedIndexBuilds;
+  }
+
+  /** Add one registered path to the stage-4 index (no-op before it is built). */
+  private _indexSanitizedPath(path: string): void {
+    const index = this.sanitizedPathIndex;
+    if (!index) return;
+    const key = sanitizeLikeThree(path);
+    const entry = index.get(key);
+    if (entry === undefined) index.set(key, path);
+    else if (typeof entry === 'string') { if (entry !== path) index.set(key, [entry, path]); } else if (!entry.includes(path)) entry.push(path);
+  }
+
+  /** Remove one registered path from the stage-4 index (no-op before it is built). */
+  private _unindexSanitizedPath(path: string): void {
+    const index = this.sanitizedPathIndex;
+    if (!index) return;
+    const key = sanitizeLikeThree(path);
+    const entry = index.get(key);
+    if (entry === undefined) return;
+    if (typeof entry === 'string') {
+      if (entry === path) index.delete(key);
+      return;
+    }
+    const i = entry.indexOf(path);
+    if (i >= 0) entry.splice(i, 1);
+    // Collapse back to the cheap single-string form so a churning subtree does
+    // not leave one-element arrays behind for the life of the registry.
+    if (entry.length === 1) index.set(key, entry[0]);
+    else if (entry.length === 0) index.delete(key);
   }
 
   /**
@@ -322,7 +473,7 @@ export class NodeRegistry {
       if (instance !== undefined) return instance as T;
     }
     // Normalize path: Three.js GLTF loader sanitizes names (spaces → underscores)
-    const normalized = path.replace(/ /g, '_');
+    const [, normalized] = this._lookupSpellings(path);
     if (normalized !== path) {
       const normMap = this.components.get(normalized);
       if (normMap) {
@@ -1000,10 +1151,14 @@ export class NodeRegistry {
   private _dropFromSuffixMap(path: string): void {
     const suffix = lastPathSegment(path);
     const arr = this.suffixMap.get(suffix);
-    if (!arr) return;
-    const idx = arr.indexOf(path);
-    if (idx >= 0) arr.splice(idx, 1);
-    if (arr.length === 0) this.suffixMap.delete(suffix);
+    if (arr) {
+      const idx = arr.indexOf(path);
+      if (idx >= 0) arr.splice(idx, 1);
+      if (arr.length === 0) this.suffixMap.delete(suffix);
+    }
+    // The two indexes are taken down together: every caller that drops a path
+    // from the suffix map drops it from the registry entirely.
+    this._unindexSanitizedPath(path);
   }
 
   /**
@@ -1052,6 +1207,10 @@ export class NodeRegistry {
         }
         newArr.push(newPath);
 
+        // Stage-4 index follows the move, incrementally (plan-734 §2.4).
+        this._unindexSanitizedPath(oldPath);
+        this._indexSanitizedPath(newPath);
+
         // Update components map
         const compMap = this.components.get(oldPath);
         if (compMap) {
@@ -1088,6 +1247,12 @@ export class NodeRegistry {
     this.typeIndex.clear();
     this.suffixMap.clear();
     this.aliasPaths.clear();
+    // Back to "never built": a reloaded scene registers its own paths, and the
+    // next stage-4 miss builds the index over them. This is NOT the forbidden
+    // invalidation-rebuild — clear() is a whole-scene teardown, not a per-frame
+    // structural edit.
+    this.sanitizedPathIndex = null;
+    this._warnedSanitizedKeys.clear();
     // Reset the reverse-ref index (was previously leaked across reloads — §10-E)
     // and the signal-name binding index so a reloaded scene never serves stale
     // bindings. Both rebuild lazily on next access.

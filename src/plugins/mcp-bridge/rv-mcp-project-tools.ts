@@ -37,6 +37,11 @@
 import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { builtinSources } from '../../core/rv-model-catalog';
+import {
+  publishedUrlNameOf,
+  resolvePublishedAlias,
+  resolvePublishedSceneParam,
+} from '../../core/hmi/scene/rv-published-scenes';
 
 /** Normalised match key: case- and separator-insensitive. */
 function matchKey(s: string): string {
@@ -140,63 +145,156 @@ export class McpProjectTools {
   }
 
   @McpTool(
-    'List what can be loaded into the viewer. `documents` is THE one list — every GLB the open '
-    + 'project owns, whichever folder holds it (`section`: scenes/models/library). There is no '
-    + 'separate scene catalogue any more; `saved` is a deprecated alias of the same array. '
-    + '`builtins` and `published` are read-only SOURCES, not documents: opening one and saving '
-    + 'materialises a new document. Pass an id, name or url to web_model_open. Note the '
-    + 'difference from web_project_list: a PROJECT decides what project-relative paths resolve '
-    + 'against, a MODEL is what is loaded in the viewport.',
-    { readOnly: true, timeoutMs: 30_000 },
+    'List the DOCUMENTS of the open project — THE one list. Asset, model and scene are the same '
+    + 'thing: a GLB document; the folder (`section`: scenes/models/library) is a storage place, '
+    + 'not a type. Each row: id, name, path, section, sizeBytes, modified. `builtins` are '
+    + 'read-only SOURCES, not documents: opening one and saving materialises a new document. '
+    + '`published` lists the DEV-ONLY documents (`devOnly: true` in the manifest) — repo '
+    + 'fixtures that no delivered channel ships; they are ordinary rows of `documents` too. '
+    + 'filter matches name or path (case-insensitive substring); withNodeCount '
+    + 'reads each GLB header to add nodeCount (slower). Pass an id, name or path to '
+    + 'web_document_open, or its path to web_document_update / web_editor_open(source=library). '
+    + 'Note the difference from web_project_list: a PROJECT decides what project-relative paths '
+    + 'resolve against, a DOCUMENT is what is loaded in the viewport.',
+    { readOnly: true, timeoutMs: 60_000 },
   )
-  async webModelList(): Promise<string> {
-    const [{ getSceneStore }, { getProjectStore }, documents] = await Promise.all([
+  async webDocumentList(
+    @McpParam('filter', 'Case-insensitive substring of name or path', 'string', false)
+    filter?: string,
+    @McpParam('withNodeCount', 'Read each GLB header to report nodeCount (slower; default false)', 'boolean', false)
+    withNodeCount?: boolean,
+  ): Promise<string> {
+    const [{ getSceneStore }, { getProjectStore }, documents, listing] = await Promise.all([
       import('../../core/hmi/scene/scene-store-singleton'),
       import('../../core/project/project-store'),
       import('../../core/project/rv-project-documents'),
+      import('./rv-mcp-asset-listing'),
     ]);
     const store = getSceneStore();
     if (!store) return JSON.stringify({ error: 'Scene store not available' });
     const viewer = this.viewer;
+    const projectStore = getProjectStore();
+    const backend = projectStore.getBackend();
+
     // plan-716 §2.7 — the ONE list, read where it lives. `listScenes()` was the
     // `scenes/`-section-shaped half of it and is gone (Phase 6); an agent asking
-    // "what can I open" must not be shown a third of the answer.
-    const rows = documents.documentsOf(getProjectStore().getProject()).map((d) => ({
-      id: d.id,
-      name: d.name,
-      path: d.path,
-      section: documents.sectionOfDocument(d),
-    }));
+    // "what can I open" must not be shown a third of the answer. Since the
+    // web_library_assets merge, size/mtime and the unadopted library files come
+    // from the SAME call: the manifest rows carry identity, `statDocuments()`
+    // carries bytes on disk, and `listLibrary()` sees a GLB dropped into the
+    // folder by hand before anything adopts it. Neither alone is the whole list.
+    interface DocumentRow {
+      id: string | null; name: string; path: string; section: string | null;
+      sizeBytes: number | null; modified: string | null; nodeCount?: number;
+    }
+    const byPath = new Map<string, DocumentRow>();
+    const allRows = documents.documentsOf(projectStore.getProject());
+    const stats = typeof backend?.statDocuments === 'function'
+      ? await backend.statDocuments().catch(() => []) : [];
+    const statByPath = new Map(stats.map((s) => [s.path, s]));
+    for (const d of allRows) {
+      const stat = statByPath.get(d.path);
+      byPath.set(d.path, {
+        id: d.id,
+        name: d.name,
+        path: d.path,
+        section: documents.sectionOfDocument(d),
+        sizeBytes: d.sizeBytes ?? stat?.size ?? null,
+        modified: d.modifiedAt ?? (stat?.mtime ? new Date(stat.mtime).toISOString() : null),
+      });
+    }
+    const libEntries = typeof backend?.listLibrary === 'function'
+      ? await backend.listLibrary().catch(() => []) : [];
+    for (const e of libEntries) {
+      if (byPath.has(e.path)) continue;
+      const stat = statByPath.get(e.path);
+      const file = e.path.split('/').pop() ?? e.path;
+      byPath.set(e.path, {
+        id: e.id ?? null,
+        name: e.label || file.replace(/\.glb$/i, ''),
+        path: e.path,
+        section: 'library',
+        sizeBytes: e.sizeBytes ?? stat?.size ?? null,
+        modified: stat?.mtime ? new Date(stat.mtime).toISOString() : null,
+      });
+    }
+
+    const rows = [...byPath.values()]
+      .filter((r) => listing.matchesAssetFilter({ name: r.name, relPath: r.path }, filter))
+      .sort((a, b) => a.path.localeCompare(b.path));
+
+    if (withNodeCount === true && backend) {
+      const { readGlbJson, glbNodeCensus } = await import('../../core/import/rv-glb-inspect');
+      for (const row of rows) {
+        try {
+          const bytes = await backend.readBlobBytes(row.path);
+          // Header-only: `readGlbJson` -> `parseGlbChunks`, which locates the BIN
+          // chunk and never decodes it. The full `parseGlbSubtree*` path is
+          // forbidden here (plan-713 F2).
+          if (bytes) row.nodeCount = glbNodeCensus(readGlbJson(bytes)).nodeCount;
+        } catch { /* an unreadable file simply reports no count */ }
+      }
+    }
+
+    const { QUERY_RESULT_CAP } = await import('./rv-mcp-observe-tools');
+    const capped = listing.capRows(rows, QUERY_RESULT_CAP, 'Narrow with the filter parameter.');
     return JSON.stringify({
-      currentModel: viewer?.currentModelUrl ?? null,
-      documents: rows,
-      /** @deprecated plan-716 — same array as `documents`; drop after one release. */
-      saved: rows,
+      currentDocument: viewer?.currentModelUrl ?? null,
+      projectOpen: projectStore.getProject() !== null,
+      writable: backend?.writable === true,
+      count: rows.length,
+      documents: capped.rows,
+      ...(capped.note ? { truncated: capped.note } : {}),
       builtins: builtinSources(viewer),
-      published: store.listPublished().map((p) => ({ urlName: p.urlName, label: p.label, file: p.file })),
-      hint: 'web_model_open(model=<id|name|url>), or model="empty" for an EMPTY viewport — '
-        + 'which is what you want before authoring a new asset from a CAD import.',
+      // The MCP contract is an OUTER BOUNDARY: the field name stays, its source
+      // moved (plan-731 2f). It used to carry the `scenes/index.json` catalogue
+      // — the second identity space — and now carries the dev-only document
+      // rows, which is what an external caller was actually looking at through
+      // it on our own deploy. Two differently-named fields for the same thing
+      // (`published` here, `availablePublished` below) is itself a symptom of
+      // that space; unifying them is a customer-visible contract cut and has its
+      // own plan.
+      published: allRows.filter((d) => d.devOnly === true).map((d) => ({
+        urlName: publishedUrlNameOf(d), label: d.name, file: d.path,
+      })),
+      hint: 'web_document_open(document=<id|name|path>), or document="empty" for an EMPTY '
+        + 'viewport — which is what you want before authoring a new asset from a CAD import.',
     });
   }
 
   @McpTool(
-    'LOAD a model/scene into the viewer, or clear it. `model` matches a label or url from '
-    + 'web_model_list (case- and separator-insensitively); the special value "empty" opens an '
+    'LOAD a document into the viewer, or clear it. `document` matches an id, name, path, '
+    + 'built-in label or url from web_document_list; the special value "empty" opens an '
     + 'EMPTY viewport. '
-    + 'Use "empty" BEFORE authoring a new asset: with a model loaded, opening the asset editor '
-    + 'with source=empty still leaves that model in the scene, and web_editor_import_cad then '
-    + 'attaches the import UNDER the loaded model — the document silently adopts the whole '
-    + 'scene (nodeCount jumps from 1 to the scene size) and a save would write the demo scene '
-    + 'plus your part. An empty viewport is the only clean starting point.',
+    + 'Open "empty" BEFORE authoring a new asset: with a document still loaded, opening the '
+    + 'asset editor with source=new leaves it in the scene and web_editor_import_cad attaches '
+    + 'the import UNDER it — the new document silently adopts the whole scene, and a save '
+    + 'would write the demo scene plus your part. '
+    + 'Refused while the asset editor is open: the editor keeps its document (and its save '
+    + 'path) bound to the previous file — call web_editor_close first.',
     { readOnly: false, timeoutMs: 180_000 },
   )
-  async webModelOpen(
-    @McpParam('model', 'Document id, name, path, built-in label or url from web_model_list — or "empty" to clear the viewport.', 'string', true)
-    model: string,
+  async webDocumentOpen(
+    @McpParam('document', 'Document id, name, path, built-in label or url from web_document_list, matched case- and separator-insensitively — or "empty" to clear the viewport (nodeCount then reports 1 instead of the whole scene).', 'string', true)
+    document: string,
   ): Promise<string> {
-    const wanted = (model ?? '').trim();
+    const wanted = (document ?? '').trim();
     if (!wanted) {
-      return JSON.stringify({ error: 'model is required — call web_model_list, or pass "empty".' });
+      return JSON.stringify({ error: 'document is required — call web_document_list, or pass "empty".' });
+    }
+    // The scene store swaps the scene WITHOUT telling the asset editor: the
+    // editor's `AssetDocument.base` (and with it the save path reported by
+    // web_editor_status) would keep naming the previous file, and a later
+    // web_editor_save would write the NEW tree under the OLD document's path
+    // (devtodo 2026-08-24). Refusing in words beats a swap that half-works.
+    if (this.viewer?.modes?.activeMode === 'editor') {
+      return JSON.stringify({
+        error: 'The asset editor is open — refusing to swap the document under it.',
+        reason: 'The editor keeps its document bound to the file it was opened on; the scene '
+          + 'would show the new document while web_editor_save still wrote to the old path.',
+        remedy: 'Close the editor first (web_editor_close), then repeat this call — or open '
+          + 'the target for editing with web_editor_open.',
+      });
     }
     const { getSceneStore } = await import('../../core/hmi/scene/scene-store-singleton');
     const store = getSceneStore();
@@ -222,7 +320,7 @@ export class McpProjectTools {
           kind: 'builtin',
           url: emptyBuiltin.url,
           currentModel: this.viewer?.currentModelUrl ?? null,
-          next: 'Empty viewport. Now web_editor_open(source=empty), then web_editor_import_cad. '
+          next: 'Empty viewport. Now web_editor_open(source=new), then web_editor_import_cad. '
             + 'Check web_editor_status: nodeCount must stay at the imported part count.',
         });
       }
@@ -238,7 +336,7 @@ export class McpProjectTools {
         warning: 'No built-in empty GLB in this install, so only the SCENE was cleared — a '
           + 'previously loaded model may still be in the viewport, and the asset editor would '
           + 'bind its document to it. Verify with web_editor_status that nodeCount is 1 after '
-          + 'web_editor_open(source=empty).',
+          + 'web_editor_open(source=new).',
       });
     }
 
@@ -275,22 +373,33 @@ export class McpProjectTools {
       });
     }
 
-    const published = store.listPublished().find((p) =>
-      matchKey(p.label) === key || matchKey(p.urlName) === key || p.file === wanted);
-    if (published) {
-      // openPublishedExample takes the catalogue entry: it knows how to resolve
-      // `file` under the deploy root and which mode the example wants.
-      await store.openPublishedExample(published);
+    // A LEGACY `published:<urlName>` address, or a bare example name, still
+    // resolves — through the alias, onto a row of the SAME list the lookup above
+    // walked (plan-731 2f). It is a second ADDRESS FORM, no longer a second
+    // catalogue with a second open verb: what it finds is a document, and
+    // `openDocument` opens it.
+    const aliased = resolvePublishedSceneParam(wanted, rows)
+      ?? resolvePublishedAlias(wanted, rows);
+    if (aliased) {
+      await store.openDocument(aliased.id);
       return JSON.stringify({
-        opened: true, kind: 'published', urlName: published.urlName, label: published.label,
+        opened: true,
+        kind: 'document',
+        id: aliased.id,
+        name: aliased.name,
+        path: aliased.path,
+        section: documents.sectionOfDocument(aliased),
+        note: 'Resolved through the legacy published:<name> alias — prefer the document id.',
       });
     }
 
     return JSON.stringify({
-      error: `No document, built-in or example matches "${wanted}".`,
+      error: `No document or built-in matches "${wanted}".`,
       availableBuiltins: builtinSources(this.viewer).map((b) => b.label),
       availableDocuments: rows.map((d) => d.name),
-      availablePublished: store.listPublished().map((p) => p.label),
+      // Same boundary rule as `published` in web_document_list: the field name
+      // stays, the source is the dev-only documents.
+      availablePublished: rows.filter((d) => d.devOnly === true).map((d) => d.name),
       note: 'Pass "empty" for a blank viewport.',
     });
   }
@@ -339,13 +448,23 @@ export class McpProjectTools {
 
     const already = store.getProject();
     if (already && already.id === entry.id) {
+      // Re-opening the OPEN project is the one MCP verb an agent has to pick up
+      // out-of-band changes (files added or deleted on disk) without a page
+      // reload — before this rescan, the in-memory registry simply never
+      // refreshed and web_document_list kept listing deleted documents forever
+      // (devtodo 2026-08-24). Rows whose file is gone leave via the adopt
+      // quarantine rather than instantly; that is the store's own rule.
+      await store.rescanDocuments?.();
       const backend = store.getBackend();
       return JSON.stringify({
         opened: true,
         unchanged: true,
+        documentsRescanned: true,
         projectName: already.name,
         writable: backend?.writable === true,
-        note: 'This project was already open; nothing was switched.',
+        note: 'This project was already open; nothing was switched. The document registry was '
+          + 're-scanned from disk — new files are listed now, rows for deleted files clear '
+          + 'after the adopt quarantine.',
       });
     }
 
@@ -380,6 +499,126 @@ export class McpProjectTools {
         ? 'Project switched in place. Project-relative paths (cad/, library/, knowledge/) now '
           + 'resolve against it. Open a document with web_editor_open.'
         : 'Open failed — the folder had no readable project.json, or the grant was lost.',
+    });
+  }
+
+  @McpTool(
+    'Show the open project as a TREE — folders, documents and attachment files, nested, exactly '
+    + 'as the Projects dashboard shows them. Each node: name, kind (folder/document/file/system), '
+    + 'path (project-relative — what web_document_open / web_document_update / web_project_folder '
+    + 'take), documentId for a GLB with a manifest row, and writable. Reserved machinery '
+    + '(settings/connect/rag/thumbnails/.trash) is grouped under one read-only "System" node. '
+    + 'Pass dir to start at a subfolder, maxDepth to limit nesting (childrenOmitted says what '
+    + 'was cut). The flat alternative with sizes is web_document_list; files-with-glob is '
+    + 'web_editor_project_files.',
+    { readOnly: true, timeoutMs: 60_000 },
+  )
+  async webProjectTree(
+    @McpParam('dir', 'Project-relative folder to start at (default: the project root).', 'string', false)
+    dir?: string,
+    @McpParam('maxDepth', 'Maximum nesting depth to render (default 6).', 'integer', false)
+    maxDepth?: number,
+  ): Promise<string> {
+    const [{ getProjectStore }, tree] = await Promise.all([
+      import('../../core/project/project-store'),
+      import('./rv-mcp-project-tree'),
+    ]);
+    const loaded = await tree.loadProjectTree(getProjectStore());
+    if ('error' in loaded) return JSON.stringify(loaded);
+
+    const start = tree.nodeAtRelPath(loaded, dir ?? '');
+    if (!start) {
+      return JSON.stringify({
+        error: `No folder at "${dir}" — pass a project-relative folder path from this tree.`,
+      });
+    }
+    const depth = Number.isFinite(maxDepth) && (maxDepth as number) > 0 ? (maxDepth as number) : 6;
+    return JSON.stringify({
+      projectName: loaded.root.name,
+      writable: loaded.writable,
+      tree: tree.serializeTreeNode(start, depth),
+      hint: 'Folders: web_project_folder(action=create|rename|move). Documents: '
+        + 'web_document_new(name, folder) to create here, web_document_update to '
+        + 'rename/move/delete, web_document_open to load.',
+    });
+  }
+
+  @McpTool(
+    'Create, rename or move a FOLDER of the open project — the same verdicts and the same write '
+    + 'path as the dashboard tree, so a folder move repoints every contained manifest row and '
+    + 'breaks no reference (document ids never change). action=create: path names the new folder '
+    + '(parents may exist or not; an empty folder is a declared manifest entry). action=rename: '
+    + 'path + newName. action=move: path + toFolder (destination folder, "" = project root). '
+    + 'Reserved system folders and catalog rows are refused; documents are managed by '
+    + 'web_document_update instead.',
+    { readOnly: false, timeoutMs: 120_000 },
+  )
+  async webProjectFolder(
+    @McpParam('action', 'create | rename | move') action: string,
+    @McpParam('path', 'Project-relative folder path (from web_project_tree).') path: string,
+    @McpParam('newName', 'New folder name (rename only).', 'string', false) newName?: string,
+    @McpParam('toFolder', 'Destination folder, "" for the project root (move only).', 'string', false) toFolder?: string,
+  ): Promise<string> {
+    const verb = (action ?? '').trim().toLowerCase();
+    if (verb !== 'create' && verb !== 'rename' && verb !== 'move') {
+      return JSON.stringify({ error: `Unknown action "${action}". Use create, rename or move.` });
+    }
+    const [{ getProjectStore }, treeMod, rules] = await Promise.all([
+      import('../../core/project/project-store'),
+      import('./rv-mcp-project-tree'),
+      import('../../core/project/rv-project-tree'),
+    ]);
+    const loaded = await treeMod.loadProjectTree(getProjectStore());
+    if ('error' in loaded) return JSON.stringify(loaded);
+
+    if (verb === 'create') {
+      const made = await treeMod.declareFolder(loaded, path);
+      if ('error' in made) return JSON.stringify(made);
+      return JSON.stringify({
+        created: true, path: made.path,
+        next: `web_document_new(name, folder="${made.path}") creates a document here; `
+          + 'web_project_tree shows the result.',
+      });
+    }
+
+    const node = treeMod.nodeAtRelPath(loaded, path);
+    if (!node || node.kind !== 'folder') {
+      return JSON.stringify({
+        error: `No folder at "${treeMod.normaliseRelPath(path)}" — see web_project_tree. `
+          + '(For documents use web_document_update.)',
+      });
+    }
+
+    let verdict;
+    if (verb === 'rename') {
+      const name = (newName ?? '').trim();
+      if (!name) return JSON.stringify({ error: 'action=rename needs newName.' });
+      verdict = rules.canRenameInTree(loaded.roots, node.path!, name);
+    } else {
+      if (toFolder === undefined) {
+        return JSON.stringify({ error: 'action=move needs toFolder ("" = project root).' });
+      }
+      const destRel = treeMod.normaliseRelPath(toFolder);
+      const dest = treeMod.nodeAtRelPath(loaded, destRel);
+      if (!dest || (dest.kind !== 'folder' && dest.kind !== 'root')) {
+        return JSON.stringify({ error: `No destination folder at "${destRel}" — see web_project_tree.` });
+      }
+      verdict = rules.canMoveInTree(loaded.roots, node.path!, dest.path!);
+    }
+    if (!verdict.ok) {
+      return JSON.stringify({ error: treeMod.refusalSentence(verdict.reason, node.relPath) });
+    }
+
+    const outcome = await treeMod.performTreeEdit(loaded, node, verdict);
+    return JSON.stringify({
+      [verb === 'rename' ? 'renamed' : 'moved']: true,
+      from: verdict.from,
+      to: verdict.to,
+      filesMoved: outcome.moved.length,
+      manifestRowsRepointed: outcome.manifestRows,
+      docsIndexRowsRepointed: outcome.docsIndexRows,
+      refsRepointed: outcome.refRows,
+      note: 'Document ids are unchanged — references keep resolving.',
     });
   }
 }

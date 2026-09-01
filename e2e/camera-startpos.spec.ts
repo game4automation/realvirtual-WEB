@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from 'playwright/test';
 
 test('save and restore camera start position across reload', async ({ page }) => {
   await page.goto('/?model=DemoRealvirtualWeb.glb');

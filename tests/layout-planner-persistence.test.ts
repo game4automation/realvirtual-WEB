@@ -9,7 +9,7 @@
  * Covers findCatalogEntryById, resolvePlacementUrl (incl. cloud download
  * mock), waitForCloudReady, refreshCloudGlbUrl idempotency.
  */
-import { describe, test, expect, vi, beforeEach } from 'vitest';
+import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import {
   findCatalogEntryById,
@@ -23,6 +23,12 @@ import type {
   LayoutPlannerCloudStore,
   LayoutPlannerCloudConnState,
 } from '../src/plugins/layout-planner/cloud-types';
+import {
+  registerLibrarySourceProvider,
+  resetLibrarySourceRegistryForTests,
+  type LibrarySource,
+} from '../src/core/library/library-source-registry';
+import type { LibraryCatalogEntry } from '../src/core/library/library-types';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -240,6 +246,105 @@ describe('layout-planner/planner-persistence', () => {
       expect(url1).toBe('https://x.com/stable.glb');
       const url2 = await refreshCloudGlbUrl(store, null, { ...p1, glbUrl: url1! });
       expect(url2).toBe('https://x.com/stable.glb');
+    });
+  });
+
+  // ─── plan-723 §9.3 — project placements ───────────────────────────────
+  //
+  // A project document has NO stable URL: `resolveAsset` mints a fresh `blob:`
+  // handle per call and the planner loads the geometry under the asset's stable
+  // cache key instead. So what these two functions owe the restore path is not
+  // an address but an answer to "is this document still readable?" — plus the
+  // invariant that they NEVER throw while answering, because the first restore
+  // loop has no try/catch around the call and a rejection there would silently
+  // drop every placement after this one.
+  describe('project placement re-resolution', () => {
+    const PROJECT_ID = 'project:library/Belt.glb';
+
+    function projectPlacement(): PlacedComponent {
+      return makePlacement({ id: 'p1', catalogId: PROJECT_ID, glbUrl: '', label: 'Belt' });
+    }
+
+    function installProjectProvider(source: Partial<LibrarySource> = {}): void {
+      const entry: LibraryCatalogEntry = {
+        id: PROJECT_ID, name: 'Belt', category: 'custom', glbUrl: '',
+        localPath: 'library/Belt.glb',
+      };
+      const full: LibrarySource = {
+        id: 'proj-1',
+        label: 'MeinProjekt',
+        kind: 'project',
+        writable: true,
+        loaded: true,
+        listEntries: () => [entry],
+        getEntry: (assetId) => (assetId === entry.id ? entry : null),
+        resolveAsset: async () => ({ url: 'blob:fresh-belt', revokeUrl: () => { revokes++; } }),
+        ...source,
+      };
+      registerLibrarySourceProvider({
+        id: 'project',
+        listSources: () => [full],
+        subscribe: () => () => {},
+      });
+    }
+
+    let revokes = 0;
+    beforeEach(() => { revokes = 0; resetLibrarySourceRegistryForTests(); });
+    afterEach(() => resetLibrarySourceRegistryForTests());
+
+    test('re-resolves a project: placement through the registry instead of the dead blob url', async () => {
+      installProjectProvider();
+      const store = new LayoutStore();
+
+      const result = await resolvePlacementUrl(store, null, projectPlacement());
+
+      // The marker is the stable catalogId, never the volatile handle — and the
+      // handle the probe minted was released before returning.
+      expect(result).toBe(PROJECT_ID);
+      expect(result).not.toContain('blob:');
+      expect(revokes).toBe(1);
+    });
+
+    test('a dead saved blob url does NOT short-circuit the project branch', async () => {
+      installProjectProvider();
+      const store = new LayoutStore();
+      const stale = makePlacement({ catalogId: PROJECT_ID, glbUrl: 'blob:dead-from-last-session' });
+
+      expect(await resolvePlacementUrl(store, null, stale)).toBe(PROJECT_ID);
+    });
+
+    test('returns null (skip, no throw) when the asset no longer exists in the active project', async () => {
+      installProjectProvider();
+      const store = new LayoutStore();
+      const fromAnotherProject = makePlacement({ catalogId: 'project:library/Gone.glb', glbUrl: '' });
+
+      await expect(resolvePlacementUrl(store, null, fromAnotherProject)).resolves.toBeNull();
+    });
+
+    test('returns null (skip, no throw) when no provider is registered at all', async () => {
+      const store = new LayoutStore();
+      await expect(resolvePlacementUrl(store, null, projectPlacement())).resolves.toBeNull();
+    });
+
+    test('returns null (skip, no throw) when resolveAsset throws (unknown provider/source)', async () => {
+      installProjectProvider({
+        resolveAsset: async () => { throw new Error('backend gone'); },
+      });
+      const store = new LayoutStore();
+
+      // The whole point: a rejection here would abort the restore loop, which
+      // has no try/catch around this call.
+      await expect(resolvePlacementUrl(store, null, projectPlacement())).resolves.toBeNull();
+    });
+
+    test('refreshCloudGlbUrl takes the same branch (legacy autosave restore path)', async () => {
+      installProjectProvider();
+      const store = new LayoutStore();
+
+      expect(await refreshCloudGlbUrl(store, null, projectPlacement())).toBe(PROJECT_ID);
+      expect(await refreshCloudGlbUrl(store, null, {
+        ...projectPlacement(), catalogId: 'project:library/Gone.glb',
+      })).toBeNull();
     });
   });
 });

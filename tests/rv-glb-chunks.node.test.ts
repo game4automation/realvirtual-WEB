@@ -126,7 +126,7 @@ describe('rv-glb-chunks', () => {
   });
 
   it('preserves the real demo GLB byte-for-byte through an unmodified round trip', () => {
-    const source = readFileSync(resolve(__dirname, '../public/models/DemoRealvirtualWeb.glb'));
+    const source = readFileSync(resolve(__dirname, '../public/DemoRealvirtualWeb.glb'));
     const chunks = parseGlbChunks(new Uint8Array(source));
     const out = rebuildGlbWithJson(chunks);
     // The JSON chunk may re-serialise to a different length (the exporter's

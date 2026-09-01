@@ -102,6 +102,7 @@ import {
   readScriptRefMigrationMarker,
 } from './rv-project-refs-migration';
 import { knowledgeForDocument, type RvKnowledge } from './rv-project-knowledge';
+import { assertContainedRef, setDocumentRefOn } from './rv-project-refs';
 import {
   CONNECT_MIGRATION_HANDOFF,
   migrateConnectRefs,
@@ -126,6 +127,7 @@ import {
   BundledBackend,
   DEMO_PROJECT_FOLDER,
   DEMO_PROJECT_ID,
+  DEMO_PROJECT_SLUG,
   type BundledBackendOptions,
 } from './backends/bundled-backend';
 import { FolderBackend } from './backends/folder-backend';
@@ -156,6 +158,7 @@ import { getWorkspaceHandle } from './rv-project-workspace';
 import {
   ensureWorkspaceDefaultManifest,
   isWorkspaceDefaultBackend,
+  isWorkspaceDefaultProject,
   openWorkspaceDefaultBackend,
 } from './rv-workspace-default';
 import {
@@ -195,6 +198,20 @@ export type { ProjectReadProvider };
 
 // ─── Snapshot ───────────────────────────────────────────────────────────
 
+/**
+ * Why the remembered project did not come back on this boot (plan-702 Punkt 3).
+ *
+ * `permission` — the stored handle exists but the readwrite grant lapsed and
+ * boot never prompts (`prompt: false`); `unreadable` — the grant held but the
+ * folder had no readable manifest (renamed, moved, deleted, I/O error).
+ */
+export interface ProjectRestoreFailure {
+  projectId: string;
+  /** Display name from the recents list, when this machine has one. */
+  projectName?: string;
+  reason: 'permission' | 'unreadable';
+}
+
 export interface ProjectSnapshot {
   project: RvProject | null;
   /** Handle name of the open folder, for display. */
@@ -227,6 +244,13 @@ export interface ProjectSnapshot {
    * and this is now the only artefact list the snapshot carries.
    */
   documents: TieredDocumentEntry[];
+  /**
+   * Set when the last session's project could not be restored at boot and the
+   * store fell back to the bundled project (plan-702 Punkt 3). Cleared by the
+   * next deliberate open. Null when the restore succeeded or nothing was
+   * remembered.
+   */
+  restoreFailure: ProjectRestoreFailure | null;
 }
 
 export interface OpenProjectOptions {
@@ -293,7 +317,13 @@ export interface ResolvedActiveProject {
   backend: ProjectBackend;
   /** Feeds `viewer.availableModels`. */
   models: RvProjectAssetEntry[];
-  /** Feeds `viewer.availablePublishedScenes`. */
+  /**
+   * Scene-section entries of the resolved project.
+   *
+   * It used to feed `viewer.availablePublishedScenes` — the second identity
+   * space plan-731 removed. What reads it now is the ordinary document path,
+   * so the comment names the data instead of a consumer that is gone.
+   */
   scenes: RvProjectSceneEntry[];
   kind: 'bundled' | 'browser' | 'folder';
 }
@@ -485,6 +515,19 @@ function repointToManifestRows(
   });
 }
 
+// ─── Project-change notifier (plan-725 §2.7) ────────────────────────────
+
+/**
+ * "Something that can bear a CONNECT configuration has just been written."
+ *
+ * Deliberately **argument-free**. The receiver reads the identity it needs —
+ * the project id, the open document — from the same synchronous seams the hero
+ * card reads them from, so this store does not have to learn what a document
+ * means to CONNECT, and a second consumer can be added without changing the
+ * shape of this callback.
+ */
+export type ProjectChangeNotifier = () => void;
+
 // ─── Store ──────────────────────────────────────────────────────────────
 
 export class ProjectStore {
@@ -523,6 +566,63 @@ export class ProjectStore {
 
   private _listeners = new Set<() => void>();
   private _snapshot: ProjectSnapshot = emptySnapshot();
+
+  /** Boot-restore failure, until the next deliberate open (plan-702 Punkt 3). */
+  private _restoreFailure: ProjectRestoreFailure | null = null;
+
+  /** plan-725 §2.7 — who wants to know that a config-bearing write happened. */
+  private _changeNotifier: ProjectChangeNotifier | null = null;
+
+  // ─── Project-change notifier (plan-725 §2.7) ──────────────────────────
+
+  /**
+   * Register (or clear, with `null`) the one listener for config-bearing writes.
+   *
+   * **Dependency inversion, and it is the point of the method.** The consumer
+   * today is realvirtual CONNECT, whose store is a 2000-line feature domain
+   * (MQTT, S7, EtherNet/IP defaults). Importing it from here would drag that
+   * whole domain into the import graph of the central data layer, for a call
+   * this layer does not care about the meaning of. So the arrow points the other
+   * way: the HMI layer, which already knows both halves, hands its callback in.
+   *
+   * One slot rather than a listener set, deliberately: this is a wiring point
+   * with exactly one owner, and a set would make "who is still registered after
+   * a hot reload" a question nobody can answer.
+   */
+  setProjectChangeNotifier(notifier: ProjectChangeNotifier | null): void {
+    this._changeNotifier = notifier;
+  }
+
+  /**
+   * Announce a config-bearing write that happened OUTSIDE this store.
+   *
+   * `ProjectsDashboardHost.handleNewConnectConfig` writes a `*.connect.json`
+   * with a raw `backend.writeBlob` and never touches the manifest, and the
+   * cross-source document transfer writes through its own CAS wrapper — neither
+   * passes any of the paths below, so both say so here instead.
+   */
+  notifyProjectChanged(): void {
+    this._notifyConnectAsync();
+  }
+
+  /**
+   * Tell the registered listener, and let nothing about it reach the caller.
+   *
+   * **Fire-and-forget is a hard requirement, not a convenience (F12).** Every
+   * call site is the tail of a write the user is waiting on; a gateway that is
+   * offline, unauthorised, busy or simply not there must not make that write
+   * slow, let alone fail. So: no `await`, no rejection escaping, and the
+   * listener's own gate decides whether anything goes on the wire at all.
+   */
+  private _notifyConnectAsync(): void {
+    const notify = this._changeNotifier;
+    if (!notify) return;
+    try {
+      notify();
+    } catch (e) {
+      console.warn('[project-store] change notifier threw (ignored):', e);
+    }
+  }
 
   // ─── Subscription ─────────────────────────────────────────────────────
 
@@ -676,12 +776,101 @@ export class ProjectStore {
       return true;
     }
     if (this._backend && await this._runDirtyGuard('switch') === 'cancel') return false;
-    if (this._backend) await this.closeProject();
-    const project = await backend.readManifest();
-    if (!project) return false;
-    await this._adoptProject(backend, project);
-    this._publish();
-    return true;
+    const leaving = this._project?.name ?? null;
+    const narrate = await this._switchNarrator();
+    try {
+      if (this._backend) {
+        if (leaving) await narrate.say(`Closing ${leaving}…`);
+        await this.closeProject();
+      }
+      const project = await backend.readManifest();
+      if (!project) return false;
+      await narrate.say(`Opening ${project.name}…`);
+      await this._adoptProject(backend, project);
+      // A deliberate open answers the boot-restore failure, whichever project
+      // the user chose (plan-702 Punkt 3).
+      this._restoreFailure = null;
+      this._publish();
+      return true;
+    } finally {
+      narrate.done();
+    }
+  }
+
+  /**
+   * Open the implicit browser project "My Workspace" (plan-726 follow-up).
+   *
+   * The workspace stopped being the projectless boot answer the moment the
+   * deploy root carries a manifest — but the documents the eager `scn_`
+   * migration converted still live in it, and so does everything a visitor
+   * saved before the root manifest arrived. This is the verb the
+   * cross-project hop in `SceneStore.openScene` uses to reach them. Same
+   * shape as `openDemoProject`, and the dirty guard applies for the same
+   * reason: the hop must not be the thing that silently drops unsaved work.
+   */
+  async openWorkspaceProject(): Promise<boolean> {
+    if (this._backend && this._project && isWorkspaceDefaultProject(this._project)) {
+      this._publish();
+      return true;
+    }
+    if (this._backend && await this._runDirtyGuard('switch') === 'cancel') return false;
+    const leaving = this._project?.name ?? null;
+    const narrate = await this._switchNarrator();
+    try {
+      if (this._backend) {
+        if (leaving) await narrate.say(`Closing ${leaving}…`);
+        await this.closeProject();
+      }
+      const backend = openWorkspaceDefaultBackend();
+      const project = await backend.readManifest();
+      if (!project) return false;
+      await narrate.say(`Opening ${project.name}…`);
+      await this._adoptProject(backend, project);
+      this._restoreFailure = null;
+      this._publish();
+      return true;
+    } finally {
+      narrate.done();
+    }
+  }
+
+  /**
+   * Narrate a project switch while it runs.
+   *
+   * A switch is two long steps with a blank screen between them, and they are
+   * not the same step: the close flushes the leaving project's writes, the open
+   * reads the arriving folder. Naming each beat is what turns one unexplained
+   * freeze into progress the user can read — and it is why this lives here
+   * rather than in the switcher UI, for the same reason the dirty guard does:
+   * every open path gets it, and no caller can route around it.
+   *
+   * The overlay module is imported lazily so that React/MUI stay out of the
+   * project store's module graph (the pattern the workspace migration below
+   * already uses). A failed import is silence, never a failed open — the
+   * narration is a courtesy, not a step of the switch.
+   */
+  private async _switchNarrator(): Promise<{
+    say: (message: string) => Promise<void>;
+    done: () => void;
+  }> {
+    // __RV_EMBED__ short-circuit: the overlay is a React/@mui surface and must
+    // not reach the embed library build (plan-326 AP1). The null path below is
+    // the existing failure path, so the embed simply narrates nothing.
+    const overlay = __RV_EMBED__
+      ? null
+      : await import('../hmi/info-overlay-store').catch(() => null);
+    if (!overlay) return { say: async () => {}, done: () => {} };
+    return {
+      // Two frames before returning: the caller's next step is a long
+      // main-thread block, so a message that has not painted yet would only
+      // appear once the thing it describes is already over.
+      say: async (message: string) => {
+        overlay.showInfoOverlay(message);
+        await new Promise<void>(resolve => requestAnimationFrame(
+          () => requestAnimationFrame(() => resolve())));
+      },
+      done: () => overlay.hideInfoOverlay(),
+    };
   }
 
   /** Show the picker in readwrite mode and open the chosen folder. */
@@ -708,11 +897,14 @@ export class ProjectStore {
       if (await this._runDirtyGuard('switch') === 'cancel') return false;
     }
 
-    await this.closeProject();
-    this._warnings = [];
-    this._lastConflicts = [];
-
     // ── readwrite upgrade; refusal degrades to read-only, never to a throw ──
+    //
+    // FIRST, and before anything that awaits. `requestPermission()` needs the
+    // transient user activation of the click that got us here, and every await
+    // in front of it spends part of that window — the module import and the
+    // paint waits of the narration below included. Asking here also puts the
+    // question in the right order: we do not tear down the open project until
+    // we know the arriving one can be written to.
     let writable = false;
     if (opts.skipPermissionRequest) {
       writable = true;
@@ -723,41 +915,65 @@ export class ProjectStore {
         writable = false;
       }
     }
-    if (!writable) {
-      this._warnings.push('Write access was declined — the project opens read-only.');
-    }
 
-    const backend = new FolderBackend(dir, {
-      writable,
-      writerHost: this._writerHost(),
-    });
-    let project = await backend.readManifest();
-
-    if (!project) {
-      if (!opts.createIfMissing) {
-        this._warnings.push('No readable project.json in this folder.');
-        this._publish();
-        return false;
-      }
+    // The narration starts only after the dirty guard and the permission
+    // prompt: both are real modal questions, and an overlay behind either
+    // would announce a switch the user may still be about to cancel.
+    const leaving = this._project?.name ?? null;
+    const narrate = await this._switchNarrator();
+    try {
+      if (leaving) await narrate.say(`Closing ${leaving}…`);
+      await this.closeProject();
+      // The folder name, until the manifest supplies the real one below.
+      await narrate.say(`Opening ${dir.name}…`);
+      this._warnings = [];
+      this._lastConflicts = [];
+      // Pushed here rather than where `writable` is decided: `_warnings` is
+      // reset just above, so an earlier push would be wiped.
       if (!writable) {
-        this._warnings.push('Cannot create a project here without write access.');
-        this._publish();
-        return false;
+        this._warnings.push('Write access was declined — the project opens read-only.');
       }
-      project = newProject(opts.name ?? dir.name ?? 'Untitled project');
-      await writeManifest(dir, project);
+
+      const backend = new FolderBackend(dir, {
+        writable,
+        writerHost: this._writerHost(),
+      });
+      let project = await backend.readManifest();
+
+      if (!project) {
+        if (!opts.createIfMissing) {
+          this._warnings.push('No readable project.json in this folder.');
+          this._publish();
+          return false;
+        }
+        if (!writable) {
+          this._warnings.push('Cannot create a project here without write access.');
+          this._publish();
+          return false;
+        }
+        project = newProject(opts.name ?? dir.name ?? 'Untitled project');
+        await writeManifest(dir, project);
+      }
+
+      if (project.name && project.name !== dir.name) {
+        await narrate.say(`Opening ${project.name}…`);
+      }
+
+      this._dir = dir;
+      await this._adoptProject(backend, project);
+      // A deliberate open answers the boot-restore failure (plan-702 Punkt 3).
+      this._restoreFailure = null;
+      try { localStorage.setItem(LS_KEY_LAST_PROJECT, project.id); } catch { /* private mode */ }
+      try { await putHandle(dir, projectHandleKey(project.id)); } catch { /* non-fatal */ }
+      // Recents are recorded AFTER the handle is stored: a display row without a
+      // reopenable handle would be a menu entry that does nothing (§4.5).
+      recordRecentProject({ id: project.id, name: project.name, folderName: dir.name });
+
+      this._publish();
+      return true;
+    } finally {
+      narrate.done();
     }
-
-    this._dir = dir;
-    await this._adoptProject(backend, project);
-    try { localStorage.setItem(LS_KEY_LAST_PROJECT, project.id); } catch { /* private mode */ }
-    try { await putHandle(dir, projectHandleKey(project.id)); } catch { /* non-fatal */ }
-    // Recents are recorded AFTER the handle is stored: a display row without a
-    // reopenable handle would be a menu entry that does nothing (§4.5).
-    recordRecentProject({ id: project.id, name: project.name, folderName: dir.name });
-
-    this._publish();
-    return true;
   }
 
   /**
@@ -922,10 +1138,13 @@ export class ProjectStore {
       try {
         const remote = this.getRemoteBackend(opts.remoteBaseUrl);
         const manifest = await remote.readManifest();
-        // `hasDeployedManifest()`, not `manifest !== null`: a base URL that
-        // serves no project.json still yields the synthetic demo manifest, and
-        // adopting that would turn a typo in the URL into a silently empty
-        // project rather than a fall-through to the real one.
+        // Both halves, still. Since plan-735 they say the same thing — a base
+        // URL that serves no `project.json` yields `null` now, where it used to
+        // yield the synthetic demo manifest — so this is belt-and-braces rather
+        // than the load-bearing distinction it once was. Kept as it is because
+        // `hasDeployedManifest()` is the SENTENCE ("this host published a
+        // project") and `manifest` is the value, and a caller pointing at
+        // someone else's URL should read the sentence.
         if (manifest && remote.hasDeployedManifest()) {
           backend = remote;
           project = manifest;
@@ -936,6 +1155,33 @@ export class ProjectStore {
     }
 
     const wanted = opts.projectId ?? readLastProjectId();
+
+    // ── `?project=<slug>` naming the bundled demo (plan-726 F7) ───────────
+    //
+    // `opts.projectId` carries whatever `?project=` said, and the only thing
+    // this function ever did with it was look for a FOLDER HANDLE under that
+    // key. The bundled demo has no folder handle and never will, so
+    // `?project=demorealvirtual` — the canonical name the backend has exported
+    // as `DEMO_PROJECT_SLUG` all along — resolved to nothing and fell through
+    // to whatever the last session had open.
+    //
+    // Matched against the id as well as the slug because both spellings are in
+    // circulation: `prj_sample` is what `localStorage` and the recents list
+    // hold, `demorealvirtual` is what a person would type or share. Only ever
+    // when it was named EXPLICITLY (`opts.projectId`), never from
+    // `readLastProjectId()` — a restored session must keep going through the
+    // normal resolution so a folder project stays a folder project.
+    if (!backend && opts.projectId) {
+      const named = opts.projectId.trim().toLowerCase();
+      if (named === DEMO_PROJECT_SLUG || named === DEMO_PROJECT_ID.toLowerCase()) {
+        const manifest = await bundled.readManifest();
+        if (manifest) {
+          backend = bundled;
+          project = manifest;
+        }
+      }
+    }
+
     if (!backend && wanted) {
       try {
         // `prompt: false` — a permission dialog on every reload would be its
@@ -955,11 +1201,34 @@ export class ProjectStore {
             backend = folder;
             project = manifest;
             dir = handle;
+          } else {
+            // Grant held, folder answered, but no readable manifest — renamed,
+            // moved, deleted or an I/O error. Record it so boot can say so
+            // instead of silently landing in the bundled project (plan-702).
+            this._restoreFailure = {
+              projectId: wanted,
+              projectName: projectNameOf(wanted),
+              reason: 'unreadable',
+            };
           }
+        } else {
+          // No handle without a prompt — the grant lapsed. The fallback below
+          // is still the right boot answer; the record makes it visible.
+          this._restoreFailure = {
+            projectId: wanted,
+            projectName: projectNameOf(wanted),
+            reason: 'permission',
+          };
         }
       } catch {
         // A stale handle or a refused grant is not an error here — the
-        // bundled project below is always a valid answer.
+        // bundled project below is always a valid answer. But it IS a failed
+        // restore, and the user gets told rather than a console reader.
+        this._restoreFailure = {
+          projectId: wanted,
+          projectName: projectNameOf(wanted),
+          reason: 'unreadable',
+        };
       }
     }
 
@@ -969,12 +1238,60 @@ export class ProjectStore {
     // DemoRealvirtual permanently read-only: no new scene, no new asset, and a
     // user tier that `_mergeTiers` drops on the floor. Only ever runs when the
     // workspace grant is already in hand, so it cannot raise a boot prompt.
+    // Asked ONCE, here, and reused by both branches below. `readManifest()` is
+    // memoised, so this is the same single fetch the fallback would have made.
+    // Guarded since plan-735 3d (R6). Before it, a `null` from here was
+    // impossible and a THROW from here was survivable only by luck: the
+    // `remoteBaseUrl` branch above has always had its own try/catch, this one
+    // never did, and `_fetchJson()` swallows the ordinary failures — so the
+    // residual throws (a `file://` page whose `fetch` rejects synchronously, a
+    // hostile `fetch` polyfill) went straight past `resolveActiveProject()` and
+    // took the whole boot with them. Now that a missing manifest is a NORMAL,
+    // reported outcome rather than an impossible one, the throw beside it has
+    // to be normal too: no project resolved, fall through to the resolution
+    // below exactly as a 404 does.
+    let deployedManifest: RvProject | null = null;
+    try {
+      deployedManifest = await bundled.readManifest();
+    } catch (e) {
+      console.warn('[project] The deploy root could not be read for a project manifest:', e);
+    }
+    const hasDeployedManifest = bundled.hasDeployedManifest();
+
     if (!backend) {
-      const demo = await this._resolveWorkspaceDemoProject();
-      if (demo) {
-        backend = demo.backend;
-        project = demo.project;
-        dir = demo.dir;
+      // ── The workspace-folder collision guard (plan-726 F9) ────────────
+      //
+      // `_resolveWorkspaceDemoProject()` looks for a folder literally named
+      // `demo-realvirtual` in the user's workspace, and that name is not
+      // exotic: it is the folder name this repository uses for the demo
+      // project under `WebViewer-Private~/projects/`. A developer who points
+      // "My Workspace" at that checkout gets a WRITABLE FolderBackend for
+      // `prj_sample` — which silently defeats the read-only contract the demo
+      // is supposed to have (F9), and does it with whatever half-finished
+      // manifest happens to sit in that folder.
+      //
+      // The guard is narrow on purpose: it only fires when the deploy itself
+      // publishes a `project.json`. In that case the deploy has SAID what the
+      // demo is, and a same-named local folder cannot outrank it. Without a
+      // root manifest nothing has said anything, and the pre-726 behaviour —
+      // the workspace folder wins, so DemoRealvirtual is editable in a
+      // checkout — is preserved exactly.
+      if (hasDeployedManifest) {
+        const collides = await this._workspaceDemoFolderExists();
+        if (collides) {
+          console.warn(
+            '[project] A workspace folder named "'
+            + `${DEMO_PROJECT_FOLDER}" was found, but this deploy publishes its own `
+            + 'project.json — opening the read-only deployed demo project instead.',
+          );
+        }
+      } else {
+        const demo = await this._resolveWorkspaceDemoProject();
+        if (demo) {
+          backend = demo.backend;
+          project = demo.project;
+          dir = demo.dir;
+        }
       }
     }
 
@@ -986,11 +1303,30 @@ export class ProjectStore {
     // such a root is unchanged — it resolved to `bundled` before too, just from
     // the fallback below. `readManifest()` is memoised, so asking here costs the
     // one fetch the fallback would have made anyway.
+    // ── The eager scn_→document migration, unhooked from one branch (F14) ──
+    //
+    // It used to live INSIDE the "My Workspace" branch below, which was
+    // correct only as long as that branch was the boot default. A deploy that
+    // publishes its own `project.json` — which, since plan-726, is every
+    // public demo and every dev checkout — resolves at the branch below this
+    // one and never reaches the workspace branch at all. The migration would
+    // then be skipped on EVERY boot, permanently, and not only in
+    // `e2e/scene-link-migration.spec.ts`: any developer profile still holding
+    // `scn_…` catalogue rows would simply stop seeing those scenes.
+    //
+    // So it runs here, before the resolution continues, independent of which
+    // branch wins. It costs a profile with nothing to convert two `getItem`s
+    // (its own early-out), it opens and closes its OWN backend instance for
+    // the workspace project, and it therefore keeps this function's promise
+    // that the backend it HANDS BACK was never activated.
+    if (opts.workspaceDefault !== false && opts.migrateScenes !== false) {
+      await this._migrateWorkspaceScenes();
+    }
+
     if (!backend) {
-      const deployed = await bundled.readManifest();
-      if (deployed && bundled.hasDeployedManifest()) {
+      if (deployedManifest && hasDeployedManifest) {
         backend = bundled;
-        project = deployed;
+        project = deployedManifest;
       }
     }
 
@@ -1024,7 +1360,11 @@ export class ProjectStore {
     if (!backend && opts.workspaceDefault !== false) {
       try {
         const workspace = openWorkspaceDefaultBackend();
-        if (opts.migrateScenes !== false) await this._migrateWorkspaceScenes();
+        // The migration itself moved ABOVE this branch (plan-726 F14) — it has
+        // to run whichever branch wins. The ordering guarantee it needed is
+        // unchanged: it is still awaited inside `resolveActiveProject()`, i.e.
+        // structurally before `initSceneStore()` and before the `?scene=`
+        // routing that needs the alias map.
         const manifest = await workspace.readManifest();
         if (manifest) {
           backend = workspace;
@@ -1039,7 +1379,7 @@ export class ProjectStore {
 
     if (!backend) {
       backend = bundled;
-      project = await bundled.readManifest();
+      project = deployedManifest;
     }
 
     this._resolved = project ? { backend, project } : null;
@@ -1070,9 +1410,12 @@ export class ProjectStore {
    * overlay's teardown to the same guarantee.
    */
   private async _migrateWorkspaceScenes(): Promise<void> {
+    // Same __RV_EMBED__ gate as _switchNarrator: no React/@mui edge into the
+    // embed build. The migration itself runs unchanged; only its progress
+    // overlay is absent there.
     const [{ runWorkspaceScenesMigration }, overlay] = await Promise.all([
       import('./rv-workspace-migration'),
-      import('../hmi/info-overlay-store'),
+      __RV_EMBED__ ? Promise.resolve(null) : import('../hmi/info-overlay-store'),
     ]);
     // The overlay is driven by `onProgress`, which fires only when there is a
     // row to convert. A profile with no catalogue — every boot after the first
@@ -1083,14 +1426,14 @@ export class ProjectStore {
       const result = await runWorkspaceScenesMigration({
         onProgress: (done, total) => {
           shown = true;
-          overlay.showInfoOverlay(`Converting ${done} of ${total}…`);
+          overlay?.showInfoOverlay(`Converting ${done} of ${total}…`);
         },
       });
       if (result.skipped.some(s => s.reason === 'alias-failed' || s.reason === 'write-failed')) {
         console.warn('[project] some scenes could not be converted:', result.skipped);
       }
     } finally {
-      if (shown) overlay.hideInfoOverlay();
+      if (shown) overlay?.hideInfoOverlay();
     }
   }
 
@@ -1103,6 +1446,26 @@ export class ProjectStore {
    * every descendant, which is why the folder can be opened writable here
    * without a second dialog.
    */
+  /**
+   * Is there a `demo-realvirtual` folder in the stored workspace? (plan-726 F9)
+   *
+   * Read-only reconnaissance for the collision guard: it answers the question
+   * WITHOUT constructing a writable `FolderBackend`, which is the whole point —
+   * the guard exists so that folder never becomes the active backend when the
+   * deploy publishes its own manifest. Never prompts, and a missing workspace,
+   * a lapsed grant or no such folder are all a plain `false`.
+   */
+  private async _workspaceDemoFolderExists(): Promise<boolean> {
+    try {
+      const workspace = await getWorkspaceHandle({ prompt: false });
+      if (!workspace) return false;
+      await workspace.getDirectoryHandle(DEMO_PROJECT_FOLDER);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async _resolveWorkspaceDemoProject(): Promise<
     { backend: FolderBackend; project: RvProject; dir: FileSystemDirectoryHandle } | null
   > {
@@ -1954,6 +2317,64 @@ export class ProjectStore {
   }
 
   /**
+   * Set or clear one document's CONNECT binding (`documents[].connectRef`,
+   * plan-718 §3) — the write half of the hero card's Unity-style reference.
+   *
+   * In-memory first, then the manifest under CAS, exactly like
+   * {@link setDocumentClassification} above: the chip and the detail pane must
+   * agree the moment the drop lands, not after the disk write settles. The
+   * pure edit itself is `setDocumentRefOn` from `rv-project-refs`, so the
+   * containment rule (a ref never leaves the project) is enforced on this path
+   * like on every other.
+   */
+  async setDocumentConnectRef(documentId: string, ref: string | null): Promise<void> {
+    return this._setDocumentRefField(documentId, 'connectRef', ref);
+  }
+
+  /** The `knowledgeRef` twin of {@link setDocumentConnectRef}. */
+  async setDocumentKnowledgeRef(documentId: string, ref: string | null): Promise<void> {
+    return this._setDocumentRefField(documentId, 'knowledgeRef', ref);
+  }
+
+  private async _setDocumentRefField(
+    documentId: string,
+    field: 'connectRef' | 'knowledgeRef',
+    ref: string | null,
+  ): Promise<void> {
+    const backend = this._backend;
+    if (!backend) throw new Error('No project is open.');
+    if (!backend.writable) throw new Error('This project is read-only.');
+    const doc = this._snapshot.documents.find(d => d.id === documentId);
+    if (!doc) throw new Error('That document is no longer part of this project.');
+    if (doc.tier === 'bundled') {
+      throw new Error(`"${doc.name}" is read-only — duplicate it into this project first.`);
+    }
+    const next = ref === null ? null : assertContainedRef(ref, field);
+
+    const key = documentKeyOf(doc);
+    const apply = (list: RvDocumentEntry[]) => list.map((e) => {
+      if (documentKeyOf(e) !== key) return e;
+      const { [field]: _dropped, ...rest } = e;
+      return next ? { ...rest, [field]: next } : rest;
+    });
+    this._userDocuments = apply(this._userDocuments);
+    this._bundledDocuments = apply(this._bundledDocuments);
+    this._publish();
+
+    const dir = this._dir;
+    if (dir) {
+      const written = await updateManifestCas(dir, (current) => {
+        const base = current ?? this._project;
+        if (!base) throw new Error('This project has no manifest to update.');
+        return setDocumentRefOn(base, documentId, field, next);
+      });
+      this._project = written.project;
+    }
+    // The hero drop itself (plan-725 F1): the whole reason the notify exists.
+    this._notifyConnectAsync();
+  }
+
+  /**
    * Adopt a manifest a caller derived from {@link getProject} (plan-703 Phase 6).
    *
    * The tree's move is the caller: it has already run `moveDocumentPath` for
@@ -1990,6 +2411,9 @@ export class ProjectStore {
     // currently open and is stating it as the new truth. The CAS wrapper is
     // still what serialises the write against the folder writer's own queue.
     if (dir) await updateManifestCas(dir, () => next);
+    // The tree move/rename path (plan-725 F7): a configuration that changed its
+    // name or folder must stop being written back to where it no longer is.
+    this._notifyConnectAsync();
   }
 
   // ─── Adopt (plan-717 §2.2) ────────────────────────────────────────────
@@ -2041,6 +2465,7 @@ export class ProjectStore {
     this._project = next;
     this._userDocuments = repointToManifestRows(this._userDocuments, next);
     if (opts.publish !== false) this._publish();
+    this._notifyConnectAsync();
     return next;
   }
 
@@ -2293,6 +2718,9 @@ export class ProjectStore {
         migrateConnectRefs(current ?? project, bindings).project);
       this._project = written.project;
       this._publish();
+      // This one writes `connectRef` rows at project-open time — the state the
+      // gateway most needs to hear about, and the earliest it can.
+      this._notifyConnectAsync();
 
       const result = migrateConnectRefs(project, bindings);
       for (const model of result.unmatched) {
@@ -2349,6 +2777,7 @@ export class ProjectStore {
           return mintReferencedAssets(base, due).project;
         });
       }
+      this._notifyConnectAsync();
       return result.minted;
     } catch (e) {
       console.warn('[project-store] could not imprint referenced asset ids:', e);
@@ -2370,6 +2799,7 @@ export class ProjectStore {
       warnings: [...this._warnings],
       backendKind: this._backend?.kind ?? null,
       models,
+      restoreFailure: this._restoreFailure,
     };
     for (const l of [...this._listeners]) {
       try { l(); } catch { /* subscriber errors never break a save */ }
@@ -2408,8 +2838,11 @@ const NO_DOCUMENTS: TieredDocumentEntry[] = [];
  * The classification is compared by value rather than by reference — a scan
  * that read the same answer out of the file must not look like a change, or the
  * open path would publish twice on every project that has any documents at all.
+ *
+ * Exported for the snapshot-equality test: every field a publish can change
+ * must be compared here, or the change is invisible to `useSyncExternalStore`.
  */
-function sameDocuments(
+export function sameDocuments(
   a: readonly TieredDocumentEntry[],
   b: readonly TieredDocumentEntry[],
 ): boolean {
@@ -2421,6 +2854,13 @@ function sameDocuments(
     if (x.id !== y.id || x.name !== y.name || x.path !== y.path
       || x.tier !== y.tier || x.modifiedAt !== y.modifiedAt
       || x.section !== y.section
+      // The three reference fields (plan-718) are row state like everything
+      // above: leaving them out made a `setDocumentConnectRef` publish look
+      // like "no change", so the hero chip neither appeared on a drop nor
+      // disappeared on a clear until the next unrelated publish.
+      || x.connectRef !== y.connectRef
+      || x.scriptRef !== y.scriptRef
+      || x.knowledgeRef !== y.knowledgeRef
       || !classificationEquals(x.classification, y.classification)) return false;
   }
   return true;
@@ -2458,6 +2898,7 @@ function emptySnapshot(): ProjectSnapshot {
     backendKind: null,
     models: NO_MODELS,
     documents: NO_DOCUMENTS,
+    restoreFailure: null,
   };
 }
 

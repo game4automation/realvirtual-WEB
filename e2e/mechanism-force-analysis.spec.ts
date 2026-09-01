@@ -42,17 +42,22 @@
  */
 
 import { expect, test, type Page } from 'playwright/test';
+ import { scratchAssetDocument } from '../tests/helpers/scratch-asset-document';
 import { DEV_GLB } from '../tests/fixtures/glb-paths.mjs';
+import { HAS_PRIVATE_SOURCE, privateModuleUrl } from './private-module-url';
 
 /** A four-bar: a closed loop, so the loop-λ path is exercised, not just a tree. */
 const BASE_MODEL = DEV_GLB.mechanismFourbar;
 
+// The asset-editor modules live in the PRIVATE sibling repository, outside the
+// dev-server root, and are addressed through `/@fs/<abs>` — see
+// `e2e/private-module-url.ts`.
 const MODULE_PATHS = {
   doc: '/src/core/editor/rv-asset-document.ts',
-  authoring: '/src/plugins/asset-editor/mechanism/mechanism-authoring.ts',
+  authoring: privateModuleUrl('plugins/asset-editor/mechanism/mechanism-authoring.ts'),
   registry: '/src/core/engine/rv-kinematic-registry.ts',
   recorder: '/src/plugins/mechanism-force-recorder-plugin.ts',
-  gizmo: '/src/plugins/asset-editor/mechanism/mechanism-force-gizmo.ts',
+  gizmo: privateModuleUrl('plugins/asset-editor/mechanism/mechanism-force-gizmo.ts'),
 };
 
 async function installHarness(page: Page): Promise<void> {
@@ -100,7 +105,7 @@ async function installHarness(page: Page): Promise<void> {
         const mech = w.__rv412.firstMechanism();
         if (!mech) throw new Error('no active mechanism to add masses to');
 
-        const doc = docMod.AssetDocument.newUntitled(viewer);
+        const doc = docMod.scratchAssetDocument(viewer);
         w.__rv412._doc = doc;
         const readField = (nodePath: string, componentType: string, fieldName: string) => {
           const node = viewer.registry?.getNode(nodePath);
@@ -240,6 +245,10 @@ async function installHarness(page: Page): Promise<void> {
 test.describe.configure({ mode: 'serial' });
 
 test.describe('plan-412 §9.7 — mechanism force analysis', () => {
+  // Mechanism authoring is commercial source; without the private sibling repo
+  // there is nothing to drive here.
+  test.skip(!HAS_PRIVATE_SOURCE, 'needs the private sibling repository (asset-editor source)');
+
   let page: Page;
 
   test.beforeAll(async ({ browser }) => {

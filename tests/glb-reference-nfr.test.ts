@@ -47,7 +47,7 @@ import { loadGLB, type LoadResult } from '../src/core/engine/rv-scene-loader';
 import { setAssetReference } from '../src/core/engine/rv-asset-reference';
 import type { ReferenceResolver } from '../src/core/engine/rv-glb-compose';
 
-const REAL_MODEL = '/models/DemoRealvirtualWeb.glb';
+const REAL_MODEL = '/DemoRealvirtualWeb.glb';
 
 /** Distinct `BufferGeometry` instances — the honest proxy for GPU footprint. */
 function distinctGeometries(root: Object3D): number {

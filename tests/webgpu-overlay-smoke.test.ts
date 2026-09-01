@@ -8,6 +8,15 @@ import type { ResolvedSlot } from '../src/core/engine/rv-binding-slot-resolver';
 import { armSignalDrag, cancelSignalDrag, updateSignalDrag } from '../src/core/hmi/signal-drag-store';
 import { DropTargetOverlayController } from '../src/plugins/signal-bind/drop-target-overlay';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.europalletEmpty);
 
 const VIEWER_TEST_TIMEOUT = 60_000;
 const SLOT: ResolvedSlot = {
@@ -21,7 +30,7 @@ afterEach(() => {
   handle = null;
 });
 
-describe('drop target overlay on webgpu renderer', () => {
+describe.skipIf(!DEV_ASSETS)('drop target overlay on webgpu renderer', () => {
   it('builds, renders and disposes on a webgpu-gl viewer', async () => {
     handle = await createTestViewer('webgpu-gl', { plannerSignalLinking: true });
     const viewer = handle.viewer;

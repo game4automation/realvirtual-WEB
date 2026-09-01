@@ -38,6 +38,15 @@ import {
 // and correctly so: there, no mechanism component is constructed at all.
 import '@rv-private/kinematic-mechanism/rv-kinematic-mechanism';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.mechanismFourbar);
 
 const GLB_URL = DEV_GLB.mechanismFourbar;
 
@@ -81,7 +90,7 @@ beforeAll(async () => {
   exportedKeys = collectExtrasKeys(await response.arrayBuffer());
 });
 
-describe('mechanism extras parity', () => {
+describe.skipIf(!DEV_ASSETS)('mechanism extras parity', () => {
   it('finds both mechanism component types in the reference export', () => {
     // Guards the guard: a fixture that silently stopped carrying mechanism
     // extras would make every assertion below vacuously true.

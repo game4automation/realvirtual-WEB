@@ -30,6 +30,7 @@ function snap(
     discoveryLoading: false,
     updateSupported: false,
     updateReason: null,
+    revealSupported: false,
     rag,
   };
 }

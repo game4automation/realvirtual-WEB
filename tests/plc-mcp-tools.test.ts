@@ -61,21 +61,13 @@ function createMockPlc(overrides: Partial<{
 
 function setupPlugin() {
   const plugin = new McpBridgePlugin();
-  // Decorator metadata lives per-prototype, so the tools are spread over five
-  // decorated instances (the plugin plus the four delegate-object tool classes
-  // it owns). Dispatching over the plugin alone would silently lose every
-  // delegated tool. Mirrors mcp-bridge-plugin.ts::_sendDiscover.
-  const delegates = plugin as unknown as {
-    _viewTools: object; _observeTools: object; _editorTools: object; _helpTool: object;
-  };
+  // Decorator metadata lives per-prototype, so the tools are spread over a
+  // dozen decorated instances; dispatching over the plugin alone would silently
+  // lose every delegated tool — the `web_plc_*` family among them since
+  // plan-713 moved it into McpDesPlcTools. `mcpToolInstances` IS the list
+  // `_sendDiscover` uses, so this can no longer be a stale subset of it.
   (plugin as unknown as { _dispatcher: ReturnType<typeof buildMultiDispatcher> })._dispatcher =
-    buildMultiDispatcher([
-      plugin,
-      delegates._viewTools,
-      delegates._observeTools,
-      delegates._editorTools,
-      delegates._helpTool,
-    ]);
+    buildMultiDispatcher(plugin.mcpToolInstances);
 
   const sent: string[] = [];
   const fakeWs = {

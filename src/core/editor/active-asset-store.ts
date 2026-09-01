@@ -189,9 +189,12 @@ export function sceneDocumentBase(documentId: string, name: string): AssetBase {
  * `referencedAsset` to a document would mean a manifest read on a synchronous
  * path.
  *
- * `empty` NEVER matches, not even itself: an untitled document is its own
- * document, and two of them are two (same rule `assetIdOfBase` states by
- * falling back to the instance id). `null` on either side is "nothing to
+ * An UNRECOGNISED kind never matches, not even itself. That case used to be
+ * `empty` — an untitled document was its own document, and two of them were
+ * two — and plan-719 F3 removed the kind but not the rule: a value out of an
+ * older record, or one written by a newer build, still reaches this function,
+ * and answering "these are the same document" about something we cannot
+ * identify is the one wrong answer. `null` on either side is "nothing to
  * compare", which is false rather than an error — callers ask this question
  * about whatever happens to be open, including nothing.
  */
@@ -223,7 +226,12 @@ export function sameDocumentBase(a: AssetBase | null, b: AssetBase | null): bool
         && a.providerId === other.providerId
         && a.sourceId === other.sourceId;
     }
-    case 'empty':
+    // Not exhaustiveness ceremony: without this the switch RETURNS UNDEFINED
+    // for a kind it does not know, and `undefined` is falsy in an `if` but not
+    // equal to `false` — so a caller comparing the result, or a test asserting
+    // it, sees something that is neither answer. A legacy record has to get a
+    // real `false`.
+    default:
       return false;
   }
 }

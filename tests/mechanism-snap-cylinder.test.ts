@@ -28,102 +28,17 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { BufferAttribute, BufferGeometry, Euler, Matrix4, Vector3 } from 'three';
+import { BufferGeometry, Euler, Matrix4, Vector3 } from 'three';
 import {
   chooseSnapCandidate, computeSnapCandidates, snapCandidateLabel,
   type SnapCandidate,
 } from '@rv-private/plugins/asset-editor/mechanism/mechanism-snap';
+// The mesh builders moved to tests/helpers with plan-722: the circle-enumeration
+// suite needs the same mantles, and two copies of a fixture that IS the ground
+// truth is how one suite ends up passing against a drifted reference.
+import { mantle, sphere, toGeometry } from './helpers/mesh-fixtures';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
-
-interface MeshData {
-  positions: number[];
-  indices: number[];
-}
-
-function toGeometry(data: MeshData): BufferGeometry {
-  const geometry = new BufferGeometry();
-  geometry.setAttribute('position', new BufferAttribute(new Float32Array(data.positions), 3));
-  geometry.setIndex(data.indices);
-  return geometry;
-}
-
-/**
- * A mantle (tube) around +Z: `segments` around, `rings` along, radius r(t)
- * interpolating from `radiusBottom` to `radiusTop` (equal ⇒ cylinder, different
- * ⇒ cone). `inward` flips the winding so the normals point AT the axis, which is
- * what a bore's wall looks like on a closed CAD solid.
- *
- * `sweepDeg` < 360 leaves the mantle open — the partial-arc case; `gapDeg`
- * removes one contiguous wedge, which is the "large gap" case.
- */
-function mantle(opts: {
-  radiusBottom: number; radiusTop?: number; height: number;
-  segments?: number; rings?: number; inward?: boolean;
-  sweepDeg?: number; gapDeg?: number;
-  transform?: Matrix4;
-}): BufferGeometry {
-  const segments = opts.segments ?? 64;
-  const rings = opts.rings ?? 4;
-  const radiusTop = opts.radiusTop ?? opts.radiusBottom;
-  const sweep = ((opts.sweepDeg ?? 360) * Math.PI) / 180;
-  const gap = ((opts.gapDeg ?? 0) * Math.PI) / 180;
-
-  const positions: number[] = [];
-  const indices: number[] = [];
-  const point = new Vector3();
-  const index = (ring: number, seg: number): number => ring * (segments + 1) + seg;
-
-  for (let ring = 0; ring <= rings; ring++) {
-    const t = ring / rings;
-    const z = (t - 0.5) * opts.height;
-    const radius = opts.radiusBottom + (radiusTop - opts.radiusBottom) * t;
-    for (let seg = 0; seg <= segments; seg++) {
-      const angle = (seg / segments) * sweep;
-      point.set(Math.cos(angle) * radius, Math.sin(angle) * radius, z);
-      if (opts.transform) point.applyMatrix4(opts.transform);
-      positions.push(point.x, point.y, point.z);
-    }
-  }
-
-  for (let ring = 0; ring < rings; ring++) {
-    for (let seg = 0; seg < segments; seg++) {
-      const angle = (seg / segments) * sweep;
-      // A contiguous wedge of missing quads, starting at 0°.
-      if (gap > 0 && angle < gap) continue;
-      const a = index(ring, seg), b = index(ring, seg + 1);
-      const c = index(ring + 1, seg + 1), d = index(ring + 1, seg);
-      if (opts.inward) indices.push(a, c, b, a, d, c);
-      else indices.push(a, b, c, a, c, d);
-    }
-  }
-  return toGeometry({ positions, indices });
-}
-
-/** A UV sphere — curved in BOTH directions, so no cylinder axis exists. */
-function sphere(radius: number, segments = 32, rings = 16): BufferGeometry {
-  const positions: number[] = [];
-  const indices: number[] = [];
-  for (let r = 0; r <= rings; r++) {
-    const phi = (r / rings) * Math.PI;
-    for (let s = 0; s <= segments; s++) {
-      const theta = (s / segments) * Math.PI * 2;
-      positions.push(
-        radius * Math.sin(phi) * Math.cos(theta),
-        radius * Math.sin(phi) * Math.sin(theta),
-        radius * Math.cos(phi),
-      );
-    }
-  }
-  for (let r = 0; r < rings; r++) {
-    for (let s = 0; s < segments; s++) {
-      const a = r * (segments + 1) + s, b = a + 1;
-      const c = (r + 1) * (segments + 1) + s + 1, d = c - 1;
-      indices.push(a, b, c, a, c, d);
-    }
-  }
-  return toGeometry({ positions, indices });
-}
 
 /** A triangle in the middle of the mantle — a stable seed for the hover. */
 function midFace(geometry: BufferGeometry): number {

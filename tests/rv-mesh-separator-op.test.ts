@@ -15,6 +15,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import {
   BufferAttribute,
   BufferGeometry,
@@ -196,7 +197,7 @@ describe('9.7 undo, redo and replay', () => {
     const { viewer, scene, model, registry, register } = makeMockViewer();
     const source = addMesh(model, 'Box');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const names = await doc.separateMesh('Asset/Box', 'islands');
     expect(names).toEqual(['Box_part0', 'Box_part1']);
@@ -234,7 +235,7 @@ describe('9.7 undo, redo and replay', () => {
       const { viewer, model, registry, register } = makeMockViewer();
       addMesh(model, 'Box');
       register();
-      const doc = AssetDocument.newUntitled(viewer);
+      const doc = scratchAssetDocument(viewer);
       const op: SeparateMeshOp = {
         ...assetOpHeader(), kind: 'separateMesh', sourcePath: 'Asset/Box',
         mode: 'islands', weldThreshold: 0.0001, childNames: ['Box_part0', 'Box_part1'],
@@ -248,7 +249,7 @@ describe('9.7 undo, redo and replay', () => {
       const { viewer, model, registry, register } = makeMockViewer();
       addMesh(model, 'Raw');
       register();
-      const doc = AssetDocument.newUntitled(viewer);
+      const doc = scratchAssetDocument(viewer);
       const rename: RvAssetOp = {
         ...assetOpHeader(), kind: 'renameNode', nodePath: 'Asset/Raw', name: 'Box', prevName: 'Raw',
       };
@@ -282,7 +283,7 @@ describe('9.10 transform preservation', () => {
 
     const worldBefore = source.localToWorld(new Vector3(10, 0, 0)); // a vertex of island B
 
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     await doc.separateMesh('Asset/Holder/Box', 'islands');
 
     const group = registry.getNode('Asset/Holder/Box')!;
@@ -304,7 +305,7 @@ describe('9.10 transform preservation', () => {
     source.matrixWorldAutoUpdate = false;
     const bakedWorld = source.matrixWorld.clone();
 
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     await doc.separateMesh('Asset/Box', 'islands');
 
     const group = registry.getNode('Asset/Box')!;
@@ -332,7 +333,7 @@ describe('9.11 GLB export round-trip', () => {
     register();
     model.updateMatrixWorld(true);
 
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     await doc.separateMesh('Asset/Box', 'islands');
 
     const glb = await exportAssetGlb(model);
@@ -371,7 +372,7 @@ describe('9.12 missing source', () => {
     const { viewer, model, registry, register } = makeMockViewer();
     addMesh(model, 'Box');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const op: SeparateMeshOp = {
       ...assetOpHeader(), kind: 'separateMesh', sourcePath: 'Asset/Gone',
@@ -400,7 +401,7 @@ describe('9.12 missing source', () => {
     const { viewer, model, registry, register } = makeMockViewer();
     addMesh(model, 'Box'); // two islands
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const op: SeparateMeshOp = {
       ...assetOpHeader(), kind: 'separateMesh', sourcePath: 'Asset/Box',
@@ -421,7 +422,7 @@ describe('9.12 missing source', () => {
     const { viewer, model, registry, register } = makeMockViewer();
     addMesh(model, 'Solid', oneIslandGeometry());
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     expect(await doc.separateMesh('Asset/Solid', 'islands')).toEqual([]);
     expect(doc.getSnapshot().opCount).toBe(0);
@@ -463,7 +464,7 @@ describe('9.14 children, userData and components', () => {
     model.updateMatrixWorld(true);
 
     // Components as they exist BEFORE the split.
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const beforeCount = built.length;
 
     await doc.separateMesh('Asset/Box', 'islands');
@@ -502,7 +503,7 @@ describe('9.14 children, userData and components', () => {
     const { viewer, model, registry, register } = makeMockViewer();
     const source = addMesh(model, 'Box');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     await doc.separateMesh('Asset/Box', 'islands');
     await doc.undo();
@@ -528,7 +529,7 @@ describe('9.14 children, userData and components', () => {
     bracket.name = 'Bracket';
     source.add(bracket);
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     await doc.separateMesh('Asset/Box', 'islands');
     const forward = childNames(registry.getNode('Asset/Box')!);
@@ -569,7 +570,7 @@ describe('runtime lifecycle symmetry', () => {
     const source = addMesh(model, 'Box');
     source.userData['realvirtual'] = { EnrollingProbe: {} };
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const tm = viewer.transportManager as unknown as { sensors: unknown[] };
 
     await doc.separateMesh('Asset/Box', 'islands');
@@ -590,7 +591,7 @@ describe('runtime lifecycle symmetry', () => {
     const { viewer, model, registry, register } = makeMockViewer({ runtime: true });
     const source = addMesh(model, 'Box');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     // A drive sitting on the source mesh, as the loader would have left it.
     (viewer.drives as unknown[]).push({ node: source });
 
@@ -619,7 +620,7 @@ describe('runtime lifecycle symmetry', () => {
       addSubtree: () => { calls.push('add'); return 1; },
     };
 
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     await doc.separateMesh('Asset/Box', 'islands');
     expect(calls).toEqual(['remove', 'add']);
 
@@ -653,7 +654,7 @@ describe('group mode via the op', () => {
     model.add(mesh);
     register();
 
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     const names = await doc.separateMesh('Asset/Plate', 'groups');
     expect(names).toEqual(['Plate_part0', 'Plate_part1']);
 
@@ -692,7 +693,7 @@ describe('9.15 BVH abort', () => {
     const { viewer, model, bvhCalls, register } = makeMockViewer();
     addMesh(model, 'Box');
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     await doc.separateMesh('Asset/Box', 'islands');
     const call = bvhCalls.at(-1)!;
@@ -718,7 +719,7 @@ describe('9.16 name stability on replay', () => {
     squatter.name = 'Box_part0'; // an existing child claims the recorded name
     source.add(squatter);
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const op: SeparateMeshOp = {
       ...assetOpHeader(), kind: 'separateMesh', sourcePath: 'Asset/Box',
@@ -747,7 +748,7 @@ describe('9.16 name stability on replay', () => {
     squatter.name = 'Box_part0';
     source.add(squatter);
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     // Live creation sidesteps the collision by claiming a free name ONCE …
     const names = await doc.separateMesh('Asset/Box', 'islands');

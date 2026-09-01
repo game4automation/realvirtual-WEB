@@ -496,7 +496,7 @@ describe('plan-716 Phase 1 — boot with no project (My Workspace)', () => {
   function bundled(): BundledBackend {
     return new BundledBackend({
       models: [{ url: DEMO_URL, label: 'Demo' }],
-      publishedScenes: [],
+      // `publishedScenes` is gone with the synthetic manifest (plan-735 3b).
       fetchImpl: (async () => (
         { ok: false, status: 404, json: async () => null } as unknown as Response
       )) as typeof fetch,
@@ -558,17 +558,30 @@ describe('plan-716 Phase 1 — boot with no project (My Workspace)', () => {
     expect(listMetas()).toEqual([]);
   });
 
-  it('boot_ExplicitDemo_StillResolvesTheBundledSampleProject', async () => {
+  it('boot_ExplicitDeployProject_StillResolvesAsBundled', async () => {
     // F2's second half, and the reason the old pin above could be flipped
-    // safely: the bundled demo did not go away, it stopped being the default.
+    // safely: the bundled tier did not go away, it stopped being the default.
+    //
+    // RE-SOURCED by plan-735. It used to point `bundled()` — a 404 deploy root —
+    // at this and expect `prj_sample`, which was the SYNTHETIC manifest the
+    // backend invented for a deploy that published nothing. There is no such
+    // manifest now, so the fixture publishes one, which is what every real
+    // channel does.
     const ps = new ProjectStore();
+    const manifest = { schemaVersion: 2, id: 'prj_deploy', name: 'Deploy', documents: [] };
     const resolved = await ps.resolveActiveProject({
       workspaceDefault: false,
-      bundledBackend: bundled(),
+      bundledBackend: new BundledBackend({
+        fetchImpl: (async (input: RequestInfo | URL) => (
+          String(input).endsWith('project.json')
+            ? { ok: true, status: 200, json: async () => manifest } as unknown as Response
+            : { ok: false, status: 404, json: async () => null } as unknown as Response
+        )) as typeof fetch,
+      }),
     });
 
     expect(resolved.kind).toBe('bundled');
-    expect(resolved.project?.id).toBe(SAMPLE_PROJECT_ID);
+    expect(resolved.project?.id).toBe('prj_deploy');
     await ps.closeProject();
   });
 

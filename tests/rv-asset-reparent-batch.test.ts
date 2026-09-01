@@ -12,6 +12,7 @@
  * unchanged world poses, and name collisions resolved before anything moves.
  */
 import { describe, it, expect, vi } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D, Euler, Matrix4 } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -84,7 +85,7 @@ describe('reparentNodesBatch — one op, one undo step', () => {
     model.add(target);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const paths = parts.map((p) => NodeRegistry.computeNodePath(p));
     const moved = await doc.reparentNodesBatch(paths, 'Asset/Link');
@@ -109,7 +110,7 @@ describe('reparentNodesBatch — one op, one undo step', () => {
     const target = new Group(); target.name = 'Link'; model.add(target);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     // Move three of five out of one parent — the case where a naive up-front
     // `prevIndex` snapshot puts them back in the wrong order.
@@ -132,7 +133,7 @@ describe('reparentNodesBatch — one op, one undo step', () => {
     model.add(target);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const before = parts.map((p) => p.matrixWorld.clone());
     const paths = parts.map((p) => NodeRegistry.computeNodePath(p));
@@ -166,7 +167,7 @@ describe('reparentNodesBatch — one op, one undo step', () => {
     target.add(squatter);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     const paths = parts.map((p) => NodeRegistry.computeNodePath(p));
     const moved = await doc.reparentNodesBatch(paths, 'Asset/Link');
@@ -194,7 +195,7 @@ describe('reparentNodesBatch — one op, one undo step', () => {
     const target = new Group(); target.name = 'Link'; model.add(target);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     // Inner is listed FIRST — input order must not decide who survives.
     const moved = await doc.reparentNodesBatch(
@@ -211,7 +212,7 @@ describe('reparentNodesBatch — one op, one undo step', () => {
     const a = new Group(); a.name = 'A'; model.add(a);
     const innerA = new Group(); innerA.name = 'Inner'; a.add(innerA);
     register();
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     expect(await doc.reparentNodesBatch(['Asset/A'], 'Asset/A/Inner')).toEqual([]);
     expect(await doc.reparentNodesBatch(['Asset/A/Inner'], 'Asset/A')).toEqual([]);
@@ -228,7 +229,7 @@ describe('reparentNodesBatch — cost per top-level op', () => {
     const target = new Group(); target.name = 'Link'; model.add(target);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     events.length = 0;
     await doc.reparentNodesBatch(parts.map((p) => NodeRegistry.computeNodePath(p)), 'Asset/Link');
@@ -248,7 +249,7 @@ describe('reparentNodesBatch — cost per top-level op', () => {
     const target = new Group(); target.name = 'Link'; model.add(target);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     events.length = 0;
     await doc.reparentNodesBatch(parts.map((p) => NodeRegistry.computeNodePath(p)), 'Asset/Link');
@@ -264,7 +265,7 @@ describe('reparentNodesBatch — cost per top-level op', () => {
     const target = new Group(); target.name = 'Link'; model.add(target);
     register();
     model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
 
     events.length = 0;
     await doc.reparentNodes(parts.map((p) => NodeRegistry.computeNodePath(p)), 'Asset/Link');
@@ -282,7 +283,7 @@ describe('reparentNodesBatch — draft replay', () => {
     const target = new Group(); target.name = 'Link'; first.model.add(target);
     first.register();
     first.model.updateMatrixWorld(true);
-    const doc = AssetDocument.newUntitled(first.viewer);
+    const doc = scratchAssetDocument(first.viewer);
     await doc.reparentNodesBatch(
       parts.map((p) => NodeRegistry.computeNodePath(p)), 'Asset/Link',
     );
@@ -295,7 +296,7 @@ describe('reparentNodesBatch — draft replay', () => {
     const target2 = new Group(); target2.name = 'Link'; second.model.add(target2);
     second.register();
     second.model.updateMatrixWorld(true);
-    const replayed = AssetDocument.newUntitled(second.viewer);
+    const replayed = scratchAssetDocument(second.viewer);
     await replayed.replayOps(ops);
 
     expect(target2.children).toHaveLength(30);

@@ -24,6 +24,44 @@ import {
   type PlacedComponent,
 } from './rv-layout-store';
 import type { LayoutPlannerCloudStore } from './cloud-types';
+import {
+  listLibrarySources,
+  type RegisteredLibrarySource,
+} from '../../core/library/library-source-registry';
+
+/**
+ * Prefix of a project-document catalog id (`project:<path>`, minted by
+ * `project-library-provider.ts`) — and therefore of a placement made from one.
+ */
+export const PROJECT_PLACEMENT_PREFIX = 'project:';
+
+/**
+ * Which registered library source owns `assetId` — the origin lookup the whole
+ * plan-723 placement pipeline runs on.
+ *
+ * It is a SEARCH rather than a parameter threaded through every signature
+ * because the planner's real drag channel is an in-memory entry reference
+ * (`setDragEntry`), which carries no provenance. The pattern is lifted verbatim
+ * from `rv-glb-reference-resolver.resolveThroughLibrary`: iterate the sources,
+ * ask each one for the id, take the first that answers.
+ *
+ * Never throws — one broken provider must not take the lookup with it.
+ */
+export function findRegistryOrigin(assetId: string): RegisteredLibrarySource | null {
+  if (!assetId) return null;
+  let sources: RegisteredLibrarySource[];
+  try {
+    sources = listLibrarySources();
+  } catch {
+    return null;
+  }
+  for (const registered of sources) {
+    try {
+      if (registered.source.getEntry(assetId) !== null) return registered;
+    } catch { /* a source that throws on lookup simply does not own the id */ }
+  }
+  return null;
+}
 
 /** Find a catalog entry by its stable id across all loaded catalogs. */
 export function findCatalogEntryById(
@@ -76,11 +114,57 @@ function rebaseLocalLibraryUrl(url: string): string | null {
   return (base.endsWith('/') ? base : base + '/') + m[1];
 }
 
+/**
+ * Liveness probe for a `project:` placement (plan-723 F5).
+ *
+ * A project document has NO stable URL: `resolveAsset` mints a fresh `blob:`
+ * handle each time, and the planner loads the geometry under the asset's
+ * STABLE cache key instead (`ModelCache.getOrLoadResolved`). So the restore
+ * path does not need a URL from here — it needs an answer to "is this document
+ * still readable in the active project?", because that is what its
+ * warn-and-skip guard turns on.
+ *
+ * The answer is therefore the placement's own `catalogId`: a stable,
+ * self-describing marker that is deliberately NOT a fetchable URL, so nothing
+ * downstream can mistake it for one (`_buildPlacementFromRecord` branches on
+ * the `project:` prefix before it ever looks at the url, and the restore loop
+ * skips `updateGlbUrl` for these placements). The handle the probe minted is
+ * released right here — a probe must not leak a blob URL.
+ *
+ * NEVER throws: the first restore loop (`index.ts` `_restorePlacements`) has no
+ * try/catch around this call, so a rejection here would abort the whole restore
+ * and silently drop every later placement.
+ */
+async function probeProjectPlacement(comp: PlacedComponent): Promise<string | null> {
+  const origin = findRegistryOrigin(comp.catalogId);
+  if (!origin) {
+    console.warn(
+      `[LayoutPlanner] Project asset "${comp.label}" (${comp.catalogId}) is not in the ` +
+      'active project — open the project it was placed from to recover.',
+    );
+    return null;
+  }
+  try {
+    const resolved = await origin.source.resolveAsset(comp.catalogId, 'place');
+    resolved.revokeUrl?.();
+    return comp.catalogId;
+  } catch (e) {
+    console.warn(`[LayoutPlanner] Project asset ${comp.catalogId} could not be read:`, e);
+    return null;
+  }
+}
+
 export async function resolvePlacementUrl(
   store: LayoutStore,
   cloudStore: LayoutPlannerCloudStore | null,
   comp: PlacedComponent,
 ): Promise<string | null> {
+  // Project documents come first: they carry `glbUrl: ''` and are re-resolved
+  // through the library registry, never through a saved URL (plan-723 F5).
+  if (comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) {
+    return probeProjectPlacement(comp);
+  }
+
   // Splat placements: resolve splatUrl instead of glbUrl
   if (comp.splatUrl) {
     if (!comp.splatUrl.startsWith('blob:')) return comp.splatUrl;
@@ -171,6 +255,14 @@ export async function refreshCloudGlbUrl(
   onProgress?: (msg: string) => void,
 ): Promise<string | null> {
   let glbUrl = comp.glbUrl;
+
+  // Project documents: same story as in `resolvePlacementUrl` — the saved
+  // `glbUrl` is empty (or a dead handle), the identity is the `catalogId`, and
+  // the geometry is loaded under the stable cache key. Return the marker so the
+  // legacy autosave loop keeps going; `_buildPlacementFromRecord` ignores it.
+  if (comp.catalogId.startsWith(PROJECT_PLACEMENT_PREFIX)) {
+    return probeProjectPlacement(comp);
+  }
 
   // Local-folder placements: the saved blob URL is stale after a page
   // reload. A local-folder scan re-mounted the working folder at boot

@@ -35,7 +35,10 @@ describe('CONNECT embedded boot gate', () => {
 
     const loaderBody = mainSource.slice(mainSource.indexOf('async function loadModel'), mainSource.indexOf('// Expose loadModel'));
     expect(loaderBody).toContain('if (!connectEmbedEnabled)');
-    expect(loaderBody).toContain('localStorage.setItem(LS_KEY_MODEL, url)');
-    expect(loaderBody).toContain('sceneStore.markGlbActive(url, label)');
+    // The resume keys are written from the model IDENTITY, not the byte source:
+    // `identityUrl` differs from `url` only on the stored-body resume path,
+    // where `url` is a throwaway `blob:` UUID (see main.ts loadModel).
+    expect(loaderBody).toContain('localStorage.setItem(LS_KEY_MODEL, identityUrl)');
+    expect(loaderBody).toContain('sceneStore.markGlbActive(identityUrl, label)');
   });
 });

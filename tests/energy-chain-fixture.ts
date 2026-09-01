@@ -4,7 +4,7 @@
 /**
  * Shared synthetic fixture for the plan-362 EnergyChain integration tests.
  *
- * There is no energy chain in any GLB in this repo (`public/models/tests.glb`
+ * There is no energy chain in any GLB in this repo (`../realvirtual-WebViewer-Private~/projects/Development/fixtures/tests.glb`
  * has no such node, and the Festo files are an AAS document and a catalogue
  * part), so every V1 test builds its scene programmatically — the same approach
  * `tests/rv-lamp-lifecycle.test.ts` and `tests/rv-asset-glb-export.test.ts` use.

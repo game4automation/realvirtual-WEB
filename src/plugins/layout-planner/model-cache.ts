@@ -24,107 +24,13 @@ import type { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { disposeSubtree } from './three-utils';
 import { RVAssetBlobCache } from '../../core/engine/rv-asset-blob-cache';
 import { unwrapGltfRoot } from '../../core/engine/rv-gltf-unwrap';
+// Pivot normalization moved to the core (2026-08-31): composition needs the
+// identical definition when it re-grafts a saved placement's content, and the
+// engine must not import a plugin. Re-exported here so every existing planner
+// call site keeps working unchanged.
+import { pivotToFloorCenter } from '../../core/engine/rv-placement-pivot';
 
-export { unwrapGltfRoot };
-
-// ─── Pivot to Floor ─────────────────────────────────────────────────────
-
-const _pivotBox = new Box3();
-const _pivotCenter = new Vector3();
-const _pivotWorld = new Vector3();
-const _pivotOrigPos = new Vector3();
-
-/** Marker component name written by the Unity WebPivot MonoBehaviour into
- *  rv_extras. Presence of this key on any descendant signals an explicit,
- *  hand-authored pivot point that overrides the auto AABB pivot. */
-const WEB_PIVOT_KEY = 'WebPivot';
-
-/**
- * Find the first descendant whose rv_extras carries a WebPivot marker.
- * Walks the subtree depth-first and stops at the first match — multiple
- * markers per library object are not supported and the first wins.
- */
-function findWebPivotMarker(root: Object3D): Object3D | null {
-  let found: Object3D | null = null;
-  root.traverse((node) => {
-    if (found) return;
-    const rv = (node.userData as { realvirtual?: Record<string, unknown> } | undefined)?.realvirtual;
-    if (rv && rv[WEB_PIVOT_KEY]) found = node;
-  });
-  return found;
-}
-
-/**
- * Recalculate pivot so the local origin lands at either:
- *   1. an explicit Unity-authored WebPivot marker child (if present), or
- *   2. the bottom-center of the model's full axis-aligned bounding box.
- *
- * WebPivot path: the marker's world position is taken as the new origin —
- * both XZ and Y come from the marker. Use this when a library object needs
- * its rotation/snap origin somewhere other than the AABB floor-center
- * (e.g. a robot mounted on a wall, a fixture with an off-center base).
- *
- * AABB path: XZ = AABB centroid, Y = AABB.min.y. Predictable and explicit;
- * asymmetric models (robot with long arm overhang, L-shaped fixture) get a
- * pivot at the AABB centroid above the floor — that's the documented
- * fallback. Callers that need a contact-footprint pivot should provide a
- * WebPivot marker instead.
- *
- * In both cases every direct child of `obj` is shifted by the negative
- * offset so the visual position of the geometry is unchanged.
- */
-export function pivotToFloorCenter(obj: Group): void {
-  // We compute everything in obj's LOCAL space so the offsets we add to
-  // child.position (which are local-space values) line up with the AABB
-  // that Three.js' setFromObject reports (which is world-space). To bridge
-  // the two, temporarily neutralize obj's own transform — then world-space
-  // coordinates _are_ obj's local-space coordinates. Without this step,
-  // any non-zero obj.position would offset the gizmo from the mesh by
-  // exactly obj.position (Unity-authored library objects whose root sat at
-  // a non-origin position are the typical trigger).
-  _pivotOrigPos.copy(obj.position);
-  const origRotX = obj.rotation.x;
-  const origRotY = obj.rotation.y;
-  const origRotZ = obj.rotation.z;
-  obj.position.set(0, 0, 0);
-  obj.rotation.set(0, 0, 0);
-  obj.updateMatrixWorld(true);
-
-  const marker = findWebPivotMarker(obj);
-  let offsetX: number;
-  let offsetY: number;
-  let offsetZ: number;
-
-  if (marker) {
-    // WebPivot wins. With obj reset to identity, the marker's world position
-    // _is_ its position in obj's local space — which is exactly the value
-    // we need to subtract from every direct child.
-    marker.getWorldPosition(_pivotWorld);
-    offsetX = -_pivotWorld.x;
-    offsetY = -_pivotWorld.y;
-    offsetZ = -_pivotWorld.z;
-  } else {
-    _pivotBox.setFromObject(obj);
-    if (_pivotBox.isEmpty()) {
-      obj.position.copy(_pivotOrigPos);
-      obj.rotation.set(origRotX, origRotY, origRotZ);
-      return;
-    }
-    _pivotBox.getCenter(_pivotCenter);
-    offsetX = -_pivotCenter.x;
-    offsetZ = -_pivotCenter.z;
-    offsetY = -_pivotBox.min.y;
-  }
-
-  for (const child of obj.children) {
-    child.position.x += offsetX;
-    child.position.y += offsetY;
-    child.position.z += offsetZ;
-  }
-
-  obj.position.copy(_pivotOrigPos);
-  obj.rotation.set(origRotX, origRotY, origRotZ);
-}
+export { unwrapGltfRoot, pivotToFloorCenter };
 
 // ─── Align to Floor ─────────────────────────────────────────────────────
 
@@ -402,14 +308,77 @@ function detachOnAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Pr
   });
 }
 
+/**
+ * How a decode gets at the bytes it needs (plan-723 §2.3).
+ *
+ * The cache KEY and the URL the loader reads are two different things. For a
+ * plain catalog GLB they happen to be the same string; for a library-registry
+ * asset they cannot be, because `LibrarySource.resolveAsset()` mints a FRESH
+ * `blob:` URL on every call. Keying the caches on that URL would mean never
+ * hitting the cache again (a silent performance defect, not a crash), and the
+ * URL carries a `revokeUrl` that somebody has to call.
+ *
+ * So the state machine keys on an explicit `cacheKey` and asks this callback
+ * for the transport when — and only when — it actually has to decode. A cache
+ * or in-flight hit never calls it, which is the whole point: a second placement
+ * of the same project document must not re-read the backend.
+ *
+ * `release` is invoked in the success, error AND abort paths — see
+ * {@link ModelCache._decode}.
+ *
+ * The return type is deliberately `T | Promise<T>` and not just `Promise<T>`:
+ * the URL path has nothing to await, and awaiting it anyway would push
+ * `loadAsync` out of the caller's own tick — which the in-flight dedup tests
+ * (plan-371 T17) observe directly, and which nothing about this feature should
+ * change.
+ */
+export interface AcquiredAsset { url: string; release?: () => void }
+export type AcquireFn = () => AcquiredAsset | Promise<AcquiredAsset>;
+
+function isThenable<T>(value: T | Promise<T>): value is Promise<T> {
+  return typeof (value as Promise<T> | undefined)?.then === 'function';
+}
+
+/** Namespace prefix of a registry-resolved cache key — see {@link resolvedCacheKey}. */
+export const RESOLVED_KEY_PREFIX = 'resolved:';
+
+/**
+ * The stable cache key of a library-registry asset (plan-723 §2.3).
+ *
+ * Namespaced so it can never collide with the URL-keyed half of the same maps:
+ * a catalog entry is keyed by its `glbUrl`, and no URL starts with `resolved:`.
+ */
+export function resolvedCacheKey(providerId: string, sourceId: string, entryId: string): string {
+  return `${RESOLVED_KEY_PREFIX}${providerId}:${sourceId}:${entryId}`;
+}
+
+/** The URL path's acquire: the key IS the transport, and there is nothing to
+ *  release — so it answers synchronously and the decode stays in one tick. */
+function acquireUrl(url: string): AcquireFn {
+  return () => ({ url });
+}
+
+/** The registry path's acquire: forward `revokeUrl` as the release obligation. */
+function acquireResolved(resolve: () => Promise<{ url: string; revokeUrl?(): void }>): AcquireFn {
+  return async () => {
+    const resolved = await resolve();
+    return {
+      url: resolved.url,
+      // Bound here, not passed as a bare method reference: `revokeUrl` closes
+      // over the provider's own handle and must keep its receiver.
+      release: resolved.revokeUrl ? () => resolved.revokeUrl!() : undefined,
+    };
+  };
+}
+
 export class ModelCache {
   /** Decoded Three.js Group cache — clones are returned to callers. */
   private _decoded = new Map<string, Group>();
   /**
-   * In-flight DECODES, keyed by url (plan-371 §2.10).
+   * In-flight DECODES, keyed by CACHE KEY (plan-371 §2.10, plan-723 §2.3).
    *
    * `_decoded` only ever holds finished results, so without this map two
-   * overlapping `getOrLoad` calls for the same url decode the same GLB twice —
+   * overlapping `getOrLoad` calls for the same key decode the same GLB twice —
    * exactly the situation the hover prefetch creates (prefetch still running,
    * drag starts). Three rules keep the map from introducing bugs of its own;
    * they are spelled out at their enforcement sites in {@link _shared} and
@@ -417,7 +386,7 @@ export class ModelCache {
    */
   private _inflight = new Map<string, Promise<Group>>();
   /**
-   * Invalidation counter per url. A decode records the epoch it started under
+   * Invalidation counter per cache key. A decode records the epoch it started under
    * and refuses to publish into `_decoded` if `invalidate()` has bumped it
    * meanwhile — dropping the promise from `_inflight` alone is NOT enough,
    * because the abandoned decode still runs to completion and would otherwise
@@ -447,7 +416,37 @@ export class ModelCache {
     const cached = this._decoded.get(url);
     if (cached) return cached.clone();
 
-    const source = await detachOnAbort(this._shared(url), signal);
+    const source = await detachOnAbort(this._shared(url, acquireUrl(url)), signal);
+    return source.clone();
+  }
+
+  /**
+   * Get a clone of a model that has no stable URL — a library-registry asset
+   * (plan-723 F4).
+   *
+   * `cacheKey` is the asset's stable identity ({@link resolvedCacheKey}); the
+   * volatile `blob:` URL never reaches the caches and never reaches the caller.
+   * `resolve` is called ONLY on a genuine miss, and its `revokeUrl` is called
+   * for us in the success, error and abort paths.
+   *
+   * Two failure shapes, deliberately different:
+   *  - `resolve()` itself throws → there IS no handle, so nothing is revoked
+   *    (`revokeUrl` only exists after a successful return).
+   *  - the load fails after a successful resolve → the handle is released in
+   *    the `finally` like any other outcome.
+   */
+  async getOrLoadResolved(
+    cacheKey: string,
+    resolve: () => Promise<{ url: string; revokeUrl?(): void }>,
+    opts?: { signal?: AbortSignal },
+  ): Promise<Group> {
+    const signal = opts?.signal;
+    throwIfAborted(signal);
+
+    const cached = this._decoded.get(cacheKey);
+    if (cached) return cached.clone();
+
+    const source = await detachOnAbort(this._shared(cacheKey, acquireResolved(resolve)), signal);
     return source.clone();
   }
 
@@ -465,11 +464,19 @@ export class ModelCache {
   prefetch(url: string): void {
     if (!url) return;
     if (this._decoded.has(url)) return;
-    this._shared(url).catch(() => { /* speculative — the real load reports */ });
+    this._shared(url, acquireUrl(url)).catch(() => { /* speculative — the real load reports */ });
+  }
+
+  /** {@link prefetch} for a registry asset — the mirror of {@link getOrLoadResolved}. */
+  prefetchResolved(cacheKey: string, resolve: () => Promise<{ url: string; revokeUrl?(): void }>): void {
+    if (!cacheKey) return;
+    if (this._decoded.has(cacheKey)) return;
+    this._shared(cacheKey, acquireResolved(resolve))
+      .catch(() => { /* speculative — the real load reports */ });
   }
 
   /**
-   * The ONE in-flight decode promise for `url`, created on first ask.
+   * The ONE in-flight decode promise for `cacheKey`, created on first ask.
    *
    * RULE 1 — cleanup in every case. Without the settle handler a REJECTED
    * promise would stay in the map forever, and every later caller (including
@@ -483,33 +490,45 @@ export class ModelCache {
    * the shared work would tear down an unrelated second placement of the same
    * asset (the same bug class as H5, one layer higher).
    */
-  private _shared(url: string): Promise<Group> {
-    const existing = this._inflight.get(url);
+  private _shared(cacheKey: string, acquire: AcquireFn): Promise<Group> {
+    const existing = this._inflight.get(cacheKey);
     if (existing) return existing;
 
-    const decode = this._decode(url);
-    this._inflight.set(url, decode);
+    const decode = this._decode(cacheKey, acquire);
+    this._inflight.set(cacheKey, decode);
     // `then(settle, settle)` rather than `finally`: it consumes the rejection
     // instead of re-raising it on a derived promise nobody awaits.
     const settle = (): void => {
-      if (this._inflight.get(url) === decode) this._inflight.delete(url);
+      if (this._inflight.get(cacheKey) === decode) this._inflight.delete(cacheKey);
     };
     decode.then(settle, settle);
     return decode;
   }
 
-  /** Fetch + decode + normalize one GLB into the decoded cache. */
-  private async _decode(url: string): Promise<Group> {
-    const epoch = this._epoch.get(url) ?? 0;
+  /**
+   * Fetch + decode + normalize one GLB into the decoded cache, under
+   * `cacheKey` — which for the URL path IS the url, and for the registry path
+   * is the asset's stable identity (plan-723 §2.3).
+   */
+  private async _decode(cacheKey: string, acquire: AcquireFn): Promise<Group> {
+    const epoch = this._epoch.get(cacheKey) ?? 0;
+
+    // A throwing `acquire()` leaves NO handle behind — there is nothing to
+    // release, and `revokeUrl` does not exist until a resolve returned.
+    // Awaited only when it actually has something to await (see `AcquireFn`).
+    const acquired = acquire();
+    const handle = isThenable(acquired) ? await acquired : acquired;
+    const url = handle.url;
 
     // Resolve bytes via the generic blob cache (in-memory + Cache API).
     // For blob: URLs the cache pass-throughs so the GLTFLoader can read
     // them directly without an extra fetch hop.
-    const loadUrl = url.startsWith('blob:')
-      ? url
-      : await _glbBlobCache.getObjectUrl(url);
-
+    let loadUrl: string | null = null;
     try {
+      loadUrl = url.startsWith('blob:')
+        ? url
+        : await _glbBlobCache.getObjectUrl(url);
+
       const gltf = await this._loader.loadAsync(loadUrl);
       let source = gltf.scene as Group;
       // Strip UnityGLTF __root__ wrapper and non-content nodes
@@ -518,10 +537,16 @@ export class ModelCache {
       // Publish only if this decode has not been invalidated while it ran. The
       // caller still gets its result — it asked before the invalidate — but the
       // CACHE must not be repopulated with a superseded tree.
-      if ((this._epoch.get(url) ?? 0) === epoch) this._decoded.set(url, source);
+      if ((this._epoch.get(cacheKey) ?? 0) === epoch) this._decoded.set(cacheKey, source);
       return source;
     } finally {
-      if (loadUrl !== url) URL.revokeObjectURL(loadUrl);
+      // Passthrough rule, unchanged: only an object URL WE minted gets revoked
+      // here. A blob: url handed in from outside is the acquire's property...
+      if (loadUrl !== null && loadUrl !== url) URL.revokeObjectURL(loadUrl);
+      // ...and is released through ITS own obligation, in every outcome —
+      // success, failure and (because `detachOnAbort` never cancels the shared
+      // work) abort.
+      handle.release?.();
     }
   }
 
@@ -537,19 +562,22 @@ export class ModelCache {
   /**
    * Drop ONE decoded entry (dispose its geometry) — the editor-save
    * invalidation hook: a re-saved library asset must not be served from the
-   * pre-save decoded tree. No-op on unknown URLs.
+   * pre-save decoded tree. No-op on unknown keys.
+   *
+   * Takes a CACHE KEY: a plain url for a catalog GLB, a
+   * {@link resolvedCacheKey} for a registry asset (plan-723 F10).
    */
-  invalidate(url: string): void {
+  invalidate(cacheKey: string): void {
     // RULE 3 (plan-371 §2.10) — TWO steps, and the second is the load-bearing
     // one. Dropping the promise makes the next ask start a fresh decode; bumping
     // the epoch stops the abandoned decode (which keeps running regardless)
     // from publishing the pre-save tree back into `_decoded` when it lands.
-    this._inflight.delete(url);
-    this._epoch.set(url, (this._epoch.get(url) ?? 0) + 1);
-    const entry = this._decoded.get(url);
+    this._inflight.delete(cacheKey);
+    this._epoch.set(cacheKey, (this._epoch.get(cacheKey) ?? 0) + 1);
+    const entry = this._decoded.get(cacheKey);
     if (!entry) return;
     disposeSubtree(entry);
-    this._decoded.delete(url);
+    this._decoded.delete(cacheKey);
   }
 
   /** Clear the persistent browser cache for all planner GLBs. */

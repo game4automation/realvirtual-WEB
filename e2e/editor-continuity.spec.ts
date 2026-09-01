@@ -46,14 +46,22 @@
 
 import { test, expect, type Page } from 'playwright/test';
 
-/** Dynamically imported in-page (kept in variables so TS does not resolve them). */
+import { HAS_PRIVATE_SOURCE, privateModuleUrl } from './private-module-url';
+
+/**
+ * Dynamically imported in-page (kept in variables so TS does not resolve them).
+ *
+ * The asset-editor modules live in the PRIVATE sibling repository, outside the
+ * dev-server root, so they are addressed through `/@fs/<abs>` — see
+ * `e2e/private-module-url.ts`. The rest is served from this repository's `src/`.
+ */
 const MODULE_PATHS = {
   doc: '/src/core/editor/rv-asset-document.ts',
-  pendingOpen: '/src/plugins/asset-editor/pending-open-store.ts',
-  resolver: '/src/plugins/asset-editor/selection-asset-resolver.ts',
-  testSession: '/src/plugins/asset-editor/test-session-store.ts',
+  pendingOpen: privateModuleUrl('plugins/asset-editor/pending-open-store.ts'),
+  resolver: privateModuleUrl('plugins/asset-editor/selection-asset-resolver.ts'),
+  testSession: privateModuleUrl('plugins/asset-editor/test-session-store.ts'),
   transition: '/src/core/hmi/scene-transition-store.ts',
-  lastEdited: '/src/plugins/asset-editor/last-edited-asset-store.ts',
+  lastEdited: privateModuleUrl('plugins/asset-editor/last-edited-asset-store.ts'),
 };
 
 /** Install the in-page harness as `window.__rv410`. Test-only scaffolding. */
@@ -313,6 +321,10 @@ test.describe('editor continuity (plan-410)', () => {
   // Each row boots its own page and asserts an independent property, so a
   // failure in one must not skip the rest (which `serial` would do).
   test.describe.configure({ mode: 'default' });
+
+  // The asset editor is commercial source. Without the private sibling repo
+  // there is nothing to drive here, so skip rather than 404 on every import.
+  test.skip(!HAS_PRIVATE_SOURCE, 'needs the private sibling repository (asset-editor source)');
 
   test('F1 — a selection resolves to its asset before the old mode clears it', async ({ page }) => {
     test.setTimeout(120_000);

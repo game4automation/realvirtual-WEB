@@ -13,6 +13,8 @@ realvirtual WEB is an open-source, browser-based 3D HMI and digital twin viewer 
 
 **One link. Any device. Live Digital Twin.** Try it: [web.realvirtual.io/demo](https://web.realvirtual.io/demo)
 
+This repository is the **community edition** — the full viewer and HMI runtime under AGPL. Authoring features such as the browser-based Asset & Kinematics Editor and CAD import (STEP, JT, …) are commercial extensions — but you can try all of them in the [public demo](https://web.realvirtual.io/demo): see [Community Edition vs. Commercial](#community-edition-vs-commercial).
+
 > Part of the [realvirtual.io](https://realvirtual.io) industrial digital twin platform — a [Unity Verified Solution](https://unity.com/partners/realvirtual) for virtual commissioning, 3D HMI, and simulation.
 
 ## What It Does
@@ -33,6 +35,33 @@ realvirtual WEB replaces traditional desktop HMI and SCADA visualization with a 
 - **Multiuser Sessions** *(Beta)* — Real-time collaboration with avatars, shared camera views, role management, and late-join state sync.
 - **Plugin Architecture** — Extend with custom plugins for project-specific HMI, KPI dashboards, maintenance workflows, and industrial interfaces.
 - **AI-Ready (MCP)** — Built-in [Model Context Protocol](https://modelcontextprotocol.io) bridge lets AI assistants like Claude inspect, control, and debug a running realvirtual WEB instance — read drive states, set signals, query scene hierarchy, and automate testing through natural language. Uses the [realvirtual MCP Server](https://github.com/game4automation/realvirtual-MCP).
+
+## Community Edition vs. Commercial
+
+This repository is the **community edition** of realvirtual WEB. It contains the complete viewer and HMI runtime under AGPL-3.0 and builds and runs entirely on its own — the commercial extension modules resolve to no-op stubs (`src/private-stubs/`), so the corresponding features are simply absent from a public build.
+
+**Included in this repository (AGPL):** the full 3D viewer and HMI runtime — GLB loading with `rv_extras` parsing, the transport simulation engine (drives, sensors, sources/sinks, grippers, LogicSteps), signal store with WebSocket / MQTT / ctrlX / REST interfaces, drag & drop signal linking, collision detection, machine information system, layout planner *(Beta)*, multiuser sessions *(Beta)*, WebXR, the plugin system, and the MCP bridge.
+
+**Commercial extensions (not part of this repository):**
+
+| Feature | Description |
+|---|---|
+| **Asset & Kinematics Editor** | Browser-based authoring workspace: rename and group parts, assign materials, create kinematic axes and drives, author mechanisms, and save the result back into the GLB. The community edition can *load and run* such models, but not author them. |
+| **CAD Import** | STEP, JT, USD, FBX, and Onshape import with local in-browser conversion (WASM) — CAD geometry never leaves your machine. |
+| **Robot IK Solver** | Interactive inverse kinematics for robot models. |
+| **Kinematic Mechanisms** | Closed-loop mechanism solver (cranks, couplers, parallel kinematics). |
+| **Machining Simulation** | CSG-based material removal. |
+| **DES Simulation Kernel** | The discrete-event simulation engine behind the DES workspace mode. |
+| **Physics & Smooth Motion** | Physics-based behavior and motion smoothing/interpolation. |
+
+**Try the commercial features live — no license, no installation:** the public demo at [web.realvirtual.io/demo](https://web.realvirtual.io/demo) runs the **full commercial feature set**. Open the Asset & Kinematics Editor, import your own STEP or JT files (conversion runs locally in your browser — geometry is never uploaded), run DES material-flow analyses, and try the IK solver, machining, and physics directly in the browser. The free-tier evaluation limits apply: CAD import up to **25 MB per STEP file** and **12 MB per JT file**, and live PLC connectivity through the free realvirtual CONNECT tier serves up to **20 signals** — a commercial license lifts these limits.
+
+Two related commercial products complete the platform and are separate from this repository:
+
+- **[realvirtual.io Professional (Unity)](https://realvirtual.io)** — the engineering platform that authors and exports `rv_extras`-enriched GLBs and bridges 15+ native industrial protocols (Siemens S7, Beckhoff ADS, OPC UA, and more).
+- **[realvirtual CONNECT](https://realvirtual.io/doc/web/connect/)** — the gateway that makes Live mode work (industrial protocols → WebSocket) and hosts the built-in MCP server.
+
+A commercial license additionally allows proprietary/closed-source use, keeping your models and configuration private, and removal of the watermark — see [License](#license).
 
 ## Use Cases
 
@@ -76,7 +105,7 @@ npm install
 npm run dev          # Vite dev server with HMR
 ```
 
-Drop `.glb` files exported from [realvirtual.io](https://realvirtual.io) into `public/models/` — they appear automatically in the model selector.
+Drop `.glb` files exported from [realvirtual.io](https://realvirtual.io) into `public/models/` — they appear automatically in the model selector as DEV BUILT-INS. That is a checkout convenience, not the product path: a delivered project keeps its documents in the project itself (root-level, `models/`, `library/` — the folder is a place, not a type) and the manifest lists them.
 
 ```bash
 npm run build        # Production build -> dist/ (local only, nothing published)
@@ -166,7 +195,7 @@ src/
                      #   edition build and run without the private sibling repository
 tests/               # Vitest browser-mode tests
 e2e/                 # Playwright E2E tests
-public/models/       # GLB model files
+public/models/       # Dev built-in GLBs (checkout convenience, not the product path)
 ```
 
 ## Extending realvirtual WEB
@@ -247,7 +276,7 @@ Developers start with **[Architecture](doc-webviewer.md)**. The full in-repo doc
 | Document | Contents |
 |----------|----------|
 | [Layout Planner](doc-layout-planner.md) | Library objects, catalogs, snap points, pivots, deep-links |
-| [Persistence](doc-persistence.md) | Scene model, edit ops log, drafts, storage layout |
+| [Persistence](doc-persistence.md) | Document model, edit ops log, drafts, storage layout |
 | [Document Linking](doc-document-linking.md) | PDF/AASX datasheet linking and metadata |
 
 **Connectivity & collaboration**

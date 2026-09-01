@@ -129,14 +129,14 @@ export interface MaterialFlowDefinition<
   readonly kind: MaterialFlowKind;
   /**
    * Short, human-facing one-liner — what this component IS and does. Shown as the
-   * library hover tooltip and returned by the `web_library_list` MCP tool. Keep it
+   * library hover tooltip and returned by the `web_catalog_list` MCP tool. Keep it
    * general (no per-instance detail).
    */
   readonly description?: string;
   /**
    * Richer, MCP-facing notes for an AI agent building layouts: material-flow
    * direction, how to connect it (snaps), key config. Returned by the
-   * `web_library_describe` MCP tool. Multi-line OK. Not shown in the UI tooltip.
+   * `web_catalog_describe` MCP tool. Multi-line OK. Not shown in the UI tooltip.
    */
   readonly mcpDocs?: string;
   /**
@@ -282,6 +282,8 @@ export function toBehavior<S = Record<string, never>>(
   const makeLocal = localFactory ?? (def.local as (() => S) | undefined);
   return {
     models,
+    // Payload→adapter bridge (plan-455) — see `defineLibraryComponent`.
+    type: def.type,
     bind(rv: RVBindContext): void {
       const self = createSelf<S>(rv, def, {
         mode: 'continuous',

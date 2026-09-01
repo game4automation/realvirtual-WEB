@@ -242,6 +242,23 @@ export function adoptPlacedNode(
 
   deps.objectMap.set(id, node);
   deps.idByObject.set(node, id);
+
+  // Snap points are part of the planner bookkeeping this method exists for —
+  // loadGLB registers components, but only the placement path ever ran
+  // `scanAndRegisterSnaps`. Without this an adopted layout has an EMPTY snap
+  // registry: no pairings, so every behavior's `outputs()` is empty, the ZPA
+  // interlock reads "downstream occupied", and the whole line stands still
+  // (2026-09-01, DemoPlanner: pallet stops at the first sensor forever). The
+  // caller's snap-pairing rebuild then reconnects neighbours by geometry.
+  const viewer = deps.getViewer();
+  if (viewer) {
+    const snapPlugin = viewer.getPlugin<SnapPointPlugin>('snap-point');
+    const snapRegistry = snapPlugin?.getRegistry();
+    if (snapRegistry) {
+      scanAndRegisterSnaps(node, snapRegistry, node);
+      snapPlugin?.getMarkerRenderer?.()?.rebuild(snapRegistry.size);
+    }
+  }
 }
 
 /**

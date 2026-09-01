@@ -24,6 +24,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -194,7 +195,7 @@ describe('scene ↔ editor', () => {
     // Entering the editor: a mode switch plus an AssetDocument of its own.
     viewer.modes.setMode('editor');
     const asset = makeAssetViewer();
-    const doc = AssetDocument.newUntitled(asset.viewer);
+    const doc = scratchAssetDocument(asset.viewer);
     doc.setField(asset.boxPath, 'Drive', 'TargetSpeed', 999, 50);
     await doc.whenIdle();
 
@@ -220,7 +221,7 @@ describe('scene ↔ editor', () => {
 
     viewer.modes.setMode('editor');
     const asset = makeAssetViewer();
-    const doc = AssetDocument.newUntitled(asset.viewer);
+    const doc = scratchAssetDocument(asset.viewer);
     doc.setField(asset.boxPath, 'Drive', 'TargetSpeed', 999, 50);
     await doc.whenIdle();
 
@@ -250,7 +251,7 @@ describe('scene ↔ editor', () => {
     // the way in (`getSnapshot().saved/draft.base`), reopen on the way out.
     viewer.modes.setMode('editor');
     const asset = makeAssetViewer();
-    const doc = AssetDocument.newUntitled(asset.viewer);
+    const doc = scratchAssetDocument(asset.viewer);
     doc.setField(asset.boxPath, 'Drive', 'TargetSpeed', 999, 50);
     await doc.whenIdle();
     doc.dispose();

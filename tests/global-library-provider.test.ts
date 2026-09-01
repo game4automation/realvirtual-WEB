@@ -91,6 +91,32 @@ describe('global-library-provider', () => {
     expect(sources[0].source.listEntries()).toHaveLength(1);
   });
 
+  // ORIGIN DOES NOT GATE VISIBILITY. The Projects dashboard used to hide the
+  // two session-only origins (`config`, from a restored scene's catalogUrls;
+  // `urlParam`, from a `?library=` link) while the planner's library window
+  // listed them. One store, two surfaces, two different answers about which
+  // libraries exist — which reads as the dashboard being broken. Both windows
+  // now render everything the provider exposes, so the provider must keep
+  // exposing every catalog whatever attached it.
+  test('exposes catalogs of EVERY origin, not just the persisted ones', () => {
+    const scene = 'https://scene.example/catalog.json';
+    const link = 'https://link.example/catalog.json';
+    const typed = 'https://typed.example/catalog.json';
+    store.catalogUrls = [scene, link, typed];
+    store.origins.set(scene, 'config');
+    store.origins.set(link, 'urlParam');
+    store.origins.set(typed, 'user');
+    for (const u of store.catalogUrls) store.catalogs.set(u, { name: u, entries: [entry('a')] });
+    installGlobalLibraryProvider(store);
+
+    expect(globalSources().map(s => s.source.id)).toEqual([scene, link, typed]);
+    // And each is a real, detachable subscription — not a second-class row.
+    for (const s of globalSources()) {
+      expect(s.source.listEntries()).toHaveLength(1);
+      expect(typeof s.source.remove).toBe('function');
+    }
+  });
+
   test('marks bundled catalogs as kind "bundled" and gives them NO remove()', () => {
     // A catalog injected via `addCatalogDirect` never records an origin — that
     // is the observable proxy for the store's private `_bundledUrls` set.

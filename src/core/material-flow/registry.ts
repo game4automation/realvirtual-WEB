@@ -25,6 +25,7 @@
  *     public side can introspect them deterministically.
  */
 
+import type { Object3D } from 'three';
 import {
   registerComponentSchema,
   getRegisteredFactories,
@@ -121,6 +122,73 @@ export function matchMaterialFlows(name: string): MaterialFlowDefinition[] {
 /** Lookup a single registered definition by `type`. */
 export function getMaterialFlow(type: string): MaterialFlowDefinition | undefined {
   return _flows.get(type)?.def;
+}
+
+/**
+ * Dual discovery for ONE node (plan-455 F7) — the single source of truth both
+ * kernels bind through.
+ *
+ * A node resolves to a material-flow definition in two independent ways:
+ *
+ *  1. **Name** — `matchName` (a GLB filename or a placed LayoutObject's asset
+ *     name) matches a definition's `models[]` globs. Pass `''` to skip this
+ *     branch entirely: an ordinary inner node has no asset name, and a
+ *     definition globbed `['*']` must not swallow every node in the scene.
+ *  2. **Payload** — the node carries `userData.realvirtual[<type>]` for a
+ *     registered type. This is what binds an EMBEDDED component whose name says
+ *     nothing about it (Plan 194 §2.6: a self-spawning `EuropalletLoaded`
+ *     carrying a `Source`; plan-455: the `AGV_1/2/3` of a saved scene).
+ *
+ * De-duplicated by `type`, so a node that matches BOTH ways yields exactly one
+ * definition (plan-455 F3). Pure — no registry writes, no node mutation.
+ *
+ * Lives in the public core on purpose: the private DES scene binding imports it
+ * rather than keeping the second copy that used to drift (plan-455 F7).
+ */
+export function resolveNodeMaterialFlows(node: Object3D, matchName: string): MaterialFlowDefinition[] {
+  const byType = new Map<string, MaterialFlowDefinition>();
+  if (matchName) {
+    for (const def of matchMaterialFlows(matchName)) byType.set(def.type, def);
+  }
+  const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
+  if (rv) {
+    for (const key of Object.keys(rv)) {
+      const def = getMaterialFlow(key);
+      if (def) byType.set(def.type, def);
+    }
+  }
+  return [...byType.values()];
+}
+
+/**
+ * The material-flow types a node carries as `rv_extras` payload — the
+ * payload-only half of {@link resolveNodeMaterialFlows}, for callers that
+ * dispatch by type rather than by definition (the continuous BehaviorManager).
+ *
+ * Returns `[]` for the overwhelming majority of nodes (no `realvirtual` extras
+ * at all), which keeps the load-time traverse cheap.
+ */
+export function extrasMaterialFlowTypes(node: Object3D): string[] {
+  const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
+  if (!rv) return [];
+  let out: string[] | null = null;
+  for (const key of Object.keys(rv)) {
+    if (_flows.has(key)) (out ??= []).push(key);
+  }
+  return out ?? [];
+}
+
+/**
+ * True when an ENGINE component factory owns `type` (e.g. `Source` → `RVSource`,
+ * `Sink` → `RVSink`), i.e. the scene loader already constructs a real driver for
+ * every `rv_extras[type]` it finds.
+ *
+ * The continuous extras dispatch consults this and steps aside for such types —
+ * see the ownership note in `behaviors.ts`. Same guard, same reason as the
+ * schema-adapter skip in {@link registerMaterialFlow} above.
+ */
+export function isEngineOwnedFlowType(type: string): boolean {
+  return getRegisteredFactories().has(type);
 }
 
 /** All registered definitions (diagnostics / runner enumeration). */

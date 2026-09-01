@@ -666,6 +666,12 @@ describe('splitTypes', () => {
     expect(n).toEqual([]);
     expect(s).toEqual(['PLCInputBool', 'PLCOutputBool']);
   });
+
+  it('drops ambient metadata types, including numbered duplicates', () => {
+    const [n, s] = splitTypes(['Kinematic', 'NodeKnowledge', 'MechanismBody', 'MechanismBody_2', 'PLCInputBool']);
+    expect(n).toEqual(['Kinematic']);
+    expect(s).toEqual(['PLCInputBool']);
+  });
 });
 
 // ── signal type predicates ────────────────────────────────────────────────
@@ -734,6 +740,13 @@ describe('badgeLabel', () => {
 
   it('handles Drive_* subtypes', () => {
     expect(badgeLabel('Drive_Linear')).toBe('D:Linear');
+  });
+
+  it('shortens long drive behaviors and the mechanism root', () => {
+    expect(badgeLabel('Drive_ErraticPosition')).toBe('D:Erratic');
+    expect(badgeLabel('Drive_DestinationMotor')).toBe('D:DestMotor');
+    expect(badgeLabel('Drive_FollowPosition')).toBe('D:Follow');
+    expect(badgeLabel('KinematicMechanism')).toBe('Mechanism');
   });
 
   it('shows step state suffix for Active/Waiting', () => {

@@ -71,6 +71,7 @@ import { debug } from '../engine/rv-debug';
 import { parseGlbSubtree } from '../engine/rv-glb-parse';
 import { GROUP_KEY_RE, syncNodeGroups, syncSubtreeGroups } from '../engine/rv-group-sync';
 import { getCadProvider, cadFormatOfName } from './rv-cad-provider';
+import { ensureMovableTransform, refreshWorldMatricesDeep } from '../engine/rv-node-transform';
 import { getCadGlb } from '../import/rv-cad-glb-cache';
 import { materialForValue } from './rv-asset-material';
 import { assetOpTouchesHierarchy, classifyAssetOpRaycastImpact } from './rv-asset-ops';
@@ -908,8 +909,17 @@ export class AssetExecutorContext {
     const node = this._node(nodePath);
     if (!node) return;
     if (this._skipRootReplay(node, nodePath, 'transformNode')) return;
+    // Editor loads run `freezeStaticMatrices()` (loader Phase 11), and
+    // `updateMatrixWorld(true)` skips every frozen node — so a transform op on
+    // a static CAD node used to land in the log and the local matrix while
+    // the RENDERED pose (matrixWorld) stayed baked. Visible symptom: the
+    // Quick-Edit transform tools "only worked" on a node the gizmo had
+    // already touched, because the gizmo unfreezes on drag start. Do the same
+    // unfreeze here, then force the whole subtree's world matrices — frozen
+    // descendants keep valid LOCAL matrices, so the recompose is exact.
+    ensureMovableTransform(node);
     applyTransform(node, { ...t, scale: t.scale ?? node.scale.toArray() as [number, number, number] });
-    node.updateMatrixWorld(true);
+    refreshWorldMatricesDeep(node);
     this.viewer.markShadowsDirty();
   }
 
@@ -1297,7 +1307,10 @@ export class AssetExecutorContext {
       const result = processExtras(
         root, v.registry, v.signalStore, v.transportManager, v.scene,
         v.gizmoManager, v, v.errorStore, v.instructionStore,
-        { logicRunState: v.logicRunState },
+        // plan-727: this runs on every separateMesh/mergeMesh undo/redo inside a
+        // normal editing session. Without the authoring flag it would re-parent
+        // kinematic group members live and bake that into the next save.
+        { logicRunState: v.logicRunState, preserveAuthoringHierarchy: true },
         v.outlineManager, v.lampManager, v.energyChainManager, v.sceneButtonManager,
       );
       // The returns are live runtime state, not diagnostics — dropping them

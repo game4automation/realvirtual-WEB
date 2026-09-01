@@ -3,6 +3,7 @@
 
 import { expect, test, type Page } from 'playwright/test';
 import { DEV_GLB } from '../tests/fixtures/glb-paths.mjs';
+import { DEV_ASSETS_SKIP_REASON, HAS_DEV_ASSETS } from './dev-assets';
 
 const TOGGLE = '[data-testid="signal-link-mode-toggle"]';
 
@@ -140,6 +141,10 @@ async function emitTargetClick(page: Page, path: string): Promise<void> {
 }
 
 test.describe('signal link mode e2e', () => {
+  // plan-395: the model is in the private Development project, so a public
+  // checkout has nothing to load. Playwright reports this as `skipped`.
+  test.skip(!HAS_DEV_ASSETS, DEV_ASSETS_SKIP_REASON);
+
   test.setTimeout(120_000);
 
   test.beforeEach(async ({ page }) => {

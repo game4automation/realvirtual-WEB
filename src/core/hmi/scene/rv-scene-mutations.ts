@@ -11,7 +11,7 @@
  * wrong twice over:
  *
  *  - `save()`/`saveAs()` are only two of the seams. `rename()`,
- *    `duplicate()`, `delete()`, `addPublishedToMyScenes()`, `createEmpty()`,
+ *    `duplicate()`, `delete()`, `materializePublishedExample()`, `createEmpty()`,
  *    `markGlbActive()` and `_loadIntoWorkspace()` all
  *    write persisted state too. A hook in save() alone lets an open project
  *    drift away from its folder with nothing visible to show for it.

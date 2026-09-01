@@ -49,7 +49,6 @@ import {
   makeRegistryBakeResolver,
   ReferencedFileWriteError,
   SaveReferenceCycleError,
-  UnwritableTransformError,
   type BakeResolver,
 } from '../src/core/hmi/scene/rv-scene-glb-bake';
 import { ModelSourceChangedError } from '../src/core/hmi/scene/rv-scene-settings-into-model';
@@ -508,7 +507,12 @@ describe('Overrides auf referenzierte Knoten', () => {
     expect(reloaded.orphanedOverrides).toHaveLength(0);
   });
 
-  it('verweigert eine Verschiebung eines Knotens INNERHALB eines referenzierten Assets', async () => {
+  // Plan-444 F3 turned this case around. It used to throw; refusing it was the
+  // reason "import a STEP and drag a part into place" could not be saved, and
+  // the move is now recorded as a transform override on the reference node.
+  // The refusal that REMAINS is the nested case — see
+  // rv-scene-glb-bake-move-in-reference.test.ts, which owns both halves.
+  it('schreibt eine Verschiebung INNERHALB eines referenzierten Assets als trs-Override', async () => {
     const h = await harness();
     const edits = materialise([op({
       kind: 'transformNode', nodePath: h.pathOf('Ram'),
@@ -516,8 +520,18 @@ describe('Overrides auf referenzierte Knoten', () => {
       prev: { position: [0, 0, 0], quaternion: [0, 0, 0, 1] },
     })]);
 
-    await expect(bakeIntoGlb(plantBytes, edits, h.resolver, {}))
-      .rejects.toBeInstanceOf(UnwritableTransformError);
+    const baked = await bakeIntoGlb(plantBytes, edits, h.resolver, {});
+    expect(baked.referenceTransforms).toBe(1);
+    // Not written as one of THIS file's own node transforms.
+    expect(baked.transforms).toBe(0);
+
+    const json = parseGlbChunks(baked.glb).json as {
+      nodes: Array<{ name?: string; extras?: Record<string, unknown> }>;
+    };
+    const referenceJson = json.nodes.find((n) => n.name === 'Press_0')!;
+    const rv = referenceJson.extras!.realvirtual as Record<string, Record<string, unknown>>;
+    const trs = rv.AssetOverrides.trsByNodeId as Record<string, { position: number[] }>;
+    expect(Object.values(trs)[0].position).toEqual([1, 2, 3]);
   });
 
   it('verweigert einen Override, dessen Referenzknoten selbst aus einer fremden Datei stammt', async () => {

@@ -120,6 +120,20 @@ export class CanvasInteractionManager {
       // starting underneath the in-flight transform drag.
       if (this.deps.transformControls?.isDragging) return;
 
+      // Same story for a DES path handle (plan-447): the path visualizer wires
+      // its `pointerdown` in `init()` — before this manager, which wires in
+      // `onModelLoaded` — so a handle grab has already armed by the time we run.
+      // Its handles are not layout instances, so the raycast below would miss
+      // them and start a marquee underneath the geometry drag. Looked up by
+      // plugin id (structural type, no import) so neither plugin knows the
+      // other's module.
+      // (`typeof` guard: test viewers are hand-rolled stubs that carry only the
+      // members the planner used to touch.)
+      const pathViz = typeof viewer.getPlugin === 'function'
+        ? viewer.getPlugin<{ id: string; isDragging: boolean }>('path-visualizer')
+        : undefined;
+      if (pathViz?.isDragging) return;
+
       const layoutObjs = [...this.deps.objectMap.values()];
 
       // Resolve a layout-instance hit (if any) up front. The result determines

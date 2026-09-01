@@ -36,6 +36,8 @@ export interface ToolEntry {
   timeoutMs?: number;
   /** Side-effect classification; drives `annotations.readOnlyHint` in discover. */
   readOnly?: boolean;
+  /** Irreversibility hint; drives `annotations.destructiveHint` in discover. */
+  destructive?: boolean;
 }
 
 export interface ParamEntry {
@@ -52,13 +54,22 @@ export interface ParamEntry {
 /**
  * MCP standard tool annotations (spec revision 2025-03-26, unchanged since).
  *
- * Only `readOnlyHint` is announced: the bridge servers use it as the write gate, and the MCP
- * client shows it. It is a HINT, never an authorisation boundary — the browser decides what a
- * tool actually does, so a server-side name list would be no stronger. Both bridges therefore
- * treat a missing or false hint as a write (secure by default).
+ * `readOnlyHint` is the one the bridge servers act on: it is the write gate, and the MCP client
+ * shows it. It is a HINT, never an authorisation boundary — the browser decides what a tool
+ * actually does, so a server-side name list would be no stronger. Both bridges therefore treat a
+ * missing or false hint as a write (secure by default).
+ *
+ * `destructiveHint` (plan-713 F3) is announced ONLY where it is true, and it gates nothing. It is
+ * the spec's own field for "this write can destroy data the caller did not name", and the client
+ * is where a confirmation belongs. Emitting it for every write would make it noise; emitting it
+ * for `web_document_update` — the one tool that deletes a file — is what makes it readable.
+ *
+ * Additive on the wire: `annotations` is already one of the four fields CONNECT projects
+ * (`McpServerSetup.cs`), so a second key inside it changes no schema (NF1).
  */
 export interface McpToolAnnotations {
   readOnlyHint: boolean;
+  destructiveHint?: boolean;
 }
 
 export interface ToolSchema {
@@ -135,6 +146,14 @@ export interface McpToolOptions {
    * disappears for read-only clients instead of leaking a mutation.
    */
   readOnly?: boolean;
+  /**
+   * Announced as `annotations.destructiveHint` when true, omitted otherwise.
+   *
+   * For the narrow case the MCP spec means by it: a write that can destroy data the caller did
+   * not name in the call. `web_document_update(action=delete)` is one; every ordinary authoring
+   * write is not, and marking them all would say nothing.
+   */
+  destructive?: boolean;
 }
 
 /**
@@ -166,6 +185,7 @@ export function McpTool(description: string, options?: McpToolOptions) {
       params,
       ...(options?.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
       ...(options?.readOnly === undefined ? {} : { readOnly: options.readOnly }),
+      ...(options?.destructive ? { destructive: true } : {}),
     });
   };
 }
@@ -217,7 +237,15 @@ export function generateToolSchemas(instance: object): ToolSchema[] {
     },
     // Emitted for BOTH values, never omitted for `false`: the bridges must be able to tell
     // "classified as a write" apart from "never classified" when a stale browser connects.
-    ...(entry.readOnly === undefined ? {} : { annotations: { readOnlyHint: entry.readOnly } }),
+    ...(entry.readOnly === undefined ? {} : {
+      annotations: {
+        readOnlyHint: entry.readOnly,
+        // Omitted when false rather than emitted as `false`: unlike `readOnlyHint` no bridge
+        // reads this, so "absent" and "false" are the same statement and the shorter one keeps
+        // 139 unaffected tools byte-identical in the discover payload.
+        ...(entry.destructive ? { destructiveHint: true } : {}),
+      },
+    }),
     ...(entry.timeoutMs ? { timeoutMs: entry.timeoutMs } : {}),
   }));
 }

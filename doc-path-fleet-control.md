@@ -69,6 +69,70 @@ teal, zoned = orange, chevron = travel direction at the hand-off point).
 Field edits re-register live (`RVPathComponent.reapplyConfig()` — id changes,
 re-linking and zone re-definition included).
 
+### 2.1 Planner editing, snappoints, re-projection (plan-447)
+
+**Visualisation.** `path-visualizer-plugin.ts` owns EXACTLY ONE renderer per
+path (`pathId → LineSegments2`, fat lines with screen-space constant width).
+Hovering a path widens and re-colours that path only; planner mode raises the
+base width and adds drag handles. Never build a second path renderer — extend
+this plugin.
+
+**Snappoints.** Every OPEN path exposes two snappoints, derived from the
+segment data by `getPathEndpoints()` (rv-path.ts): start = flow `in`, end =
+flow `out`, axis code from the dominant component of the outward vector. They
+live in the ordinary `SnapPointRegistry` (`PathSnapSource`,
+`src/plugins/snap-point/path-snap-source.ts`), so the marker renderer, the
+magnetic controller and the snap tools treat them like any other port. A closed
+loop has no free ends and therefore no snappoints.
+
+**Editing.** In planner mode each chain vertex (and both free chain ends) is a
+draggable handle; arcs get a CENTER and a RADIUS handle — a free arc-endpoint
+drag is underdetermined without a tangent constraint and is an explicit
+non-goal. Dragging a shared vertex updates BOTH adjacent line segments in one
+step, so the chain never tears. The pure maths lives in
+`src/core/engine/rv-path-edit.ts` (`derivePathHandles` / `movePathHandle` /
+`snapDragTarget`); handles are picked as AUX RAYCAST TARGETS
+(`addAuxRaycastTarget`, doc-render-picking.md §2.3) — never via layer bits.
+While dragging, only the preview geometry is rebuilt; on release the new
+segment list is committed as an ordinary `setField` op on the generic `'json'`
+field `segments`, so undo/redo and the save roundtrip come for free.
+
+**Rastung targets (F4).** An endpoint drag rasts onto the nearest compatible
+point within ~0.35 m. The visualizer enumerates the free ends of every
+other path itself; STATION snappoints come from the snap-point plugin, which
+pushes them in through `PathVisualizerPlugin.addSnapCandidateSource()` (core
+must not import a plugin registry). A dragged path START (flow `in`) only sees
+`out`/`bidi` ports and vice versa; occupied ports are skipped.
+
+**Who owns the pointer.** A handle grab belongs to the visualizer alone: it
+wires its `pointerdown` in `init()` (before the layout-planner, which wires in
+`onModelLoaded`) and calls `stopImmediatePropagation()` on a hit -- plain
+`stopPropagation` does NOT stop a sibling listener on the same canvas. The
+planner additionally bails out of its marquee while a handle drag is in flight
+(`canvas-interaction.ts`), the same belt-and-braces as the FloorGizmo pair.
+
+**Three invariants a live edit must not break** (each has a test in
+`tests/path/`):
+
+1. **Zone claims survive.** `reapplyConfig()` uses
+   `ZoneRegistry.redefine(zoneId, capacity)` — capacity HARD-overwritten (a
+   SHRINK must take effect; `define()` is max-wins), holders untouched.
+   `undefine()` (definition AND holders) stays the MODEL-CLEAR route
+   (`dispose()`). Freeing a held claim mid-edit would put two vehicles into one
+   exclusive zone.
+2. **Travelers are re-projected, not re-pointed by accident.** `RVPath` is
+   readonly and gets REPLACED, so every traveler on the edited path re-fetches
+   through `network.get(pathId)` and gets `traveler.path` REASSIGNED
+   (`reprojectTravelersOnPath`, rv-path-network.ts). `s` is clamped into the
+   new length (closed paths wrap); a vehicle parked at the end (`atEnd`,
+   waiting for a dock's `release()`) STAYS at the end. The fleet iteration is
+   owned by `SpacingController.forEachOnPath(pathId, fn)` — the only
+   fleet-wide registry of live travelers.
+3. **Everyone learns about it through one channel.**
+   `RVPathNetwork.onPathChanged(pathId)` / `notifyPathChanged(pathId)`. The
+   payload is the ID, never the (already replaced) object. An id rename
+   announces both the old and the new id.
+
 ## 3. The vehicle (`Agv` library component)
 
 Binds automatically to placed assets whose name matches `*Agv*`/`*AGV*`.

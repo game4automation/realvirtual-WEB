@@ -8,13 +8,22 @@
  * Uses Three.js GLTFLoader to load tests.glb from the dev server,
  * then verifies all realvirtual component data needed for WebViewer simulation.
  *
- * Export the demo scene GLB from Unity and place at: public/models/tests.glb
+ * Export the demo scene GLB from Unity and place at: ../realvirtual-WebViewer-Private~/projects/Development/fixtures/tests.glb
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { Scene, Object3D } from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.tests);
 
 // ─── GLB Loading Helper ────────────────────────────────────────────
 
@@ -55,7 +64,9 @@ function getComponentData(rvNode: RVNode, type: string): Record<string, unknown>
 
 function requireGLB(): void {
   if (loadError) {
-    throw new Error(`GLB not available: ${loadError}. Export demo scene and place at public/models/tests.glb`);
+    throw new Error(`GLB not available: ${loadError}. Export the demo scene to `
+      + `../realvirtual-WebViewer-Private~/projects/Development/fixtures/tests.glb `
+      + `(it moved out of public/models/ with plan-395).`);
   }
 }
 
@@ -106,7 +117,7 @@ beforeAll(async () => {
 
 // ─── Basic Structure ───────────────────────────────────────────────
 
-describe('GLB structure', () => {
+describe.skipIf(!DEV_ASSETS)('GLB structure', () => {
   it('should load tests.glb successfully', () => {
     requireGLB();
   });
@@ -135,7 +146,7 @@ describe('GLB structure', () => {
 
 // ─── Drive Components ──────────────────────────────────────────────
 
-describe('Drive extras', () => {
+describe.skipIf(!DEV_ASSETS)('Drive extras', () => {
   it('should find Drive components', () => {
     requireGLB();
     const drives = getNodesWithComponent('Drive');
@@ -163,7 +174,7 @@ describe('Drive extras', () => {
 
 // ─── TransportSurface Components ───────────────────────────────────
 
-describe('TransportSurface extras', () => {
+describe.skipIf(!DEV_ASSETS)('TransportSurface extras', () => {
   it('should find TransportSurface components', () => {
     requireGLB();
     const surfaces = getNodesWithComponent('TransportSurface');
@@ -233,7 +244,7 @@ describe('TransportSurface extras', () => {
 
 // ─── Sensor Components ─────────────────────────────────────────────
 
-describe('Sensor extras', () => {
+describe.skipIf(!DEV_ASSETS)('Sensor extras', () => {
   it('should find Sensor components', () => {
     requireGLB();
     const sensors = getNodesWithComponent('Sensor');
@@ -272,7 +283,7 @@ describe('Sensor extras', () => {
 
 // ─── Source Components ─────────────────────────────────────────────
 
-describe('Source extras', () => {
+describe.skipIf(!DEV_ASSETS)('Source extras', () => {
   it('should find Source components', () => {
     requireGLB();
     const sources = getNodesWithComponent('Source');
@@ -295,7 +306,7 @@ describe('Source extras', () => {
 
 // ─── Sink Components ───────────────────────────────────────────────
 
-describe('Sink extras', () => {
+describe.skipIf(!DEV_ASSETS)('Sink extras', () => {
   it('should find Sink components', () => {
     requireGLB();
     const sinks = getNodesWithComponent('Sink');
@@ -317,7 +328,7 @@ describe('Sink extras', () => {
 
 // ─── MU (Moving Unit) Templates ────────────────────────────────────
 
-describe('MU extras', () => {
+describe.skipIf(!DEV_ASSETS)('MU extras', () => {
   it('should check for MU template nodes', () => {
     requireGLB();
     const mus = getNodesWithComponent('MU');
@@ -345,7 +356,7 @@ describe('MU extras', () => {
 
 // ─── Drive-TransportSurface Association ────────────────────────────
 
-describe('Drive-TransportSurface association', () => {
+describe.skipIf(!DEV_ASSETS)('Drive-TransportSurface association', () => {
   it('should verify every TransportSurface can derive direction from a Drive', () => {
     requireGLB();
     const surfaces = getNodesWithComponent('TransportSurface');

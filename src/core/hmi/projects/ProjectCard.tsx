@@ -63,6 +63,11 @@ export interface ProjectCardModel {
    */
   thumbnailKey?: ThumbnailKeyParts;
   resolveThumbnail?: () => Promise<ResolvedThumbnailSource | null>;
+  /**
+   * Stated glyph tile instead of a picture — a CONNECT configuration or
+   * knowledge card. Suppresses the thumbnail request: nothing to render.
+   */
+  glyph?: 'connect' | 'knowledge';
 }
 
 /**
@@ -79,7 +84,8 @@ export function ProjectCard({ card }: { card: ProjectCardModel }) {
     service: viewer?.thumbnails ?? null,
     keyParts: card.thumbnailKey ?? null,
     resolve: card.resolveThumbnail ?? null,
-    enabled: !card.entry.thumbnailUrl,
+    // A glyph card has nothing to render — never queue a request for it.
+    enabled: !card.entry.thumbnailUrl && !card.glyph,
   });
   // Anchored at the pointer, not the card: a context menu that jumps to the
   // card corner reads as detached from the click that raised it.
@@ -100,6 +106,7 @@ export function ProjectCard({ card }: { card: ProjectCardModel }) {
         tier={card.tier}
         selected={card.selected}
         empty={empty}
+        glyph={card.glyph}
         onClick={card.onSelect}
         onDoubleClick={card.onOpen}
         onContextMenu={hasMenu

@@ -103,8 +103,23 @@ src/
   private-stubs/                 # No-op fallbacks when ../realvirtual-WebViewer-Private~ is absent
 tests/                           # Vitest browser tests
 e2e/                             # Playwright E2E tests
-public/models/                   # GLB model files
+public/models/                   # GLB storage — NOT a catalogue; nothing is discovered here
+public/project.json              # The DemoRealvirtual manifest — SSOT for what the demo ships
 ```
+
+Those last two lines used to be a pair with a caveat: dropping a GLB into
+`public/models/` made it a "DEV BUILT-IN" you could pick in the model list even
+though it was not in the demo. **That is gone (plan-735.)** The build-time glob
+over `public/models/*.glb` has been removed, so a file dropped there is invisible
+until a manifest declares it — add a `documents[]` row to `public/project.json`.
+
+The rule is now the same everywhere and has no exceptions: **a document exists
+because a `project.json` says so.** Every channel publishes one — the hosted demo,
+the CONNECT bundle, the dev checkout, the customer workspace, and the projectless
+standard delivery, whose manifest is generated at staging time and is vendor-owned.
+A deploy root without a readable `project.json` has no project at all: the viewer
+logs a named error and shows one, rather than inventing a project around whatever
+GLBs happen to be lying about.
 
 ## Operating Modes
 
@@ -226,7 +241,7 @@ Tool ownership is strict: CONNECT owns the `web_*` browser tools, the Unity Pyth
 | `doc-multiuser-system.md` | Multiuser sessions, relay server, shared views |
 | `doc-web-debugging.md` | Debugging tools and workflow |
 | `doc-webviewer-interface.md` | Industrial interfaces (WebSocket Realtime, ctrlX, MQTT) — protocol, signal flow, new-interface guide |
-| `doc-persistence.md` | Persistence architecture: Scene model, ops log, drafts, localStorage / sessionStorage / IndexedDB layout |
+| `doc-persistence.md` | Persistence architecture: document model, ops log, drafts, localStorage / sessionStorage / IndexedDB layout |
 | `doc-ai-integration.md` | AI integration + MCP bridge: architecture, setup, the AI Bridge status panel, activity indicator, `web_screenshot` cropping, troubleshooting |
 | `webviewer.mcp.md` | MCP tools reference (imported at runtime) |
 

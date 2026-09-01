@@ -21,6 +21,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import {
   __clearDraftStoresForTests,
   draftKeyOf,
@@ -114,7 +115,11 @@ describe('der ROOT-FrameKey des geteilten Dokuments', () => {
 
   it('is null for every kind that cannot be bound — the asset lineage is unchanged', () => {
     expect(sharedDocumentFrame(null)).toBeNull();
-    expect(sharedDocumentFrame({ kind: 'empty' })).toBeNull();
+    // A LEGACY value: plan-719 F3 removed 'empty' from the union, but a record
+    // written by an older build can still reach this reader, and answering null
+    // is what keeps such a record out of the shared-slot path. Cast, because
+    // the whole point is that no live code can produce it any more.
+    expect(sharedDocumentFrame({ kind: 'empty' } as never)).toBeNull();
     expect(sharedDocumentFrame(projectDocumentBase('library/a.glb', 'a')))
       .toBeNull();
     expect(sharedDocumentFrame({ kind: 'sceneGlbSlot', slot: 'draft/x', label: 'X' })).toBeNull();
@@ -286,7 +291,7 @@ describe('der geteilte Record gehoert der Szene, nicht dem Editor', () => {
     const editorFrame = rootFrame(null, 'asset_own');
     const editorDraft = toDocumentDraft({
       frame: editorFrame,
-      shell: { id: 'asset_own', name: 'Gripper', base: { kind: 'empty' }, createdAt: 1 },
+      shell: { id: 'asset_own', name: 'Gripper', base: { kind: 'document', documentId: 'doc_scratch', path: 'scratch.glb', name: 'Scratch' }, createdAt: 1 },
       ops: [setField(9)],
       savedAt: 1_000,
     });
@@ -304,7 +309,7 @@ describe('der geteilte Record gehoert der Szene, nicht dem Editor', () => {
   it('an editor draft and a shared one live side by side in storage', async () => {
     await saveDocumentDraft({
       frame: rootFrame(null, 'asset_own'),
-      shell: { id: 'asset_own', name: 'Gripper', base: { kind: 'empty' }, createdAt: 1 },
+      shell: { id: 'asset_own', name: 'Gripper', base: { kind: 'document', documentId: 'doc_scratch', path: 'scratch.glb', name: 'Scratch' }, createdAt: 1 },
       ops: [setField(9)],
     });
     await saveDocumentDraft({
@@ -425,7 +430,7 @@ describe('Ungleich-Fall: zwei Schreiber, unveraendert', () => {
       emit() {}, on() { return () => {}; },
       rebuildGroupedBvh() {}, refitRaycastSubtrees() {},
     } as unknown as RVViewer;
-    const doc = AssetDocument.newUntitled(viewer);
+    const doc = scratchAssetDocument(viewer);
     expect(doc.draftFrame).toEqual(rootFrame(null, doc.id));
     // No stamp either: an unbound document has no bytes projection to point at,
     // so nothing may claim it has one.
@@ -437,7 +442,7 @@ describe('Ungleich-Fall: zwei Schreiber, unveraendert', () => {
     const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     await saveDocumentDraft({
       frame: rootFrame(null, 'asset_plain'),
-      shell: { id: 'asset_plain', name: 'Plain', base: { kind: 'empty' }, createdAt: 1 },
+      shell: { id: 'asset_plain', name: 'Plain', base: { kind: 'document', documentId: 'doc_scratch', path: 'scratch.glb', name: 'Scratch' }, createdAt: 1 },
       ops: [setField(1)],
     });
     const stored = await loadDocumentDraft(rootFrame(null, 'asset_plain'));

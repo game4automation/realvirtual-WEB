@@ -52,6 +52,7 @@ import type {
 } from '../rv-scene-record';
 export { WriteQueue } from './write-queue';
 import type { DocumentStat } from '../rv-project-documents';
+import { isConnectConfigPath, isKnowledgeFilePath } from '../rv-project-refs';
 import type {
   RvDocumentEntry,
   RvProject,
@@ -160,6 +161,42 @@ export interface ProjectBackend extends ProjectReadProvider {
    */
   listDocuments(): Promise<RvDocumentEntry[]>;
   /**
+   * Project-relative paths of every CONNECT configuration file
+   * (`*.connect.json`) anywhere under the project root — including the
+   * reserved `connect/` folder, which the document walk never enters as an
+   * asset location.
+   *
+   * Classification is by the file ENDING, not the folder (plan-718 reference
+   * model): a config a user keeps next to its model must be found exactly like
+   * one CONNECT wrote into `connect/`. Optional — a backend without a real
+   * folder to walk (bundled, HTTP) simply does not implement it, and callers
+   * treat that as "none".
+   */
+  listConnectConfigs?(): Promise<string[]>;
+  /**
+   * Project-relative paths of every knowledge file (`*.knowledge.md`) anywhere
+   * under the project root — the `knowledgeRef` twin of
+   * {@link listConnectConfigs}, with the same by-ending rule and the same
+   * optionality.
+   */
+  listKnowledgeFiles?(): Promise<string[]>;
+  /**
+   * Project-relative paths of EVERY file the project folder holds — the one
+   * walk behind the full view (plan-445 F1).
+   *
+   * Internals are already gone: the backend applies
+   * {@link isInternalProjectPath} so there is exactly one place that decides
+   * what a user is not meant to see, and no caller can forget it.
+   *
+   * This is a superset of {@link listConnectConfigs} and
+   * {@link listKnowledgeFiles}, which is the point: {@link listProjectFiles}
+   * classifies it into all three lists from ONE walk instead of walking the
+   * folder once per ending. Optional for the same reason as its two siblings —
+   * a backend with no folder to walk (bundled, HTTP) simply omits it, and the
+   * helper falls back to the per-ending calls.
+   */
+  listAllFiles?(): Promise<string[]>;
+  /**
    * Cheap size/mtime/digest for the documents this backend stores — the
    * pre-filter of the classification scan (§2.5, SOL R1-7).
    *
@@ -267,6 +304,107 @@ export interface ProjectBackend extends ProjectReadProvider {
   readBlobBytes(relPath: string): Promise<ArrayBuffer | null>;
   /** Await any queued write. Safe on a read-only or inactive backend. */
   flush(): Promise<void>;
+}
+
+// ─── The full-view listing (plan-445 F1) ────────────────────────────────
+
+/**
+ * Files the project browser must NOT show, by name.
+ *
+ * `project.json` is the manifest the tree is BUILT from and `docs-index.json`
+ * is the attachment index — showing either would offer the user a row that
+ * describes the list it appears in. Both are also written by machinery, so a
+ * rename of one is a corruption, not an edit.
+ */
+const INTERNAL_FILE_NAMES: ReadonlySet<string> = new Set([
+  'project.json',
+  'docs-index.json',
+]);
+
+/**
+ * Top-level folders whose contents are viewer artefacts rather than content.
+ *
+ * `thumbnails/` is the preview cache — regenerated at will, meaningless to a
+ * human, and large. The rest of the reserved set (`settings`, `connect`, `rag`,
+ * `.trash`) is deliberately NOT here: those hold files a user legitimately
+ * looks at, and the tree already groups them under its collapsed *System* node
+ * (`RESERVED_SYSTEM_FOLDERS`) instead of hiding them.
+ */
+const INTERNAL_FOLDERS: readonly string[] = ['thumbnails'];
+
+/**
+ * Is `relPath` viewer machinery rather than project content?
+ *
+ * The ONE internals rule (plan-445 §2.3), applied by the backend so that every
+ * consumer — dashboard, MCP tree, a future one — hides exactly the same set.
+ * Three clauses, in the order they were decided: any segment beginning with a
+ * dot (`.trash`, `.thumbnails`, `.git`), the two index files, and the thumbnail
+ * cache.
+ */
+export function isInternalProjectPath(relPath: string): boolean {
+  const path = (relPath ?? '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+  if (path === '') return true;
+  const segments = path.split('/').filter(Boolean);
+  if (segments.some(s => s.startsWith('.'))) return true;
+  if (INTERNAL_FILE_NAMES.has(segments[segments.length - 1].toLowerCase())) return true;
+  return INTERNAL_FOLDERS.includes(segments[0].toLowerCase());
+}
+
+/** The three by-ending lists the project tree needs, from one path list. */
+export interface ProjectFileListing {
+  /** `*.connect.json`, wherever they sit (plan-718 reference model). */
+  configs: string[];
+  /** `*.knowledge.md`, same by-ending rule. */
+  knowledge: string[];
+  /** Everything else — the inert rows of the full view. */
+  plainFiles: string[];
+}
+
+/**
+ * Split one walk's paths into the three lists the tree consumes.
+ *
+ * Pure, and the only classifier: the dashboard and `web_project_tree` both call
+ * it on the same input, which is what makes them show the same tree rather than
+ * two hand-maintained approximations of one (plan-445 §2.4).
+ */
+export function classifyProjectFiles(paths: readonly string[]): ProjectFileListing {
+  const configs: string[] = [];
+  const knowledge: string[] = [];
+  const plainFiles: string[] = [];
+  for (const path of paths) {
+    if (isInternalProjectPath(path)) continue;
+    if (isConnectConfigPath(path)) configs.push(path);
+    else if (isKnowledgeFilePath(path)) knowledge.push(path);
+    else plainFiles.push(path);
+  }
+  return { configs, knowledge, plainFiles };
+}
+
+/**
+ * Everything the project tree needs from the backend's folder, in ONE walk.
+ *
+ * `listAllFiles()` where the backend has it, the two per-ending walks where it
+ * does not (and then no `plainFiles`, because a backend that cannot enumerate
+ * cannot honestly claim there are none of anything else). Never throws: a
+ * revoked folder grant or a backend that answers nothing yields empty lists,
+ * which renders as a project with no extra rows rather than as a broken screen.
+ */
+export async function listProjectFiles(
+  backend: Pick<ProjectBackend, 'listAllFiles' | 'listConnectConfigs' | 'listKnowledgeFiles'> | null,
+): Promise<ProjectFileListing> {
+  if (!backend) return { configs: [], knowledge: [], plainFiles: [] };
+  if (backend.listAllFiles) {
+    try {
+      return classifyProjectFiles(await backend.listAllFiles());
+    } catch {
+      return { configs: [], knowledge: [], plainFiles: [] };
+    }
+  }
+  const [configs, knowledge] = await Promise.all([
+    backend.listConnectConfigs?.().catch(() => []) ?? Promise.resolve([]),
+    backend.listKnowledgeFiles?.().catch(() => []) ?? Promise.resolve([]),
+  ]);
+  return { configs, knowledge, plainFiles: [] };
 }
 
 // ─── Guards ─────────────────────────────────────────────────────────────

@@ -251,9 +251,15 @@ const IGNORED: Record<string, string[]> = {
     // were therefore dropped at load — an authored `JogForward: true` never
     // reached the engine and the drive silently refused to move. They are now
     // real schema fields (see rv-odt.json → $defs/Drive) applied by initDrive().
-    'SpeedOverride', 'SpeedScaleTransportSurface',
-    'JumpToLowerLimitOnUpperLimit', 'LimitRayCast',
-    'SmoothAcceleration', 'Jerk', 'smoothMotion',
+    'SpeedScaleTransportSurface',
+    'LimitRayCast',
+    // NOTE (plan-281 Phase 4): SmoothAcceleration / Jerk / SpeedOverride /
+    // JumpToLowerLimitOnUpperLimit used to be listed here as "not implemented"
+    // and were therefore dropped at load. They are now real schema fields (see
+    // rv-odt.json → $defs/Drive) consumed by the jerk-limited motion path.
+    // `smoothMotion` stays ignored on purpose: it is the serialized internal C#
+    // solver object, not an end-user property (plan-281 §3.2).
+    'smoothMotion',
     'TargetStartMove', 'ResetDrive', '_StopDrive',
     'MoveThisRigidBody', 'UseInteract',
     // realvirtual component metadata

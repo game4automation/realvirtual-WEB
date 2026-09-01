@@ -21,7 +21,7 @@
  *
  *  1. Both tiers appear in **one** list, each entry knowing its `tier`.
  *  2. A bundled entry is read-only. The first edit **forks** it into the user
- *    tier — the same semantics `SceneStore.addPublishedToMyScenes` has, which is
+ *    tier — the same semantics `SceneStore.materializePublishedExample` has, which is
  *    also why importing an example materialises a document rather than sharing
  *    the bundled one (plan-716 F1).
  *  3. A fork records `forkedFrom`, so the UI can say "based on Sample/Demo".

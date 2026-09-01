@@ -37,7 +37,13 @@ const h = vi.hoisted(() => ({
 // A browser-backend project has no File System Access handle at all. This is
 // not a convenience stub: `getWorkFolder()` genuinely returns null there, which
 // is exactly why the old resolution path could not work.
-vi.mock('../src/core/engine/rv-local-filesystem', () => ({
+// Spread the real module and override only the four functions this test steers.
+// A bare factory silently drops every OTHER export, and the modules under test
+// (folder-backend, rv-project-storage) import more of them than this test names —
+// omitting one turns the whole file into an import error, which is how this guard
+// went dark once already.
+vi.mock('../src/core/engine/rv-local-filesystem', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/core/engine/rv-local-filesystem')>()),
   isSupported: () => false,
   getWorkFolder: async () => h.workFolder,
   getSubfolder: async () => null,
@@ -82,7 +88,7 @@ const store = {
   mintReferencedAssetIdentities: async () => {},
 };
 
-import { saveAssetToCustomLibrary } from '../src/core/editor/rv-asset-library-save';
+import { saveDocument } from '../src/core/editor/rv-save-document';
 import { AssetEditorPlugin } from '@rv-private/plugins/asset-editor/index';
 import type { AssetBase } from '../src/core/editor/rv-asset-document';
 import {
@@ -97,11 +103,40 @@ function loaderViewer() {
     currentModelRoot: { name: 'Belt' },
     renderer: {},
     scene: {},
+    // The save path announces itself now (plan-719 F8) and emits the
+    // pre-export hook before cloning the tree; both go nowhere here.
+    emit: () => {},
+    getPlugin: () => undefined,
     async loadModel(url: string) { loaded.push(url); },
   };
 }
 
-const doc = { whenIdle: async () => {} } as never;
+/**
+ * A document over `library/Custom/Belt.glb`, as `createDocument` would have
+ * left it: a real path, a real id, nothing to invent at save time.
+ *
+ * plan-719 F9 deleted `saveAssetToCustomLibrary`, which is what this round trip
+ * used to save through. The BROWSER-BACKEND pin it carries is not about that
+ * function though — it is about the two ends of the trip addressing the same
+ * store, which is the only thing that works on Firefox, Safari and every iPad
+ * (plan-709 §2.6.1). So the save half moves to the one save path and the pin
+ * survives intact, rather than being deleted along with the function.
+ */
+function beltDocument() {
+  const doc = {
+    name: 'Belt',
+    base: libraryDocumentBase('Custom/Belt.glb'),
+    dirty: true,
+    whenIdle: async () => {},
+    async markSaved(next: AssetBase) { doc.base = next; },
+    document: {
+      opCount: 0,
+      runExclusive: <T,>(work: () => Promise<T>) => work(),
+      markSaved() {},
+    },
+  };
+  return doc;
+}
 
 /** `_loadBase` is private by design; the test drives it deliberately. */
 function loadBase(plugin: AssetEditorPlugin, viewer: unknown, base: AssetBase): Promise<void> {
@@ -119,16 +154,16 @@ beforeEach(() => {
 describe('libraryGlb round trip in a browser-backend project', () => {
   it('saves into the project and re-opens from the project', async () => {
     const saver = loaderViewer();
-    const outcome = await saveAssetToCustomLibrary(saver as never, doc, 'Belt');
+    const outcome = await saveDocument(saver as never, beltDocument() as never);
 
     expect(outcome.kind).toBe('saved');
     if (outcome.kind !== 'saved') return;
-    expect(outcome.relPath).toBe('Custom/Belt.glb');
+    expect(outcome.relPath).toBe('library/Custom/Belt.glb');
     expect(writes).toContain('library/Custom/Belt.glb');
 
     // A new session: the document is gone, only the base survives.
     const reopen = loaderViewer();
-    const base: AssetBase = libraryDocumentBase(outcome.relPath);
+    const base: AssetBase = libraryDocumentBase('Custom/Belt.glb');
     await loadBase(new AssetEditorPlugin(), reopen, base);
 
     expect(reopen.loaded).toHaveLength(1);

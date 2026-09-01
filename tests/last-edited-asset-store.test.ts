@@ -39,17 +39,24 @@ describe('last-edited-asset-store', () => {
     expect(JSON.stringify(restored)).not.toContain('blob:');
   });
 
-  it('never persists kind empty and survives corrupt JSON', () => {
-    saveLastEditedAsset({ kind: 'empty' });
+  /**
+   * plan-719 F3: no live code can produce this base any more, so the guard is
+   * restated against what CAN still arrive — a value out of an older record —
+   * with the corrupt-JSON half unchanged. Written with a cast on purpose: the
+   * point of the test is that the type system already refuses it, and the
+   * reader has to refuse it too.
+   */
+  it('never persists a legacy homeless base and survives corrupt JSON', () => {
+    saveLastEditedAsset({ kind: 'empty' } as never);
     expect(loadLastEditedAsset()).toBeNull();
 
     localStorage.setItem(EDITOR_LAST_ASSET_KEY, '{broken');
     expect(loadLastEditedAsset()).toBeNull();
   });
 
-  it('an empty save does not overwrite a real memory', () => {
+  it('a legacy homeless save does not overwrite a real memory', () => {
     saveLastEditedAsset(projectDocumentBase('library/Custom/a.glb', 'a'));
-    saveLastEditedAsset({ kind: 'empty' });
+    saveLastEditedAsset({ kind: 'empty' } as never);
     expect(loadLastEditedAsset()).toMatchObject({ path: 'library/Custom/a.glb' });
   });
 

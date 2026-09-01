@@ -205,7 +205,9 @@ export const DOC_FAMILIES: readonly FamilySpec[] = [
   {
     marker: 'tool-reference layout',
     file: 'src/plugins/mcp-bridge/help/layout.md',
-    match: (n) => startsWithAny(n, ['web_layout_', 'web_library_', 'web_scene_']),
+    // web_scene_ still matches web_scene_query; the document and catalog
+    // families replaced the old web_library_/web_model_/web_scene_* verbs.
+    match: (n) => startsWithAny(n, ['web_layout_', 'web_catalog_', 'web_document_', 'web_scene_']),
     render: renderToolTable,
   },
   {

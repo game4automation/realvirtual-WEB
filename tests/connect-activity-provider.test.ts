@@ -36,6 +36,7 @@ function snap(over: Partial<ConnectSnapshot>): ConnectSnapshot {
     discoveryLoading: false,
     updateSupported: false,
     updateReason: null,
+    revealSupported: false,
     ...over,
   };
 }

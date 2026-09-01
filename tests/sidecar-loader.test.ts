@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { tryFetchSidecarSpec } from '../src/core/engine/rv-scene-loader';
+import { resetSidecarProbeCache, tryFetchSidecarSpec } from '../src/core/engine/rv-scene-loader';
 
 const realFetch = globalThis.fetch;
 
@@ -13,6 +13,10 @@ function mockFetch(impl: (url: string) => Promise<Response>): void {
 
 afterEach(() => {
   globalThis.fetch = realFetch;
+});
+
+beforeEach(() => {
+  resetSidecarProbeCache();
 });
 
 describe('tryFetchSidecarSpec', () => {

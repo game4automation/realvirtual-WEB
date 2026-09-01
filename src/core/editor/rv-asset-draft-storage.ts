@@ -47,7 +47,14 @@ export interface AssetDraft {
 
 /** Where the document started from (mirrors AssetBase, kept JSON-local here). */
 export type AssetDraftBase =
-  | { kind: 'empty' }
+  // `{ kind: 'empty' }` was here until plan-719 F3, and its absence is the
+  // point: "New asset" creates a REAL document (bytes + manifest row) the
+  // moment it is asked for, so there is no longer such a thing as an asset
+  // that exists only in memory and has to invent a home at its first save.
+  // The whole first-save special case went with it. Records already on disk
+  // are read as {@link LegacyEmptyAssetBase} and converted by
+  // {@link migrateLegacyEmptyDraft}; nothing can produce one again, and that
+  // is enforced by this union rather than by a comment.
   /**
    * A GLB DOCUMENT the user owns — the one identity for owned bytes
    * (plan-716 §2.6, F6).
@@ -186,6 +193,102 @@ export type LegacyAssetDraftBase =
   | { kind: 'sceneDocument'; sceneId: string; sceneName: string }
   | { kind: 'projectDocument'; relPath: string; name: string }
   | { kind: 'libraryGlb'; fileName: string; relPath: string };
+
+/**
+ * The base an older build wrote for a document that had never been saved.
+ *
+ * Kept as a type of its own rather than a member of {@link LegacyAssetDraftBase}
+ * because it does not belong to that union's contract: those three are read by
+ * {@link upgradeLegacyAssetBase}, which is PURE and synchronous — it remaps
+ * fields it already has. An `'empty'` record has no fields to remap. Recovering
+ * it means creating a document, which writes bytes, writes a manifest row and
+ * can fail, so it needs its own async path ({@link migrateLegacyEmptyDraft})
+ * rather than a case bent into a pure function (plan-719 §2.9, R2-2).
+ */
+export type LegacyEmptyAssetBase = { kind: 'empty' };
+
+/**
+ * How a stale `'empty'` draft is turned into a real document — injected, not
+ * imported.
+ *
+ * Same reason `LegacyBaseResolver` above is injected: this module is a plain
+ * storage-shape file that the draft layer, the editor and the scene store all
+ * read, and importing the project package here would close the cycle
+ * (project → documents → drafts → project) the duplicated
+ * {@link stableDocumentIdOfPath} already exists to avoid.
+ */
+export interface LegacyEmptyDraftIo {
+  /** Can a document be created at all right now? A read-only project cannot. */
+  isWritable(): boolean;
+  /** Create the document (bytes first, row second) and answer its identity. */
+  createDocument(name: string): Promise<{ documentId: string; path: string; name: string }>;
+  /**
+   * Persist the converted identity back into the draft slot.
+   *
+   * This IS the idempotency marker (§2.9 point 2), and storing it in the slot
+   * rather than in a side table is what makes it correct by construction: a
+   * second load of the same record reads `kind: 'document'` and never reaches
+   * the create at all. Called only AFTER a successful create, so a failed
+   * conversion leaves the stale record intact for the next attempt.
+   */
+  rebase(base: Extract<AssetDraftBase, { kind: 'document' }>): Promise<void>;
+}
+
+/** A draft as this migration needs to see it — shell name plus its base. */
+export interface MigratableDraft {
+  shell: { name: string; base: AssetDraftBase | LegacyEmptyAssetBase };
+}
+
+/**
+ * Recover a draft an older build left with no home (plan-719 §2.9).
+ *
+ * ## The failure this exists to prevent
+ *
+ * Autosave and crash recovery persisted `shell.base = {kind:'empty'}` for every
+ * never-saved editor document. Once the union no longer carries that kind, the
+ * editor's `_loadBase` if-chain matches NOTHING for such a record — it does not
+ * throw, it simply falls through — and the recovery then replays the op log
+ * against an empty scene. The user's work is gone, silently, with no error and
+ * no draft left to try again from. That is the one outcome this codebase
+ * consistently refuses, so the record is converted into a real document BEFORE
+ * the replay, and the ops land on the document they were recorded against.
+ *
+ * ## The three answers
+ *
+ *  - a base that already names something — returned untouched, no I/O at all,
+ *    which is also what a second load of an already-converted slot hits;
+ *  - a stale `'empty'` in a writable project — a fresh document, with the slot
+ *    rebased onto it so this can never run twice;
+ *  - a stale `'empty'` with nowhere to write — `null`, meaning "tell the user
+ *    they need a writable project". The record is left exactly as it was, so
+ *    opening the same draft later in a real project still recovers it. Never a
+ *    silent discard.
+ *
+ * A create that FAILS propagates. Swallowing it would leave the caller unable
+ * to distinguish "no writable project" from "the write blew up", and would
+ * strand the draft under a recovery that reported success.
+ */
+export async function migrateLegacyEmptyDraft(
+  draft: MigratableDraft,
+  io: LegacyEmptyDraftIo,
+): Promise<AssetDraftBase | null> {
+  const base = draft.shell.base;
+  if (base.kind !== 'empty') return base as AssetDraftBase;
+  if (!io.isWritable()) return null;
+
+  const created = await io.createDocument(draft.shell.name || 'Untitled');
+  const next: Extract<AssetDraftBase, { kind: 'document' }> = {
+    kind: 'document',
+    documentId: created.documentId,
+    path: created.path,
+    name: created.name,
+  };
+  // Marker AFTER the create, never before: a rebase that ran first would point
+  // the slot at a document the failed create never made.
+  await io.rebase(next);
+  draft.shell.base = next;
+  return next;
+}
 
 /**
  * Is this a COMPLETE record an older build wrote for owned content?

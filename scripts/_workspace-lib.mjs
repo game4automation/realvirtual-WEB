@@ -110,7 +110,7 @@ const REGISTRATION_KEYS = new Set(['adapter', 'requires', 'status']);
 const REGISTRATION_STATUSES = Object.freeze(['stable', 'beta']);
 const GENERATED_GIT_ATTRIBUTES = [
   'connect/rag.zip filter=lfs diff=lfs merge=lfs -text',
-  'projects/*/models/*.glb filter=lfs diff=lfs merge=lfs -text',
+  'projects/**/*.glb filter=lfs diff=lfs merge=lfs -text',
   'realvirtual-web/public/models/*.glb filter=lfs diff=lfs merge=lfs -text',
   'realvirtual-web/public/models/library/**/*.glb filter=lfs diff=lfs merge=lfs -text',
 ];
@@ -163,13 +163,18 @@ const NON_DELIVERED_DOC_LINK_PREFIXES = [
 // assets are only partially tracked by Git and can hold other customers' geometry, so the
 // allowlists below are intersected with the Git index (see deliveredPublicModels) instead of
 // being copied from disk.
-// The DemoRealvirtual content is BUNDLED: it sits in the core tree's own `public/models/` and
-// `public/library/`. Named explicitly rather than globbed, because the rest of `public/models/`
-// is scratch. Delivered into the workspace's `public/models/`, which is where the runtime
+// The DemoRealvirtual content is BUNDLED: it sits at the ROOT of the core tree's own `public/`
+// (user decision 2026-08-31: the demo documents live at the main level, not in subfolders) and
+// in `public/library/`. Named explicitly rather than globbed, because `public/models/` is
+// scratch. Delivered into the workspace's `public/models/`, which is where the runtime
 // resolves models from — a customer needs a reference model next to their own machine.
 const DELIVERED_DEMO_MODEL_FILES = [
   'DemoRealvirtualWeb.glb',
   'DemoRealvirtualWeb.settings.json',
+  // User decision 2026-08-30: DemoRobotIK and DemoCSGMachining are internal dev/test
+  // models (repo fixtures for the IK/BVH/CSG suites) and are deliberately NOT part of
+  // the delivered demo surface. Keep this list in sync with the model entries of
+  // public/project.json documents[] — the deploy's manifest gate enforces equality.
 ];
 // Curated bundled-library categories under `public/library/`. Anything else there is scratch
 // or CAD-import material. Set this to [] to deliver a workspace without the bundled library.
@@ -183,6 +188,8 @@ const LIBRARY_CONSUMER_DIR = 'src/plugins/layout-planner';
 const CORE_SCRIPT_FILES = [
   'install-private-dependencies.mjs', 'patch-occt-memory.mjs',
   'build-local-library-catalog.mjs', 'inject-ga-settings.mjs',
+  // vite.config.ts imports this at config-load time — the staged build fails without it.
+  '_rv-private-assets.mjs', '_rv-private-assets.d.mts',
 ];
 // Directories outside src/ and public/ that staged source imports (schema/v1/rv-odt.json
 // via src/core/engine/rv-component-registry.ts) — the build fails without them.
@@ -238,7 +245,15 @@ const CORE_FEATURES = Object.freeze([
 // `SHARED_REPO` is the repository name itself, so the suggested folder matches what a
 // `git clone` produces instead of inventing a second name for the same thing.
 const SHARED_DISPLAY_NAME = 'realvirtual Commercial';
-const SHARED_CLONE_FOLDER = SHARED_REPO;
+// A FUNCTION, not a const: `SHARED_REPO` comes from `_rv-customers.mjs`, which imports this
+// module back (the deliberate cycle documented there). Reading an imported binding at module
+// EVALUATION time is the one thing that cycle cannot survive — whichever of the two modules is
+// entered first, the other one is still initialising, and `const X = SHARED_REPO` then throws
+// "Cannot access 'SHARED_REPO' before initialization". It did: every CLI whose first import was
+// `_rv-customers.mjs` (`rv-customers.mjs list|doctor|forgejo-sync`) died on this line before
+// printing anything. Inside a function body the read happens after both modules are evaluated,
+// which is what the cycle's contract has always required.
+const sharedCloneFolder = () => SHARED_REPO;
 
 //! The name a delivery may be called BY in generated, delivered text. It is the customer's
 //! display name in their own repository, and the neutral product name in the shared one.
@@ -501,8 +516,12 @@ function hubBaseUrl(privateRoot, customer) {
  * with an empty `projects/` folder they fill themselves. The ordering above
  * still matters, because a `hosted-link` customer has neither a licence key nor
  * a hub URL and must not be blamed for missing either.
+ *
+ * Exported since plan-434 Phase 5, because the batch release run has to filter
+ * the register by exactly this rule. A second copy of it in `/deliver-release`
+ * is how a customer silently drops out of — or into — a release.
  */
-function undeliverableReason(customer) {
+export function undeliverableReason(customer) {
   if (customer.delivery.channel !== 'git-workspace') {
     return `Customer "${customer.customer}" is a "${customer.delivery.channel}" customer, `
       + `no git delivery. See customers/${customer.customer}.json.`;
@@ -1013,13 +1032,15 @@ function deliveredPublicModels(coreRoot) {
 //! missing file throws rather than shipping an empty workspace.
 function copyDemoAssetsIntoCore(coreRoot, coreOutput) {
   const projectDir = join(coreRoot, 'public');
-  const sourceDir = join(projectDir, 'models');
   const targetDir = join(coreOutput, 'public', 'models');
   mkdirSync(targetDir, { recursive: true });
   for (const name of DELIVERED_DEMO_MODEL_FILES) {
-    const source = join(sourceDir, name);
-    if (!existsSync(source)) {
-      throw new Error(`Demo model is missing from the core public/ tree: ${source}`);
+    // Root of public/ since 2026-08-31 (demo documents at main level); the models/
+    // spelling is accepted as the pre-move fallback so an older core tree still delivers.
+    const source = [join(projectDir, name), join(projectDir, 'models', name)]
+      .find(candidate => existsSync(candidate));
+    if (!source) {
+      throw new Error(`Demo model is missing from the core public/ tree: ${join(projectDir, name)}`);
     }
     copyFileSync(source, join(targetDir, name));
   }
@@ -1050,6 +1071,111 @@ function writeDeliveredLibraryCatalog(projectDir, publicOutput, delivered) {
   const destination = join(publicOutput, LIBRARY_CATALOG);
   mkdirSync(dirname(destination), { recursive: true });
   writeFileSync(destination, JSON.stringify({ ...catalog, entries }, null, 2) + '\n');
+}
+
+// ─── The delivered reference model, as a manifest row (plan-735 Phase 1) ────
+//
+// `copyDemoAssetsIntoCore()` puts `DemoRealvirtualWeb.glb` into every delivery's
+// `realvirtual-web/public/models/`, and until plan-735 nothing DECLARED it: the
+// viewer found it through a build-time glob over `/public/models/*.glb` and
+// invented a project around it. That glob is gone, so the delivery has to say
+// what it ships — on both customer channels, in the two different files that
+// each of them actually boots from.
+
+//! Deploy-root-relative path of the delivered reference model. This is the address
+//! the removed build-time glob produced (`<BASE_URL>models/<file>`), and the one
+//! `realvirtual-web/public/settings.json` documents for `defaultModel`.
+const REFERENCE_MODEL_FILE = 'DemoRealvirtualWeb.glb';
+const REFERENCE_MODEL_PATH = `models/${REFERENCE_MODEL_FILE}`;
+const REFERENCE_MODEL_SETTINGS_PATH = `models/DemoRealvirtualWeb.settings.json`;
+
+//! Header of a generated, vendor-owned manifest (plan-735 F3).
+//!
+//! It is a JSON object key rather than a comment because `project.json` is JSON:
+//! `isValidProjectV2()` ignores unknown keys, so this travels intact through the
+//! reader and stays visible to whoever opens the file. Saying it out loud is the
+//! whole mitigation — the file sits in Zone A and every update replaces it
+//! wholesale (§3.2, user decision "vendor-owned, and say so").
+const GENERATED_MANIFEST_NOTICE =
+  'GENERATED BY realvirtual — do not edit. This file is owned by the vendor and is '
+  + 'replaced in full by every delivery update. To ship documents of your own, create a '
+  + 'project under projects/ and keep them there; projects/ is never touched by an update.';
+
+//! `stableDocumentId()` from `src/core/project/rv-project-documents.ts`, in Node.
+//!
+//! Deliberately a second implementation and not an import: this file is a plain
+//! `.mjs` staging script with no TypeScript build step in front of it, and the
+//! function it mirrors is a pure, path-derived hash whose whole contract is that
+//! it produces the same answer everywhere. `tests/customer-workspace.node.test.ts`
+//! asserts the two agree, which is what keeps the duplication honest.
+function stableDocumentIdOf(path) {
+  const clean = String(path ?? '').trim();
+  const slug = clean
+    .toLowerCase()
+    .replace(/\.(scene\.)?(glb|gltf|json|splat|ksplat|ply)$/i, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  let h = 2166136261;
+  for (let i = 0; i < clean.length; i++) {
+    h ^= clean.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return `doc_${slug || 'unnamed'}_${(h >>> 0).toString(36)}`;
+}
+
+//! The `documents[]` row for the delivered reference model.
+function referenceModelDocument() {
+  return {
+    id: stableDocumentIdOf(REFERENCE_MODEL_PATH),
+    name: 'realvirtual WEB Demo',
+    path: REFERENCE_MODEL_PATH,
+    section: 'models',
+    settingsPath: REFERENCE_MODEL_SETTINGS_PATH,
+  };
+}
+
+//! Writes the generated deploy-root manifest of a PROJECTLESS delivery (plan-735 F2/F3).
+//!
+//! A standard customer buys the product, not a project, so nothing in the delivery
+//! declares a document — `projects/` arrives empty and `public/project.json` (the
+//! DEMO manifest) is filtered out of every customer workspace. Before plan-735 the
+//! viewer papered over that with a synthetic manifest built from the build-time
+//! glob; with both gone, this file is what makes the delivery a project.
+//!
+//! **Written after `copyCore()` has run**, from the projectless branch of the
+//! staging function — never from `copyDemoAssetsIntoCore()`. `copyCore()` filters
+//! `public/project.json` out of every customer delivery (the demo manifest must
+//! not reach a customer, plan-726 F13), so a manifest generated before that pass
+//! would delete itself. The filter is unchanged and still refuses the demo one.
+//!
+//! `settings.defaultModel` here is the PROJECT's start document and is NOT the
+//! same field as `realvirtual-web/public/settings.json`'s: that one stays empty
+//! for a standard customer (they have no project of their own to open), and this
+//! one names the reference model so the delivery boots into something real.
+function writeGeneratedDeliveryManifest(coreOutput, delivery) {
+  const customer = String(delivery?.customer ?? '').trim();
+  const slug = customer.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  const modelPath = join(coreOutput, 'public', REFERENCE_MODEL_PATH);
+  if (!existsSync(modelPath)) {
+    // 1e: the delivery guarantee widened from "never model-less" to "never a
+    // model without a manifest row". Both halves throw, in the same run.
+    throw new Error('Cannot generate the delivery manifest: the reference model is missing from '
+      + `the staged workspace (${modelPath}). copyDemoAssetsIntoCore() must run first.`);
+  }
+  const manifest = {
+    _generated: GENERATED_MANIFEST_NOTICE,
+    schemaVersion: 2,
+    id: `prj_delivery_${slug || 'standard'}`,
+    name: String(delivery?.project ?? '').trim() || 'realvirtual WEB',
+    canonicalName: slug || 'delivery',
+    kind: 'delivery',
+    activeSceneId: null,
+    settings: { defaultModel: REFERENCE_MODEL_PATH },
+    documents: [referenceModelDocument()],
+  };
+  const destination = join(coreOutput, 'public', 'project.json');
+  writeFileSync(destination, JSON.stringify(manifest, null, 2) + '\n');
 }
 
 function copyCore(coreRoot, outputRoot, deliveredDocs, publicModels = new Set(), opts = {}) {
@@ -1090,6 +1216,22 @@ function copyCore(coreRoot, outputRoot, deliveredDocs, publicModels = new Set(),
     if (!includePublicDemoContent) {
       if (normalized === 'scenes' || normalized.startsWith('scenes/')) return false;
       if (normalized === 'aasx' || normalized.startsWith('aasx/')) return false;
+      // `public/project.json` is the DEMO project's manifest (plan-726 F13) —
+      // demo content, exactly like scenes/ and aasx/, and it must not reach a
+      // customer.
+      //
+      // It needs its own line because every rule above filters a SUBDIRECTORY,
+      // and this is a top-level file: it would sail straight past them into the
+      // build, then into `dist/` root, then onto the customer's deploy root —
+      // where `BundledBackend.readManifest()` reads exactly that path and would
+      // hand the customer realvirtual's demo project instead of their own.
+      if (normalized === 'project.json') return false;
+      // The demo documents live at the ROOT of public/ (2026-08-31) and are demo
+      // content exactly like scenes/ and project.json. Customers still get the
+      // reference model — copyDemoAssetsIntoCore delivers it into models/.
+      if (!normalized.includes('/') && DELIVERED_DEMO_MODEL_FILES
+        .some(name => normalized === name.toLowerCase())) return false;
+      if (!normalized.includes('/') && normalized.endsWith('.glb')) return false;
     }
     // The bundled component library is delivered by copyDemoAssetsIntoCore, which filters it
     // to DELIVERED_LIBRARY_CATEGORIES and writes a matching reduced catalog. Copying the tree
@@ -1252,11 +1394,30 @@ function bareDefaultModel(project) {
   return configured ? basename(String(configured).replace(/\\/g, '/')) : '';
 }
 
-function generatedSettings(project, delivery, connectPin) {
-  const settings = {
-    defaultModel: bareDefaultModel(project),
-    connectChannel: delivery.connectChannel,
-  };
+/**
+ * The delivered `public/settings.json`.
+ *
+ * `options.omitDefaultModel` (plan-721 F7) leaves the key out ENTIRELY rather
+ * than blanking it — an appliance delivery boots from `project.json`, which has
+ * been the single source of truth for what a project contains since plan-716,
+ * and a second copy of "which document opens first" baked into the runtime is
+ * exactly the LOP-116 class of bug: two answers that drift apart, with the
+ * stale one winning because it is the one the code reads first.
+ *
+ * An option rather than a fourth copy of this function. The three shapes a
+ * delivery can take already differ only in which keys they carry, and the way
+ * to keep them consistent is to keep them in one place — cloning it for the
+ * appliance would guarantee that the next key added lands in three of four.
+ *
+ * `options.modeLock` is the other half of the same delivery (F5): the box comes
+ * up locked into that workspace mode and cannot leave it.
+ */
+export function generatedSettings(project, delivery, connectPin, options = {}) {
+  const settings = {};
+  // Key ORDER is part of what the existing callers get: the previous shape put
+  // `defaultModel` first, so it is written first whenever it is written at all.
+  if (options.omitDefaultModel !== true) settings.defaultModel = bareDefaultModel(project);
+  settings.connectChannel = delivery.connectChannel;
   // NO prefill in the shared repository (plan-434 §2.7): settings.json is a
   // delivered file, and in a repository every standard customer can read, one
   // customer's licence key would be visible to all of them. It is left out
@@ -1266,10 +1427,27 @@ function generatedSettings(project, delivery, connectPin) {
   if (delivery.sharedRepo !== true) settings.connectLicensePrefill = delivery.connectLicenseKey;
   settings.analytics = { googleAnalyticsId: '' };
   if (connectPin) settings.connectDownload = { channel: delivery.connectChannel, ...connectPin };
+  // Last, and only when asked for: appended rather than woven in, so a delivery
+  // that does not lock produces a byte-identical file to the one it produced
+  // before this option existed.
+  const modeLock = typeof options.modeLock === 'string' ? options.modeLock.trim() : '';
+  if (modeLock !== '') settings.mode = { lock: modeLock };
   return settings;
 }
 
-function generateReadme(delivery, projectKey, model, features, projectPlugins = null, hasDiagnosis = true) {
+/**
+ * ` (BETA)` for a feature the manifest marks `status: "beta"`, `''` otherwise.
+ *
+ * FEATURES.md has said this in its `Status` column since the matrix existed; the
+ * README's licensed-features list said nothing, so a customer reading the file
+ * they are actually pointed at could not tell a finished feature from one still
+ * moving. Same source (`tier-manifest.json`), same statement, two renderings.
+ */
+function featureBetaSuffix(manifest, feature) {
+  return manifest?.registrations?.[feature]?.status === 'beta' ? ' (BETA)' : '';
+}
+
+function generateReadme(delivery, projectKey, model, features, projectPlugins = null, hasDiagnosis = true, manifest = null) {
   const plugins = projectPlugins ?? [];
   // The projectless (standard) delivery: the product with an empty `projects/`
   // folder. Every sentence that names a delivered project folder has to say
@@ -1279,11 +1457,11 @@ function generateReadme(delivery, projectKey, model, features, projectPlugins = 
   // The suggested local folder. In the shared repository it must not be a customer slug
   // (§2.7) — it is the repository's own name, which is also what `git clone` produces.
   const shared = delivery.sharedRepo === true;
-  const cloneFolder = shared ? SHARED_CLONE_FOLDER
+  const cloneFolder = shared ? sharedCloneFolder()
     : (projectKey ?? (typeof delivery.customer === 'string' && delivery.customer.trim()
       ? delivery.customer.trim() : 'realvirtual-web'));
   const licensedBlock = features.length
-    ? features.map((feature) => `- \`${feature}\``).join('\n')
+    ? features.map((feature) => `- \`${feature}\`${featureBetaSuffix(manifest, feature)}`).join('\n')
     : '- None enabled for this profile.';
   const projectBlock = plugins.length
     ? plugins.map((plugin) => `- \`${plugin.name}\` (${plugin.file})`).join('\n')
@@ -1379,6 +1557,7 @@ function generateReadme(delivery, projectKey, model, features, projectPlugins = 
     `### Receiving an update\n\n` +
     (projectless
       ? `An update arrives as a commit pushed to this repository by realvirtual. Take it with \`git pull\`. It replaces everything outside \`projects/\` - \`realvirtual-web/\`, \`realvirtual-web-pro/\`, the scripts and the manifests - and it never touches anything inside \`projects/\`. Your projects are yours: they are neither updated, nor merged, nor removed by a delivery.\n\n`
+        + `\`realvirtual-web/public/project.json\` is one of those replaced files. It is generated by realvirtual, it declares the delivered reference model, and every update overwrites it in full - so do not keep your own documents in it. Anything you want to survive an update belongs in a project under \`projects/\`.\n\n`
         + `After every update, read \`DELIVERY-REPORT.md\` in the repository root. It is regenerated each time and lists, in German, what was updated, added and removed, and any changes of yours outside \`projects/\` that the update overwrote.\n\n`
       : `An update arrives as a commit pushed to this repository by realvirtual. It touches three kinds of file, and the rule differs for each:\n\n`) +
     (projectless ? `` : `| What | What an update does |\n` +
@@ -1510,9 +1689,9 @@ function writeWorkspaceRecipes(root, projectKey, model, coreRoot) {
       `## Goal and outcome\n\nReplace the current \`${customerModel}\` model for project \`${projectArg}\` with a GLB exported from Unity. The result loads in the development server with the intended axes, units, and startup camera and without browser console errors.\n\n` +
       `## When to use\n\nUse this recipe after changing the machine in Unity or when introducing a different customer model.\n\n` +
       `## Prerequisites\n\n- realvirtual Professional in Unity with GLB export available.\n- Git and Git LFS installed; run \`git lfs install\` once per computer.\n- A clean export that includes the required realvirtual metadata.\n\n` +
-      `## Steps\n\n1. In Unity, export the machine with the realvirtual Professional GLB export.\n2. Copy the GLB into ${projectDirLink('project model directory', 'models/')}. The generated \`.gitattributes\` tracks \`projects/*/models/*.glb\` with Git LFS.\n3. To replace \`${customerModel}\` without a configuration change, keep exactly the same filename.\n4. If the filename changes, set \`defaultModel\` to the new bare filename in [settings.json](../realvirtual-web/public/settings.json); do not add a directory prefix.\n5. Start the workspace with \`start.ps1\` (Linux: \`./start.sh\`) and open http://localhost:5100. Hard-reload the browser and confirm that the requested GLB, rather than a cached previous file, loads.\n6. Check the machine's X/Y/Z orientation, physical scale and units, and the initial camera framing. Correct the Unity export or startup-camera data if any of them are wrong.\n7. Review \`git status\` and confirm that the GLB is handled by Git LFS before committing it.\n\n` +
+      `## Steps\n\n1. In Unity, export the machine with the realvirtual Professional GLB export.\n2. Copy the GLB into ${projectDirLink('project directory', '')} - any location inside the project works; the library lists every GLB the project contains. The generated \`.gitattributes\` tracks \`projects/**/*.glb\` with Git LFS.\n3. To replace \`${customerModel}\` without a configuration change, keep exactly the same filename.\n4. If the filename changes, set \`defaultModel\` to the new bare filename in [settings.json](../realvirtual-web/public/settings.json); do not add a directory prefix.\n5. Start the workspace with \`start.ps1\` (Linux: \`./start.sh\`) and open http://localhost:5100. Hard-reload the browser and confirm that the requested GLB, rather than a cached previous file, loads.\n6. Check the machine's X/Y/Z orientation, physical scale and units, and the initial camera framing. Correct the Unity export or startup-camera data if any of them are wrong.\n7. Review \`git status\` and confirm that the GLB is handled by Git LFS before committing it.\n\n` +
       `## Acceptance criteria\n\n- The model loads in the development server without browser console errors.\n- Axes, units, scale, and the startup camera are correct.\n- Git LFS tracks the GLB, and \`defaultModel\` is the bare filename of the delivered model.\n\n` +
-      `## Rollback\n\nRestore the previous tracked file with \`git checkout -- ${projectPath}/models/${customerModel}\`. If you changed \`defaultModel\`, also restore \`realvirtual-web/public/settings.json\`, then restart the development server.\n\n` +
+      `## Rollback\n\nRestore the previous tracked file with \`git checkout -- <path-to-the-glb-in-your-project>\`. If you changed \`defaultModel\`, also restore \`realvirtual-web/public/settings.json\`, then restart the development server.\n\n` +
       `## Common problems\n\n- **404 for the GLB:** the filename or \`defaultModel\` does not match, including letter case.\n- **Only a small text pointer is present:** run \`git lfs pull\`.\n- **Wrong size or orientation:** fix the Unity unit/axis export settings and export again.\n- **Old geometry remains:** hard-reload and verify the requested model URL in the browser Network panel.\n\n` +
       `## Security and version notes\n\nA GLB shipped to an authorized browser user can be downloaded by that user. Do not include geometry or metadata that the recipient is not permitted to receive. Version meaningful model changes in Git; for deployments that cache models, prefer a new filename when cache invalidation must be explicit.\n\n` +
       `## Further reading\n\n- [Unity-to-WEB workflow](../realvirtual-web/doc-unity-to-web.md)\n- [realvirtual WEB overview](../realvirtual-web/doc-webviewer.md)\n`,
@@ -1975,7 +2154,7 @@ function writeWorkspaceFiles(root, coreRoot, privateRoot, project, projectKey, d
   writeFileSync(join(core, 'public', 'settings.json'), JSON.stringify(generatedSettings(project, delivery, connectPin), null, 2) + '\n');
   const features = selectedFeatures(manifest, delivery);
   const projectPlugins = listProjectPluginNames(root, projectKey);
-  writeFileSync(join(root, 'README.md'), generateReadme(delivery, projectKey, bareDefaultModel(project), features, projectPlugins, hasDiagnosis));
+  writeFileSync(join(root, 'README.md'), generateReadme(delivery, projectKey, bareDefaultModel(project), features, projectPlugins, hasDiagnosis, manifest));
   writeWorkspaceRecipes(root, projectKey, bareDefaultModel(project), coreRoot);
   writeFileSync(join(root, 'CONTRIBUTING.md'), generateContributing(projectKey));
   const workspaceGuide = generateWorkspaceGuide(projectKey, deliveredDocs);
@@ -2021,6 +2200,16 @@ function writeWorkspaceFiles(root, coreRoot, privateRoot, project, projectKey, d
   if (existsSync(launcherSource)) {
     mkdirSync(join(root, 'tools'), { recursive: true });
     copyFileSync(launcherSource, join(root, 'tools', 'rv-launcher.ps1'));
+  }
+  // The native STEP converter (rv-step-convert + OCCT DLLs) is ExcludeFromSingleFile in
+  // Connect.csproj, so the downloaded single-file exe never contains it. It travels as a
+  // tracked workspace folder instead; rv-launcher.ps1 points StepImport__ConverterPath at it
+  // before starting CONNECT. Windows-only by design (PlatformSupported gates the rest).
+  const stepConverterSource = join(privateRoot, '..', 'realvirtual-Connect~', 'src', 'Connect', 'tools', 'rv-step-convert');
+  if (existsSync(join(stepConverterSource, 'rv-step-convert.exe'))) {
+    cpSync(stepConverterSource, join(root, 'tools', 'rv-step-convert'), { recursive: true, force: true });
+  } else {
+    console.warn(`[customer-workspace] WARNING: rv-step-convert not found at ${stepConverterSource}; CONNECT STEP import will be unavailable in this workspace.`);
   }
   const provisionInfluxSource = join(privateRoot, 'scripts', 'provision-influx.mjs');
   if (!existsSync(provisionInfluxSource)) {
@@ -2294,6 +2483,22 @@ export function stageFilteredSourceTree(options) {
       const projectsOutput = join(destinationRoot, 'projects');
       mkdirSync(projectsOutput, { recursive: true });
       writeFileSync(join(projectsOutput, '.gitkeep'), '');
+      // plan-735 Phase 1b/1d: the generated, vendor-owned deploy-root manifest.
+      // HERE and not in `copyDemoAssetsIntoCore()`: `projectless` is only known
+      // at this point (it is computed well after that call), and this is also
+      // the first point AFTER `copyCore()`'s `public/project.json` filter — the
+      // filter that would otherwise delete the file we just wrote (R4).
+      //
+      // …but NOT for the public demo staging. `bunny-deploy --demo` is also
+      // projectless and also commercial-tier, so it reaches this branch — while
+      // `includePublicDemoContent` is precisely the caller's statement that this
+      // is the DEMO and not a customer delivery. For it `copyCore()` deliberately
+      // KEPT the authorized `public/project.json` (`prj_sample`, kind `demo`,
+      // the curated documents incl. DemoPlanner), and generating over it would
+      // hand the hosted demo a `prj_delivery_standard` manifest with nothing but
+      // the reference model in it. The generated manifest is for customers who
+      // have no manifest of their own; the demo has one.
+      if (!includePublicDemoContent) writeGeneratedDeliveryManifest(coreOutput, delivery);
     }
     for (const key of projectKeys) {
       const projectOutput = join(destinationRoot, 'projects', key);
@@ -2301,6 +2506,30 @@ export function stageFilteredSourceTree(options) {
         (rel) => !rel.split('/').some((s) => projectExcluded.has(s)));
       const customerProjectConfig = readJson(join(projectOutput, 'project.json'));
       delete customerProjectConfig.delivery;
+      // plan-735 Phase 1a (F1), RESOLVED THE OTHER WAY — deliberately.
+      //
+      // The plan located the reference-model `documents[]` row here, at this
+      // seam. It cannot live here: `copyDemoAssetsIntoCore()` delivers
+      // `DemoRealvirtualWeb.glb` into the workspace's DEPLOY root
+      // (`realvirtual-web/public/models/`), not into `projects/<key>/`, so a row
+      // in THIS manifest names a file that is not under this manifest's root —
+      // a guaranteed 404, and the plan-731 release gate
+      // (`assertManifestResolves`, applied to `projects/<key>/`) rejects it on
+      // exactly that rule. Writing it anyway would trade a silent fill for a
+      // silent dead row.
+      //
+      // The row therefore belongs to the deploy root, which is where the
+      // generated vendor manifest declares it for the projectless channel
+      // (`writeGeneratedDeliveryManifest`). The project-bearing channel needs no
+      // equivalent: all three `development` customers in the register declare
+      // their own `models` section already (verified 2026-09-01 over
+      // `projects/*/project.json`), so Vektor B (§2.2) does not reach them, and
+      // their boot resolves through `settings.defaultModel` against `entries`,
+      // which `/__api/private-models` (dev) and `models.json` (deploy) still
+      // fill after the glob is gone. Generating a deploy-root manifest for them
+      // would be the actual regression: `hasDeployedManifest()` would flip true,
+      // the bundled backend would outrank their workspace, and the delivery
+      // would boot the reference model instead of the customer's machine.
       writeFileSync(join(projectOutput, 'project.json'), JSON.stringify(customerProjectConfig, null, 2) + '\n');
     }
     // hasDiagnosis:false (a --no-rag delivery) ships no connect/ payload, so the generated README
@@ -2387,12 +2616,16 @@ function hasLfsFilter(repoRoot, path) {
 
 //! Verifies that every Git LFS-filtered file is staged as a Git LFS v1 pointer.
 export function assertLfsPointer(repoRoot) {
-  const indexedPaths = execFileSync('git', ['ls-files', '-z'], { cwd: repoRoot })
+  // 256 MB like gitIn: `git show` of a wrongly-staged full binary (the very case this
+  // assertion exists to report) overflows the 1 MB default as spawnSync git ENOBUFS,
+  // which crashes the check instead of letting it state its finding.
+  const gitBuffer = { maxBuffer: 256 * 1024 * 1024 };
+  const indexedPaths = execFileSync('git', ['ls-files', '-z'], { cwd: repoRoot, ...gitBuffer })
     .toString('utf8')
     .split('\0')
     .filter(Boolean);
   for (const path of indexedPaths.filter((candidate) => hasLfsFilter(repoRoot, candidate))) {
-    const blob = execFileSync('git', ['show', `:${path}`], { cwd: repoRoot });
+    const blob = execFileSync('git', ['show', `:${path}`], { cwd: repoRoot, ...gitBuffer });
     const text = blob.toString('utf8');
     if (blob.length > 1024 || !text.startsWith('version https://git-lfs.github.com/spec/v1\n') || !/oid sha256:[0-9a-f]{64}/.test(text)) {
       throw new Error(`Staged ${path} is not a small Git LFS v1 pointer.`);

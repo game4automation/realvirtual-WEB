@@ -2,9 +2,9 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, expect, it, vi } from 'vitest';
-import type { AgentRunRecord } from '../src/plugins/agents/agent-provider';
-import { FakeAgentProvider } from '../src/plugins/agents/agent-provider';
-import { pollAgentRun } from '../src/plugins/agents/agent-store';
+import type { AgentRunRecord } from '../../realvirtual-WebViewer-Private~/src/plugins/agents/agent-provider';
+import { FakeAgentProvider } from '../../realvirtual-WebViewer-Private~/src/plugins/agents/agent-provider';
+import { pollAgentRun } from '../../realvirtual-WebViewer-Private~/src/plugins/agents/agent-store';
 
 function run(status: AgentRunRecord['status']): AgentRunRecord {
   return {

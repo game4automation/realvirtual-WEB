@@ -18,11 +18,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 import { glbWrite } from './helpers/scene-write';
-import {
-  BundledBackend,
-  publishedSceneId,
-  SAMPLE_PROJECT_ID,
-} from '../src/core/project/backends/bundled-backend';
+import { BundledBackend } from '../src/core/project/backends/bundled-backend';
 import { FolderBackend } from '../src/core/project/backends/folder-backend';
 import {
   assertWritable,
@@ -118,30 +114,54 @@ describe('BundledBackend', () => {
     await expect(b.writeScene()).rejects.toBeInstanceOf(BackendNotWritableError);
   });
 
-  it('synthesises the Sample manifest when the deploy has no project.json', async () => {
+  // ── plan-735 F6: the synthetic manifest is gone, and so is its spec ──────
+  //
+  // What stood here was the canonical specification of
+  // `BundledBackend._syntheticManifest()`: "a deploy with no project.json still
+  // yields the Sample project, assembled from the injected models and the
+  // `scenes/index.json` catalogue". Both the function and the catalogue are
+  // removed, so this is a REPLACEMENT rather than an edit — the old assertions
+  // describe behaviour that must no longer exist.
+  //
+  // The rule now: a deploy root either published a project or it did not, and
+  // the viewer never invents the difference away.
+  it('returns null when the deploy has no project.json, and says why', async () => {
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+    try {
+      const b = new BundledBackend({
+        fetchImpl: fakeFetch({}),
+        // Injected models are NOT a project. Before plan-735 these two entries
+        // were enough to manufacture one; the whole point is that they are not.
+        models: [{ url: '/models/Demo.glb', label: 'Demo' }],
+      });
+      expect(await b.readManifest()).toBeNull();
+      expect(b.hasDeployedManifest()).toBe(false);
+      // F7: named, not silent — and naming all three indistinguishable causes.
+      expect(warnings.join('\n')).toMatch(/project\.json could not be read/);
+      expect(warnings.join('\n')).toMatch(/404.*CORS.*file:\/\//s);
+    } finally {
+      console.warn = warn;
+    }
+  });
+
+  it('lists nothing when there is no manifest — no invented catalogue', async () => {
     const b = new BundledBackend({
       fetchImpl: fakeFetch({}),
       models: [{ url: '/models/Demo.glb', label: 'Demo' }],
-      publishedScenes: [
-        { file: 'DemoPlanner.scene.glb', urlName: 'DemoPlanner', label: 'Demo Planner' },
-      ],
     });
-    const p = await b.readManifest();
-    expect(p?.id).toBe(SAMPLE_PROJECT_ID);
-    expect(assetDocumentsOf(p, 'models')[0]?.label).toBe('Demo');
-    expect(sceneDocumentsOf(p)[0]?.id).toBe(publishedSceneId('DemoPlanner'));
-    expect(sceneDocumentsOf(p)[0]?.path).toBe('scenes/DemoPlanner.scene.glb');
+    expect(await b.listModels()).toEqual([]);
+    expect(await b.listDocuments()).toEqual([]);
+    expect(sceneDocumentsOf(await b.readManifest())).toEqual([]);
   });
 
-  it('published scene ids are stable across instances', async () => {
-    const make = () => new BundledBackend({
-      fetchImpl: fakeFetch({}),
-      publishedScenes: [{ file: 'A.scene.glb', urlName: 'A', label: 'A' }],
-    });
-    const first = sceneDocumentsOf(await make().readManifest())[0]?.id;
-    const second = sceneDocumentsOf(await make().readManifest())[0]?.id;
-    expect(first).toBe(second);
-  });
+  // (The INVALID-manifest half of F6 — a file that is there, parses, and is
+  // still not a v2 project — is pinned by the plan-726 F11b block further down,
+  // which plan-735 flipped from "falls back to the synthetic demo" to "is
+  // null". A bare `{schemaVersion: 2}` would not serve here: `migrateManifest()`
+  // mints an id and a name for it, so it is a VALID empty project, not an
+  // invalid one.)
 
   it('prefers a deployed project.json and keeps its own sections', async () => {
     const b = new BundledBackend({
@@ -165,14 +185,22 @@ describe('BundledBackend', () => {
     expect((p as Record<string, unknown>).models).toBeUndefined();
   });
 
-  it('fills the sections a deploy manifest leaves empty', async () => {
+  // plan-735 Phase 2 (Vektor B, §2.2). This asserted the OPPOSITE: that a
+  // manifest declaring no `models` section had one filled in from whatever the
+  // build's discovery had found. That fill ran on every valid manifest, which
+  // made the build-time glob the silent completion of any customer project that
+  // simply did not list its models — remove the glob and those projects boot to
+  // an empty viewport. Every manifest declares its own models now, and this
+  // pins that nothing is added behind its back.
+  it('does not fill a deploy manifest from injected models', async () => {
     const b = new BundledBackend({
       fetchImpl: fakeFetch({
         'project.json': { schemaVersion: 1, id: 'prj_deploy', name: 'Deploy' },
       }),
       models: [{ url: '/models/Demo.glb', label: 'Demo' }],
     });
-    expect((await b.listModels())[0]?.label).toBe('Demo');
+    expect(await b.listModels()).toEqual([]);
+    expect((await b.readManifest())?.id).toBe('prj_deploy');
   });
 
   it('reads a scene body over fetch as bytes, and refuses a JSON path', async () => {
@@ -225,11 +253,24 @@ describe('BundledBackend without a filesystem API', () => {
     expect(isSupported()).toBe(false);
   });
 
+  // Unchanged in substance, re-sourced by plan-735: the project a Safari/iPad
+  // visitor gets now comes from the deploy's OWN `project.json` — which every
+  // channel publishes — rather than from a manifest the backend invented around
+  // injected sources. The claim being proved is the same one: no filesystem
+  // API, still a complete project.
   it('still yields a full project, so no browser is left without one', async () => {
     const b = new BundledBackend({
-      fetchImpl: fakeFetch({}),
-      models: [{ url: '/models/Demo.glb', label: 'Demo' }],
-      publishedScenes: [{ file: 'A.scene.glb', urlName: 'A', label: 'A' }],
+      fetchImpl: fakeFetch({
+        'project.json': {
+          schemaVersion: 2,
+          id: 'prj_deploy',
+          name: 'Deploy',
+          documents: [
+            { id: 'doc_a', name: 'A', path: 'scenes/A.glb', section: 'scenes' },
+            { id: 'doc_demo', name: 'Demo', path: 'models/Demo.glb', section: 'models' },
+          ],
+        },
+      }),
     });
     expect(await b.readManifest()).not.toBeNull();
     expect(sceneDocumentsOf(await b.readManifest())).toHaveLength(1);
@@ -462,5 +503,139 @@ describe('listDocuments / statDocuments', () => {
     // Read-only bytes cannot drift from the manifest that describes them, and
     // `fetch` has no mtime worth trusting — so there is nothing to scan.
     expect(await b.statDocuments()).toEqual([]);
+  });
+});
+
+// ─── plan-726 F11b: the manifest gate, and its voice ────────────────────
+
+/**
+ * `readManifest()` had no validation and no logging at all.
+ *
+ * The only check on the path was `migrateManifest()`'s, which calls
+ * `isValidProjectV1()` — and V1 does not look at `documents[]`. So a deploy
+ * manifest declaring a document with no `id`, or `documents` as an object,
+ * was adopted in silence and then presented as an empty project. Since
+ * plan-726 the root `project.json` is what the public demo BOOTS from, so
+ * "adopted silently and wrong" became the worst of the three answers.
+ *
+ * Two properties are pinned here, and they are separate on purpose: the
+ * fallback must happen (the demo still loads), and it must be AUDIBLE (the
+ * file previously contained zero `console.*` calls, so every failure mode —
+ * 404, HTML error page, corrupt JSON, invalid schema — looked identical from
+ * outside).
+ *
+ * The 404 case and "a deployed manifest wins" are already covered above and
+ * are deliberately not repeated.
+ */
+
+/** A fetch that answers 200 with a body that is not JSON. */
+function fetchWithUnparseableBody(): typeof fetch {
+  return (async () => ({
+    ok: true,
+    status: 200,
+    json: async () => { throw new SyntaxError('Unexpected token < in JSON at position 0'); },
+    arrayBuffer: async () => new ArrayBuffer(0),
+  } as unknown as Response)) as typeof fetch;
+}
+
+describe('BundledBackend manifest validation (plan-726 F11b)', () => {
+  let warnings: string[];
+  let restoreWarn: typeof console.warn;
+
+  beforeEach(() => {
+    warnings = [];
+    restoreWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  });
+  afterEach(() => { console.warn = restoreWarn; });
+
+  it('falls back and WARNS when project.json is served but is not JSON', async () => {
+    const b = new BundledBackend({
+      fetchImpl: fetchWithUnparseableBody(),
+      models: [{ url: '/models/Demo.glb', label: 'Demo' }],
+    });
+    const p = await b.readManifest();
+
+    // Not a throw — and, since plan-735, not a plausible-looking substitute
+    // either: the deploy served something unreadable, so it has no project.
+    expect(p).toBeNull();
+    expect(b.hasDeployedManifest()).toBe(false);
+    expect(warnings.join('\n')).toMatch(/not valid JSON/i);
+  });
+
+  it('falls back and WARNS when project.json is valid JSON but invalid v2', async () => {
+    const b = new BundledBackend({
+      // Parses, survives `migrateManifest()` (V1 never looks at documents[]),
+      // and is still unusable: a document row with no `id`.
+      fetchImpl: fakeFetch({
+        'project.json': {
+          schemaVersion: 2,
+          id: 'prj_broken',
+          name: 'Broken',
+          documents: [{ path: 'models/Line.glb' }],
+        },
+      }),
+      models: [{ url: '/models/Demo.glb', label: 'Demo' }],
+    });
+    const p = await b.readManifest();
+
+    // Before plan-726 this returned `prj_broken` without a word; before
+    // plan-735 it returned the synthetic demo project in its place.
+    expect(p).toBeNull();
+    expect(b.hasDeployedManifest()).toBe(false);
+    expect(warnings.join('\n')).toMatch(/not a valid v2 project manifest/i);
+  });
+
+  it('rejects a manifest whose documents[] is not an array', async () => {
+    const b = new BundledBackend({
+      fetchImpl: fakeFetch({
+        'project.json': {
+          schemaVersion: 2, id: 'prj_broken', name: 'Broken',
+          documents: { 'models/Line.glb': {} },
+        },
+      }),
+    });
+    expect(await b.readManifest()).toBeNull();
+    expect(b.hasDeployedManifest()).toBe(false);
+  });
+
+  it('accepts a VALID manifest silently — the gate is not noisy', async () => {
+    const b = new BundledBackend({
+      fetchImpl: fakeFetch({
+        'project.json': {
+          schemaVersion: 2,
+          id: 'prj_ok',
+          name: 'Fine',
+          documents: [{ id: 'doc_line', path: 'models/Line.glb', section: 'models' }],
+        },
+      }),
+    });
+    const p = await b.readManifest();
+
+    expect(p?.id).toBe('prj_ok');
+    expect(b.hasDeployedManifest()).toBe(true);
+    expect(warnings).toEqual([]);
+  });
+
+  it('still accepts an UNMIGRATED manifest — validation runs after derivation', async () => {
+    // The regression this prevents: validating the raw bytes instead of the
+    // derived manifest would reject every pre-phase-6 customer deploy, which
+    // legitimately carries `models[]` and no `documents[]` at all.
+    const b = new BundledBackend({
+      fetchImpl: fakeFetch({
+        'project.json': {
+          schemaVersion: 1,
+          id: 'prj_legacy',
+          name: 'Legacy',
+          models: [{ path: 'models/Line.glb', label: 'Line' }],
+        },
+      }),
+    });
+    const p = await b.readManifest();
+
+    expect(p?.id).toBe('prj_legacy');
+    expect(b.hasDeployedManifest()).toBe(true);
+    expect(assetDocumentsOf(p, 'models')).toMatchObject([{ path: 'models/Line.glb' }]);
+    expect(warnings).toEqual([]);
   });
 });

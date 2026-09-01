@@ -88,6 +88,13 @@ function InstructionCard({
   const isLast = clamped >= stepCount - 1;
   const isFirst = clamped <= 0;
   const targetPaths = step?.targetPaths ?? [];
+  // plan-734 F6 — targets the model does not contain, resolved once at load.
+  // Until this existed, a step whose target had gone missing behaved exactly
+  // like a step with no target at all: the card appeared, the View button was
+  // there, and pressing it did nothing, silently.
+  const unresolvedPaths = step?.unresolvedTargetPaths ?? [];
+  const allTargetsMissing = targetPaths.length > 0
+    && unresolvedPaths.length === targetPaths.length;
 
   // Highlight the current step's targets in parallel (type color) whenever the
   // shown step changes. Cleared on unmount (dismiss / falling edge / model switch).
@@ -199,9 +206,23 @@ function InstructionCard({
             '&:hover': targetPaths.length > 0 ? { backgroundColor: 'rgba(255,255,255,0.06)' } : undefined,
           }}
         >
-          <Typography variant="caption" sx={{ flex: 1, minWidth: 0, lineHeight: 1.4, whiteSpace: 'pre-wrap' }}>
-            {step.instruction}
-          </Typography>
+          <Box sx={{ flex: 1, minWidth: 0 }}>
+            <Typography variant="caption" sx={{ display: 'block', lineHeight: 1.4, whiteSpace: 'pre-wrap' }}>
+              {step.instruction}
+            </Typography>
+            {/* A warning, not an error: a maintenance instruction with one dead
+                target is still perfectly readable and executable. It just must
+                not pretend the View button will do something. */}
+            {unresolvedPaths.length > 0 && (
+              <Typography
+                sx={{ display: 'block', mt: 0.25, fontSize: 10, color: 'warning.main', lineHeight: 1.3 }}
+              >
+                {unresolvedPaths.length === targetPaths.length
+                  ? `${unresolvedPaths.length === 1 ? 'Target object' : `All ${unresolvedPaths.length} target objects`} not found in the model`
+                  : `${unresolvedPaths.length} of ${targetPaths.length} target objects not found in the model`}
+              </Typography>
+            )}
+          </Box>
           <Box sx={{ display: 'flex', gap: 0.25, flexShrink: 0 }}>
             {aiAvailable && <AskAiButton onClick={askAi} />}
             {step.url && (
@@ -212,10 +233,24 @@ function InstructionCard({
               </Tooltip>
             )}
             {targetPaths.length > 0 && (
-              <Tooltip title="View in 3D">
-                <IconButton size="small" sx={{ p: 0.25 }} onClick={(e) => { e.stopPropagation(); onView(); }}>
-                  <Visibility sx={{ fontSize: 15 }} />
-                </IconButton>
+              <Tooltip
+                title={allTargetsMissing
+                  ? `Target not found in the model: ${unresolvedPaths[0]}`
+                  : 'View in 3D'}
+              >
+                {/* A disabled IconButton swallows pointer events, so MUI needs a
+                    wrapper element to hang the tooltip on — the same pattern the
+                    step-navigation buttons below already use. */}
+                <span>
+                  <IconButton
+                    size="small"
+                    sx={{ p: 0.25 }}
+                    disabled={allTargetsMissing}
+                    onClick={(e) => { e.stopPropagation(); onView(); }}
+                  >
+                    <Visibility sx={{ fontSize: 15 }} />
+                  </IconButton>
+                </span>
               </Tooltip>
             )}
           </Box>

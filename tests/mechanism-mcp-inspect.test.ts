@@ -24,6 +24,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+ import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import { Scene, Group, Object3D } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -56,7 +57,7 @@ function joint(nodePath: string, name: string): MechanismJointView {
 
 function link(nodePath: string, name: string): MechanismLinkView {
   return {
-    nodePath, name, hasBody: true,
+    nodePath, name, hasBody: true, hasMass: true,
     densityPreset: 'steel', densityKgM3: 7850,
     massKg: 4.25, comLocalMm: [0, 10, 0],
     massOverridden: false, comOverridden: false,
@@ -93,6 +94,7 @@ class FakeBridge implements MechanismUiBridge {
   list(): MechanismView[] { return this._views; }
   validate(): MechanismFindingView[] { return [FINDING]; }
   jog(): { converged: boolean; residualError: number } | null { return { converged: true, residualError: 0 }; }
+  solve(): { converged: boolean; residualError: number } | null { return { converged: true, residualError: 0 }; }
   rebuild(mechanismPath: string): void {
     this.rebuilt.push(mechanismPath);
     this.opCountAtRebuild.push(this.opCounter());
@@ -102,6 +104,7 @@ class FakeBridge implements MechanismUiBridge {
   forcesSnapshot(): null { return null; }
   solveStatics(): null { return null; }
   resetForces(): void {}
+  linkNodes(): { path: string; node: Object3D }[] { return []; }
 }
 
 // ─── Scene fixture ──────────────────────────────────────────────────────────
@@ -164,7 +167,7 @@ function makeEnv(): Env {
     rebuildGroupedBvh() {}, refitRaycastSubtrees() {},
   } as unknown as RVViewer;
 
-  const doc = AssetDocument.newUntitled(viewer);
+  const doc = scratchAssetDocument(viewer);
   setActiveAssetContext({ viewer, doc });
   return { viewer, doc, tools: new McpEditorTools(() => viewer) };
 }

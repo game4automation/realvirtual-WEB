@@ -7,7 +7,7 @@
  * Binding criterion (user decision): <= 2 ms MEDIAN additional tick time over
  * 600 ticks on the reference model, and the report must land in the same tick.
  *
- * The reference model is `public/models/DemoRobotIK.glb` (see
+ * The reference model is `../realvirtual-WebViewer-Private~/projects/Development/models/DemoRobotIK.glb` (see
  * rv-collision-bvh-coverage.test.ts for why). Its nodes are split into six
  * role bodies, all moving every tick, so the measurement covers the real work:
  * per-tick union boxes over every mesh, the cross-pair broadphase and the
@@ -23,6 +23,15 @@ import { createInlineBVHPort } from '../src/core/engine/rv-bvh-build-port';
 import { FakeHighlightHost } from './collision-fixture';
 import type { CollisionRoleName } from '../src/core/engine/rv-collision-role';
 import { DEV_GLB } from './fixtures/glb-paths.mjs';
+import { devAssetAvailable } from './fixtures/dev-asset-available';
+
+// plan-395: everything in `DEV_GLB` lives in the private Development project
+// and is absent from a public checkout. The suites below must then report
+// `skipped` rather than `passed` - a probe-and-return would leave this file
+// green while it checked nothing. The probe tests the CONTENT TYPE, not
+// `res.ok`: without the private sibling nothing claims `/private-assets/`, so
+// the dev server answers it with the SPA fallback, a 200 text/html.
+const DEV_ASSETS = await devAssetAvailable(DEV_GLB.robotIK);
 
 const MODEL = DEV_GLB.robotIK;
 const TICKS = 600;
@@ -40,7 +49,7 @@ function percentile(values: number[], p: number): number {
   return s[Math.min(s.length - 1, Math.floor(s.length * p))];
 }
 
-describe('collision tick cost (plan-394 perf gate)', () => {
+describe.skipIf(!DEV_ASSETS)('collision tick cost (plan-394 perf gate)', () => {
   it('stays within 2 ms median tick cost on the reference model', async () => {
     const gltf = await new GLTFLoader().loadAsync(MODEL);
     const root = gltf.scene;

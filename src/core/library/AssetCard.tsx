@@ -25,7 +25,10 @@
 
 import { forwardRef, type ReactNode } from 'react';
 import { Box, Typography, Tooltip } from '@mui/material';
-import { TimerOutlined, Landscape, PrecisionManufacturingOutlined } from '@mui/icons-material';
+import {
+  TimerOutlined, Landscape, MenuBookOutlined, PrecisionManufacturingOutlined,
+  SettingsEthernet,
+} from '@mui/icons-material';
 import type { LibraryCatalogEntry } from './library-types';
 
 /** Matches `CatalogBrowserVariant`; kept structural to avoid a circular import. */
@@ -62,6 +65,12 @@ export interface AssetCardProps {
    * an empty file is a fact, a blank square is a bug report.
    */
   empty?: boolean;
+  /**
+   * A stated glyph tile for an entry that has no picture BY NATURE — a CONNECT
+   * configuration or knowledge file, for instance — rather than one whose
+   * picture merely has not arrived. Takes precedence over the thumbnail slot.
+   */
+  glyph?: 'connect' | 'knowledge';
   /** Tooltip body (usually the component's behaviour description). */
   tooltip?: ReactNode;
   /** Controlled tooltip visibility — suppressed while dragging. */
@@ -86,6 +95,10 @@ const SCALE = {
 const ACCENT = 'rgba(79, 195, 247';   // Instrument Blue (DESIGN.md), alpha appended
 const SPLAT = 'rgba(139, 195, 74';
 const NEUTRAL = 'rgba(255, 255, 255';
+// The reference-file type colors (user decision 2026-08-19): CONNECT is green,
+// knowledge is realvirtual Magenta — same hues as the hero card's slot wells.
+const CONNECT = 'rgba(102, 187, 106';
+const KNOWLEDGE = 'rgba(233, 64, 120';
 
 export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function AssetCard(
   {
@@ -97,6 +110,7 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
     cursor,
     placeholderAction,
     empty = false,
+    glyph,
     tooltip,
     tooltipOpen,
     ...handlers
@@ -105,7 +119,21 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
 ) {
   const s = SCALE[variant];
 
-  const preview = entry.thumbnailUrl ? (
+  const preview = glyph === 'connect' ? (
+    <GlyphTile
+      accent={CONNECT}
+      icon={<SettingsEthernet sx={{ fontSize: s.glyph, color: `${CONNECT}, 0.6)` }} />}
+      label="Connect"
+      labelSize={s.glyphLabel}
+    />
+  ) : glyph === 'knowledge' ? (
+    <GlyphTile
+      accent={KNOWLEDGE}
+      icon={<MenuBookOutlined sx={{ fontSize: s.glyph, color: `${KNOWLEDGE}, 0.6)` }} />}
+      label="Knowledge"
+      labelSize={s.glyphLabel}
+    />
+  ) : entry.thumbnailUrl ? (
     <Box
       component="img"
       src={entry.thumbnailUrl}

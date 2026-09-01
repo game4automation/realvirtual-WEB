@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, expect, it } from 'vitest';
-import { parseAgentMarkdown } from '../src/plugins/agents/agent-report';
+import { parseAgentMarkdown } from '../../realvirtual-WebViewer-Private~/src/plugins/agents/agent-report';
 
 describe('agent report sanitizing', () => {
   it('keeps raw HTML inert and never creates image nodes', () => {

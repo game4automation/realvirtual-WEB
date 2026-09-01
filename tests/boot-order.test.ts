@@ -4,11 +4,19 @@
 /**
  * boot-order.test — plan-372 §9.28 (review findings S8 / M6).
  *
- * Boot has a cycle. `entries` and `availablePublishedScenes` must stand
- * before the `SceneStore` constructor reads them (`scene-store.ts`), but the
- * only pre-existing project resolution (`restoreLastProject`) required an
- * already-attached store. A line swap would either crash `attachToSceneStore`
- * or break the Examples mirroring.
+ * Boot has a cycle. `entries` must stand before the `SceneStore` constructor
+ * reads it (`scene-store.ts`), but the only pre-existing project resolution
+ * (`restoreLastProject`) required an already-attached store. A line swap would
+ * crash `attachToSceneStore`.
+ *
+ * **One of the two ordered lists is gone (plan-731 Phase 2).** The cycle used
+ * to have a second horn: `availablePublishedScenes` had to stand before the
+ * same constructor, because the store mirrored it into an Examples section.
+ * There is no such list and no such mirror — the examples are `documents[]`
+ * rows, read where every document is read — so that half of the invariant went
+ * with its cause rather than being left here as a green assertion about
+ * nothing. What is pinned in its place is the property that OUTLIVED it: the
+ * resolution yields a project with its documents while no store exists.
  *
  * The fix is a split, and these are its terms:
  *
@@ -54,12 +62,13 @@ import {
   resetProjectStore,
   type SceneStoreLike,
 } from '../src/core/project/project-store';
-import { BundledBackend, SAMPLE_PROJECT_ID } from '../src/core/project/backends/bundled-backend';
+import { BundledBackend } from '../src/core/project/backends/bundled-backend';
 import {
   WORKSPACE_DEFAULT_PROJECT_ID,
   WORKSPACE_DEFAULT_PROJECT_NAME,
 } from '../src/core/project/rv-workspace-default';
 import { FolderBackend } from '../src/core/project/backends/folder-backend';
+import { documentsOf } from '../src/core/project/rv-project-documents';
 import { clearSceneMutationListeners } from '../src/core/hmi/scene/rv-scene-mutations';
 import {
   clearAllScenes,
@@ -82,11 +91,55 @@ const scene = (id: string, name: string): RvScene => ({
   edits: { ops: [], settings: { catalogUrls: [], gridSizeMm: 500 } },
 });
 
-function bundled(models: Array<{ url: string; label: string }> = [], published: Array<{ file: string; urlName: string; label: string; mode?: string }> = []) {
+/**
+ * A bundled backend, over a deploy that publishes what it was given (plan-735 3b/5d).
+ *
+ * It used to be a 404 root plus injected `models`/`publishedScenes`, which the
+ * backend turned into a synthetic project. Both the synthesis and the
+ * `publishedScenes` injection are gone, so the fixture says the same thing the
+ * honest way: a deploy with documents DECLARES them in its `project.json`.
+ *
+ * Called with nothing it is still a 404 root — and that now means what it says:
+ * a deploy that publishes no manifest has no project, so the resolution falls
+ * through to "My Workspace". Several tests below depend on exactly that, which
+ * is why the empty case must not be given an empty manifest instead.
+ */
+function bundled(
+  models: Array<{ url: string; label: string }> = [],
+  scenes: Array<{ path: string; label: string; mode?: string }> = [],
+) {
+  const publishesNothing = models.length === 0 && scenes.length === 0;
+  const project = {
+    schemaVersion: 2,
+    id: 'prj_deploy',
+    name: 'Deploy',
+    documents: [
+      ...scenes.map(s => ({
+        id: `doc_${s.path.replace(/[^a-z0-9]+/gi, '_')}`,
+        name: s.label,
+        path: s.path,
+        section: 'scenes',
+        ...(s.mode ? { mode: s.mode } : {}),
+      })),
+      ...models.map(m => ({
+        id: `doc_${m.url.replace(/[^a-z0-9]+/gi, '_')}`,
+        name: m.label,
+        // `label` too: `assetDocumentsOf()` projects a document row onto the
+        // asset-entry shape, which reads `label` rather than `name`.
+        label: m.label,
+        path: m.url,
+        section: 'models',
+      })),
+    ],
+  };
   return new BundledBackend({
-    models,
-    publishedScenes: published,
-    fetchImpl: (async () => ({ ok: false, status: 404, json: async () => null } as unknown as Response)) as typeof fetch,
+    fetchImpl: (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (publishesNothing || !url.endsWith('project.json')) {
+        return { ok: false, status: 404, json: async () => null } as unknown as Response;
+      }
+      return { ok: true, status: 200, json: async () => project } as unknown as Response;
+    }) as typeof fetch,
   });
 }
 
@@ -144,15 +197,21 @@ describe('resolveActiveProject', () => {
     // produces models[] and scenes[] with no store in existence, and the bundled
     // fixture is the one that HAS both. Which project a projectless boot opens
     // is the separate question below (plan-716 F2).
+    //
+    // The scene row here comes from the deploy's own manifest (plan-735): the
+    // synthetic manifest and its `publishedScenes` injection are gone, so the
+    // fixture declares what it ships. What is pinned is unchanged — that half
+    // one completes, with models and scenes, without a store in existence.
     const resolved = await store.resolveActiveProject({
       workspaceDefault: false,
       bundledBackend: bundled(
         [{ url: '/models/Demo.glb', label: 'Demo' }],
-        [{ file: 'A.scene.glb', urlName: 'A', label: 'Demo A' }],
+        [{ path: 'scenes/A.glb', label: 'Demo A' }],
       ),
     });
     expect(resolved.kind).toBe('bundled');
-    expect(resolved.project?.id).toBe(SAMPLE_PROJECT_ID);
+    // The DEPLOY's id — the synthetic `prj_sample` is gone (plan-735 F6).
+    expect(resolved.project?.id).toBe('prj_deploy');
     expect(resolved.models.map(m => m.label)).toEqual(['Demo']);
     expect(resolved.scenes.map(s => s.name)).toEqual(['Demo A']);
   });
@@ -171,14 +230,17 @@ describe('resolveActiveProject', () => {
     expect(resolved.backend.isActive).toBe(false);
   });
 
-  it('the bundled demo stays reachable — it is a source, not the boot default', async () => {
-    // F2's other half: the demo did not go away, it stopped being the default.
+  it('the bundled deploy stays reachable — it is a source, not the boot default', async () => {
+    // F2's other half: the deploy's project did not go away, it stopped being
+    // the default. Re-sourced by plan-735 — the reachable project is the one the
+    // deploy PUBLISHES, not a `prj_sample` invented for a deploy that published
+    // nothing.
     const resolved = await store.resolveActiveProject({
       workspaceDefault: false,
-      bundledBackend: bundled(),
+      bundledBackend: bundled([{ url: '/models/Demo.glb', label: 'Demo' }]),
     });
     expect(resolved.backend.kind).toBe('bundled');
-    expect(resolved.project?.id).toBe(SAMPLE_PROJECT_ID);
+    expect(resolved.project?.id).toBe('prj_deploy');
   });
 
   it('prefers the last-opened folder project when its grant survived', async () => {
@@ -232,21 +294,33 @@ describe('resolveActiveProject', () => {
     expect(log).toEqual(['attach']);
   });
 
-  it('leaves the published-scene list resolvable before any store exists', async () => {
-    // The invariant §2.10 protects: `availablePublishedScenes` is derivable
-    // at this point in boot, i.e. before the SceneStore constructor reads it.
+  it('yields the project and its documents before any store exists', async () => {
+    // What survives of the §2.10 invariant after plan-731: the resolution is
+    // complete at this point in boot — a project, its backend and its document
+    // list — while the SceneStore constructor has not run. The published half
+    // of the old assertion is deliberately NOT restated: there is no second
+    // list to sequence, and asserting one from a foreign `scenes/index.json`
+    // would test the `discover` boundary, not the boot order.
     const resolved = await store.resolveActiveProject({
-      // The bundled tier is what publishes examples, so this net keeps resolving
-      // to it (plan-716 §2.2 — the option exists for exactly this).
+      // The bundled tier, so this net keeps resolving to it and not to
+      // "My Workspace" (plan-716 §2.2 — the option exists for exactly this).
       workspaceDefault: false,
-      bundledBackend: bundled([], [
-        { file: 'A.scene.glb', urlName: 'A', label: 'A', mode: 'planner' },
-        { file: 'B.scene.glb', urlName: 'B', label: 'B' },
+      bundledBackend: bundled([
+        { url: '/models/A.glb', label: 'A' },
+        { url: '/models/B.glb', label: 'B' },
       ]),
     });
-    expect(resolved.scenes).toHaveLength(2);
-    expect(resolved.scenes[0]!.mode).toBe('planner');
+    expect(resolved.project).toBeTruthy();
+    expect(resolved.kind).toBe('bundled');
+    expect(resolved.models).toHaveLength(2);
+    expect(documentsOf(resolved.project).map((d) => d.path))
+      .toEqual(expect.arrayContaining(['/models/A.glb', '/models/B.glb']));
   });
+
+  // The other half of the same statement — "no source declares a second list
+  // to order against" — is a SOURCE guard and lives where source guards can be
+  // read from disk: `demo-manifest-invariants.node.test.ts`. A `?raw` import of
+  // a `.ts` module does not resolve in this browser-mode suite.
 });
 
 // ─── Half two ───────────────────────────────────────────────────────────
@@ -275,11 +349,13 @@ describe('hydrateProjectScenes', () => {
   it('adopts the bundled project when that is what resolved', async () => {
     await store.resolveActiveProject({
       workspaceDefault: false,
-      bundledBackend: bundled([], [{ file: 'A.scene.glb', urlName: 'A', label: 'A' }]),
+      bundledBackend: bundled([], [{ path: 'scenes/A.glb', label: 'A' }]),
     });
     store.attachToSceneStore(fakeSceneStore([]));
     expect(await store.hydrateProjectScenes()).toBe(true);
-    expect(store.getProject()?.id).toBe(SAMPLE_PROJECT_ID);
+    // The DEPLOY's project id, not the synthetic demo's: since plan-735 the
+    // bundled backend adopts what the deploy published and never mints one.
+    expect(store.getProject()?.id).toBe('prj_deploy');
     expect(store.getSnapshot().backendKind).toBe('bundled');
   });
 

@@ -378,7 +378,7 @@ describe('Drive_FollowPosition binding and recording handoff', () => {
     disposeHarness();
     const viewer = viewerHandle.viewer;
     viewer.modelPluginManager ??= new ModelPluginManager();
-    await viewer.loadModel('/models/DemoRealvirtualWeb.glb');
+    await viewer.loadModel('/DemoRealvirtualWeb.glb');
     const playback = viewer.playback;
     const registry = viewer.registry;
     const store = viewer.signalStore;
@@ -407,7 +407,7 @@ describe('Drive_FollowPosition binding and recording handoff', () => {
     const viewer = viewerHandle.viewer;
     viewer.modelPluginManager ??= new ModelPluginManager();
     setContext('planner', false);
-    await viewer.loadModel('/models/DemoRealvirtualWeb.glb');
+    await viewer.loadModel('/DemoRealvirtualWeb.glb');
     const playback = viewer.playback!;
     const store = viewer.signalStore!;
     const registry = viewer.registry!;

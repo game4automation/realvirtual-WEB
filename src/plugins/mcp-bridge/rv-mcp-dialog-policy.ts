@@ -31,10 +31,19 @@
  * | `unsaved` | `cancel` | Refuse rather than guess. `web_editor_open` already takes `ifDirty` — a tool with an explicit parameter must not be second-guessed here. |
  * | `draft-recovery` | `restore` | Of `restore | discard`, only one is reversible. A silent discard is exactly the data loss the per-frame keyspace exists to prevent. |
  * | `shelved-drafts` | `{action:'later'}` | Touch nothing; the offer comes back. |
- * | `save-fallback` | `cancel` | Never trigger a browser download nobody asked for. The tool reports the real reason instead. |
+ * | `save-problem` | `cancel` | Never trigger a browser download nobody asked for. The tool reports the real reason instead. |
  * | `name` | `null` | An agent that wanted a name passed one (`web_editor_save name=`). Being asked means it did not — cancel and say so. |
  * | `reimport-report`, `cad-missing`, `stack-problem`, `merge-unapplied` | dismiss | Informational. Auto-dismissed but carried back in `autoAnsweredDialogs` WITH their detail, so the diagnostic is never lost. |
  * | `separate-preview`, `merge-preview` | decline | Interactive previews driven by a human flow; an agent has no business confirming a destructive mesh operation from a dialog it cannot see. |
+ *
+ * ## TWO stores since plan-719 §2.4
+ *
+ * The save dialogs (`unsaved`, `name`, `save-problem`) moved into the public
+ * `save-dialog-store`; the editor kept its authoring ones. A responder on the
+ * private store alone would therefore leave exactly the dialogs an MCP save
+ * raises unanswered — the failure this module exists to prevent, reintroduced
+ * by a refactor. Both are armed, both are released, and the public one is armed
+ * even in a Community build where the editor chunk does not exist at all.
  */
 
 /** Dialogs answered automatically during one MCP call. */
@@ -56,42 +65,62 @@ const NOOP_RELEASE: DialogPolicyRelease = () => [];
  * must never be the thing that breaks a tool call.
  */
 export async function installMcpDialogPolicy(): Promise<DialogPolicyRelease> {
-  let mod: typeof import('@rv-private/plugins/asset-editor/editor-dialog-store');
-  try {
-    mod = await import('@rv-private/plugins/asset-editor/editor-dialog-store');
-  } catch {
-    return NOOP_RELEASE;
+  const releases: DialogPolicyRelease[] = [];
+
+  // ── The public save dialogs. Always present, editor or not. ──
+  {
+    const save = await import('../../core/hmi/scene/save-dialog-store');
+    const previous = save.setDialogAutoResponder((d) => {
+      switch (d.kind) {
+        case 'unsaved': return 'cancel';
+        case 'save-problem': return 'cancel';
+        case 'name': return null;
+        default: return undefined;
+      }
+    });
+    // Drop anything logged before this call so the report is per-call.
+    save.takeSaveDialogAutoLog();
+    releases.push(() => {
+      save.setDialogAutoResponder(previous);
+      return save.takeSaveDialogAutoLog();
+    });
   }
-  if (typeof mod.setDialogAutoResponder !== 'function') return NOOP_RELEASE;
 
-  const { DIALOG_AUTO_DISMISS } = mod;
-
-  const previous = mod.setDialogAutoResponder((d) => {
-    switch (d.kind) {
-      case 'draft-conflict': return 'open-requested';
-      case 'unsaved': return 'cancel';
-      case 'draft-recovery': return 'restore';
-      case 'shelved-drafts': return { action: 'later' };
-      case 'save-fallback': return 'cancel';
-      case 'name': return null;
-      case 'reimport-report':
-      case 'cad-missing':
-      case 'stack-problem':
-      case 'merge-unapplied':
-        return DIALOG_AUTO_DISMISS;
-      default:
-        // Interactive previews and anything added later: let the human decide.
-        return undefined;
+  // ── The editor's authoring dialogs. Absent in a Community build. ──
+  try {
+    const mod = await import('@rv-private/plugins/asset-editor/editor-dialog-store');
+    if (typeof mod.setDialogAutoResponder === 'function') {
+      const { DIALOG_AUTO_DISMISS } = mod;
+      const previous = mod.setDialogAutoResponder((d) => {
+        switch (d.kind) {
+          case 'draft-conflict': return 'open-requested';
+          case 'draft-recovery': return 'restore';
+          case 'shelved-drafts': return { action: 'later' };
+          case 'name': return null;
+          case 'reimport-report':
+          case 'cad-missing':
+          case 'stack-problem':
+          case 'merge-unapplied':
+            return DIALOG_AUTO_DISMISS;
+          default:
+            // Interactive previews and anything added later: let the human decide.
+            return undefined;
+        }
+      });
+      mod.takeDialogAutoLog();
+      releases.push(() => {
+        mod.setDialogAutoResponder(previous);
+        return mod.takeDialogAutoLog();
+      });
     }
-  });
+  } catch {
+    // No editor chunk. The public half above is still armed, which is the
+    // half a Community build can actually raise.
+  }
 
-  // Drop anything logged before this call so the report is per-call.
-  mod.takeDialogAutoLog();
-
-  return () => {
-    mod.setDialogAutoResponder(previous);
-    return mod.takeDialogAutoLog();
-  };
+  if (releases.length === 0) return NOOP_RELEASE;
+  // Released in reverse, so nesting restores exactly what it replaced.
+  return () => releases.reverse().flatMap(release => release());
 }
 
 /**

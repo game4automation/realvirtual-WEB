@@ -154,7 +154,7 @@ describe('open / close / toggle', () => {
     openProjectsDashboard({ kind: 'library', sourceId: 'lib1' });
     setProjectsSearch('belt');
     setProjectsChip('conveyor');
-    setProjectsSelection({ kind: 'scene', sceneId: 's1' });
+    setProjectsSelection({ kind: 'document', documentId: 's1' });
 
     closeProjectsDashboard();
     openProjectsDashboard();
@@ -164,7 +164,7 @@ describe('open / close / toggle', () => {
     // a place they return to, not a form to fill in again.
     expect(s.search).toBe('belt');
     expect(s.chip).toBe('conveyor');
-    expect(s.selection).toEqual({ kind: 'scene', sceneId: 's1' });
+    expect(s.selection).toEqual({ kind: 'document', documentId: 's1' });
     expect(s.group).toEqual({ kind: 'library', sourceId: 'lib1' });
   });
 
@@ -181,7 +181,7 @@ describe('open / close / toggle', () => {
 describe('selection', () => {
   it('drops the selection, the chip and the tag when the rail group changes', () => {
     openProjectsDashboard();
-    setProjectsSelection({ kind: 'scene', sceneId: 's1' });
+    setProjectsSelection({ kind: 'document', documentId: 's1' });
     setProjectsChip('robot');
     setProjectsTag('line3');
     setProjectsRailGroup({ kind: 'models' });

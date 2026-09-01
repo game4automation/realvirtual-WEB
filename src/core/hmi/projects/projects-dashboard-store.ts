@@ -60,12 +60,19 @@ export type ProjectsRailGroup =
  * They are two variants rather than one with a flag because they answer to
  * different verbs: a folder can be renamed and dropped into, a `file` is an
  * attachment whose move rewrites `docs-index.json` (§2.6.5).
+ *
+ * `document` / `documentPath` were called `scene` / `model` until plan-720. The
+ * old names outlived the thing they described: since plan-716 there is one
+ * document type and both variants carried a document — one addressed BY ID, the
+ * other by its manifest PATH (which is what a published example and a tree row
+ * hand you). The names now say which key they hold, because that, and not an
+ * asset type, is the only difference between them.
  */
 export type ProjectsSelection =
   | { kind: 'none' }
   | { kind: 'project'; projectId: string }
-  | { kind: 'scene'; sceneId: string }
-  | { kind: 'model'; modelId: string }
+  | { kind: 'document'; documentId: string }
+  | { kind: 'documentPath'; path: string }
   | { kind: 'folder'; rootId: string; relPath: string }
   | { kind: 'file'; rootId: string; relPath: string }
   | { kind: 'asset'; providerId: string; sourceId: string; assetId: string };

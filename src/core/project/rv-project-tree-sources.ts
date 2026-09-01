@@ -23,11 +23,15 @@
  *     with an {@link DashboardTree.refs} index keyed by tree path. Parsing the
  *     path back apart would be the alternative, and a `providerId` containing a
  *     slash would silently break it.
- *  3. **What the project root contains.** Every manifest document, plus the
- *     paths `docs-index.json` points at. Deliberately not a recursive folder
- *     walk: the two things a move has to keep honest are a manifest row and a
- *     docs-index row (§2.6.5, F12/F13), and those are exactly these two
- *     listings. A file that is in neither is a file no reference can break on.
+ *  3. **What the project root contains.** Since plan-445 F1: EVERYTHING the
+ *     project folder holds. The four reference-bearing listings first — manifest
+ *     documents, the paths `docs-index.json` points at, the `*.connect.json`
+ *     configs and the `*.knowledge.md` files — and then, deduped against all
+ *     four, whatever else the backend's walk found ({@link
+ *     ProjectRootInput.plainFiles}). The distinction did not disappear, it moved:
+ *     a file in one of the four listings is a file a move has to keep honest
+ *     (§2.6.5, F12/F13), and a file in none of them is one no reference can
+ *     break on — so it is listed INERT and no verb touches it.
  *
  * ## Filtering
  *
@@ -41,6 +45,7 @@
  */
 
 import type { ProjectTreeFile, ProjectTreeRootInput } from './rv-project-tree';
+import { stripConnectConfigSuffix, stripKnowledgeFileSuffix } from './rv-project-refs';
 
 // ─── Inputs ─────────────────────────────────────────────────────────────
 
@@ -64,6 +69,31 @@ export interface ProjectRootInput {
    * targets. Anything already listed as a document is ignored.
    */
   attachments?: readonly string[];
+  /**
+   * Project-relative paths of the CONNECT configuration files
+   * (`*.connect.json`), from the backend's suffix walk. A config is a config
+   * by its ENDING, wherever it sits (plan-718 reference model) — this list is
+   * what makes one visible even though it is neither a manifest document nor a
+   * docs-index target. Anything already listed above is ignored.
+   */
+  configs?: readonly string[];
+  /**
+   * Project-relative paths of the knowledge files (`*.knowledge.md`) — the
+   * `knowledgeRef` twin of {@link configs}, same by-ending rule, same
+   * listing origin. Anything already listed above is ignored.
+   */
+  knowledge?: readonly string[];
+  /**
+   * Every REMAINING file of the project folder, from the backend's one walk
+   * (plan-445 F1) — internals already filtered by the backend.
+   *
+   * This is what turns the curated listing into the honest full view. A file
+   * that is none of the four lists above has no reference model behind it, so
+   * it arrives as an INERT row: visible, selectable, and refused by
+   * `canMoveInTree` / `canRenameInTree` as a source. Anything already listed
+   * above is ignored — same dedupe rule as {@link configs} / {@link knowledge}.
+   */
+  plainFiles?: readonly string[];
   /** `RvProject.folders` — the folders that exist while still empty. */
   folders?: readonly string[];
 }
@@ -88,12 +118,38 @@ export interface CatalogRootInput {
   /** Remote catalogs carry the `(o)` origin mark of §3.1. */
   remote: boolean;
   entries: readonly TreeCatalogEntryInput[];
+  /**
+   * What one of this root's rows POINTS AT. Defaults to `catalogAsset`.
+   *
+   * The built-in demo catalog (plan-445 F6) is a catalog root by structure and
+   * something else entirely by verb: a `catalogAsset` activates into the asset
+   * EDITOR, which is the wrong answer for a demo model — opening one has to
+   * load it as the working scene, exactly as the `?model=` deep link does. The
+   * two are therefore different ref kinds rather than one kind with a flag the
+   * activation handler has to remember to read.
+   */
+  refKind?: 'catalogAsset' | 'bundledDocument';
 }
 
 /** What one tree row points at. The tree model itself carries none of this. */
 export type DashboardTreeRef =
   | { kind: 'document'; path: string; documentId?: string }
   | { kind: 'attachment'; path: string }
+  /** A CONNECT configuration file — classified by ending, not by folder. */
+  | { kind: 'connectConfig'; path: string }
+  /** A knowledge file (`*.knowledge.md`) — classified by ending too. */
+  | { kind: 'knowledgeFile'; path: string }
+  /**
+   * Any other file of the project folder (plan-445 F1/F2). INERT: it carries a
+   * path so the pane can describe it, and no verb at all.
+   */
+  | { kind: 'plainFile'; path: string }
+  /**
+   * A read-only built-in demo model (plan-445 F6). `url` is what
+   * `sceneStore.openBuiltin` loads — the same deploy URL the `?model=` deep
+   * link resolves to — so activating one never switches the open project.
+   */
+  | { kind: 'bundledDocument'; url: string; path: string }
   | { kind: 'catalogAsset'; providerId: string; sourceId: string; assetId: string };
 
 export interface DashboardTree {
@@ -174,6 +230,68 @@ function uniquePath(taken: Set<string>, path: string): string {
   return path;
 }
 
+/** One project row on its way into the tree, before the collision pass. */
+interface PendingRow {
+  path: string;
+  name: string;
+  documentId?: string;
+  inert?: boolean;
+  /** True when {@link name} had a compound classifier ending removed. */
+  stripped?: boolean;
+  ref: DashboardTreeRef;
+}
+
+/** The directory part of a normalised path — `''` for the project root. */
+function dirOf(path: string): string {
+  const cut = path.lastIndexOf('/');
+  return cut < 0 ? '' : path.slice(0, cut);
+}
+
+/**
+ * "Is there another row with this name in this folder" as one string key.
+ *
+ * Joined with `/`, which is unambiguous rather than merely convenient: a
+ * directory carries no trailing slash and a display name can contain no `/` at
+ * all (`ILLEGAL_NAME` in `rv-project-tree.ts` forbids it, and a name derived
+ * from a path is one segment by construction). So no two distinct
+ * `(folder, name)` pairs can produce the same key.
+ */
+function folderNameKey(path: string, name: string): string {
+  return `${dirOf(path)}/${name.toLowerCase()}`;
+}
+
+/**
+ * Give a suffix-stripped row its FULL file name back when the short one would
+ * collide with a sibling (plan-445 §5.2).
+ *
+ * `device.connect.json` shows as `device` — which is right until something else
+ * in that folder also reads as `device`: an extension-less file of that name, or
+ * its knowledge twin `device.knowledge.md`, which strips to the same thing. Then
+ * there are two identical rows, the user cannot tell which is which, and the
+ * display-name collision check inside `canRenameInTree` starts refusing a rename
+ * the filesystem would happily accept. (A plain `device.json` is NOT one of
+ * these: the WHOLE `.connect.json` is stripped, not just `.connect`.)
+ *
+ * Only the STRIPPED rows give the short name up; the file that owns its name
+ * outright keeps it, so the fallback reads as "this one needed disambiguating"
+ * rather than as two arbitrary long names.
+ *
+ * In place, because the caller built the array and nothing else has seen it.
+ */
+function unstripCollidingNames(rows: PendingRow[]): void {
+  const seen = new Map<string, number>();
+  for (const row of rows) {
+    const key = folderNameKey(row.path, row.name);
+    seen.set(key, (seen.get(key) ?? 0) + 1);
+  }
+  for (const row of rows) {
+    if (!row.stripped) continue;
+    if ((seen.get(folderNameKey(row.path, row.name)) ?? 0) > 1) {
+      row.name = leafOf(row.path);
+    }
+  }
+}
+
 // ─── Build ──────────────────────────────────────────────────────────────
 
 /**
@@ -192,7 +310,7 @@ export function buildDashboardTree({
   const keep = accept ?? (() => true);
 
   if (project) {
-    const files: ProjectTreeFile[] = [];
+    const rows: PendingRow[] = [];
     const taken = new Set<string>();
 
     for (const doc of project.documents) {
@@ -202,9 +320,11 @@ export function buildDashboardTree({
       if (!keep({ name, path })) continue;
       if (taken.has(path)) continue;         // the manifest listed it twice
       taken.add(path);
-      files.push({ path, name, ...(doc.id ? { documentId: doc.id } : {}) });
-      refs.set(`${project.id}/${path}`, {
-        kind: 'document', path, ...(doc.id ? { documentId: doc.id } : {}),
+      rows.push({
+        path,
+        name,
+        ...(doc.id ? { documentId: doc.id } : {}),
+        ref: { kind: 'document', path, ...(doc.id ? { documentId: doc.id } : {}) },
       });
     }
 
@@ -214,9 +334,50 @@ export function buildDashboardTree({
       const name = leafOf(path);
       if (!keep({ name, path })) continue;
       taken.add(path);
-      files.push({ path, name });
-      refs.set(`${project.id}/${path}`, { kind: 'attachment', path });
+      rows.push({ path, name, ref: { kind: 'attachment', path } });
     }
+
+    for (const raw of project.configs ?? []) {
+      const path = normalise(raw);
+      if (path === '' || taken.has(path)) continue;
+      // The `.connect.json` ending is the CLASSIFIER, not part of the name —
+      // no row or card ever shows it. The path keeps it, of course: it is the
+      // identity every ref and every storage call runs on.
+      const name = leafOf(stripConnectConfigSuffix(path));
+      if (!keep({ name, path })) continue;
+      taken.add(path);
+      rows.push({ path, name, stripped: true, ref: { kind: 'connectConfig', path } });
+    }
+
+    for (const raw of project.knowledge ?? []) {
+      const path = normalise(raw);
+      if (path === '' || taken.has(path)) continue;
+      // Same rule as the configs above: the ending classifies, the name drops it.
+      const name = leafOf(stripKnowledgeFileSuffix(path));
+      if (!keep({ name, path })) continue;
+      taken.add(path);
+      rows.push({ path, name, stripped: true, ref: { kind: 'knowledgeFile', path } });
+    }
+
+    // LAST, and only what the four lists above did not claim: everything else
+    // the project folder holds (plan-445 F1). Inert — see `DashboardTreeRef`.
+    for (const raw of project.plainFiles ?? []) {
+      const path = normalise(raw);
+      if (path === '' || taken.has(path)) continue;
+      const name = leafOf(path);
+      if (!keep({ name, path })) continue;
+      taken.add(path);
+      rows.push({ path, name, inert: true, ref: { kind: 'plainFile', path } });
+    }
+
+    unstripCollidingNames(rows);
+    const files: ProjectTreeFile[] = rows.map(r => ({
+      path: r.path,
+      name: r.name,
+      ...(r.documentId ? { documentId: r.documentId } : {}),
+      ...(r.inert ? { inert: true } : {}),
+    }));
+    for (const r of rows) refs.set(`${project.id}/${r.path}`, r.ref);
 
     // Declared folders are NOT run through `accept`: the filter answers "does
     // this row match the search", and a folder that matches nothing still has
@@ -245,12 +406,16 @@ export function buildDashboardTree({
       if (!keep({ name, path: base })) continue;
       const path = uniquePath(taken, base);
       files.push({ path, name });
-      refs.set(`${id}/${path}`, {
-        kind: 'catalogAsset',
-        providerId: catalog.providerId,
-        sourceId: catalog.sourceId,
-        assetId: entry.assetId,
-      });
+      refs.set(`${id}/${path}`, catalog.refKind === 'bundledDocument'
+        // A built-in demo is addressed by the URL it loads from, which is what
+        // `assetId` carries for this root — see `CatalogRootInput.refKind`.
+        ? { kind: 'bundledDocument', url: entry.assetId, path }
+        : {
+          kind: 'catalogAsset',
+          providerId: catalog.providerId,
+          sourceId: catalog.sourceId,
+          assetId: entry.assetId,
+        });
     }
 
     roots.push({

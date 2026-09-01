@@ -302,11 +302,15 @@ The `web_*` tools fall into these groups (full reference in
   `web_view_source_markers`.
 - **Screenshot** — `web_screenshot`, `web_screenshot_burst`, `web_screenshot_annotated`,
   `web_screenshot_analyze` (see below).
-- **Authoring** (Layout Planner) — `web_mode_set`, `web_library_list`,
-  `web_library_describe`, `web_layout_place`, `web_layout_move`, `web_layout_remove`,
+- **Authoring** (Layout Planner) — `web_mode_set`, `web_catalog_list`,
+  `web_catalog_describe`, `web_layout_place`, `web_layout_move`, `web_layout_remove`,
   `web_layout_list`, `web_layout_snap_list`, `web_layout_snap_suggest`,
-  `web_layout_snap_attach`, `web_component_set`, `web_scene_new`, `web_scene_save`,
-  `web_scene_open`, `web_scene_list`, `web_scene_export`.
+  `web_layout_snap_attach`, `web_component_set`, `web_document_new`, `web_document_save`,
+  `web_layout_export`, `web_document_list`, `web_document_open`.
+  *(2026-08-19 rework: asset = document = model — one concept, one `web_document_*`
+  family. The old `web_scene_*`, `web_model_*` and `web_library_*` names are retired;
+  the parts catalogue is `web_catalog_*`, and the planner-snapshot export is
+  `web_layout_export`.)*
 - **Signal binding** (plan-425) — `web_signal_bindings_list`, `web_signal_sources_list`
   (read-only) and `web_signal_bind`, `web_signal_unbind` (write). See *Autobinding a PLC*
   below.
@@ -319,11 +323,60 @@ The `web_*` tools fall into these groups (full reference in
   instructions stay a compact map.
 - **Orient** (plan-707) — `web_describe` answers "where am I, what is blocked, what next"
   in one read-only call. See *Orientation and effect verification* below.
+- **Link out** (plan-437) — `web_link_compose` is the counterpart to every tool that OPENS
+  something: it hands back a URL. Called with no arguments it snapshots the current state
+  (document or model, the *live* active mode, the model option) into a link that reproduces
+  it; called with `model`/`glb`/`doc`/`scene`/`mode`/`option` it validates each against the
+  live catalogues and composes a canonical URL, plus an optional `base` override. Unknown
+  values are returned in `warnings[]` and still set, so a link is never withheld over a
+  catalogue miss. It is read-only, mints no share (an existing `s:<id>` is passed through,
+  never created), and composes from a strict allowlist — the current address bar is never
+  copied, so `devkey`/`sharetoken` cannot leak into a link that gets mailed or bookmarked.
 - **Perceive & navigate** (all modes) — `web_node_bounds`, `web_view_pick`,
   `web_view_gaze`, `web_view_isolate`, `web_screenshot_annotated`, `web_camera_get`,
-  `web_camera_set`, `web_camera_focus`, `web_camera_orbit`, `web_select`,
-  `web_selection_get`, `web_select_similar`. Camera tools animate the REAL viewport
-  camera, so a watching user sees exactly what the agent looks at.
+  `web_camera_set`, `web_camera_focus`, `web_camera_orbit`, `web_camera_fly`,
+  `web_view_sweep`, `web_select`, `web_selection_get`, `web_select_similar`. Camera tools
+  animate the REAL viewport camera, so a watching user sees exactly what the agent looks at.
+
+## Camera moves and timeouts
+
+Two tools (plan-705) move the camera far enough that the default call timeout matters.
+
+- **`web_camera_fly`** moves RELATIVE to the current pose — metres forward/right/up, degrees
+  of yaw/pitch — which is what travelling through a long line needs; `web_camera_orbit`
+  circles a fixed point and cannot do it. `ground=true` walks at eye height above the nearest
+  surface below, probed through the ordinary pick BVH, so modelled floors and platforms count,
+  not just the viewer's grid fixture. There is deliberately no wall collision.
+- **`web_camera_view`** (plan-713 F9) moves to a NAMED view — `iso | top | front | back |
+  left | right | home` — with `target` choosing what to frame (`"selection"`, a node path, or
+  the whole scene). The framing distance is MEASURED from the viewer's own fit rather than
+  re-derived, so a preset frames exactly as tightly as `web_camera_focus`. `web_camera_orbit`
+  gained a matching `pivot` parameter (`"selection"`, a node path, or omit for the current
+  target — the default is unchanged). Both refuse while FPV, camera-follow or XR own the
+  camera, as `web_camera_fly` already did: those three write the pose every frame, so a
+  scripted move would be silently overwritten.
+- **`web_view_sweep`** flies 4–8 views around a target and returns ONE labelled montage. It
+  freezes the orbit controls for its duration (a human orbiting mid-sweep would otherwise
+  overwrite the trajectory, leaving a cell that shows a different pose than its note claims)
+  and restores both the controls and the starting pose in a `finally`, so an aborted sweep
+  never strands the operator in a half-way pose.
+
+Both refuse rather than fight for the camera: while FPV, a camera-follow/sit-on mode or XR
+owns it, they answer `{ error, blockedBy }` and move nothing. A scripted move would be
+overwritten in the next frame anyway, and a silent no-op is worse than an error.
+
+**Timeouts.** CONNECT and the Node bridge both default to a 15 s call timeout — too tight for
+a sweep, which costs roughly 6–11 s before any reserve for a large scene. Both tools therefore
+declare their own: `timeoutMs: 30_000` for `web_camera_fly`, `timeoutMs: 120_000` for
+`web_view_sweep`. CONNECT clamps only at 600 s (`MaxToolTimeoutMs`) and the Node bridge passes
+the value through unclamped, so the declared number is what both transports use.
+
+**Where the notes arrive.** The sweep result is an image payload carrying `views`, `center`,
+`radius` and `restored` as extra metadata, and the bridge delivers those as a separate TEXT
+block beside the image — the same mechanism `web_render` uses for its legend. Angles are burned
+into the montage because they are meaningless without the picture; node paths stay in the text
+because they would be unreadable and expensive as pixels. Each note carries its measured
+`cameraPosition`, so pulling one cell up in full resolution is a single `web_camera_set`.
 - **Measure & analyse** (`McpObserveTools`, all read-only) — `web_measure` (pairwise
   distances, per-axis gaps and AABB separation between parts), `web_node_shape` (PCA
   shape class and the functional rotation axis of a part), `web_scene_query` (read-only
@@ -338,6 +391,25 @@ The `web_*` tools fall into these groups (full reference in
   (pose-sweep montage with exact restore). Every tool calls the same action functions
   the Quick Edit / Materials panel buttons call, against the op-logged AssetDocument —
   agent edits are undoable and reflected live in the UI.
+- **Document lifecycle** (plan-713, unified 2026-08-19) — `web_document_list` is THE one
+  list: every GLB document the project owns, with name, path, `section`, size and mtime
+  (`withNodeCount=true` adds a node count read from the GLB header alone), plus the
+  read-only built-in and published sources. Do not confuse it with `web_catalog_list`,
+  which is the placeable planner *catalogue*.
+  `web_document_update(action=delete|rename, relPath, newName?)` manages the saved files;
+  it is the one tool announced with `destructiveHint`, refuses anything outside
+  `library/Custom/` and refuses the file of the document currently open in the editor. A
+  delete moves the bytes to `.trash/`; a rename is copy-then-delete and says so in its
+  result. `web_editor_project_files(dir?, glob?)` browses the whole project, and answers
+  with the same `projectOpen:false` shape as `web_editor_project_info` when nothing is open.
+  Both save tools (`web_editor_save`, `web_document_save`) report `saveVerb` — `save`,
+  `save-into-project` (the write COPIES and changes the document's identity) or `blocked`
+  with a reason — the same verb the save card shows.
+- **Hierarchical editing** (plan-713 F10) — `web_editor_descend(path)` enters a referenced
+  asset as its own document one level deeper (the double-click gesture), and
+  `web_editor_back()` leaves it again. The chain is in `web_editor_status` as `depth` plus
+  `breadcrumb`. Editor mode only; `web_editor_back` refuses at the root, where
+  `web_editor_close` is the right verb.
 
 ## Orientation and effect verification
 
@@ -543,7 +615,25 @@ thing its name claims. Three tools let it keep that:
 
 The note is stored as the `NodeKnowledge` rv_extras entry on the glTF node, so it travels
 inside the GLB — no sidecar file, consistent with *GLB is the single source of truth*.
-There is **no HMI panel** for it: this is agent memory and a prompt input, not a UI feature.
+
+### Notes are visible in the Property Inspector — and read-only there
+
+Select an annotated node and the Property Inspector shows a `NodeKnowledge` section: a
+compact provenance line (relative date · author · confidence) over the note rendered as
+Markdown, GFM tables included, in a fixed-height box that scrolls in itself. The hierarchy
+carries the usual `NodeKnowledge` type chip, so an annotated node is findable without
+`web_knowledge_list`.
+
+**Nothing in that section is editable — by design.** There is no field, no save button and
+no delete button. Writing a note stays exclusively `web_knowledge_set`, which is what keeps
+one authorship convention (and the `confidence` discipline below) instead of two. The four
+provenance fields do not appear as rows at all; they are in the header.
+
+Read-only in the UI does **not** mean the fields are write-protected in the data model, and
+it deliberately must not: the inspector's read-only flag (`readonly: true` in the schema) is
+the same predicate the overlay write guard uses, so setting it would make
+`web_knowledge_set` fail on every field it writes. See plan-431 §2.1 and the warning comment
+in `rv-node-knowledge.ts`.
 
 `confidence` (`observed` | `inferred` | `unverified`) is the part worth insisting on. A
 hallucinated guess becomes an apparent fact simply by being written down, and the next
