@@ -103,6 +103,13 @@ export interface ProjectsDashboardSnapshot {
   chip: string | null;
   /** Selected tag of the document view, or null for "any tag". */
   tag: string | null;
+  /**
+   * Display name of a document currently being opened IN PLACE — the load
+   * runs behind the still-open dashboard while the hero band shows this name
+   * and the load's progress; the dashboard closes only once the model is in.
+   * `null` when no open-in-place is running.
+   */
+  opening: string | null;
 }
 
 const NONE: ProjectsSelection = { kind: 'none' };
@@ -117,6 +124,7 @@ let _snapshot: ProjectsDashboardSnapshot = {
   search: '',
   chip: null,
   tag: null,
+  opening: null,
 };
 
 const _listeners = new Set<() => void>();
@@ -184,6 +192,19 @@ export function closeProjectsDashboard(): void {
 }
 
 /**
+ * An open-in-place load began: `label` is what the hero band announces while
+ * the model loads behind the still-open dashboard.
+ */
+export function beginProjectsOpening(label: string): void {
+  publish({ opening: label });
+}
+
+/** The open-in-place load ended — success or failure, the hero goes back. */
+export function endProjectsOpening(): void {
+  publish({ opening: null });
+}
+
+/**
  * Switch between the project list and the open project.
  *
  * The search term is cleared with the screen: it filters completely different
@@ -225,7 +246,7 @@ export function setProjectsTag(tag: string | null): void {
 export function resetProjectsDashboardForTests(): void {
   _snapshot = {
     open: false, view: DEFAULT_VIEW, group: DEFAULT_GROUP, selection: NONE,
-    search: '', chip: null, tag: null,
+    search: '', chip: null, tag: null, opening: null,
   };
   _everOpened = false;
   _listeners.clear();

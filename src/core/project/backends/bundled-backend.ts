@@ -42,13 +42,11 @@ import {
   type RvProjectAssetEntry,
 } from '../rv-project-types';
 import {
-  assetDocumentsOf,
   documentsFromLists,
   readDocuments,
   sceneDocumentsOf,
-  sectionOfDocument,
+  stableDocumentId,
   withDerivedDocuments,
-  type DocumentSection,
   type DocumentStat,
 } from '../rv-project-documents';
 import type { RvDocumentEntry } from '../rv-project-types';
@@ -117,6 +115,19 @@ export const REALVIRTUAL_LIBRARY_PATH = 'library/catalog.json';
 
 /** A document that lives under `library/` — the place, read off the path. */
 const LIBRARY_PREFIX = /^library\//i;
+
+/**
+ * The asset endings a manifest row must carry to BE a document — the same list
+ * `FolderBackend.ASSET_EXTENSIONS` walks for. Everything else a manifest
+ * declares (`*.knowledge.md`, `*.connect.json`) is a file classified by its
+ * ending, not a document card.
+ */
+const ASSET_EXTENSIONS = ['.glb', '.gltf', '.splat', '.ksplat', '.ply'];
+
+function isBundledAssetPath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return ASSET_EXTENSIONS.some(ext => lower.endsWith(ext));
+}
 /** A document that lives under `models/`. See {@link BundledBackend.listModels}. */
 const MODELS_PREFIX = /^models\//i;
 
@@ -398,24 +409,49 @@ export class BundledBackend implements ProjectBackend {
   }
 
   /**
-   * The one list (plan-413 §2.4), assembled from the three listings.
+   * Every file the manifest declares — the manifest IS the walk here.
    *
-   * Sequential, not `Promise.all`, and deliberately so: {@link readManifest}
-   * sets its `_manifestRead` latch *before* awaiting the fetch, so a second
-   * caller arriving while the first is still in flight is handed the field it
-   * has not filled in yet — an empty project. Awaiting the manifest once up
-   * front makes the three listings cache hits and side-steps it entirely. (The
-   * latch itself is a pre-existing sharp edge; caching the in-flight promise
-   * instead of the result would be the real fix, and belongs to whoever owns
-   * that file next.)
+   * An HTTP deploy cannot enumerate its directory, so this is the only honest
+   * answer it can give, and it is enough for what reads it:
+   * {@link listProjectFiles} classifies the paths by ending, which is how a
+   * `*.knowledge.md` gets its own icon and detail pane instead of rendering as
+   * a model card. Declared asset files are documents and are filtered out here,
+   * exactly as the folder backend's own listing separates the two.
+   */
+  async listAllFiles(): Promise<string[]> {
+    return (readDocuments(await this.readManifest()) ?? [])
+      .map(d => (typeof d.path === 'string' ? d.path : ''))
+      .filter(path => path !== '' && !isBundledAssetPath(path));
+  }
+
+  /**
+   * The one list (plan-413 §2.4) — documents-first since plan-736.
+   *
+   * The manifest IS this backend's file scan: an HTTP deploy cannot walk its
+   * directory, so the declared `documents[]` rows ARE the list, filtered to
+   * asset files exactly as the folder backend's walk filters the files it
+   * finds. A `*.knowledge.md` or `*.connect.json` is not a document — it is a
+   * file classified by its ending, published via {@link listAllFiles}, which
+   * gives it its own icon and pane. No section machinery: the pre-736 assembly
+   * from the three prefix-filtered listings dropped every ROOT-LEVEL document
+   * (the folder is a place, not a type — plan-716), and the demo manifest
+   * declares nothing but root-level documents.
    */
   async listDocuments(): Promise<RvDocumentEntry[]> {
-    const manifest = await this.readManifest();
-    const declared = readDocuments(manifest) ?? [];
-    const scenes = sceneDocumentsOf(manifest);
-    const models = await this.listModels();
-    const library = await this.listLibrary();
-    return documentsFromLists({ scenes, models, library }, declared);
+    const declared = readDocuments(await this.readManifest()) ?? [];
+    const out: RvDocumentEntry[] = [];
+    for (const row of declared) {
+      if (!row || typeof row.path !== 'string' || !isBundledAssetPath(row.path)) continue;
+      // A hand-edited manifest may omit id or name; mint them the way every
+      // other listing does — id from the path, name from the file stem.
+      const id = typeof row.id === 'string' && row.id.trim() !== ''
+        ? row.id : stableDocumentId(row.path);
+      const stem = (row.path.split('/').pop() ?? row.path).replace(/\.[^.]+$/, '');
+      const name = typeof row.name === 'string' && row.name.trim() !== ''
+        ? row.name : (stem || row.path);
+      out.push({ ...row, id, name });
+    }
+    return out;
   }
 
   /**

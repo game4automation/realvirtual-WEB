@@ -656,7 +656,7 @@ export class SceneStore {
     documentId: string,
     opts: { name?: string; updateUrl?: boolean } = {},
   ): Promise<void> {
-    const row = this._documentRow(documentId);
+    const row = await this._documentRowOrAdopt(documentId);
     if (!row) throw new Error(`Document ${documentId} not found`);
     const name = opts.name?.trim() || row.name || row.id;
     const base: SceneBase = { kind: 'builtin', url: projectAssetUrl(row.path), label: name };
@@ -764,6 +764,26 @@ export class SceneStore {
   }
 
   /**
+   * {@link _documentRow}, with one recovery for a file that is on disk but has
+   * no manifest row yet: a GLB copied into an OPEN folder project through the
+   * file explorer (field finding wmyb 2026-09-02). Its card shows a DERIVED
+   * row whose id is path-minted (`stableDocumentId`), and the adopt verb mints
+   * the same id — so one rescan, which runs the adopt and writes the row,
+   * makes the very id that just missed resolve. Without this, the open falls
+   * through to the identity-less legacy path and the later save fails its
+   * "expected it to be new" precondition against the document's own file.
+   *
+   * Cheap on a genuine miss: `rescanDocuments()` is single-flighted, skips
+   * bundled backends, and writes nothing when there is nothing to adopt.
+   */
+  private async _documentRowOrAdopt(idOrScn: string): Promise<RvDocumentEntry | null> {
+    const row = this._documentRow(idOrScn);
+    if (row) return row;
+    await getProjectStore().rescanDocuments().catch(() => {});
+    return this._documentRow(idOrScn);
+  }
+
+  /**
    * Open a saved scene by id.
    *
    * A thin forward since plan-716 Phase 3: an id that names a document (which,
@@ -774,7 +794,7 @@ export class SceneStore {
    * yet — and it goes with the rest of the catalogue in Phase 6.
    */
   async openScene(id: string): Promise<void> {
-    const row = this._documentRow(id);
+    const row = await this._documentRowOrAdopt(id);
     if (row) return this.openDocument(row.id);
     // ── The cross-project hop (plan-726 follow-up) ───────────────────────
     //

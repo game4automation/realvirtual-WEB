@@ -35,7 +35,7 @@
  * would leave a customer build with the overlay under its own title bar.
  */
 
-import { useCallback, useEffect, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { Box, IconButton, TextField, Tooltip, Typography, InputAdornment } from '@mui/material';
 import { ArrowBack, Close, Search } from '@mui/icons-material';
@@ -97,6 +97,27 @@ export function ProjectsDashboard({
   const snap = useSyncExternalStore(subscribeProjectsDashboard, getProjectsDashboardSnapshot);
   const insets = useViewportInsets();
 
+  /**
+   * Exit choreography: a close SLIDES the dashboard off to the left instead
+   * of blinking it away — the freshly loaded model behind it is the reveal.
+   * The element keeps `display: flex` for the slide's duration, then goes
+   * back to the hidden-not-unmounted rule below. Under reduced motion the
+   * close stays instant.
+   */
+  const [closing, setClosing] = useState(false);
+  const wasOpen = useRef(snap.open);
+  useEffect(() => {
+    const was = wasOpen.current;
+    wasOpen.current = snap.open;
+    if (snap.open) { setClosing(false); return; }
+    if (!was) return;
+    if (typeof matchMedia === 'function'
+      && matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    setClosing(true);
+    const t = setTimeout(() => setClosing(false), 320);
+    return () => clearTimeout(t);
+  }, [snap.open]);
+
   const onKeyDown = useCallback((e: KeyboardEvent) => {
     if (e.key === 'Escape') {
       e.stopPropagation();
@@ -128,15 +149,24 @@ export function ProjectsDashboard({
         right: 0,
         bottom: 0,
         zIndex: PROJECTS_DASHBOARD_ZINDEX,
-        display: snap.open ? 'flex' : 'none',
+        display: snap.open || closing ? 'flex' : 'none',
         flexDirection: 'column',
+        // The exit slide (see `closing` above). Transitioned only on the way
+        // OUT: reopening snaps into place, because a place you return to
+        // should not perform an entrance.
+        transform: closing && !snap.open ? 'translateX(-100%)' : 'none',
+        opacity: closing && !snap.open ? 0 : 1,
+        transition: closing && !snap.open
+          ? 'transform 300ms cubic-bezier(0.22, 1, 0.36, 1), opacity 300ms ease-out'
+          : 'none',
         // Tier-3 glass over the viewport (DESIGN.md) — the 3D scene stays
         // faintly visible so the overlay reads as part of the same product.
         // The blur lives HERE, the paint on the sections below: the hero band
         // wears a lighter wash than the rest, and one backdrop-filter on the
         // root is what lets both share a single blurred scene behind them.
         backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
-        pointerEvents: 'auto',
+        // A sliding overlay must not take clicks with it.
+        pointerEvents: closing && !snap.open ? 'none' : 'auto',
       }}
     >
       {/* Header — title and window chrome only. */}

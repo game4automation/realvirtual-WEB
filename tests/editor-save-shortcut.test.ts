@@ -73,12 +73,33 @@ const backend = {
   id: 'backend-1',
   writable: true,
   isActive: true,
-  async writeBlob(relPath: string, blob: Blob) {
+  // plan-736: one write surface. The precondition is accepted and ignored —
+  // this file is about the shortcut, not about compare-and-swap.
+  async writeDocument(
+    ref: string | { path: string },
+    bytes: Uint8Array,
+    _opts: { expectedRevision: string },
+  ) {
+    const relPath = typeof ref === 'string' ? ref : ref.path;
     if (h.hold) await h.hold;
     writes.push(relPath);
-    h.files.set(relPath, await blob.text());
+    const text = new TextDecoder().decode(bytes);
+    h.files.set(relPath, text);
+    return { revision: await revisionOfBytes(bytes) };
   },
-  async readDocumentUrl(relPath: string) {
+  async readDocument(ref: string | { path: string }) {
+    const relPath = typeof ref === 'string' ? ref : ref.path;
+    const value = h.files.get(relPath);
+    if (value === undefined) return null;
+    const bytes = new TextEncoder().encode(value);
+    return {
+      bytes,
+      meta: { id: '', name: relPath, path: relPath },
+      revision: await revisionOfBytes(bytes),
+    };
+  },
+  async readDocumentUrl(ref: string | { path: string }) {
+    const relPath = typeof ref === 'string' ? ref : ref.path;
     const value = h.files.get(relPath);
     if (value === undefined) return null;
     const url = URL.createObjectURL(new Blob([value]));
@@ -96,6 +117,7 @@ const projectStore = {
 
 import { AssetEditorPlugin } from '@rv-private/plugins/asset-editor/index';
 import { forgetSavedRevisions, isSaving } from '../src/core/editor/rv-save-document';
+import { revisionOfBytes } from '../src/core/project/rv-scene-record';
 import type { AssetBase } from '../src/core/editor/rv-asset-document';
 import {
   libraryDocumentBase,

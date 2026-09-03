@@ -132,13 +132,9 @@ export interface DocumentCardProps {
    */
   onReveal?: () => void;
   /**
-   * Whether the hero preview picture may be rendered right now (hero only).
-   *
-   * The dashboard host stays mounted while hidden (`display:none`), so without
-   * this gate every model load/clear — i.e. every project switch — would
-   * re-render the preview offscreen for a card nobody can see. The mount that
-   * knows visibility (DocumentHeroSection via the projects-dashboard store)
-   * passes it in; the card itself stays decoupled from that store.
+   * @deprecated Accepted and ignored. The hero dropped its preview picture
+   * (user decision 2026-09-02) — the model behind the translucent band IS the
+   * picture. Kept so existing callers keep compiling.
    */
   previewVisible?: boolean;
   /**
@@ -342,7 +338,6 @@ export function DocumentCard({
   variant = 'compact',
   activeMode = null,
   onReveal,
-  previewVisible = true,
   connect = null,
   knowledge = null,
 }: DocumentCardProps) {
@@ -371,23 +366,6 @@ export function DocumentCard({
   /** The live region. Written on save transitions only — never on an edit. */
   const [announcement, setAnnouncement] = useState('');
 
-  /**
-   * Picture of the open document, as a PNG data URL.
-   *
-   * Rendered from what is IN the viewer rather than pulled through
-   * `ThumbnailService.enqueue` like a library card: the hero's document is the
-   * one already loaded, so there is nothing to resolve and no cache identity
-   * worth writing — a saved snapshot would go stale the moment the user moves
-   * something. `renderLiveNow` renders the live scene in place — never
-   * `renderNow`, whose clone/dispose cycle is O(model) and destroys resources
-   * shared with the live scene (that combination froze the dashboard for
-   * ~20 s on large models). It is synchronous on the service's one renderer,
-   * so it cannot interleave with a queued job.
-   *
-   * Null under a WebGPU viewer or before the model is in the scene; the slot
-   * then falls back to the document name, which is what it always showed.
-   */
-  const [preview, setPreview] = useState<string | null>(null);
   const documentKey = view
     ? (view.thumbnailKey ? JSON.stringify(view.thumbnailKey) : view.name)
     : null;
@@ -406,44 +384,6 @@ export function DocumentCard({
     const offClear = viewer.on('model-cleared', bump);
     return () => { offLoad(); offClear(); };
   }, [variant, viewer]);
-
-  /** What the current preview picture shows — skip when unchanged (reopen = free). */
-  const lastRenderedRef = useRef<{ key: string; tick: number } | null>(null);
-  useEffect(() => {
-    if (variant !== 'hero' || !viewer || !documentKey) {
-      setPreview(null);
-      lastRenderedRef.current = null;
-      return;
-    }
-    const root = viewer.currentModelRoot;
-    if (!root) {
-      // model-cleared: a stale picture must not survive a clear.
-      setPreview(null);
-      lastRenderedRef.current = null;
-      return;
-    }
-    const last = lastRenderedRef.current;
-    const upToDate = last !== null && last.key === documentKey && last.tick === modelTick;
-    if (!previewVisible) {
-      // Hidden dashboard: never render for a card nobody can see. Drop a
-      // picture of a DIFFERENT document/model so it cannot flash on reopen.
-      if (!upToDate) { setPreview(null); lastRenderedRef.current = null; }
-      return;
-    }
-    if (upToDate) return;
-    // Double rAF: the first frame paints the dashboard overlay, the second
-    // does the offscreen render — the user sees the screen before the work.
-    let raf2 = 0;
-    const raf1 = requestAnimationFrame(() => {
-      raf2 = requestAnimationFrame(() => {
-        lastRenderedRef.current = { key: documentKey, tick: modelTick };
-        setPreview(viewer.thumbnails.renderLiveNow(root, 512));
-      });
-    });
-    return () => { cancelAnimationFrame(raf1); cancelAnimationFrame(raf2); };
-    // Deliberately NOT keyed on `version`: the view republishes on every edit,
-    // and re-rendering the whole model for a dirty dot is not worth a frame.
-  }, [variant, viewer, documentKey, modelTick, previewVisible]);
 
   /**
    * Distinct referenced assets of the loaded model, split local vs cloud.
@@ -863,59 +803,11 @@ export function DocumentCard({
             }}
       >
         {hero ? (
-          /* A slim banner, not a poster: picture left, one line of content
-             right, vertically centred. Undo/redo stay with the compact header
-             where the editing happens — here they were dead weight between the
-             title and the kebab. */
+          /* A slim banner, not a poster — and pictureless (user decision
+             2026-09-02): the model itself is on screen behind the translucent
+             band, so a rendered thumbnail beside it repeated what the eye
+             already sees. */
           <Box sx={{ display: 'flex', alignItems: 'stretch', gap: 2 }}>
-            {/* The picture. Fixed box (the render is square, so letting the
-                image set the row height would balloon the card); keyboard
-                users focus it as the card's one reveal control (mouse clicks
-                bubble to the card itself). */}
-            <Box
-              data-testid="document-card-preview"
-              key={documentKey ?? view.name}
-              role={onReveal ? 'button' : undefined}
-              tabIndex={onReveal ? 0 : undefined}
-              aria-label={onReveal ? `Show ${view.name} in the library` : undefined}
-              onKeyDown={(e) => {
-                if (!onReveal) return;
-                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onReveal(); }
-              }}
-              sx={{
-                // Stretches to the right column's height (the row is
-                // `alignItems: stretch`), so the picture and the content block
-                // always share top AND bottom edge. FULL-BLEED: the render
-                // fills its frame edge to edge — an inner margin here read as
-                // a picture floating in a box.
-                width: 200, alignSelf: 'stretch', minHeight: 150, flexShrink: 0,
-                borderRadius: '4px',
-                border: '1px solid rgba(255,255,255,0.08)',
-                bgcolor: 'rgba(255,255,255,0.02)',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                overflow: 'hidden',
-                '&:focus-visible': {
-                  outline: '1px solid rgba(79,195,247,0.8)',
-                  outlineOffset: 1,
-                },
-              }}
-            >
-              {preview
-                ? (
-                  <Box
-                    component="img"
-                    src={preview}
-                    alt=""
-                    sx={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                  />
-                )
-                : (
-                  <Typography sx={{ fontSize: 11, color: 'text.disabled', px: 1 }}>
-                    {view.name}
-                  </Typography>
-                )}
-            </Box>
-
             {/* One frame level, not four: the card is the frame, the identity
                 cluster sits at the top, a hairline separates it from the slot
                 wells pinned to the bottom. The old inner border box doubled

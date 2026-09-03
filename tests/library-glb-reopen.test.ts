@@ -66,11 +66,31 @@ const backend = {
   id: 'fake-browser',
   writable: true,
   isActive: true,
-  async writeBlob(relPath: string, blob: Blob) {
+  // plan-736: one write surface. The precondition is accepted and ignored —
+  // this file is about the round trip, not about compare-and-swap.
+  async writeDocument(
+    ref: string | { path: string },
+    bytes: Uint8Array,
+    _opts: { expectedRevision: string },
+  ) {
+    const relPath = typeof ref === 'string' ? ref : ref.path;
     writes.push(relPath);
-    h.blobs.set(relPath, blob);
+    h.blobs.set(relPath, new Blob([bytes as BlobPart]));
+    return { revision: await revisionOfBytes(bytes) };
   },
-  async readDocumentUrl(relPath: string) {
+  async readDocument(ref: string | { path: string }) {
+    const relPath = typeof ref === 'string' ? ref : ref.path;
+    const blob = h.blobs.get(relPath);
+    if (!blob) return null;
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    return {
+      bytes,
+      meta: { id: '', name: relPath, path: relPath },
+      revision: await revisionOfBytes(bytes),
+    };
+  },
+  async readDocumentUrl(ref: string | { path: string }) {
+    const relPath = typeof ref === 'string' ? ref : ref.path;
     const blob = h.blobs.get(relPath);
     if (!blob) return null;
     const url = URL.createObjectURL(blob);
@@ -89,6 +109,7 @@ const store = {
 };
 
 import { saveDocument } from '../src/core/editor/rv-save-document';
+import { revisionOfBytes } from '../src/core/project/rv-scene-record';
 import { AssetEditorPlugin } from '@rv-private/plugins/asset-editor/index';
 import type { AssetBase } from '../src/core/editor/rv-asset-document';
 import {

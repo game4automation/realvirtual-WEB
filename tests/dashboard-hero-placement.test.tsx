@@ -83,8 +83,9 @@ describe('dashboard hero placement', () => {
     renderDashboard();
     const style = getComputedStyle(screen.getByTestId('document-hero'));
     expect(style.justifyContent).toBe('center');
-    // A band, not a column beside something: it owns the whole row.
-    expect(screen.getByTestId('document-hero').parentElement)
+    // A band, not a column beside something: it owns the whole row. The hero
+    // sits inside its translucent band wrapper, which sits on the region.
+    expect(screen.getByTestId('document-hero').parentElement?.parentElement)
       .toBe(screen.getByRole('region', { name: 'Projects' }));
   });
 
@@ -102,11 +103,13 @@ describe('dashboard hero placement', () => {
       .toContain('double-click an asset');
   });
 
-  it('clicking the preview asks the dashboard to reveal the asset', () => {
+  it('clicking the card asks the dashboard to reveal the asset', () => {
+    // The hero dropped its preview picture (2026-09-02); the whole card is
+    // the one navigation target now.
     const onReveal = vi.fn();
     setActiveDocumentView(makeView());
     renderDashboard(onReveal);
-    fireEvent.click(screen.getByTestId('document-card-preview'));
+    fireEvent.click(screen.getByTestId('document-card'));
     expect(onReveal).toHaveBeenCalledTimes(1);
   });
 });

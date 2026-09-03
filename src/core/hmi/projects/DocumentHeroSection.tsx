@@ -23,7 +23,11 @@
  */
 
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
-import { Box, Button, Typography } from '@mui/material';
+import { Box, Button, LinearProgress, Typography } from '@mui/material';
+import {
+  getModelLoadProgressSnapshot,
+  subscribeModelLoadProgress,
+} from '../model-load-progress-store';
 import {
   clearActiveDocumentState,
   confirmPendingActivation,
@@ -51,6 +55,70 @@ import {
 } from './projects-dashboard-store';
 import { CONNECT_CONFIG_DRAG_TYPE, KNOWLEDGE_FILE_DRAG_TYPE } from './connect-config-dnd';
 import { DocumentCard, type DocumentCardRefSlot } from '../scene/DocumentCard';
+
+/**
+ * The hero while an open-in-place load runs (plan: cool + animated open).
+ *
+ * The card of the OLD document slides away and this takes its place: the
+ * target's name at title weight, the load's progress underneath — determinate
+ * while bytes stream (monospace MB, DESIGN.md's rule for measured values),
+ * indeterminate for parse + scene construction. It reads the same
+ * model-load-progress-store the splash writes, so the two can never disagree;
+ * the dashboard itself closes (with its exit slide) only when the load is in.
+ */
+function OpeningHero({ label }: { label: string }) {
+  const progress = useSyncExternalStore(subscribeModelLoadProgress, getModelLoadProgressSnapshot);
+  const determinate = progress.active && !progress.preparing && progress.total > 0;
+  const pct = determinate ? Math.min(100, (progress.loaded / progress.total) * 100) : 0;
+  const mb = (n: number) => (n / (1024 * 1024)).toFixed(1);
+  return (
+    <Box
+      data-testid="document-hero-opening"
+      // Keyed mount per open: rises in once, then only the bar moves. An
+      // OVERLAY on the hero band, so the band keeps the height of the (dimmed)
+      // card underneath — the load must not make the layout jump.
+      key={label}
+      sx={{
+        position: 'absolute',
+        inset: 0,
+        px: 4,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 1,
+        '@keyframes rvHeroOpeningIn': {
+          from: { opacity: 0, transform: 'translateY(6px)' },
+          to: { opacity: 1, transform: 'none' },
+        },
+        animation: 'rvHeroOpeningIn 220ms cubic-bezier(0.22, 1, 0.36, 1)',
+        '@media (prefers-reduced-motion: reduce)': { animation: 'none' },
+      }}
+    >
+      <Typography sx={{ fontSize: 16, fontWeight: 600, maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        {label}
+      </Typography>
+      <LinearProgress
+        variant={determinate ? 'determinate' : 'indeterminate'}
+        value={pct}
+        sx={{
+          width: 'min(60%, 480px)',
+          height: 3,
+          borderRadius: '2px',
+          bgcolor: 'rgba(255,255,255,0.08)',
+          '& .MuiLinearProgress-bar': { bgcolor: '#4fc3f7' },
+        }}
+      />
+      <Typography sx={{ fontSize: 11, color: 'text.secondary', fontFamily: determinate ? 'monospace' : 'inherit' }}>
+        {progress.preparing
+          ? 'Preparing scene…'
+          : determinate
+            ? `${mb(progress.loaded)} / ${mb(progress.total)} MB`
+            : 'Loading…'}
+      </Typography>
+    </Box>
+  );
+}
 
 export interface DocumentHeroSectionProps {
   /**
@@ -238,8 +306,20 @@ export function DocumentHeroSection({ onReveal }: DocumentHeroSectionProps) {
         py: 1.25,
         borderBottom: '1px solid rgba(255,255,255,0.06)',
         flexShrink: 0,
+        // Anchor for the open-in-place overlay (OpeningHero).
+        position: 'relative',
       }}
     >
+      {/* While an open-in-place load runs, the current content stays MOUNTED
+          and merely dims — the band keeps its exact height — while the
+          opening panel floats over it. */}
+      <Box
+        sx={{
+          width: '100%', display: 'flex', justifyContent: 'center',
+          transition: 'opacity 200ms ease-out',
+          ...(dashboard.opening !== null && { opacity: 0.15, pointerEvents: 'none' }),
+        }}
+      >
       {open
         ? (
           <Box
@@ -315,6 +395,8 @@ export function DocumentHeroSection({ onReveal }: DocumentHeroSectionProps) {
             Nothing open — double-click an asset to start.
           </Typography>
         )}
+      </Box>
+      {dashboard.opening !== null && <OpeningHero label={dashboard.opening} />}
     </Box>
   );
 }

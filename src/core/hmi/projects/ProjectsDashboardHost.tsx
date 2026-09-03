@@ -20,10 +20,10 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { Alert, Box, Button, Chip, Divider, IconButton, InputAdornment, ListItemText, Menu, MenuItem, Snackbar, TextField, Tooltip, Typography } from '@mui/material';
+import { Alert, Badge, Box, Button, Chip, Collapse, Divider, IconButton, InputAdornment, ListItemText, Menu, MenuItem, Snackbar, TextField, Tooltip, Typography } from '@mui/material';
 import { SectionHeader } from '../shared-components';
 import {
-  Add, ChevronRight, CreateNewFolderOutlined, DeleteOutline,
+  Add, ChevronRight, CreateNewFolderOutlined, DeleteOutline, FilterList,
   MoreVert, NoteAddOutlined, Refresh, Search, SettingsEthernet,
 } from '@mui/icons-material';
 import type { LibraryCatalogEntry } from '../../library/library-types';
@@ -142,7 +142,9 @@ import type { ProjectCardMenuAction } from './ProjectCard';
 import { ProjectsDetailPane, type DetailAction, type DetailField } from './ProjectsDetailPane';
 import { DestructiveConfirmDialog, type DestructiveConfirmRequest } from './DestructiveConfirmDialog';
 import {
+  beginProjectsOpening,
   closeProjectsDashboard,
+  endProjectsOpening,
   getProjectsDashboardSnapshot,
   openProjectsDashboard,
   setProjectsChip,
@@ -467,6 +469,7 @@ export function ProjectsDashboardHost() {
             name: DEMO_PROJECT_NAME,
             caption: 'realvirtual demo scenes & library',
             origin: 'workspace' as const,
+            hint: 'bundled' as const,
           }]
         : []),
       ...workspaceProjects
@@ -477,6 +480,7 @@ export function ProjectsDashboardHost() {
           caption: p.folderName,
           origin: 'workspace' as const,
           canManage: true,
+          hint: 'local' as const,
         })),
       ...recentOutside
         .filter(r => match(r.name))
@@ -485,6 +489,7 @@ export function ProjectsDashboardHost() {
           name: r.name,
           caption: r.folderName,
           origin: 'recent' as const,
+          hint: 'local' as const,
         })),
     ];
 
@@ -497,6 +502,12 @@ export function ProjectsDashboardHost() {
         // Not 'recent': there is no recents entry to forget, so the row must
         // not offer a remove button that would do nothing.
         origin: 'workspace',
+        // The open project is the one row whose backend is known exactly, so
+        // its hint is read rather than assumed. 'browser' is My Workspace and
+        // says so: it lives in this browser's storage, not in a folder.
+        hint: project.backendKind === 'bundled' ? 'bundled'
+          : project.backendKind === 'browser' ? 'browser'
+          : 'local',
       });
     }
     return rows;
@@ -1128,6 +1139,13 @@ export function ProjectsDashboardHost() {
     else void action();
   }, [sceneSnap?.dirty]);
 
+  /**
+   * Which open-in-place run is the CURRENT one. A second double-click aborts
+   * the first load (the newer load owns the scene); the first run's cleanup
+   * must then leave the dashboard alone — it belongs to the newer open now.
+   */
+  const openSeqRef = useRef(0);
+
   const openScene = useCallback((id: string) => {
     if (!sceneStore) return;
     // Opening the document that is ALREADY open means one thing: the dashboard
@@ -1141,12 +1159,22 @@ export function ProjectsDashboardHost() {
       return;
     }
     trySwitch(async () => {
-      // Close BEFORE the await, as `openAssetInEditor` does: the dashboard sits
-      // at PROJECTS_DASHBOARD_ZINDEX (10500) above the info overlay (10000), so
-      // closing it after the load means the "Loading…" overlay the SceneStore
-      // shows is covered for its entire lifetime and the click appears dead.
-      closeProjectsDashboard();
-      await openDocumentAsWorkingScene(viewer, sceneStore, project.documents, id);
+      // Open IN PLACE: the dashboard stays up while the load runs behind it,
+      // the hero band announces the target and shows the load's progress
+      // (model-load-progress-store mirrors the splash), and only a finished
+      // load closes the dashboard — with its exit slide. On failure it closes
+      // too: the splash error card with its Retry (z 1000) is the one error
+      // surface, and it sits behind the dashboard until then.
+      const seq = ++openSeqRef.current;
+      beginProjectsOpening(project.documents.find(d => d.id === id)?.name ?? '…');
+      try {
+        await openDocumentAsWorkingScene(viewer, sceneStore, project.documents, id);
+      } finally {
+        if (openSeqRef.current === seq) {
+          endProjectsOpening();
+          closeProjectsDashboard();
+        }
+      }
     });
   }, [sceneStore, trySwitch, project.documents, viewer]);
 
@@ -1248,10 +1276,17 @@ export function ProjectsDashboardHost() {
       return;
     }
     trySwitch(async () => {
-      // Close first — same reason as `openScene` above: the load's own
-      // "Loading…" overlay is invisible under the still-open dashboard.
-      closeProjectsDashboard();
-      await sceneStore.openBuiltin(sourceUrl ?? projectAssetUrl(modelId), label);
+      // Open IN PLACE — same choreography as `openScene` above.
+      const seq = ++openSeqRef.current;
+      beginProjectsOpening(label);
+      try {
+        await sceneStore.openBuiltin(sourceUrl ?? projectAssetUrl(modelId), label);
+      } finally {
+        if (openSeqRef.current === seq) {
+          endProjectsOpening();
+          closeProjectsDashboard();
+        }
+      }
       // Say WHAT is now open, so a mode that takes over later opens the same
       // thing instead of starting from nothing.
       // This one STAYS, unlike `openScene`'s (plan-702 Phase 3). The funnel
@@ -1908,6 +1943,16 @@ export function ProjectsDashboardHost() {
 
   /** Announce a card drag to the tree, which owns every drop. */
   const [cardDragPath, setCardDragPath] = useState<string | null>(null);
+
+  /**
+   * The classification chips + tag picker, collapsed behind the toolbar's
+   * filter icon — the same gesture the hierarchy browser and the property
+   * inspector already use, so one icon means one thing everywhere. An active
+   * filter keeps narrowing the cards while collapsed; the badge dot on the
+   * icon is what says so.
+   */
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const hasActiveFilters = dash.chip !== null || dash.tag !== null;
 
   const folderCards = useMemo<FolderCardModel[]>(
     () => folderRows
@@ -3367,7 +3412,7 @@ export function ProjectsDashboardHost() {
           <Box
             sx={{
               display: 'flex', alignItems: 'center',
-              px: 1.25, minHeight: 30, flexShrink: 0,
+              px: 1.25, minHeight: 40, flexShrink: 0,
               bgcolor: 'rgba(0,0,0,0.28)',
             }}
           >
@@ -3400,21 +3445,14 @@ export function ProjectsDashboardHost() {
               externalDragPath={cardDragPath}
             />
           </Box>
-          {/* The ONE boundary in this column: clear space, the separator line
-              floating in the middle of it, clear space again, then the next
-              section's dark header band. The line gets air on BOTH sides —
-              sitting directly on the dark band it read as the band's own edge
-              rather than as a separator (user decision 2026-09-02). */}
-          <Box
-            sx={{
-              flexShrink: 0, mx: 0, my: '12px',
-              borderTop: '1px solid rgba(255,255,255,0.1)',
-            }}
-          />
+          {/* The boundary between the sections is clear space plus the next
+              dark header band — no separator line (user decision 2026-09-02,
+              revised same day: the band alone carries it). */}
+          <Box sx={{ flexShrink: 0, height: 12 }} />
           <Box
             sx={{
               display: 'flex', alignItems: 'center',
-              px: 1.25, minHeight: 30, flexShrink: 0,
+              px: 1.25, minHeight: 40, flexShrink: 0,
               bgcolor: 'rgba(0,0,0,0.28)',
             }}
           >
@@ -3466,6 +3504,8 @@ export function ProjectsDashboardHost() {
           <Box
             sx={{
               display: 'flex', alignItems: 'center', gap: 0.75,
+              // Same height as the left panel's Project/Libraries headers —
+              // the three columns open on one shared 40px header line.
               px: 1.5, minHeight: 40, flexShrink: 0,
               borderBottom: '1px solid rgba(255,255,255,0.06)',
             }}
@@ -3512,20 +3552,38 @@ export function ProjectsDashboardHost() {
 
             <Box sx={{ flex: 1, minWidth: 8 }} />
 
-            {/* The classification filter sits right-aligned, directly beside
-                the search: the two are the same gesture at different grains.
-                Both narrow the CARDS of the folder in view (Lauf 13) — the
-                folder tree beside them keeps its shape, because a structure
-                that rearranges itself as you type is a structure you cannot
-                navigate. */}
-            <DocumentFilterBar
-              chips={folderChips}
-              chip={dash.chip}
-              onChipChange={setProjectsChip}
-              tags={documentTags}
-              tag={dash.tag}
-              onTagChange={setProjectsTag}
-            />
+            {/* The classification chips live in a drawer under this bar,
+                behind the same filter icon the hierarchy browser and the
+                property inspector use — open = Instrument Blue, active-while-
+                collapsed = badge dot. The chips are the same gesture as the
+                search at a different grain; the icon keeps them one reach away
+                without spending header width on every chip all the time. */}
+            <Tooltip title={filtersOpen ? 'Hide filter' : 'Filter by classification or tag'} disableInteractive>
+              <IconButton
+                size="small"
+                aria-label="Filter documents"
+                aria-expanded={filtersOpen}
+                onClick={() => setFiltersOpen(open => !open)}
+                sx={{
+                  // One control height for the whole bar (24px) — icon, search
+                  // field and button sit on a shared cap and base line.
+                  p: 0, width: 24, height: 24,
+                  flexShrink: 0,
+                  color: filtersOpen || hasActiveFilters ? 'primary.main' : 'text.secondary',
+                  bgcolor: filtersOpen ? 'rgba(79, 195, 247, 0.12)' : 'transparent',
+                  '&:hover': { bgcolor: filtersOpen ? 'rgba(79, 195, 247, 0.18)' : 'rgba(255, 255, 255, 0.08)' },
+                }}
+              >
+                <Badge
+                  color="primary"
+                  variant="dot"
+                  invisible={!hasActiveFilters}
+                  sx={{ '& .MuiBadge-badge': { minWidth: 6, height: 6, top: 1, right: 1 } }}
+                >
+                  <FilterList sx={{ fontSize: 16 }} />
+                </Badge>
+              </IconButton>
+            </Tooltip>
 
             <TextField
               size="small"
@@ -3539,7 +3597,7 @@ export function ProjectsDashboardHost() {
                       <Search sx={{ fontSize: 16, color: 'text.disabled' }} />
                     </InputAdornment>
                   ),
-                  sx: { fontSize: 12, height: 28 },
+                  sx: { fontSize: 12, height: 24 },
                 },
               }}
               sx={{ width: 200, flexShrink: 0 }}
@@ -3571,7 +3629,9 @@ export function ProjectsDashboardHost() {
                     fontSize: 11,
                     textTransform: 'none',
                     whiteSpace: 'nowrap',
-                    py: 0.25,
+                    py: 0,
+                    height: 24,
+                    minHeight: 0,
                     // Instrument Blue — the one working accent of DESIGN.md.
                     bgcolor: '#4fc3f7',
                     color: 'rgba(0,0,0,0.87)',
@@ -3605,12 +3665,35 @@ export function ProjectsDashboardHost() {
                   aria-label="New CONNECT configuration"
                   disabled={!project.writable}
                   onClick={handleNewConnectConfig}
+                  sx={{ p: 0, width: 24, height: 24 }}
                 >
                   <SettingsEthernet sx={{ fontSize: 16 }} />
                 </IconButton>
               </span>
             </Tooltip>
           </Box>
+          {/* The filter drawer — right-aligned so the chips sit under the
+              icon that opened them. Stays mounted while collapsed: an active
+              chip keeps narrowing the cards, exactly like the hierarchy
+              browser's collapsed search (the badge dot signals it). */}
+          <Collapse in={filtersOpen} timeout={150} sx={{ flexShrink: 0 }}>
+            <Box
+              sx={{
+                display: 'flex', justifyContent: 'flex-end',
+                px: 1.5, pb: 0.75,
+                borderBottom: '1px solid rgba(255,255,255,0.06)',
+              }}
+            >
+              <DocumentFilterBar
+                chips={folderChips}
+                chip={dash.chip}
+                onChipChange={setProjectsChip}
+                tags={documentTags}
+                tag={dash.tag}
+                onTagChange={setProjectsTag}
+              />
+            </Box>
+          </Collapse>
           <ProjectFolderContents
             cards={folderCards}
             folders={subfolderTiles}

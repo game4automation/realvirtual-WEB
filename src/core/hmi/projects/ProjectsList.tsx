@@ -42,6 +42,15 @@ export interface ProjectListRow {
   caption?: string | null;
   origin: ProjectOrigin;
   /**
+   * Where the project's bytes live — the list groups its rows by this.
+   *
+   * The caption alone could not say it: a bundled project has no folder, so it
+   * captions with a description while every local one captions with a folder
+   * name — two different KINDS of sentence in the same slot, which is exactly
+   * what made "which of these ships with the app?" unanswerable at a glance.
+   */
+  hint?: 'bundled' | 'local' | 'browser';
+  /**
    * True only for a real workspace subfolder: rename writes its manifest and
    * delete removes the folder. The bundled demo and recents have neither.
    */
@@ -67,6 +76,29 @@ export interface ProjectsListProps {
 }
 
 const ROW_MAX_WIDTH = 760;
+
+/**
+ * The list's groups, in render order — the shipped demo first (user decision
+ * 2026-09-03), then the user's own work.
+ *
+ * Membership is exclusive by construction: `origin` separates recents, `hint`
+ * separates the storage kinds within the rest, so no row can appear twice. A
+ * section with no rows renders nothing, headers included.
+ */
+const SECTIONS: {
+  key: string;
+  label: string;
+  member: (row: ProjectListRow) => boolean;
+}[] = [
+  { key: 'bundled', label: 'Bundled', member: row => row.hint === 'bundled' },
+  {
+    key: 'workspace',
+    label: 'Local workspace',
+    member: row => row.origin === 'workspace' && row.hint !== 'bundled' && row.hint !== 'browser',
+  },
+  { key: 'browser', label: 'This browser', member: row => row.hint === 'browser' },
+  { key: 'recent', label: 'Recent', member: row => row.origin === 'recent' },
+];
 
 export function ProjectsList({
   hasWorkspace,
@@ -157,13 +189,11 @@ export function ProjectsList({
   return (
     <Box className={RV_SCROLL_CLASS} sx={{ flex: 1, overflowY: 'auto', minWidth: 0, p: 2 }}>
       <Box sx={{ maxWidth: ROW_MAX_WIDTH, mx: 'auto' }}>
-        {workspaceName ? (
-          <Typography sx={{ fontSize: 11, color: 'text.disabled', mb: 1 }}>
-            Workspace: {workspaceName}
-          </Typography>
-        ) : (
-          // Rows without a workspace: say so, and keep the picker one click
-          // away rather than making the user find it in the header.
+        {/* With a workspace open, its name and the switch action live in the
+            LOCAL WORKSPACE section header below — one place says everything
+            about it. Without one, say so here, and keep the picker one click
+            away rather than making the user find it in the header. */}
+        {!hasWorkspace && (
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
             <Typography sx={{ fontSize: 11, color: 'text.disabled' }}>
               No workspace selected.
@@ -183,18 +213,72 @@ export function ProjectsList({
             This workspace has no projects yet.
           </Typography>
         ) : (
-          <Stack spacing={1}>
-            {rows.map(row => (
-              <ProjectRow
-                key={row.id}
-                row={row}
-                active={row.id === activeProjectId}
-                onOpen={() => onOpenProject(row.id)}
-                onForget={() => onForgetProject(row.id)}
-                onRename={() => onRenameProject(row.id)}
-                onDelete={() => onDeleteProject(row.id)}
-              />
-            ))}
+          <Stack spacing={2.5}>
+            {SECTIONS.map(section => {
+              const members = rows.filter(section.member);
+              const isWorkspaceSection = section.key === 'workspace';
+              // The workspace section is the workspace's home in this screen:
+              // with one open it renders even empty, because its header is
+              // where the name lives and where switching happens.
+              if (members.length === 0 && !(isWorkspaceSection && hasWorkspace)) return null;
+              return (
+                <Box key={section.key}>
+                  {/* A labeled hairline, not a heading: the label says where
+                      these projects live, the line carries the separation. */}
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                    <Typography
+                      sx={{
+                        fontSize: 10, letterSpacing: 0.8, textTransform: 'uppercase',
+                        color: 'text.disabled', flexShrink: 0,
+                      }}
+                    >
+                      {section.label}
+                    </Typography>
+                    {isWorkspaceSection && workspaceName && (
+                      // The folder's own name, spelled as the filesystem
+                      // spells it — monospace, like every path in this screen.
+                      <Typography
+                        sx={{
+                          fontSize: 10, fontFamily: 'monospace',
+                          color: 'text.secondary', flexShrink: 0,
+                        }}
+                      >
+                        {workspaceName}
+                      </Typography>
+                    )}
+                    <Box sx={{ flex: 1, borderTop: '1px solid rgba(255,255,255,0.08)' }} />
+                    {isWorkspaceSection && hasWorkspace && (
+                      <Button
+                        size="small"
+                        onClick={onOpenWorkspace}
+                        sx={{ fontSize: 11, textTransform: 'none', minWidth: 0, p: 0, flexShrink: 0 }}
+                      >
+                        Switch workspace…
+                      </Button>
+                    )}
+                  </Box>
+                  {members.length === 0 ? (
+                    <Typography sx={{ fontSize: 12, color: 'text.disabled', py: 1 }}>
+                      This workspace has no projects yet.
+                    </Typography>
+                  ) : (
+                    <Stack spacing={1}>
+                      {members.map(row => (
+                        <ProjectRow
+                          key={row.id}
+                          row={row}
+                          active={row.id === activeProjectId}
+                          onOpen={() => onOpenProject(row.id)}
+                          onForget={() => onForgetProject(row.id)}
+                          onRename={() => onRenameProject(row.id)}
+                          onDelete={() => onDeleteProject(row.id)}
+                        />
+                      ))}
+                    </Stack>
+                  )}
+                </Box>
+              );
+            })}
           </Stack>
         )}
       </Box>
@@ -240,7 +324,12 @@ function ProjectRow({
         }}
       >
         <Box sx={{ flex: 1, minWidth: 0 }}>
-          <Typography sx={{ fontSize: 14, fontWeight: 600, lineHeight: 1.3 }}>
+          <Typography
+            sx={{
+              fontSize: 14, fontWeight: 600, lineHeight: 1.3,
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}
+          >
             {row.name}
           </Typography>
           {row.caption && (

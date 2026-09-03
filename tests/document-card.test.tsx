@@ -94,13 +94,13 @@ describe('DocumentCard variants', () => {
       .toBe(compactDirty);
   });
 
-  it('only the hero carries a preview', () => {
+  it('neither variant carries a preview — the model behind the band is the picture', () => {
     const compact = mount(makeView(), 'compact');
     expect(screen.queryByTestId('document-card-preview')).toBeNull();
     compact.unmount();
 
     mount(makeView(), 'hero');
-    expect(screen.getByTestId('document-card-preview')).toBeTruthy();
+    expect(screen.queryByTestId('document-card-preview')).toBeNull();
   });
 });
 

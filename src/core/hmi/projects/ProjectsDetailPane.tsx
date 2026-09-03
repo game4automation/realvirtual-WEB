@@ -360,13 +360,13 @@ export function ProjectsDetailPane({
       ) : (
         <>
           {/* The header BAND — same height and type as the other two column
-              headers ("Project" / the folder trail): 32px tall, 12px semibold,
+              headers ("Project" / the folder trail): 40px tall, 12px semibold,
               hairline below. The name stays a single ellipsized line here;
               the pane body carries everything that wraps. */}
           <Box
             sx={{
               display: 'flex', alignItems: 'center', gap: 0.75,
-              px: 1.5, minHeight: 32, flexShrink: 0,
+              px: 1.5, minHeight: 40, flexShrink: 0,
               borderBottom: '1px solid rgba(255,255,255,0.06)',
             }}
           >

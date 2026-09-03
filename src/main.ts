@@ -41,6 +41,10 @@ import {
 import { captureViewState, restoreViewState } from './core/rv-view-state';
 import { showInstruction, hideInstruction } from './core/hmi/instruction-store';
 import { hideInfoOverlay } from './core/hmi/info-overlay-store';
+import {
+  reportModelLoadEnd, reportModelLoadPreparing, reportModelLoadProgress,
+  reportModelLoadStart,
+} from './core/hmi/model-load-progress-store';
 import { setBrandedSplashVisible } from './core/hmi/scene-transition-store';
 
 // Private content (resolves to stubs when private folder is absent)
@@ -211,6 +215,9 @@ function showLoadingOverlay(modelName: string) {
   // transition store, so "Opening editor…" waits until the splash is gone.
   hideInfoOverlay();
   setBrandedSplashVisible(true);
+  // Mirror into the subscribable store — the dashboard hero shows the same
+  // load when it stays open over the splash (open-in-place flow).
+  reportModelLoadStart(modelName);
 }
 
 // Show the error card inside the loading overlay (download/parse failed after all
@@ -218,6 +225,9 @@ function showLoadingOverlay(modelName: string) {
 // surfacing the failure here — with a Retry — is the difference between a usable
 // error and a silent "empty scene". `detail` is a short, user-readable reason.
 function showLoadingError(detail: string) {
+  // The store goes idle — whoever was showing progress (the hero) stops; the
+  // splash's own error card with Retry is the one error surface.
+  reportModelLoadEnd();
   if (loadingProgressWrap) loadingProgressWrap.style.display = 'none';
   loadingStatus.style.display = 'none';
   loadingErrorDetail.textContent = detail;
@@ -250,6 +260,7 @@ function setLoadingProgress(loaded: number, total: number) {
     return;
   }
   const pct = Math.round((loaded / total) * 100);
+  reportModelLoadProgress(loaded, total);
   loadingProgressBar.classList.remove('indeterminate');
   loadingProgressBar.style.width = `${pct}%`;
   const loadedMB = (loaded / (1024 * 1024)).toFixed(1);
@@ -260,12 +271,14 @@ function setLoadingProgress(loaded: number, total: number) {
 // Post-download phase: bytes are in, now parsing the GLB + building the scene.
 // Animated (indeterminate) bar + label so the user knows work is still ongoing.
 function setLoadingPreparing() {
+  reportModelLoadPreparing();
   loadingProgressBar.classList.add('indeterminate');
   loadingProgressBar.style.width = '';
   loadingProgressPct.textContent = 'Preparing scene…';
 }
 
 function hideLoadingOverlay() {
+  reportModelLoadEnd();
   loadingOverlay.classList.add('fade-out');
   // Released at the START of the fade, not after it: a transition held through
   // the load ("Opening editor…") may surface under the fading splash rather
