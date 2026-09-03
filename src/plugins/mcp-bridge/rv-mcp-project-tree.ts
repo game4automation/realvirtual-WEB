@@ -19,6 +19,7 @@
  * moves the model refuses anyway (`cross-root`).
  */
 
+import { arrayBufferOf } from '../../core/project/rv-scene-record';
 import type { ProjectStore } from '../../core/project/project-store';
 import type { ProjectTreeNode, TreeEditVerdict } from '../../core/project/rv-project-tree';
 import {
@@ -76,7 +77,7 @@ export async function loadProjectTree(
 
   let attachments: string[] = [];
   try {
-    const bytes = await backend.readBlobBytes(DOCS_INDEX_FILE);
+    const bytes = (await backend.readDocument(DOCS_INDEX_FILE))?.bytes ?? null;
     if (bytes) {
       const text = new TextDecoder().decode(bytes);
       attachments = docsIndexPaths(parseDocsIndex(JSON.parse(text) as unknown));
@@ -144,13 +145,25 @@ export function mcpTreeMoveIO(store: ProjectStore): TreeMoveIO | null {
   const backend = store.getBackend();
   if (!backend?.writable) return null;
   const readBytes = async (relPath: string): Promise<Blob | null> => {
-    const bytes = await backend.readBlobBytes(relPath).catch(() => null);
-    return bytes ? new Blob([bytes]) : null;
+    const bytes = await backend.readDocument(relPath).catch(() => null).then(r => r?.bytes ?? null);
+    return bytes ? new Blob([arrayBufferOf(bytes)]) : null;
   };
   return {
     readBytes,
-    writeBytes: (relPath, blob) => backend.writeBlob(relPath, blob),
-    deleteBytes: relPath => backend.deleteBlob(relPath),
+    // The agent write path is the one that MUST carry a precondition: an
+    // unattended overwrite of a file somebody is editing is exactly the lost
+    // update plan-736 makes impossible. The revision comes from the same read
+    // `readBytes` performs, so a caller that read before writing is protected
+    // and one writing a new file says 'create'.
+    writeBytes: async (relPath, blob) => {
+      const current = await backend.readDocument(relPath).catch(() => null);
+      await backend.writeDocument(
+        relPath,
+        new Uint8Array(await blob.arrayBuffer()),
+        { expectedRevision: current ? current.revision : 'create' },
+      );
+    },
+    deleteBytes: relPath => backend.deleteDocument(relPath),
     readManifest: async () => store.getProject(),
     writeManifest: next => store.replaceManifest(next),
     readDocsIndex: async () => {
@@ -158,10 +171,15 @@ export function mcpTreeMoveIO(store: ProjectStore): TreeMoveIO | null {
       if (!blob) return null;
       try { return JSON.parse(await blob.text()) as unknown; } catch { return null; }
     },
-    writeDocsIndex: index => backend.writeBlob(
-      DOCS_INDEX_FILE,
-      new Blob([JSON.stringify(index, null, 2)], { type: 'application/json' }),
-    ),
+    // The attachment index is machinery, rewritten wholesale from state the
+    // caller already holds — there is nothing to merge and nothing to lose.
+    writeDocsIndex: async index => {
+      await backend.writeDocument(
+        DOCS_INDEX_FILE,
+        new TextEncoder().encode(JSON.stringify(index, null, 2)),
+        { expectedRevision: 'any' },
+      );
+    },
   };
 }
 

@@ -704,16 +704,39 @@ export function DocumentCard({
           word at the right where it reads as one statement. The compact
           header keeps the dot in front — there the trail is the title. */}
       {!hero && (view.dirty ? <DirtyDot /> : <Box sx={{ width: 7, minWidth: 7 }} />)}
-      <Typography
-        data-testid="document-card-name"
-        sx={{
-          fontSize: hero ? 16 : 13, fontWeight: 600, flex: 1, minWidth: 0,
-          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-        }}
-        title={view.name}
-      >
-        {view.name}
-      </Typography>
+      {hero
+        ? (
+          /* The trail IS the title — the same rule the compact header follows.
+             The crumbs end in the current document at title size and weight,
+             so a name line above a subtitle trail printed the name twice.
+             Crumb clicks are navigation of their own, never the card's
+             reveal. */
+          <Box
+            onClick={(e) => e.stopPropagation()}
+            sx={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center' }}
+          >
+            <DocumentCrumbs
+              crumbs={view.crumbs}
+              location={view.location}
+              onCrumbClick={view.actions.onCrumb}
+              testIdPrefix="document-crumb"
+              fontSize={16}
+              ariaLabel="Document breadcrumb"
+            />
+          </Box>
+        )
+        : (
+          <Typography
+            data-testid="document-card-name"
+            sx={{
+              fontSize: 13, fontWeight: 600, flex: 1, minWidth: 0,
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}
+            title={view.name}
+          >
+            {view.name}
+          </Typography>
+        )}
       {view.dirty && (
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexShrink: 0 }}>
           {hero && <DirtyDot />}
@@ -820,17 +843,16 @@ export function DocumentCard({
         onClick={hero && onReveal ? () => onReveal() : undefined}
         sx={hero
           ? {
-              width: '100%', maxWidth: 780,
+              // Frameless on its translucent band: no plate, no border — the
+              // hero IS the band, and its content sits directly on the blurred
+              // scene. A faint wash appears only on hover, as the reveal
+              // affordance.
+              width: '100%',
               p: 2, borderRadius: '4px',
-              bgcolor: 'rgba(255,255,255,0.04)',
-              border: '1px solid rgba(255,255,255,0.08)',
               ...(onReveal && {
                 cursor: 'pointer',
-                transition: 'background-color 150ms ease-out, border-color 150ms ease-out',
-                '&:hover': {
-                  bgcolor: 'rgba(255,255,255,0.06)',
-                  borderColor: 'rgba(255,255,255,0.16)',
-                },
+                transition: 'background-color 150ms ease-out',
+                '&:hover': { bgcolor: 'rgba(255,255,255,0.04)' },
               }),
             }
           : {
@@ -915,27 +937,6 @@ export function DocumentCard({
                   {kebab}
                 </Box>
               </Box>
-              {/* The trail — only when it says something the title does not.
-                  A root document's trail is exactly its name, and printing
-                  the name twice was the "weird" the redesign kept tripping
-                  over. */}
-              {((view.location?.length ?? 0) > 0
-                || view.crumbs.length > 1
-                || (view.crumbs[0]?.label ?? view.name) !== view.name) && (
-                <Box
-                  onClick={(e) => e.stopPropagation()}
-                  sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}
-                >
-                  <DocumentCrumbs
-                    crumbs={view.crumbs}
-                    location={view.location}
-                    onCrumbClick={view.actions.onCrumb}
-                    testIdPrefix="document-crumb"
-                    fontSize={11}
-                    ariaLabel="Document breadcrumb"
-                  />
-                </Box>
-              )}
               {/* What this file pulls in. "Self-contained" is as much a fact
                   worth stating as a dependency count — a file with cloud
                   references needs its libraries wherever it travels. */}

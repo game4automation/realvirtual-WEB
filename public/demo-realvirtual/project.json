@@ -10,30 +10,42 @@
     "defaultModel": "DemoRealvirtualWeb.glb"
   },
   "libraries": [
-    { "url": "library/catalog.json", "label": "realvirtual Library" }
+    {
+      "url": "library/catalog.json"
+    }
   ],
   "documents": [
     {
       "id": "doc_demorealvirtualweb_7l7hfw",
       "name": "realvirtual WEB Demo",
       "path": "DemoRealvirtualWeb.glb",
-      "section": "models",
       "settingsPath": "DemoRealvirtualWeb.settings.json"
     },
     {
       "id": "doc_demoplanner_gf4m6v",
       "name": "Layout Planner Demo",
       "path": "DemoPlanner.glb",
-      "section": "scenes",
-      "mode": "planner"
+      "mode": "planner",
+      "classification": {
+        "v": 1,
+        "level": "scene"
+      }
     },
     {
       "id": "doc_test-des-turntable-loop_1y3v7m0",
       "name": "Test DES Turntable Loop",
       "path": "Test-DES-Turntable-Loop.glb",
-      "section": "scenes",
       "mode": "des",
-      "devOnly": true
+      "devOnly": true,
+      "classification": {
+        "v": 1,
+        "level": "scene"
+      }
+    },
+    {
+      "id": "doc_demo-knowledge-md_1bio4kv",
+      "name": "About this demo project",
+      "path": "demo.knowledge.md"
     }
   ]
 }

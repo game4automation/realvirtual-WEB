@@ -36,7 +36,7 @@ test('the boot manifest is preloaded and fetched exactly once', async ({ page })
   const manifestRequests: string[] = [];
   page.on('request', (req) => {
     const path = new URL(req.url()).pathname;
-    if (path === '/project.json') manifestRequests.push(req.url());
+    if (path === '/demo-realvirtual/project.json') manifestRequests.push(req.url());
   });
 
   // Chrome's "preload not used" verdict arrives as a console warning and is the

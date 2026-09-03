@@ -108,6 +108,8 @@ import {
   installFakeDocumentProject,
   type FakeDocumentProject,
 } from './helpers/fake-document-project';
+import { writeBlobDocument } from './helpers/document-io';
+import { arrayBufferOf } from '../src/core/project/rv-scene-record';
 
 // ─── Harness ────────────────────────────────────────────────────────────
 
@@ -207,7 +209,6 @@ describe('plan-717 F6 — a rename moves the name and the file, never the id', (
     expect(row?.id).toBe(roll.documentId);
     expect(row?.name).toBe('Roll 2000');
     expect(row?.path).toBe('library/parts/Roll 2000.glb');
-    expect(row?.section).toBe('library');
     expect(project.files.has('library/parts/Roll2m.glb')).toBe(false);
   });
 
@@ -274,11 +275,11 @@ describe('plan-717 F6 — a rename moves the name and the file, never the id', (
   // an unregistered file, so the next adopt run registers it as its own
   // document with its own id. Nothing points anywhere it should not.
   it('a failed delete abandons the rename, reports both paths and keeps the row', async () => {
-    const deleteBlob = vi.spyOn(project.backend, 'deleteBlob')
+    const deleteDocument = vi.spyOn(project.backend, 'deleteDocument')
       .mockRejectedValue(new Error('permission revoked'));
 
     await expect(store.rename(BELT_ID, 'Belt Line 7')).rejects.toThrow(/could not be removed/);
-    expect(deleteBlob).toHaveBeenCalledWith(BELT_PATH);
+    expect(deleteDocument).toHaveBeenCalledWith(BELT_PATH);
 
     const row = rowOf(project, BELT_ID);
     // The row still describes the file that is still there.
@@ -332,11 +333,12 @@ describe('plan-717 Risiko 6 — renaming the OPEN document', () => {
 
     // The race the create-only write exists for: the probe saw a free name, and
     // by the time the bytes are written somebody else has taken it.
-    const realRead = project.backend.readBlobBytes.bind(project.backend);
+    const realRead = project.backend.readDocument.bind(project.backend);
     let probed = false;
-    vi.spyOn(project.backend, 'readBlobBytes').mockImplementation(async (path: string) => {
+    vi.spyOn(project.backend, 'readDocument').mockImplementation(async (ref) => {
+      const path = typeof ref === 'string' ? ref : ref.path;
       if (path === destination && !probed) { probed = true; return null; }
-      return realRead(path);
+      return realRead(ref);
     });
     project.writeForeign(destination, 'a colleague got there first');
 
@@ -374,7 +376,7 @@ describe('plan-717 F8 — a pre-717 assetId survives adopt AND rename', () => {
       schemaVersion: 3, id, name: 'Rename fixture', documents: [],
     } as unknown as RvProject;
     await backend.writeManifest(manifest);
-    await backend.writeBlob(ROLL, new Blob([fakeGlbBytes() as BlobPart]));
+    await writeBlobDocument(backend, ROLL, new Blob([fakeGlbBytes() as BlobPart]));
 
     // The same injection seam the adopt tests use — but into the SINGLETON,
     // because `rv-glb-reference-resolver` reaches for `getProjectStore()` and
@@ -431,11 +433,11 @@ describe('plan-717 F8 — a pre-717 assetId survives adopt AND rename', () => {
     // ── after rename, through the ONE rename route ──
     const io: TreeMoveIO = {
       readBytes: async p => {
-        const bytes = await backend.readBlobBytes(p);
-        return bytes ? new Blob([bytes]) : null;
+        const bytes = (await backend.readDocument(p))?.bytes ?? null;
+        return bytes ? new Blob([arrayBufferOf(bytes)]) : null;
       },
-      writeBytes: (p, b) => backend.writeBlob(p, b),
-      deleteBytes: p => backend.deleteBlob(p),
+      writeBytes: (p, b) => writeBlobDocument(backend, p, b),
+      deleteBytes: p => backend.deleteDocument(p),
       readManifest: async () => opfsStore.getProject(),
       writeManifest: async next => {
         await opfsStore.replaceManifest(next);
@@ -462,11 +464,11 @@ describe('plan-717 F8 — a pre-717 assetId survives adopt AND rename', () => {
 
     const io: TreeMoveIO = {
       readBytes: async p => {
-        const bytes = await backend.readBlobBytes(p);
-        return bytes ? new Blob([bytes]) : null;
+        const bytes = (await backend.readDocument(p))?.bytes ?? null;
+        return bytes ? new Blob([arrayBufferOf(bytes)]) : null;
       },
-      writeBytes: (p, b) => backend.writeBlob(p, b),
-      deleteBytes: p => backend.deleteBlob(p),
+      writeBytes: (p, b) => writeBlobDocument(backend, p, b),
+      deleteBytes: p => backend.deleteDocument(p),
       readManifest: async () => opfsStore.getProject(),
       writeManifest: async next => {
         await opfsStore.replaceManifest(next);
@@ -533,7 +535,9 @@ describe('plan-717 F7 — "New" is one call, whatever folder is in view', () => 
 
     const row = rowOf(project, created.documentId);
     expect(row?.path).toBe('scenes/Untitled.glb');
-    expect(row?.section).toBe('scenes');
+    // plan-736 F3: nothing is stamped beside the path. The row used to carry
+    // `section: 'scenes'` here, derived from that very path.
+    expect(row?.section).toBeUndefined();
     expect(project.files.has('scenes/Untitled.glb')).toBe(true);
   });
 
@@ -558,9 +562,9 @@ describe('plan-717 F7 — "New" is one call, whatever folder is in view', () => 
 
     const row = rowOf(project, created.documentId);
     expect(row?.path).toBe('library/parts/Untitled.glb');
-    // The section follows the FOLDER — a library asset stamped `scenes` would
-    // sort itself into the wrong half of every listing that groups by section.
-    expect(row?.section).toBe('library');
+    // The FOLDER is where the document is, and since plan-736 it is the only
+    // place that says so — a second, stored answer could disagree with it.
+    expect(row?.section).toBeUndefined();
     expect(project.files.has('library/parts/Untitled.glb')).toBe(true);
     // ...and it is a document like any other: it renames through the same verb.
     await store.rename(created.documentId, 'Roller');

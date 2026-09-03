@@ -37,15 +37,19 @@
  *   which is what lets the publish path stop carrying its own `scenes[]`
  *   fallback.
  *
- * ## Sections survive the mirror
+ * ## Sections are READ here, never written (plan-736)
  *
- * A document still says which of the three surfaces holds its bytes
- * (`section: 'scenes' | 'models' | 'library'`), because that is a real property
- * and not mirror bookkeeping: it decides whether a document is opened as a
- * scene or referenced as an asset, and — in the browser backend — it is the
- * only thing that can say so, since a scene's `path` there is a bare id with no
- * folder prefix to read it off. What went away is the *duplication*, not the
- * distinction.
+ * A document used to say which of the three surfaces held its bytes
+ * (`section: 'scenes' | 'models' | 'library'`), and that decided which write
+ * protocol it went through. It decides nothing now: there is one
+ * `writeDocument` with a mandatory compare-and-swap, and each backend routes on
+ * what IT stores. Nothing stamps the field.
+ *
+ * What survives here is reading a value somebody else wrote — a delivered
+ * customer manifest, or the transitional `section: 'scenes'` that the scene
+ * branch of `documentOfLegacyEntry` still records so an old client cannot
+ * misroute a bare-id browser scene. Delivered manifests keep their values
+ * forever; nothing strips them.
  *
  * Kept deliberately tiny and dependency-free: this is imported by the
  * validator, the deploy library, the offline migrator and their tests, and a
@@ -317,7 +321,14 @@ export function documentOfLegacyEntry(entry, section) {
   const name = section === 'scenes' && typeof entry.name === 'string' && entry.name !== ''
     ? entry.name
     : assetNameOf(entry);
-  return { ...entry, id, name, path: entry.path, section };
+  // Only the SCENE branch still stamps `section`, and only as the transitional
+  // Alt-Client guard described on `documentOfSceneEntry` in
+  // `rv-project-documents.ts` — the TS twin this file must stay identical to
+  // (plan-736 F6). A `models[]`/`library[]` entry carries a real folder in its
+  // path and needs no second copy of that fact.
+  return section === 'scenes'
+    ? { ...entry, id, name, path: entry.path, section }
+    : { ...entry, id, name, path: entry.path };
 }
 
 /** The manifest keys a pre-phase-6 project carried and nothing maintains now. */

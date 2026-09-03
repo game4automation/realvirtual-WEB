@@ -123,6 +123,11 @@ export interface ProjectTreeNode extends TreeNode {
   /** Roots only: remote catalogs get the `(o)` origin mark of §3.1. */
   remote?: boolean;
   /**
+   * Roots only: the provider-declared kind of a catalog source (e.g.
+   * `'github'`). Presentation only — the row icon reads it; no verb does.
+   */
+  sourceKind?: string;
+  /**
    * Folders/roots in a {@link foldersOnlyTree} projection: does the ORIGINAL
    * node hold anything at all — documents and attachments included?
    *
@@ -165,6 +170,8 @@ export interface ProjectTreeRootInput {
   writable: boolean;
   /** Shown with the `(o)` origin mark (§3.1). */
   remote?: boolean;
+  /** See {@link ProjectTreeNode.sourceKind}. */
+  sourceKind?: string;
   files: readonly ProjectTreeFile[];
   /**
    * Folders that exist without holding anything (`RvProject.folders`).
@@ -224,6 +231,7 @@ function buildRoot(input: ProjectTreeRootInput): ProjectTreeNode {
     rootKind: input.kind,
     path: input.id,
     ...(input.remote ? { remote: true } : {}),
+    ...(input.sourceKind ? { sourceKind: input.sourceKind } : {}),
   });
 
   // The System node is created lazily: a project with no reserved folder on disk
@@ -441,6 +449,28 @@ export function folderContents(
   const node = findTreeNode(roots, folderPath);
   if (!node) return [];
   return node.children.filter(c => c.kind === 'document' || c.kind === 'file');
+}
+
+/**
+ * The direct `folder` children of one folder — the navigation tiles the grid
+ * shows ABOVE the asset cards.
+ *
+ * Separate from {@link folderContents} because the two lists live under
+ * different rules downstream: documents run through the search, chip and
+ * classification filters, a subfolder tile only through the search. Without
+ * these tiles a folder holding nothing but subfolders read as
+ * "This folder is empty" — true of its direct documents, false of the folder.
+ * The `system` node stays out: it is the tree's reserved row, not a place the
+ * grid navigates into.
+ */
+export function folderSubfolders(
+  roots: readonly ProjectTreeNode[],
+  folderPath: string | null | undefined,
+): ProjectTreeNode[] {
+  if (!folderPath) return [];
+  const node = findTreeNode(roots, folderPath);
+  if (!node) return [];
+  return node.children.filter(c => c.kind === 'folder');
 }
 
 // ─── Move and rename ────────────────────────────────────────────────────

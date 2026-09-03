@@ -368,12 +368,12 @@ async function _migrate(
         const placed = await placeDocument(backend, row.name || row.id, row.id, body, takenPaths, takenIds);
         try {
           if (!placed.reuse) {
-            await backend.writeBlob(
+            await backend.writeDocument(
               placed.path,
-              new Blob([body as unknown as BlobPart], { type: 'model/gltf-binary' }),
+              body,
               // "create only" — the migration copies in and never overwrites
-              // (write-blob-cas.contract.test.ts names this mode in those words).
-              { expectedRevision: null },
+              // (unified-document-write-cas.test.ts names this mode in those words).
+              { expectedRevision: 'create' },
             );
           }
         } catch (e) {
@@ -431,10 +431,10 @@ async function _migrate(
       const placed = await placeDocument(backend, `Recovered ${orphanId}`, orphanId, body, takenPaths, takenIds);
       try {
         if (!placed.reuse) {
-          await backend.writeBlob(
+          await backend.writeDocument(
             placed.path,
-            new Blob([body as unknown as BlobPart], { type: 'model/gltf-binary' }),
-            { expectedRevision: null },
+            body,
+            { expectedRevision: 'create' },
           );
         }
         writeDocumentAlias(orphanId, placed.id, now);
@@ -677,7 +677,7 @@ async function placeDocument(
     if (!takenPaths.has(normalisePath(path))) {
       // Not claimed by a manifest row. Ask the STORE as well, because a crashed
       // earlier attempt leaves bytes with no row (see {@link PlacedDocument}).
-      const stored = await backend.readBlobBytes(path).catch(() => null);
+      const stored = await backend.readDocument(path).catch(() => null).then(r => r?.bytes ?? null);
       if (!stored) break;
       if (sameBytes(new Uint8Array(stored), body)) { reuse = true; break; }
     }
@@ -708,6 +708,13 @@ function documentRowOf(
     id: placed.id,
     path: placed.path,
     name: placed.name,
+    // The transitional stamp (plan-736 Phase 3) — one of exactly two write
+    // sites that still record `section`, and for one reason: this migration
+    // converts the localStorage scene catalogue into browser documents, whose
+    // paths are bare ids. An OLD client meeting a section-less bare-id row runs
+    // it through the pre-plan-736 path heuristic, gets 'library', and routes it
+    // down the blob branch — a storage failure, not a badge. See
+    // `documentOfSceneEntry` for the full note and the removal gate.
     section: 'scenes',
     createdAt: row.createdAt ?? at,
     modifiedAt: row.modifiedAt ?? at,

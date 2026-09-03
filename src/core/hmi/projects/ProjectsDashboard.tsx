@@ -132,8 +132,10 @@ export function ProjectsDashboard({
         flexDirection: 'column',
         // Tier-3 glass over the viewport (DESIGN.md) — the 3D scene stays
         // faintly visible so the overlay reads as part of the same product.
-        bgcolor: 'rgba(18, 20, 24, 0.94)',
-        backdropFilter: 'blur(calc(12px * var(--rv-ui-blur-scale, 1)))',
+        // The blur lives HERE, the paint on the sections below: the hero band
+        // wears a lighter wash than the rest, and one backdrop-filter on the
+        // root is what lets both share a single blurred scene behind them.
+        backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
         pointerEvents: 'auto',
       }}
     >
@@ -147,6 +149,7 @@ export function ProjectsDashboard({
           py: 1,
           borderBottom: '1px solid rgba(255,255,255,0.06)',
           flexShrink: 0,
+          bgcolor: 'rgba(18, 20, 24, 0.94)',
         }}
       >
         {onBack && (
@@ -175,8 +178,23 @@ export function ProjectsDashboard({
         </Tooltip>
       </Box>
 
-      {/* The open document, full width, above the tools. */}
-      {hero}
+      {/* The open document, full width, above the tools. Its band is the one
+          section that keeps a LIGHTER wash: the blurred scene shows through
+          behind the hero card, which is what sets the open document apart
+          from the working surfaces below it. */}
+      <Box
+        sx={{
+          flexShrink: 0,
+          bgcolor: 'rgba(18, 20, 24, 0.65)',
+          // A soft inset shadow from the band's top and bottom edges — the
+          // recessed look that makes the translucent band read as BEHIND the
+          // opaque surfaces above and below it.
+          boxShadow: 'inset 0 8px 10px -8px rgba(0,0,0,0.55), '
+            + 'inset 0 -8px 10px -8px rgba(0,0,0,0.55)',
+        }}
+      >
+        {hero}
+      </Box>
 
       {/* Sub-header — the tools, on their own bar. Filters and verbs read
           left-to-right from the start of the bar; search sits centred, under
@@ -192,6 +210,7 @@ export function ProjectsDashboard({
             py: 1,
             borderBottom: '1px solid rgba(255,255,255,0.06)',
             flexShrink: 0,
+            bgcolor: 'rgba(18, 20, 24, 0.94)',
           }}
         >
           {headerActions}
@@ -223,7 +242,7 @@ export function ProjectsDashboard({
       )}
 
       {/* The active screen. A row, so a detail pane can sit beside the body. */}
-      <Box sx={{ flex: 1, display: 'flex', minHeight: 0 }}>
+      <Box sx={{ flex: 1, display: 'flex', minHeight: 0, bgcolor: 'rgba(18, 20, 24, 0.94)' }}>
         {children}
       </Box>
     </Box>

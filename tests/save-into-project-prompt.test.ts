@@ -57,11 +57,22 @@ function makeBackend(id: string) {
     id,
     writable: true,
     isActive: true,
-    async writeBlob(relPath: string, blob: Blob) {
+    async writeDocument(ref: string | { path: string }, bytes: Uint8Array) {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
       writes.push(relPath);
-      h.files.set(relPath, await blob.text());
+      h.files.set(relPath, new TextDecoder().decode(bytes));
+      return { revision: 'rev' };
     },
-    async readBlobUrl(relPath: string) {
+    async readDocument(ref: string | { path: string }) {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
+      const value = h.files.get(relPath);
+      return value === undefined ? null : {
+        bytes: new TextEncoder().encode(value),
+        meta: { id: '', name: relPath, path: relPath },
+        revision: 'rev',
+      };
+    },
+    async readDocumentUrl(relPath: string) {
       const value = h.files.get(relPath);
       if (value === undefined) return null;
       const url = URL.createObjectURL(new Blob([value]));

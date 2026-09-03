@@ -38,7 +38,7 @@
  *
  * Every blob write here passes `expectedRevision: null`. That is the mode the
  * CAS contract calls "copy in, never overwrite"
- * (write-blob-cas.contract.test.ts:164), and it is what makes the name probe
+ * (unified-document-write-cas.test.ts), and it is what makes the name probe
  * below a guarantee rather than an optimistic guess: if the probe and the write
  * disagree — another tab created the same name in between — the write is
  * REFUSED instead of silently replacing somebody's file.
@@ -48,9 +48,7 @@ import type { ProjectBackend } from './backends/project-backend';
 import type { RvDocumentEntry, RvProject } from './rv-project-types';
 import {
   documentsOf,
-  sectionOfDocument,
   stableDocumentId,
-  type DocumentSection,
 } from './rv-project-documents';
 
 /**
@@ -128,7 +126,7 @@ export async function planDocument(
   backend: ProjectBackend,
   project: RvProject | null,
   rawName: string,
-  opts: { folder?: string; section?: DocumentSection; exclude?: string } = {},
+  opts: { folder?: string; exclude?: string } = {},
 ): Promise<DocumentTarget> {
   // An EMPTY folder is the project root, and so is an absent one — the two
   // agree since the default became the root, which is why nothing here has to
@@ -147,7 +145,7 @@ export async function planDocument(
     if (!taken.has(normalisePath(relPath))) {
       const stored = normalisePath(relPath) === exclude
         ? null
-        : await backend.readBlobBytes(relPath).catch(() => null);
+        : await backend.readDocument(relPath).catch(() => null).then(r => r?.bytes ?? null);
       if (!stored) break;
     }
     name = `${base} ${n}`;
@@ -192,14 +190,12 @@ export async function commitDocuments(
 /**
  * The row a freshly placed document gets.
  *
- * `section` is DERIVED from the target path rather than fixed at `'scenes'`
- * (plan-717 F7). Since Phase 3 this function serves every create — the "New"
- * button now places a document into whatever folder is in view, and a library
- * asset stamped `section: 'scenes'` would sort itself into the wrong half of
- * every listing that groups by section. `sectionOfDocument` is the same rule the
- * scan applies, so a created row and a scanned one describe themselves
- * identically; `extra.section` still wins when a caller knows better (the
- * duplicate, which copies its source's).
+ * No `section` is stamped (plan-736 F3). plan-717 F7 had already stopped
+ * FIXING it at `'scenes'` and derived it from the target path instead — which
+ * was the right correction and also the demonstration that the field carried
+ * nothing the path did not already say. Nothing reads it any more, so a new row
+ * simply does not carry it; a row that HAS one keeps it, because the manifest
+ * passes unknown fields through untouched (§F4).
  */
 export function documentRowFor(
   target: DocumentTarget,
@@ -210,7 +206,6 @@ export function documentRowFor(
     id: target.documentId,
     path: target.relPath,
     name: target.name,
-    section: sectionOfDocument({ path: target.relPath } as RvDocumentEntry),
     createdAt: at,
     modifiedAt: at,
     ...extra,
@@ -248,7 +243,7 @@ export function documentFolderOf(path: string): string {
 export async function createDocument(
   host: DocumentManifestHost,
   name: string,
-  opts: { bytes?: BlobPart; folder?: string; extra?: Partial<RvDocumentEntry>; now?: () => string } = {},
+  opts: { bytes?: Uint8Array; folder?: string; extra?: Partial<RvDocumentEntry>; now?: () => string } = {},
 ): Promise<DocumentTarget> {
   const backend = host.getBackend();
   if (!backend?.writable) throw new Error('This project cannot be written to.');
@@ -257,11 +252,11 @@ export async function createDocument(
   // target, and dropping it here would silently redirect the create to `scenes/`.
   const target = await planDocument(backend, project, name, { ...(opts.folder !== undefined ? { folder: opts.folder } : {}) });
 
-  const bytes = opts.bytes ?? (await emptyGlbPart());
-  await backend.writeBlob(
+  const bytes = opts.bytes ?? (await emptyGlbBytes());
+  await backend.writeDocument(
     target.relPath,
-    new Blob([bytes], { type: 'model/gltf-binary' }),
-    { expectedRevision: null },
+    bytes,
+    { expectedRevision: 'create' },
   );
 
   const at = (opts.now ?? (() => new Date().toISOString()))();
@@ -273,9 +268,12 @@ export async function createDocument(
 }
 
 /** A minimal valid GLB, lazily imported so the empty-scene builder is not eager. */
-async function emptyGlbPart(): Promise<BlobPart> {
+async function emptyGlbBytes(): Promise<Uint8Array> {
   const { buildEmptyGlbBlob } = await import('../hmi/scene/empty-glb');
-  return buildEmptyGlbBlob();
+  const part = buildEmptyGlbBlob();
+  if (part instanceof Uint8Array) return part;
+  if (part instanceof ArrayBuffer) return new Uint8Array(part);
+  return new Uint8Array(await new Blob([part]).arrayBuffer());
 }
 
 /**
@@ -305,24 +303,19 @@ export async function duplicateDocument(
   const source = documentsOf(project).find(d => d.id === documentId);
   if (!source) throw new Error(`Document ${documentId} not found`);
 
-  const bytes = await backend.readBlobBytes(source.path);
+  const bytes = (await backend.readDocument(source.path))?.bytes ?? null;
   if (!bytes) throw new Error(`"${source.name}" could not be read.`);
 
   const target = await planDocument(backend, project, `${source.name} copy`, {
     folder: documentFolderOf(source.path),
   });
-  await backend.writeBlob(
-    target.relPath,
-    new Blob([bytes], { type: 'model/gltf-binary' }),
-    { expectedRevision: null },
-  );
+  await backend.writeDocument(target.relPath, bytes, { expectedRevision: 'create' });
 
   const at = (opts.now ?? (() => new Date().toISOString()))();
   await commitDocuments(host, [
     ...documentsOf(project),
     documentRowFor(target, at, {
       copiedFrom: source.id,
-      ...(source.section ? { section: source.section } : {}),
       ...(Array.isArray(source.collections) ? { collections: [...source.collections] } : {}),
     }),
   ]);
@@ -350,18 +343,19 @@ export async function retireDocument(
   if (!row) return false;
 
   try {
-    const bytes = await backend.readBlobBytes(row.path);
+    const bytes = (await backend.readDocument(row.path))?.bytes ?? null;
     if (bytes) {
       const file = row.path.split('/').pop() ?? row.path;
       let target = `${DOCUMENT_TRASH_FOLDER}/${file}`;
-      for (let n = 2; n < 100 && (await backend.readBlobBytes(target).catch(() => null)); n++) {
+      for (let n = 2; n < 100 && (await backend.readDocument(target).catch(() => null).then(r => r?.bytes ?? null)); n++) {
         const dot = file.lastIndexOf('.');
         const stem = dot > 0 ? file.slice(0, dot) : file;
         const ext = dot > 0 ? file.slice(dot) : '';
         target = `${DOCUMENT_TRASH_FOLDER}/${stem} ${n}${ext}`;
       }
-      await backend.writeBlob(target, new Blob([bytes], { type: 'model/gltf-binary' }));
-      await backend.deleteBlob(row.path);
+      // `target` is the first free name found by the probe loop above.
+      await backend.writeDocument(target, bytes, { expectedRevision: 'create' });
+      await backend.deleteDocument(row.path);
     }
   } catch (e) {
     // The row still goes: a document whose bytes cannot be moved is exactly the

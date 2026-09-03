@@ -33,6 +33,7 @@ import {
 import { sceneGlbRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
 import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
+import { writeSceneDocument, writeBlobDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -56,7 +57,7 @@ interface Candidate {
    * The scene PATHS the writer recorded in this folder's manifest.
    *
    * The writer stopped writing bodies in plan-413 phase 6 — the GLB goes
-   * through `backend.writeScene()` before the mutation is even emitted — so
+   * through `writeSceneDocument(backend, )` before the mutation is even emitted — so
    * "did this folder receive the mutation?" is answered by its manifest, not by
    * its `scenes/` directory. Same question, the surface that still answers it.
    */
@@ -114,11 +115,11 @@ describe('a discovered backend', () => {
   it('throws from every write method while inactive', async () => {
     const c = track(candidate('a', new Map()));
     const s = scene('scn_a', 'A');
-    await expect(c.backend.writeScene(sceneGlbRelPathFor(s), glbWriteFor(s)))
+    await expect(writeSceneDocument(c.backend, sceneGlbRelPathFor(s), glbWriteFor(s)))
       .rejects.toBeInstanceOf(BackendNotWritableError);
-    await expect(c.backend.deleteScene(sceneGlbRelPathFor(s)))
+    await expect(c.backend.deleteDocument(sceneGlbRelPathFor(s)))
       .rejects.toBeInstanceOf(BackendNotWritableError);
-    await expect(c.backend.writeBlob('models/x.glb', new Blob(['x'])))
+    await expect(writeBlobDocument(c.backend, 'models/x.glb', new Blob(['x'])))
       .rejects.toBeInstanceOf(BackendNotWritableError);
   });
 
@@ -270,12 +271,28 @@ describe('RR1 path ownership', () => {
       }],
     };
     await c.backend.activate();
-    await expect(c.backend.writeScene(sceneGlbRelPathFor(yours), glbWriteFor(mine))).rejects.toThrow(/belongs to scene/);
+    await expect(writeSceneDocument(c.backend, sceneGlbRelPathFor(yours), glbWriteFor(mine))).rejects.toThrow(/belongs to scene/);
   });
 
-  it('refuses a delete for a path no manifest entry owns', async () => {
+  /**
+   * plan-736 §2.3: this used to refuse, and the refusal was the section split
+   * showing through on the delete path.
+   *
+   * `deleteScene` threw for a path no manifest row owned, while `deleteBlob` —
+   * one screen down in the same class — deleted it without a word. Which of the
+   * two a caller got was decided by `sectionOfDocument`, so "may I delete an
+   * unowned file" had two answers depending on which folder the file happened
+   * to be in. One method cannot keep both.
+   *
+   * Tolerance wins because it is the one of the two that is idempotent: the
+   * caller's intent ("this must not be there") is already satisfied by a file
+   * that is not there, and a second Delete click must not become an error. R2 —
+   * never tidy away what nobody asked about — is untouched: it constrains the
+   * writer's own sweeps, not an explicit delete somebody asked for.
+   */
+  it('a delete for a path no manifest entry owns is a no-op, not a refusal', async () => {
     const c = track(candidate('a', new Map()));
     await c.backend.activate();
-    await expect(c.backend.deleteScene('scenes/ghost.scene.glb')).rejects.toThrow(/No manifest entry/);
+    await expect(c.backend.deleteDocument('scenes/ghost.scene.glb')).resolves.toBeUndefined();
   });
 });

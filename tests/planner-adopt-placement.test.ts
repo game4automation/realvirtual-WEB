@@ -19,12 +19,18 @@
 import { describe, it, expect } from 'vitest';
 import { Group, Object3D } from 'three';
 import { adoptPlacedNode } from '../src/plugins/layout-planner/scene-mutations';
+import { SnapPointRegistry } from '../src/core/engine/rv-snap-point-registry';
+import { scanAndRegisterSnaps } from '../src/plugins/snap-point/snap-scanner';
 
-function deps(): {
+function deps(registry?: SnapPointRegistry): {
   objectMap: Map<string, Object3D>;
   idByObject: WeakMap<Object3D, string>;
+  getViewer: () => unknown;
 } {
-  return { objectMap: new Map(), idByObject: new WeakMap() };
+  const viewer = registry
+    ? { getPlugin: () => ({ getRegistry: () => registry }) }
+    : null;
+  return { objectMap: new Map(), idByObject: new WeakMap(), getViewer: () => viewer };
 }
 
 /** A composed placement: a reference node with a grafted subtree under it. */
@@ -96,5 +102,25 @@ describe('adoptPlacedNode', () => {
     const { node } = composedPlacement();
     adoptPlacedNode(deps() as never, node, 'plc_1', 'Presse_02', 'press');
     expect(node.userData._originalName).toBe('Presse_02');
+  });
+
+  it('re-owns snaps the model-root scan registered with the wrong owner', () => {
+    // The snap plugin's onModelLoaded scans the WHOLE loaded root with
+    // ownerRoot = model root, so every baked placement's snaps share one
+    // owner — and same-owner snaps can never pair in the geometry rebuild.
+    // Adoption must drop those entries and re-register per placement.
+    const { root, node } = composedPlacement();
+    const snap = new Object3D();
+    snap.name = 'Snap-XP-conv';
+    node.add(snap);
+
+    const registry = new SnapPointRegistry();
+    scanAndRegisterSnaps(root, registry, root); // what onModelLoaded does
+
+    expect(registry.getById(snap.uuid)?.ownerRoot).toBe(root);
+
+    adoptPlacedNode(deps(registry) as never, node, 'plc_1', 'Presse_02', 'press');
+
+    expect(registry.getById(snap.uuid)?.ownerRoot).toBe(node);
   });
 });

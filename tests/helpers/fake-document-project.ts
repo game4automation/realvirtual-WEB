@@ -31,7 +31,7 @@
  */
 
 import { getProjectStore, type ProjectStore } from '../../src/core/project/project-store';
-import type { ProjectBackend } from '../../src/core/project/backends/project-backend';
+import { docPathOf, preconditionOf, type DocRef, type ProjectBackend } from '../../src/core/project/backends/project-backend';
 import type { RvDocumentEntry, RvProject } from '../../src/core/project/rv-project-types';
 import {
   revisionOfBytes,
@@ -120,28 +120,31 @@ export function installFakeDocumentProject(opts: {
     async statDocuments() { return []; },
     async activate() {},
     async deactivate() {},
-    async readScene() { return null; },
     async readSettings() { return null; },
-    async writeScene() { return 'rev'; },
-    async deleteScene() {},
-    async readBlobBytes(relPath: string) {
+    async readDocument(ref: DocRef) {
+      const relPath = docPathOf(ref);
       const found = files.get(relPath);
-      return found ? (found.buffer.slice(found.byteOffset, found.byteOffset + found.byteLength) as ArrayBuffer) : null;
+      if (!found) return null;
+      return { bytes: found, meta: { id: '', name: '', path: relPath }, revision: await revisionOfBytes(found) };
     },
-    async readBlobUrl() { return null; },
-    async writeBlob(relPath: string, blob: Blob, o?: { expectedRevision?: string | null }) {
-      const expected = o === undefined ? undefined : o.expectedRevision;
+    async readDocumentUrl() { return null; },
+    async writeDocument(ref: DocRef, bytes: Uint8Array, o: { expectedRevision: string }) {
+      const relPath = docPathOf(ref);
+      const expected = preconditionOf(o.expectedRevision);
+      // `writes` still records the three-valued token the assertions read, so a
+      // test can say "this was a create" the way it always could.
       writes.push({ relPath, expected });
       if (expected !== undefined) {
         const stored = files.get(relPath);
         const actual = stored ? await revisionOfBytes(stored) : null;
         if (actual !== expected) {
-          throw new SceneRevisionConflictError(relPath, expected ?? null, actual);
+          throw new SceneRevisionConflictError(relPath, expected, actual);
         }
       }
-      files.set(relPath, await toBytes(blob));
+      files.set(relPath, bytes);
+      return { revision: await revisionOfBytes(bytes) };
     },
-    async deleteBlob(relPath: string) { files.delete(relPath); },
+    async deleteDocument(ref: DocRef) { files.delete(docPathOf(ref)); },
     async flush() {},
   } as unknown as ProjectBackend;
 

@@ -70,7 +70,7 @@ const backend = {
     writes.push(relPath);
     h.blobs.set(relPath, blob);
   },
-  async readBlobUrl(relPath: string) {
+  async readDocumentUrl(relPath: string) {
     const blob = h.blobs.get(relPath);
     if (!blob) return null;
     const url = URL.createObjectURL(blob);
@@ -82,7 +82,7 @@ const store = {
   getBackend: () => backend,
   getProject: () => ({ id: 'prj_browser' }),
   async resolveAssetUrl(relPath: string) {
-    return (await backend.readBlobUrl(relPath))?.url ?? null;
+    return (await backend.readDocumentUrl(relPath))?.url ?? null;
   },
   setDirtyDocumentsProbe: () => {},
   mintReferencedAssetIdentities: async () => {},

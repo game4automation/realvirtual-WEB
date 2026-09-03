@@ -419,8 +419,16 @@ export class LibraryStore {
           this._notify();
           return;
         }
-        // Derive baseUrl from catalog URL directory
-        const baseUrl = data.baseUrl ?? fetchUrl.substring(0, fetchUrl.lastIndexOf('/') + 1);
+        // Derive baseUrl from catalog URL directory. A RELATIVE catalog URL (a
+        // deployed manifest's `libraries[]` may say `library/catalog.json`) is
+        // resolved against the page base first: a relative base would leak into
+        // every entry's glbUrl, and `catalogEntryPath` only strips the
+        // `…library/` prefix from absolute URLs — the dashboard tree then grew
+        // a phantom `library/` folder level around every entry.
+        const absUrl = /^[a-z][a-z0-9+.-]*:/i.test(fetchUrl) || typeof document === 'undefined'
+          ? fetchUrl
+          : new URL(fetchUrl, document.baseURI).href;
+        const baseUrl = data.baseUrl ?? absUrl.substring(0, absUrl.lastIndexOf('/') + 1);
         // Normalize entries: auto-fill missing fields, resolve relative URLs
         data.entries = data.entries.map(e => normalizeCatalogEntry(e, baseUrl));
         this._catalogs.set(url, data);

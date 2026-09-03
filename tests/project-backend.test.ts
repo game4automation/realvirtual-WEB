@@ -33,6 +33,7 @@ import {
   sceneDocumentsOf,
 } from '../src/core/project/rv-project-documents';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
+import { writeSceneDocument, writeBlobDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -102,16 +103,18 @@ describe('BundledBackend', () => {
 
   it('throws from every write method', async () => {
     const b = new BundledBackend({ fetchImpl: fakeFetch({}) });
-    await expect(b.writeScene()).rejects.toBeInstanceOf(BackendNotWritableError);
-    await expect(b.deleteScene()).rejects.toBeInstanceOf(BackendNotWritableError);
-    await expect(b.writeBlob()).rejects.toBeInstanceOf(BackendNotWritableError);
+    await expect(b.writeDocument('scenes/x.scene.glb', new Uint8Array([1]), { expectedRevision: 'any' }))
+      .rejects.toBeInstanceOf(BackendNotWritableError);
+    await expect(b.deleteDocument('scenes/x.scene.glb'))
+      .rejects.toBeInstanceOf(BackendNotWritableError);
   });
 
   it('activating it does not make it writable', async () => {
     const b = new BundledBackend({ fetchImpl: fakeFetch({}) });
     await b.activate();
     expect(b.isActive).toBe(true);
-    await expect(b.writeScene()).rejects.toBeInstanceOf(BackendNotWritableError);
+    await expect(b.writeDocument('scenes/x.scene.glb', new Uint8Array([1]), { expectedRevision: 'any' }))
+      .rejects.toBeInstanceOf(BackendNotWritableError);
   });
 
   // ── plan-735 F6: the synthetic manifest is gone, and so is its spec ──────
@@ -207,23 +210,23 @@ describe('BundledBackend', () => {
     const b = new BundledBackend({
       fetchImpl: fakeFetch({ 'scenes/x.scene.glb': 'glb:scn_x' }),
     });
-    const record = await b.readScene('scenes/x.scene.glb');
-    expect(new TextDecoder().decode(record!.glb)).toBe('glb:scn_x');
+    const record = await b.readDocument('scenes/x.scene.glb');
+    expect(new TextDecoder().decode(record!.bytes)).toBe('glb:scn_x');
     // F10: a deploy that still publishes `.scene.json` is told so, rather than
     // being served a body nothing downstream can read.
-    await expect(b.readScene('scenes/junk.json')).rejects.toThrow(/6\.3\.16/);
+    await expect(b.readDocument('scenes/junk.json')).rejects.toThrow(/6\.3\.16/);
   });
 
   it('resolves a blob url with nothing to revoke', async () => {
     const b = new BundledBackend({ baseUrl: '/app/', fetchImpl: fakeFetch({}) });
-    const resolved = await b.readBlobUrl('models/A.glb');
+    const resolved = await b.readDocumentUrl('models/A.glb');
     expect(resolved?.url).toBe('/app/models/A.glb');
     expect(() => resolved?.release()).not.toThrow();
   });
 
   it('leaves an absolute url alone', async () => {
     const b = new BundledBackend({ baseUrl: '/app/', fetchImpl: fakeFetch({}) });
-    const resolved = await b.readBlobUrl('https://cdn.example/x.glb');
+    const resolved = await b.readDocumentUrl('https://cdn.example/x.glb');
     expect(resolved?.url).toBe('https://cdn.example/x.glb');
   });
 
@@ -293,7 +296,7 @@ describe('FolderBackend', () => {
     const b = new FolderBackend(asDirHandle(root), { writable: true });
 
     expect((await b.readManifest())?.id).toBe('prj_folder');
-    expect(new TextDecoder().decode((await b.readScene(sceneGlbRelPathFor(s)))!.glb))
+    expect(new TextDecoder().decode((await b.readDocument(sceneGlbRelPathFor(s)))!.bytes))
       .toContain('scn_a');
     expect(await b.readSettings()).toEqual({ $schema: 'rv-settings-bundle/1.0' });
     expect(b.kind).toBe('folder');
@@ -326,7 +329,7 @@ describe('FolderBackend', () => {
     const root = folderWith();
     root.seedDir('library').seedDir('PalletHandling').seedText('Pallet.glb', 'GLB');
     const b = new FolderBackend(asDirHandle(root), { writable: true });
-    const resolved = await b.readBlobUrl('library/PalletHandling/Pallet.glb');
+    const resolved = await b.readDocumentUrl('library/PalletHandling/Pallet.glb');
     expect(resolved?.url.startsWith('blob:')).toBe(true);
     resolved?.release();
   });
@@ -364,16 +367,16 @@ describe('FolderBackend', () => {
     const root = folderWith();
     root.seedDir('models').seedText('press.glb', 'GLB');
     const b = new FolderBackend(asDirHandle(root), { writable: true });
-    const resolved = await b.readBlobUrl('models/press.glb');
+    const resolved = await b.readDocumentUrl('models/press.glb');
     expect(resolved?.url.startsWith('blob:')).toBe(true);
     expect(() => resolved?.release()).not.toThrow();
-    expect(await b.readBlobUrl('models/missing.glb')).toBeNull();
+    expect(await b.readDocumentUrl('models/missing.glb')).toBeNull();
   });
 
   it('a read-only folder refuses writes even once active', async () => {
     const b = new FolderBackend(asDirHandle(folderWith()), { writable: false });
     await b.activate();
-    await expect(b.writeScene('scenes/a.scene.glb', glbWrite('scn_a', 'A')))
+    await expect(writeSceneDocument(b, 'scenes/a.scene.glb', glbWrite('scn_a', 'A')))
       .rejects.toBeInstanceOf(BackendNotWritableError);
   });
 });
@@ -391,7 +394,7 @@ describe('contract', () => {
       // the assignment that would fail if `kind` had been narrowed wrongly.
       const reader: ProjectReadProvider = b;
       expect(typeof reader.readManifest).toBe('function');
-      expect(typeof reader.readScene).toBe('function');
+      expect(typeof reader.readDocument).toBe('function');
       expect(typeof reader.readSettings).toBe('function');
       expect(['bundled', 'browser', 'folder']).toContain(reader.kind);
       expect(typeof b.id).toBe('string');
@@ -451,17 +454,19 @@ describe('BundledBackend library', () => {
 // ─── documents[] listing (plan-413 §2.4) ────────────────────────────────
 
 describe('listDocuments / statDocuments', () => {
-  it('folds scenes, models and library into one list, each with its section', async () => {
+  it('folds scenes, models and library into ONE list, each at its own path', async () => {
     const root = folderWith([scene('scn_a', 'A')]);
     root.seedDir('models').seedText('press.glb', 'glb');
     root.seedDir('library').seedDir('Custom').seedText('gripper.glb', 'glb');
     const b = new FolderBackend(asDirHandle(root), { writable: false });
 
     const docs = await b.listDocuments();
-    expect(docs.map(d => [d.section, d.path])).toEqual([
-      ['scenes', sceneGlbRelPathFor(scene('scn_a', 'A'))],
-      ['models', 'models/press.glb'],
-      ['library', 'library/Custom/gripper.glb'],
+    // The path is the whole answer since plan-736 — a row no longer restates
+    // its folder in a second field that could disagree with it.
+    expect(docs.map(d => d.path)).toEqual([
+      sceneGlbRelPathFor(scene('scn_a', 'A')),
+      'models/press.glb',
+      'library/Custom/gripper.glb',
     ]);
     // Every document has an id — the mandatory one of F2, minted from the path
     // where the legacy entry had none.

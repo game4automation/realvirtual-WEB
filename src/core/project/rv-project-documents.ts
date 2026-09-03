@@ -53,36 +53,56 @@ import {
   type RvProjectSceneEntry,
 } from './rv-project-types';
 
-// ─── Sections ───────────────────────────────────────────────────────────
+// ─── Sections: the legacy compatibility layer (plan-736) ────────────────
+//
+// Everything in this block reads a shape the product no longer WRITES.
+//
+// `section` used to be a stored field on `RvDocumentEntry` and the last place
+// the project model distinguished three kinds of document. Its real job was
+// storage routing — it decided whether a document went through
+// `readScene`/`writeScene` (compare-and-swap) or `writeBlob` (no precondition)
+// — and it was stored rather than derived because the path prefix is wrong for
+// the browser backend, where a scene's path is its bare id.
+//
+// plan-736 removed the routing (there is one `writeDocument` with a mandatory
+// precondition, and each backend routes on what IT stores), which removed the
+// reason to keep the field. It is gone from the type and nothing stamps it.
+//
+// What survives here, and why:
+//
+//  - **The Legacy-v1 migration** (`scenes[]`/`models[]`/`library[]` →
+//    `documents[]`) must keep knowing the three array names, or an unmigrated
+//    customer manifest loses its documents. That is `LEGACY_DOCUMENT_ARRAYS`,
+//    `documentOfAssetEntry` and `documentsFromLists`.
+//  - **Reading a value somebody else wrote.** Delivered manifests carry
+//    `section` and always will (§F4: it is never actively removed), and the
+//    browser scene path still stamps `'scenes'` for one transition period, so
+//    old clients do not misroute a bare-id scene. `sectionOfDocument` reads
+//    those, so the few remaining scene-shaped projections still find them.
+//
+// Nothing outside those two purposes may grow a new caller here. The place a
+// document is, is its path.
 
-/**
- * Which storage surface holds a document's bytes.
- *
- * Not transition bookkeeping — it outlived the mirror on purpose (run 6). A
- * `scenes` document is read and written through `readScene`/`writeScene` with
- * the compare-and-swap of §2.8; a `models`/`library` document is a plain blob.
- * It is *stored* rather than inferred because the only other candidate — the
- * path prefix — is wrong for the browser backend, where a scene's path is its
- * bare id and every path heuristic would file it under `library`.
- */
+/** The three legacy kinds. Read, derived — never written to a new row. */
 export type DocumentSection = 'scenes' | 'models' | 'library';
 
-/** All sections, in the order a listing enumerates them. */
-export const DOCUMENT_SECTIONS: readonly DocumentSection[] =
+/** The three pre-plan-413 manifest arrays, by name. */
+export const LEGACY_DOCUMENT_ARRAYS: readonly DocumentSection[] =
   ['scenes', 'models', 'library'] as const;
 
-/** True for a value this build recognises as a section. */
+/** True for a value this build recognises as a legacy section name. */
 export function isDocumentSection(value: unknown): value is DocumentSection {
-  return typeof value === 'string' && (DOCUMENT_SECTIONS as readonly string[]).includes(value);
+  return typeof value === 'string' && (LEGACY_DOCUMENT_ARRAYS as readonly string[]).includes(value);
 }
 
 /**
- * The section a document belongs to.
+ * The legacy section a document would have been filed under.
  *
- * Recorded value first; for a foreign manifest that has `documents[]` without
- * our bookkeeping, the path prefix is the honest guess, and `library` is the
- * fallback — a document of unknown provenance is a referenceable artefact, not
- * something we would open on a click.
+ * A recorded value first — a delivered manifest or a browser scene row may
+ * carry one and it is read through the index signature, since the field is no
+ * longer part of {@link RvDocumentEntry} — then the path prefix, with `library`
+ * as the fallback: a document of unknown provenance is a referenceable
+ * artefact, not something we would open on a click.
  */
 export function sectionOfDocument(entry: RvDocumentEntry): DocumentSection {
   if (isDocumentSection(entry.section)) return entry.section;
@@ -95,25 +115,25 @@ export function sectionOfDocument(entry: RvDocumentEntry): DocumentSection {
 // ─── Keys and ids ───────────────────────────────────────────────────────
 
 /**
- * The key a document is addressed by inside its section.
+ * The key a document is addressed by.
  *
- * Same rule as {@link assetEntryKey} — id when it has one, path otherwise — so
- * an entry that gains an id keeps answering to the same question it did before.
- * The section is part of the key because `models/a.glb` and `library/a.glb` are
- * two documents.
+ * Same rule as {@link assetEntryKey} and as `documentTierKey` — id when it has
+ * one, path otherwise — so an entry that gains an id keeps answering to the same
+ * question it did before.
+ *
+ * plan-736 dropped the section prefix this used to carry (`sectionKeyOf`). Its
+ * stated reason was that "`models/a.glb` and `library/a.glb` are two
+ * documents" — which is true, and which the PATH already says: the two keys
+ * differed in the prefix only because the paths they were built from differed
+ * first. What the prefix could do, and did, is make one document answer to two
+ * keys whenever the stored section and the path heuristic disagreed about it —
+ * a browser scene (`path` = bare id, `section: 'scenes'`) keyed as
+ * `scenes:<id>` in the manifest and `library:<id>` off a scan.
  */
-export function sectionKeyOf(
-  section: DocumentSection,
-  entry: { id?: unknown; path?: unknown },
-): string {
+export function documentKeyOf(entry: { id?: unknown; path?: unknown }): string {
   const id = typeof entry.id === 'string' ? entry.id.trim() : '';
   const path = typeof entry.path === 'string' ? entry.path : '';
-  return `${section}:${id !== '' ? id : path}`;
-}
-
-/** The key of a document entry. */
-export function documentKeyOf(entry: RvDocumentEntry): string {
-  return sectionKeyOf(sectionOfDocument(entry), entry);
+  return id !== '' ? id : path;
 }
 
 /**
@@ -190,6 +210,19 @@ export function documentOfSceneEntry(
   const name = typeof entry.name === 'string' && entry.name !== ''
     ? entry.name
     : assetNameOf(entry as unknown as RvProjectAssetEntry);
+  // ## The transitional stamp (plan-736 Phase 3) — deliberately still here
+  //
+  // Every other write site stopped recording `section`. This one has not, and
+  // the reason is an OLD CLIENT reading a browser project: a scene's path there
+  // is its bare id, so a section-less row hits the pre-plan-736 path heuristic,
+  // comes back `'library'`, and gets routed down the blob branch of that
+  // client's `writeDocumentClassification` and out of its adopt filter. That is
+  // a storage-routing failure, not a badge problem.
+  //
+  // Removing it is an explicit, separate step, gated on the slow delivery
+  // channels (ctrlX snap, CONNECT-embedded appliances) carrying a client that
+  // no longer reads the field. The first section-less row written into a user's
+  // browser storage is the point of no return, and it belongs behind that gate.
   return { ...entry, id, name, path: entry.path, section: 'scenes' };
 }
 
@@ -204,12 +237,19 @@ export function documentOfSceneEntry(
  */
 export function documentOfAssetEntry(
   entry: RvProjectAssetEntry,
-  section: Exclude<DocumentSection, 'scenes'>,
+  _section: Exclude<DocumentSection, 'scenes'>,
   mintId: (entry: { path: string }) => string = e => stableDocumentId(e.path),
 ): RvDocumentEntry {
   const id = typeof entry.id === 'string' && entry.id.trim() !== '' ? entry.id : mintId(entry);
   const own = typeof entry.name === 'string' ? entry.name.trim() : '';
-  return { ...entry, id, name: own !== '' ? own : assetNameOf(entry), path: entry.path, section };
+  // `_section` says which legacy ARRAY the entry was lifted out of. It is not
+  // written to the row any more (plan-736 F3): a `models[]`/`library[]` entry
+  // carries a real `models/`/`library/` path, so the row would only be
+  // restating its own path. The parameter stays because the caller genuinely
+  // has the information and a later migration may need it again — unlike the
+  // scene branch above, this one needs no transitional stamp, because a path
+  // with a folder in it is legible to an old client's heuristic.
+  return { ...entry, id, name: own !== '' ? own : assetNameOf(entry), path: entry.path };
 }
 
 // ─── Fingerprints ───────────────────────────────────────────────────────
@@ -421,7 +461,7 @@ export function withDerivedDocuments(project: RvProject | null | undefined): RvP
  */
 export function withoutLegacyArrays(project: RvProject): RvProject {
   const out: Record<string, unknown> = { ...(project as Record<string, unknown>) };
-  for (const key of DOCUMENT_SECTIONS) delete out[key];
+  for (const key of LEGACY_DOCUMENT_ARRAYS) delete out[key];
   delete out.documentsBaseline;
   return out as RvProject;
 }
@@ -451,23 +491,21 @@ export function documentsFromLists(
   const overlay = new Map<string, RvDocumentEntry>();
   for (const doc of declared) {
     if (!doc || typeof doc !== 'object') continue;
-    overlay.set(sectionKeyOf(sectionOfDocument(doc), doc), doc);
+    overlay.set(documentKeyOf(doc), doc);
   }
 
   const out: RvDocumentEntry[] = [];
   for (const entry of lists.scenes ?? []) {
     if (!entry || typeof entry.path !== 'string') continue;
-    const key = sectionKeyOf('scenes', entry);
     const base = documentOfSceneEntry(entry, mintId);
-    const known = overlay.get(key);
+    const known = overlay.get(documentKeyOf(entry));
     out.push(known ? { ...known, ...base, classification: known.classification } : base);
   }
   for (const section of ['models', 'library'] as const) {
     for (const entry of lists[section] ?? []) {
       if (!entry || typeof entry.path !== 'string') continue;
-      const key = sectionKeyOf(section, entry);
       const base = documentOfAssetEntry(entry, section, mintId);
-      const known = overlay.get(key);
+      const known = overlay.get(documentKeyOf(entry));
       out.push(known ? { ...known, ...base, classification: known.classification } : base);
     }
   }

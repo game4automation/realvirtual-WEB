@@ -26,6 +26,7 @@
  */
 
 import { Autocomplete, Box, Chip, TextField } from '@mui/material';
+import { filterChipSx } from '../shared-sx';
 import { DOCUMENT_CHIP_ALL, type DocumentChipOption } from './document-filter';
 
 export interface DocumentFilterBarProps {
@@ -58,13 +59,16 @@ export function DocumentFilterBar({
             size="small"
             label={`${option.label} ${option.count}`}
             aria-pressed={selected}
-            // The one accent, used to mean "this is on" — nothing else on this
-            // bar is coloured, so the lit chip is unambiguous.
-            color={selected ? 'primary' : 'default'}
-            variant={selected ? 'filled' : 'outlined'}
+            // The canonical filter chip (shared-sx): 2px corners per the chip
+            // family rule, tinted Instrument Blue for "on". The solid-filled
+            // primary Chip it replaces was the loudest element on the screen —
+            // button-weight color on what is only a view filter.
             onClick={() => onChipChange(
               option.key === DOCUMENT_CHIP_ALL ? null : option.key)}
-            sx={{ height: 22, fontSize: 11, '& .MuiChip-label': { px: 0.75 } }}
+            sx={{
+              ...filterChipSx(selected, 22) as object,
+              '& .MuiChip-label': { px: 0.75 },
+            }}
           />
         );
       })}

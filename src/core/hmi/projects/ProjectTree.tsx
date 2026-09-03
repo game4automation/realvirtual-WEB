@@ -53,6 +53,7 @@ import {
   ExpandMore,
   Folder,
   FolderOutlined,
+  GitHub,
   InsertDriveFileOutlined,
   LockOutlined,
   PublicOutlined,
@@ -75,17 +76,6 @@ import {
 
 /** Row height, matching the scene hierarchy's fine-pointer density. */
 export const PROJECT_TREE_ROW_HEIGHT = 22;
-
-/**
- * Blank space a library row carries above itself, in pixels.
- *
- * The seam needs room on both sides or it reads as an underline of the row
- * above rather than a break between two trees. The space is part of the row —
- * the virtualizer measures it (see `estimateSize`), so scroll maths, the drop
- * geometry and the row rectangle all stay in agreement, which a margin between
- * absolutely-positioned rows could not do.
- */
-const LIBRARY_GAP = 12;
 
 /** Drag-insertion accent — the same Instrument Blue the scene hierarchy uses. */
 const DND_ACCENT = '79, 195, 247';
@@ -166,6 +156,9 @@ function KindIcon({ node }: { node: ProjectTreeNode }) {
     if (node.rootKind !== 'catalog') {
       return holdsSomething ? <Folder sx={sx} /> : <FolderOutlined sx={sx} />;
     }
+    // A GitHub-backed catalog wears the GitHub mark — "the cloud" undersells
+    // a source whose identity IS the repo it scans.
+    if (node.sourceKind === 'github') return <GitHub sx={sx} />;
     // A cloud for what lives in the cloud, a globe for the rest. `remote` is
     // the flag the badge beside the row already says out loud, so icon and
     // wording cannot drift apart: a library reachable only over the network
@@ -247,13 +240,6 @@ const ProjectTreeRowView = memo(function ProjectTreeRowView({
   const hoverFill = selected ? `rgba(${DND_ACCENT}, 0.2)`
     : containsSelection ? `rgba(${DND_ACCENT}, 0.1)`
       : node.kind === 'root' ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.04)';
-  // On a library row the fill starts BELOW the gap, so the seam keeps clear
-  // space on both sides instead of sitting inside the band. One background
-  // property rather than a second element — the row already carries a
-  // pseudo-element for the seam itself.
-  const fillFrom = (colour: string) => (drawsSeam
-    ? `linear-gradient(to bottom, transparent 0 ${LIBRARY_GAP}px, ${colour} ${LIBRARY_GAP}px 100%)`
-    : colour);
 
   return (
     <Box
@@ -295,9 +281,7 @@ const ProjectTreeRowView = memo(function ProjectTreeRowView({
         userSelect: 'none',
         borderRadius: '2px',
         minWidth: 0,
-        // The gap belongs to the row, so the content sits below it.
-        pt: drawsSeam ? `${LIBRARY_GAP}px` : 0,
-        background: fillFrom(restFill),
+        background: restFill,
         boxShadow: dropZone === 'before'
           ? `inset 0 2px 0 0 rgba(${DND_ACCENT}, 0.95)`
           : dropZone === 'after'
@@ -307,18 +291,18 @@ const ProjectTreeRowView = memo(function ProjectTreeRowView({
               : 'none',
         // Hover lifts a root off its own band rather than off the panel, so the
         // feedback stays equally visible on both kinds of row.
-        '&:hover': { background: fillFrom(hoverFill) },
-        // Every attached library opens with a seam: it separates the first one
-        // from the project AND each library from the one above it, which a
-        // single rule under the project did not. Centred in the gap the row
-        // reserves for it, so it has clear space above and below.
+        '&:hover': { background: hoverFill },
+        // Every attached library opens with a seam separating it from what
+        // sits above. A hairline on the row's own top edge — the row no
+        // longer reserves extra height for it, so a library root is exactly
+        // as tall as every other row.
         ...(drawsSeam && {
           '&::before': {
             content: '""',
             position: 'absolute',
             left: 4,
             right: 8,
-            top: `${Math.round(LIBRARY_GAP / 2)}px`,
+            top: 0,
             height: '1px',
             bgcolor: 'rgba(255,255,255,0.12)',
           },
@@ -451,12 +435,9 @@ export function ProjectTree({
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: (index) => {
-      const node = rows[index]?.node;
-      return node?.kind === 'root' && node.rootKind === 'catalog'
-        ? PROJECT_TREE_ROW_HEIGHT + LIBRARY_GAP
-        : PROJECT_TREE_ROW_HEIGHT;
-    },
+    // One height for every row — a library root is not taller than its
+    // children; its seam is a hairline on the row's top edge, not extra size.
+    estimateSize: () => PROJECT_TREE_ROW_HEIGHT,
     getItemKey: (index) => rows[index]?.rowKey ?? index,
     overscan: 12,
   });

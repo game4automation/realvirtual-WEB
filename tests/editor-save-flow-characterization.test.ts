@@ -63,7 +63,7 @@ const backend = {
   isActive: true,
   async writeBlob(relPath: string) { writes.push(relPath); },
   // Nothing is stored, so every save is a first save of its path.
-  async readBlobUrl() { return null; },
+  async readDocumentUrl() { return null; },
   async listDocuments() { return []; },
 };
 

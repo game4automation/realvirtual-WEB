@@ -28,7 +28,7 @@ describe.skipIf(!adapter)('real WebGPU smoke', () => {
     expect(handle.viewer.hasCompute).toBe(true);
 
     handle.viewer.applyVisualSettings(getDefaultVisualSettings());
-    const result = await handle.viewer.loadModel('/DemoRealvirtualWeb.glb');
+    const result = await handle.viewer.loadModel('/demo-realvirtual/DemoRealvirtualWeb.glb');
     expect(result).toBeTruthy();
     expect(handle.viewer.currentModelRoot).toBeTruthy();
     expect(errors.mock.calls).toEqual([]);

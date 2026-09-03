@@ -62,8 +62,8 @@ customer:
 
 | Root | Contents | Served in dev as | Deployed? |
 |---|---|---|---|
-| `public/models/` | **Only shipped demo models**, as declared by `public/project.json` — since plan-735 a GLB here that the manifest does not declare is invisible, not a "dev built-in" | `/models/<file>` | yes |
-| `public/library/` | The delivered standard library (`PalletHandling` + `catalog.json`) | `/library/...` | yes |
+| `public/demo-realvirtual/` | **The demo PROJECT** (plan-737): its `project.json` plus every document that manifest declares. One folder, delivered unchanged to every channel; a GLB here that the manifest does not declare is invisible, not a "dev built-in" | `/demo-realvirtual/<file>` | yes |
+| `public/library/` | **The component library — app-level**, one copy per installation, beside the demo rather than inside it (the delivered standard library: `PalletHandling` + `catalog.json`). Reached through a manifest `libraries[]` subscription, never through the demo backend base path | `/library/...` | yes |
 | `../realvirtual-WebViewer-Private~/projects/<name>/` | Customer and internal projects. `projects/Development/` is the **internal** one: `fixtures/`, `models/`, `library/Custom/`, `scratch/` | `/private-assets/<project>/<path...>` | only on a private deploy of that project |
 
 The third root is why `public/models/` can be small. Before plan-395 it held
@@ -235,7 +235,7 @@ kind of content any more. It is a **legacy keyspace being read**.
 |---|---|
 | `newSceneId()` minted `scn_<time>_<rand>` | **deleted.** No code path mints a scene id. `tests/scene-removal-guard.test.ts` fails if one comes back |
 | `SceneStore.listScenes()` / `listBuiltins()` | **deleted.** Documents come from `documentsOf(project)`; built-in SOURCES come from `builtinSources(viewer)` in `rv-model-catalog.ts` |
-| `ProjectBackend.listScenes()` on all three backends | **deleted.** `listDocuments()` is the one listing; `section` says which folder holds a row |
+| `ProjectBackend.listScenes()` on all three backends | **deleted.** `listDocuments()` is the one listing; the row's `path` says which folder holds it |
 | `mergeSceneTiers` / `forkSceneEntry` / `TieredSceneEntry` | **deleted.** `mergeDocumentTiers` is the one merge |
 | `ProjectSnapshot.scenes` / `sceneIds`, `getProjectScenes()`, `getProjectSceneIds()` | **deleted.** The snapshot carries `documents[]` |
 | `createEmpty` / `duplicate` / `delete` fell back to a catalogue row | **document ops only.** They throw when the id names no document, or when there is no writable project |
@@ -274,7 +274,7 @@ alias map exists when the router needs it. One tab at a time
 ```
 resolveDocumentAlias(scn_X)?  ─ yes ─> skip b–d (already converted)
   b. read body            (null and no alias ⇒ a row that never had one)
-  c. write document       writeBlob(scenes/<name>.glb, { expectedRevision: null })
+  c. write document       writeDocument(scenes/<name>.glb, { expectedRevision: 'create' })
   d. write alias          scn_X → <documentId>   ← FAILS ⇒ abort this row, do NOT retire
   e. rename draft slot    draft/<scn_X> → draft/<documentId>     ← always runs
   f. retire the old body  rv-scenes-retired/glb/<scn_X>          ← always runs
@@ -341,6 +341,67 @@ restore the same content exists twice, once as a document and once as a
 catalogue row. That is the safe direction — the alternative is a restore that
 can lose work — and re-running the newer build converges it again, because the
 alias pre-check recognises what it has already done.
+
+### 2.0-0b One document I/O protocol, and the end of `section` (plan-736)
+
+The type distinction was gone; the *storage* distinction was not. Until plan-736
+a document's manifest row carried `section: 'scenes' | 'models' | 'library'`, and
+exactly one place read it to decide **which write protocol** the bytes went
+through: a `scenes` row used `readScene`/`writeScene` with a compare-and-swap, and
+everything else used `readBlobUrl`/`writeBlob` without one. The field was stored
+rather than derived because the path prefix is wrong on the browser backend, where
+a scene's path is its bare id.
+
+**The backend surface now.** One read, one write, one delete, one URL:
+
+| Method | Replaces | Note |
+|---|---|---|
+| `readDocument(ref)` → `DocumentRecord` | `readScene` + `readBlobBytes` | bytes **+ manifest meta + revision**, for every document |
+| `writeDocument(ref, bytes, { expectedRevision })` | `writeScene` + `writeBlob` | the precondition is **mandatory** |
+| `deleteDocument(ref)` | `deleteScene` + `deleteBlob` | tolerant: a missing body is the desired end state |
+| `readDocumentUrl(ref)` | `readBlobUrl` | kept — a glTF with external buffers needs a base URL |
+
+`expectedRevision` is required and has three spellings: a **revision** ("I read
+this and am replacing it"), `'create'` ("this must not exist yet"), and `'any'`
+(a deliberate unconditional overwrite). There is no way to omit it. That does not
+make an `'any'` write safer by itself — it makes each one *state* which of the
+three it is, which turns a missing precondition from an invisible default into a
+reviewable line. Every `'any'` in this tree carries a comment saying why.
+
+**Where the routing went.** Into the backends, where it is a private detail of
+what each one stores. The browser backend keeps scene bodies in the GLB store
+(`rv-scene-glb/<id>` + OPFS) and everything else in the path-keyed blob index, and
+it chooses between them by asking its own stores — an id with a pointer *is* a
+scene body — plus, for a brand-new scene that has no pointer yet, the `meta` the
+caller passes in the `DocRef`. That is caller intent at the call site, not a
+persisted category: nothing stores it and nothing can disagree with it later.
+
+**`statDocuments()` is body-authoritative.** It enumerates *both* browser stores.
+This is the load-bearing part: the adopt/orphan scan quarantines and eventually
+deletes a row whose body it cannot see, and a blob-only stat list made every
+browser scene look missing. `section === 'scenes'` was the guard standing between
+that and data loss — so the guard could only be removed once the hole was closed
+at its source. `tests/document-predicate-equivalence.test.ts` is the measurement.
+
+**`section` is never removed from a manifest.** It is gone from
+`RvDocumentEntry`, nothing stamps it, and the demo manifest carries none. But a
+delivered `project.json` that has one keeps it forever: unknown fields ride
+through `isValidProjectV1` and `mergeManifest`'s read-modify-write untouched
+(`tests/section-passthrough.test.ts`). Reading one is the business of the legacy
+layer at the top of `rv-project-documents.ts` and of nothing else.
+
+**One transitional exception.** `documentOfSceneEntry` (and its Node twin in
+`scripts/_rv-manifest.mjs`) still stamps `section: 'scenes'` on a browser scene
+row. An OLD client meeting a section-less bare-id scene would run it through the
+pre-plan-736 path heuristic, get `'library'`, and route it down the blob branch —
+a storage failure, not a badge. Removing the stamp is a separate step, gated on
+the slow delivery channels (ctrlX snap, CONNECT-embedded appliances) shipping a
+client that no longer reads the field. The first section-less row written into a
+user's browser storage is the point of no return.
+
+**For MCP callers.** The file/document tools report `folder` — the first path
+segment, `''` at the project root. `section` survives as a deprecated alias
+carrying the identical value for one release.
 
 ### 2.0-0 One content type: the document
 
@@ -949,10 +1010,18 @@ into the project.
 ### Examples are documents (plan-731)
 
 There is **one catalogue**. An "Example" — a curated demo scene shipped with the
-build — is an ordinary `documents[]` row of `public/project.json`, in the
-`scenes` section, and it is opened by `openDocument()` like every other
-document. Its preferred workspace mode (e.g. `planner`) is a property of the
-row (`mode`), applied on open unless `?mode=` overrides it.
+build — is an ordinary `documents[]` row of `public/project.json`, and it is
+opened by `openDocument()` like every other document. Its preferred workspace
+mode (e.g. `planner`) is a property of the row (`mode`), applied on open unless
+`?mode=` overrides it.
+
+The demo's examples sit at the project ROOT, so no folder identifies them and
+(since plan-736) no `section` field does either. What says an example is a scene
+is `classification.level: "scene"` — a statement about what the document IS,
+whose truth lives in the GLB's own root extras and whose manifest copy is a
+cache of it (§2.5). The two Node guards that select them
+(`bake-published-scenes`, `published-examples-glb`) read that, and re-read the
+GLB in the same test, so cache and file are checked against each other.
 
 Until plan-731 they were a **second identity space**: a curated
 `public/scenes/index.json` (`[{ file, name, mode }]`) discovered at boot by
@@ -1493,7 +1562,7 @@ Three interchangeable backends behind one `ProjectBackend` interface
 |---|---|---|
 | **folder** | A user-picked directory via the File System Access API (`selectFolderForKey`, readwrite) | Durable, user-owned, shareable. The successor to the old "working folder". |
 | **browser** | OPFS blobs + `localStorage rv-project/browser/<id>` | Zero-setup default; evictable like all browser storage. |
-| **bundled** | Read-only, shipped with the build (`library/catalog.json` etc.) | The DemoRealvirtual project — authored in `public/project.json`, see below. `writeBlob` is refused with a reason. |
+| **bundled** | Read-only, shipped with the build (`library/catalog.json` etc.) | The DemoRealvirtual project — authored in `public/project.json`, see below. `writeDocument` is refused with a reason. |
 
 The `rv-project/*` localStorage keyspace:
 
@@ -1509,7 +1578,7 @@ The `rv-project/*` localStorage keyspace:
 
 Two couplings back into this document: the project id scopes the per-base draft
 key (§3.1), and `saveSettingsIntoModel()` writes through
-`ProjectBackend.writeBlob` (§6.1), which is why "bundled" refuses that write.
+`ProjectBackend.writeDocument` (§6.1), which is why "bundled" refuses that write.
 
 #### 3.6a `project.json` — the manifest, schema 2
 
@@ -1518,7 +1587,7 @@ holds:
 
 | Field | Meaning |
 |---|---|
-| `documents[]` | **The list.** One `RvDocumentEntry` per document: mandatory `id`, `path`, `name`, `section`, `classification?` (cache), `revision?`, `sha256?`, `sizeBytes?`, `mtimeMs?`, `forkedFrom?`, `copiedFrom?`, `collections?` (plan-717: the user's filing, successor of the `library.json` sidecar), `missingSince?` (plan-717: the adopt verb's quarantine mark, absent on every healthy row). Unknown fields survive every read-modify-write. |
+| `documents[]` | **The list.** One `RvDocumentEntry` per document: mandatory `id`, `path`, `name`, `classification?` (cache), `revision?`, `sha256?`, `sizeBytes?`, `mtimeMs?`, `forkedFrom?`, `copiedFrom?`, `collections?` (plan-717: the user's filing, successor of the `library.json` sidecar), `missingSince?` (plan-717: the adopt verb's quarantine mark, absent on every healthy row). Unknown fields survive every read-modify-write. |
 | `rv-project/documents-migration` | Marker recording that this manifest has been given a `documents[]`. Lives **in the file**, not in localStorage, because the thing being migrated travels (git, zip, a customer delivery, a second machine). |
 
 `scenes[]`, `models[]`, `library[]` and `documentsBaseline` are **not written
@@ -1917,9 +1986,9 @@ of the same three lines:
 
 | Script | What changed |
 |---|---|
-| `validate-project.mjs` | Validates `documents[]`: array shape, mandatory `id` (F2), relative paths, existence against the folder the entry's section names, and a stated `sha256`. The three legacy arrays are still checked — an unmigrated customer repository is not an invalid project. |
+| `validate-project.mjs` | Validates `documents[]`: array shape, mandatory `id` (F2), relative paths, existence at the entry's own path (plan-736: the second candidate the row's `section` used to name is gone), and a stated `sha256`. The three legacy arrays are still checked — an unmigrated customer repository is not an invalid project. |
 | `_bunny-lib.mjs` | `publishedSceneIndex()` derives the curated `scenes/index.json` from the scene documents and **requires a `.glb`**; a `.scene.json` entry would publish a catalogue row pointing at a format the viewer no longer opens. It carries `classification.level` into the catalogue, because a bundled deploy is never scanned (§3.7) and reading the level out of the GLBs would mean downloading every example to draw a list. |
-| `_vendor-merge.mjs` | `documents` is an owned section, merged entry-wise by `path` exactly like `models`/`library`. Its paths already carry their folder, so — unlike the section-relative arrays — they are classified **unprefixed**; prefixing again would match no vendor glob and silently mark every customer document as ours. |
+| `_vendor-merge.mjs` | `documents` is an owned manifest key, merged entry-wise by `path` exactly like `models`/`library`. Its paths already carry their folder, so — unlike the folder-relative legacy arrays — they are classified **unprefixed**; prefixing again would match no vendor glob and silently mark every customer document as ours. |
 | `migrate-project-manifest.mjs` | Brings a manifest to schema 2: derives `documents[]` from the three arrays, writes the migration marker, and indexes `.scene.glb` bodies (preferring the GLB over a `.scene.json` sibling rather than listing the scene twice). Still **additive** on the Node side, and deliberately so: it is an offline tool that may run against a repository the browser has not opened, and removing a customer's arrays from outside the app is a decision the app itself makes on its first save. It writes no `documentsBaseline` — that field no longer exists. |
 | `pull-customer-project.mjs` | Unchanged — it gates on `assertValidProject()` and inherits the above. |
 
@@ -2172,10 +2241,10 @@ The mechanics are in
   mid-flight and then be erased by the empty op log the adoption installs.
   Scene *loads* bypass the queue, so the workspace is re-checked before
   adoption; a switch mid-write yields `scene-changed` and leaves the scene
-  alone. Any failure after `writeBlob` deletes the file again — an orphan in
+  alone. Any failure after `writeDocument` deletes the file again — an orphan in
   `models/` is indistinguishable from a finished delivery.
 
-The output is written through `ProjectBackend.writeBlob` to `models/<name>.glb`
+The output is written through `ProjectBackend.writeDocument` to `models/<name>.glb`
 (folder → disk, browser → OPFS, bundled → refused with a reason), then
 reopened via `openBuiltin` — which reloads from the bytes just written and is
 therefore also the cheapest proof that the write is loadable.

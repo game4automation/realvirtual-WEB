@@ -43,7 +43,7 @@ import { buildEmptyGlbBlob } from '../src/core/hmi/scene/empty-glb';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
 import type { DocumentClassification } from '../src/core/project/rv-document-classification';
 
-const PUBLIC_DIR = resolve(__dirname, '../public');
+const PUBLIC_DIR = resolve(__dirname, '../public/demo-realvirtual');
 
 /**
  * `GLTFExporter` reads its assembled binary chunk through a `FileReader`, which
@@ -81,14 +81,40 @@ if (typeof (globalThis as { FileReader?: unknown }).FileReader === 'undefined') 
 /** Every example is a scene — that is what the level says, and it travels. */
 const EXAMPLE_CLASSIFICATION: DocumentClassification = { v: 1, level: 'scene' };
 
-/** The scene documents the demo ships, read from the ONE catalogue. */
+/**
+ * The scene documents the demo ships, read from the ONE catalogue.
+ *
+ * ## Selected by CLASSIFICATION since plan-736
+ *
+ * This used to select `section === 'scenes'`, with a `scenes/` path prefix as
+ * the fallback. The demo's example documents moved to the project root on
+ * 2026-08-31, so the prefix matched nothing and the stored section was carrying
+ * the whole set on its own — which is exactly the root-level case that made
+ * `section` look unremovable, and exactly what plan-736 had to answer.
+ *
+ * `classification.level` is the answer, and a better one than the field it
+ * replaces: it says what the document IS rather than which storage surface held
+ * it, it is authored per document rather than implied by a folder, and — the
+ * part that matters here — its truth lives in the GLB's own root extras, which
+ * the per-file assertion below re-reads. So the manifest cache and the file are
+ * cross-checked against each other on every run, where the section field could
+ * only ever be checked against itself.
+ *
+ * The `scenes/` prefix stays as the fallback for a project that does keep its
+ * scenes in a folder.
+ */
 function shippedSceneDocuments(): { path: string; name: string; devOnly?: boolean }[] {
   const manifest = JSON.parse(
     readFileSync(resolve(PUBLIC_DIR, 'project.json'), 'utf8'),
-  ) as { documents?: { path?: string; name?: string; section?: string; devOnly?: boolean }[] };
+  ) as {
+    documents?: {
+      path?: string; name?: string; devOnly?: boolean;
+      classification?: { level?: string };
+    }[];
+  };
   return (manifest.documents ?? [])
     .filter(d => typeof d.path === 'string' && /\.glb$/i.test(d.path)
-      && (d.section === 'scenes' || d.path.toLowerCase().startsWith('scenes/')))
+      && (d.classification?.level === 'scene' || d.path.toLowerCase().startsWith('scenes/')))
     .map(d => ({ path: d.path as string, name: d.name ?? (d.path as string), devOnly: d.devOnly }));
 }
 

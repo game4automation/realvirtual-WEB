@@ -33,6 +33,7 @@ import {
   buildRemoteIndex,
   mimeType,
   ALWAYS_UPLOAD_FILES,
+  isAlwaysUploadFile,
   applyPublicModelAllowlist,
   publicDemoModelAllowlist,
   publicDemoManifestMisses,
@@ -293,10 +294,15 @@ describe('applyPublicModelAllowlist', () => {
     );
   });
 
-  it('writes models.json listing only the kept demo models', () => {
+  // plan-737: this pass no longer writes models.json. The selector reads the
+  // demo manifest directly, so a second derivation of the same set — which after
+  // the folder move would also have carried the WRONG urls — was removed rather
+  // than repointed. models.json survives only where it is genuinely the deploy
+  // own statement about itself (stagePrivateProject / a foreign host).
+  it('does not write a models.json — the manifest is the only catalogue', () => {
     const dist = makeDist();
     applyPublicModelAllowlist(dist, { prefix: 'DemoRealvirtual' });
-    expect(JSON.parse(readFileSync(join(dist, 'models.json'), 'utf8'))).toEqual(['DemoRealvirtualWeb.glb']);
+    expect(existsSync(join(dist, 'models.json'))).toBe(false);
   });
 
   it('dry-run computes the report without deleting or writing', () => {
@@ -332,8 +338,7 @@ describe('applyPublicModelAllowlist', () => {
     expect(res.kept).toEqual(['DemoCSGMachining.glb', 'DemoRealvirtualWeb.glb']);
     expect(existsSync(join(dist, 'models', 'DemoCSGMachining.glb'))).toBe(true);
     expect(existsSync(join(dist, 'assets', 'DemoCSGMachining-DwwnP9kU.glb'))).toBe(true);
-    expect(JSON.parse(readFileSync(join(dist, 'models.json'), 'utf8')))
-      .toEqual(['DemoCSGMachining.glb', 'DemoRealvirtualWeb.glb']);
+    expect(existsSync(join(dist, 'models.json'))).toBe(false);
   });
 });
 
@@ -1015,5 +1020,128 @@ describe('the public dist passes the release gate (plan-731 F6)', () => {
     applyPublicScenePruning(dist, { prefix: PUBLIC_TEST_SCENE_PREFIX });
     rmSync(join(dist, 'DemoRealvirtualWeb.settings.json'), { force: true });
     expect(() => assertManifestResolves(dist)).toThrow(/did not travel/);
+  });
+});
+
+// ─── plan-737 9.5: the guards work from dist/demo-realvirtual/ ────────────
+
+/**
+ * The demo is a FOLDER in the deploy now, and all three public-demo guards had
+ * to move with it. The failure they share if one is missed is silence: a guard
+ * pointed at `dist/` finds no manifest, returns "nothing to check", and reports
+ * success on a build it never looked at.
+ *
+ * The devOnly row is the load-bearing fixture here — it is the one thing that
+ * MUST be deleted before upload, and both halves (file gone, row gone) have to
+ * be resolved against the demo folder for it to happen at all.
+ */
+describe('the demo manifest bypasses the size diff wherever it lives (plan-737)', () => {
+  // The rollback runbook (doc-deploy.md §"replace one file") only works if a
+  // manifest edit is always re-uploaded. A curator's edit — renaming a
+  // document, swapping the start document — routinely leaves the BYTE COUNT
+  // untouched, so the size diff would skip exactly the upload that matters.
+  //
+  // The move into `demo-realvirtual/` is what makes this worth pinning: the
+  // predicate matches on the BASENAME, so it survived the move for free — but
+  // nothing said so, and `uploadDirectory` carried a second, hand-written
+  // spelling of the rule that listed `settings|models|manifest` and omitted
+  // `project.json` entirely.
+  it('selects demo-realvirtual/project.json even when its size is unchanged', () => {
+    expect(ALWAYS_UPLOAD_FILES.has('project.json')).toBe(true);
+    expect(isAlwaysUploadFile('demo-realvirtual/project.json')).toBe(true);
+    // …and the size-diff selection agrees, which is the behaviour that matters.
+    const local = [
+      { rel: 'demo-realvirtual/project.json', size: 512, abs: '/x/demo-realvirtual/project.json' },
+      { rel: 'demo-realvirtual/DemoRealvirtualWeb.glb', size: 999, abs: '/x/demo-realvirtual/DemoRealvirtualWeb.glb' },
+    ];
+    // Keys are lowercased — that is the contract `buildRemoteIndex()` produces.
+    const remote = new Map([
+      ['demo-realvirtual/project.json', 512],
+      ['demo-realvirtual/demorealvirtualweb.glb', 999],
+    ]);
+    const selected = selectFilesToUpload(local, remote, {});
+    expect(selected.map(f => f.rel)).toEqual(['demo-realvirtual/project.json']);
+  });
+});
+
+describe('public demo guards on the demo folder (plan-737)', () => {
+  let work: string;
+  beforeEach(() => { work = mkdtempSync(join(tmpdir(), 'rvdemo737-')); });
+  afterEach(() => { rmSync(work, { recursive: true, force: true }); });
+
+  /** A dist/ in the plan-737 shape: everything the demo owns inside its folder. */
+  function makeFolderDist(): string {
+    const dist = join(work, 'dist');
+    const demo = join(dist, 'demo-realvirtual');
+    mkdirSync(demo, { recursive: true });
+    mkdirSync(join(dist, 'library', 'PalletHandling'), { recursive: true });
+    for (const f of ['DemoRealvirtualWeb.glb', 'DemoPlanner.glb', 'Test-DES-Turntable-Loop.glb', 'Stray.glb']) {
+      writeFileSync(join(demo, f), 'GLB');
+    }
+    writeFileSync(join(demo, 'DemoRealvirtualWeb.settings.json'), '{}');
+    writeFileSync(join(dist, 'library', 'PalletHandling', 'Europallet.glb'), 'GLB');
+    writeFileSync(join(demo, 'project.json'), JSON.stringify({
+      schemaVersion: 2,
+      id: 'prj_sample',
+      name: 'DemoRealvirtual',
+      kind: 'demo',
+      settings: { defaultModel: 'DemoRealvirtualWeb.glb' },
+      libraries: [{ url: 'library/catalog.json' }],
+      documents: [
+        { id: 'doc_a', name: 'Demo', path: 'DemoRealvirtualWeb.glb', settingsPath: 'DemoRealvirtualWeb.settings.json' },
+        { id: 'doc_b', name: 'Planner', path: 'DemoPlanner.glb' },
+        { id: 'doc_c', name: 'Turntable', path: 'Test-DES-Turntable-Loop.glb', devOnly: true },
+      ],
+    }, null, 2));
+    return dist;
+  }
+
+  it('reads the allowlist from the demo folder manifest, root-level rows included', () => {
+    // Both halves matter. Before plan-737 this function only accepted
+    // `models/<file>` paths, so against a root-level demo manifest it returned
+    // `[]` — and `[]` is not "no manifest", it is "keep nothing".
+    expect(publicDemoModelAllowlist(makeFolderDist())?.sort()).toEqual([
+      'DemoPlanner.glb', 'DemoRealvirtualWeb.glb', 'Test-DES-Turntable-Loop.glb',
+    ]);
+  });
+
+  it('prunes inside the demo folder and leaves the app-level library alone', () => {
+    const dist = makeFolderDist();
+    const res = applyPublicModelAllowlist(dist, { keep: publicDemoModelAllowlist(dist)! });
+    expect(res.dropped).toEqual(['Stray.glb']);
+    expect(existsSync(join(dist, 'demo-realvirtual', 'Stray.glb'))).toBe(false);
+    expect(existsSync(join(dist, 'demo-realvirtual', 'DemoRealvirtualWeb.glb'))).toBe(true);
+    // The library is a SIBLING of the demo folder and app-level — never curated
+    // by this pass, and never pruned by it.
+    expect(existsSync(join(dist, 'library', 'PalletHandling', 'Europallet.glb'))).toBe(true);
+  });
+
+  it('prunes the devOnly row AND its file from inside the demo folder', () => {
+    const dist = makeFolderDist();
+    const res = applyPublicScenePruning(dist, { prefix: PUBLIC_TEST_SCENE_PREFIX });
+    expect(res.dropped).toContain('Test-DES-Turntable-Loop.glb');
+    expect(existsSync(join(dist, 'demo-realvirtual', 'Test-DES-Turntable-Loop.glb'))).toBe(false);
+    const shipped = JSON.parse(readFileSync(join(dist, 'demo-realvirtual', 'project.json'), 'utf8'));
+    expect(shipped.documents.map((d: { path: string }) => d.path))
+      .toEqual(['DemoRealvirtualWeb.glb', 'DemoPlanner.glb']);
+  });
+
+  it('resolves manifest misses against the demo folder, and exempts the library', () => {
+    const dist = makeFolderDist();
+    applyPublicScenePruning(dist, { prefix: PUBLIC_TEST_SCENE_PREFIX });
+    // A healthy build has no misses…
+    expect(publicDemoManifestMisses(dist)).toEqual([]);
+    // …and a document whose file did not travel is named.
+    rmSync(join(dist, 'demo-realvirtual', 'DemoPlanner.glb'), { force: true });
+    expect(publicDemoManifestMisses(dist)).toEqual(['DemoPlanner.glb']);
+  });
+
+  it('RV_PUBLIC_MODEL_PREFIX still works as the rollback lever on the new basis', () => {
+    // doc-deploy.md's incident runbook: an operator overrides the manifest for
+    // one deploy. The prefix has to keep matching the files where they now are.
+    const dist = makeFolderDist();
+    const res = applyPublicModelAllowlist(dist, { prefix: 'DemoRealvirtual' });
+    expect(res.kept.sort()).toEqual(['DemoRealvirtualWeb.glb']);
+    expect(res.dropped).toContain('Stray.glb');
   });
 });

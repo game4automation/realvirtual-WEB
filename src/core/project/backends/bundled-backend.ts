@@ -52,16 +52,17 @@ import {
   type DocumentStat,
 } from '../rv-project-documents';
 import type { RvDocumentEntry } from '../rv-project-types';
-import {
-  glbSceneRecord,
-  type SceneRecord,
-} from '../rv-scene-record';
+import type { SceneRevision } from '../rv-scene-record';
 import {
   BackendNotWritableError,
+  docPathOf,
+  documentRecord,
+  type DocRef,
+  type DocumentRecord,
+  type WriteDocumentOptions,
   type ProjectBackend,
   type ResolvedBackendBlob,
 } from './project-backend';
-import type { TreeCatalogEntryInput } from '../rv-project-tree-sources';
 
 /**
  * Stable id of the demo project every build has.
@@ -77,19 +78,47 @@ export const DEMO_PROJECT_NAME = 'DemoRealvirtual';
 /** Canonical (slug) name, used by `?project=` deep links. */
 export const DEMO_PROJECT_SLUG = 'demorealvirtual';
 /**
- * Conventional folder name of the demo project.
+ * Folder name of the demo project — on every carrier there is (plan-737).
  *
- * The demo content itself is bundled (`public/`), so this is no longer a
- * repository path. It survives as the folder name `ProjectStore` looks for in a
- * user's local File System Access workspace.
+ * It used to mean one thing only: the folder `ProjectStore` looks for in a
+ * user's local File System Access workspace. Since plan-737 it means the same
+ * thing everywhere, which is the whole point of that plan — the demo is ONE
+ * folder artefact, delivered byte-identically to five places:
+ *
+ *  - `public/demo-realvirtual/` in this checkout (the source of truth)
+ *  - `demo-realvirtual/` on a deploy root, read over HTTP through
+ *    {@link DEMO_BASE_PATH} below
+ *  - the same folder in the community Git mirror
+ *  - `projects/demo-realvirtual/` in a customer workspace (writable)
+ *  - a user's own workspace folder of that name
+ *
+ * Because the name is the same in all five, none of them needs a rename step,
+ * and `_workspaceDemoFolderExists()` keeps working unchanged.
  */
 export const DEMO_PROJECT_FOLDER = 'demo-realvirtual';
+
+/**
+ * Base path of the demo instance's HTTP reads — the deploy-root half of
+ * {@link DEMO_PROJECT_FOLDER}.
+ *
+ * Prefixed onto every relative fetch of the DEMO backend in {@link
+ * BundledBackend._url}, so `project.json` resolves to
+ * `<BASE_URL>demo-realvirtual/project.json` and each document path to a file
+ * beside it. It is NOT applied to a remote/root backend — those address a
+ * deploy root as a whole (see {@link BundledBackendOptions.basePath}).
+ */
+export const DEMO_BASE_PATH = `${DEMO_PROJECT_FOLDER}/`;
 /**
  * Catalog of the realvirtual component library, relative to the deploy root.
  * NOT read by any boot path — a deploy manifest must reference it explicitly
  * (`libraries[]`) for the library to exist at runtime.
  */
 export const REALVIRTUAL_LIBRARY_PATH = 'library/catalog.json';
+
+/** A document that lives under `library/` — the place, read off the path. */
+const LIBRARY_PREFIX = /^library\//i;
+/** A document that lives under `models/`. See {@link BundledBackend.listModels}. */
+const MODELS_PREFIX = /^models\//i;
 
 /** @deprecated Use {@link DEMO_PROJECT_ID}. */
 export const SAMPLE_PROJECT_ID = DEMO_PROJECT_ID;
@@ -106,6 +135,27 @@ export interface BundledModel {
 export interface BundledBackendOptions {
   /** Deploy root. Defaults to `import.meta.env.BASE_URL`, or `/` outside a bundler. */
   baseUrl?: string;
+  /**
+   * Folder INSIDE the deploy root this backend reads from (plan-737).
+   *
+   * Empty by default, which is the deploy root itself — what a root instance
+   * and every `getRemoteBackend()` instance want. The DEMO instance passes
+   * {@link DEMO_BASE_PATH}, so a demo that ships as a folder is addressed as a
+   * folder without every caller having to prefix its own paths.
+   *
+   * It is applied in {@link BundledBackend._url}, which is the single funnel
+   * for `readManifest`, `readDocument`, `readDocumentUrl`, `readSettings` and
+   * the `models.json` discovery — so there is no read path that can miss it.
+   * Absolute URLs (`https://…`, `blob:`, `data:`) bypass it, as they always
+   * bypassed the base URL.
+   *
+   * NOT applied to `library/catalog.json`: the library is app-level and lives
+   * beside the demo folder, not inside it. Nothing here fetches it — the
+   * subscription in the demo manifest's `libraries[]` is resolved by
+   * `library-store` against the page base — and {@link REALVIRTUAL_LIBRARY_PATH}
+   * stays a deploy-root-relative constant for that reason.
+   */
+  basePath?: string;
   /** Models the build ships, as `main.ts` resolved them. */
   models?: BundledModel[];
   /** Injectable for tests; defaults to `globalThis.fetch`. */
@@ -138,6 +188,7 @@ export class BundledBackend implements ProjectBackend {
   readonly writable = false;
 
   private readonly _baseUrl: string;
+  private readonly _basePath: string;
   private _models: BundledModel[];
   private readonly _fetch: typeof fetch | null;
   private readonly _discover: boolean;
@@ -149,14 +200,28 @@ export class BundledBackend implements ProjectBackend {
 
   constructor(opts: BundledBackendOptions = {}) {
     this._baseUrl = normaliseBase(opts.baseUrl ?? defaultBaseUrl());
+    this._basePath = normalisePath(opts.basePath ?? '');
     this._models = opts.models ?? [];
     this._fetch = opts.fetchImpl ?? (typeof fetch === 'function' ? fetch.bind(globalThis) : null);
     this._discover = opts.discover === true;
-    this.id = opts.id ?? `bundled:${this._baseUrl}`;
+    // The base PATH belongs in the id, or the demo instance and the root
+    // instance of the same deploy would be indistinguishable — they share a base
+    // URL and differ only by folder, and backend ids are how the store, the
+    // dashboard and every diagnostic tell two backends apart.
+    this.id = opts.id ?? `bundled:${this._baseUrl}${this._basePath}`;
   }
 
   /** The deploy root this backend reads from. Always ends in `/`. */
   get baseUrl(): string { return this._baseUrl; }
+
+  /**
+   * The folder inside that root, `''` for the root itself. Ends in `/` when set.
+   *
+   * Exposed so a caller can tell a ROOT instance from the DEMO instance without
+   * comparing ids — which is what `resolveActiveProject()` needs after plan-737
+   * split the two apart.
+   */
+  get basePath(): string { return this._basePath; }
 
   get isActive(): boolean { return this._active; }
 
@@ -280,12 +345,13 @@ export class BundledBackend implements ProjectBackend {
    * remedy is to rebuild that deploy, and saying so is more use than silently
    * serving a format nothing downstream understands.
    */
-  async readScene(relPath: string): Promise<SceneRecord | null> {
+  async readDocument(ref: DocRef): Promise<DocumentRecord | null> {
+    const relPath = docPathOf(ref);
     assertReadableScenePath(relPath);
     const bytes = await this._fetchBytes(relPath);
     if (!bytes) return null;
     const meta = sceneDocumentsOf(await this.readManifest()).find(e => e.path === relPath);
-    return glbSceneRecord(bytes, { ...meta, path: relPath });
+    return documentRecord(bytes, { ...meta, path: relPath });
   }
 
   async readSettings(relPath?: string): Promise<unknown | null> {
@@ -294,8 +360,25 @@ export class BundledBackend implements ProjectBackend {
 
   // ─── Listing ──────────────────────────────────────────────────────────
 
+  /**
+   * The model documents of this deploy.
+   *
+   * Selected by PLACE since plan-736: a `models/` path, or the URL of a model
+   * this backend discovered itself. The second half is not a special case but
+   * the whole reason this cannot be a plain prefix test — `_withDiscoveredModels`
+   * folds a FOREIGN deploy's `models.json` in, and those rows carry the absolute
+   * URL the foreign host published (`https://cdn…/customer/models/Press.glb`).
+   * They used to be found because `documentOfAssetEntry` stamped
+   * `section: 'models'` on them; nothing stamps now, so the backend answers from
+   * what it actually discovered.
+   */
   async listModels(): Promise<RvProjectAssetEntry[]> {
-    return assetDocumentsOf(await this.readManifest(), 'models');
+    const declared = readDocuments(await this.readManifest()) ?? [];
+    const discovered = new Set(this._models.map(m => m.url));
+    return declared.filter((d) => {
+      const path = typeof d.path === 'string' ? d.path : '';
+      return MODELS_PREFIX.test(path) || discovered.has(path);
+    }) as unknown as RvProjectAssetEntry[];
   }
 
   /**
@@ -305,9 +388,13 @@ export class BundledBackend implements ProjectBackend {
    * fallback anymore: a library exists only when it was explicitly referenced,
    * either as `library[]` contents or as a `libraries[]` subscription in a
    * deployed manifest. A deploy without such a declaration has no library.
+   *
+   * By PATH since plan-736, for the same reason as {@link listModels}. Nothing
+   * is discovered here, so the prefix is the whole rule.
    */
   async listLibrary(): Promise<RvProjectAssetEntry[]> {
-    return assetDocumentsOf(await this.readManifest(), 'library');
+    return (readDocuments(await this.readManifest()) ?? [])
+      .filter(d => LIBRARY_PREFIX.test(typeof d.path === 'string' ? d.path : '')) as unknown as RvProjectAssetEntry[];
   }
 
   /**
@@ -351,33 +438,27 @@ export class BundledBackend implements ProjectBackend {
 
   // ─── Write — all of it refused ────────────────────────────────────────
 
-  async writeScene(): Promise<never> { throw new BackendNotWritableError(this.id, 'read-only'); }
-  async deleteScene(): Promise<void> { throw new BackendNotWritableError(this.id, 'read-only'); }
   /**
    * Refused before the precondition is even looked at (plan-709 §2.3).
    *
-   * The parameters are deliberately absent: "read-only" outranks every
-   * `expectedRevision`, so accepting them here would only invite a reader to
-   * think a `null` ("create only") might get through. It does not.
+   * The parameters are accepted and ignored: "read-only" outranks every
+   * `expectedRevision`, so nothing here reads one — not even `'create'`, which
+   * is the mode a reader might otherwise expect to slip through. It does not.
    */
-  async writeBlob(): Promise<void> { throw new BackendNotWritableError(this.id, 'read-only'); }
-  async deleteBlob(): Promise<void> { throw new BackendNotWritableError(this.id, 'read-only'); }
-
-  async readBlobUrl(relPath: string): Promise<ResolvedBackendBlob | null> {
-    // Nothing to revoke: a deploy URL is already loadable as it stands.
-    return { url: this._url(relPath), release: () => {} };
+  async writeDocument(
+    _ref: DocRef,
+    _bytes: Uint8Array,
+    _opts: WriteDocumentOptions,
+  ): Promise<{ revision: SceneRevision }> {
+    throw new BackendNotWritableError(this.id, 'read-only');
+  }
+  async deleteDocument(_ref: DocRef): Promise<void> {
+    throw new BackendNotWritableError(this.id, 'read-only');
   }
 
-  async readBlobBytes(relPath: string): Promise<ArrayBuffer | null> {
-    // No leak to close here — a deploy URL is not an object URL — but the
-    // contract is one method for every backend, so a caller never branches on
-    // `kind` to find out how to get bytes.
-    const bytes = await this._fetchBytes(relPath);
-    if (!bytes) return null;
-    return bytes.buffer.slice(
-      bytes.byteOffset,
-      bytes.byteOffset + bytes.byteLength,
-    ) as ArrayBuffer;
+  async readDocumentUrl(ref: DocRef): Promise<ResolvedBackendBlob | null> {
+    // Nothing to revoke: a deploy URL is already loadable as it stands.
+    return { url: this._url(docPathOf(ref)), release: () => {} };
   }
 
   /** No queue, nothing to await. Present so callers need no `kind` check. */
@@ -410,9 +491,15 @@ export class BundledBackend implements ProjectBackend {
   private _withDiscoveredModels(project: RvProject): RvProject {
     if (!this._discover || this._models.length === 0) return project;
     const declared = readDocuments(project) ?? [];
-    const missing = (section: DocumentSection) =>
-      !declared.some(d => sectionOfDocument(d) === section);
-    if (!missing('models')) return project;
+    // "Does this host already declare its models?" — asked of the PATHS, not of
+    // a stored section (plan-736 §2.3 #4). A bundled manifest is a deploy
+    // manifest: every row in it carries a real project-relative path, because a
+    // deploy has real files. So the `models/` prefix is not a heuristic here, it
+    // is the same fact the section field was recording, read from where it
+    // actually lives.
+    if (declared.some(d => MODELS_PREFIX.test(typeof d.path === 'string' ? d.path : ''))) {
+      return project;
+    }
     const added = documentsFromLists({
       models: this._models.map(m => ({ path: m.url, label: m.label })),
     });
@@ -451,11 +538,24 @@ export class BundledBackend implements ProjectBackend {
     }
   }
 
+  /**
+   * The one place a relative path becomes a URL — base URL, then base path.
+   *
+   * Every read this class performs funnels through here (`_fetchJson`,
+   * `_fetchBytes`, `readDocumentUrl`, the `models.json` discovery), which is
+   * what makes {@link BundledBackendOptions.basePath} a complete statement
+   * rather than something each call site has to remember.
+   *
+   * An ABSOLUTE path or URL is returned untouched, and that is load-bearing for
+   * more than the obvious `https://` case: `_withDiscoveredModels()` folds a
+   * foreign host's `models.json` in as absolute URLs, and those must not be
+   * re-based against anything.
+   */
   private _url(relPath: string): string {
     if (/^(https?:)?\/\//i.test(relPath) || relPath.startsWith('blob:') || relPath.startsWith('data:')) {
       return relPath;
     }
-    return `${this._baseUrl}${relPath.replace(/^\/+/, '')}`;
+    return `${this._baseUrl}${this._basePath}${relPath.replace(/^\/+/, '')}`;
   }
 
   /** Same posture as {@link _fetchJson}, for a binary body. */
@@ -517,79 +617,25 @@ export class BundledBackend implements ProjectBackend {
 // owns the `published:` id alias, which is a different thing: an ADDRESS for a
 // document, not a second catalogue of what exists.
 
-// ─── The built-in demo catalog (plan-445 F6) ────────────────────────────
-
-/** Provider/source id and label of the read-only built-in demos root. */
-export const BUILTIN_CATALOG_PROVIDER_ID = 'builtin';
-export const BUILTIN_CATALOG_SOURCE_ID = 'demos';
-export const BUILTIN_CATALOG_LABEL = 'Built-in demos';
-
-/**
- * The demo models a build ships, as rows of a read-only catalog root.
- *
- * ## Why an adapter and not a `LibrarySource`
- *
- * `library-source-registry` has had `kind: 'bundled'` in its union since it was
- * written and has never instantiated one, because a demo model is not a library
- * asset: it is a whole scene, it is opened rather than dropped into one, and it
- * has no thumbnail, no collections and no category. Registering a source would
- * have meant inventing all three. Translating the listing the bundled backend
- * ALREADY produces into `TreeCatalogEntryInput` costs nothing and invents none
- * of it — the root is `writable: false`, and every refusal follows from that
- * one flag through `canMoveInTree` / `canRenameInTree`.
- *
- * `assetId` carries the model's **URL**, because that is what opening one needs
- * (`sceneStore.openBuiltin`, the `?model=` deep link's own call) and the bundled
- * manifest already stores models by URL. `path` is the bare file name, so the
- * catalog reads as one flat list of demos rather than as somebody's deploy
- * folder structure.
- */
-export async function bundledCatalogEntries(
-  backend: Pick<ProjectBackend, 'listModels'>,
-): Promise<TreeCatalogEntryInput[]> {
-  let models: RvProjectAssetEntry[];
-  try {
-    models = await backend.listModels();
-  } catch {
-    // A deploy that cannot answer has no demos — never a broken dashboard.
-    return [];
-  }
-  const out: TreeCatalogEntryInput[] = [];
-  for (const model of models) {
-    const url = typeof model.path === 'string' ? model.path.trim() : '';
-    if (url === '') continue;
-    const file = bundledFileNameOf(url);
-    out.push({
-      assetId: url,
-      name: (model.label?.trim() || file).replace(/\.(glb|gltf)$/i, ''),
-      path: file,
-    });
-  }
-  return out;
-}
-
-/**
- * Drop the demos the OPEN project already carries (plan-445 Phase 5).
- *
- * A developer checkout has `DemoRealvirtualWeb.glb` sitting in the project
- * folder AND shipped as a built-in, and two rows for one file is worse than
- * either row alone. The project row wins: it is the writable one, and it is the
- * copy an edit would actually change. Matched on the FILE NAME, because the two
- * sides agree on nothing else — one is a deploy URL, the other a project path.
- */
-export function dedupeBundledEntries(
-  entries: readonly TreeCatalogEntryInput[],
-  projectPaths: readonly string[],
-): TreeCatalogEntryInput[] {
-  const taken = new Set(projectPaths.map(p => bundledFileNameOf(p).toLowerCase()));
-  return entries.filter(e => !taken.has(bundledFileNameOf(e.path ?? e.assetId).toLowerCase()));
-}
-
-/** Last path segment of a URL or a relative path, query and hash removed. */
-function bundledFileNameOf(pathOrUrl: string): string {
-  const withoutQuery = pathOrUrl.split(/[?#]/)[0];
-  return withoutQuery.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? withoutQuery;
-}
+// ─── The built-in demo catalog is GONE (plan-737 Phase 3) ──────────────
+//
+// BUILTIN_CATALOG_PROVIDER_ID/_SOURCE_ID/_LABEL, bundledCatalogEntries(),
+// dedupeBundledEntries() and bundledFileNameOf() lived here since plan-445 F6.
+// They turned listModels() into a read-only "Built-in demos" root in the
+// project explorer.
+//
+// The adapter was sound; the thing it adapted stopped existing. It rested on
+// "the demos are a deploy artefact, not a project", and it showed:
+//
+//  - in a CUSTOMER delivery the bundled backend lists the CUSTOMER's models,
+//    so their own machines appeared under a heading reading "Built-in demos";
+//  - on the demo deploy the rows WERE the open project's rows, which is why it
+//    needed a skip for backendKind === 'bundled' AND a name-based dedupe
+//    against the project's own paths just to stay merely redundant.
+//
+// Since plan-737 the demo is an ordinary project on every channel, so the
+// project list itself answers both. Deleted outright, with no transition
+// period (user decision, Grill Q6).
 
 function defaultBaseUrl(): string {
   try {
@@ -602,5 +648,18 @@ function defaultBaseUrl(): string {
 function normaliseBase(base: string): string {
   const b = base || '/';
   return b.endsWith('/') ? b : `${b}/`;
+}
+
+/**
+ * A folder segment as `_url()` wants it: no leading slash, one trailing slash,
+ * and `''` for "no folder at all".
+ *
+ * Accepting the sloppy spellings (`/demo-realvirtual`, `demo-realvirtual`) is
+ * cheap here and removes a whole class of double-slash URL that a static host
+ * answers with a 404 while looking perfectly correct in a log line.
+ */
+function normalisePath(path: string): string {
+  const p = path.trim().replace(/^\/+/, '').replace(/\/+$/, '');
+  return p === '' ? '' : `${p}/`;
 }
 

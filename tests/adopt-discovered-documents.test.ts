@@ -45,6 +45,7 @@ import type { RvDocumentEntry, RvProject } from '../src/core/project/rv-project-
 import { clearAllScenes, setDraftScope } from '../src/core/hmi/scene/rv-scene-storage';
 import { clearAllBlobs } from '../src/core/storage/rv-opfs-blobs';
 import { clearAllSceneOwners } from '../src/core/project/rv-scene-owner';
+import { writeBlobDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -141,7 +142,7 @@ async function browserFixture(
   const manifest = { ...project(opts.rows ?? []), id } as RvProject;
   await backend.writeManifest(manifest);
   for (const [path, body] of Object.entries(files)) {
-    await backend.writeBlob(path, new Blob([body]));
+    await writeBlobDocument(backend, path, new Blob([body]));
   }
 
   // The same injection seam `fake-document-project` uses: a browser project is
@@ -156,8 +157,8 @@ async function browserFixture(
     kind: 'browser',
     store,
     backend: () => backend,
-    async seed(path, body) { await backend.writeBlob(path, new Blob([body])); },
-    async drop(path) { await backend.deleteBlob(path); },
+    async seed(path, body) { await writeBlobDocument(backend, path, new Blob([body])); },
+    async drop(path) { await backend.deleteDocument(path); },
     async storedRows() {
       return ((await backend.readManifest())?.documents ?? []) as RvDocumentEntry[];
     },
@@ -215,8 +216,13 @@ describe.each(BACKENDS)('adoptDiscoveredDocuments — %s backend', (kind, makeFi
     const rows = await fx.storedRows();
     expect(rows.map(r => r.path).sort()).toEqual([BELT, ROLL, PRESS].sort());
     for (const row of rows) expect(row.id).toBe(previewAssetId(row.path));
-    expect(rows.find(r => r.path === PRESS)?.section).toBe('models');
-    expect(rows.find(r => r.path === ROLL)?.section).toBe('library');
+    // plan-736 F3: an adopted row records WHERE it is (its path) and nothing
+    // that restates the path in another vocabulary. The two assertions here
+    // used to read `row.section` back as 'models' / 'library'; the folder
+    // prefix of the path is the same fact, from the place it actually lives.
+    expect(rows.find(r => r.path === PRESS)?.path.startsWith('models/')).toBe(true);
+    expect(rows.find(r => r.path === ROLL)?.path.startsWith('library/')).toBe(true);
+    for (const row of rows) expect(row.section).toBeUndefined();
     // Auditable, not silent — one line per adoption (Zotero-Negativpraezedenz).
     expect(log.filter(l => l.kind === 'adopt').map(l => l.path).sort())
       .toEqual([BELT, ROLL, PRESS].sort());
@@ -461,7 +467,7 @@ describe('plan-717 §2.2 step 2 — the adopt verb maintains sha256 itself', () 
   it('a folder adopt computes the digest once and the next run hashes nothing', async () => {
     const fx = await folderFixture({ [ROLL]: 'glTF-ROLL', [BELT]: 'glTF-BELT' });
     const backend = fx.backend();
-    const reads = vi.spyOn(backend, 'readBlobBytes');
+    const reads = vi.spyOn(backend, 'readDocument');
 
     const first = await fx.store.adoptDiscoveredDocuments();
     expect(first.hashed).toBe(2);
@@ -497,7 +503,7 @@ describe('plan-717 §2.2 step 2 — the adopt verb maintains sha256 itself', () 
     await fx.seed('library/parts/B.glb', 'another-differently-sized-body-x');
     await fx.seed('library/parts/C.glb', 'glTF-ROLL');
 
-    const reads = vi.spyOn(backend, 'readBlobBytes');
+    const reads = vi.spyOn(backend, 'readDocument');
     const summary = await fx.store.adoptDiscoveredDocuments();
     const hashedForMatch = documentReads(reads);
 
@@ -523,7 +529,7 @@ describe('plan-717 §2.2 step 5 — applyAdoptDelta merges into a manifest it ne
     // there first and its row for Belt is already on disk. A's delta is applied
     // to B's state — the CAS retry — and both rows must survive.
     const tabADelta: AdoptOp[] = [
-      { op: 'adopt', path: ROLL, section: 'library', name: 'Roll2m', sha256: 'a'.repeat(64) },
+      { op: 'adopt', path: ROLL, name: 'Roll2m', sha256: 'a'.repeat(64) },
     ];
     const afterTabB = project([
       { id: previewAssetId(BELT), path: BELT, name: 'Belt1m', section: 'library' },
@@ -538,7 +544,7 @@ describe('plan-717 §2.2 step 5 — applyAdoptDelta merges into a manifest it ne
     const owned = project([
       { id: 'doc_authored_first', path: ROLL, name: 'Roll 2m', section: 'library' },
     ]);
-    const delta: AdoptOp[] = [{ op: 'adopt', path: ROLL, section: 'library', name: 'Roll2m' }];
+    const delta: AdoptOp[] = [{ op: 'adopt', path: ROLL, name: 'Roll2m' }];
 
     const merged = applyAdoptDelta(owned, delta);
     expect(merged.changed).toBe(false);
@@ -571,7 +577,7 @@ describe('plan-717 §2.2 step 5 — applyAdoptDelta merges into a manifest it ne
       { id: previewAssetId(ROLL), path: 'library/elsewhere/Other.glb', name: 'Other', section: 'library' },
     ]);
     const merged = applyAdoptDelta(taken, [
-      { op: 'adopt', path: ROLL, section: 'library', name: 'Roll2m' },
+      { op: 'adopt', path: ROLL, name: 'Roll2m' },
     ]);
 
     const adopted = (merged.project.documents ?? []).find(d => d.path === ROLL)!;
@@ -581,14 +587,14 @@ describe('plan-717 §2.2 step 5 — applyAdoptDelta merges into a manifest it ne
 
   it('an intra-batch collision is resolved too — the second op sees the first row', () => {
     const first: AdoptOp = {
-      op: 'adopt', path: 'library/a/X.glb', section: 'library', name: 'X',
+      op: 'adopt', path: 'library/a/X.glb', name: 'X',
     };
     // A second file whose derived id would be the first one's: impossible to
     // stage through the hash, so it is staged through the manifest — the row
     // the FIRST op just added is what the second collides with.
     const merged = applyAdoptDelta(project(), [
       first,
-      { op: 'adopt', path: 'library/a/X.glb', section: 'library', name: 'X duplicate' },
+      { op: 'adopt', path: 'library/a/X.glb', name: 'X duplicate' },
     ]);
     expect(merged.project.documents).toHaveLength(1);
     expect(merged.log.filter(l => l.kind === 'discarded')).toHaveLength(1);

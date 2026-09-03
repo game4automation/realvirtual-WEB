@@ -346,9 +346,17 @@ export function ProjectsDetailPane({
       }}
     >
       {!title ? (
-        <Typography data-testid="projects-detail-empty" sx={{ fontSize: 12, color: 'text.disabled', p: 1.5 }}>
-          Nothing selected
-        </Typography>
+        // Says what the pane IS, not just that it is idle: "Nothing selected"
+        // describes the state and leaves a first-time user to guess the
+        // purpose of a permanently visible 260px column.
+        <Box data-testid="projects-detail-empty" sx={{ p: 1.5 }}>
+          <Typography sx={{ fontSize: 12, color: 'text.disabled' }}>
+            Nothing selected
+          </Typography>
+          <Typography sx={{ fontSize: 11, color: 'text.disabled', mt: 0.75, opacity: 0.75 }}>
+            Pick a document to see its preview, properties and links here.
+          </Typography>
+        </Box>
       ) : (
         <>
           {/* The header BAND — same height and type as the other two column

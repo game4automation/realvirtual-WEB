@@ -26,15 +26,15 @@
 import { readdir, writeFile, stat } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { join, relative, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const LIBRARY_DIR = join(ROOT, 'public', 'library');
+export const ROOT = fileURLToPath(new URL('..', import.meta.url));
+export const LIBRARY_DIR = join(ROOT, 'public', 'library');
 const LIBRARY_URL_ROOT = 'public/library';
-const OUTPUT = join(LIBRARY_DIR, 'catalog.json');
+export const OUTPUT = join(LIBRARY_DIR, 'catalog.json');
 
 /** Insert spaces at camelCase / acronym boundaries and on `-`/`_`, then title-trim. */
-function humanize(s) {
+export function humanize(s) {
   return s
     .replace(/[_-]+/g, ' ')                     // separators -> space
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')     // camelCase -> "camel Case"
@@ -44,12 +44,12 @@ function humanize(s) {
 }
 
 /** Stable, URL-safe id from a path-ish string. */
-function slug(s) {
+export function slug(s) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
 /** Recursively collect all `.glb` files under `dir`, returned as paths relative to LIBRARY_DIR. */
-async function collectGlbs(dir) {
+export async function collectGlbs(dir) {
   const out = [];
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     const full = join(dir, entry.name);
@@ -71,7 +71,7 @@ async function collectGlbs(dir) {
  * catalog would list them, and the entries would 404 for everyone but the local machine.
  * Outside a Git checkout (public fork, exported tarball) nothing is filtered.
  */
-function gitIgnored(relPaths) {
+export function gitIgnored(relPaths) {
   if (relPaths.length === 0) return new Set();
   const toGitPath = (rel) => `${LIBRARY_URL_ROOT}/${rel.split(sep).join('/')}`;
   try {
@@ -84,6 +84,24 @@ function gitIgnored(relPaths) {
     // Exit 1 means "nothing ignored"; any other failure (no Git, no repository) filters nothing.
     return new Set();
   }
+}
+
+/**
+ * The stable id of one library file — the identity contract (plan-737).
+ *
+ * `rel` is LIBRARY_DIR-relative with native separators. It is the SAME
+ * derivation the catalog entries above use, exported so the guard test can
+ * assert it without re-deriving it: every `AssetReference.assetId` a planner
+ * scene ever baked against the bundled catalog resolves by this identity.
+ *
+ * The demo manifest no longer carries `library/` document rows at all
+ * (plan-737). The library is APP-LEVEL (`public/library/catalog.json`) and the
+ * demo merely SUBSCRIBES to it through its `libraries[]` — it does not own it.
+ * So there is nothing left to sync into a project manifest, and
+ * `syncManifestLibraryRows()` and its `MANIFEST` target went with the rows.
+ */
+export function libraryAssetId(rel) {
+  return slug(rel.replace(/\.glb$/i, ''));
 }
 
 async function main() {
@@ -128,4 +146,8 @@ async function main() {
   for (const [cat, n] of Object.entries(byCat).sort()) console.log(`  ${cat}: ${n}`);
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+// Run only when invoked directly (`node scripts/build-local-library-catalog.mjs`);
+// the guard test imports the helpers above and must not trigger a write.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => { console.error(e); process.exit(1); });
+}

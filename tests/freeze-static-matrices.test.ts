@@ -160,6 +160,27 @@ describe('freezeStaticMatrices', () => {
     expect(staticMesh.matrixWorldAutoUpdate).toBe(false);
   });
 
+  it('keeps a whole PlacementMeta subtree dynamic (baked planner placement)', () => {
+    // A baked placement: drive subtree (rolls) plus a static frame sibling.
+    // Freezing the frame made only the rolls follow a planner drag (2026-09-01,
+    // DemoPlanner) — the placement root marks the ENTIRE subtree as movable.
+    const root = named('root');
+    const placement = withComponent(named('RollConveyor'), 'PlacementMeta');
+    const drive = withComponent(named('drive'), 'Drive');
+    const roll = named('roll', true);
+    const frame = named('frame');
+    const frameMesh = named('frameMesh', true);
+    root.add(placement);
+    placement.add(drive); drive.add(roll);
+    placement.add(frame); frame.add(frameMesh);
+
+    freezeStaticMatrices(root);
+
+    expect(placement.matrixWorldAutoUpdate).toBe(true);
+    expect(frame.matrixWorldAutoUpdate).toBe(true);
+    expect(frameMesh.matrixWorldAutoUpdate).toBe(true);
+  });
+
   it('leaves world transforms correct after freezing', () => {
     const root = named('root');
     const child = named('child', true);

@@ -73,15 +73,22 @@ function project(name: string, manifest: unknown, files: string[] = []): string 
 describe('deriveDocuments — documents[] is the source, not the mirror', () => {
   it('lifts a pure legacy manifest to the same documents as before the hardcut', () => {
     // The unchanged half. Nothing about a manifest with no `documents[]` moved:
-    // all three arrays are lifted, in section order, with the same ids.
+    // all three arrays are lifted, in array order, with the same ids.
     const derived = deriveDocuments(LEGACY_ONLY, { now: '2026-08-10T00:00:00.000Z' });
     expect(derived).not.toBeNull();
     expect(derived!.existing).toBe(0);
-    expect(derived!.documents.map(d => [d.section, d.path, d.id])).toEqual([
-      ['scenes', 'scenes/a.scene.glb', 'scn_a'],
-      ['models', 'models/machine.glb', stableDocumentId('models/machine.glb')],
-      ['library', 'library/gripper.glb', stableDocumentId('library/gripper.glb')],
+    expect(derived!.documents.map(d => [d.path, d.id])).toEqual([
+      ['scenes/a.scene.glb', 'scn_a'],
+      ['models/machine.glb', stableDocumentId('models/machine.glb')],
+      ['library/gripper.glb', stableDocumentId('library/gripper.glb')],
     ]);
+    // plan-736 F3/F5: the migration still READS the three arrays — that is its
+    // whole job — but it no longer writes their names back onto the rows. The
+    // scene row keeps its `section` as the transitional Alt-Client stamp
+    // (see `documentOfSceneEntry`); the other two carry their folder in the
+    // path and nothing else.
+    expect(derived!.documents.map(d => d.section))
+      .toEqual(['scenes', undefined, undefined]);
     expect(derived!.marker).toEqual({
       at: '2026-08-10T00:00:00.000Z', schemaVersion: 2,
       counts: { scenes: 1, models: 1, library: 1 },

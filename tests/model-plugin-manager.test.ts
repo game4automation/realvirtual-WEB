@@ -303,4 +303,12 @@ describe('resolveModelName', () => {
     expect(resolveModelName('/models/Linie1.glb?v=2')).toBe('Linie1');
     expect(resolveModelName('Linie1')).toBe('Linie1');
   });
+
+  it('strips the rvproject: scheme — a root-level document must still match', () => {
+    // plan-737 made the demo documents root-level: no slash in the path, so the
+    // scheme leaked into the "basename" and no model plugin matched (/demo lost
+    // its failure-message show, 2026-09-02).
+    expect(resolveModelName('rvproject:DemoRealvirtualWeb.glb')).toBe('DemoRealvirtualWeb');
+    expect(resolveModelName('rvproject:models/Linie1.glb')).toBe('Linie1');
+  });
 });

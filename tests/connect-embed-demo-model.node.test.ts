@@ -16,7 +16,7 @@ function parseGlbJson(path: string): { nodes: GlbNode[]; scenes: Array<{ nodes?:
 
 describe('CONNECT embedded reference demo', () => {
   it('contains the verified ConveyorEntry1 Drive_Simple.Forward bind target', () => {
-    const gltf = parseGlbJson(resolve(__dirname, '../public/DemoRealvirtualWeb.glb'));
+    const gltf = parseGlbJson(resolve(__dirname, '../public/demo-realvirtual/DemoRealvirtualWeb.glb'));
     const paths = new Map<number, string>();
     const visit = (index: number, parent = ''): void => {
       const node = gltf.nodes[index];

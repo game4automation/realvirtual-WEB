@@ -534,7 +534,7 @@ describe('plan-716 Phase 1 — the verbs still work, now inside My Workspace', (
     // RE-PINNED: no catalogue row anywhere. The document IS the artefact.
     expect(listMetas()).toEqual([]);
     // The bytes really landed in the project the boot opened.
-    expect(await project.getBackend()!.readBlobBytes('Demo.glb')).not.toBeNull();
+    expect(await project.getBackend()!.readDocument('Demo.glb')).not.toBeNull();
     store.dispose();
     await project.closeProject();
   });
@@ -584,9 +584,9 @@ describe('plan-716 Phase 1 — the verbs still work, now inside My Workspace', (
     await store.delete(row.id);
 
     expect(workspaceDocuments(project)).toEqual([]);
-    expect(await project.getBackend()!.readBlobBytes(row.path)).toBeNull();
+    expect(await project.getBackend()!.readDocument(row.path)).toBeNull();
     // Retired, not destroyed — the bytes are in the trash (plan-716 R1-I1).
-    expect(await project.getBackend()!.readBlobBytes('.trash/Demo.glb')).not.toBeNull();
+    expect(await project.getBackend()!.readDocument('.trash/Demo.glb')).not.toBeNull();
     expect(listMetas()).toEqual([]);
     store.dispose();
     await project.closeProject();

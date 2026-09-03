@@ -58,7 +58,7 @@ function storeWith(documents: RvDocumentEntry[]): ProjectStoreLike {
       writable: true,
       listDocuments: async () => documents,
       listLibrary: async () => [],
-      readBlobUrl: async (relPath: string) => ({ url: 'blob:' + relPath, release: () => {} }),
+      readDocumentUrl: async (relPath: string) => ({ url: 'blob:' + relPath, release: () => {} }),
     } as never),
   };
 }

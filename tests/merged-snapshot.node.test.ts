@@ -409,6 +409,50 @@ describe('applyMergedSnapshot', { timeout: 180000 }, () => {
       { projects: [{ key: 'acme', vendor: VENDOR }], version: '2.0.0' })).toThrow(/no .git/);
   });
 
+  // ── plan-737: the one folder under projects/ that is Zone A ────────────
+  //
+  // Everything else below `projects/` is the customer's and is either merged or
+  // left alone. `projects/demo-realvirtual/` is vendor-owned sample content
+  // staged by `copyDemoRealvirtualFolder()`, and the decision behind F4 is
+  // "always overwrite in full". Both halves need pinning, because each fails
+  // silently on its own: without the copy filter's exception the demo never
+  // ARRIVES (the per-project loop iterates customer keys, and a standard
+  // customer has none), and without the delete the customer's edited copy
+  // survives every later delivery.
+  it('replaces projects/demo-realvirtual/ on every delivery — Zone A, not customer-owned', () => {
+    const root = sandbox();
+    const withDemo = {
+      ...V1,
+      'projects/demo-realvirtual/project.json': '{"id":"prj_sample","name":"DemoRealvirtual"}\n',
+      'projects/demo-realvirtual/DemoRealvirtualWeb.glb': 'demo-v1',
+    };
+    const { clone } = seededClone(root, '1.0.0', withDemo);
+    // It arrived on the FIRST delivery at all — the half the copy filter owns.
+    expect(readFileSync(join(clone, 'projects/demo-realvirtual/DemoRealvirtualWeb.glb'), 'utf8')).toBe('demo-v1');
+
+    // The customer treats it as the sandbox it is: edits a document, adds one.
+    write(join(clone, 'projects/demo-realvirtual/DemoRealvirtualWeb.glb'), 'customer scribbled here');
+    write(join(clone, 'projects/demo-realvirtual/their-experiment.glb'), 'customer added this');
+    commit(clone, 'customer played with the demo');
+
+    const stagedV2 = stage(root, 'staged-v2', {
+      ...withDemo,
+      'projects/demo-realvirtual/DemoRealvirtualWeb.glb': 'demo-v2',
+    }, '2.0.0');
+    const snapshot = applyMergedSnapshot(stagedV2, clone,
+      { projects: [{ key: 'acme', vendor: VENDOR }], version: '2.0.0' });
+
+    // Vendor version wins outright, and the customer's addition is GONE — that
+    // is what "replaced in full, never merged" means, and demo.knowledge.md
+    // says so to the customer in the same words.
+    expect(readFileSync(join(clone, 'projects/demo-realvirtual/DemoRealvirtualWeb.glb'), 'utf8')).toBe('demo-v2');
+    expect(existsSync(join(clone, 'projects/demo-realvirtual/their-experiment.glb'))).toBe(false);
+    // And none of it is reported as a conflict: nothing here was being defended.
+    expect(snapshot.projects.acme.conflicts).toHaveLength(0);
+    // The customer's OWN project is untouched by all of this.
+    expect(readFileSync(join(clone, 'projects/acme/scenes/shipped.scene.json'), 'utf8')).toBe('{"scene":"shipped"}\n');
+  });
+
   it('honours vendor.handover: a path inside a managed glob stays customer-owned', () => {
     const root = sandbox();
     const files = { ...V1, 'projects/acme/models/custom/theirs.glb': 'customer model v1' };

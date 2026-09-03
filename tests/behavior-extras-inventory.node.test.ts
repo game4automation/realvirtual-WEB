@@ -132,8 +132,8 @@ const ALLOWLIST: readonly string[] = [
   'public/library/PalletHandling/Europallet.glb :: Europallet :: Source',
   'public/library/PalletHandling/EuropalletLoaded.glb :: EuropalletLoaded :: Source',
   'public/library/PalletHandling/PalletSink.glb :: PalletSink :: Sink',
-  'public/DemoRealvirtualWeb.glb :: DemoCell/Sink :: Sink',
-  'public/DemoRealvirtualWeb.glb :: DemoCell/Turbine :: Source',
+  'public/demo-realvirtual/DemoRealvirtualWeb.glb :: DemoCell/Sink :: Sink',
+  'public/demo-realvirtual/DemoRealvirtualWeb.glb :: DemoCell/Turbine :: Source',
   // The embed vignette is cut from the demo model above — same DemoCell
   // payloads, same review; it entered the scan when ROOTS widened to public/.
   'public/embed/vignettes/conveyor-sensor.glb :: DemoCell/Sink :: Sink',

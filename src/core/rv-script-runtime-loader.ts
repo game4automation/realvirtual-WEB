@@ -49,7 +49,7 @@ import { debug, debugWarn } from './engine/rv-debug';
 /**
  * Where a project's own files come from.
  *
- * `ProjectBackend` satisfies this structurally through `readBlobBytes`, which
+ * `ProjectBackend` satisfies this structurally through `readDocument`, which
  * is deliberate — the loader must not import the project store (the same rule
  * `ModelPluginManager` follows), and a test must be able to state a project's
  * contents as an object literal.

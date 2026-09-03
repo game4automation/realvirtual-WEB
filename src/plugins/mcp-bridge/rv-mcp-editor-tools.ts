@@ -58,6 +58,7 @@ import {
 import { requireEditor, isGuardError } from './rv-mcp-editor-guard';
 import { parsePathsParam } from './rv-object-analyzer-math';
 import { captureFrameCanvas, canvasToRvImage, compositeMontage } from './rv-frame-capture';
+import { arrayBufferOf } from '../../core/project/rv-scene-record';
 import { buildMeshUniverse } from './rv-mcp-view-tools';
 import {
   computeIdenticalPaths,
@@ -576,7 +577,7 @@ export class McpEditorTools {
     });
   }
 
-  @McpTool('List the files the OPEN PROJECT owns, project-relative (path, name, sizeBytes, modified, section, documentId). Narrow with dir (folder prefix, e.g. "library/Custom") and glob ("*" and "?", matched over the whole path, e.g. "*.glb"). With no project open it answers with the same projectOpen:false shape as web_editor_project_info. Oversized listings are truncated and say by how much.', { readOnly: true, timeoutMs: 60_000 })
+  @McpTool('List the files the OPEN PROJECT owns, project-relative (path, name, sizeBytes, modified, folder, documentId). Narrow with dir (folder prefix, e.g. "library/Custom") and glob ("*" and "?", matched over the whole path, e.g. "*.glb"). With no project open it answers with the same projectOpen:false shape as web_editor_project_info. Oversized listings are truncated and say by how much.', { readOnly: true, timeoutMs: 60_000 })
   async webEditorProjectFiles(
     @McpParam('dir', 'Project-relative folder prefix, e.g. "library/Custom"', 'string', false) dir?: string,
     @McpParam('glob', 'Glob over the whole path, "*" and "?" only, e.g. "*.glb"', 'string', false) glob?: string,
@@ -614,28 +615,41 @@ export class McpEditorTools {
 
     interface FileRow {
       path: string; name: string; sizeBytes: number | null;
-      modified: string | null; section: string | null; documentId: string | null;
+      modified: string | null;
+      /** First path segment, `''` at the project root — where the file IS. */
+      folder: string;
+      /** @deprecated plan-736 — carries the identical value as `folder`. */
+      section: string;
+      documentId: string | null;
     }
     const byPath = new Map<string, FileRow>();
-    const put = (path: string, name: string, section: string | null,
+    const put = (path: string, name: string,
                  documentId: string | null, sizeBytes: number | null,
                  modified: string | null): void => {
       if (!path || byPath.has(path)) return;
       const stat = statByPath.get(path);
+      // The folder is READ OFF THE PATH, for every row, in one place (plan-736
+      // F7). It used to be a `section` argument each caller passed by hand —
+      // `'models'` here, `'library'` there, the row's stored field for a
+      // document — which is how a listing could disagree with the tree it was
+      // listing, and how a root-level file ended up filed as `null`. `section`
+      // stays as a deprecated alias with the identical value, so an agent
+      // prompt written against the old field keeps working for one release.
+      const folder = path.includes('/') ? path.slice(0, path.indexOf('/')) : '';
       byPath.set(path, {
         path, name,
         sizeBytes: sizeBytes ?? stat?.size ?? null,
         modified: modified ?? (stat?.mtime ? new Date(stat.mtime).toISOString() : null),
-        section, documentId,
+        folder, section: folder, documentId,
       });
     };
     for (const d of documents) {
-      put(d.path, d.name, d.section ?? null, d.id, d.sizeBytes ?? null, d.modifiedAt ?? null);
+      put(d.path, d.name, d.id, d.sizeBytes ?? null, d.modifiedAt ?? null);
     }
     const fileStem = (p: string): string => (p.split('/').pop() ?? p).replace(/\.glb$/i, '');
-    for (const m of models) put(m.path, m.label || fileStem(m.path), 'models', m.id ?? null, m.sizeBytes ?? null, null);
-    for (const l of library) put(l.path, l.label || fileStem(l.path), 'library', l.id ?? null, l.sizeBytes ?? null, null);
-    for (const s of stats) put(s.path, fileStem(s.path), null, null, s.size, s.mtime ? new Date(s.mtime).toISOString() : null);
+    for (const m of models) put(m.path, m.label || fileStem(m.path), m.id ?? null, m.sizeBytes ?? null, null);
+    for (const l of library) put(l.path, l.label || fileStem(l.path), l.id ?? null, l.sizeBytes ?? null, null);
+    for (const s of stats) put(s.path, fileStem(s.path), null, s.size, s.mtime ? new Date(s.mtime).toISOString() : null);
 
     const rows = [...byPath.values()]
       .filter(r => listing.inDirectory(r.path, dir) && listing.matchesGlob(r.path, glob))
@@ -2622,9 +2636,9 @@ export class McpEditorTools {
     const { getProjectStore } = await import('../../core/project/project-store');
     const backend = getProjectStore().getBackend();
     if (!backend) return { error: 'No project is open (open one in Projects)' };
-    const bytes = await backend.readBlobBytes(trimmed);
-    if (!bytes) return { error: `File not found in the open project: ${trimmed}` };
-    return { bytes, name: trimmed.split('/').pop() || trimmed };
+    const read = (await backend.readDocument(trimmed))?.bytes ?? null;
+    if (!read) return { error: `File not found in the open project: ${trimmed}` };
+    return { bytes: arrayBufferOf(read), name: trimmed.split('/').pop() || trimmed };
   }
 }
 

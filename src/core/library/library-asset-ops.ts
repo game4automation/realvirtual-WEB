@@ -48,7 +48,6 @@
 import type { DocumentTransferSession, DocumentTransferSide } from '../project/rv-document-transfer';
 import {
   classificationOfGlbBlob,
-  isDocumentSection,
   newDocumentId,
 } from '../project/rv-project-documents';
 import type { DocumentClassification } from '../project/rv-document-classification';
@@ -81,14 +80,18 @@ function libPath(relPath: string): string {
  * bytes, write the bytes, probe the name".
  */
 interface BlobSurface {
-  readBlobUrl(relPath: string): Promise<{ url: string; release(): void } | null>;
-  writeBlob(relPath: string, blob: Blob): Promise<void>;
-  deleteBlob(relPath: string): Promise<void>;
+  readDocumentUrl(relPath: string): Promise<{ url: string; release(): void } | null>;
+  writeDocument(
+    relPath: string,
+    bytes: Uint8Array,
+    opts: { expectedRevision: string },
+  ): Promise<{ revision: string }>;
+  deleteDocument(relPath: string): Promise<void>;
 }
 
 /** Read a full path as bytes, or null when it is not there. */
 async function readBytesAt(surface: BlobSurface, path: string): Promise<Blob | null> {
-  const resolved = await surface.readBlobUrl(path);
+  const resolved = await surface.readDocumentUrl(path);
   if (!resolved) return null;
   try {
     return await (await fetch(resolved.url)).blob();
@@ -99,7 +102,7 @@ async function readBytesAt(surface: BlobSurface, path: string): Promise<Blob | n
 
 /** True when something is stored at this full path. */
 async function existsAt(surface: BlobSurface, path: string): Promise<boolean> {
-  const resolved = await surface.readBlobUrl(path);
+  const resolved = await surface.readDocumentUrl(path);
   if (!resolved) return false;
   resolved.release();
   return true;
@@ -208,12 +211,6 @@ function trashPathFor(path: string): string {
   const { folder, file } = splitFileName(path);
   const root = folder.split('/').filter(Boolean)[0] ?? '';
   return root ? `${root}/${TRASH_FOLDER}/${file}` : `${TRASH_FOLDER}/${file}`;
-}
-
-/** The manifest section a path belongs to. Unknown roots are library assets. */
-function sectionOfPath(path: string): 'scenes' | 'models' | 'library' {
-  const root = path.split('/').filter(Boolean)[0] ?? '';
-  return isDocumentSection(root) ? root : 'library';
 }
 
 function errText(e: unknown): string {
@@ -333,7 +330,11 @@ async function transferDocument(
   }
 
   try {
-    await target.writeBlob(targetPath, bytes);
+    // `targetPath` is the first free name the probe above found, so this is a
+    // create — and saying so is what refuses the write if a concurrent copy got
+    // there between the probe and here.
+    await target.writeDocument(
+      targetPath, new Uint8Array(await bytes.arrayBuffer()), { expectedRevision: 'create' });
   } catch (e) {
     return { kind: 'error', message: errText(e) };
   }
@@ -358,7 +359,6 @@ async function transferDocument(
       // A probed name has to reach the display string too, or two rows read
       // "Belt" and only the file names tell them apart.
       name: arrivedName === sourceName ? doc.name : arrivedName,
-      section: sectionOfPath(targetPath),
       sizeBytes: bytes.size,
       modifiedAt: new Date().toISOString(),
     };
@@ -409,7 +409,7 @@ async function transferDocument(
     // Body written, cache (or verification) failed: take the partial copy back
     // out. A target left holding bytes nothing lists is exactly the orphan the
     // "bytes first" ordering is meant to make repairable, not permanent.
-    await target.deleteBlob(targetPath).catch(() => {});
+    await target.deleteDocument(targetPath).catch(() => {});
     return { kind: 'error', message: errText(e) };
   }
 }
@@ -437,8 +437,10 @@ async function retireSourceDocument(
 
   const bytes = await readBytesAt(source, doc.path);
   if (!bytes) throw new Error(`"${doc.name}" could not be read.`);
-  await source.writeBlob(free, bytes);
-  await source.deleteBlob(doc.path);
+  // `free` came from `probeFreeName` — nothing may be there.
+  await source.writeDocument(
+    free, new Uint8Array(await bytes.arrayBuffer()), { expectedRevision: 'create' });
+  await source.deleteDocument(doc.path);
 
   await source.updateManifestEntry(documents => documents.filter(d => d.path !== doc.path));
 }

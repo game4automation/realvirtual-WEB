@@ -27,10 +27,12 @@ import { ProjectTree } from '../src/core/hmi/projects/ProjectTree';
 import {
   ProjectFolderContents,
   type FolderCardModel,
+  type FolderTileModel,
 } from '../src/core/hmi/projects/ProjectFolderContents';
 import {
   buildProjectTree,
   folderContents,
+  folderSubfolders,
   nearestFolderPath,
   type ProjectTreeNode,
   type ProjectTreeRootInput,
@@ -38,6 +40,7 @@ import {
 import {
   documentChipOptions,
   matchesDocumentFilter,
+  matchesSearchTerm,
   type DocumentFilterState,
 } from '../src/core/hmi/projects/document-filter';
 
@@ -99,6 +102,16 @@ function Screen({ roots: input = [PROJECT_ROOT], filter = NO_FILTER, onOpen, onM
   }));
 
   const chips = documentChipOptions(rows, filter.chip);
+  // Subfolder tiles ahead of the asset cards, exactly as the host builds them:
+  // only the search cuts them (chips describe documents), click navigates.
+  const subfolderTiles: FolderTileModel[] = folderSubfolders(roots, folderPath)
+    .filter(node => matchesSearchTerm(node.name, filter.term))
+    .map(node => ({
+      key: node.path!,
+      name: node.name,
+      holdsSomething: node.hasContent ?? node.children.length > 0,
+      onOpen: () => setSelectedPath(node.path!),
+    }));
   const cards: FolderCardModel[] = rows
     .filter(row => matchesDocumentFilter(row, filter))
     .map(({ node }) => ({
@@ -127,7 +140,7 @@ function Screen({ roots: input = [PROJECT_ROOT], filter = NO_FILTER, onOpen, onM
         onMove={onMove}
         externalDragPath={cardDragPath}
       />
-      <ProjectFolderContents cards={cards} />
+      <ProjectFolderContents cards={cards} folders={subfolderTiles} />
     </>
   );
 }
@@ -147,10 +160,10 @@ afterEach(cleanup);
 // ─── 1. The grid shows the selected folder ───────────────────────────────
 
 describe('Lauf 13 — the cards are the selected folder\'s contents', () => {
-  it('starts on the project root, which holds no loose files here', () => {
+  it('starts on the project root: its subfolders are tiles, not an empty state', () => {
     render(<Screen />);
-    expect(cardNames()).toEqual([]);
-    expect(screen.getByText('This folder is empty.')).toBeTruthy();
+    expect(cardNames().sort()).toEqual(['docs', 'machines', 'parts']);
+    expect(screen.queryByText('This folder is empty.')).toBeNull();
   });
 
   it('shows a folder\'s documents once that folder is picked', () => {
@@ -168,10 +181,11 @@ describe('Lauf 13 — the cards are the selected folder\'s contents', () => {
   it('shows an attachment as a card too, not only a GLB', () => {
     render(<Screen />);
     fireEvent.click(document.querySelector('[data-path="proj_myplant/docs"]')!);
-    // `docs` itself holds only the subfolder; its PDF is one level down.
-    expect(cardNames()).toEqual([]);
-    fireEvent.click(screen.getByLabelText('Expand'));
-    clickFolder('proj_myplant/docs/Module_A');
+    // `docs` itself holds only the subfolder; the grid shows it as a tile,
+    // and clicking the tile navigates — the same verb as the tree row.
+    expect(cardNames()).toEqual(['Module_A']);
+    fireEvent.click(document.querySelector('[data-card-path$="Module_A"]')!
+      .querySelector('*')!);
     expect(cardNames()).toEqual(['4112630_BOM.pdf']);
   });
 
@@ -193,6 +207,16 @@ describe('Lauf 13 — the filter narrows the cards, not the tree', () => {
     expect(cardNames()).toEqual(['Capper.glb']);
     // The folder it is in is still in the tree — navigation does not move.
     expect(document.querySelector('[data-path="proj_myplant/parts"]')).not.toBeNull();
+  });
+
+  it('the search term cuts the subfolder tiles too — by name, like everything else', () => {
+    render(<Screen filter={{ term: 'mach', chip: null, tag: null }} />);
+    expect(cardNames()).toEqual(['machines']);
+  });
+
+  it('a chip never hides a subfolder tile — a folder carries no classification', () => {
+    render(<Screen filter={{ term: '', chip: 'assembly', tag: null }} />);
+    expect(cardNames().sort()).toEqual(['docs', 'machines', 'parts']);
   });
 
   it('a chip cuts by classification', () => {

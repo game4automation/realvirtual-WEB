@@ -11,7 +11,7 @@
  * disk never changed, and the project silently gained a "scene" that was
  * really the document under another name. With `_saveIntoDocument`:
  *
- *  - the bytes replace the document's own file (`backend.writeBlob` at the
+ *  - the bytes replace the document's own file (`backend.writeDocument` at the
  *    manifest path) — no scene id, no catalogue row, no body-slot commit;
  *  - a clean second save is a true no-op, and an edited one writes the SAME
  *    file again;
@@ -89,7 +89,14 @@ function makeViewer() {
     availablePublishedScenes: [],
     currentScene: null as RvScene | null,
     currentModelUrl: null as string | null,
-    currentModelRoot: { name: 'root' },
+    // `children: []` is load-bearing since plan-736, not decoration. The fake
+    // backend used to have `readBlobBytes` but no `readScene`, so
+    // `readSceneGlbBody()` threw on it and the open fell through to OPFS before
+    // ever adopting from a loaded GLB. There is ONE read now, so the same double
+    // serves both callers, the open gets as far as `collectPlacementNodes`, and
+    // the root it walks has to be walkable. The test double was incomplete; the
+    // unification is what made that visible.
+    currentModelRoot: { name: 'root', children: [] as unknown[] },
     registry: {
       getGltfNodeNames: () => [], getGltfNodeIndex: () => -1,
       getPathForNode: () => null, getNode: () => null,
@@ -111,10 +118,18 @@ function fakeBackend() {
     kind: 'browser', id: 'test', writable: true, isActive: true,
     listModels: async () => [],
     listDocuments: async () => [],
-    readBlobBytes: async (relPath: string) =>
-      relPath === PATH ? (bytes.buffer.slice(0) as ArrayBuffer) : null,
-    readBlobUrl: async () => null,
-    writeBlob: async (relPath: string, blob: Blob) => { blobWrites.push({ relPath, size: blob.size }); },
+    readDocument: async (ref: string | { path: string }) => {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
+      return relPath === PATH
+        ? { bytes: new Uint8Array(bytes), meta: { id: '', name: PATH, path: PATH }, revision: 'rev' }
+        : null;
+    },
+    readDocumentUrl: async () => null,
+    writeDocument: async (ref: string | { path: string }, written: Uint8Array) => {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
+      blobWrites.push({ relPath, size: written.byteLength });
+      return { revision: 'rev' };
+    },
   } as unknown as ProjectBackend;
   return { backend, blobWrites };
 }

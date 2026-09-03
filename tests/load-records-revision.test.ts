@@ -60,23 +60,38 @@ function makeBackend(id: string) {
     id,
     writable: true,
     isActive: true,
-    async writeBlob(relPath: string, blob: Blob, opts?: { expectedRevision?: string | null }) {
+    async writeDocument(
+      ref: string | { path: string },
+      bytes: Uint8Array,
+      opts: { expectedRevision: string },
+    ) {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
       const actual = h.files.has(relPath) ? await revisionOf(h.files.get(relPath)!) : null;
-      const expected = opts?.expectedRevision;
-      if (expected !== undefined && (expected ?? null) !== actual) {
+      // plan-736: 'any' / 'create' / a revision, in place of undefined / null.
+      const expected = opts.expectedRevision === 'any'
+        ? undefined
+        : opts.expectedRevision === 'create' ? null : opts.expectedRevision;
+      if (expected !== undefined && expected !== actual) {
         const { SceneRevisionConflictError } =
           await import('../src/core/project/rv-scene-record');
-        throw new SceneRevisionConflictError(relPath, expected ?? null, actual);
+        throw new SceneRevisionConflictError(relPath, expected, actual);
       }
       writes.push({ path: relPath, expected });
-      h.files.set(relPath, await blob.text());
+      const text = new TextDecoder().decode(bytes);
+      h.files.set(relPath, text);
+      return { revision: await revisionOf(text) };
     },
-    async readBlobBytes(relPath: string) {
+    async readDocument(ref: string | { path: string }) {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
       const value = h.files.get(relPath);
       if (value === undefined) return null;
-      return new TextEncoder().encode(value).buffer;
+      return {
+        bytes: new TextEncoder().encode(value),
+        meta: { id: '', name: relPath, path: relPath },
+        revision: await revisionOf(value),
+      };
     },
-    async readBlobUrl(relPath: string) {
+    async readDocumentUrl(relPath: string) {
       const value = h.files.get(relPath);
       if (value === undefined) return null;
       const url = URL.createObjectURL(new Blob([value]));
@@ -224,7 +239,7 @@ describe('the load records the revision (F6)', () => {
   it('never fails an open: an unreadable path leaves the ledger empty', async () => {
     const broken = {
       ...makeBackend('backend-broken'),
-      readBlobBytes: async () => { throw new Error('disk went away'); },
+      readDocument: async () => { throw new Error('disk went away'); },
     };
     // The load must not blow up because a revision could not be taken — a
     // missing CAS token degrades to plan-709 behaviour, never to a failed open.

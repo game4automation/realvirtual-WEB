@@ -108,9 +108,13 @@ function fakeBackend(bytes: Uint8Array) {
   const backend = {
     kind: 'browser', id: 'test', writable: true, isActive: true,
     listModels: async () => [],
-    readBlobBytes: async (relPath: string) =>
-      relPath === PATH ? (bytes.buffer.slice(0) as ArrayBuffer) : null,
-    readBlobUrl: async (relPath: string) => {
+    readDocument: async (ref: string | { path: string }) => {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
+      return relPath === PATH
+        ? { bytes: new Uint8Array(bytes), meta: { id: '', name: PATH, path: PATH }, revision: 'rev' }
+        : null;
+    },
+    readDocumentUrl: async (relPath: string) => {
       if (relPath !== PATH) return null;
       const url = URL.createObjectURL(new Blob([bytes as unknown as BlobPart]));
       return { url, release: () => { released.push(url); URL.revokeObjectURL(url); } };

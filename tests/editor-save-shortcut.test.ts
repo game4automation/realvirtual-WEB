@@ -78,7 +78,7 @@ const backend = {
     writes.push(relPath);
     h.files.set(relPath, await blob.text());
   },
-  async readBlobUrl(relPath: string) {
+  async readDocumentUrl(relPath: string) {
     const value = h.files.get(relPath);
     if (value === undefined) return null;
     const url = URL.createObjectURL(new Blob([value]));

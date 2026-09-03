@@ -10,6 +10,7 @@ import {
   assertNoCrossTierLeak,
   assertWorkspaceGuards,
   collectPrivateSourceInventory,
+  copyDemoRealvirtualFolder,
   createDeliveryManifest,
   deliveryChangelog,
   gitProvenance,
@@ -122,11 +123,13 @@ function fixture() {
   write(join(core, 'src', 'main.ts'), 'export {};');
   write(join(core, 'public', 'settings.json'), '{}');
   write(join(core, 'public', 'aasx', 'demo.aasx'), 'fixture');
-  // The DEMO project's manifest (plan-726). Demo content exactly like scenes/
-  // and aasx/, and — unlike those two — a TOP-LEVEL FILE, which is why it needs
-  // a filter branch of its own in `copyCore()`.
-  write(join(core, 'public', 'project.json'), JSON.stringify({
-    schemaVersion: 2, id: 'prj_sample', name: 'DemoRealvirtual', documents: [],
+  // The DEMO project, as ONE FOLDER (plan-737). It is filtered out of a customer
+  // deploy by a single subdirectory rule now — the same shape as `scenes/` and
+  // `aasx/` — and delivered to the customer as `projects/demo-realvirtual/`.
+  write(join(core, 'public', 'demo-realvirtual', 'project.json'), JSON.stringify({
+    schemaVersion: 2, id: 'prj_sample', name: 'DemoRealvirtual', kind: 'demo',
+    settings: { defaultModel: 'DemoRealvirtualWeb.glb' },
+    documents: [{ id: 'doc_a', name: 'Demo', path: 'DemoRealvirtualWeb.glb' }],
   }));
   write(join(core, 'package.json'), '{"name":"core","version":"1.0.0"}');
   write(join(core, 'package-lock.json'), '{"lockfileVersion":3}');
@@ -139,8 +142,8 @@ function fixture() {
   write(join(privateRoot, 'scripts', 'provision-influx.mjs'), PROVISION_INFLUX_FIXTURE);
   // The delivered reference model is bundled in the core tree's own public/ — staging throws
   // when it is missing, so every fixture carries it.
-  write(join(core, 'public', 'models', 'DemoRealvirtualWeb.glb'), 'fixture:demo-glb');
-  write(join(core, 'public', 'models', 'DemoRealvirtualWeb.settings.json'), '{}');
+  write(join(core, 'public', 'demo-realvirtual', 'DemoRealvirtualWeb.glb'), 'fixture:demo-glb');
+  write(join(core, 'public', 'demo-realvirtual', 'DemoRealvirtualWeb.settings.json'), '{}');
   write(join(privateRoot, 'scripts', 'get-dependencies.mjs'), '// get-dependencies fixture\n');
   // The shared launcher functions are delivered from the installer payload into the workspace, so
   // the fixture has to carry the same layout the private repository has.
@@ -409,7 +412,9 @@ describe('customer workspace generator', () => {
       'screenshot-drive-chart.png', 'screenshot-hierarchy.png', 'screenshot-settings.png',
     ]) expect(existsSync(join(first.coreRoot, 'docs', 'images', name)), name).toBe(true);
     expect(existsSync(join(first.coreRoot, 'docs', 'images', 'unreferenced.png'))).toBe(false);
-    expect(readdirSync(join(first.workspaceRoot, 'projects'))).toEqual(['acme']);
+    // The customer project AND the demo project (plan-737 F4): every delivery
+    // carries the demo as a normal, writable project of its own.
+    expect(readdirSync(join(first.workspaceRoot, 'projects')).sort()).toEqual(['acme', 'demo-realvirtual']);
     const readme = readFileSync(join(first.workspaceRoot, 'README.md'), 'utf8');
     expect(readme).toContain('Git LFS is critical');
     expect(readme).toContain('git clone git@example.invalid:acme.git');
@@ -565,10 +570,10 @@ describe('customer workspace generator', () => {
     // schedule rather than by behaviour.
   }, 60000);
 
-  // Customers need a reference model next to their own machine, and the planner needs its
-  // component library. Both come from the DemoRealvirtual project; whatever is still lying
-  // around in the core's public/models/ is scratch and must never be delivered.
-  it('delivers the demo model and the curated library, never the core public models', () => {
+  // Customers get the demo as a PROJECT (plan-737) and the planner gets its component
+  // library beside it. Whatever is lying around in the core's public/models/ is scratch
+  // and must never be delivered.
+  it('delivers the demo project and the curated library, never the core public models', () => {
     const { core, privateRoot, delivery } = fixture();
     write(join(core, 'src', 'plugins', 'layout-planner', 'index.ts'), 'export const LayoutPlannerPlugin = null;');
     const projectRoot = join(core, 'public');
@@ -588,10 +593,16 @@ describe('customer workspace generator', () => {
     temporary.push(staged.workspaceRoot);
 
     const models = join(staged.coreRoot, 'public', 'models');
-    // The library is delivered NEXT TO models/, mirroring the project layout.
+    // The library stays APP-LEVEL, in the deploy — one copy, shared by every project.
     const library = join(staged.coreRoot, 'public', 'library');
-    expect(existsSync(join(models, 'DemoRealvirtualWeb.glb'))).toBe(true);
-    expect(existsSync(join(models, 'DemoRealvirtualWeb.settings.json'))).toBe(true);
+    // The demo is a PROJECT now, so it arrives under projects/ — writable, complete,
+    // and carrying its own manifest instead of being a loose GLB on the deploy root.
+    const demo = join(staged.workspaceRoot, 'projects', 'demo-realvirtual');
+    expect(existsSync(join(demo, 'project.json'))).toBe(true);
+    expect(existsSync(join(demo, 'DemoRealvirtualWeb.glb'))).toBe(true);
+    expect(existsSync(join(demo, 'DemoRealvirtualWeb.settings.json'))).toBe(true);
+    // …and NOT as a loose reference model on the deploy root any more.
+    expect(existsSync(join(models, 'DemoRealvirtualWeb.glb'))).toBe(false);
     expect(existsSync(join(library, 'PalletHandling', 'RollConveyor-1m.glb'))).toBe(true);
     // A core scratch model, and a library category that is never delivered — neither may
     // appear, not even as an empty directory.
@@ -615,12 +626,14 @@ describe('customer workspace generator', () => {
   // It needed its own filter branch because every pre-existing exclusion in
   // `copyCore()` filters a SUBDIRECTORY (`scenes/`, `aasx/`, `library/`), and a
   // top-level file sails straight past all of them.
-  it('never delivers the demo project manifest to a customer workspace', () => {
+  it('never delivers the demo project onto a customer deploy root', () => {
     const { core, privateRoot, delivery } = fixture();
     const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
     temporary.push(staged.workspaceRoot);
 
-    expect(existsSync(join(staged.coreRoot, 'public', 'project.json'))).toBe(false);
+    expect(existsSync(join(staged.coreRoot, 'public', 'demo-realvirtual'))).toBe(false);
+    // It is not absent, though — it is somewhere better (plan-737 F4).
+    expect(existsSync(join(staged.workspaceRoot, 'projects', 'demo-realvirtual', 'project.json'))).toBe(true);
     // The neighbours it is filtered alongside, restated so a regression that
     // widened the filter the wrong way is visible here too.
     expect(existsSync(join(staged.coreRoot, 'public', 'aasx'))).toBe(false);
@@ -643,8 +656,11 @@ describe('customer workspace generator', () => {
     });
     temporary.push(staged.workspaceRoot);
 
-    expect(existsSync(join(staged.coreRoot, 'public', 'project.json'))).toBe(true);
+    expect(existsSync(join(staged.coreRoot, 'public', 'demo-realvirtual', 'project.json'))).toBe(true);
     expect(existsSync(join(staged.coreRoot, 'public', 'aasx', 'demo.aasx'))).toBe(true);
+    // The public demo reads the folder in place; it must NOT also be staged as a
+    // second copy under projects/, or the hosted demo would list itself twice.
+    expect(existsSync(join(staged.workspaceRoot, 'projects', 'demo-realvirtual'))).toBe(false);
   });
 
   // The plan-735 regression, pinned: `--demo` is ALSO projectless and ALSO
@@ -655,16 +671,16 @@ describe('customer workspace generator', () => {
   // project. Existence alone did not catch it; the IDENTITY has to be asserted.
   it('keeps the AUTHORIZED demo manifest for the public demo build', () => {
     const { core, privateRoot } = fixture();
-    write(join(core, 'public', 'scenes', 'DemoPlanner.glb'), 'fixture:planner');
-    write(join(core, 'public', 'project.json'), JSON.stringify({
+    write(join(core, 'public', 'demo-realvirtual', 'DemoPlanner.glb'), 'fixture:planner');
+    write(join(core, 'public', 'demo-realvirtual', 'project.json'), JSON.stringify({
       schemaVersion: 2,
       id: 'prj_sample',
       name: 'DemoRealvirtual',
       kind: 'demo',
-      settings: { defaultModel: 'models/DemoRealvirtualWeb.glb' },
+      settings: { defaultModel: 'DemoRealvirtualWeb.glb' },
       documents: [
-        { id: 'doc_a', name: 'Demo', path: 'models/DemoRealvirtualWeb.glb', section: 'models' },
-        { id: 'doc_d', name: 'Layout Planner Demo', path: 'scenes/DemoPlanner.glb', section: 'scenes' },
+        { id: 'doc_a', name: 'Demo', path: 'DemoRealvirtualWeb.glb' },
+        { id: 'doc_d', name: 'Layout Planner Demo', path: 'DemoPlanner.glb' },
       ],
     }));
 
@@ -678,11 +694,11 @@ describe('customer workspace generator', () => {
     temporary.push(staged.workspaceRoot);
 
     const manifest = JSON.parse(
-      readFileSync(join(staged.coreRoot, 'public', 'project.json'), 'utf8'));
+      readFileSync(join(staged.coreRoot, 'public', 'demo-realvirtual', 'project.json'), 'utf8'));
     expect(manifest.id).toBe('prj_sample');
     expect(manifest.kind).toBe('demo');
     expect(manifest.documents.map((d: { path: string }) => d.path))
-      .toContain('scenes/DemoPlanner.glb');
+      .toContain('DemoPlanner.glb');
     // …and not a trace of the generated one.
     expect(manifest.id).not.toMatch(/^prj_delivery_/);
     expect(manifest._generated).toBeUndefined();
@@ -695,19 +711,45 @@ describe('customer workspace generator', () => {
     const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
     temporary.push(staged.workspaceRoot);
 
-    expect(existsSync(join(staged.coreRoot, 'public', 'models', 'DemoRealvirtualWeb.glb'))).toBe(true);
+    // The demo project still travels — it does not depend on the planner.
+    expect(existsSync(join(staged.workspaceRoot, 'projects', 'demo-realvirtual', 'DemoRealvirtualWeb.glb'))).toBe(true);
     expect(existsSync(join(staged.coreRoot, 'public', 'library'))).toBe(false);
   });
 
-  it('refuses to deliver when the bundled demo model is missing', () => {
+  // The "reference model is missing" guard went with the reference model itself
+  // (plan-737). What replaced it is stronger: the demo travels as a whole project,
+  // and `assertManifestResolves()` checks that EVERY row of it resolves to bytes —
+  // where the old guard only ever checked that one named file existed.
+  it('delivers a demo project whose every document resolves', () => {
     const { core, privateRoot, delivery } = fixture();
     trackPublicModels(core, ['public/models/tests.glb']);
-    // The reference model is named explicitly rather than globbed, so a core tree without it
-    // must fail loudly rather than ship a model-less workspace.
-    rmSync(join(core, 'public', 'models'), { recursive: true, force: true });
+    const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
+    temporary.push(staged.workspaceRoot);
 
-    expect(() => stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery }))
-      .toThrow(/Demo model is missing/);
+    const demo = join(staged.workspaceRoot, 'projects', 'demo-realvirtual');
+    const gate = assertManifestResolves(demo);
+    expect(gate.documents.map(d => d.path)).toContain('DemoRealvirtualWeb.glb');
+    expect(gate.start.path).toBe('DemoRealvirtualWeb.glb');
+  });
+
+  // Always-overwrite (user decision): the demo is vendor-owned sample content, so a
+  // re-delivery REPLACES it rather than merging — anything the customer left in that
+  // folder is gone, which is what `demo.knowledge.md` tells them in as many words.
+  it('replaces an existing demo project wholesale on re-delivery', () => {
+    const { core, privateRoot, delivery } = fixture();
+    const first = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
+    temporary.push(first.workspaceRoot);
+
+    // The customer edits the demo and leaves a file of their own in it.
+    const demo = join(first.workspaceRoot, 'projects', 'demo-realvirtual');
+    write(join(demo, 'MyOwnEdit.glb'), 'customer:edit');
+    write(join(demo, 'DemoRealvirtualWeb.glb'), 'customer:overwritten');
+
+    // A second delivery into the SAME workspace root — what a re-delivery does.
+    copyDemoRealvirtualFolder(core, first.workspaceRoot);
+
+    expect(existsSync(join(demo, 'MyOwnEdit.glb'))).toBe(false);
+    expect(readFileSync(join(demo, 'DemoRealvirtualWeb.glb'), 'utf8')).toBe('fixture:demo-glb');
   });
 
   it('stages stub fallbacks for excluded private modules and adapts the flat customer layout', () => {
@@ -1497,9 +1539,10 @@ describe('projectless customer workspace', () => {
   it('delivers an empty projects/ folder and no project material at all', () => {
     const { staged } = stageProjectless();
 
-    // The folder exists — Git cannot carry an empty directory, so `.gitkeep` is
-    // the one vendor file under `projects/` — and it holds nothing else.
-    expect(readdirSync(join(staged.workspaceRoot, 'projects'))).toEqual(['.gitkeep']);
+    // `.gitkeep` (Git cannot carry an empty directory) and the demo project,
+    // which every channel gets since plan-737. Nothing else: no CUSTOMER project.
+    expect(readdirSync(join(staged.workspaceRoot, 'projects')).sort())
+      .toEqual(['.gitkeep', 'demo-realvirtual']);
     expect(readFileSync(join(staged.workspaceRoot, 'projects', '.gitkeep'), 'utf8')).toBe('');
     // The private repo's own `acme` project must not have followed along.
     expect(existsSync(join(staged.workspaceRoot, 'projects', 'acme'))).toBe(false);
@@ -1510,8 +1553,10 @@ describe('projectless customer workspace', () => {
     // No diagnosis payload: no connect/ folder, no rag.zip.
     expect(existsSync(join(staged.workspaceRoot, 'connect'))).toBe(false);
 
-    // The product itself IS delivered — the customer has something to open.
-    expect(existsSync(join(staged.coreRoot, 'public', 'models', 'DemoRealvirtualWeb.glb'))).toBe(true);
+    // The product itself IS delivered — the customer has something to open. Since
+    // plan-737 that something is the demo PROJECT, not a loose reference model.
+    expect(existsSync(join(staged.workspaceRoot, 'projects', 'demo-realvirtual', 'DemoRealvirtualWeb.glb'))).toBe(true);
+    expect(existsSync(join(staged.coreRoot, 'public', 'models', 'DemoRealvirtualWeb.glb'))).toBe(false);
     expect(existsSync(join(staged.privateRoot!, 'src', 'commercial', 'safe.ts'))).toBe(true);
   });
 
@@ -1524,17 +1569,20 @@ describe('projectless customer workspace', () => {
   // had no manifest at all and the viewer papered over it with a synthetic
   // project assembled from a build-time glob. Both are gone; this is what took
   // their place.
-  it('generates a vendor-owned project.json declaring the reference model', () => {
+  it('generates a vendor-owned project.json for the customer own, still-empty project', () => {
     const { staged } = stageProjectless();
     const manifestPath = join(staged.coreRoot, 'public', 'project.json');
     expect(existsSync(manifestPath)).toBe(true);
 
-    // The gate from plan-731 Phase 4, applied to this channel's deploy root:
-    // valid v2, every row resolves to bytes, sidecars travelled, a start
-    // document that is one of the rows. This is the F1/F2 acceptance.
-    const gate = assertManifestResolves(join(staged.coreRoot, 'public'));
-    expect(gate.documents.map(d => d.path)).toContain('models/DemoRealvirtualWeb.glb');
-    expect(gate.start.path).toBe('models/DemoRealvirtualWeb.glb');
+    // EMPTY since plan-737, and that is the honest statement: this manifest
+    // describes the CUSTOMER's project, and they have authored nothing yet. It used
+    // to declare a vendor reference model so the delivery had something to open —
+    // the demo project (projects/demo-realvirtual/) is that something now, so this
+    // file stops naming a file it does not own.
+    const generated = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    expect(generated.kind).toBe('delivery');
+    expect(generated.documents).toEqual([]);
+    expect(generated.settings?.defaultModel).toBeUndefined();
 
     // F3, asserted as a STRING and not merely implied: the generated file says
     // out loud that it is vendor-owned and replaced by every update. It sits in
@@ -1558,7 +1606,8 @@ describe('projectless customer workspace', () => {
     const { core, staged } = stageProjectless();
     const generated = JSON.parse(
       readFileSync(join(staged.coreRoot, 'public', 'project.json'), 'utf8'));
-    const demo = JSON.parse(readFileSync(join(core, 'public', 'project.json'), 'utf8'));
+    const demo = JSON.parse(readFileSync(
+      join(core, 'public', 'demo-realvirtual', 'project.json'), 'utf8'));
     expect(generated.id).not.toBe(demo.id);
     expect(generated.id).toMatch(/^prj_delivery_/);
     // None of the demo's own documents came along with it.
@@ -1807,11 +1856,20 @@ describe('projectless customer workspace', () => {
   /**
    * The §6.7 zone-C proof, as a unit test.
    *
-   * A projectless delivery delivers nothing under `projects/`, so nothing there is
-   * vendor-managed — and the merge must therefore leave the customer's own project
+   * A projectless delivery delivers nothing OF THE CUSTOMER'S under `projects/`, so
+   * nothing of theirs is vendor-managed — and the merge must leave their own project
    * exactly as it found it. This follows from the existing logic without a special
    * case (the per-project loop has nothing to iterate), which is precisely what
    * makes it worth pinning: a future "seed the folder" convenience would break it.
+   *
+   * ## The one exception, since plan-737
+   *
+   * `projects/demo-realvirtual/` DOES arrive, on this channel too (F5). It is
+   * vendor-owned sample content, classified Zone A and replaced in full on every
+   * delivery — see the dedicated case in `merged-snapshot.node.test.ts`. So the
+   * claim here is no longer "nothing appears under projects/" but the sharper and
+   * more useful one: nothing appears there EXCEPT the demo, and nothing of the
+   * customer's is touched either way.
    */
   it('leaves a customer-created project under projects/ byte-identical across an update', () => {
     const { staged } = stageProjectless();
@@ -1855,7 +1913,15 @@ describe('projectless customer workspace', () => {
       { cwd: clone, encoding: 'utf8' })
       .split('\n')
       .filter(line => line.trim() && !line.includes('.gitkeep') && !line.endsWith('.glb'));
-    expect(status).toEqual([]);
+    // The demo folder is the ONE expected arrival (plan-737 F5) — untracked,
+    // because this clone has never seen it before. Everything else must be
+    // absent from this list, which is what makes the assertion still bite.
+    const demoLines = status.filter(line => line.includes('demo-realvirtual'));
+    const rest = status.filter(line => !line.includes('demo-realvirtual'));
+    expect(rest).toEqual([]);
+    expect(demoLines.every(line => line.trimStart().startsWith('??'))).toBe(true);
+    // Nothing of the CUSTOMER'S was added, modified or deleted — the actual claim.
+    expect(status.some(line => line.includes('mymachine'))).toBe(false);
     // And zone A did happen: the delivered README replaced the old one.
     expect(readFileSync(join(clone, 'README.md'), 'utf8')).toContain('Create your first project');
   });

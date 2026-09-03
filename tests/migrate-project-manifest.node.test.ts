@@ -251,11 +251,16 @@ describe('documents[] derivation (plan-413 §2.4 step A, offline)', () => {
     const { manifest } = migrateManifest(WITH_LISTS, {
       folderName: 'p', now: '2026-08-08T00:00:00.000Z',
     });
-    expect(manifest.documents.map((d: Record<string, unknown>) => [d.section, d.path])).toEqual([
-      ['scenes', 'scenes/a.scene.glb'],
-      ['models', 'models/machine.glb'],
-      ['library', 'library/gripper.glb'],
+    expect(manifest.documents.map((d: Record<string, unknown>) => d.path)).toEqual([
+      'scenes/a.scene.glb',
+      'models/machine.glb',
+      'library/gripper.glb',
     ]);
+    // plan-736 F5/F6: the Node twin lifts the same rows as the TS side and
+    // stamps the same single `section` — the scene one, kept as the
+    // transitional Alt-Client guard. Drift between the two would show up here.
+    expect(manifest.documents.map((d: Record<string, unknown>) => d.section))
+      .toEqual(['scenes', undefined, undefined]);
     expect(manifest[DOCUMENTS_MIGRATION_MARKER]).toEqual({
       at: '2026-08-08T00:00:00.000Z', schemaVersion: 2,
       counts: { scenes: 1, models: 1, library: 1 },

@@ -163,19 +163,19 @@ const NON_DELIVERED_DOC_LINK_PREFIXES = [
 // assets are only partially tracked by Git and can hold other customers' geometry, so the
 // allowlists below are intersected with the Git index (see deliveredPublicModels) instead of
 // being copied from disk.
-// The DemoRealvirtual content is BUNDLED: it sits at the ROOT of the core tree's own `public/`
-// (user decision 2026-08-31: the demo documents live at the main level, not in subfolders) and
-// in `public/library/`. Named explicitly rather than globbed, because `public/models/` is
-// scratch. Delivered into the workspace's `public/models/`, which is where the runtime
-// resolves models from — a customer needs a reference model next to their own machine.
-const DELIVERED_DEMO_MODEL_FILES = [
-  'DemoRealvirtualWeb.glb',
-  'DemoRealvirtualWeb.settings.json',
-  // User decision 2026-08-30: DemoRobotIK and DemoCSGMachining are internal dev/test
-  // models (repo fixtures for the IK/BVH/CSG suites) and are deliberately NOT part of
-  // the delivered demo surface. Keep this list in sync with the model entries of
-  // public/project.json documents[] — the deploy's manifest gate enforces equality.
-];
+// The DemoRealvirtual content is ONE FOLDER since plan-737: `public/demo-realvirtual/`,
+// carrying its own `project.json` and every document that manifest declares. It is
+// delivered whole, as a PROJECT (`projects/demo-realvirtual/`), by
+// {@link copyDemoRealvirtualFolder} — not file by file into the deploy root.
+//
+// `DELIVERED_DEMO_MODEL_FILES` is therefore GONE, and with it the whole
+// reference-model mechanic (`REFERENCE_MODEL_*`, `referenceModelDocument()`, the
+// "reference model is missing" guard). That construction existed to give a
+// projectless customer *something* to open once the build-time glob was removed
+// (plan-735): a single loose GLB at the deploy root plus a generated manifest row
+// pointing at it. A whole, real, editable demo project is a strictly better answer
+// to the same question, so the stand-in goes rather than being maintained beside it.
+const DEMO_PROJECT_FOLDER = 'demo-realvirtual';
 // Curated bundled-library categories under `public/library/`. Anything else there is scratch
 // or CAD-import material. Set this to [] to deliver a workspace without the bundled library.
 const DELIVERED_LIBRARY_CATEGORIES = ['PalletHandling'];
@@ -1017,34 +1017,24 @@ function deliveredPublicModels(coreRoot) {
   return new Set();
 }
 
-//! Copies the DemoRealvirtual reference model AND the curated component library out of the
-//! core tree into the delivered `realvirtual-web/public/`.
+//! Copies the curated component library out of the core tree into the delivered
+//! `realvirtual-web/public/library/`.
 //!
-//! The demo content is bundled: it lives in the core tree's own `public/models/` and
-//! `public/library/`, which is also where the workspace expects it, because that is where
-//! the runtime resolves models and the library catalog from.
+//! The library is APP-LEVEL (plan-737): one copy per installation, beside the demo
+//! project rather than inside it, because it is shared by every project a customer
+//! ever makes and must not be duplicated — or drift — per project. The demo merely
+//! SUBSCRIBES to it through the `libraries[]` of its own manifest.
 //!
 //! The library follows the layout planner: without the planner in the core there is nothing to
 //! browse it with, so it is omitted (and its categories are still filtered to
 //! {@link DELIVERED_LIBRARY_CATEGORIES} — `Custom/` and `imports/` are scratch).
 //!
-//! A silently model-less delivery is exactly the failure this step exists to prevent, so a
-//! missing file throws rather than shipping an empty workspace.
-function copyDemoAssetsIntoCore(coreRoot, coreOutput) {
+//! The demo MODEL half of this function is gone with plan-737 — the demo travels as a
+//! whole project folder now ({@link copyDemoRealvirtualFolder}), so there is no loose
+//! reference GLB to place and no "model is missing" guard to keep. What guards a
+//! model-less delivery today is `assertManifestResolves()` over the delivered project.
+function copyLibraryIntoCore(coreRoot, coreOutput) {
   const projectDir = join(coreRoot, 'public');
-  const targetDir = join(coreOutput, 'public', 'models');
-  mkdirSync(targetDir, { recursive: true });
-  for (const name of DELIVERED_DEMO_MODEL_FILES) {
-    // Root of public/ since 2026-08-31 (demo documents at main level); the models/
-    // spelling is accepted as the pre-move fallback so an older core tree still delivers.
-    const source = [join(projectDir, name), join(projectDir, 'models', name)]
-      .find(candidate => existsSync(candidate));
-    if (!source) {
-      throw new Error(`Demo model is missing from the core public/ tree: ${join(projectDir, name)}`);
-    }
-    copyFileSync(source, join(targetDir, name));
-  }
-
   if (!existsSync(join(coreRoot, LIBRARY_CONSUMER_DIR))) return;
   const delivered = new Set();
   for (const category of DELIVERED_LIBRARY_CATEGORIES) {
@@ -1073,21 +1063,22 @@ function writeDeliveredLibraryCatalog(projectDir, publicOutput, delivered) {
   writeFileSync(destination, JSON.stringify({ ...catalog, entries }, null, 2) + '\n');
 }
 
-// ─── The delivered reference model, as a manifest row (plan-735 Phase 1) ────
+// ─── The reference model is GONE (plan-737, was plan-735 Phase 1) ───────────
 //
-// `copyDemoAssetsIntoCore()` puts `DemoRealvirtualWeb.glb` into every delivery's
-// `realvirtual-web/public/models/`, and until plan-735 nothing DECLARED it: the
-// viewer found it through a build-time glob over `/public/models/*.glb` and
-// invented a project around it. That glob is gone, so the delivery has to say
-// what it ships — on both customer channels, in the two different files that
-// each of them actually boots from.
-
-//! Deploy-root-relative path of the delivered reference model. This is the address
-//! the removed build-time glob produced (`<BASE_URL>models/<file>`), and the one
-//! `realvirtual-web/public/settings.json` documents for `defaultModel`.
-const REFERENCE_MODEL_FILE = 'DemoRealvirtualWeb.glb';
-const REFERENCE_MODEL_PATH = `models/${REFERENCE_MODEL_FILE}`;
-const REFERENCE_MODEL_SETTINGS_PATH = `models/DemoRealvirtualWeb.settings.json`;
+// `REFERENCE_MODEL_FILE`/`_PATH`/`_SETTINGS_PATH` and `referenceModelDocument()`
+// lived here. They named ONE loose GLB that `copyDemoAssetsIntoCore()` dropped at
+// `realvirtual-web/public/models/`, so that the generated deploy-root manifest of a
+// projectless customer had at least one row to declare and the delivery booted into
+// something rather than nothing.
+//
+// Since plan-737 every delivery carries the whole demo PROJECT
+// (`projects/demo-realvirtual/`), which is the same reassurance in an honest shape:
+// a real project the customer can open, edit and learn from, instead of a single
+// orphan model wearing a generated manifest. So the generated root manifest stops
+// claiming a document it does not own — it is a minimal EMPTY customer project now
+// — and the guard that threw "the reference model is missing from the staged
+// workspace" has nothing left to check, because there is no longer a model that the
+// manifest could disagree with.
 
 //! Header of a generated, vendor-owned manifest (plan-735 F3).
 //!
@@ -1124,17 +1115,6 @@ function stableDocumentIdOf(path) {
   return `doc_${slug || 'unnamed'}_${(h >>> 0).toString(36)}`;
 }
 
-//! The `documents[]` row for the delivered reference model.
-function referenceModelDocument() {
-  return {
-    id: stableDocumentIdOf(REFERENCE_MODEL_PATH),
-    name: 'realvirtual WEB Demo',
-    path: REFERENCE_MODEL_PATH,
-    section: 'models',
-    settingsPath: REFERENCE_MODEL_SETTINGS_PATH,
-  };
-}
-
 //! Writes the generated deploy-root manifest of a PROJECTLESS delivery (plan-735 F2/F3).
 //!
 //! A standard customer buys the product, not a project, so nothing in the delivery
@@ -1149,20 +1129,22 @@ function referenceModelDocument() {
 //! not reach a customer, plan-726 F13), so a manifest generated before that pass
 //! would delete itself. The filter is unchanged and still refuses the demo one.
 //!
-//! `settings.defaultModel` here is the PROJECT's start document and is NOT the
-//! same field as `realvirtual-web/public/settings.json`'s: that one stays empty
-//! for a standard customer (they have no project of their own to open), and this
-//! one names the reference model so the delivery boots into something real.
+//! ## It declares NOTHING since plan-737 — and that is the point
+//!
+//! It used to carry one row for the delivered reference model, so a projectless
+//! delivery had something to open. The demo project travels whole now
+//! (`projects/demo-realvirtual/`), so this manifest goes back to describing what it
+//! actually is: the customer's OWN, still-empty project at the deploy root. An
+//! empty `documents[]` is the truthful statement — the customer has bought the
+//! product and has not authored anything yet — and it removes the last place where
+//! a customer's manifest named a vendor file.
+//!
+//! `settings.defaultModel` is empty for the same reason: the delivery's first-run
+//! target is the demo PROJECT, resolved as a project rather than smuggled in as
+//! this project's start document.
 function writeGeneratedDeliveryManifest(coreOutput, delivery) {
   const customer = String(delivery?.customer ?? '').trim();
   const slug = customer.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-  const modelPath = join(coreOutput, 'public', REFERENCE_MODEL_PATH);
-  if (!existsSync(modelPath)) {
-    // 1e: the delivery guarantee widened from "never model-less" to "never a
-    // model without a manifest row". Both halves throw, in the same run.
-    throw new Error('Cannot generate the delivery manifest: the reference model is missing from '
-      + `the staged workspace (${modelPath}). copyDemoAssetsIntoCore() must run first.`);
-  }
   const manifest = {
     _generated: GENERATED_MANIFEST_NOTICE,
     schemaVersion: 2,
@@ -1171,11 +1153,53 @@ function writeGeneratedDeliveryManifest(coreOutput, delivery) {
     canonicalName: slug || 'delivery',
     kind: 'delivery',
     activeSceneId: null,
-    settings: { defaultModel: REFERENCE_MODEL_PATH },
-    documents: [referenceModelDocument()],
+    settings: {},
+    documents: [],
   };
   const destination = join(coreOutput, 'public', 'project.json');
   writeFileSync(destination, JSON.stringify(manifest, null, 2) + '\n');
+}
+
+//! Stages the whole demo project into a customer workspace as `projects/demo-realvirtual/`,
+//! REPLACING whatever was there (plan-737 F4).
+//!
+//! ## Delete-then-copy, deliberately
+//!
+//! Every other vendor→customer copy in this file merges. This one does not, and the
+//! user decision behind it is explicit: *"immer komplett ueberschreiben"*. The demo is
+//! vendor-owned sample content and a sandbox — a customer is invited to break it — so
+//! there is nothing here worth a three-way merge, and a merge would instead accumulate
+//! deleted-upstream documents forever. `demo.knowledge.md` inside the folder says so to
+//! the customer in the same words.
+//!
+//! This is why `projects/demo-realvirtual/` must be classified ZONE A ("replaced on
+//! every delivery") in the delivery push, even though everything else under `projects/`
+//! is Zone B/C and protected as the customer's. Without that, the SECOND delivery would
+//! keep the customer's edited copy and the report would show phantom conflicts.
+//!
+//! ## Windows failure paths
+//!
+//! `rmSync` can throw `EBUSY`/`EPERM` when a viewer, an indexer or an editor holds a
+//! handle inside the folder. `maxRetries` covers the transient case; a persistent one
+//! is reported with the path so the operator can close whatever holds it. A partially
+//! deleted folder is not repaired here — it is crash-only: the next run deletes it
+//! again from the top, which is safe precisely because nothing in it is worth keeping.
+export function copyDemoRealvirtualFolder(coreRoot, destinationRoot) {
+  const source = join(coreRoot, 'public', DEMO_PROJECT_FOLDER);
+  if (!existsSync(source)) return false;
+  const target = join(destinationRoot, 'projects', DEMO_PROJECT_FOLDER);
+  try {
+    rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch (error) {
+    throw new Error(
+      `Cannot replace the delivered demo project at ${target}: ${error?.message ?? error}. `
+      + 'Something is holding a file inside it (an open viewer, an editor, a virus scanner). '
+      + 'Close it and run the delivery again — the folder is replaced in full every time, so a '
+      + 'half-deleted one is repaired by the next run.',
+    );
+  }
+  copyTree(source, target);
+  return true;
 }
 
 function copyCore(coreRoot, outputRoot, deliveredDocs, publicModels = new Set(), opts = {}) {
@@ -1216,22 +1240,24 @@ function copyCore(coreRoot, outputRoot, deliveredDocs, publicModels = new Set(),
     if (!includePublicDemoContent) {
       if (normalized === 'scenes' || normalized.startsWith('scenes/')) return false;
       if (normalized === 'aasx' || normalized.startsWith('aasx/')) return false;
-      // `public/project.json` is the DEMO project's manifest (plan-726 F13) —
-      // demo content, exactly like scenes/ and aasx/, and it must not reach a
-      // customer.
+      // The demo is ONE FOLDER since plan-737, so it is ONE RULE — the same
+      // subdirectory shape as `scenes/` and `aasx/` above, which is exactly why
+      // the move was worth making.
       //
-      // It needs its own line because every rule above filters a SUBDIRECTORY,
-      // and this is a top-level file: it would sail straight past them into the
-      // build, then into `dist/` root, then onto the customer's deploy root —
-      // where `BundledBackend.readManifest()` reads exactly that path and would
-      // hand the customer realvirtual's demo project instead of their own.
-      if (normalized === 'project.json') return false;
-      // The demo documents live at the ROOT of public/ (2026-08-31) and are demo
-      // content exactly like scenes/ and project.json. Customers still get the
-      // reference model — copyDemoAssetsIntoCore delivers it into models/.
-      if (!normalized.includes('/') && DELIVERED_DEMO_MODEL_FILES
-        .some(name => normalized === name.toLowerCase())) return false;
-      if (!normalized.includes('/') && normalized.endsWith('.glb')) return false;
+      // What stood here before was three rules for three shapes of the same
+      // thing: a `project.json` line (a top-level FILE, which every
+      // subdirectory rule sailed past), a `DELIVERED_DEMO_MODEL_FILES` line,
+      // and a catch-all "no loose .glb at the root of public/" line. Each was a
+      // patch for the demo living at the deploy root rather than in a place of
+      // its own.
+      //
+      // A customer does still get the demo — as a PROJECT, staged into
+      // `projects/demo-realvirtual/` by `copyDemoRealvirtualFolder()`. What must
+      // not happen is it ALSO landing on their deploy root, where
+      // `BundledBackend` would read `demo-realvirtual/project.json` beside their
+      // own manifest and the delivery would ship the demo twice.
+      if (normalized === DEMO_PROJECT_FOLDER
+        || normalized.startsWith(`${DEMO_PROJECT_FOLDER}/`)) return false;
     }
     // The bundled component library is delivered by copyDemoAssetsIntoCore, which filters it
     // to DELIVERED_LIBRARY_CATEGORIES and writes a matching reduced catalog. Copying the tree
@@ -1557,7 +1583,8 @@ function generateReadme(delivery, projectKey, model, features, projectPlugins = 
     `### Receiving an update\n\n` +
     (projectless
       ? `An update arrives as a commit pushed to this repository by realvirtual. Take it with \`git pull\`. It replaces everything outside \`projects/\` - \`realvirtual-web/\`, \`realvirtual-web-pro/\`, the scripts and the manifests - and it never touches anything inside \`projects/\`. Your projects are yours: they are neither updated, nor merged, nor removed by a delivery.\n\n`
-        + `\`realvirtual-web/public/project.json\` is one of those replaced files. It is generated by realvirtual, it declares the delivered reference model, and every update overwrites it in full - so do not keep your own documents in it. Anything you want to survive an update belongs in a project under \`projects/\`.\n\n`
+        + `\`realvirtual-web/public/project.json\` is one of those replaced files. It is generated by realvirtual, it is the empty starting point of your own deploy-root project, and every update overwrites it in full - so do not keep your own documents in it. Anything you want to survive an update belongs in a project under \`projects/\`.\n\n`
+        + `\`projects/demo-realvirtual/\` is the realvirtual demo project. It is yours to open, edit and break - but it is vendor-owned sample content, and every update REPLACES THE WHOLE FOLDER without merging. If you want to keep something you built from it, copy it into a project of your own first.\n\n`
         + `After every update, read \`DELIVERY-REPORT.md\` in the repository root. It is regenerated each time and lists, in German, what was updated, added and removed, and any changes of yours outside \`projects/\` that the update overwrote.\n\n`
       : `An update arrives as a commit pushed to this repository by realvirtual. It touches three kinds of file, and the rule differs for each:\n\n`) +
     (projectless ? `` : `| What | What an update does |\n` +
@@ -2414,7 +2441,12 @@ export function stageFilteredSourceTree(options) {
   copyCore(coreRoot, coreOutput, deliveredDocs, deliveredPublicModels(coreRoot), {
     includePublicDemoContent,
   });
-  copyDemoAssetsIntoCore(coreRoot, coreOutput);
+  copyLibraryIntoCore(coreRoot, coreOutput);
+  // The demo as a PROJECT, for the customer channels only (plan-737 F4/F5). The
+  // public demo deploy is not staged this way: there `includePublicDemoContent`
+  // kept `public/demo-realvirtual/` where it already is, and copying it a second
+  // time into `projects/` would list the demo twice on the hosted channel.
+  if (!includePublicDemoContent) copyDemoRealvirtualFolder(coreRoot, destinationRoot);
 
   let delivery = options.delivery ?? null;
   let project = options.project ?? null;
@@ -3003,16 +3035,41 @@ export function applyMergedSnapshot(stagedRoot, cloneRoot, options) {
     if (entry.name === '.git' || entry.name === 'projects') continue;
     rmSync(join(clone, entry.name), { recursive: true, force: true });
   }
+  // ── The one project folder that is ZONE A (plan-737) ──────────────────
+  //
+  // `projects/demo-realvirtual/` sits under `projects/` and is therefore
+  // structurally Zone B/C — the customer's, protected, merged at most. It is
+  // neither: it is vendor-owned sample content that `copyDemoRealvirtualFolder()`
+  // staged as a whole folder, and the user decision behind plan-737 F4 is
+  // "immer komplett ueberschreiben".
+  //
+  // Without this exception the delivery would be quietly wrong in BOTH
+  // directions, and neither would look like a failure:
+  //
+  //  - the FIRST delivery ships no demo at all — the filter below drops every
+  //    staged path under `projects/`, and the per-project loop iterates only
+  //    the customer's own keys (for a standard customer: none), so F4 silently
+  //    delivers nothing;
+  //  - a LATER delivery keeps whatever the customer edited the demo into, and
+  //    the report lists their sandbox scribbles as conflicts against content
+  //    nobody was defending.
+  //
+  // So it is deleted and re-copied with the rest of Zone A. `projects/` itself
+  // stays the customer's — this names exactly one folder inside it.
+  const demoRel = `projects/${DEMO_PROJECT_FOLDER}`;
+  rmSync(join(clone, 'projects', DEMO_PROJECT_FOLDER), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   copyTree(staged, clone, (rel, entry) => rel !== '.git' && !rel.startsWith('.git/')
     && !isNonDeliveredBuildDir(entry)
-    // `projects/` itself is traversed only so that `projects/.gitkeep` can be
-    // copied; every other path below it is rejected here. The `.gitkeep` is not a
-    // merge decision — it only makes the customer-owned folder exist in a
-    // repository that cannot carry an empty directory (plan-434 Phase 4).
+    // `projects/` itself is traversed only so that `projects/.gitkeep` and the
+    // vendor-owned demo folder can be copied; every other path below it is
+    // rejected here. The `.gitkeep` is not a merge decision — it only makes the
+    // customer-owned folder exist in a repository that cannot carry an empty
+    // directory (plan-434 Phase 4).
     // Everything else under `projects/` is decided by the per-project loop below,
     // which for a projectless delivery has nothing to iterate — so the whole
     // folder stays the customer's, untouched (§6.7).
-    && (!rel.startsWith('projects/') || rel === 'projects/.gitkeep'));
+    && (!rel.startsWith('projects/') || rel === 'projects/.gitkeep'
+      || rel === demoRel || rel.startsWith(`${demoRel}/`)));
 
   const report = {};
   for (const { key, vendor } of projects) {

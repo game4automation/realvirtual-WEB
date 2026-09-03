@@ -21,28 +21,29 @@
  * is the *same* writer the save path uses, so a classification written here and
  * one written by a Save cannot drift into two spellings of the same block.
  *
- * ## Compare-and-swap on BOTH surfaces (plan-709 §2.3)
+ * ## One surface, one compare-and-swap (plan-736 §2.3 #1)
  *
- * A scene body goes in through `writeScene`, which has carried the plan-397
- * precondition since it existed: the revision read a moment ago must still be
- * the revision stored, or the write is refused rather than clobbering somebody
- * else's. The asset surface used to have no such precondition, and this
- * function reported the split honestly (`surface: 'blob'` meant "unprotected").
+ * This function used to have two halves. A scene body went in through
+ * `writeScene`, which has carried the plan-397 precondition since it existed;
+ * everything else went through `writeBlob`, which had none until plan-709 and
+ * an optional one after it. Which half ran was decided by
+ * `sectionOfDocument(doc)` — the last place in the product where a manifest
+ * field chose a storage protocol.
  *
- * plan-709 gave `writeBlob` the same optional precondition, so the split is
- * gone: the asset branch hashes what it read and hands that back as
- * `expectedRevision`. `surface` survives as a description of WHICH store took
- * the bytes — a fact callers and tests still use — but it no longer implies
- * anything about safety, because both are now safe.
+ * Both halves are now `readDocument`/`writeDocument` with a mandatory
+ * precondition, so the branch is gone and with it the `surface` field this
+ * result used to report. What survives is the property the branch existed to
+ * provide: the revision read a moment ago must still be the revision stored,
+ * or the write is refused rather than clobbering somebody else's
+ * classification.
  */
 
 import { bakeIntoGlb } from '../hmi/scene/rv-scene-glb-bake';
 import { materialise } from '../hmi/scene/rv-scene-edits';
 import type { ProjectBackend } from './backends/project-backend';
-import { sectionOfDocument } from './rv-project-documents';
 import { isEmptyClassification, type DocumentClassification } from './rv-document-classification';
 import type { RvDocumentEntry, RvProjectSceneEntry } from './rv-project-types';
-import { revisionOfBytes, type SceneRevision } from './rv-scene-record';
+import type { SceneRevision } from './rv-scene-record';
 
 /** A resolver that locates nothing — there are no node edits to place. */
 const NO_NODES = { locate: () => null };
@@ -50,10 +51,16 @@ const NO_NODES = { locate: () => null };
 export interface ClassifyResult {
   /** What the file now says it is. `null` when the block was removed. */
   classification: DocumentClassification | null;
-  /** Which write surface carried the bytes — the CAS one, or the plain one. */
-  surface: 'scene' | 'blob';
-  /** Revision of the stored body, where the surface reports one. */
-  revision?: SceneRevision;
+  /**
+   * Revision of the stored body.
+   *
+   * No longer optional, and `surface` is gone beside it (plan-736): it named
+   * WHICH of two write surfaces took the bytes, and there is one. Its last
+   * honest use was as a hint about safety — `'blob'` once meant "written
+   * without a precondition" — which plan-709 already made false and plan-736
+   * made unrepresentable.
+   */
+  revision: SceneRevision;
 }
 
 /**
@@ -77,57 +84,39 @@ export async function writeDocumentClassification(
   const next = classification !== null && !isEmptyClassification(classification)
     ? classification
     : null;
-  const section = sectionOfDocument(doc);
 
-  if (section === 'scenes') {
-    const record = await backend.readScene(doc.path);
-    if (!record?.glb) {
-      throw new Error(`"${doc.name}" could not be read from this project.`);
-    }
-    const baked = await bakeIntoGlb(record.glb, materialise([]), NO_NODES, {
-      classification: next,
-      self: { assetId: doc.id, path: doc.path },
-    });
-    const revision = await backend.writeScene(doc.path, {
-      glb: baked.glb,
+  // The `section === 'scenes'` branch that used to stand here is gone
+  // (plan-736 §2.3 #1). It was the ONE place that chose a storage protocol from
+  // a manifest field: a scene went through `readScene`/`writeScene` with a
+  // compare-and-swap, everything else through `readBlobUrl`/`writeBlob`
+  // without one. There is now a single protocol with the precondition always
+  // on, so the branch has nothing left to decide — the two halves it guarded
+  // were the same six lines with different method names.
+  const record = await backend.readDocument({ path: doc.path, id: doc.id });
+  if (!record) throw new Error(`"${doc.name}" could not be read from this project.`);
+
+  const baked = await bakeIntoGlb(record.bytes, materialise([]), NO_NODES, {
+    classification: next,
+    self: { assetId: doc.id, path: doc.path },
+  });
+  const { revision } = await backend.writeDocument(
+    {
+      path: doc.path,
+      id: doc.id,
       // The manifest metadata the body write carries with it. The document IS
-      // the entry since phase 6 — one list, one shape — so the only thing to do
-      // here is to state the classification that was just written into the
-      // bytes, and let the manifest cache follow them (§2.5).
+      // the entry since plan-413 phase 6 — one list, one shape — so the only
+      // thing to do here is to state the classification that was just written
+      // into the bytes, and let the manifest cache follow them (§2.5).
       meta: {
         ...doc,
         ...(next ? { classification: next } : { classification: undefined }),
       } as RvProjectSceneEntry,
-      expectedRevision: record.revision,
-    });
-    return { classification: next, surface: 'scene', revision };
-  }
-
-  const resolved = await backend.readBlobUrl(doc.path);
-  if (!resolved) throw new Error(`"${doc.name}" could not be read from this project.`);
-  let bytes: ArrayBuffer;
-  try {
-    bytes = await (await fetch(resolved.url)).arrayBuffer();
-  } finally {
-    // Always: an object URL that outlives its read is a leak whether the read
-    // succeeded or threw.
-    resolved.release();
-  }
-  // The revision of what was just read — the same compare-and-swap token the
-  // scene branch gets from `readScene`, computed here because `readBlobUrl`
-  // hands back bytes rather than a record. Since plan-709 §2.3 `writeBlob`
-  // carries the precondition too, so the split this function used to REPORT
-  // (`surface: 'blob'` meaning "no precondition") is gone: both branches now
-  // refuse a write whose basis somebody else replaced.
-  const readRevision = await revisionOfBytes(bytes);
-  const baked = await bakeIntoGlb(bytes, materialise([]), NO_NODES, {
-    classification: next,
-    self: { assetId: doc.id, path: doc.path },
-  });
-  await backend.writeBlob(
-    doc.path,
-    new Blob([baked.glb as BlobPart], { type: 'model/gltf-binary' }),
-    { expectedRevision: readRevision },
+    },
+    baked.glb,
+    // The revision of what was just read: whoever replaced it in the meantime
+    // wrote a classification of their own, and overwriting it silently is the
+    // lost update this precondition exists to refuse.
+    { expectedRevision: record.revision },
   );
-  return { classification: next, surface: 'blob', revision: await revisionOfBytes(baked.glb) };
+  return { classification: next, revision };
 }

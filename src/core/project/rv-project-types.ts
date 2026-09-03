@@ -196,8 +196,20 @@ export interface RvDocumentEntry {
   name: string;
   /** Cache of the GLB's own classification. The file wins on conflict (§2.5). */
   classification?: DocumentClassification;
-  /** Which storage surface holds the bytes — see `DocumentSection`. */
-  section?: 'scenes' | 'models' | 'library';
+  // `section?: 'scenes' | 'models' | 'library'` stood here until plan-736.
+  //
+  // It named which storage surface held the bytes, and that is what it was
+  // for: a `scenes` row went through `writeScene` (compare-and-swap), anything
+  // else through `writeBlob` (no precondition). One `writeDocument` with a
+  // mandatory precondition later, there is no surface to name — and a field
+  // that describes nothing becomes a field that grows a second meaning.
+  //
+  // It is NOT removed from stored manifests. Every delivered `project.json`
+  // that carries one keeps it: the index signature below is exactly the
+  // forward-compatibility contract that lets an unknown field survive a save
+  // by this build, and `mergeManifest`'s read-modify-write carries it through
+  // untouched. Reading one is the business of the legacy layer in
+  // `rv-project-documents.ts` and of nothing else.
   /** SHA-256 of the body — the compare-and-swap token from plan-397. */
   revision?: string;
   createdAt?: string;

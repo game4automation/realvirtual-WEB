@@ -65,10 +65,17 @@ export function asModelPluginModule(value: unknown): ModelPluginModule | null {
 
 /**
  * Stable model identity used by model plugins and signature-unlock storage.
- * Query strings and the final .glb suffix are ignored.
+ * Query strings, a `rvproject:` scheme, and the final .glb suffix are ignored.
  */
 export function resolveModelName(url: string): string {
-  const withoutQuery = url.split('?')[0];
+  // A project document opens as `rvproject:<project-relative path>` (plan-726).
+  // A ROOT-LEVEL document has no slash in that path, so without stripping the
+  // scheme the "basename" came out as `rvproject:DemoRealvirtualWeb` and no
+  // model plugin matched — the public demo lost its failure-message show and
+  // every other model-specific plugin (2026-09-02, /demo after plan-737 made
+  // the demo documents root-level).
+  const withoutScheme = url.replace(/^rvproject:/, '');
+  const withoutQuery = withoutScheme.split('?')[0];
   const lastSlash = withoutQuery.lastIndexOf('/');
   const fileName = lastSlash >= 0 ? withoutQuery.substring(lastSlash + 1) : withoutQuery;
   return fileName.replace(/\.glb$/i, '');

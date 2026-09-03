@@ -68,21 +68,43 @@ function makeBackend(id: string) {
     id,
     writable: true,
     isActive: true,
-    async writeBlob(relPath: string, blob: Blob, opts?: { expectedRevision?: string | null }) {
+    async writeDocument(
+      ref: string | { path: string },
+      bytes: Uint8Array,
+      opts: { expectedRevision: string },
+    ) {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
       if (h.gate) {
         await new Promise<void>(resolve => { h.gate = resolve; });
       }
       const actual = h.files.has(relPath) ? await revisionOf(h.files.get(relPath)!) : null;
-      const expected = opts?.expectedRevision;
-      if (expected !== undefined && (expected ?? null) !== actual) {
+      // plan-736: the precondition is mandatory, so the three intents arrive as
+      // 'any' / 'create' / a revision rather than undefined / null / a revision.
+      const expected = opts.expectedRevision === 'any'
+        ? undefined
+        : opts.expectedRevision === 'create' ? null : opts.expectedRevision;
+      if (expected !== undefined && expected !== actual) {
         const { SceneRevisionConflictError } =
           await import('../src/core/project/rv-scene-record');
-        throw new SceneRevisionConflictError(relPath, expected ?? null, actual);
+        throw new SceneRevisionConflictError(relPath, expected, actual);
       }
       writes.push({ path: relPath, expected });
-      h.files.set(relPath, await blob.text());
+      const text = new TextDecoder().decode(bytes);
+      h.files.set(relPath, text);
+      return { revision: await revisionOf(text) };
     },
-    async readBlobUrl(relPath: string) {
+    async readDocument(ref: string | { path: string }) {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
+      const value = h.files.get(relPath);
+      if (value === undefined) return null;
+      return {
+        bytes: new TextEncoder().encode(value),
+        meta: { id: '', name: relPath, path: relPath },
+        revision: await revisionOf(value),
+      };
+    },
+    async readDocumentUrl(ref: string | { path: string }) {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
       const value = h.files.get(relPath);
       if (value === undefined) return null;
       const url = URL.createObjectURL(new Blob([value]));

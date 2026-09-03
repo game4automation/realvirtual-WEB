@@ -37,7 +37,8 @@
 
 import { Box3, Matrix4 } from 'three';
 import type { BufferGeometry, Mesh, Object3D } from 'three';
-import type { MeshBVH, ExtendedTriangle } from 'three-mesh-bvh';
+import { MeshBVH } from 'three-mesh-bvh';
+import type { ExtendedTriangle } from 'three-mesh-bvh';
 import { NodeRegistry } from './rv-node-registry';
 import type { CollisionRoleName, CollisionRoleRegistrar, StockBoundsSource } from './rv-collision-role';
 import { toCollisionRole } from './rv-collision-role';
@@ -527,7 +528,7 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
             deformedSkipped++;
           } else {
             const bm = this._makeBodyMesh(mesh);
-            if (!(mesh.geometry as BufferGeometry).boundsTree) {
+            if (!this._ensureBoundsTree(mesh)) {
               meshesWithoutBVH++;
               aabbOnly = true;
             }
@@ -565,7 +566,7 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
           if (!mesh.isMesh || !mesh.geometry) return;
           if (isPipelineHelperMesh(mesh)) return;
           if (isDeformedMesh(mesh)) { deformedSkipped++; return; }
-          if (!(mesh.geometry as BufferGeometry).boundsTree) {
+          if (!this._ensureBoundsTree(mesh)) {
             meshesWithoutBVH++;
             aabbOnly = true;
           }
@@ -640,6 +641,43 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
       );
     }
     debug('sensor', `[collision] rebuild: ${this._bodies.length} bodies, ${this._pairs.length} pairs`);
+  }
+
+  /**
+   * A `boundsTree` for a body mesh, built on the spot when the load pipeline
+   * left none. Returns whether the mesh now has one.
+   *
+   * Batched loads stopped producing per-mesh trees (the pick path raycasts
+   * merged `__raycastBVH_*` arenas instead), so every role-carrying body fell
+   * to the AABB fallback — and a Workpiece INSIDE a Machine is a permanent
+   * box overlap: /demo showed a standing "Machine ↔ Workpiece" card the moment
+   * the robot loaded the CNC (2026-09-02). Bodies are few and hand-authored,
+   * so a synchronous build at rebuild time is cheap; the budget guards the one
+   * pathological case (a multi-million-triangle body), which then keeps the
+   * documented AABB fallback. Failures are remembered per geometry so a
+   * rebuild loop cannot retry a throwing build every tick.
+   */
+  private static readonly BVH_BUILD_TRIANGLE_BUDGET = 300_000;
+  private readonly _bvhBuildFailed = new WeakSet<BufferGeometry>();
+
+  private _ensureBoundsTree(mesh: Mesh): boolean {
+    const geo = mesh.geometry as BufferGeometry;
+    if (geo.boundsTree) return true;
+    if (this._bvhBuildFailed.has(geo)) return false;
+    const pos = geo.attributes?.position;
+    if (!pos) return false;
+    const triangles = (geo.index ? geo.index.count : pos.count) / 3;
+    if (triangles > RVCollisionManager.BVH_BUILD_TRIANGLE_BUDGET) {
+      this._bvhBuildFailed.add(geo);
+      return false;
+    }
+    try {
+      geo.boundsTree = new MeshBVH(geo) as BufferGeometry['boundsTree'];
+      return true;
+    } catch {
+      this._bvhBuildFailed.add(geo);
+      return false;
+    }
   }
 
   private _makeBodyMesh(mesh: Mesh): BodyMesh {

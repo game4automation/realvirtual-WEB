@@ -109,9 +109,9 @@ There is no longer any channel on which the viewer works out what it has by look
 
 | Channel | Where its `project.json` comes from |
 | --- | --- |
-| Dev checkout | `public/project.json`, checked in (plan-726) |
-| Bunny public / `--demo` | `public/project.json` → `dist/project.json` |
-| CONNECT embed | `public/project.json` → payload root |
+| Dev checkout | `public/demo-realvirtual/project.json`, checked in (plan-737) |
+| Bunny public / `--demo` | `public/demo-realvirtual/` → `dist/demo-realvirtual/` (Vite copies `public/` recursively) |
+| CONNECT embed | `public/demo-realvirtual/` → payload — **`realvirtual-Connect~/tools/stage-public.mjs` still expects the pre-737 root layout and must be updated in its own lane before the next CONNECT bundle** |
 | Customer, project-bearing | `projects/<key>/project.json`, plus their own `models.json` on a CDN deploy |
 | Customer, projectless (`kind: standard`) | **generated at staging time** into `realvirtual-web/public/project.json` |
 | Foreign host (`discover: true`) | its own `project.json` — otherwise there is no project (see below) |
@@ -141,7 +141,7 @@ The rule, applied to the built `dist/` after the build and before upload:
 - **Pruned** — every other top-level `models/*.glb` and the content-hashed copy Vite also emits under `assets/`. The hyphen-boundary match means pruning e.g. `EuropalletEmpty` never touches the library's `Europallet*` assets.
 - **`models.json`** — rewritten to the kept models so the model selector shows exactly what is shipped (the build-time glob otherwise bakes every dev GLB filename into the selector, leaving 404 ghost entries).
 
-The prune is logged (`keep` / `prune` lines), with the curator named on the header line so it is visible which of the three rules applied. **To ship a model on the public demo, add it to `public/project.json`** — the filename no longer matters. Override the manifest for one deploy with the `RV_PUBLIC_MODEL_PREFIX` environment variable. This applies to the **public** deploy only — private projects already stage their own models, and a plain `npm run build` for self-hosting keeps every model. (A public `--dry-run` never reaches this step, see the tip above.)
+The prune is logged (`keep` / `prune` lines), with the curator named on the header line so it is visible which of the three rules applied. **To ship a model on the public demo, add it to `public/demo-realvirtual/project.json`** — the filename no longer matters. Override the manifest for one deploy with the `RV_PUBLIC_MODEL_PREFIX` environment variable. This applies to the **public** deploy only — private projects already stage their own models, and a plain `npm run build` for self-hosting keeps every model. (A public `--dry-run` never reaches this step, see the tip above.)
 
 ### The demo manifest is a deploy artifact
 
@@ -194,17 +194,29 @@ the pull zone is purged after upload; the client fetches it with
 touching the bundle.
 
 ```bash
-# Fix public/project.json, then:
+# Fix public/demo-realvirtual/project.json, then:
 npm run deploy                       # re-uploads project.json + purges
-curl -s https://web.realvirtual.io/project.json | head -20    # verify what is live
+curl -s https://web.realvirtual.io/demo-realvirtual/project.json | head -20   # verify what is live
 ```
 
-To fall back to **no** curated demo at all, delete `public/project.json` and
+> **One-off CDN task, still open (plan-737).** The demo GLBs moved from the
+> deploy root into `demo-realvirtual/`, and the in-app `?model=` alias only
+> covers links opened *through the viewer*. A direct fetch — a `curl`, a
+> crawler, an `<img>`/`<script>` style hotlink, anything without JS — still asks
+> for the old path and gets a 404. Add a Bunny **Edge Rule** on the pull zone
+> (*Action: Redirect to URL*, 301) for the three old root paths
+> (`/DemoRealvirtualWeb.glb`, `/DemoPlanner.glb`,
+> `/DemoRealvirtualWeb.settings.json`) → `/demo-realvirtual/<same file>`. This
+> is a manual step in the Bunny dashboard; nothing in this repository can do it,
+> and it has NOT been done yet.
+
+To fall back to **no** curated demo at all, delete `public/demo-realvirtual/project.json` and
 deploy: step 7 removes remote files that no longer exist locally, and
-`BundledBackend.readManifest()` then serves `_syntheticManifest()` — the demo
-project assembled from whatever the deploy discovered. Visibly degraded (no
-curated names, no start document) but never a white page, and reversible by
-restoring the file.
+`BundledBackend.readManifest()` then returns `null` and says why in the console.
+There is **no** synthetic fallback any more — `_syntheticManifest()` went with
+plan-735, precisely so that a broken manifest stops being indistinguishable from
+a working one. The deploy then has no demo project at all (a named error, not a
+white page), and restoring the file reverses it.
 
 > Confirm it is really the manifest before reaching for the bundle. Open the
 > browser console: an invalid manifest logs a `[bundled] … is not a valid v2
@@ -243,7 +255,7 @@ CONNECT embed gate (Phase 4). The JS bundle is content-hashed and immutable, so
 the only way back is to build and deploy the previous commit:
 
 ```bash
-git log --oneline -- public/project.json src/main.ts   # find the last good commit
+git log --oneline -- public/demo-realvirtual/project.json src/main.ts   # find the last good commit
 git checkout <sha> -- <the files>                      # or: git revert <sha>
 npm run typecheck && npm test
 npm run deploy
@@ -364,7 +376,7 @@ What comes from where:
 | Published file | Source |
 |----------------|--------|
 | `models.json` | **The `models/` folder UNION the manifest's root-level GLB documents** (`projectModelNames()`, plan-720). The folder can never be shortened by the manifest — every GLB in `models/` belongs to the project and nobody should have to register one (plan-700 P0-3). It can only be LENGTHENED, by a `documents[]` entry naming an existing root-level `.glb`, which is the layout the viewer writes today and which the folder glob structurally cannot see. Entries under `scenes/`/`library/` are excluded — those folders are staged whole. A declared file that is missing, or a folder GLB with no manifest row, is logged rather than silently dropped |
-| `scenes/index.json` | The manifest's scene-section documents (`documentsInSection(project, "scenes")`), for entries marked `baseKind: "published"` whose `path` is a `.glb` directly under `scenes/`. A project whose manifest lists none keeps whatever `index.json` its `scenes/` folder already had. **Legacy since plan-731:** realvirtual's own deploys ship no such file — their examples are ordinary `documents[]` rows. It is still written for a customer project that keeps its scenes in a folder, and still READ by a `discover` backend pointed at a foreign root |
+| `scenes/index.json` | The manifest's scene documents (`documentsInSection(project, "scenes")` — a legacy projection, see doc-persistence §2.0-13), for entries marked `baseKind: "published"` whose `path` is a `.glb` directly under `scenes/`. A project whose manifest lists none keeps whatever `index.json` its `scenes/` folder already had. **Legacy since plan-731:** realvirtual's own deploys ship no such file — their examples are ordinary `documents[]` rows. It is still written for a customer project that keeps its scenes in a folder, and still READ by a `discover` backend pointed at a foreign root |
 | `settings.json` | Generated, on top of the project's own `settings/project-settings.json` when it has one. The project file is a **base**: `projectAssetsPath`, `analytics`, `encryption` and `generated` are written afterwards and always win, so a project file can add settings but can never re-enable analytics or aim the assets path elsewhere |
 
 Every private deploy — and every public one, and every CONNECT embed — runs `validate-project.mjs`

@@ -89,7 +89,10 @@ describe('§9.9.2 — the first persistence imprints exactly one row', () => {
     expect(after.minted).toHaveLength(1);
     expect(after.minted[0].id).toBe(previewAssetId('library/parts/Roll2m.glb'));
     expect(after.minted[0].path).toBe('library/parts/Roll2m.glb');
-    expect(after.minted[0].section).toBe('library');
+    // plan-736 F3: a minted row records its path and stops there. It used to
+    // carry `section: 'library'` as well — the same fact, restated in the
+    // vocabulary the plan retired.
+    expect(after.minted[0].section).toBeUndefined();
     expect(after.minted[0].name).toBe('Roll2m');
     expect(before.documents).toEqual([]);          // the input is not mutated
   });

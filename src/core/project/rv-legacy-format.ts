@@ -79,17 +79,37 @@ export function legacyFormatMessage(kind: LegacyFormatKind, subject: string): st
  * Extension-driven, like the manifest-format helper it replaces: a backend is
  * handed a path and has to decide before it can look anything up, and a
  * declared format field is exactly what a half-finished migration gets wrong.
+ *
+ * ## Why this is narrower than `.json` (plan-736)
+ *
+ * It used to be exactly `/\.json$/i`, and that was correct for as long as the
+ * gate below sat on `readScene` — a method only ever handed a scene body. Since
+ * plan-736 there is ONE read for every document, so the same gate now sees the
+ * attachment index, the library sidecar, a `*.connect.json` config and any JSON
+ * a user keeps in their project. Refusing all of those with "convert this
+ * project with an older release" is both wrong and unactionable.
+ *
+ * So the rule says what it always meant. A pre-397 scene body is either:
+ *
+ *  - a `*.scene.json`, the name the format was written under, wherever it sits;
+ *  - or any `.json` directly inside `scenes/`, which is where a project that
+ *    predates the naming convention keeps them.
+ *
+ * A `.json` anywhere else was never a scene body and is not one now.
  */
 export function isLegacyScenePath(relPath: string): boolean {
-  return /\.json$/i.test((relPath ?? '').trim());
+  const path = (relPath ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  if (/\.scene\.json$/i.test(path)) return true;
+  return /^scenes\/[^/]+\.json$/i.test(path);
 }
 
 /**
- * Gate every scene body read. Throws {@link LegacyFormatError} for a JSON path.
+ * Gate every document body read. Throws {@link LegacyFormatError} for a path
+ * that names a pre-phase-6 JSON scene body.
  *
- * Called at the top of each backend's `readScene`, before any I/O: reading the
- * bytes first and failing to parse them afterwards is how "unsupported format"
- * degrades into "missing scene".
+ * Called at the top of each backend's `readDocument`, before any I/O: reading
+ * the bytes first and failing to parse them afterwards is how "unsupported
+ * format" degrades into "missing scene".
  */
 export function assertReadableScenePath(relPath: string): void {
   if (isLegacyScenePath(relPath)) {

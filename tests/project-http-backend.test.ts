@@ -22,6 +22,7 @@ import { ProjectStore } from '../src/core/project/project-store';
 import { assetDocumentsOf } from '../src/core/project/rv-project-documents';
 import { WORKSPACE_DEFAULT_PROJECT_ID } from '../src/core/project/rv-workspace-default';
 import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { writeSceneDocument, writeBlobDocument } from './helpers/document-io';
 
 const REMOTE = 'https://cdn.example.test/customer/';
 
@@ -100,7 +101,7 @@ describe('BundledBackend against a foreign baseUrl', () => {
 
   it('resolves blob URLs against the foreign base', async () => {
     const backend = remoteBackend({ [`${REMOTE}project.json`]: DEPLOYED_MANIFEST });
-    expect((await backend.readBlobUrl('models/Press.glb'))?.url).toBe(`${REMOTE}models/Press.glb`);
+    expect((await backend.readDocumentUrl('models/Press.glb'))?.url).toBe(`${REMOTE}models/Press.glb`);
   });
 
   // ── plan-735 R1: the deliberate degradation of plan-700 F12 ─────────────
@@ -135,10 +136,10 @@ describe('BundledBackend against a foreign baseUrl', () => {
   it('refuses every write', async () => {
     const backend = remoteBackend({ [`${REMOTE}project.json`]: DEPLOYED_MANIFEST });
     expect(backend.writable).toBe(false);
-    await expect(backend.writeScene()).rejects.toBeInstanceOf(BackendNotWritableError);
-    await expect(backend.deleteScene()).rejects.toBeInstanceOf(BackendNotWritableError);
-    await expect(backend.writeBlob()).rejects.toBeInstanceOf(BackendNotWritableError);
-    await expect(backend.deleteBlob()).rejects.toBeInstanceOf(BackendNotWritableError);
+    await expect(backend.writeDocument('scenes/a.scene.glb', new Uint8Array([1]), { expectedRevision: 'any' }))
+      .rejects.toBeInstanceOf(BackendNotWritableError);
+    await expect(backend.deleteDocument('scenes/a.scene.glb'))
+      .rejects.toBeInstanceOf(BackendNotWritableError);
   });
 });
 

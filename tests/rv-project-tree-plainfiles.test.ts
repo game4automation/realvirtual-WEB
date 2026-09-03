@@ -36,6 +36,14 @@ describe('§9.1 — the internals filter', () => {
     expect(isInternalProjectPath('nested/project.json')).toBe(true);
   });
 
+  it('hides the manifest write\'s crash-recovery copy', () => {
+    // `project.json.bak` is written by the manifest writer purely so
+    // `readManifest` can recover an unparseable primary — machinery, and one
+    // more row the user can only be confused by.
+    expect(isInternalProjectPath('project.json.bak')).toBe(true);
+    expect(isInternalProjectPath('nested/project.json.bak')).toBe(true);
+  });
+
   it('hides the thumbnail cache but keeps the other reserved folders', () => {
     expect(isInternalProjectPath('thumbnails/abc.png')).toBe(true);
     // `settings` / `connect` / `rag` hold files a human legitimately reads —

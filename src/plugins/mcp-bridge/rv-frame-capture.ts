@@ -169,7 +169,13 @@ export async function saveCanvasToProject(
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
   if (!blob) return { saveError: 'Could not encode the frame as PNG' };
   try {
-    await backend.writeBlob(target, blob);
+    // Overwrite-by-design: a capture replaces the previous capture at the same
+    // path, and there is no earlier revision this frame was derived from.
+    await backend.writeDocument(
+      target,
+      new Uint8Array(await blob.arrayBuffer()),
+      { expectedRevision: 'any' },
+    );
     return { savedPath: target };
   } catch (e) {
     return { saveError: `Could not write "${target}": ${e instanceof Error ? e.message : String(e)}` };

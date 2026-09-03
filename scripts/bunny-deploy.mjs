@@ -53,6 +53,8 @@ import {
   applyPublicModelAllowlist,
   publicDemoModelAllowlist,
   publicDemoManifestMisses,
+  publicDemoDir,
+  isAlwaysUploadFile,
   assertNoDevArtifacts,
   PUBLIC_MODEL_PREFIX,
   applyPublicScenePruning,
@@ -258,7 +260,13 @@ export async function uploadDirectory(client, localDir, remotePrefix, {
   let uploaded = 0;
   for (const f of selected) {
     const remotePath = prefix ? `${prefix}/${f.rel}` : f.rel;
-    const always = /\.html$/i.test(f.rel) || /(^|\/)(settings|models|manifest)\.json$/i.test(f.rel);
+    // The REAL predicate, not a second spelling of it. This regex used to list
+    // `settings|models|manifest` and omit `project.json`, so the one file whose
+    // always-upload matters most — the demo manifest, since plan-737 at
+    // `demo-realvirtual/project.json` — was uploaded unconditionally but logged
+    // as though it had been diffed. A log that disagrees with the mechanism is
+    // how a manifest fix looks skipped while the rollback runbook is being read.
+    const always = /\.html$/i.test(f.rel) || isAlwaysUploadFile(f.rel);
     const tag = always ? `${MAGENTA}(always)${RESET}` : '';
     log(`  ${GREEN}↑${RESET} ${f.rel} ${tag} ${DIM}${humanSize(f.size)}${RESET}`);
     try {
@@ -278,14 +286,28 @@ export async function uploadDirectory(client, localDir, remotePrefix, {
     return !localPaths.has(rel.toLowerCase())
       && !preserveRemotePrefixes.some((prefix) => rel.startsWith(prefix));
   });
+  let deleteFailures = 0;
   for (const entry of stale) {
     const remotePath = prefix ? `${prefix}/${entry.rel}` : entry.rel;
     log(`  ${RED}-${RESET} ${entry.rel} ${DIM}(stale)${RESET}`);
-    await client.deleteFile(remotePath);
+    try {
+      await client.deleteFile(remotePath);
+    } catch (ex) {
+      // A stale leftover Bunny refuses to delete (HTTP 400 "Unable to delete
+      // file" on some legacy demo/models/* objects) must not abort the deploy:
+      // every upload is already done at this point, and dying here skipped the
+      // cache purge — the live site kept serving the OLD index.html against
+      // the NEW assets (2026-09-02, /demo). Deletes are cleanup, not delivery.
+      deleteFailures++;
+      log(`    ${RED}! delete failed${RESET} ${DIM}${ex?.message ?? ex}${RESET}`);
+    }
+  }
+  if (deleteFailures > 0) {
+    log(`${RED}${deleteFailures} stale file(s) could not be deleted${RESET} ${DIM}— remove them via the Bunny dashboard.${RESET}`);
   }
 
   if (skipped > 0) log(`  ${DIM}= ${skipped} unchanged (skipped)${RESET}`);
-  return { uploaded, skipped, deleted: stale.length };
+  return { uploaded, skipped, deleted: stale.length - deleteFailures };
 }
 
 // ─── Public deploy ───────────────────────────────────────────────────────
@@ -382,7 +404,8 @@ async function deployPublic(cfg, opts) {
       throw new Error(
         'The deploy manifest names documents that are not in the build output:\n'
         + misses.map((p) => `  - ${p}`).join('\n')
-        + '\n\nEither add them to public/, or remove them from public/project.json.'
+        + '\n\nEither add them to public/demo-realvirtual/, or remove them from'
+        + ' public/demo-realvirtual/project.json.'
         + ' (A case-only mismatch counts: the storage zone is case-sensitive.)',
       );
     }

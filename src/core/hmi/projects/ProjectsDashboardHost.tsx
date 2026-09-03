@@ -20,10 +20,11 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { Alert, Box, Button, Chip, Divider, IconButton, ListItemText, Menu, MenuItem, Snackbar, Tooltip, Typography } from '@mui/material';
+import { Alert, Box, Button, Chip, Divider, IconButton, InputAdornment, ListItemText, Menu, MenuItem, Snackbar, TextField, Tooltip, Typography } from '@mui/material';
 import { SectionHeader } from '../shared-components';
 import {
-  Add, ChevronRight, DeleteOutline, MoreVert, Refresh, SettingsEthernet,
+  Add, ChevronRight, CreateNewFolderOutlined, DeleteOutline,
+  MoreVert, NoteAddOutlined, Refresh, Search, SettingsEthernet,
 } from '@mui/icons-material';
 import type { LibraryCatalogEntry } from '../../library/library-types';
 import { debug } from '../../engine/rv-debug'; // TEMP open-perf instrumentation
@@ -114,6 +115,7 @@ import {
   canRenameInTree,
   findTreeNode,
   folderContents,
+  folderSubfolders,
   isRenamableInTree,
   nearestFolderPath,
   planTreeMove,
@@ -121,13 +123,10 @@ import {
 } from '../../project/rv-project-tree';
 import { listProjectFiles } from '../../project/backends/project-backend';
 import {
-  BUILTIN_CATALOG_LABEL,
-  BUILTIN_CATALOG_PROVIDER_ID,
-  BUILTIN_CATALOG_SOURCE_ID,
-  bundledCatalogEntries,
-  dedupeBundledEntries,
 } from '../../project/backends/bundled-backend';
-import { ProjectFolderContents, type FolderCardModel } from './ProjectFolderContents';
+import {
+  ProjectFolderContents, type FolderCardModel, type FolderTileModel,
+} from './ProjectFolderContents';
 import { applyTreeMove, DOCS_INDEX_FILE, type TreeMoveIO } from '../../project/rv-project-tree-move';
 import { docsIndexPaths, parseDocsIndex, type DocsIndex } from '../../project/rv-docs-index';
 import { findLocalIdCollisions } from '../../project/rv-asset-identity';
@@ -147,6 +146,7 @@ import {
   getProjectsDashboardSnapshot,
   openProjectsDashboard,
   setProjectsChip,
+  setProjectsSearch,
   setProjectsSelection,
   setProjectsTag,
   setProjectsView,
@@ -1393,6 +1393,7 @@ export function ProjectsDashboardHost() {
       // drop rather than as an error afterwards.
       writable: false,
       remote: source.kind !== 'project' && source.kind !== 'local',
+      sourceKind: source.kind,
       entries: entries.map(e => ({
         assetId: e.id,
         name: e.name,
@@ -1578,7 +1579,7 @@ export function ProjectsDashboardHost() {
     let alive = true;
     void (async () => {
       try {
-        const resolved = await backend.readBlobUrl(DOCS_INDEX_FILE);
+        const resolved = await backend.readDocumentUrl(DOCS_INDEX_FILE);
         if (!resolved) { if (alive) setAttachments([]); return; }
         let text: string;
         try { text = await (await fetch(resolved.url)).text(); } finally { resolved.release(); }
@@ -1658,50 +1659,28 @@ export function ProjectsDashboardHost() {
     return () => { alive = false; };
   }, [dash.open, store, project.project?.id, project.documents, statsBump]);
 
-  /**
-   * The demo models the build ships, as a read-only catalog root (plan-445 F6).
-   *
-   * Read once per dashboard open off the bundled backend — the same instance
-   * `main.ts` filled during boot, so this is a listing, not a second discovery.
-   * Skipped when the OPEN project IS the bundled demo project: the demos are
-   * then already its own rows, and a "Built-in demos" root beside them would
-   * show every model twice.
-   */
-  const [builtinEntries, setBuiltinEntries] = useState<readonly TreeCatalogEntryInput[]>([]);
-  useEffect(() => {
-    if (!dash.open || project.backendKind === 'bundled') { setBuiltinEntries([]); return; }
-    let alive = true;
-    void bundledCatalogEntries(store.getBundledBackend())
-      .then(entries => { if (alive) setBuiltinEntries(entries); })
-      .catch(() => { if (alive) setBuiltinEntries([]); });
-    return () => { alive = false; };
-  }, [dash.open, store, project.backendKind]);
-
-  /** Tree id of the built-in root — the rootId its rows and selections carry. */
-  const builtinRootId = useMemo(
-    () => catalogRootId(BUILTIN_CATALOG_PROVIDER_ID, BUILTIN_CATALOG_SOURCE_ID), []);
-
-  /**
-   * The catalogs, plus the built-ins — deduped against what the project itself
-   * holds, because a dev checkout carries the demo GLBs in both places and the
-   * writable copy is the one worth showing.
-   */
-  const treeCatalogs = useMemo<CatalogRootInput[]>(() => {
-    const deduped = dedupeBundledEntries(
-      builtinEntries, project.documents.map(d => d.path));
-    if (deduped.length === 0) return catalogRoots;
-    return [...catalogRoots, {
-      providerId: BUILTIN_CATALOG_PROVIDER_ID,
-      sourceId: BUILTIN_CATALOG_SOURCE_ID,
-      label: BUILTIN_CATALOG_LABEL,
-      // The one flag the whole read-only story hangs off: `canMoveInTree` and
-      // `canRenameInTree` refuse every row of a root that is not writable.
-      writable: false,
-      remote: false,
-      entries: deduped,
-      refKind: 'bundledDocument',
-    }];
-  }, [catalogRoots, builtinEntries, project.documents]);
+  // ─── The "Built-in demos" root is GONE (plan-737 Phase 3) ──────────────
+  //
+  // plan-445 F6 added a read-only catalog root listing whatever
+  // `BundledBackend.listModels()` returned. It was built for a world where the
+  // demo could only ever be a deploy artefact, and it had two failure modes
+  // that the demo-as-a-project move removes rather than mitigates:
+  //
+  //  - **In a customer delivery it lied.** The bundled backend there lists the
+  //    CUSTOMER's models, so their own machines appeared under a heading that
+  //    called them "Built-in demos".
+  //  - **On the demo deploy it duplicated.** The rows were the open project's
+  //    own rows, which is why it needed a `backendKind === 'bundled'` skip and
+  //    a `dedupeBundledEntries()` pass to stay merely redundant.
+  //
+  // Since plan-737 the demo is an ordinary project — a writable
+  // `projects/demo-realvirtual/` in a customer workspace, a normal row in the
+  // project list, the open project itself on the hosted demo — so there is
+  // nothing left for a synthetic read-only root to show that the project list
+  // does not show better. Deleted outright by user decision (Grill Q6), with no
+  // transition period; `bundledCatalogEntries`/`dedupeBundledEntries` and the
+  // `bundledDocument` ref kind went with it.
+  const treeCatalogs = catalogRoots;
 
   const tree = useMemo(() => buildDashboardTree({
     project: project.project
@@ -1760,12 +1739,10 @@ export function ProjectsDashboardHost() {
       // too — the hero chip's "reveal" ping needs the selected card to light
       // up, exactly like clicking an object field pings the asset in Unity.
       // Every non-document leaf answers to a `file` selection — the four
-      // reference kinds, the inert plain files of the full view, and a built-in
-      // demo row (whose rootId is the built-in catalog's, not the project's).
+      // reference kinds and the inert plain files of the full view.
       if (sel.kind === 'file'
         && (ref.kind === 'attachment' || ref.kind === 'connectConfig'
-          || ref.kind === 'knowledgeFile' || ref.kind === 'plainFile'
-          || ref.kind === 'bundledDocument')
+          || ref.kind === 'knowledgeFile' || ref.kind === 'plainFile')
         && path === `${sel.rootId}/${sel.relPath}`) return path;
     }
     return null;
@@ -1788,8 +1765,7 @@ export function ProjectsDashboardHost() {
       return;
     }
     if (ref.kind === 'attachment' || ref.kind === 'connectConfig'
-      || ref.kind === 'knowledgeFile' || ref.kind === 'plainFile'
-      || ref.kind === 'bundledDocument') {
+      || ref.kind === 'knowledgeFile' || ref.kind === 'plainFile') {
       setProjectsSelection({ kind: 'file', rootId: node.rootId, relPath: node.relPath });
       return;
     }
@@ -1816,14 +1792,6 @@ export function ProjectsDashboardHost() {
     if (ref.kind === 'connectConfig') return;          // a config is inspected, not opened
     if (ref.kind === 'knowledgeFile') return;          // knowledge too — the pane describes it
     if (ref.kind === 'plainFile') return;              // inert (plan-445 F2) — no verb at all
-    if (ref.kind === 'bundledDocument') {
-      // A built-in demo loads exactly as the `?model=` deep link loads it —
-      // `openBuiltin` on the deploy URL — and NOT through the catalog-asset
-      // branch below, which would open the asset EDITOR on a demo scene.
-      // The open project is untouched: nothing here switches it.
-      openModel(ref.url, node.name, ref.url);
-      return;
-    }
     if (ref.kind === 'catalogAsset') {
       const source = sources.find(
         s => s.providerId === ref.providerId && s.source.id === ref.sourceId)?.source;
@@ -1910,6 +1878,13 @@ export function ProjectsDashboardHost() {
     return { node, ref, doc, name: node.name, classification: doc?.classification };
   }), [treeRoots, selectedFolderPath, tree.refs, documentByPath]);
 
+  /** The folder's direct subfolders — pre-search, so the empty state can tell
+   *  "empty" from "your search hid the subfolders". */
+  const subfoldersInView = useMemo(
+    () => folderSubfolders(treeRoots, selectedFolderPath),
+    [treeRoots, selectedFolderPath],
+  );
+
   /**
    * Chips of the folder in view, counted over what the search left.
    *
@@ -1963,7 +1938,6 @@ export function ProjectsDashboardHost() {
         // verb set, so the card shows no menu at all rather than a menu whose
         // every entry refuses.
         const isInert = node.inert === true;
-        const isBundled = ref?.kind === 'bundledDocument';
         const menuActions: ProjectCardMenuAction[] = isRefFile || isInert
           ? []
           : [{ key: 'open', label: 'Open', onClick: () => handleTreeActivate(node) }];
@@ -2030,7 +2004,7 @@ export function ProjectsDashboardHost() {
             return { url: resolved.url, release: resolved.revokeUrl };
           }
           : node.kind === 'document' && backend
-            ? async () => backend.readBlobUrl(node.relPath)
+            ? async () => backend.readDocumentUrl(node.relPath)
             : undefined;
         return {
           key: path,
@@ -2039,9 +2013,10 @@ export function ProjectsDashboardHost() {
           resolveThumbnail,
           ...(isConnectConfig ? { glyph: 'connect' as const } : {}),
           ...(isKnowledgeFile ? { glyph: 'knowledge' as const } : {}),
-          // A built-in demo wears the same read-only mark a bundled document
-          // does — one affordance for one fact, not a second one beside it.
-          tier: isBundled || doc?.tier === 'bundled' ? 'bundled' : 'user',
+          // The document's own tier is the whole answer since plan-737. The
+          // `isBundled` half beside it described a built-in-demo ROW, and there
+          // are no such rows any more.
+          tier: doc?.tier === 'bundled' ? 'bundled' : 'user',
           selected: selectedTreePath === path,
           onSelect: () => handleTreeSelect(node),
           onOpen: () => handleTreeActivate(node),
@@ -2050,9 +2025,9 @@ export function ProjectsDashboardHost() {
           // move (a reserved-folder row): the drag then carries only the
           // reference payload for the hero card's Unity-style assignment,
           // never a tree move.
-          // …but never an inert one, and never a built-in: neither has a move
-          // to offer, and a drag that can only be refused is a broken promise.
-          draggable: (node.writable || isRefFile) && !isInert && !isBundled,
+          // …but never an inert one: it has no move to offer, and a drag that
+          // can only be refused is a broken promise.
+          draggable: (node.writable || isRefFile) && !isInert,
           onDragStart: (e: React.DragEvent) => {
             // What travels under the cursor is the collapsed chip — type icon
             // + name — not a ghost of the whole card.
@@ -2080,6 +2055,41 @@ export function ProjectsDashboardHost() {
       store, docStats, handleTreeSelect, handleTreeActivate, treeRoots],
   );
 
+  /**
+   * Navigation tiles for the subfolders, shown AHEAD of the asset cards. A
+   * folder holding nothing but subfolders (the demo's `library/`) used to
+   * read as "This folder is empty" — true of its direct documents, false of
+   * the folder. Only the search cuts them: the chips and the classification
+   * filter describe documents, and a folder carries neither. Click navigates
+   * — the same thing clicking the folder's tree row does — so the grid and
+   * the tree stay one navigation model, not two.
+   */
+  const subfolderTiles = useMemo<FolderTileModel[]>(
+    () => subfoldersInView
+      .filter(node => matchesSearchTerm(node.name, dash.search))
+      .map(node => {
+        const path = node.path!;
+        const menuActions: ProjectCardMenuAction[] = node.inert === true
+          ? []
+          : [{ key: 'open', label: 'Open', onClick: () => handleTreeSelect(node) }];
+        if (isRenamableInTree(treeRoots, path) && node.rootId === project.project?.id) {
+          menuActions.push({
+            key: 'rename',
+            label: 'Rename…',
+            onClick: () => setAssetDialog({ kind: 'renameNode', relPath: path, value: node.name }),
+          });
+        }
+        return {
+          key: path,
+          name: node.name,
+          holdsSomething: node.hasContent ?? node.children.length > 0,
+          onOpen: () => handleTreeSelect(node),
+          menuActions,
+        };
+      }),
+    [subfoldersInView, dash.search, treeRoots, project.project?.id, handleTreeSelect],
+  );
+
   // ── The move write path (plan-703 Phase 5 rest, F12/F13) ──────────────
   /**
    * The IO `applyTreeMove` writes through, or null when nothing can be written.
@@ -2092,14 +2102,21 @@ export function ProjectsDashboardHost() {
     const backend = store.getBackend();
     if (!backend?.writable) return null;
     const readBytes = async (relPath: string): Promise<Blob | null> => {
-      const resolved = await backend.readBlobUrl(relPath);
+      const resolved = await backend.readDocumentUrl(relPath);
       if (!resolved) return null;
       try { return await (await fetch(resolved.url)).blob(); } finally { resolved.release(); }
     };
     return {
       readBytes,
-      writeBytes: (relPath, blob) => backend.writeBlob(relPath, blob),
-      deleteBytes: relPath => backend.deleteBlob(relPath),
+      writeBytes: async (relPath, blob) => {
+        // Overwrite-by-design: the docs pane writes what the user just typed
+        // over whatever is there, and the editor holds no revision to compare
+        // against. The MCP twin of this seam DOES carry one (plan-736 Phase 1),
+        // because an agent's blind overwrite is the case worth refusing.
+        await backend.writeDocument(
+          relPath, new Uint8Array(await blob.arrayBuffer()), { expectedRevision: 'any' });
+      },
+      deleteBytes: relPath => backend.deleteDocument(relPath),
       readManifest: async () => store.getProject(),
       writeManifest: next => store.replaceManifest(next),
       readDocsIndex: async () => {
@@ -2107,10 +2124,15 @@ export function ProjectsDashboardHost() {
         if (!blob) return null;
         try { return JSON.parse(await blob.text()) as unknown; } catch { return null; }
       },
-      writeDocsIndex: (index: DocsIndex) => backend.writeBlob(
-        DOCS_INDEX_FILE,
-        new Blob([JSON.stringify(index, null, 2)], { type: 'application/json' }),
-      ),
+      writeDocsIndex: async (index: DocsIndex) => {
+        // The attachment index is machinery, rewritten wholesale from state the
+        // caller already holds — there is nothing to merge and nothing to lose.
+        await backend.writeDocument(
+          DOCS_INDEX_FILE,
+          new TextEncoder().encode(JSON.stringify(index, null, 2)),
+          { expectedRevision: 'any' },
+        );
+      },
     };
   }, [store]);
 
@@ -2156,12 +2178,18 @@ export function ProjectsDashboardHost() {
       await store.rescanDocuments();
       await listLibrarySources()
         .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
+      // Those two refresh the LISTINGS. Whatever renders the LIVING document —
+      // the hero card, the hierarchy card — reads the open document's own name,
+      // which no rescan touches: renaming the open document from the tree left
+      // both on the old title until the next reload. `SceneStore.rename` adopts
+      // its own rename inline; this is the same adoption for the tree route.
+      sceneStore?.adoptDocumentRename();
       onDone?.(to);
       if (outcome.docsIndexRows > 0) {
         setMessage(`Moved, and repointed ${outcome.docsIndexRows} document link(s).`);
       }
     });
-  }, [runVerb, treeMoveIO, treeRoots, project.project?.id, store]);
+  }, [runVerb, treeMoveIO, treeRoots, project.project?.id, store, sceneStore]);
 
   /**
    * Create a CONNECT configuration in the folder in view — the sibling of
@@ -2191,16 +2219,16 @@ export function ProjectsDashboardHost() {
         Mirrors: [],
         Mappings: [],
       };
-      await backend.writeBlob(
+      await backend.writeDocument(
         rel,
-        new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }),
-        { expectedRevision: null },
+        new TextEncoder().encode(JSON.stringify(payload, null, 2)),
+        { expectedRevision: 'create' },
       );
       // Show it NOW — the listing effect re-scans later and merely confirms.
       setConnectConfigs(prev => (prev.includes(rel) ? prev : [...prev, rel]));
       setProjectsSelection({ kind: 'file', rootId, relPath: rel });
       // plan-725 §2.7 — this is the ONE config-bearing write in the app that
-      // never touches the manifest: a raw `writeBlob` and nothing else. No
+      // never touches the manifest: a raw `writeDocument` and nothing else. No
       // notify site in the project store can see it, so it says so itself, or
       // the file a user just made stays invisible to a running gateway until
       // some unrelated write or a restart happens to reveal it.
@@ -2249,6 +2277,21 @@ export function ProjectsDashboardHost() {
 
   const handleTreeContextMenu = useCallback((node: ProjectTreeNode, e: React.MouseEvent) => {
     setTreeMenu({ node, x: e.clientX, y: e.clientY });
+  }, []);
+
+  /**
+   * Right-click on the empty part of the card grid (user request 2026-09-01).
+   *
+   * The tree has had a context menu since Lauf 13, the cards since Phase 6, and
+   * the one surface in between — the folder's own blank space, which is exactly
+   * where someone stands when they want to CREATE something — had none. It
+   * carries the folder verbs, i.e. the same ones the toolbar offers, so the
+   * menu teaches the toolbar rather than hiding an alternative.
+   */
+  const [gridMenu, setGridMenu] = useState<{ x: number; y: number } | null>(null);
+  const handleGridContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    setGridMenu({ x: e.clientX, y: e.clientY });
   }, []);
 
   // ── "Show in Explorer" (plan-446 Phase 2) ────────────────────────────
@@ -2486,6 +2529,9 @@ export function ProjectsDashboardHost() {
       // on how the project was opened.
       defaultModel: projectStartDocument(project.project) ?? getAppConfig().defaultModel,
       modeLocked,
+      // Same rule at both call sites: a demo deployment always resumes into
+      // its start document, never into the visitor's last session.
+      demoProject: project.project?.kind === 'demo',
     });
     if (!target.asset) return;
 
@@ -2636,7 +2682,7 @@ export function ProjectsDashboardHost() {
     if (!backend) { setMdFile(null); return; }
     let alive = true;
     setMdFile({ path: selectedMdPath, text: null });
-    void backend.readBlobBytes(selectedMdPath)
+    void backend.readDocument(selectedMdPath).then(r => r?.bytes ?? null)
       .then(bytes => {
         if (!alive) return;
         setMdFile({
@@ -2649,7 +2695,7 @@ export function ProjectsDashboardHost() {
   }, [selectedMdPath, store, listingBump]);
 
   /**
-   * Write an edited Markdown body back, through the SAME `writeBlob` seam every
+   * Write an edited Markdown body back, through the SAME `writeDocument` seam every
    * other file write in this file uses — no second storage path for text.
    *
    * Unconditional (no `expectedRevision`): the alternative would be to hash the
@@ -2661,8 +2707,9 @@ export function ProjectsDashboardHost() {
     void runVerb('Save file', async () => {
       const backend = store.getBackend();
       if (!backend?.writable) throw new Error('This project is read-only.');
-      await backend.writeBlob(
-        relPath, new Blob([next], { type: 'text/markdown' }));
+      // Overwrite-by-design: this is the editor saving the text it is showing.
+      await backend.writeDocument(
+        relPath, new TextEncoder().encode(next), { expectedRevision: 'any' });
       setMdFile({ path: relPath, text: next });
       setListingBump(n => n + 1);
     });
@@ -2905,26 +2952,10 @@ export function ProjectsDashboardHost() {
           actions,
         };
       };
-      // A built-in demo row (plan-445 F6). Its own branch and not the project
-      // one below: it belongs to no project, so "used by" and "path" would both
-      // be answers about the wrong thing. One verb, and it says what it is.
-      if (sel.kind === 'file' && sel.rootId === builtinRootId) {
-        const node = selectedTreePath ? findTreeNode(treeRoots, selectedTreePath) : null;
-        const ref = selectedTreePath ? tree.refs.get(selectedTreePath) : undefined;
-        if (!node || ref?.kind !== 'bundledDocument') return { title: null };
-        return {
-          title: node.name,
-          subtitle: 'Built-in — read-only',
-          badges: ['Built-in'],
-          fields: [{ label: 'Source', value: ref.path }],
-          actions: [{
-            key: 'open',
-            label: 'Open',
-            primary: true,
-            onClick: () => openModel(ref.url, node.name, ref.url),
-          }] as DetailAction[],
-        };
-      }
+      // The "Built-in — read-only" pane went with the root it described
+      // (plan-737 Phase 3). The demo's documents are ordinary project rows now
+      // and get the ordinary project pane below — with a real path, a real
+      // "used by", and the verbs of a project that can actually be written to.
       if (sel.kind === 'file' && sel.rootId === project.project?.id) {
         if (isConnectConfigPath(sel.relPath)) {
           return refFilePane(
@@ -2982,7 +3013,7 @@ export function ProjectsDashboardHost() {
       transferActionsFor, documentByPath, sourceOfRoot, treeRoots, catalogRoots,
       handleRefreshLibrary, handleRemoveLibrary,
       sceneStore, selectedTreePath, runTreeEdit, renameLibraryAsset, renameDocumentRow,
-      builtinRootId, tree.refs, markdownPane]);
+      tree.refs, markdownPane]);
 
   const handleForget = useCallback((id: string) => {
     forgetRecentProject(id);
@@ -3243,6 +3274,9 @@ export function ProjectsDashboardHost() {
       }
       return acc;
     }, []);
+    // The folder the grid is showing, as a tree node — what "New folder" from
+    // the grid's own menu needs as its parent.
+    const folderNode = selectedFolderPath ? findTreeNode(treeRoots, selectedFolderPath) : null;
     return (
       <ProjectsDashboard
         title={project.project?.name ?? 'Project'}
@@ -3253,8 +3287,14 @@ export function ProjectsDashboardHost() {
         ].filter(Boolean).join(' · ')}
         onBack={() => setProjectsView('projects')}
         hero={<DocumentHeroSection onReveal={handleHeroReveal} />}
+        // The tools moved down onto the grid's own toolbar, where the things
+        // they filter are: a separate full-width bar carrying nothing but a
+        // centred search field was a third horizontal rule between the user
+        // and the documents.
+        showSearch={false}
         titleActions={
           <>
+            {sharedChrome}
             <Tooltip title="Project actions">
               <IconButton
                 size="small"
@@ -3297,24 +3337,6 @@ export function ProjectsDashboardHost() {
             </Menu>
           </>
         }
-        headerActions={
-          <>
-            {/* The classification filter belongs beside the search: the two are
-                the same gesture at different grains. Both narrow the CARDS of
-                the folder in view (Lauf 13) — the folder tree beside them keeps
-                its shape, because a structure that rearranges itself as you
-                type is a structure you cannot navigate. */}
-            <DocumentFilterBar
-              chips={folderChips}
-              chip={dash.chip}
-              onChipChange={setProjectsChip}
-              tags={documentTags}
-              tag={dash.tag}
-              onTagChange={setProjectsTag}
-            />
-            {sharedChrome}
-          </>
-        }
       >
         {/* Folders left, contents right — the Unity project window (Lauf 13).
             The tree is a fixed column rather than a flex share: it holds names
@@ -3333,17 +3355,29 @@ export function ProjectsDashboardHost() {
           {/* Two named sections rather than one list: what the project holds,
               and what is attached to it. Each verb sits under the header it
               belongs to — "add library" is a libraries verb, so it moved off
-              the panel title and onto the Libraries header. */}
-          {/* All three column headers share ONE height (32px) and type
-              (12px semibold) — this one is the reference. */}
+              the panel title and onto the Libraries header.
+
+              The two used to differ only by the word in the header, which is
+              why they read as one confusing list. Each section header sits on
+              the DARKEST band in the column (user decision 2026-09-02) —
+              darker than the tree's own root bands, so the two headers frame
+              their sections the way the top/bottom toolbars frame the
+              viewport — and the boundary between the sections is stated
+              twice: clear space, then a hairline, then the next dark band. */}
           <Box
             sx={{
-              display: 'flex', alignItems: 'center', gap: 0.5,
-              px: 1.25, minHeight: 32, flexShrink: 0,
-              borderBottom: '1px solid rgba(255,255,255,0.06)',
+              display: 'flex', alignItems: 'center',
+              px: 1.25, minHeight: 30, flexShrink: 0,
+              bgcolor: 'rgba(0,0,0,0.28)',
             }}
           >
-            <Typography sx={{ fontSize: 12, fontWeight: 600, flex: 1 }}>
+            <Typography
+              sx={{
+                fontSize: 11, fontWeight: 600, flex: 1,
+                textTransform: 'uppercase', letterSpacing: '0.06em',
+                color: 'rgba(255,255,255,0.55)',
+              }}
+            >
               Project
             </Typography>
           </Box>
@@ -3366,18 +3400,36 @@ export function ProjectsDashboardHost() {
               externalDragPath={cardDragPath}
             />
           </Box>
+          {/* The ONE boundary in this column: clear space, the separator line
+              floating in the middle of it, clear space again, then the next
+              section's dark header band. The line gets air on BOTH sides —
+              sitting directly on the dark band it read as the band's own edge
+              rather than as a separator (user decision 2026-09-02). */}
           <Box
             sx={{
-              display: 'flex', alignItems: 'center', gap: 0.5,
-              px: 1.25, minHeight: 32, flexShrink: 0,
-              borderTop: '1px solid rgba(255,255,255,0.06)',
-              borderBottom: '1px solid rgba(255,255,255,0.06)',
+              flexShrink: 0, mx: 0, my: '12px',
+              borderTop: '1px solid rgba(255,255,255,0.1)',
+            }}
+          />
+          <Box
+            sx={{
+              display: 'flex', alignItems: 'center',
+              px: 1.25, minHeight: 30, flexShrink: 0,
+              bgcolor: 'rgba(0,0,0,0.28)',
             }}
           >
-            <Typography sx={{ fontSize: 12, fontWeight: 600, flex: 1 }}>
-              Libraries
-            </Typography>
-            <Tooltip title="Add library">
+            <Tooltip title="Shared asset collections attached to this project — read-only unless you own them.">
+              <Typography
+                sx={{
+                  fontSize: 11, fontWeight: 600, flex: 1,
+                  textTransform: 'uppercase', letterSpacing: '0.06em',
+                  color: 'rgba(255,255,255,0.55)',
+                }}
+              >
+                Libraries
+              </Typography>
+            </Tooltip>
+            <Tooltip title="Attach a library to this project">
               <IconButton
                 size="small"
                 aria-label="Add library"
@@ -3406,19 +3458,21 @@ export function ProjectsDashboardHost() {
           </Box>
         </Box>
         <Box sx={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-          {/* The folder in view, and creation exactly where the result will
-              appear. Creating writes to the project, so a read-only one says
-              so up front instead of failing on the click. */}
+          {/* ONE toolbar for the grid: where you are, what you are filtering
+              it by, and what you can make in it — left to right in the order
+              you would say them. The chips and the search used to live on a
+              separate bar spanning the whole window, which put them nearer the
+              tree they do NOT filter than the cards they do. */}
           <Box
             sx={{
-              display: 'flex', alignItems: 'center', gap: 0.5,
-              px: 1.5, minHeight: 32, flexShrink: 0,
+              display: 'flex', alignItems: 'center', gap: 0.75,
+              px: 1.5, minHeight: 40, flexShrink: 0,
               borderBottom: '1px solid rgba(255,255,255,0.06)',
             }}
           >
             <Box
               data-testid="folder-header-name"
-              sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flex: 1, minWidth: 0,
+              sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 1, minWidth: 0,
                 overflow: 'hidden', whiteSpace: 'nowrap' }}
             >
               {folderCrumbs.map((crumb, i) => {
@@ -3455,6 +3509,41 @@ export function ProjectsDashboardHost() {
                 );
               })}
             </Box>
+
+            <Box sx={{ flex: 1, minWidth: 8 }} />
+
+            {/* The classification filter sits right-aligned, directly beside
+                the search: the two are the same gesture at different grains.
+                Both narrow the CARDS of the folder in view (Lauf 13) — the
+                folder tree beside them keeps its shape, because a structure
+                that rearranges itself as you type is a structure you cannot
+                navigate. */}
+            <DocumentFilterBar
+              chips={folderChips}
+              chip={dash.chip}
+              onChipChange={setProjectsChip}
+              tags={documentTags}
+              tag={dash.tag}
+              onTagChange={setProjectsTag}
+            />
+
+            <TextField
+              size="small"
+              placeholder="Search this folder…"
+              value={dash.search}
+              onChange={(e) => setProjectsSearch(e.target.value)}
+              slotProps={{
+                input: {
+                  startAdornment: (
+                    <InputAdornment position="start" sx={{ mr: 0.5 }}>
+                      <Search sx={{ fontSize: 16, color: 'text.disabled' }} />
+                    </InputAdornment>
+                  ),
+                  sx: { fontSize: 12, height: 28 },
+                },
+              }}
+              sx={{ width: 200, flexShrink: 0 }}
+            />
             {/*
               The PRIMARY way in (plan-445 F5). "New document" was a 16px plus
               among three other icon buttons — the single most-used verb on the
@@ -3487,6 +3576,13 @@ export function ProjectsDashboardHost() {
                     bgcolor: '#4fc3f7',
                     color: 'rgba(0,0,0,0.87)',
                     '&:hover': { bgcolor: '#81d4fa' },
+                    // Read-only project: properly muted, not washed-out blue —
+                    // the custom bgcolor otherwise bleeds through MUI's
+                    // disabled state and reads as a broken primary button.
+                    '&.Mui-disabled': {
+                      bgcolor: 'rgba(255,255,255,0.06)',
+                      color: 'rgba(255,255,255,0.3)',
+                    },
                   }}
                 >
                   New document
@@ -3517,10 +3613,77 @@ export function ProjectsDashboardHost() {
           </Box>
           <ProjectFolderContents
             cards={folderCards}
-            emptyMessage={folderRows.length > 0
+            folders={subfolderTiles}
+            onBackgroundContextMenu={handleGridContextMenu}
+            emptyMessage={folderRows.length > 0 || subfoldersInView.length > 0
               ? 'Nothing in this folder matches the filter.'
-              : 'This folder is empty.'}
+              : project.writable
+                ? 'This folder is empty. Create a document, or drag one in from a library.'
+                : 'This folder is empty.'}
+            emptyAction={folderRows.length === 0 && project.writable && (
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={<Add sx={{ fontSize: 14 }} />}
+                onClick={handleNewDocument}
+                sx={{ fontSize: 11, textTransform: 'none', py: 0.25 }}
+              >
+                New document
+              </Button>
+            )}
           />
+          {/* The folder's verbs where the folder is. Anchored to the pointer,
+              same as the tree menu, and disabled entries stay VISIBLE so a
+              read-only project still teaches what the screen can do. */}
+          <Menu
+            open={gridMenu !== null}
+            onClose={() => setGridMenu(null)}
+            anchorReference="anchorPosition"
+            anchorPosition={gridMenu ? { top: gridMenu.y, left: gridMenu.x } : undefined}
+          >
+            <MenuItem
+              data-testid="grid-menu-new-document"
+              disabled={!project.writable}
+              onClick={() => { setGridMenu(null); handleNewDocument(); }}
+              sx={{ fontSize: 13, gap: 1 }}
+            >
+              <NoteAddOutlined sx={{ fontSize: 16 }} />
+              New document
+            </MenuItem>
+            <MenuItem
+              data-testid="grid-menu-new-folder"
+              disabled={!project.writable || folderNode === null}
+              onClick={() => {
+                setGridMenu(null);
+                if (folderNode) handleNewFolder(folderNode);
+              }}
+              sx={{ fontSize: 13, gap: 1 }}
+            >
+              <CreateNewFolderOutlined sx={{ fontSize: 16 }} />
+              New folder
+            </MenuItem>
+            <MenuItem
+              data-testid="grid-menu-new-connect"
+              disabled={!project.writable}
+              onClick={() => { setGridMenu(null); handleNewConnectConfig(); }}
+              sx={{ fontSize: 13, gap: 1 }}
+            >
+              <SettingsEthernet sx={{ fontSize: 16 }} />
+              New CONNECT configuration
+            </MenuItem>
+            <Divider sx={{ my: 0.5 }} />
+            <MenuItem
+              data-testid="grid-menu-refresh"
+              onClick={() => {
+                setGridMenu(null);
+                void runVerb('Refresh', () => store.rescanDocuments());
+              }}
+              sx={{ fontSize: 13, gap: 1 }}
+            >
+              <Refresh sx={{ fontSize: 16 }} />
+              Refresh
+            </MenuItem>
+          </Menu>
         </Box>
         {/* Always present, so the layout never jumps when a selection comes
             and goes; without one it says so ("Nothing selected"). */}

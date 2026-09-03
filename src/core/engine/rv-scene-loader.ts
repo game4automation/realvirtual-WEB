@@ -2017,6 +2017,18 @@ export interface ComputeBVHAsyncOptions {
    * and in indirect mode so their face-range tables stay valid.
    */
   indirectGeometries?: BufferGeometry[];
+  /**
+   * When false, no build may take the worker's transfer route. The worker
+   * DETACHES the geometry's position/index buffers for the duration of a
+   * build; if the renderer's FIRST upload of a mesh lands inside that window
+   * (a subtree imported into a live, rendering scene), the GPU keeps a
+   * zero-size buffer while the draw still uses the attribute's count —
+   * `GL_INVALID_OPERATION: glDrawElements: Insufficient buffer size`, and the
+   * part stays invisible until the next full load. Callers that add meshes
+   * to an ALREADY-RENDERING scene must pass false; the initial load path may
+   * keep the worker (its first frame renders after the load completes).
+   */
+  transferable?: boolean;
 }
 
 /**
@@ -2092,7 +2104,7 @@ export async function computeBVHAsync(
         (idx != null && (bufferUse.get(bufferOf(idx.array)) ?? 0) > 1);
       bvh = await port.generate(job.geometry, {
         indirect: job.indirect,
-        transferable: !sharedBuffer,
+        transferable: !sharedBuffer && options?.transferable !== false,
       });
     } catch (e) {
       console.warn('[computeBVHAsync] BVH build failed for a geometry — skipping:', e);

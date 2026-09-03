@@ -50,6 +50,7 @@ import {
 import type { LibraryCatalogEntry } from '../src/core/library/library-types';
 import type { RvDocumentEntry, RvProject } from '../src/core/project/rv-project-types';
 import type { DocumentClassification } from '../src/core/project/rv-document-classification';
+import { writeBlobDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -145,8 +146,8 @@ async function seed(): Promise<void> {
   // `seedText` round trip would re-encode it as UTF-8 and the classification
   // reader — which slices bytes, not characters — would see a different file.
   await src.activate();
-  await src.writeBlob(beltDoc.path, classifiedGlb(BELT_CLASSIFICATION));
-  await src.writeBlob(
+  await writeBlobDocument(src, beltDoc.path, classifiedGlb(BELT_CLASSIFICATION));
+  await writeBlobDocument(src, 
     `${LIBRARY_FOLDER}/${SIDECAR_FILENAME}`,
     new Blob([JSON.stringify({
       schemaVersion: 1,

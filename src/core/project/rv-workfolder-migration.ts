@@ -185,11 +185,9 @@ function suffixedPath(relPath: string, attempt: number): string {
   return `${dir}${stem}-migrated${attempt > 1 ? `-${attempt}` : ''}${ext}`;
 }
 
-function sameBytes(a: ArrayBuffer, b: ArrayBuffer): boolean {
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.byteLength !== b.byteLength) return false;
-  const x = new Uint8Array(a);
-  const y = new Uint8Array(b);
-  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;
 }
 
@@ -243,13 +241,13 @@ export async function migrateWorkfolderIntoProject(
 
     try {
       const file = await handle.getFile();
-      const bytes = await file.arrayBuffer();
+      const bytes = new Uint8Array(await file.arrayBuffer());
 
       // `expectedRevision: null` = create only. It is the whole safety story:
       // a path that already holds something refuses the write instead of
       // replacing work the user did after (or independently of) the old folder.
       try {
-        await backend.writeBlob(relPath, new Blob([bytes]), { expectedRevision: null });
+        await backend.writeDocument(relPath, bytes, { expectedRevision: 'create' });
         report.copied++;
         newlyDone.push(relPath);
         continue;
@@ -257,7 +255,7 @@ export async function migrateWorkfolderIntoProject(
         /* something is already there — decide by comparing bytes, below */
       }
 
-      const existing = await backend.readBlobBytes(relPath);
+      const existing = (await backend.readDocument(relPath))?.bytes ?? null;
       if (existing && sameBytes(existing, bytes)) {
         // Same file. Either a crash between write and manifest entry, or it was
         // brought in another way. Recording it is the honest end state.
@@ -271,7 +269,7 @@ export async function migrateWorkfolderIntoProject(
       for (let attempt = 1; attempt <= 20 && saved === null; attempt++) {
         const candidate = suffixedPath(relPath, attempt);
         try {
-          await backend.writeBlob(candidate, new Blob([bytes]), { expectedRevision: null });
+          await backend.writeDocument(candidate, bytes, { expectedRevision: 'create' });
           saved = candidate;
         } catch { /* that name is taken too — next attempt */ }
       }

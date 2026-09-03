@@ -9,7 +9,7 @@
  *
  * The obvious shape — "hand the verb a passive backend handle for the other
  * side" — cannot work, and the review found out why before the code did:
- * `writeBlob`, `deleteBlob` and `writeScene` all go through `assertWritable`,
+ * `writeDocument` and `deleteDocument` both go through `assertWritable`,
  * which demands `writable` **and** `isActive`
  * ([project-backend.ts:245](./backends/project-backend.ts)). A backend that
  * nobody activated throws on every write. And a *move* needs write rights on
@@ -84,7 +84,7 @@ export interface DocumentTransferEndpoint {
  * What a verb may do to one side of a transfer.
  *
  * Deliberately narrower than `ProjectBackend`: bytes in, bytes out, bytes gone,
- * and one manifest edit. A verb that could reach `writeScene` or `activate`
+ * and one manifest edit. A verb that could reach `activate`
  * through this handle would be able to do the things the session exists to keep
  * exclusive.
  */
@@ -92,9 +92,13 @@ export interface DocumentTransferSide {
   readonly label: string;
   readonly backendId: string;
   readonly writable: boolean;
-  readBlobUrl(relPath: string): Promise<ResolvedBackendBlob | null>;
-  writeBlob(relPath: string, blob: Blob): Promise<void>;
-  deleteBlob(relPath: string): Promise<void>;
+  readDocumentUrl(relPath: string): Promise<ResolvedBackendBlob | null>;
+  writeDocument(
+    relPath: string,
+    bytes: Uint8Array,
+    opts: { expectedRevision: string },
+  ): Promise<{ revision: string }>;
+  deleteDocument(relPath: string): Promise<void>;
   /** The manifest's `documents[]`, or `[]` when this side has no manifest. */
   listDocuments(): Promise<RvDocumentEntry[]>;
   /**
@@ -130,9 +134,9 @@ function sideOf(endpoint: DocumentTransferEndpoint): DocumentTransferSide {
     label,
     backendId: backend.id,
     get writable() { return backend.writable; },
-    readBlobUrl: (relPath) => backend.readBlobUrl(relPath),
-    writeBlob: (relPath, blob) => backend.writeBlob(relPath, blob),
-    deleteBlob: (relPath) => backend.deleteBlob(relPath),
+    readDocumentUrl: (relPath) => backend.readDocumentUrl(relPath),
+    writeDocument: (relPath, bytes, opts) => backend.writeDocument(relPath, bytes, opts),
+    deleteDocument: (relPath) => backend.deleteDocument(relPath),
     listDocuments: async () => {
       const manifest = await backend.readManifest().catch(() => null);
       return readDocuments(manifest) ?? [];

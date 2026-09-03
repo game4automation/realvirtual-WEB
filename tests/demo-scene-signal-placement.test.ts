@@ -27,7 +27,8 @@ import { findSignalBindTarget, signalBindTargetId } from '../src/plugins/signal-
 import { PLC_SIGNAL_SLOT } from '../src/core/engine/rv-binding-slot-resolver';
 import type { RVViewer } from '../src/core/rv-viewer';
 
-const DEMO_MODEL = '/DemoRealvirtualWeb.glb';
+// Inside the demo's own folder since plan-737 (one folder artefact).
+const DEMO_MODEL = '/demo-realvirtual/DemoRealvirtualWeb.glb';
 
 /** Signals that must sit under the MACHINE, not under a central PLC node. */
 const MACHINE_SIGNALS = [

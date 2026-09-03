@@ -174,6 +174,35 @@ describe('§9.15 — the resume order', () => {
       .toBe('none');
   });
 
+  it('a demo deployment skips the remembered pair — and its MODE with it', () => {
+    // One planner session must not turn the public demo into the planner demo
+    // for every later visit (2026-09-02, /demo).
+    expect(resolveResumeTarget({
+      search: '',
+      remembered,
+      defaultModel: 'DemoRealvirtualWeb.glb',
+      demoProject: true,
+    })).toEqual({ asset: 'DemoRealvirtualWeb.glb', mode: null, source: 'defaultModel' });
+  });
+
+  it('a demo deployment still honours the URL — a shared link is explicit', () => {
+    expect(resolveResumeTarget({
+      search: '?scene=DemoPlanner.glb',
+      remembered,
+      defaultModel: 'DemoRealvirtualWeb.glb',
+      demoProject: true,
+    })).toEqual({ asset: 'DemoPlanner.glb', mode: null, source: 'url' });
+  });
+
+  it('a demo deployment with no start document falls through to projectActive', () => {
+    expect(resolveResumeTarget({
+      search: '',
+      remembered,
+      projectActive: 'scenes/Active.glb',
+      demoProject: true,
+    })).toEqual({ asset: 'scenes/Active.glb', mode: null, source: 'projectActive' });
+  });
+
   it('?project= selects the project, not the asset', () => {
     expect(resolveResumeTarget({ search: '?project=myplant', defaultModel: 'd.glb' }))
       .toEqual({ asset: 'd.glb', mode: null, source: 'defaultModel' });

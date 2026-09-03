@@ -713,6 +713,49 @@ export class SceneStore {
    * `openScene` forward, the `openBuiltin` forward) so the alias tolerance
    * cannot be applied in three places and forgotten in the fourth.
    */
+  /**
+   * Adopt a rename the MANIFEST already records for the open document.
+   *
+   * {@link rename} does this inline for the rename it performs itself, but it is
+   * not the only route: the dashboard tree's F2 (`applyTreeMove`, and the detail
+   * pane's inline title edit through it) writes the row and rescans, which moves
+   * the tree row and the card and leaves everything reading the LIVING document
+   * — the hero card and the hierarchy card — on the old title until the next
+   * reload (field finding 2026-09-01, the same symptom as 2026-08-26 on the
+   * other route).
+   *
+   * Silent and idempotent: the file and the row are already written, so this
+   * adopts a completed rename rather than authoring one, and a call with nothing
+   * to adopt does nothing at all.
+   */
+  adoptDocumentRename(): void {
+    const ws = this._workspace;
+    if (!ws?.documentId) return;
+    const row = this._documentRow(ws.documentId);
+    if (!row) return;
+    const name = row.name || ws.name;
+    if (name === ws.name && row.path === ws.documentPath) return;
+
+    let next: WorkspaceShell = { ...ws, name, documentPath: row.path };
+    // A moved file is a new address for the same bytes — re-point the base the
+    // way `rename` does, or the next save writes to the path the row left.
+    if (row.path !== ws.documentPath && ws.base.kind === 'builtin') {
+      const base: SceneBase = { kind: 'builtin', url: projectAssetUrl(row.path), label: name };
+      const oldKey = baseKeyOf(ws.base);
+      if (this._baseBytes?.key === oldKey) this._setBaseBytes(baseKeyOf(base), this._baseBytes.bytes);
+      next = { ...next, base };
+      if (this._saved) this._saved = { ...this._saved, base };
+    }
+    this._workspace = next;
+    if (this._saved) {
+      this._saved = { ...this._saved, name };
+      this._viewer.currentScene = this._saved;
+    }
+    this._doc.setNameSilently(name);
+    this._publishDocumentIdentity();
+    this._notify();
+  }
+
   private _documentRow(idOrScn: string): RvDocumentEntry | null {
     if (!idOrScn) return null;
     const id = resolveDocumentId(idOrScn);
@@ -1307,7 +1350,7 @@ export class SceneStore {
    */
   private async _createDocument(
     name: string,
-    bytes?: BlobPart,
+    bytes?: Uint8Array,
     folder?: string,
   ): Promise<{ documentId: string; relPath: string; name: string } | null> {
     const store = getProjectStore();
@@ -2017,7 +2060,7 @@ export class SceneStore {
    * `_commitBody` uses for the body slot: the revision the FILE had when this
    * session last saw it, recorded at load and re-derived after every write. Both
    * writable backends implement the precondition in full
-   * (write-blob-cas.contract.test.ts:121-213), so this is the last unconditional
+   * (unified-document-write-cas.test.ts), so this is the last unconditional
    * asset write in the save path, and it is now conditional.
    *
    * The degradation is deliberate and matches `_commitBody` word for word: a
@@ -2085,10 +2128,13 @@ export class SceneStore {
       ? null
       : this._expectedDocumentRevision(target.relPath);
     try {
-      await backendAtStart.writeBlob(
+      await backendAtStart.writeDocument(
         target.relPath,
-        new Blob([bytes as unknown as BlobPart], { type: 'model/gltf-binary' }),
-        ...(expected !== undefined ? [{ expectedRevision: expected }] as const : []),
+        bytes,
+        // `expected` is the revision this save was based on where one is known.
+        // Where it is not, the save is still deliberate — the user asked for it
+        // — so it overwrites rather than being refused for want of bookkeeping.
+        { expectedRevision: expected ?? 'any' },
       );
     } catch (e) {
       const moved = await this._reportSaveRefusal(e, target);
@@ -2415,7 +2461,7 @@ export class SceneStore {
       ?? workspaceAtStart.documentPath;
     const created = await this._createDocument(
       name,
-      bytes as unknown as BlobPart,
+      bytes,
       sourcePath ? documentFolderOf(sourcePath) : undefined,
     );
     if (!created) throw new Error('There is no writable project to save into.');
@@ -2549,19 +2595,19 @@ export class SceneStore {
 
     // ── 2./3. The bytes: copy, then delete. ──
     if (target && backend) {
-      const bytes = await backend.readBlobBytes(row.path).catch(() => null);
+      const bytes = await backend.readDocument(row.path).catch(() => null).then(r => r?.bytes ?? null);
       if (!bytes) {
         // A row whose file is already gone renames its name and nothing else —
         // there is no byte to move and inventing one would create a document.
         target = null;
       } else {
-        await backend.writeBlob(
+        await backend.writeDocument(
           target.relPath,
-          new Blob([bytes], { type: 'model/gltf-binary' }),
-          { expectedRevision: null },
+          bytes,
+          { expectedRevision: 'create' },
         );
         try {
-          await backend.deleteBlob(row.path);
+          await backend.deleteDocument(row.path);
         } catch (e) {
           throw new Error(
             `"${row.name}" was copied to "${target.relPath}" but "${row.path}" could not be `
@@ -2797,10 +2843,10 @@ export class SceneStore {
       // window between that listing and this write: if anything is at the path
       // by now the write is refused instead of silently replacing a file the
       // dedup was there to protect.
-      await backend.writeBlob(
+      await backend.writeDocument(
         relPath,
-        new Blob([result.glb as BlobPart], { type: 'model/gltf-binary' }),
-        { expectedRevision: null },
+        result.glb,
+        { expectedRevision: 'create' },
       );
       writtenPath = relPath;
 
@@ -2858,7 +2904,7 @@ export class SceneStore {
       console.error('[scene-store] saving settings into the model failed:', e);
       if (writtenPath) {
         // Best-effort: a failed run must not leave a file that looks finished.
-        try { await backend.deleteBlob(writtenPath); } catch (cleanup) {
+        try { await backend.deleteDocument(writtenPath); } catch (cleanup) {
           console.warn('[scene-store] could not remove the partially written model:', cleanup);
           return {
             kind: 'error',

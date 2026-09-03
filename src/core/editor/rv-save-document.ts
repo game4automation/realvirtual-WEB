@@ -84,7 +84,7 @@ import { stableDocumentIdOfPath } from './rv-asset-draft-storage';
 import { sanitizeAssetFileName, CUSTOM_LIBRARY_FOLDER } from './rv-asset-library-save';
 import { getProjectStore } from '../project/project-store';
 import { revisionOfBytes, SceneRevisionConflictError } from '../project/rv-scene-record';
-import type { ProjectBackend } from '../project/backends/project-backend';
+import type { ProjectBackend, WriteExpectation } from '../project/backends/project-backend';
 import { assertNoDocumentIdCollisions } from '../project/rv-asset-identity';
 
 // ─── The verb, before the click (§2.2.1-6) ──────────────────────────────
@@ -203,7 +203,7 @@ export async function noteLoadedRevision(
 ): Promise<void> {
   if (!backend) return;
   try {
-    const bytes = await backend.readBlobBytes(relPath);
+    const bytes = (await backend.readDocument(relPath))?.bytes ?? null;
     if (!bytes) return;
     seenRevisions.set(ledgerKey(backend, relPath), await revisionOfBytes(bytes));
   } catch {
@@ -226,21 +226,15 @@ export async function noteLoadedRevision(
 async function expectedRevisionFor(
   backend: ProjectBackend,
   relPath: string,
-): Promise<string | null> {
+): Promise<WriteExpectation> {
   const known = seenRevisions.get(ledgerKey(backend, relPath));
   if (known) return known;
-  const resolved = await backend.readBlobUrl(relPath).catch(() => null);
-  if (!resolved) return null;
-  try {
-    const bytes = await (await fetch(resolved.url)).arrayBuffer();
-    const revision = await revisionOfBytes(bytes);
-    seenRevisions.set(ledgerKey(backend, relPath), revision);
-    return revision;
-  } catch {
-    return null;
-  } finally {
-    resolved.release();
-  }
+  // One read, and it already carries the revision — no object URL to own, no
+  // second hash of bytes the backend just hashed (plan-736 Phase 1).
+  const record = await backend.readDocument(relPath).catch(() => null);
+  if (!record) return 'create';
+  seenRevisions.set(ledgerKey(backend, relPath), record.revision);
+  return record.revision;
 }
 
 // ─── Routing (§2.2 step 1, §2.3; one function since plan-710 F5) ────────
@@ -787,16 +781,12 @@ async function saveAssetDocument(
 
       // A copy goes to a path nothing may occupy; an in-place save replaces
       // what this session last saw there.
-      const expectedRevision = decision.copies
-        ? null
+      const expectedRevision: WriteExpectation = decision.copies
+        ? 'create'
         : await expectedRevisionFor(backend, relPath);
 
       try {
-        await backend.writeBlob(
-          relPath,
-          new Blob([bytes as unknown as BlobPart], { type: 'model/gltf-binary' }),
-          { expectedRevision },
-        );
+        await backend.writeDocument(relPath, bytes, { expectedRevision });
       } catch (e) {
         if (e instanceof SceneRevisionConflictError) {
           return { kind: 'conflict', message: e.message } as const;
@@ -964,9 +954,12 @@ async function writeThumbnailBesideAsset(
     // null = WebGPU renderer; thumbnails need the classic one (plan-271).
     if (!dataUrl) return;
     const blob = await (await fetch(dataUrl)).blob();
-    await backend.writeBlob(
+    // Overwrite-by-design: a thumbnail is derived from the asset that was just
+    // saved, so the current one is by definition the one to replace.
+    await backend.writeDocument(
       `library/.thumbnails/${libraryRelative.replace(/\.glb$/i, '.png')}`,
-      blob,
+      new Uint8Array(await blob.arrayBuffer()),
+      { expectedRevision: 'any' },
     );
   } catch (e) {
     console.warn('[save-document] thumbnail write failed (the asset saved fine):', e);

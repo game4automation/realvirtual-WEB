@@ -85,7 +85,10 @@ describe('DocumentCard variants', () => {
 
     mount(view, 'hero');
     expect(screen.getByTestId('document-card').dataset.variant).toBe('hero');
-    expect(screen.getByTestId('document-card-name').textContent).toBe('Conveyor');
+    // The hero states the document once too: the trail IS the title, ending
+    // in the current document — a separate name line printed the name twice.
+    expect(screen.queryByTestId('document-card-name')).toBeNull();
+    expect(screen.getByTestId('document-crumb-current').textContent).toContain('Conveyor');
     expect(screen.getAllByTestId(/^document-crumb/).map(e => e.textContent)).toEqual(compactCrumbs);
     expect(screen.getByTestId('document-card').querySelectorAll('[data-testid="dirty-dot"]').length)
       .toBe(compactDirty);

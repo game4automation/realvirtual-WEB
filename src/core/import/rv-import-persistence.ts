@@ -105,11 +105,16 @@ export async function persistImportedGlb(
     }
 
     const localPath = `${IMPORTS_SUBFOLDER}/${filename}`;
-    await backend.writeBlob(`library/${localPath}`, blob);
+    // `localPath` came from a free-name probe just above, so the target is new.
+    await backend.writeDocument(
+      `library/${localPath}`,
+      new Uint8Array(await blob.arrayBuffer()),
+      { expectedRevision: 'create' },
+    );
 
     // Read back through the backend so the URL points at the stored bytes,
     // identical to what the scanner serves after a rescan.
-    const resolved = await backend.readBlobUrl(`library/${localPath}`);
+    const resolved = await backend.readDocumentUrl(`library/${localPath}`);
     if (!resolved) {
       return ephemeralEntry(base, blob,
         'The import could not be read back after writing — it will NOT survive a reload.');
@@ -213,7 +218,7 @@ async function backendHasFile(
   backend: NonNullable<ReturnType<ReturnType<typeof getProjectStore>['getBackend']>>,
   relPath: string,
 ): Promise<boolean> {
-  const resolved = await backend.readBlobUrl(relPath);
+  const resolved = await backend.readDocumentUrl(relPath);
   if (!resolved) return false;
   resolved.release();
   return true;

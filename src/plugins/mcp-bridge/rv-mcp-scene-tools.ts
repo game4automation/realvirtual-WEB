@@ -429,7 +429,7 @@ export class McpSceneTools {
       // No manifest row — an attachment or a file nothing adopted. Deleting the
       // bytes is still the caller's intent, and `deleteBlob` treats a missing
       // file as satisfied rather than as an error.
-      await backend.deleteBlob(target);
+      await backend.deleteDocument(target);
       return JSON.stringify({ deleted: true, relPath: target, documentId: null });
     }
 

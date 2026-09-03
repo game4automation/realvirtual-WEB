@@ -45,6 +45,7 @@ import { clearAllSceneOwners } from '../src/core/project/rv-scene-owner';
 import { clearAllBlobs } from '../src/core/storage/rv-opfs-blobs';
 import { readSceneGlbPointer } from '../src/core/storage/rv-scene-glb-store';
 import { clearSceneMutationListeners } from '../src/core/hmi/scene/rv-scene-mutations';
+import { writeSceneDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -131,7 +132,7 @@ describe('BrowserBackend.writeScene — the id is given, not derived', () => {
     );
     expect(relPath).not.toContain(BUILTIN_DRAFT.id);
 
-    const revision = await backend.writeScene(
+    const revision = await writeSceneDocument(backend, 
       relPath,
       glbWrite(BUILTIN_DRAFT.id, BUILTIN_DRAFT.name),
     );
@@ -144,8 +145,8 @@ describe('BrowserBackend.writeScene — the id is given, not derived', () => {
     const backend = await openBrowser();
     // `<id>` is how most callers reach a browser body — the backend keys them
     // by scene id — and dropping it would have been a silent regression.
-    await expect(backend.writeScene('scn_a', glbWrite('scn_a', 'Cell'))).resolves.toBeTruthy();
-    await expect(backend.writeScene('scenes/scn_b', glbWrite('scn_b', 'Cell'))).resolves.toBeTruthy();
+    await expect(writeSceneDocument(backend, 'scn_a', glbWrite('scn_a', 'Cell'))).resolves.toBeTruthy();
+    await expect(writeSceneDocument(backend, 'scenes/scn_b', glbWrite('scn_b', 'Cell'))).resolves.toBeTruthy();
   });
 });
 
@@ -157,7 +158,7 @@ describe('BrowserBackend.writeScene — foreign ownership', () => {
     const backend = await openBrowser([row(b)]);
 
     await expect(
-      backend.writeScene(sceneGlbRelPathFor(b), glbWrite('scn_a', 'Line A')),
+      writeSceneDocument(backend, sceneGlbRelPathFor(b), glbWrite('scn_a', 'Line A')),
     ).rejects.toThrow(/belongs to scene scn_b/);
 
     // The protection is worth nothing if the bytes went in anyway.
@@ -167,17 +168,46 @@ describe('BrowserBackend.writeScene — foreign ownership', () => {
 
 // ─── 9.3 ────────────────────────────────────────────────────────────────
 
-describe('BrowserBackend.writeScene — the id is mandatory', () => {
-  it('writeScene without meta.id is refused', async () => {
+describe('BrowserBackend — a scene row without an id is refused', () => {
+  /**
+   * plan-736 narrowed this guard, and the narrowing is the point.
+   *
+   * It used to be "`writeScene` requires `meta.id`", which it could be because
+   * `writeScene` was a separate method that only scene saves reached. There is
+   * one `writeDocument` now, and most of its callers legitimately have no row
+   * at all — a library import, a screenshot, a docs index. "No meta" therefore
+   * cannot be an error any more; it is simply a document write.
+   *
+   * What IS still an error is a caller that hands over a row with an empty id.
+   * That is a scene save that has lost track of what it is saving, and it is
+   * the case the old guard existed for: the body would land in the blob index
+   * under a path key, where `readSceneGlb(id)` — which the scene layer calls
+   * directly — can never find it.
+   */
+  it('a write carrying a row with an empty id is refused', async () => {
     const backend = await openBrowser();
-    const noMeta = {
+    const idless = {
       glb: new TextEncoder().encode('glTF-stand-in'),
-      meta: undefined as unknown as RvProjectSceneEntry,
+      meta: { id: '', name: 'Nameless' } as unknown as RvProjectSceneEntry,
     } satisfies SceneWrite;
 
     // Same words as the folder backend — one contract, one message.
-    await expect(backend.writeScene('scenes/x.scene.glb', noMeta))
+    await expect(writeSceneDocument(backend, 'scenes/x.scene.glb', idless))
       .rejects.toThrow('writeScene needs meta.id.');
+    expect(readSceneGlbPointer('')).toBeNull();
+  });
+
+  it('a write carrying NO row is an ordinary document write, not an error', async () => {
+    const backend = await openBrowser();
+    await backend.writeDocument(
+      'library/Loose.glb',
+      new TextEncoder().encode('glTF-stand-in'),
+      { expectedRevision: 'create' },
+    );
+    const record = await backend.readDocument('library/Loose.glb');
+    expect(new TextDecoder().decode(record!.bytes)).toBe('glTF-stand-in');
+    // It went to the blob store, not the scene store: nothing said it was a scene.
+    expect(readSceneGlbPointer('Loose.glb')).toBeNull();
   });
 });
 
@@ -192,8 +222,8 @@ describe('the shared invariant', () => {
     const browser = await openBrowser([row(b)]);
     const folder = await openFolder([row(b)]);
 
-    await expect(browser.writeScene(stolen, mine)).rejects.toThrow(/belongs to scene scn_b/);
-    await expect(folder.writeScene(stolen, mine)).rejects.toThrow(/belongs to scene scn_b/);
+    await expect(writeSceneDocument(browser, stolen, mine)).rejects.toThrow(/belongs to scene scn_b/);
+    await expect(writeSceneDocument(folder, stolen, mine)).rejects.toThrow(/belongs to scene scn_b/);
   });
 
   it('the folder backend does NOT pin an existing row to its path', async () => {
@@ -203,7 +233,7 @@ describe('the shared invariant', () => {
     const a = { id: 'scn_a', name: 'Line A' };
     const folder = await openFolder([row(a, 'scenes/pinned-a.scene.glb')]);
 
-    await expect(folder.writeScene('scenes/somewhere-else.scene.glb', glbWrite('scn_a', 'Line A')))
+    await expect(writeSceneDocument(folder, 'scenes/somewhere-else.scene.glb', glbWrite('scn_a', 'Line A')))
       .resolves.toBeTruthy();
   });
 });
@@ -217,11 +247,11 @@ describe('BrowserBackend.writeScene — an existing row pins the path', () => {
 
     // `scenes/free.scene.glb` is well-formed and owned by nobody — and still
     // refused, because `scn_a` already lives somewhere.
-    await expect(backend.writeScene('scenes/free.scene.glb', glbWrite('scn_a', 'Line A')))
+    await expect(writeSceneDocument(backend, 'scenes/free.scene.glb', glbWrite('scn_a', 'Line A')))
       .rejects.toThrow(/Scene scn_a is stored at "scenes\/pinned-a\.scene\.glb"/);
 
     // Its own stored path goes through, of course.
-    await expect(backend.writeScene('scenes/pinned-a.scene.glb', glbWrite('scn_a', 'Line A')))
+    await expect(writeSceneDocument(backend, 'scenes/pinned-a.scene.glb', glbWrite('scn_a', 'Line A')))
       .resolves.toBeTruthy();
   });
 });
@@ -242,13 +272,13 @@ describe('BrowserBackend.writeScene — the token collision', () => {
 
     // B owns the path.
     const backend = await openBrowser([row(b, shared)]);
-    const bRevision = await backend.writeScene(shared, glbWrite(b.id, b.name));
+    const bRevision = await writeSceneDocument(backend, shared, glbWrite(b.id, b.name));
     expect(readSceneGlbPointer(b.id)?.sha).toBe(bRevision);
 
     // A wants the same path. Its own canonical path IS this path — a check
     // that only compared against `sceneGlbRelPathFor(meta)` would have let it
     // through, and A would have taken over B's row.
-    await expect(backend.writeScene(shared, glbWrite(a.id, a.name)))
+    await expect(writeSceneDocument(backend, shared, glbWrite(a.id, a.name)))
       .rejects.toThrow(/belongs to scene a\/b/);
 
     // B is untouched and A never got a body.

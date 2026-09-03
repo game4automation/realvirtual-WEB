@@ -223,7 +223,7 @@ describe('writeSettingsIntoModel', () => {
   });
 
   it('bakes into the real demo GLB without touching its geometry', () => {
-    const path = resolve(__dirname, '../public/DemoRealvirtualWeb.glb');
+    const path = resolve(__dirname, '../public/demo-realvirtual/DemoRealvirtualWeb.glb');
     const source = new Uint8Array(readFileSync(path));
     const json = parseGlbChunks(source).json as {
       nodes: { name?: string; children?: number[] }[];

@@ -14,27 +14,32 @@
  *
  * It used to read `/scenes/index.json`, the curated second catalogue. There is
  * no such file and no such folder any more: the examples are `documents[]` rows
- * of `/project.json`, the SAME list the models are in. So the fetch changed and
- * the assertions did not — which is exactly the claim the plan makes.
+ * of the demo manifest, the SAME list the models are in. So the fetch changed
+ * and the assertions did not — which is exactly the claim the plan makes.
+ *
+ * ## What moved again (plan-737)
+ *
+ * That manifest is `/demo-realvirtual/project.json` now, and its document paths
+ * resolve inside that folder. Same principle a second time: the addresses moved,
+ * the claims did not.
  *
  * What is pinned:
  *   1. the second catalogue is GONE, file and folder both (F2);
  *   2. every scene-section document names a file the deploy really serves,
  *      and that file is a GLB carrying its classification;
  *   3. the dev-only fixture is a row like any other, marked `devOnly`;
- *   4. `BundledBackend.readScene()` answers a GLB `SceneRecord` for one.
+ *   4. `BundledBackend.readDocument()` answers a GLB `SceneRecord` for one.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { classificationOfGlbBlob } from '../src/core/project/rv-project-documents';
-import { BundledBackend } from '../src/core/project/backends/bundled-backend';
-import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { BundledBackend, DEMO_BASE_PATH } from '../src/core/project/backends/bundled-backend';
 import { documentsOf, stableDocumentId } from '../src/core/project/rv-project-documents';
 import type { RvDocumentEntry, RvProject } from '../src/core/project/rv-project-types';
 
 /** The manifest as the deploy publishes it — the ONE catalogue. */
 async function shippedManifest(): Promise<RvProject> {
-  const resp = await fetch('/project.json', { cache: 'no-store' });
+  const resp = await fetch('/demo-realvirtual/project.json', { cache: 'no-store' });
   expect(resp.ok).toBe(true);
   return await resp.json() as RvProject;
 }
@@ -47,7 +52,11 @@ describe('the shipped examples are documents (plan-731 F2)', () => {
   beforeEach(async () => {
     manifest = await shippedManifest();
     documents = documentsOf(manifest);
-    scenes = sceneDocumentsOf(manifest) as unknown as RvDocumentEntry[];
+    // By CLASSIFICATION since plan-736, not by `section`: the demo's examples
+    // live at the project ROOT, so no path prefix identifies them and the
+    // stored section was the only thing that did. `classification.level` says
+    // what a document IS, and its truth lives in the GLB (plan-413 §2.5).
+    scenes = documents.filter(d => d.classification?.level === 'scene');
   });
 
   it('the second catalogue is gone — no scenes/index.json, no scenes/ folder', async () => {
@@ -76,7 +85,9 @@ describe('the shipped examples are documents (plan-731 F2)', () => {
 
   it('every scene document names a GLB the deploy really serves', async () => {
     for (const doc of scenes) {
-      const resp = await fetch(`/${doc.path}`, { cache: 'no-store' });
+      // Resolved against the DEMO FOLDER (plan-737): a manifest's paths are
+      // relative to the manifest, and the manifest moved with the documents.
+      const resp = await fetch(`/demo-realvirtual/${doc.path}`, { cache: 'no-store' });
       expect(resp.ok, `${doc.path} is served`).toBe(true);
       const bytes = new Uint8Array(await resp.arrayBuffer());
       // 'glTF' — not a JSON body (or an index.html) wearing a .glb name.
@@ -105,22 +116,27 @@ describe('the shipped examples are documents (plan-731 F2)', () => {
     }
   });
 
-  it('BundledBackend.readScene answers a GLB SceneRecord for a scene document', async () => {
+  it('BundledBackend.readDocument answers GLB bytes for a scene document', async () => {
     const backend = new BundledBackend({
       baseUrl: '/',
+      // The DEMO instance's base path (plan-737) — this test reads the demo's
+      // manifest, so it must be the backend that addresses the demo's folder.
+      basePath: DEMO_BASE_PATH,
       // The deploy root of this test IS the dev server, so the real fetch is
       // the honest implementation here.
       fetchImpl: fetch.bind(globalThis),
     });
 
-    const read = sceneDocumentsOf(await backend.readManifest());
-    const meta = read.find(s => s.path === scenes[0]!.path);
-    expect(meta, 'the example is a manifest scene entry').toBeTruthy();
+    // The manifest's own rows, by path — the same selection the suite makes
+    // above, and no longer a section projection (plan-736).
+    const read = documentsOf(await backend.readManifest());
+    const meta = read.find(d => d.path === scenes[0]!.path);
+    expect(meta, 'the example is a manifest document row').toBeTruthy();
 
-    const record = await backend.readScene(meta!.path);
+    const record = await backend.readDocument(meta!.path);
     expect(record).toBeTruthy();
-    expect(record!.glb).toBeTruthy();
-    expect(new DataView(record!.glb.buffer, record!.glb.byteOffset, 4).getUint32(0, true))
+    expect(record!.bytes).toBeTruthy();
+    expect(new DataView(record!.bytes.buffer, record!.bytes.byteOffset, 4).getUint32(0, true))
       .toBe(0x46546c67);
   });
 });

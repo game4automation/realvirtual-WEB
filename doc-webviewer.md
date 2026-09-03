@@ -2990,20 +2990,23 @@ drag, and refused as a move/rename source by the tree rules themselves, so the
 MCP write path obeys it too. `web_project_tree` is built from the same listing
 call, so an agent and the screen see one tree.
 
-**Built-in demos are a read-only root.** The models a build ships
-(`DemoRealvirtualWeb` and friends) appear as a *Built-in demos* catalog root with
-a padlock. It is read-only through the ordinary `writable: false` rule — no
-special case — and opening one loads it exactly as the `?model=` deep link does,
-**without switching the open project**. In a dev checkout that carries the same
-GLB inside its project folder, the project's own row wins and the built-in is
-dropped (matched on the file name).
+**There is no *Built-in demos* root any more (plan-737).** The models a build
+ships used to appear under a read-only catalog root of that name. It was removed
+outright, because the demo stopped being a deploy artefact and became an ordinary
+project: `public/demo-realvirtual/` in this checkout, a writable
+`projects/demo-realvirtual/` in a customer workspace, and the open project itself
+on the hosted demo. The root had two problems the move ends rather than
+mitigates — in a customer delivery it listed the *customer's* machines under the
+heading "Built-in demos", and on the demo deploy it duplicated the open project's
+own rows. The demo's documents are normal project rows now, with a real path, a
+real *used by*, and the verbs of a project that can actually be written to.
 
 **Markdown has a preview and an editor.** Selecting a `*.knowledge.md` — or any
 other `.md` the full view now lists — gives the detail pane *Preview | Edit*
 tabs. Preview goes through the same lazy `react-markdown` chunk the node
 knowledge field uses; Edit is a plain textarea (no new dependency) and is
 offered only where the project is writable, saving through the ordinary
-`writeBlob` seam.
+`writeDocument` seam.
 
 **New document is a button.** The single most-used verb on the screen was a 16px
 plus among three other icon buttons; it is now a contained Instrument-Blue

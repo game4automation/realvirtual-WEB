@@ -210,7 +210,7 @@ class ProjectLibraryProvider implements LibrarySourceProvider {
         if (!entry?.localPath) {
           throw new Error(`Asset "${assetId}" is not in project "${project.name}".`);
         }
-        const blob = await backend.readBlobUrl(entry.localPath);
+        const blob = await backend.readDocumentUrl(entry.localPath);
         if (!blob) throw new Error(`Asset "${entry.localPath}" could not be read.`);
         return { url: blob.url, revokeUrl: () => blob.release() };
       },

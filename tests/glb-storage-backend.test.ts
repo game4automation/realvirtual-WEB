@@ -60,6 +60,7 @@ import {
   type SceneSyncNotice,
 } from '../src/core/hmi/scene/rv-scene-live-sync';
 import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { writeSceneDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -109,29 +110,29 @@ afterEach(async () => {
 describe('Ablage — where a scene body goes', () => {
   it('writes to OPFS when there is no project folder', async () => {
     const backend = await openBrowser();
-    const revision = await backend.writeScene(SCENE.id, glbWrite(SCENE.id, SCENE.name));
+    const revision = await writeSceneDocument(backend, SCENE.id, glbWrite(SCENE.id, SCENE.name));
 
     // The bytes are in the content-addressed store under their own digest…
     expect(await listBlobs()).toContain(revision);
     // …and localStorage holds a pointer, not a body.
     expect(readSceneGlbPointer(SCENE.id)?.sha).toBe(revision);
 
-    const record = await backend.readScene(SCENE.id);
-    expect(record?.glb).not.toBeNull();
+    const record = await backend.readDocument(SCENE.id);
+    expect(record?.bytes).not.toBeNull();
     expect(record?.revision).toBe(revision);
   });
 
   it('writes into the project folder when there is one', async () => {
     const root = folderWithScene();
     const backend = await openFolder(root);
-    const revision = await backend.writeScene(REL, glbWrite(SCENE.id, SCENE.name));
+    const revision = await writeSceneDocument(backend, REL, glbWrite(SCENE.id, SCENE.name));
 
     const stored = await root.readTextAt('scenes', REL.split('/')[1]!);
     expect(stored).toContain(SCENE.id);
     expect(revision).toBe(await revisionOfBytes(glbBytes(SCENE.id, SCENE.name)));
 
-    const record = await backend.readScene(REL);
-    expect(record?.glb).toBeTruthy();
+    const record = await backend.readDocument(REL);
+    expect(record?.bytes).toBeTruthy();
     expect(record?.meta.id).toBe(SCENE.id);
     expect(record?.revision).toBe(revision);
   });
@@ -139,7 +140,7 @@ describe('Ablage — where a scene body goes', () => {
   it('lists scenes from the manifest without reading a single body', async () => {
     const root = folderWithScene();
     const backend = await openFolder(root);
-    await backend.writeScene(REL, glbWrite(SCENE.id, SCENE.name));
+    await writeSceneDocument(backend, REL, glbWrite(SCENE.id, SCENE.name));
 
     // Any read of the body would trip this.
     root.failures.fail({ point: 'getFile', name: REL.split('/')[1]! });
@@ -169,7 +170,7 @@ describe('Persistenz-Grant', () => {
 
       // …and the user keeps working. That is the decision on open question 2:
       // a warning, never a block.
-      const revision = await backend.writeScene(SCENE.id, glbWrite(SCENE.id));
+      const revision = await writeSceneDocument(backend, SCENE.id, glbWrite(SCENE.id));
       expect(await listBlobs()).toContain(revision);
     } finally {
       storage.persist = realPersist;
@@ -185,58 +186,58 @@ describe('Nebenläufigkeit — Revision statt Verlust', () => {
   it('folder: a stale expected revision is a conflict, not an overwrite', async () => {
     const root = folderWithScene();
     const backend = await openFolder(root);
-    const first = await backend.writeScene(REL, glbWrite(SCENE.id, 'v1'));
-    const second = await backend.writeScene(REL, { ...glbWrite(SCENE.id, 'v2'), expectedRevision: first });
+    const first = await writeSceneDocument(backend, REL, glbWrite(SCENE.id, 'v1'));
+    const second = await writeSceneDocument(backend, REL, { ...glbWrite(SCENE.id, 'v2'), expectedRevision: first });
 
     await expect(
-      backend.writeScene(REL, { ...glbWrite(SCENE.id, 'v3'), expectedRevision: first }),
+      writeSceneDocument(backend, REL, { ...glbWrite(SCENE.id, 'v3'), expectedRevision: first }),
     ).rejects.toBeInstanceOf(SceneRevisionConflictError);
 
     // The loser changed nothing: v2 is still what is stored.
-    expect((await backend.readScene(REL))?.revision).toBe(second);
+    expect((await backend.readDocument(REL))?.revision).toBe(second);
     expect(await root.readTextAt('scenes', REL.split('/')[1]!)).toContain('v2');
   });
 
   it('browser: two tabs, and the second one is told instead of winning', async () => {
     const tabA = await openBrowser();
     const tabB = await openBrowser();          // same keyspace, same project
-    const base = await tabA.writeScene(SCENE.id, glbWrite(SCENE.id, 'v1'));
+    const base = await writeSceneDocument(tabA, SCENE.id, glbWrite(SCENE.id, 'v1'));
 
     // Both tabs read `base`; A saves first.
-    await tabA.writeScene(SCENE.id, { ...glbWrite(SCENE.id, 'A'), expectedRevision: base });
+    await writeSceneDocument(tabA, SCENE.id, { ...glbWrite(SCENE.id, 'A'), expectedRevision: base });
     await expect(
-      tabB.writeScene(SCENE.id, { ...glbWrite(SCENE.id, 'B'), expectedRevision: base }),
+      writeSceneDocument(tabB, SCENE.id, { ...glbWrite(SCENE.id, 'B'), expectedRevision: base }),
     ).rejects.toBeInstanceOf(SceneRevisionConflictError);
 
-    expect(new TextDecoder().decode((await tabA.readScene(SCENE.id))!.glb!)).toContain(':A');
+    expect(new TextDecoder().decode((await tabA.readDocument(SCENE.id))!.bytes!)).toContain(':A');
   });
 
   it('expecting "new" fails once something is stored', async () => {
     const backend = await openBrowser();
-    await backend.writeScene(SCENE.id, glbWrite(SCENE.id));
+    await writeSceneDocument(backend, SCENE.id, glbWrite(SCENE.id));
     await expect(
-      backend.writeScene(SCENE.id, { ...glbWrite(SCENE.id), expectedRevision: null }),
+      writeSceneDocument(backend, SCENE.id, { ...glbWrite(SCENE.id), expectedRevision: null }),
     ).rejects.toBeInstanceOf(SceneRevisionConflictError);
   });
 
   it('an omitted expectation writes unconditionally — the migrator’s escape hatch', async () => {
     const backend = await openBrowser();
-    await backend.writeScene(SCENE.id, glbWrite(SCENE.id, 'v1'));
-    const revision = await backend.writeScene(SCENE.id, glbWrite(SCENE.id, 'v2'));
+    await writeSceneDocument(backend, SCENE.id, glbWrite(SCENE.id, 'v1'));
+    const revision = await writeSceneDocument(backend, SCENE.id, glbWrite(SCENE.id, 'v2'));
     expect(readSceneGlbPointer(SCENE.id)?.sha).toBe(revision);
   });
 
   it('an external change to the project folder is detected as a conflict', async () => {
     const root = folderWithScene();
     const backend = await openFolder(root);
-    const mine = await backend.writeScene(REL, glbWrite(SCENE.id, 'mine'));
+    const mine = await writeSceneDocument(backend, REL, glbWrite(SCENE.id, 'mine'));
 
     // Someone else — a git pull, a second app, a text editor — replaces the
     // file. Nothing announces it; the only evidence is the changed bytes.
     root.seedDir('scenes').seedText(REL.split('/')[1]!, 'someone else wrote this');
 
     await expect(
-      backend.writeScene(REL, { ...glbWrite(SCENE.id, 'mine2'), expectedRevision: mine }),
+      writeSceneDocument(backend, REL, { ...glbWrite(SCENE.id, 'mine2'), expectedRevision: mine }),
     ).rejects.toBeInstanceOf(SceneRevisionConflictError);
     // And their content is still there — we did not silently win.
     expect(await root.readTextAt('scenes', REL.split('/')[1]!)).toBe('someone else wrote this');
@@ -249,14 +250,14 @@ describe('Atomarer Ersatz — kein Teilzustand', () => {
   it('a failed write leaves the previous body byte-for-byte intact', async () => {
     const root = folderWithScene();
     const backend = await openFolder(root);
-    const good = await backend.writeScene(REL, glbWrite(SCENE.id, 'good'));
+    const good = await writeSceneDocument(backend, REL, glbWrite(SCENE.id, 'good'));
     const before = await root.readTextAt('scenes', REL.split('/')[1]!);
 
     root.failures.fail({ point: 'write', name: REL.split('/')[1]!, times: 1 });
-    await expect(backend.writeScene(REL, glbWrite(SCENE.id, 'doomed'))).rejects.toThrow();
+    await expect(writeSceneDocument(backend, REL, glbWrite(SCENE.id, 'doomed'))).rejects.toThrow();
 
     expect(await root.readTextAt('scenes', REL.split('/')[1]!)).toBe(before);
-    expect((await backend.readScene(REL))?.revision).toBe(good);
+    expect((await backend.readDocument(REL))?.revision).toBe(good);
   });
 
   it('a failed first write leaves no zero-byte file behind', async () => {
@@ -268,12 +269,12 @@ describe('Atomarer Ersatz — kein Teilzustand', () => {
       name: REL.split('/')[1]!,
       error: namedError('QuotaExceededError', 'disk full'),
     });
-    await expect(backend.writeScene(REL, glbWrite(SCENE.id))).rejects.toThrow(/disk full/);
+    await expect(writeSceneDocument(backend, REL, glbWrite(SCENE.id))).rejects.toThrow(/disk full/);
 
     // "No scene here" must not have become "a scene with an empty body" —
     // the second is a corrupt file where the first was merely an absent one.
     root.failures.clear();
-    expect(await backend.readScene(REL)).toBeNull();
+    expect(await backend.readDocument(REL)).toBeNull();
     const scenes = await root.getDirectoryHandle('scenes').catch(() => null);
     expect(scenes?.childNames() ?? []).not.toContain(REL.split('/')[1]!);
   });

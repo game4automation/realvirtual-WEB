@@ -24,26 +24,20 @@
 
 import {
   getOrCreateSubfolder,
-  writeBlobFile,
 } from '../../engine/rv-local-filesystem';
 import { emitSceneMutation } from '../../hmi/scene/rv-scene-mutations';
 import {
-  deleteSceneFile,
+  atomicReplaceFile,
   readManifest,
-  readSceneGlbFile,
   readSettingsFile,
   splitRelPath,
-  writeSceneGlbFile,
 } from '../rv-project-storage';
 import { assertReadableScenePath } from '../rv-legacy-format';
 import { CONNECT_CONFIG_SUFFIX, KNOWLEDGE_FILE_SUFFIX } from '../rv-project-refs';
 import {
   assertRevisionPrecondition,
-  glbSceneRecord,
   revisionOfBytes,
-  type SceneRecord,
   type SceneRevision,
-  type SceneWrite,
 } from '../rv-scene-record';
 import {
   RVProjectFolderWriter,
@@ -66,11 +60,17 @@ import {
 } from '../rv-project-types';
 import {
   assertWritable,
+  docPathOf,
+  docRefOf,
+  documentRecord,
   isInternalProjectPath,
+  preconditionOf,
   WriteQueue,
+  type DocRef,
+  type DocumentRecord,
   type ProjectBackend,
   type ResolvedBackendBlob,
-  type WriteBlobOptions,
+  type WriteDocumentOptions,
 } from './project-backend';
 
 export interface FolderBackendOptions {
@@ -151,18 +151,46 @@ export class FolderBackend implements ProjectBackend {
   }
 
   /**
-   * Read one scene body. GLB, and nothing else (plan-413 phase 6).
+   * Read one document body — bytes, manifest metadata, revision.
+   *
+   * The former `readScene` plus `readBlobBytes`, which on a folder backend were
+   * always the same file read: one attached the manifest row and hashed the
+   * bytes, the other threw both away. Reading a model now costs exactly what
+   * reading a scene did and answers the same three questions, which is what
+   * lets every caller hand the revision straight back to
+   * {@link writeDocument}.
    *
    * A `.scene.json` path is refused before any I/O rather than parsed and
    * found wanting: the bytes of a JSON body are perfectly readable, so a
    * tolerant reader would hand back a "GLB" that only fails four layers later,
    * as a broken render instead of a sentence the user can act on.
    */
-  async readScene(relPath: string): Promise<SceneRecord | null> {
+  async readDocument(ref: DocRef): Promise<DocumentRecord | null> {
+    const relPath = docPathOf(ref);
     assertReadableScenePath(relPath);
     const meta = await this._entryForPath(relPath);
-    const glb = await readSceneGlbFile(this._dir, relPath);
-    return glb ? glbSceneRecord(glb, { ...meta, path: relPath }) : null;
+    const bytes = await this._bytesAt(relPath);
+    return bytes ? documentRecord(bytes, { ...meta, path: relPath }) : null;
+  }
+
+  /**
+   * Raw bytes at a project-relative path, or null.
+   *
+   * Resolves the folder half segment by segment — see the note in
+   * {@link writeDocument}. `readSceneGlbFile` does it in one `getDirectoryHandle`
+   * call, which works for `scenes/` and for nothing deeper, and a document can
+   * live anywhere in the tree since plan-716.
+   */
+  private async _bytesAt(relPath: string): Promise<Uint8Array | null> {
+    const { folder, filename } = splitRelPath(relPath);
+    const dir = folder ? await this._resolveDir(folder) : this._dir;
+    if (!dir) return null;
+    try {
+      const file = await (await dir.getFileHandle(filename)).getFile();
+      return new Uint8Array(await file.arrayBuffer());
+    } catch {
+      return null;
+    }
   }
 
   readSettings(relPath?: string): Promise<unknown | null> {
@@ -430,108 +458,122 @@ export class FolderBackend implements ProjectBackend {
   // ─── Write (delegated — see the file header) ──────────────────────────
 
   /**
-   * Write a scene GLB into the project folder, under a precondition.
+   * Write one document body into the project folder, under a precondition.
    *
-   * ## Why this one does *not* go through `RVProjectFolderWriter`
+   * ## Why this does *not* go through `RVProjectFolderWriter`
    *
    * The file header says scene writes are delegated to the writer, and for
-   * the JSON body they still are — the writer is what carries the RR1
+   * the manifest they still are — the writer is what carries the RR1
    * ownership check and the debounce that keeps a save from writing the file
    * five times a second. But the writer is driven by the scene **mutation
    * bus**, whose events carry an `RvScene`, and its whole reason for existing
-   * is to serialise that object. A GLB body is not derivable from it.
+   * is to serialise that object. A byte body is not derivable from it.
    *
-   * Rather than push bytes through a bus that speaks op-logs, the GLB path is
+   * Rather than push bytes through a bus that speaks op-logs, the body path is
    * direct and keeps the two guarantees the writer would have provided:
    * `_assertPathMatchesEntry` is the RR1 check, unchanged, and
    * `writeSceneGlbFile` is atomic. What it does not keep is the debounce —
-   * that belongs on the *caller* side (the phase-6 autosave), because a
-   * compare-and-swap write cannot be coalesced by something that does not
-   * know which revision each queued version was based on.
+   * that belongs on the *caller* side, because a compare-and-swap write cannot
+   * be coalesced by something that does not know which revision each queued
+   * version was based on.
    *
-   * `relPath` is still validated rather than obeyed: a path owned by another
-   * scene is refused here, which is cheaper than discovering it after the
+   * ## What plan-736 changed here
+   *
+   * `writeBlob` used to sit beside this with a *conditional* precondition and a
+   * non-atomic `writeBlobFile`. Both differences are gone: every document is
+   * written through the atomic replace, and every write states its expectation.
+   * The read that the precondition costs is the price scenes have always paid;
+   * `'any'` is still available for a caller that genuinely has nothing to
+   * compare against, and it skips the read exactly as before.
+   *
+   * `relPath` is validated rather than obeyed: a path owned by another
+   * document is refused here, which is cheaper than discovering it after the
    * file is gone.
    */
-  async writeScene(relPath: string, write: SceneWrite): Promise<SceneRevision> {
+  async writeDocument(
+    ref: DocRef,
+    bytes: Uint8Array,
+    opts: WriteDocumentOptions,
+  ): Promise<{ revision: SceneRevision }> {
     assertWritable(this);
-    const id = write.meta?.id;
-    if (!id) throw new Error('writeScene needs meta.id.');
-    this._assertPathMatchesEntry(relPath, id);
+    const { path: relPath, id, meta } = docRefOf(ref);
+    // A caller that hands over a row hands over its id with it — see the same
+    // guard, with the same words and the same reasoning, in `BrowserBackend`.
+    if (meta && !meta.id) throw new Error('writeScene needs meta.id.');
+    // The RR1 collision guard, now for every document rather than for scenes
+    // only. A caller that does not know its id cannot be checked — which is the
+    // same position `writeBlob` left every asset write in, so this is strictly
+    // more protection than before, never less.
+    const ownId = meta?.id ?? id;
+    if (ownId) this._assertPathMatchesEntry(relPath, ownId);
+    const { folder, filename } = splitRelPath(relPath);
+    const expected = preconditionOf(opts.expectedRevision);
 
     return this._writes.run(async () => {
       // Read-before-write: the stored revision is the only thing that can tell
       // us somebody edited this file in the folder since we last looked. On the
       // queue, so a write already accepted cannot land between this read and
-      // the write below.
-      const current = await readSceneGlbFile(this._dir, relPath);
-      const actual = current ? await revisionOfBytes(current) : null;
-      assertRevisionPrecondition(relPath, write.expectedRevision, actual);
-
-      await writeSceneGlbFile(this._dir, relPath, write.glb);
-      return revisionOfBytes(write.glb);
-    });
-  }
-
-  /**
-   * Delete a scene body.
-   *
-   * Direct rather than through the mutation bus: the writer would have to
-   * derive the filename from the scene id, and the manifest path is the only
-   * thing that actually knows it. The manifest-entry check above is what keeps
-   * R2 intact, so this is still never a tidy-up of something unmanaged — and
-   * the bus still hears about it, so the writer retires the manifest row.
-   */
-  async deleteScene(relPath: string): Promise<void> {
-    assertWritable(this);
-    const id = this._entryIdForPath(relPath);
-    if (!id) throw new Error(`No manifest entry owns "${relPath}" — refusing to delete.`);
-    await deleteSceneFile(this._dir, relPath);
-    emitSceneMutation({ type: 'delete', id });
-  }
-
-  /**
-   * Write a binary artefact, optionally under a revision precondition.
-   *
-   * The precondition costs a read here (there is no stored digest to consult,
-   * unlike the browser backend) — which is why it is OPT-IN: a caller that
-   * passes no `opts` performs exactly the same single write it always did, with
-   * no extra file access at all.
-   */
-  async writeBlob(relPath: string, blob: Blob, opts?: WriteBlobOptions): Promise<void> {
-    assertWritable(this);
-    const { folder, filename } = splitRelPath(relPath);
-    return this._writes.run(async () => {
-      if (opts && opts.expectedRevision !== undefined) {
+      // the write below. Skipped entirely for `'any'`, which is what makes an
+      // unconditional overwrite cost exactly one file access.
+      if (expected !== undefined) {
         assertRevisionPrecondition(
-          relPath, opts.expectedRevision, await this._blobRevision(folder, filename));
+          relPath, expected, await this._blobRevision(folder, filename));
       }
-      // Segment by segment, for the same reason `readBlobUrl` resolves that way:
-      // `getDirectoryHandle` takes ONE name, and `library/.trash` is not a
-      // directory called "library/.trash" — it is two lookups. Handing the whole
-      // string to the real API throws; handing it to a Map-shaped test double
-      // quietly "works", which is how the trash path could look tested and still
-      // have been unreachable on disk.
-      //
       // AFTER the precondition, deliberately: `_createDir` creates, and a
       // refused write must not leave an empty directory behind as its trace.
+      //
+      // Segment by segment, for the same reason `readDocumentUrl` resolves that
+      // way: `getDirectoryHandle` takes ONE name, and `library/Custom` is not a
+      // directory called "library/Custom" — it is two lookups. Handing the whole
+      // string to the real API throws; handing it to a Map-shaped test double
+      // quietly "works", which is how a nested path can look tested and still be
+      // unreachable on disk. (`writeSceneGlbFile` resolves the one-shot way and
+      // was only ever given the single-segment `scenes/`, which is why the bug
+      // it carries has never fired.)
       const dir = folder ? await this._createDir(folder) : this._dir;
-      await writeBlobFile(dir, filename, blob);
+      await atomicReplaceFile(
+        dir,
+        filename,
+        new Blob([bytes as unknown as BlobPart], { type: 'model/gltf-binary' }),
+      );
+      return { revision: await revisionOfBytes(bytes) };
     });
   }
 
-  async deleteBlob(relPath: string): Promise<void> {
+  /**
+   * Delete one document body.
+   *
+   * Direct rather than through the mutation bus: the writer would have to
+   * derive the filename from the document id, and the manifest path is the
+   * only thing that actually knows it. The bus still hears about it when a row
+   * owns the path, so the writer retires that row.
+   *
+   * ## Why the "no manifest entry owns this" refusal is gone
+   *
+   * `deleteScene` used to throw for an unowned path while `deleteBlob`, one
+   * screen down, deleted it without a word. That was not two policies; it was
+   * the `section` split showing through on the delete path. Tolerance wins
+   * because it is the one of the two that is idempotent: the caller's intent
+   * ("this must not be there") is already satisfied by a file that is not
+   * there, and R2 — never tidy away what nobody asked about — is a rule about
+   * the *writer's* own sweeps, not about an explicit delete.
+   */
+  async deleteDocument(ref: DocRef): Promise<void> {
     assertWritable(this);
+    const relPath = docPathOf(ref);
+    const id = docRefOf(ref).id ?? this._entryIdForPath(relPath);
     const { folder, filename } = splitRelPath(relPath);
-    return this._writes.run(async () => {
+    await this._writes.run(async () => {
       try {
+        // Segment by segment, like every other path resolution here.
         const dir = folder ? await this._resolveDir(folder) : this._dir;
-        if (!dir) return;              // the folder never existed — already gone
+        if (!dir) return;            // the folder never existed — already gone
         await dir.removeEntry(filename);
       } catch {
         // Already gone — the desired end state.
       }
     });
+    if (id) emitSceneMutation({ type: 'delete', id });
   }
 
   /** SHA-256 of what is stored at `folder/filename`, or null when nothing is. */
@@ -549,8 +591,8 @@ export class FolderBackend implements ProjectBackend {
     }
   }
 
-  async readBlobUrl(relPath: string): Promise<ResolvedBackendBlob | null> {
-    const { folder, filename } = splitRelPath(relPath);
+  async readDocumentUrl(ref: DocRef): Promise<ResolvedBackendBlob | null> {
+    const { folder, filename } = splitRelPath(docPathOf(ref));
     // `folder` can be several segments deep (`models/library/PalletHandling`),
     // and `getDirectoryHandle` takes ONE name — a slashed string is not a
     // directory called "a/b", it is a lookup that always fails.
@@ -564,18 +606,6 @@ export class FolderBackend implements ProjectBackend {
     }
     const url = URL.createObjectURL(file);
     return { url, release: () => URL.revokeObjectURL(url) };
-  }
-
-  async readBlobBytes(relPath: string): Promise<ArrayBuffer | null> {
-    const { folder, filename } = splitRelPath(relPath);
-    const dir = folder ? await this._resolveDir(folder) : this._dir;
-    if (!dir) return null;
-    try {
-      // A `File` already IS the bytes on disk; `readBlobUrl` only wraps it.
-      return await (await (await dir.getFileHandle(filename)).getFile()).arrayBuffer();
-    } catch {
-      return null;
-    }
   }
 
   async flush(): Promise<void> {

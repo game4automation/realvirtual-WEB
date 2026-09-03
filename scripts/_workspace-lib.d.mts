@@ -69,6 +69,12 @@ export function renderFeatureMatrix(
   projectPlugins?: Array<{ file: string; name: string }> | null,
   options?: { customerScoped?: boolean },
 ): string;
+/**
+ * Stages public/demo-realvirtual/ into <destinationRoot>/projects/demo-realvirtual/,
+ * DELETING whatever was there first (plan-737 F4: always overwrite).
+ * Returns false when the core tree carries no demo folder.
+ */
+export function copyDemoRealvirtualFolder(coreRoot: string, destinationRoot: string): boolean;
 export function stageFilteredSourceTree(options: Record<string, any>): { workspaceRoot: string; coreRoot: string; privateRoot: string | null; project: any; projectKey: string | null; projectKeys: string[]; delivery: any; manifest: TierManifest };
 export function assertNoCrossTierLeak(workspaceRoot: string, manifest: TierManifest, profile: DeliveryProfile): void;
 export function assertWorkspaceGuards(workspaceRoot: string, options?: Record<string, any>): void;

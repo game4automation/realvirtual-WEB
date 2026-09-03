@@ -84,24 +84,48 @@ describe('resolveActiveProject with a root manifest (F9, F14)', () => {
     localStorage.removeItem(LS_KEY_LAST_PROJECT);
   });
 
+  // ── `rootBackend`, not `bundledBackend` (plan-737) ─────────────────────
+  //
+  // These tests are all about ONE question: "has the deploy ROOT published a
+  // project?". Until plan-737 that question was answered by the same backend
+  // that served the demo, because the demo manifest WAS the root manifest —
+  // one file, `public/project.json`, wearing both hats. So injecting it as
+  // `bundledBackend` expressed the root fact by accident.
+  //
+  // The demo lives in `demo-realvirtual/` now and the two backends are
+  // separate objects reading separate files. The root fact has to be stated
+  // as a root fact, or these tests would be silently exercising the demo
+  // probe — which answers true on nearly every channel and would make every
+  // assertion below vacuous.
   it('F9: the workspace demo folder is not even consulted', async () => {
     const spy = vi.fn(async () => null);
     (store as unknown as Record<string, unknown>)._resolveWorkspaceDemoProject = spy;
-    await store.resolveActiveProject({ bundledBackend: serving(DEMO_MANIFEST) });
+    await store.resolveActiveProject({ rootBackend: serving(DEMO_MANIFEST), bundledBackend: bare() });
     expect(spy).not.toHaveBeenCalled();
   });
 
   it('F9 control: without a root manifest it still is', async () => {
     const spy = vi.fn(async () => null);
     (store as unknown as Record<string, unknown>)._resolveWorkspaceDemoProject = spy;
-    await store.resolveActiveProject({ bundledBackend: bare() });
+    await store.resolveActiveProject({ rootBackend: bare(), bundledBackend: bare() });
+    expect(spy).toHaveBeenCalled();
+  });
+
+  // The new half of the control, and the one plan-737 actually turns on: a
+  // deploy that carries the DEMO folder but no root manifest must still reach
+  // the workspace branch. If the guard had kept reading the demo probe, this
+  // is the case that would have silently stopped working — on every channel.
+  it('F9: a demo folder alone does not count as a root manifest', async () => {
+    const spy = vi.fn(async () => null);
+    (store as unknown as Record<string, unknown>)._resolveWorkspaceDemoProject = spy;
+    await store.resolveActiveProject({ rootBackend: bare(), bundledBackend: serving(DEMO_MANIFEST) });
     expect(spy).toHaveBeenCalled();
   });
 
   it('F14: the eager scn_ migration still runs — it did not fall out of the boot', async () => {
     const spy = vi.fn(async () => {});
     (store as unknown as Record<string, unknown>)._migrateWorkspaceScenes = spy;
-    await store.resolveActiveProject({ bundledBackend: serving(DEMO_MANIFEST) });
+    await store.resolveActiveProject({ rootBackend: serving(DEMO_MANIFEST), bundledBackend: bare() });
     expect(spy).toHaveBeenCalled();
   });
 
@@ -109,7 +133,8 @@ describe('resolveActiveProject with a root manifest (F9, F14)', () => {
     const spy = vi.fn(async () => {});
     (store as unknown as Record<string, unknown>)._migrateWorkspaceScenes = spy;
     await store.resolveActiveProject({
-      bundledBackend: serving(DEMO_MANIFEST),
+      rootBackend: serving(DEMO_MANIFEST),
+      bundledBackend: bare(),
       migrateScenes: false,
     });
     expect(spy).not.toHaveBeenCalled();
@@ -121,7 +146,9 @@ describe('resolveActiveProject with a root manifest (F9, F14)', () => {
     // `public/project.json` is therefore NOT the behaviour-neutral step the
     // plan called Phase 1 additive. Pinned here so the switch is a decision
     // somebody made, not a surprise somebody finds in production.
-    const resolved = await store.resolveActiveProject({ bundledBackend: serving(DEMO_MANIFEST) });
+    const resolved = await store.resolveActiveProject({
+      rootBackend: serving(DEMO_MANIFEST), bundledBackend: bare(),
+    });
     expect(resolved.backend.kind).toBe('bundled');
     expect(resolved.project?.id).toBe(SAMPLE_PROJECT_ID);
   });

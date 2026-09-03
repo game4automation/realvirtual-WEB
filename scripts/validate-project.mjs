@@ -39,7 +39,6 @@ import {
   documentsOf,
   isContainedRef,
   projectConnectRefs,
-  sectionOfDocument,
 } from './_rv-manifest.mjs';
 
 const MANIFEST = 'project.json';
@@ -157,12 +156,13 @@ function validateReferences(root, manifest) {
       }
     }
   };
-  // documents[] first — the list since plan-413 phase 6. Each entry is checked
-  // against the folder its section names, so a scene entry that lost its
-  // `scenes/` prefix is still found rather than reported as missing.
-  for (const entry of documentsOf(manifest)) {
-    check([entry], 'documents', sectionOfDocument(entry));
-  }
+  // documents[] first — the list since plan-413 phase 6. Checked against the
+  // project root and nothing else: a `documents[]` path is project-relative by
+  // definition, so it either exists at that path or it does not (plan-736
+  // Phase 3). The second candidate this used to build — the folder the row's
+  // SECTION named — was a fallback for a row that had lost its own prefix, and
+  // it could only ever turn a genuinely missing file into a silent pass.
+  check(documentsOf(manifest), 'documents', null);
   // The pre-413 arrays, for a manifest that still carries them.
   check(manifest.scenes, 'scenes', 'scenes');
   check(manifest.models, 'models', 'models');
@@ -357,7 +357,7 @@ function validateVendorBlock(manifest) {
 function validateAssetHashes(root, manifest) {
   if (!manifest) return;
   const groups = [
-    ...documentsOf(manifest).map(entry => ['documents', sectionOfDocument(entry), [entry]]),
+    ['documents', null, documentsOf(manifest)],
     ['models', 'models', manifest.models],
     ['library', 'library', manifest.library],
   ];
@@ -368,7 +368,8 @@ function validateAssetHashes(root, manifest) {
       const { path: rel, sha256 } = entry;
       if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(sha256)) continue;
       if (typeof rel !== 'string' || !rel) continue;
-      const file = [join(root, folder, rel), join(root, rel)].find(p => existsSync(p));
+      const file = (folder ? [join(root, folder, rel), join(root, rel)] : [join(root, rel)])
+        .find(p => existsSync(p));
       if (!file) continue;
       const actual = createHash('sha256').update(readFileSync(file)).digest('hex');
       if (actual !== sha256.toLowerCase()) {

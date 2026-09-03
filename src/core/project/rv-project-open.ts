@@ -122,6 +122,17 @@ export interface ResumeInputs {
   defaultModel?: string | null | undefined;
   /** Kiosk. Beats everything (decision 3). */
   modeLocked?: boolean;
+  /**
+   * The manifest says `kind: "demo"` (plan-434). A public demo is a showcase,
+   * not a workspace: every visit to the bare URL must land on the deployer's
+   * start document, or the flagship HMI demo silently turns into whatever the
+   * visitor tried last — after one planner session the public demo re-opened
+   * DemoPlanner in planner mode instead of the HMI demo (2026-09-02, /demo).
+   * A shared URL still wins (it is an explicit statement), only the remembered
+   * pair and the remembered MODE are skipped — the same reasoning the kiosk
+   * lock applies, minus the URL override.
+   */
+  demoProject?: boolean;
 }
 
 /**
@@ -202,13 +213,20 @@ export function resolveResumeTarget(inputs: ResumeInputs): ResumeTarget {
     if (value !== '') return { asset: value, mode: null, source: 'url' };
   }
 
-  const remembered = inputs.remembered;
+  // Demo deployments skip the remembered pair (see `ResumeInputs.demoProject`):
+  // the bare URL always presents the start document, only an explicit URL
+  // (handled above) overrides it.
+  const remembered = inputs.demoProject ? null : inputs.remembered;
   if (remembered && remembered.asset.trim() !== '') {
     return {
       asset: remembered.asset.trim(),
       mode: remembered.mode?.trim() || null,
       source: 'remembered',
     };
+  }
+
+  if (inputs.demoProject && fallback !== '') {
+    return { asset: fallback, mode: null, source: 'defaultModel' };
   }
 
   const projectActive = (inputs.projectActive ?? '').trim();

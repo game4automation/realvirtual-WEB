@@ -981,11 +981,31 @@ export function assertNoDevArtifacts(distDir) {
 //! `RV_PUBLIC_MODEL_PREFIX` escape hatch, so the signature is additive: every
 //! existing caller (and every existing test) that passes no `keep` keeps the
 //! behaviour it had.
+//! Folder name of the demo project inside a deploy root (plan-737).
+//! Mirrors `DEMO_PROJECT_FOLDER` in `src/core/project/backends/bundled-backend.ts`;
+//! `tests/bunny-deploy.node.test.ts` pins the two together.
+export const PUBLIC_DEMO_FOLDER = 'demo-realvirtual';
+
+//! `dist/demo-realvirtual` — the base every public-demo guard works from since
+//! plan-737, and the only place the folder name is turned into a path.
+export function publicDemoDir(distDir) {
+  return join(distDir, PUBLIC_DEMO_FOLDER);
+}
+
 export function applyPublicModelAllowlist(
   distDir,
   { prefix = PUBLIC_MODEL_PREFIX, dryRun = false, keep = null } = {},
 ) {
-  const modelsDir = join(distDir, 'models');
+  // ── Where the demo's models live (plan-737) ──────────────────────────
+  //
+  // They are the ROOT-LEVEL documents of `dist/demo-realvirtual/`, not
+  // `dist/models/*.glb`. `models/` is still honoured — a deploy may carry one,
+  // and a private deploy's staging writes exactly that shape — so the pass
+  // prunes whichever of the two this dist actually has, with the demo folder
+  // taking precedence. Without this the guard would find an empty `models/`,
+  // keep nothing, and print "no model matches" on a perfectly good build.
+  const demoDir = publicDemoDir(distDir);
+  const modelsDir = existsSync(demoDir) ? demoDir : join(distDir, 'models');
   const kept = [];
   const dropped = [];
   const droppedAssets = [];
@@ -1034,10 +1054,22 @@ export function applyPublicModelAllowlist(
     }
   }
 
-  // Step 4: authoritative model manifest for the selector (always-upload file).
-  if (!dryRun) {
-    writeFileSync(join(distDir, 'models.json'), JSON.stringify(kept.slice().sort()));
-  }
+  // ── Step 4 is GONE: `models.json` is not a second catalogue (plan-737) ──
+  //
+  // This used to rewrite `dist/models.json` to the kept filenames, so the model
+  // selector listed exactly what shipped. It was already a duplicate of the
+  // manifest — the same set, derived twice — and after the demo moved into its
+  // own folder it became a WRONG duplicate: `main.ts` resolves a `models.json`
+  // name to `<BASE_URL>models/<name>`, so every entry would have pointed at a
+  // path the demo no longer uses and 404'd.
+  //
+  // The selector reads `demo-realvirtual/project.json` directly now (plan-737
+  // Phase 2), which is the same rule as everywhere else — a document exists
+  // because a `project.json` says so — and leaves exactly one curator instead
+  // of two that agree only by coincidence. `models.json` survives as what it
+  // always genuinely was: the file a PRIVATE deploy publishes about ITSELF
+  // (`stagePrivateProject`) and the one `getRemoteBackend()` reads off a
+  // foreign host. Neither is written here.
 
   return {
     kept: kept.sort(),
@@ -1061,17 +1093,24 @@ export function applyPublicModelAllowlist(
 //! see `assertPublicDemoManifestSatisfied()` for the check that covers all of
 //! them at once.
 export function publicDemoModelAllowlist(distDir) {
-  const manifest = readDeployManifest(distDir);
+  // The demo's own manifest, inside its own folder (plan-737). Falls back to a
+  // root manifest so a dist/ in the pre-737 shape still answers — that is what
+  // keeps `--no-build` re-runs over an old dist/ from silently pruning it bare.
+  const demoDir = publicDemoDir(distDir);
+  const manifest = readDeployManifest(existsSync(demoDir) ? demoDir : distDir);
   if (!manifest) return null;
   const documents = Array.isArray(manifest.documents) ? manifest.documents : [];
   const out = [];
   for (const doc of documents) {
     const raw = manifestDocumentPath(doc);
-    const segments = raw.split('/');
-    if (segments.length !== 2) continue;
-    if (segments[0].toLowerCase() !== 'models') continue;
     if (!raw.toLowerCase().endsWith('.glb')) continue;
-    out.push(segments[1]);
+    const segments = raw.split('/');
+    // ROOT-LEVEL of the demo folder is the shape the demo actually has, and
+    // `models/<file>` stays accepted for a deploy that uses that layout. A
+    // deeper path (notably `library/…`) is somebody else's surface — the
+    // library is app-level and is neither curated nor pruned by this pass.
+    if (segments.length === 1) out.push(segments[0]);
+    else if (segments.length === 2 && segments[0].toLowerCase() === 'models') out.push(segments[1]);
   }
   return out;
 }
@@ -1110,16 +1149,25 @@ function manifestDocumentPath(doc) {
 //! Returns the list of offending paths; the caller decides to throw. Never
 //! throws by itself, and a dist/ with no manifest is vacuously fine (`[]`).
 export function publicDemoManifestMisses(distDir) {
-  const manifest = readDeployManifest(distDir);
+  // Resolved against the DEMO FOLDER since plan-737 — the manifest's paths are
+  // relative to the manifest, and the manifest moved. Checking them against
+  // `dist/` would report every document as missing.
+  const demoDir = publicDemoDir(distDir);
+  const root = existsSync(demoDir) ? demoDir : distDir;
+  const manifest = readDeployManifest(root);
   if (!manifest) return [];
   const documents = Array.isArray(manifest.documents) ? manifest.documents : [];
   const misses = [];
   for (const doc of documents) {
     const rel = manifestDocumentPath(doc);
     if (rel === '') continue;
-    const section = rel.split('/')[0].toLowerCase();
-    if (section !== 'models' && section !== 'scenes') continue;
-    if (!existsOnDiskExactly(distDir, rel)) misses.push(rel);
+    // EVERY document is checked now, not just `models/` and `scenes/`. That
+    // narrowing existed because the demo's rows lived in those two folders; the
+    // demo's rows are root-level in its own folder today, so the old rule
+    // checked precisely nothing. `library/` stays exempt for its original
+    // reason — it is an app-level subscription, staged by another step.
+    if (rel.split('/')[0].toLowerCase() === 'library') continue;
+    if (!existsOnDiskExactly(root, rel)) misses.push(rel);
   }
   return misses;
 }
@@ -1180,7 +1228,15 @@ export function applyPublicScenePruning(distDir, { prefix = PUBLIC_TEST_SCENE_PR
   const pfx = String(prefix || PUBLIC_TEST_SCENE_PREFIX).toLowerCase();
 
   // ── Pass 1: the manifest's own dev-only rows ──────────────────────────
-  const manifestPath = join(distDir, 'project.json');
+  //
+  // Rooted at the DEMO FOLDER since plan-737, for both halves: the manifest is
+  // read there, and `row.path` is resolved there. Rooting the delete at `dist/`
+  // while reading the manifest from the folder would delete nothing and report
+  // success — the exact silent-stop failure the pass-2 fallback below exists to
+  // prevent, so it must not be reintroduced by the base path.
+  const demoDir = publicDemoDir(distDir);
+  const manifestRoot = existsSync(demoDir) ? demoDir : distDir;
+  const manifestPath = join(manifestRoot, 'project.json');
   if (existsSync(manifestPath)) {
     let manifest = null;
     try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch { manifest = null; }
@@ -1193,7 +1249,7 @@ export function applyPublicScenePruning(distDir, { prefix = PUBLIC_TEST_SCENE_PR
         if (!path) { survivors.push(row); continue; }
         if (row.devOnly === true) {
           dropped.push(path);
-          if (!dryRun) rmSync(join(distDir, path), { force: true });
+          if (!dryRun) rmSync(join(manifestRoot, path), { force: true });
         } else {
           kept.push(path);
           survivors.push(row);

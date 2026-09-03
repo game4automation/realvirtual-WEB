@@ -63,19 +63,33 @@ const tracked = (): string[] => {
   return lines(git('ls-files')).filter(p => !deleted.has(p));
 };
 
-/** The model documents of the shipped manifest — the delivery decision. */
+/**
+ * The file names the shipped manifest accounts for — the delivery decision.
+ *
+ * ## Selected by PLACE since plan-736
+ *
+ * The demo documents live at the ROOT of `public/` since 2026-08-31. This used
+ * to recognise them by `section === 'models'` — a stored field, because a root
+ * path has no folder to read one off — with `models/` as a fallback spelling.
+ *
+ * The field is gone, and it turns out nothing of substance was resting on it:
+ * this guard asks "is a file sitting in `public/models/` one the manifest
+ * ships?", and the two places a shipped file can be named from are exactly the
+ * project root and `models/`. Both are visible in the path. A `library/`
+ * component is deliberately NOT in the allowlist — it belongs under
+ * `public/library/`, and a copy of it in `public/models/` is the duplication
+ * this guard exists to catch.
+ */
 function shippedModelFiles(): Set<string> {
-  const manifestPath = resolve(REPO, 'public/project.json');
+  const manifestPath = resolve(REPO, 'public/demo-realvirtual/project.json');
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
-    documents?: Array<{ path?: string; section?: string }>;
+    documents?: Array<{ path?: string }>;
   };
   const files = new Set<string>();
   for (const doc of manifest.documents ?? []) {
     const path = typeof doc.path === 'string' ? doc.path : '';
-    // The demo documents live at the ROOT of public/ since 2026-08-31, typed by
-    // `section`; a `models/` path spelling is still honoured for older rows.
-    const isModel = doc.section === 'models' || path.startsWith('models/');
-    if (!isModel) continue;
+    const atRoot = path !== '' && !path.includes('/');
+    if (!atRoot && !path.startsWith('models/')) continue;
     const name = path.startsWith('models/') ? path.slice('models/'.length) : path;
     if (name && !name.includes('/')) files.add(name);
   }

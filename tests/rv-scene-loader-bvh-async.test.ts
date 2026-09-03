@@ -350,4 +350,21 @@ describe('async BVH build', () => {
     const second = await runOnce();
     expect(second.labels()).toEqual(first.labels());
   });
+
+  it('transferable:false in the options forces EVERY build off the worker transfer route', async () => {
+    // The live-scene path (RVViewer.buildMeshBvhsAsync — CAD import into a
+    // rendering scene) must never let a worker detach position/index buffers:
+    // a first GPU upload inside the detach window leaves the mesh invisible
+    // ("glDrawElements: Insufficient buffer size"). Exclusive-buffer
+    // geometries — exactly the ones the worker WOULD transfer — must come out
+    // flagged transferable:false.
+    const { root } = makeMeshTree(['a', 'b', 'c']);
+    const port = new MockBVHPort();
+    const done = computeBVHAsync(root, port, { transferable: false });
+    await drainAll(port, 3);
+    expect(await done).toBe(true);
+    for (const call of port.calls) {
+      expect(call.options?.transferable).toBe(false);
+    }
+  });
 });

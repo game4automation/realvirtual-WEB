@@ -74,6 +74,7 @@ import { browserManifestKey, browserBlobIndexKey } from '../src/core/project/bac
 import { documentsOf } from '../src/core/project/rv-project-documents';
 import { RV_SCENE_SCHEMA_VERSION, type RvScene } from '../src/core/hmi/scene/rv-scene-types';
 import type { RvProject } from '../src/core/project/rv-project-types';
+import { writeBlobDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -187,7 +188,7 @@ describe('the catalogue becomes documents', () => {
     await runWorkspaceScenesMigration({ backend: testBackend() });
 
     const backend = testBackend();
-    const bytes = await backend.readBlobBytes('scenes/Line A.glb');
+    const bytes = (await backend.readDocument('scenes/Line A.glb'))?.bytes ?? null;
     expect(bytes).not.toBeNull();
     expect(new Uint8Array(bytes!)).toEqual(bodyBytes('scn_a'));
   });
@@ -477,7 +478,7 @@ describe('collisions never overwrite (R2-T)', () => {
   it('does not overwrite a document that is already at the target path', async () => {
     const backend = testBackend();
     await backend.activate();
-    await backend.writeBlob(
+    await writeBlobDocument(backend, 
       'scenes/Line.glb',
       new Blob([bodyBytes('pre-existing') as unknown as BlobPart]),
     );
@@ -493,10 +494,10 @@ describe('collisions never overwrite (R2-T)', () => {
     await runWorkspaceScenesMigration({ backend: testBackend() });
 
     // The incumbent kept its bytes; the migrated row went beside it.
-    const kept = await testBackend().readBlobBytes('scenes/Line.glb');
-    expect(new Uint8Array(kept!)).toEqual(bodyBytes('pre-existing'));
-    const moved = await testBackend().readBlobBytes('scenes/Line 2.glb');
-    expect(new Uint8Array(moved!)).toEqual(bodyBytes('scn_a'));
+    const kept = await testBackend().readDocument('scenes/Line.glb');
+    expect(kept!.bytes).toEqual(bodyBytes('pre-existing'));
+    const moved = await testBackend().readDocument('scenes/Line 2.glb');
+    expect(moved!.bytes).toEqual(bodyBytes('scn_a'));
   });
 });
 
@@ -561,7 +562,7 @@ describe('quota failures abort a row and retire nothing (R1-S3)', () => {
   it('a refused OPFS write aborts its row too, and retires nothing', async () => {
     await seedScene('scn_a', 'Line A');
     const backend = testBackend();
-    vi.spyOn(backend, 'writeBlob').mockRejectedValue(new DOMException('quota', 'QuotaExceededError'));
+    vi.spyOn(backend, 'writeDocument').mockRejectedValue(new DOMException('quota', 'QuotaExceededError'));
 
     const result = await runWorkspaceScenesMigration({ backend });
 

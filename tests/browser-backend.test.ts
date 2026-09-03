@@ -46,6 +46,7 @@ import { clearAllBlobs, sha256OfBlob } from '../src/core/storage/rv-opfs-blobs';
 import { listSceneGlbIds, readSceneGlbPointer } from '../src/core/storage/rv-scene-glb-store';
 import { glbWrite } from './helpers/scene-write';
 import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { writeSceneDocument, writeBlobDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -100,11 +101,11 @@ describe('BrowserBackend — identity', () => {
   it('is inert until activated (§2.2.1b)', async () => {
     const backend = new BrowserBackend(P1, { requestPersistence: false });
     expect(backend.isActive).toBe(false);
-    await expect(backend.writeScene('scn_x', glbWrite('scn_x'))).rejects.toBeInstanceOf(
+    await expect(writeSceneDocument(backend, 'scn_x', glbWrite('scn_x'))).rejects.toBeInstanceOf(
       BackendNotWritableError,
     );
-    await expect(backend.deleteScene('scn_x')).rejects.toBeInstanceOf(BackendNotWritableError);
-    await expect(backend.writeBlob('models/a.glb', new Blob(['x']))).rejects.toBeInstanceOf(
+    await expect(backend.deleteDocument('scn_x')).rejects.toBeInstanceOf(BackendNotWritableError);
+    await expect(writeBlobDocument(backend, 'models/a.glb', new Blob(['x']))).rejects.toBeInstanceOf(
       BackendNotWritableError,
     );
   });
@@ -117,7 +118,7 @@ describe('BrowserBackend — identity', () => {
     expect(await backend.listDocuments()).toEqual([]);
     // A row with no GLB body has no body at all since plan-413 phase 6: the
     // op-log fallback is gone, and `readScene` says so by answering null.
-    expect(await backend.readScene('scn_r')).toBeNull();
+    expect(await backend.readDocument('scn_r')).toBeNull();
   });
 
   it('deactivate closes the gate again and is idempotent', async () => {
@@ -125,7 +126,7 @@ describe('BrowserBackend — identity', () => {
     await backend.deactivate();
     await backend.deactivate();
     expect(backend.isActive).toBe(false);
-    await expect(backend.writeScene('scn_x', glbWrite('scn_x'))).rejects.toBeInstanceOf(
+    await expect(writeSceneDocument(backend, 'scn_x', glbWrite('scn_x'))).rejects.toBeInstanceOf(
       BackendNotWritableError,
     );
   });
@@ -139,7 +140,7 @@ describe('BrowserBackend — identity', () => {
 
   it('refuses a path that addresses a different scene', async () => {
     const backend = await open(P1);
-    await expect(backend.writeScene('scn_other', glbWrite('scn_a'))).rejects.toThrow(/scn_a/);
+    await expect(writeSceneDocument(backend, 'scn_other', glbWrite('scn_a'))).rejects.toThrow(/scn_a/);
   });
 });
 
@@ -152,7 +153,7 @@ describe('BrowserBackend — the scene keyspace is untouched', () => {
     const before = localStorage.getItem('rv-scenes/scn_a');
 
     const backend = await open(P1);
-    await backend.writeScene('scn_a', glbWrite('scn_a', 'Cell 1'));
+    await writeSceneDocument(backend, 'scn_a', glbWrite('scn_a', 'Cell 1'));
 
     // The GLB write goes to OPFS + its own pointer. The op-log record is not
     // rewritten, not deleted and not migrated — phase 7 owns that decision,
@@ -164,7 +165,7 @@ describe('BrowserBackend — the scene keyspace is untouched', () => {
 
   it('stores the GLB body in OPFS and keeps only a pointer in localStorage', async () => {
     const backend = await open(P1);
-    const revision = await backend.writeScene('scn_a', glbWrite('scn_a', 'Cell 1'));
+    const revision = await writeSceneDocument(backend, 'scn_a', glbWrite('scn_a', 'Cell 1'));
 
     const pointer = readSceneGlbPointer('scn_a');
     expect(pointer?.sha).toBe(revision);
@@ -172,14 +173,14 @@ describe('BrowserBackend — the scene keyspace is untouched', () => {
     // localStorage under it.
     expect(pointer?.size).toBeGreaterThan(0);
 
-    const record = await backend.readScene('scn_a');
+    const record = await backend.readDocument('scn_a');
     expect(record?.revision).toBe(revision);
-    expect(new TextDecoder().decode(record!.glb)).toContain('scn_a');
+    expect(new TextDecoder().decode(record!.bytes)).toContain('scn_a');
   });
 
   it('a GLB write leaves the body and the marker, and no index row', async () => {
     const backend = await open(P1);
-    await backend.writeScene('scn_glb_only', glbWrite('scn_glb_only'));
+    await writeSceneDocument(backend, 'scn_glb_only', glbWrite('scn_glb_only'));
     // `writeScene` puts bytes in OPFS and a membership marker beside them; it
     // never touched `rv-scenes-index`, and since Phase 6 nothing derives a
     // listing from that index either.
@@ -190,7 +191,7 @@ describe('BrowserBackend — the scene keyspace is untouched', () => {
 
   it('introduces no key outside its own additive namespace', async () => {
     const backend = await open(P1);
-    await backend.writeScene('scn_a', glbWrite('scn_a'));
+    await writeSceneDocument(backend, 'scn_a', glbWrite('scn_a'));
     await backend.writeManifest({
       schemaVersion: 1,
       id: P1,
@@ -212,7 +213,7 @@ describe('BrowserBackend — the scene keyspace is untouched', () => {
 
   it('records membership but never provenance', async () => {
     const backend = await open(P1);
-    await backend.writeScene('scn_a', glbWrite('scn_a'));
+    await writeSceneDocument(backend, 'scn_a', glbWrite('scn_a'));
 
     const owner = readSceneOwner('scn_a');
     expect(owner?.projectIds).toEqual([P1]);
@@ -228,8 +229,8 @@ describe('BrowserBackend — two browser projects share the keyspace safely', ()
   it('each body carries its own project marker', async () => {
     const one = await open(P1);
     const two = await open(P2);
-    await one.writeScene('scn_1', glbWrite('scn_1', 'Line A'));
-    await two.writeScene('scn_2', glbWrite('scn_2', 'Line B'));
+    await writeSceneDocument(one, 'scn_1', glbWrite('scn_1', 'Line A'));
+    await writeSceneDocument(two, 'scn_2', glbWrite('scn_2', 'Line B'));
 
     // Both bodies are in the one store — the separation is the marker, not
     // the keyspace.
@@ -241,19 +242,19 @@ describe('BrowserBackend — two browser projects share the keyspace safely', ()
   it('neither can overwrite the other: distinct ids are distinct bodies', async () => {
     const one = await open(P1);
     const two = await open(P2);
-    await one.writeScene('scn_1', glbWrite('scn_1', 'Line A'));
-    await two.writeScene('scn_2', glbWrite('scn_2', 'Line B'));
+    await writeSceneDocument(one, 'scn_1', glbWrite('scn_1', 'Line A'));
+    await writeSceneDocument(two, 'scn_2', glbWrite('scn_2', 'Line B'));
 
-    expect(new TextDecoder().decode((await one.readScene('scn_1'))!.glb!)).toContain('Line A');
-    expect(new TextDecoder().decode((await two.readScene('scn_2'))!.glb!)).toContain('Line B');
+    expect(new TextDecoder().decode((await one.readDocument('scn_1'))!.bytes!)).toContain('Line A');
+    expect(new TextDecoder().decode((await two.readDocument('scn_2'))!.bytes!)).toContain('Line B');
   });
 
   it('a shared scene id is sharing, and both projects list it', async () => {
     const one = await open(P1);
     const two = await open(P2);
-    await one.writeScene('scn_shared', glbWrite('scn_shared'));
+    await writeSceneDocument(one, 'scn_shared', glbWrite('scn_shared'));
     // What `createProjectFromScenes()` does: the same id in two manifests.
-    await two.writeScene('scn_shared', glbWrite('scn_shared'));
+    await writeSceneDocument(two, 'scn_shared', glbWrite('scn_shared'));
 
     expect(readSceneOwner('scn_shared')?.projectIds).toEqual([P1, P2]);
   });
@@ -261,10 +262,10 @@ describe('BrowserBackend — two browser projects share the keyspace safely', ()
   it('deleting a shared scene drops only the caller’s claim', async () => {
     const one = await open(P1);
     const two = await open(P2);
-    await one.writeScene('scn_shared', glbWrite('scn_shared'));
-    await two.writeScene('scn_shared', glbWrite('scn_shared'));
+    await writeSceneDocument(one, 'scn_shared', glbWrite('scn_shared'));
+    await writeSceneDocument(two, 'scn_shared', glbWrite('scn_shared'));
 
-    await one.deleteScene('scn_shared');
+    await one.deleteDocument('scn_shared');
 
     // The other owner still has it — and the body is still there.
     expect(readSceneOwner('scn_shared')?.projectIds).toEqual([P2]);
@@ -273,9 +274,9 @@ describe('BrowserBackend — two browser projects share the keyspace safely', ()
 
   it('the last owner deleting takes the body and the marker with it', async () => {
     const one = await open(P1);
-    await one.writeScene('scn_only', glbWrite('scn_only'));
+    await writeSceneDocument(one, 'scn_only', glbWrite('scn_only'));
 
-    await one.deleteScene('scn_only');
+    await one.deleteDocument('scn_only');
 
     expect(readSceneGlbPointer('scn_only')).toBeNull();
     expect(readScene('scn_only')).toBeNull();
@@ -384,9 +385,9 @@ describe('BrowserBackend — manifest', () => {
 describe('BrowserBackend — blobs go to OPFS', () => {
   it('stores and resolves a blob by its manifest path', async () => {
     const backend = await open(P1);
-    await backend.writeBlob('models/cell.glb', new Blob(['glb-bytes']));
+    await writeBlobDocument(backend, 'models/cell.glb', new Blob(['glb-bytes']));
 
-    const resolved = await backend.readBlobUrl('models/cell.glb');
+    const resolved = await backend.readDocumentUrl('models/cell.glb');
     expect(resolved).not.toBeNull();
     expect(await (await fetch(resolved!.url)).text()).toBe('glb-bytes');
     resolved!.release();
@@ -395,8 +396,8 @@ describe('BrowserBackend — blobs go to OPFS', () => {
   it('keys by content, so identical bytes under two paths cost one copy', async () => {
     const backend = await open(P1);
     const sha = await sha256OfBlob(new Blob(['same']));
-    await backend.writeBlob('models/a.glb', new Blob(['same']));
-    await backend.writeBlob('library/b.glb', new Blob(['same']));
+    await writeBlobDocument(backend, 'models/a.glb', new Blob(['same']));
+    await writeBlobDocument(backend, 'library/b.glb', new Blob(['same']));
 
     const index = JSON.parse(localStorage.getItem(browserBlobIndexKey(P1))!);
     expect(index['models/a.glb']).toBe(sha);
@@ -406,27 +407,27 @@ describe('BrowserBackend — blobs go to OPFS', () => {
   it('resolves a bare digest as well as a mapped path', async () => {
     const backend = await open(P1);
     const sha = await sha256OfBlob(new Blob(['direct']));
-    await backend.writeBlob('models/d.glb', new Blob(['direct']));
+    await writeBlobDocument(backend, 'models/d.glb', new Blob(['direct']));
 
-    const resolved = await backend.readBlobUrl(sha);
+    const resolved = await backend.readDocumentUrl(sha);
     expect(resolved).not.toBeNull();
     resolved!.release();
   });
 
   it('returns null for an unknown path instead of a dead url', async () => {
     const backend = await open(P1);
-    expect(await backend.readBlobUrl('models/missing.glb')).toBeNull();
+    expect(await backend.readDocumentUrl('models/missing.glb')).toBeNull();
   });
 
   it('unmapping a path keeps bytes another path still references', async () => {
     const backend = await open(P1);
-    await backend.writeBlob('models/a.glb', new Blob(['same']));
-    await backend.writeBlob('models/b.glb', new Blob(['same']));
+    await writeBlobDocument(backend, 'models/a.glb', new Blob(['same']));
+    await writeBlobDocument(backend, 'models/b.glb', new Blob(['same']));
 
-    await backend.deleteBlob('models/a.glb');
+    await backend.deleteDocument('models/a.glb');
 
-    expect(await backend.readBlobUrl('models/a.glb')).toBeNull();
-    const still = await backend.readBlobUrl('models/b.glb');
+    expect(await backend.readDocumentUrl('models/a.glb')).toBeNull();
+    const still = await backend.readDocumentUrl('models/b.glb');
     expect(still).not.toBeNull();
     still!.release();
   });
@@ -434,9 +435,9 @@ describe('BrowserBackend — blobs go to OPFS', () => {
   it('unmapping the last reference removes the bytes', async () => {
     const backend = await open(P1);
     const sha = await sha256OfBlob(new Blob(['lonely']));
-    await backend.writeBlob('models/only.glb', new Blob(['lonely']));
+    await writeBlobDocument(backend, 'models/only.glb', new Blob(['lonely']));
 
-    await backend.deleteBlob('models/only.glb');
+    await backend.deleteDocument('models/only.glb');
 
     const { hasBlob } = await import('../src/core/storage/rv-opfs-blobs');
     expect(await hasBlob(sha)).toBe(false);
@@ -444,8 +445,8 @@ describe('BrowserBackend — blobs go to OPFS', () => {
 
   it('release() is the backend contract over the store’s revokeUrl()', async () => {
     const backend = await open(P1);
-    await backend.writeBlob('models/r.glb', new Blob(['r']));
-    const resolved = await backend.readBlobUrl('models/r.glb');
+    await writeBlobDocument(backend, 'models/r.glb', new Blob(['r']));
+    const resolved = await backend.readDocumentUrl('models/r.glb');
     resolved!.release();
     expect(() => resolved!.release()).not.toThrow();
   });

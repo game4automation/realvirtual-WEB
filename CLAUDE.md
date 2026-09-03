@@ -104,14 +104,25 @@ src/
 tests/                           # Vitest browser tests
 e2e/                             # Playwright E2E tests
 public/models/                   # GLB storage — NOT a catalogue; nothing is discovered here
-public/project.json              # The DemoRealvirtual manifest — SSOT for what the demo ships
+public/demo-realvirtual/         # The DemoRealvirtual PROJECT — one folder, delivered as-is
+public/demo-realvirtual/project.json  # its manifest: SSOT for what the demo ships
+public/library/                  # The component library — APP-LEVEL, beside the demo, not in it
 ```
 
 Those last two lines used to be a pair with a caveat: dropping a GLB into
 `public/models/` made it a "DEV BUILT-IN" you could pick in the model list even
 though it was not in the demo. **That is gone (plan-735.)** The build-time glob
 over `public/models/*.glb` has been removed, so a file dropped there is invisible
-until a manifest declares it — add a `documents[]` row to `public/project.json`.
+until a manifest declares it — add a `documents[]` row to
+`public/demo-realvirtual/project.json`.
+
+Since plan-737 the demo is **one folder artefact** (`public/demo-realvirtual/`),
+delivered byte-identically to every channel: in place on the hosted demo and in
+the Git mirror, and as a normal writable project (`projects/demo-realvirtual/`)
+in a customer workspace, where every delivery **replaces it in full**. The
+component library is *not* part of it — `public/library/` is app-level, shared
+by every project, and the demo merely subscribes to it through its
+`libraries[]`.
 
 The rule is now the same everywhere and has no exceptions: **a document exists
 because a `project.json` says so.** Every channel publishes one — the hosted demo,

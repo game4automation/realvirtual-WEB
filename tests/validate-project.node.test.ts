@@ -85,12 +85,27 @@ describe('documents[] shape', () => {
     }
   });
 
-  it('resolves a section-relative document against its own folder', () => {
-    // A document that lost its folder prefix is still found, because the
-    // section says which folder it belongs to. Reporting it missing would send
-    // a delivery engineer looking for a file that is right there.
+  it('checks a document against its own path and nothing else (plan-736)', () => {
+    // This used to assert the opposite: a document that had lost its folder
+    // prefix was still found, because the row's `section` named a second folder
+    // to look in. The fallback is gone with the field, and dropping it is the
+    // stricter, more useful behaviour — a `documents[]` path is project-relative
+    // by definition, so a row saying `a.glb` when the file is at `models/a.glb`
+    // is a row that will not resolve at runtime either. Reporting it is the
+    // point of a validator; papering over it sent the engineer looking for a
+    // problem the delivery would hit later, somewhere less legible.
     const dir = project({ ...BASE, documents: [doc({ path: 'a.glb' })] }, ['models/a.glb']);
-    expect(validateProject(dir).warnings.filter(w => w.includes('not present on disk'))).toEqual([]);
+    const missing = validateProject(dir).warnings.filter(w => w.includes('not present on disk'));
+    expect(missing).toHaveLength(1);
+    expect(missing[0]).toContain('a.glb');
+  });
+
+  it('a document whose path IS right passes, wherever in the tree it sits', () => {
+    for (const path of ['models/a.glb', 'library/parts/a.glb', 'a.glb']) {
+      const dir = project({ ...BASE, documents: [doc({ path })] }, [path]);
+      expect(validateProject(dir).warnings.filter(w => w.includes('not present on disk')))
+        .toEqual([]);
+    }
   });
 
   it('checks a stated sha256 on a document, as it always did on models[]', () => {

@@ -160,7 +160,7 @@ describe('plan-717 F4/F9 — no code path writes a sidecar', () => {
     const calls = [...store.matchAll(/\.(\w+)\(\s*SIDECAR_PATH/g)].map(m => m[1]).sort();
     // R1-S3's ordering rule made visible as a shape: the only verbs are a read
     // and a delete, and the delete is unreachable unless the rows are durable.
-    expect([...new Set(calls)]).toEqual(['deleteBlob', 'readBlobBytes']);
+    expect([...new Set(calls)]).toEqual(['deleteDocument', 'readDocument']);
   });
 
   it('the library ops layer has no sidecar knowledge left', () => {

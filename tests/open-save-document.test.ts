@@ -30,7 +30,7 @@
  *
  * `installFakeDocumentProject` hashes what it stores and throws the real
  * `SceneRevisionConflictError`, exactly as both writable backends do under
- * `write-blob-cas.contract.test.ts`. A recording-only fake would pass every
+ * `unified-document-write-cas.test.ts`. A recording-only fake would pass every
  * assertion here for a store that sent no precondition at all.
  */
 

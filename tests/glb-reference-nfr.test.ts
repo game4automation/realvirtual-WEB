@@ -47,7 +47,9 @@ import { loadGLB, type LoadResult } from '../src/core/engine/rv-scene-loader';
 import { setAssetReference } from '../src/core/engine/rv-asset-reference';
 import type { ReferenceResolver } from '../src/core/engine/rv-glb-compose';
 
-const REAL_MODEL = '/DemoRealvirtualWeb.glb';
+// In the demo's own folder since plan-737 — the demo is one folder artefact now,
+// and the dev server serves `public/` at the root, so this is the real address.
+const REAL_MODEL = '/demo-realvirtual/DemoRealvirtualWeb.glb';
 
 /** Distinct `BufferGeometry` instances — the honest proxy for GPU footprint. */
 function distinctGeometries(root: Object3D): number {

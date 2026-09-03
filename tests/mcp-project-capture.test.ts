@@ -29,9 +29,21 @@ function fakeBackend(opts: { writable?: boolean; files?: Record<string, string> 
   const files = opts.files ?? {};
   const backend = {
     kind: 'browser', id: 'test', writable: opts.writable !== false, isActive: true,
-    writeBlob: async (path: string, blob: Blob) => { rec.writes.push({ path, blob }); },
-    readBlobBytes: async (path: string) =>
-      path in files ? (new TextEncoder().encode(files[path]).buffer as ArrayBuffer) : null,
+    writeDocument: async (ref: string | { path: string }, bytes: Uint8Array) => {
+      const path = typeof ref === 'string' ? ref : ref.path;
+      rec.writes.push({ path, blob: new Blob([bytes as unknown as BlobPart]) });
+      return { revision: 'rev' };
+    },
+    readDocument: async (ref: string | { path: string }) => {
+      const path = typeof ref === 'string' ? ref : ref.path;
+      return path in files
+        ? {
+          bytes: new TextEncoder().encode(files[path]),
+          meta: { id: '', name: path, path },
+          revision: 'rev',
+        }
+        : null;
+    },
   } as unknown as ProjectBackend;
   return { backend, rec };
 }

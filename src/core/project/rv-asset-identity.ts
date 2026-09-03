@@ -102,14 +102,15 @@ function normalisePath(path: string): string {
 export function findDocumentByPath(
   project: RvProject | null | undefined,
   path: string,
-  section?: DocumentSection,
 ): RvDocumentEntry | null {
   const wanted = normalisePath(path);
   if (wanted === '') return null;
+  // The optional `section` filter that used to narrow this is gone (plan-736
+  // §2.3). It was only ever passed additively — no caller had two rows at one
+  // path to tell apart — and a path IS unique in a manifest, so the filter could
+  // only ever turn a correct hit into a miss.
   for (const doc of readDocuments(project) ?? []) {
-    if (normalisePath(doc.path) !== wanted) continue;
-    if (section && sectionOfDocument(doc) !== section) continue;
-    return doc;
+    if (normalisePath(doc.path) === wanted) return doc;
   }
   return null;
 }
@@ -175,8 +176,6 @@ export function assertNoDocumentIdCollisions(project: RvProject | null | undefin
 export interface AssetIdentityRequest {
   /** Project-relative path the bytes were just written to. */
   path: string;
-  /** Which storage surface. Defaults to the path-derived section. */
-  section?: DocumentSection;
   /** Display name; the file stem when omitted. */
   name?: string;
   /**
@@ -188,8 +187,8 @@ export interface AssetIdentityRequest {
   /**
    * Extra row fields to record with the mint — stats the adopt verb just
    * learnt (`sizeBytes`, `mtimeMs`, `sha256`), and from Phase 2 the collections
-   * ingested out of a sidecar. `id`, `path`, `name` and `section` are owned by
-   * the request above and cannot be overridden here.
+   * ingested out of a sidecar. `id`, `path` and `name` are owned by the
+   * request above and cannot be overridden here.
    */
   extra?: Partial<RvDocumentEntry>;
 }
@@ -211,14 +210,6 @@ function stemOf(path: string): string {
   return file.replace(/\.(scene\.)?(glb|gltf|json|splat|ksplat|ply)$/i, '') || file;
 }
 
-/** Section a path belongs to when the caller does not say. */
-function sectionOfPath(path: string): DocumentSection {
-  const p = normalisePath(path);
-  if (p.startsWith('scenes/')) return 'scenes';
-  if (p.startsWith('models/')) return 'models';
-  return 'library';
-}
-
 /**
  * Give the file at `request.path` a durable identity — **exactly one row**.
  *
@@ -238,9 +229,8 @@ export function mintAssetIdentity(
 ): AssetIdentityResult {
   const path = normalisePath(request.path);
   if (path === '') throw new Error('mintAssetIdentity needs a path.');
-  const section = request.section ?? sectionOfPath(path);
 
-  const existing = findDocumentByPath(project, path, section);
+  const existing = findDocumentByPath(project, path);
   if (existing) return { project, entry: existing, minted: false };
 
   const id = request.id?.trim() || previewAssetId(path);
@@ -254,7 +244,6 @@ export function mintAssetIdentity(
     id,
     path,
     name: request.name?.trim() || stemOf(path),
-    section,
   };
   const documents = [...(readDocuments(project) ?? []), entry];
   return { project: { ...project, documents }, entry, minted: true };
@@ -264,7 +253,6 @@ export function mintAssetIdentity(
 export interface WrittenReference {
   /** Project-relative path of the referenced GLB. */
   path: string;
-  section?: DocumentSection;
   name?: string;
 }
 
@@ -500,7 +488,6 @@ export type AdoptOp =
   | {
     op: 'adopt';
     path: string;
-    section: DocumentSection;
     name: string;
     sizeBytes?: number;
     mtimeMs?: number;
@@ -582,9 +569,12 @@ export interface AdoptScanResult {
  *     (`missingSince`), a later run removes, and only once the mark is older
  *     than the window. A file that comes back clears the mark and keeps its id
  *     and its collections.
- *  5. **Scenes are never orphan candidates.** That section is manifest-driven
- *     on every backend, and on the browser one its bodies are not blobs at all
- *     — every scene row would look missing to a stat list of blobs.
+ *  5. **The stat list is the only authority on what exists.** It used to have
+ *     an exception — scene rows were never orphan candidates, because on the
+ *     browser backend their bodies are not blobs and a blob-only stat list made
+ *     every one of them look missing. Since plan-736 Phase 1 the stat list
+ *     covers every store a backend has, so the exception is gone and no row is
+ *     exempt from the quarantine that protects all of them (point 4).
  *
  * An EMPTY stat list means "the scan learnt nothing" (a backend that cannot
  * stat, a revoked grant mid-scan), never "the project is empty": it returns an
@@ -626,9 +616,15 @@ export async function adoptDiscoveredDocuments(
   const unregistered = [...statByPath.entries()]
     .filter(([path]) => !rowPaths.has(path) && isAdoptablePath(path))
     .map(([path, stat]) => ({ path, stat }));
-  const missing = rows.filter(
-    r => sectionOfDocument(r) !== 'scenes' && !statByPath.has(normalisePath(r.path)),
-  );
+  // Every row whose body this backend does not report. The
+  // `sectionOfDocument(r) !== 'scenes'` half that used to stand here is gone
+  // (plan-736 §2.3 #2): it existed because `statDocuments()` on the browser
+  // backend enumerated only the blob index, so a scene body — which lives in the
+  // GLB store — made its row look missing, and the exclusion was what stood
+  // between that and deletion. Phase 1 made the stat list body-authoritative on
+  // every backend, so "the scan does not see it" now means what it says, and
+  // `document-predicate-equivalence.test.ts` is the measurement that says so.
+  const missing = rows.filter(r => !statByPath.has(normalisePath(r.path)));
 
   // ── 2. Move-match ──
   const claimed = new Set<string>();
@@ -668,7 +664,6 @@ export async function adoptDiscoveredDocuments(
     delta.push({
       op: 'adopt',
       path: candidate.path,
-      section: sectionOfPath(candidate.path),
       // A fresh row has no name to defend, so the sidecar's display name is
       // simply the better one — it is what the user saw before the upgrade.
       name: meta?.displayName?.trim() || stem,
@@ -832,7 +827,7 @@ export function applyAdoptDelta(
         for (let n = 2; n <= 10; n++) {
           try {
             const result = mintAssetIdentity(next, {
-              path: op.path, section: op.section, name: op.name, id, extra,
+              path: op.path, name: op.name, id, extra,
             });
             next = result.project;
             minted = result.entry;

@@ -4135,6 +4135,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
         if (!completed || this._loadGeneration !== generation) return;
 
         this._pickMetrics.setBvhPending(0);
+        // The collision bodies were built while the trees were still pending —
+        // every mesh looked tree-less, so every body latched `aabbOnly` and a
+        // workpiece INSIDE a machine reported a permanent AABB collision
+        // (2026-09-02, /demo: Turbine in the CNC). Rebuild against the finished
+        // trees; the rebuild is lazy and costs one tick.
+        this.collisionManager.invalidate();
         this._renderDirty = true;
         this.emit('raycast-ready', undefined);
       } catch (e) {
@@ -5076,6 +5082,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this._bvhPort ??= createBVHPort();
     void computeBVHAsync(root, this._bvhPort, {
       shouldAbort: () => this._loadGeneration !== generation || isAlive?.() === false,
+      // This entry point adds meshes into a LIVE, rendering scene. The worker
+      // route detaches position/index buffers during a build; a first GPU
+      // upload inside that window leaves the mesh permanently invisible
+      // ("Insufficient buffer size" GL spam). Inline builds never detach.
+      transferable: false,
     }).then((completed) => {
       if (completed && this._loadGeneration === generation) this.markRenderDirty();
     }).catch((e) => {

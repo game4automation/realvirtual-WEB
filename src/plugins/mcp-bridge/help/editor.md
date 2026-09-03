@@ -259,7 +259,7 @@ _58 tools in this family, generated from the @McpTool decorators — do not edit
 | `web_editor_mechanism_validate` | read | `path` string | Validate a rigid-body mechanism: structured findings (MissingBodyB, SameBodyAAndB, UnresolvedBody, AnchorsApart, MissingSecondaryAxis, IdleSpinRod, NegativeDof, DriveAxi… |
 | `web_editor_open` | write | `source` string **req**, `relPath` string, `ifDirty` string | Open the ASSET EDITOR with a document: source=new (creates a NEW document in the open project and opens it) or source=library with relPath (e.g. "Custom/MyAsset.glb", re… |
 | `web_editor_pivot` | write | `path` string **req**, `mode` string **req**, `targetPath` string | Move a node's PIVOT without moving geometry (children compensated, one undo unit). |
-| `web_editor_project_files` | read | `dir` string, `glob` string | List the files the OPEN PROJECT owns, project-relative (path, name, sizeBytes, modified, section, documentId). |
+| `web_editor_project_files` | read | `dir` string, `glob` string | List the files the OPEN PROJECT owns, project-relative (path, name, sizeBytes, modified, folder, documentId). |
 | `web_editor_project_info` | read | — | Locate the KNOWLEDGE FOLDER for the open asset inside the OPEN PROJECT — the durable home for notes, a part catalogue and saved views across sessions. |
 | `web_editor_redo` | write | `count` integer | Redo the last N undone editor operations (default 1). |
 | `web_editor_remove_component` | write | `path` string **req**, `componentType` string **req** | Remove a component from a node by its concrete key (e.g. "Drive" or "Drive_1" — see web_component_get_all). |

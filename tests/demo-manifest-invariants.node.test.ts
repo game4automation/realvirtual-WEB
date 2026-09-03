@@ -40,7 +40,7 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url));
  * a JSON import would let a bundler transform stand between the test and the
  * file it is about.
  */
-const demo = JSON.parse(readFileSync(join(ROOT, 'public', 'project.json'), 'utf8'));
+const demo = JSON.parse(readFileSync(join(ROOT, 'public', 'demo-realvirtual', 'project.json'), 'utf8'));
 
 /**
  * The two constants `bundled-backend.ts` exports, restated as literals.
@@ -112,19 +112,58 @@ describe('the demo project manifest', () => {
     // The runtime half of the deploy guard: a manifest row with no file behind
     // it is a 404 the visitor hits and nobody else does.
     for (const d of demo.documents) {
-      expect(() => readFileSync(join(ROOT, 'public', d.path)), d.path).not.toThrow();
+      expect(() => readFileSync(join(ROOT, 'public', 'demo-realvirtual', d.path)), d.path).not.toThrow();
     }
   });
 
-  it('declares an explicit section on every document', () => {
-    // Root-level paths imply no section, so the row must say what it is — and
-    // when a path DOES sit in a section-named folder, the two must agree.
+  it('declares NO section on any document (plan-736 F3)', () => {
+    /**
+     * The inverse of the invariant that stood here, and deliberately so.
+     *
+     * It used to demand an explicit `section` on every row, on the grounds that
+     * "root-level paths imply no section, so the row must say what it is". That
+     * was true while something CONSUMED the field — the storage routing did,
+     * until plan-736 replaced it with one `writeDocument`. Nothing reads it now,
+     * so a row carrying it is a row asserting something no code can be wrong
+     * about, and the demo manifest is the reference every hand-written and
+     * generated manifest is copied from.
+     *
+     * This is an invariant this repository imposes on ITS OWN manifest, not a
+     * schema rule: a delivered customer `project.json` that still carries
+     * `section` keeps it forever (§F4, `mergeManifest` passthrough), and
+     * `isValidProjectV1` still rejects nothing for having it.
+     */
     for (const d of demo.documents) {
-      expect(['scenes', 'models', 'library'], d.path).toContain(d.section);
-      const folder = d.path.includes('/') ? d.path.split('/')[0] : null;
-      if (folder === 'scenes' || folder === 'models' || folder === 'library') {
-        expect(d.section, d.path).toBe(folder);
-      }
+      expect(d.section, `${d.path} still carries a section`).toBeUndefined();
+    }
+  });
+
+  it('owns no library documents — the library is app-level (plan-737 F7)', () => {
+    // The 17 `library/…` rows that used to sit here made the demo the OWNER of
+    // the shipped component library. Since plan-737 the library is app-level
+    // (`public/library/`, one copy, delivered by DELIVERED_LIBRARY_CATEGORIES)
+    // and the demo is one SUBSCRIBER through its `libraries[]` — which is what
+    // keeps the demo folder a self-contained, always-overwritable artefact.
+    const owned = demo.documents.filter((d: { path: string }) => /^library\//i.test(d.path));
+    expect(owned.map((d: { path: string }) => d.path)).toEqual([]);
+    expect((demo.libraries ?? []).map((l: { url: string }) => l.url)).toContain('library/catalog.json');
+  });
+
+  it('ships the knowledge sidecar the dashboard renders (plan-737 F8)', () => {
+    // `*.knowledge.md`, not a bare `knowledge.md`: only the SUFFIX is listed as
+    // knowledge (KNOWLEDGE_FILE_SUFFIX, rv-project-refs.ts). A plain `.md` would
+    // get the generic preview and never reach the knowledge pane.
+    const knowledge = demo.documents.filter((d: { path: string }) => d.path.endsWith('.knowledge.md'));
+    expect(knowledge.length, 'the demo must explain that it is an overwritable sandbox').toBe(1);
+    expect(() => readFileSync(join(ROOT, 'public', 'demo-realvirtual', knowledge[0].path))).not.toThrow();
+  });
+
+  it('every document says where it is in its PATH', () => {
+    // What the section invariant was really protecting: a row you can locate.
+    // The path is the whole answer now, so it has to be one.
+    for (const d of demo.documents) {
+      expect(typeof d.path === 'string' && d.path.trim() !== '', String(d.path)).toBe(true);
+      expect(d.path.startsWith('/'), d.path).toBe(false);
     }
   });
 });
@@ -193,12 +232,12 @@ describe('the demo model is defined once (plan-726 F10)', () => {
     // the point: a new entry has to be argued into one of these buckets.
     expect(hits).toEqual([
       // ── The one definition of what the demo opens ──
-      'public/project.json',
+      'public/demo-realvirtual/project.json',
 
       // ── Bound to the filename, not to "the default" ──
       // A per-model settings sidecar is addressed BY the model's name; it
       // cannot be expressed through the manifest without inverting that.
-      'public/DemoRealvirtualWeb.settings.json',
+      'public/demo-realvirtual/DemoRealvirtualWeb.settings.json',
 
       // ── Model-plugin bindings: naming their model is their whole job ──
       // `models`/`baseModel` say "attach this plugin when THAT model loads".
@@ -207,11 +246,14 @@ describe('the demo model is defined once (plan-726 F10)', () => {
       'src/plugins/models/DemoRealvirtualWeb/index.ts',
       'src/plugins/models/DemoRealvirtualWeb/model-options.ts',
 
-      // ── Different responsibility: which files SHIP (plan-726 "Nicht anfassen") ──
-      // `DELIVERED_DEMO_MODEL_FILES` is a delivery scope, not a default. A
-      // customer workspace gets the demo model as a REFERENCE model; what the
-      // demo project opens has no bearing on that.
-      'scripts/_workspace-lib.mjs',
+      // ── One FEWER since plan-737 ──
+      // `scripts/_workspace-lib.mjs` used to belong here, for
+      // `DELIVERED_DEMO_MODEL_FILES` — the list of demo files a customer
+      // delivery copied to its deploy root as a "reference model". plan-737
+      // delivers the demo as a whole PROJECT folder, so the delivery no longer
+      // names any file inside it: it copies the folder and lets the folder's
+      // own manifest say what is in it. The count this test tracks went 7 → 6 →
+      // 5, and the direction is the point.
 
       // ── Dev tooling input ──
       // A vignette render script naming its source GLB.
@@ -281,7 +323,7 @@ describe('the published-scene catalogue is gone (plan-731 F2)', () => {
     const start = findStartDocument(demo, demo.settings?.defaultModel);
     expect(start, 'the start document resolves').toBeTruthy();
     expect(start!.settingsPath).toBe('DemoRealvirtualWeb.settings.json');
-    expect(() => readFileSync(join(ROOT, 'public', start!.settingsPath as string)))
+    expect(() => readFileSync(join(ROOT, 'public', 'demo-realvirtual', start!.settingsPath as string)))
       .not.toThrow();
   });
 });

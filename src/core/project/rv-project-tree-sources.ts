@@ -117,18 +117,23 @@ export interface CatalogRootInput {
   writable: boolean;
   /** Remote catalogs carry the `(o)` origin mark of §3.1. */
   remote: boolean;
+  /**
+   * The provider-declared kind of the source (`LibrarySource['kind']`, e.g.
+   * `'github'`). Presentation only — the row icon reads it; no verb does.
+   */
+  sourceKind?: string;
   entries: readonly TreeCatalogEntryInput[];
   /**
    * What one of this root's rows POINTS AT. Defaults to `catalogAsset`.
    *
-   * The built-in demo catalog (plan-445 F6) is a catalog root by structure and
-   * something else entirely by verb: a `catalogAsset` activates into the asset
-   * EDITOR, which is the wrong answer for a demo model — opening one has to
-   * load it as the working scene, exactly as the `?model=` deep link does. The
-   * two are therefore different ref kinds rather than one kind with a flag the
-   * activation handler has to remember to read.
+   * One kind is left. `bundledDocument` — the built-in demo catalog of
+   * plan-445 F6 — went with that root in plan-737: the demo is an ordinary
+   * project now, so its models are `document` rows and need no second ref kind
+   * with a second activation verb. The field survives as an explicit option
+   * because a future root may again need to say "structurally a catalog, but
+   * activated differently".
    */
-  refKind?: 'catalogAsset' | 'bundledDocument';
+  refKind?: 'catalogAsset';
 }
 
 /** What one tree row points at. The tree model itself carries none of this. */
@@ -144,12 +149,6 @@ export type DashboardTreeRef =
    * path so the pane can describe it, and no verb at all.
    */
   | { kind: 'plainFile'; path: string }
-  /**
-   * A read-only built-in demo model (plan-445 F6). `url` is what
-   * `sceneStore.openBuiltin` loads — the same deploy URL the `?model=` deep
-   * link resolves to — so activating one never switches the open project.
-   */
-  | { kind: 'bundledDocument'; url: string; path: string }
   | { kind: 'catalogAsset'; providerId: string; sourceId: string; assetId: string };
 
 export interface DashboardTree {
@@ -406,16 +405,12 @@ export function buildDashboardTree({
       if (!keep({ name, path: base })) continue;
       const path = uniquePath(taken, base);
       files.push({ path, name });
-      refs.set(`${id}/${path}`, catalog.refKind === 'bundledDocument'
-        // A built-in demo is addressed by the URL it loads from, which is what
-        // `assetId` carries for this root — see `CatalogRootInput.refKind`.
-        ? { kind: 'bundledDocument', url: entry.assetId, path }
-        : {
-          kind: 'catalogAsset',
-          providerId: catalog.providerId,
-          sourceId: catalog.sourceId,
-          assetId: entry.assetId,
-        });
+      refs.set(`${id}/${path}`, {
+        kind: 'catalogAsset',
+        providerId: catalog.providerId,
+        sourceId: catalog.sourceId,
+        assetId: entry.assetId,
+      });
     }
 
     roots.push({
@@ -424,6 +419,7 @@ export function buildDashboardTree({
       kind: 'catalog',
       writable: catalog.writable,
       ...(catalog.remote ? { remote: true } : {}),
+      ...(catalog.sourceKind ? { sourceKind: catalog.sourceKind } : {}),
       files,
     });
   }

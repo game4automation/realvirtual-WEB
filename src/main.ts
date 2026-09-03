@@ -108,6 +108,7 @@ import { readActiveId, listMetas } from './core/hmi/scene/rv-scene-storage';
 // function directly — this call site sits OUTSIDE SceneStore, so a
 // store-internal notifier could not reach it (plan-370 RR3).
 import { setActiveSceneId } from './core/hmi/scene/rv-scene-mutations';
+import { arrayBufferOf } from './core/project/rv-scene-record';
 import { getProjectStore } from './core/project/project-store';
 import { scriptRefForModelUrl } from './core/project/rv-project-refs';
 import { requestProjectCodeConsent } from './core/project/rv-project-code-consent';
@@ -126,7 +127,7 @@ import { diagnoseKioskBoot, projectStartDocument, resolveResumeTarget } from './
 import { forgetRememberedSession, readRememberedSession } from './core/project/rv-project-resume-store';
 import { reportMissingDocument } from './core/hmi/scene/rv-scene-live-sync';
 import { openProjectsDashboard } from './core/hmi/projects/projects-dashboard-store';
-import { DEMO_PROJECT_FOLDER } from './core/project/backends/bundled-backend';
+import { DEMO_PROJECT_FOLDER, DEMO_BASE_PATH } from './core/project/backends/bundled-backend';
 import { getLibraryStore } from './core/library/library-store-singleton';
 import { installProjectLibraryProvider } from './core/library/project-library-provider';
 import { installGlobalLibraryProvider } from './core/library/global-library-provider';
@@ -725,7 +726,14 @@ async function init() {
     // manager), and reading a file is all the manager is given — no write side.
     runtimeScriptSource: () => {
       const backend = getProjectStore().getBackend();
-      return backend ? { readBytes: (rel: string) => backend.readBlobBytes(rel) } : null;
+      return backend
+        ? {
+          readBytes: async (rel: string) => {
+            const record = await backend.readDocument(rel);
+            return record ? arrayBufferOf(record.bytes) : null;
+          },
+        }
+        : null;
     },
     // …and it runs only with this project's persisted consent (2b.3, R8).
     runtimeScriptConsent: ({ scriptRef }) => {
@@ -907,6 +915,44 @@ async function init() {
       }
     }
   } catch { /* no manifest — use build-time discovery only */ }
+
+  // ── The demo project's own models (plan-737) ────────────────────────────
+  //
+  // The demo ships as a FOLDER with a manifest in it, so the catalogue reads
+  // that manifest — the same rule as everywhere else since plan-735: a document
+  // exists because a `project.json` says so. This replaces the demo's old share
+  // of `models.json`, which the public deploy used to rewrite from the same
+  // manifest; two derivations of one set is exactly the duplication plan-735
+  // removed, and after the move they no longer even agreed on the URL.
+  //
+  // ADDITIVE, and after `models.json` on purpose. A private deploy's
+  // `models.json` is authoritative about ITS models and clears the list above;
+  // the demo folder is a different project that may sit beside it, so it adds
+  // to the catalogue rather than replacing it. Deduped by filename so a deploy
+  // that carries the demo in both shapes lists it once.
+  //
+  // A deploy without the folder answers 404, the catch keeps boot silent, and
+  // `entries` degrades to whatever else was found — an empty selector, never a
+  // crash.
+  try {
+    const demoBase = `${import.meta.env.BASE_URL}${DEMO_BASE_PATH}`;
+    const resp = await fetch(`${demoBase}project.json`, { cache: 'no-cache' });
+    if (resp.ok) {
+      const manifest = await resp.json() as { documents?: Array<{ path?: unknown; devOnly?: unknown }> };
+      for (const doc of manifest.documents ?? []) {
+        const path = typeof doc?.path === 'string' ? doc.path.replace(/^\.?\//, '') : '';
+        if (!path.toLowerCase().endsWith('.glb')) continue;
+        // `library/` rows are not models — the library is app-level and has its
+        // own browser. (The demo declares none since plan-737; the guard keeps
+        // an older, still-deployed manifest from filling the selector with
+        // component parts.)
+        if (/^library\//i.test(path)) continue;
+        const filename = path.split('/').pop() ?? path;
+        if (entries.some(e => e.filename.toLowerCase() === filename.toLowerCase())) continue;
+        entries.push({ filename, url: `${demoBase}${path}` });
+      }
+    }
+  } catch { /* no demo folder on this deploy — nothing to add */ }
 
   // Discover local working folder models (File System Access API, Chrome/Edge only)
   if (isFsApiSupported()) {
@@ -1753,7 +1799,34 @@ async function init() {
       localStorage.removeItem(LS_KEY_MODEL);
     }
 
-    let modelToLoad = urlModel
+    // ── `?model=` gets the same basename resolution as the others (plan-737) ──
+    //
+    // It was the one of the three that was passed through UNTOUCHED, which was
+    // harmless only while the demo models sat at the deploy root: `?model=` had
+    // been handed a real, working URL. Moving them into `demo-realvirtual/`
+    // turned every shared link into a silent 404 — the value is a URL, so it
+    // loads, and it loads nothing.
+    //
+    // Resolved by FILE NAME, the same key `savedEntry` above uses and the same
+    // one `resolvePublishedAlias()` uses for `?scene=`: the path prefix is a
+    // deployment detail that has now changed three times, the file name is what
+    // people actually shared. So `/DemoRealvirtualWeb.glb`,
+    // `models/DemoRealvirtualWeb.glb` and a bare `DemoRealvirtualWeb.glb` all
+    // land on the entry this deploy really has.
+    //
+    // A `?model=` that matches NOTHING is still passed through unchanged: it may
+    // legitimately address a host this catalogue knows nothing about, and
+    // rewriting it would break the deep links that do work today.
+    const urlModelBase = urlModel?.split(/[?#]/)[0].split('/').pop()?.toLowerCase() ?? '';
+    const urlModelEntry = urlModel
+      ? entries.find(e => e.url === urlModel || e.filename.toLowerCase() === urlModelBase)
+      : null;
+    if (urlModel && urlModelEntry && urlModelEntry.url !== urlModel) {
+      debug('config', `?model="${urlModel}" resolved by file name to ${urlModelEntry.url}`);
+    }
+
+    let modelToLoad = urlModelEntry?.url
+      ?? urlModel
       ?? savedEntry?.url
       ?? resolvedConfigModel
       ?? null;
@@ -1834,6 +1907,9 @@ async function init() {
             // locked deployment must come up in its machine, not in whatever
             // somebody last looked at on that tablet.
             modeLocked,
+            // A public demo ignores the remembered pair too (but not the URL):
+            // the bare link must always present the start document.
+            demoProject: project?.kind === 'demo',
           });
 
           // ── The appliance boot (plan-721 §2.4, F1/F8) ─────────────────
@@ -2008,7 +2084,13 @@ async function init() {
         // this is that guarantee generalised off the `?projectUrl=` path.
         const project = getProjectStore().getProject();
         const documentCount = documentsOf(project).length;
-        const served = getProjectStore().getBundledBackend().hasDeployedManifest();
+        // The ROOT backend, not the demo one (plan-737 §2.4 consumer 3). The
+        // sentence below is about the deploy ROOT, and since the demo moved
+        // into `demo-realvirtual/` the demo probe answers true on virtually
+        // every channel — asking it here would have made the "serves no
+        // project.json" branch unreachable and left case 1 of the four above
+        // permanently misreported as case 3.
+        const served = getProjectStore().getRootBackend().hasDeployedManifest();
         const detail = !served
           ? 'This deploy root serves no project.json, so there is nothing to open. '
             + 'The file may be missing, blocked by CORS, or unreachable from this origin.'

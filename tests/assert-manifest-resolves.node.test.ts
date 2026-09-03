@@ -206,7 +206,7 @@ describe('assertManifestResolves — against the real demo source', () => {
     // carries the fixture, so the gate must refuse it. That is the proof the
     // devOnly rule is live and not vacuously true — if it ever passed here,
     // every channel's use of it would be asserting nothing.
-    const publicDir = resolve(__dirname, '..', 'public');
+    const publicDir = resolve(__dirname, '..', 'public', 'demo-realvirtual');
     expect(() => assertManifestResolves(publicDir)).toThrow(/dev-only/);
   });
 });

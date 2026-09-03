@@ -93,8 +93,8 @@ export async function readSceneGlbBody(sceneId: string): Promise<SceneGlbBody | 
   const entry = projectEntry(sceneId);
   if (backend && entry?.path) {
     try {
-      const record = await backend.readScene(entry.path);
-      if (record?.glb) return { glb: record.glb, revision: record.revision, target: 'project' };
+      const record = await backend.readDocument({ path: entry.path, id: sceneId });
+      if (record?.bytes) return { glb: record.bytes, revision: record.revision, target: 'project' };
     } catch {
       // Fall through: an unreadable project file is not a reason to withhold a
       // body the OPFS store may still have.
@@ -151,11 +151,18 @@ export async function writeSceneGlbBody(write: SceneGlbWrite): Promise<SceneGlbW
       modifiedAt: new Date().toISOString(),
       ...(write.createdAt ? { createdAt: write.createdAt } : {}),
     };
-    const revision = await backend.writeScene(meta.path, {
-      glb: write.glb,
-      meta,
-      expectedRevision: write.expectedRevision,
-    });
+    // `meta` is what makes this a scene body on a backend that keys scene
+    // bodies by id (the browser one). It is caller intent at the call site, not
+    // a stored category — see `BrowserBackend.writeDocument` (plan-736).
+    const { revision } = await backend.writeDocument(
+      { path: meta.path, id: write.sceneId, meta },
+      write.glb,
+      {
+        expectedRevision: write.expectedRevision === undefined
+          ? 'any'
+          : write.expectedRevision === null ? 'create' : write.expectedRevision,
+      },
+    );
     return { revision, target: 'project' };
   }
 

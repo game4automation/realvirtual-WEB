@@ -126,14 +126,15 @@ import type { FolderWriterHost, FolderWriterStatus } from './rv-project-folder-w
 import {
   BundledBackend,
   DEMO_PROJECT_FOLDER,
+  DEMO_BASE_PATH,
   DEMO_PROJECT_ID,
   DEMO_PROJECT_SLUG,
   type BundledBackendOptions,
 } from './backends/bundled-backend';
 import { FolderBackend } from './backends/folder-backend';
-import type { ProjectBackend, ProjectReadProvider } from './backends/project-backend';
+import type { DocumentRecord, ProjectBackend, ProjectReadProvider } from './backends/project-backend';
 import { isSelfContainedGlb, type ProjectAssetSource } from './rv-project-asset-source';
-import { revisionOfBytes, type SceneRecord } from './rv-scene-record';
+import { arrayBufferOf, revisionOfBytes } from './rv-scene-record';
 import {
   hiddenIdsOf, mergeAssetTiers, mergeDocumentTiers,
   type TieredAssetEntry, type TieredDocumentEntry,
@@ -147,6 +148,8 @@ import {
   classificationOfGlbBlob,
   documentKeyOf,
   documentOfSceneEntry,
+  documentsOf,
+  readDocuments,
   assetDocumentsOf,
   reconcileClassificationCache,
   sceneDocumentsOf,
@@ -274,8 +277,17 @@ export interface ResolveProjectOptions {
   projectId?: string;
   /** Options for the bundled backend built on demand. */
   bundled?: BundledBackendOptions;
-  /** Pre-built bundled backend. Tests and callers that already made one. */
+  /** Pre-built DEMO backend. Tests and callers that already made one. */
   bundledBackend?: BundledBackend;
+  /**
+   * Pre-built ROOT backend — the deploy root, without the demo's base path.
+   *
+   * Since plan-737 the two are different objects reading two different files
+   * (`demo-realvirtual/project.json` and `project.json`), so a test that injects
+   * one must be able to inject the other; passing only `bundledBackend` would
+   * leave the root probe reading the real deploy through the real `fetch`.
+   */
+  rootBackend?: BundledBackend;
   /**
    * Deploy root of a project hosted somewhere else (plan-700 Phase 7 / F12).
    *
@@ -537,8 +549,10 @@ export class ProjectStore {
   private _writable = false;
   /** The one backend that may write. Null when nothing is open. */
   private _backend: ProjectBackend | null = null;
-  /** The always-available read-only backend (§2.2.1). Built on first resolve. */
+  /** The always-available read-only DEMO backend (§2.2.1). Built on first resolve. */
   private _bundled: BundledBackend | null = null;
+  /** The deploy ROOT, read separately from the demo since plan-737. */
+  private _rootBackend: BundledBackend | null = null;
   /** Read-only backends for foreign deploy roots, keyed by base URL (F12). */
   private _remotes = new Map<string, BundledBackend>();
   /** Result of {@link resolveActiveProject}, awaiting hydration. */
@@ -652,14 +666,61 @@ export class ProjectStore {
   getProjectDir(): FileSystemDirectoryHandle | null { return this._dir; }
 
   /**
-   * The always-available read-only backend.
+   * The always-available read-only backend: the DEMO project, over HTTP.
    *
    * Built on first use so a store that is never resolved costs nothing, and
    * so tests can inject one via {@link resolveActiveProject}.
+   *
+   * ## The base path is fixed HERE, never passed in (plan-737 §2.4)
+   *
+   * This is a lazy singleton, and it silently DISCARDS `opts` on every call but
+   * the first. There are four call sites with four different options
+   * (`_resolveWorkspaceDemoProject`, two in `main.ts`, one in
+   * `ProjectsDashboardHost`), so "whoever gets here first decides" was already a
+   * sharp edge — and handing it the demo's base path as a caller option would
+   * have made it a correctness bug: the demo would read from
+   * `demo-realvirtual/` or from the deploy root depending on which module
+   * happened to boot first, which is not a property anyone can reason about.
+   *
+   * Constructing it here makes the call order irrelevant, which is what test
+   * 9.1 pins. A caller's `basePath` is ignored on purpose — this factory
+   * returns THE demo backend, and a different folder is a different backend
+   * (see {@link getRemoteBackend}, {@link getRootBackend}).
    */
   getBundledBackend(opts?: BundledBackendOptions): BundledBackend {
-    if (!this._bundled) this._bundled = new BundledBackend(opts);
+    if (!this._bundled) {
+      this._bundled = new BundledBackend({ ...opts, basePath: DEMO_BASE_PATH });
+    }
     return this._bundled;
+  }
+
+  /**
+   * The deploy ROOT itself — a different question from {@link getBundledBackend}.
+   *
+   * Before plan-737 the two were the same object, because the demo WAS the
+   * deploy root: `public/project.json` was both "the demo manifest" and "this
+   * deploy's manifest". Moving the demo into a folder split that identity, and
+   * three consumers in {@link resolveActiveProject} were reading the demo
+   * instance to answer a question about the ROOT:
+   *
+   *  1. the workspace-collision guard (F9) — "has this deploy published its own
+   *     project?", which the demo probe would have answered `true` on almost
+   *     every channel, silencing the guard's else-branch everywhere;
+   *  2. the root fallback — where the backend and the manifest MUST come from
+   *     the same source, or a customer's manifest gets resolved against
+   *     `demo-realvirtual/` URLs;
+   *  3. `main.ts`'s boot diagnosis — "no project.json at the deploy root".
+   *
+   * So the root gets its own instance, with no base path and its own manifest
+   * latch. It costs one conditional request on a deploy that has no root
+   * manifest (the hosted demo), which is the correct price for the three
+   * answers above being about the thing they name.
+   */
+  getRootBackend(opts?: BundledBackendOptions): BundledBackend {
+    if (!this._rootBackend) {
+      this._rootBackend = new BundledBackend({ ...opts, basePath: '', id: opts?.id ?? 'bundled:root' });
+    }
+    return this._rootBackend;
   }
 
   /**
@@ -1063,7 +1124,7 @@ export class ProjectStore {
     return {
       getDirectory: () => (this._writable ? this._dir : null),
       getManifest: () => this._project ?? newProject('Untitled project'),
-      setManifest: p => { this._project = p; this._publish(); },
+      setManifest: (p) => { this._adoptWrittenManifest(p); this._publish(); },
     };
   }
 
@@ -1250,13 +1311,32 @@ export class ProjectStore {
     // reported outcome rather than an impossible one, the throw beside it has
     // to be normal too: no project resolved, fall through to the resolution
     // below exactly as a 404 does.
+    // ── Two probes, two questions (plan-737 §2.4) ─────────────────────────
+    //
+    // `demoManifest` answers "is there a demo project to open?" and
+    // `deployedManifest` answers "has THIS DEPLOY ROOT published a project of
+    // its own?". They used to be one variable because they used to be one file.
+    //
+    // Keeping them apart is the whole Phase-2 correctness argument: after the
+    // demo moved into `demo-realvirtual/`, the demo probe is true on virtually
+    // every channel (the folder ships everywhere), so had the three consumers
+    // below kept reading it, the F9 guard would fire always, the root fallback
+    // would pair a customer manifest with demo-folder URLs, and the boot
+    // diagnosis would never report a rootless deploy again.
+    const rootBackend = opts.rootBackend ?? this.getRootBackend(opts.bundled);
+    let demoManifest: RvProject | null = null;
+    try {
+      demoManifest = await bundled.readManifest();
+    } catch (e) {
+      console.warn('[project] The demo project could not be read from the deploy:', e);
+    }
     let deployedManifest: RvProject | null = null;
     try {
-      deployedManifest = await bundled.readManifest();
+      deployedManifest = await rootBackend.readManifest();
     } catch (e) {
       console.warn('[project] The deploy root could not be read for a project manifest:', e);
     }
-    const hasDeployedManifest = bundled.hasDeployedManifest();
+    const hasDeployedManifest = rootBackend.hasDeployedManifest();
 
     if (!backend) {
       // ── The workspace-folder collision guard (plan-726 F9) ────────────
@@ -1325,8 +1405,25 @@ export class ProjectStore {
 
     if (!backend) {
       if (deployedManifest && hasDeployedManifest) {
-        backend = bundled;
+        // BOTH halves from the ROOT source — the pairing is the point (plan-737
+        // §2.4 consumer 2). Handing the demo backend a root manifest would
+        // resolve a customer's documents against `demo-realvirtual/` URLs and
+        // 404 every one of them, while looking entirely healthy from here.
+        backend = rootBackend;
         project = deployedManifest;
+      } else if (demoManifest && bundled.hasDeployedManifest()) {
+        // The hosted demo: no manifest at the deploy root, a whole demo project
+        // in the folder beside it. Before plan-737 this case WAS the branch
+        // above, because the demo manifest sat at the root; the demo has to
+        // keep booting, so it becomes its own, explicitly named branch instead
+        // of an accident of where a file happened to live.
+        //
+        // Ordered after the root, deliberately: a customer deploy carries both,
+        // and there the customer's own project is the answer — their demo stays
+        // reachable as the second project in the list, never as the thing that
+        // opens instead of their machine.
+        backend = bundled;
+        project = demoManifest;
       }
     }
 
@@ -1708,9 +1805,9 @@ export class ProjectStore {
     entry: RvProjectSceneEntry,
   ): Promise<{ scene: RvScene; revision: string } | null> {
     if (!this._provider || typeof entry.path !== 'string') return null;
-    let record: SceneRecord | null;
+    let record: DocumentRecord | null;
     try {
-      record = await this._provider.readScene(entry.path);
+      record = await this._provider.readDocument({ path: entry.path, id: entry.id });
     } catch {
       this._warnings.push(`Could not read "${entry.path}".`);
       return null;
@@ -2138,16 +2235,58 @@ export class ProjectStore {
   }
 
   /**
-   * The user tier's documents, with the scene half taken from the LIVE manifest.
+   * Install a manifest the writer just wrote, and retire what it dropped.
+   *
+   * ## Why the retirement is explicit now (plan-736 §2.3 #5)
+   *
+   * `_userDocuments` is a ONE-SHOT scan taken when the project opened, while
+   * `_project` is live — the folder writer keeps it current through this very
+   * callback. So a document the writer removes from the manifest is still in
+   * the captured scan, and something has to say that it is gone.
+   *
+   * That something used to be `sectionOfDocument(doc) !== 'scenes'` in
+   * {@link _liveUserDocuments}: captured SCENE rows were never re-appended, so
+   * a deleted scene fell out, while captured non-scene rows always were, so a
+   * folder-driven model with no manifest row survived. One line, two rules, and
+   * which one you got depended on a stored string.
+   *
+   * Both rules were right about their own case and neither was about scenes:
+   * "the manifest dropped this row" and "this body has no row yet" are
+   * different facts, and the section field was standing in for the first. So it
+   * is recorded where it happens — here, by comparing the manifest that goes
+   * out with the one that comes in. Everything else keeps working exactly as
+   * before, including on the browser backend, where paths are bare ids and the
+   * old heuristic could not have answered either question.
+   */
+  private _adoptWrittenManifest(next: RvProject): void {
+    const before = this._project;
+    this._project = next;
+    if (!before) return;
+    const had = new Set((readDocuments(before) ?? []).map(d => d.id).filter(Boolean));
+    const has = new Set((readDocuments(next) ?? []).map(d => d.id).filter(Boolean));
+    if (had.size === 0) return;
+    const retired = [...had].filter(id => !has.has(id));
+    if (retired.length === 0) return;
+    const gone = new Set(retired);
+    this._userDocuments = this._userDocuments.filter(d => !gone.has(d.id));
+  }
+
+  /**
+   * The user tier's documents: the LIVE manifest, over the captured scan.
    *
    * `listDocuments()` runs once, when the project opens — it is a folder scan,
    * and re-running it on every publish would put disk IO behind a synchronous
-   * render. That is right for models and library assets, which change only by
-   * somebody putting a file in a folder, and wrong for scenes, which the user
-   * creates, renames and deletes from this very screen. So the scene half is
-   * re-derived from the manifest's own scene documents, the same list
-   * `_mergeTiers()` reads, which the folder writer keeps current through
-   * `setManifest`.
+   * render. The manifest, by contrast, is live: the folder writer keeps it
+   * current through `setManifest`, so it is the half that knows about anything
+   * the user has created, renamed or deleted from this very screen.
+   *
+   * So the manifest is walked first and the scan is the overlay — not the other
+   * way round. A captured row the manifest does not list is still appended,
+   * because a folder-driven file with no authored row (a read-only project, or
+   * one where the adopt has not run yet) is a real document; a row the manifest
+   * *retired* was already dropped from the capture by
+   * {@link _adoptWrittenManifest}, which is what keeps that append from
+   * resurrecting deleted documents.
    *
    * The classification is merged rather than overwritten: a manifest row that
    * has not been through a scan carries none, and the cached document is then
@@ -2157,19 +2296,40 @@ export class ProjectStore {
     const captured = this._userDocuments;
     // A bundled project has no user tier at all, and nothing in it can change.
     if (this._backend?.kind === 'bundled') return captured;
-    const manifestScenes = sceneDocumentsOf(this._project);
+
+    // ## The scene/non-scene split is gone (plan-736 §2.3 #5)
+    //
+    // This used to walk `sceneDocumentsOf(project)` first and then append every
+    // captured row whose section was NOT `'scenes'`. The split existed because
+    // the scene half was the half the manifest could have moved under the cache
+    // (a save rewrites the row) while the rest was believed static.
+    //
+    // That belief stopped being true when every document became savable, and
+    // the split was doing real harm in the meantime: a captured row the manifest
+    // ALSO listed appeared twice whenever the path heuristic and the stored
+    // section disagreed about it, and a manifest row for a non-scene document
+    // was dropped entirely. Walking the manifest once, with the cache as an
+    // overlay, is both the simpler rule and the one that was intended: the
+    // manifest says which documents there are, the cache says what was learnt
+    // about them.
     const cached = new Map(captured.map(d => [documentKeyOf(d), d]));
     const out: RvDocumentEntry[] = [];
-    for (const entry of manifestScenes) {
+    const seen = new Set<string>();
+    for (const entry of documentsOf(this._project)) {
       if (!entry || typeof entry.path !== 'string') continue;
-      const doc = documentOfSceneEntry(entry);
-      const known = cached.get(documentKeyOf(doc));
+      const doc = documentOfSceneEntry(entry as unknown as RvProjectSceneEntry);
+      const key = documentKeyOf(doc);
+      seen.add(key);
+      const known = cached.get(key);
       out.push(known
         ? { ...known, ...doc, classification: doc.classification ?? known.classification }
         : doc);
     }
+    // Captured rows the manifest does not (yet) list — a document adopted by a
+    // scan whose manifest write has not landed. Dropping them would make a
+    // just-adopted file vanish from the list until the next open.
     for (const doc of captured) {
-      if (sectionOfDocument(doc) !== 'scenes') out.push(doc);
+      if (!seen.has(documentKeyOf(doc))) out.push(doc);
     }
     return out;
   }
@@ -2203,7 +2363,7 @@ export class ProjectStore {
       const scanned = await reconcileClassificationCache(documents, {
         stats,
         readClassification: async path => {
-          const resolved = await backend.readBlobUrl(path);
+          const resolved = await backend.readDocumentUrl(path);
           if (!resolved) return null;
           try {
             const blob = await (await fetch(resolved.url)).blob();
@@ -2229,7 +2389,7 @@ export class ProjectStore {
    * would pull the bytes out from under it.
    */
   async resolveAssetUrl(relPath: string): Promise<string | null> {
-    const resolved = await this._backend?.readBlobUrl(relPath);
+    const resolved = await this._backend?.readDocumentUrl(relPath);
     return resolved?.url ?? null;
   }
 
@@ -2249,14 +2409,15 @@ export class ProjectStore {
   async resolveAssetSource(relPath: string): Promise<ProjectAssetSource | null> {
     const backend = this._backend;
     if (!backend) return null;
-    const bytes = await backend.readBlobBytes(relPath);
+    const read = (await backend.readDocument(relPath))?.bytes ?? null;
+    const bytes = read ? arrayBufferOf(read) : null;
     if (bytes && isSelfContainedGlb(bytes)) return { kind: 'bytes', bytes };
     // Either nothing is stored, or the bytes name sibling files. Falling
     // through to the URL — rather than returning the bytes we already hold —
     // is deliberate: without a base URL the loader cannot fetch those
     // siblings, and a model missing its textures is worse than one more
     // owned object URL.
-    const resolved = await backend.readBlobUrl(relPath);
+    const resolved = await backend.readDocumentUrl(relPath);
     if (!resolved) return null;
     return { kind: 'url', url: resolved.url, release: resolved.release };
   }
@@ -2519,7 +2680,7 @@ export class ProjectStore {
       quarantineMs: this._adoptOptions.quarantineMs,
       sidecar: sidecar.ingestion ?? undefined,
       hashOf: async path => {
-        const bytes = await backend.readBlobBytes(path).catch(() => null);
+        const bytes = await backend.readDocument(path).catch(() => null).then(r => r?.bytes ?? null);
         return bytes ? await revisionOfBytes(bytes) : null;
       },
     });
@@ -2580,7 +2741,7 @@ export class ProjectStore {
   ): Promise<{ ingestion: AdoptSidecarIngestion | null; unreadable: boolean }> {
     let text: string | null = null;
     try {
-      const bytes = await backend.readBlobBytes(SIDECAR_PATH);
+      const bytes = (await backend.readDocument(SIDECAR_PATH))?.bytes ?? null;
       if (bytes) text = new TextDecoder().decode(bytes);
     } catch {
       return { ingestion: null, unreadable: false };   // unreadable BYTES, not a bad shape
@@ -2617,7 +2778,7 @@ export class ProjectStore {
     if (!isSidecarMigrated(this._project)) return false;
     if (!backend.writable) return false;
     try {
-      await backend.deleteBlob(SIDECAR_PATH);
+      await backend.deleteDocument(SIDECAR_PATH);
       return true;
     } catch (e) {
       // A sidecar that outlives its ingestion is harmless — the row wins and
@@ -2853,7 +3014,6 @@ export function sameDocuments(
     const y = b[i]!;
     if (x.id !== y.id || x.name !== y.name || x.path !== y.path
       || x.tier !== y.tier || x.modifiedAt !== y.modifiedAt
-      || x.section !== y.section
       // The three reference fields (plan-718) are row state like everything
       // above: leaving them out made a `setDocumentConnectRef` publish look
       // like "no change", so the hero chip neither appeared on a drop nor

@@ -391,8 +391,8 @@ test.describe('a legacy ?scene=published: link (plan-731 F3)', () => {
     //
     // Not from the source tree and not from a constant here: what a legacy link
     // has to meet is the manifest the deploy actually publishes, and that is the
-    // same document `/project.json` hands the boot.
-    const res = await request.get('/project.json');
+    // same document `/demo-realvirtual/project.json` hands the boot (plan-737).
+    const res = await request.get('/demo-realvirtual/project.json');
     expect(res.ok(), 'the deploy publishes its boot manifest').toBeTruthy();
     const manifest = await res.json() as {
       documents?: { id: string; name: string; path: string; section?: string; devOnly?: boolean }[];

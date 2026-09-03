@@ -255,6 +255,15 @@ export function adoptPlacedNode(
     const snapPlugin = viewer.getPlugin<SnapPointPlugin>('snap-point');
     const snapRegistry = snapPlugin?.getRegistry();
     if (snapRegistry) {
+      // The snap plugin's onModelLoaded already scanned the WHOLE loaded root
+      // with ownerRoot = model root — so every baked placement's snaps carry
+      // the SAME owner, and register() is idempotent on uuid, making the
+      // per-node scan below a silent no-op. Same-owner snaps can never pair
+      // (`b.owner === a.owner` in computeProximityPairings), which left a
+      // re-opened saved layout with green, unconnected ports and no
+      // successors. Drop the wrongly-owned entries first, then re-register
+      // with the placement node as owner.
+      snapRegistry.unregisterUnder(node);
       scanAndRegisterSnaps(node, snapRegistry, node);
       snapPlugin?.getMarkerRenderer?.()?.rebuild(snapRegistry.size);
     }

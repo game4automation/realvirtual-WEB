@@ -248,8 +248,9 @@ export function DocumentHeroSection({ onReveal }: DocumentHeroSectionProps) {
             onDragLeave={() => setDragOver(null)}
             onDrop={onDrop}
             sx={{
+              // Full band width — the hero shares its edges with the content
+              // area below instead of floating as a narrow centred plate.
               width: '100%',
-              maxWidth: 780,
               borderRadius: '4px',
               // The ring appears only for a drag the drop would accept, in the
               // TARGET slot's color — green for a config, pink for knowledge —

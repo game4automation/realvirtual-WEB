@@ -72,6 +72,21 @@ export function isSceneRevision(value: unknown): value is SceneRevision {
  * ones that never touch OPFS. `sha256OfBlob` computes the same digest for the
  * blob store's own key — same algorithm, two independent reasons to exist.
  */
+/**
+ * The `ArrayBuffer` behind a `Uint8Array`, without copying where possible.
+ *
+ * `DocumentRecord.bytes` is a `Uint8Array` (plan-736) while several older
+ * consumers — the GLB chunk reader, `ProjectAssetSource`, the MCP file tools —
+ * are typed on `ArrayBuffer`. A whole-buffer view hands its buffer over
+ * directly; a partial view is copied, because handing over a buffer that is
+ * larger than the view would silently change what the consumer reads.
+ */
+export function arrayBufferOf(bytes: Uint8Array): ArrayBuffer {
+  return bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+    ? (bytes.buffer as ArrayBuffer)
+    : (bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+}
+
 export async function revisionOfBytes(bytes: Uint8Array | ArrayBuffer): Promise<SceneRevision> {
   const digest = await crypto.subtle.digest('SHA-256', bytes as BufferSource);
   return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');

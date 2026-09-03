@@ -66,19 +66,30 @@ function fakeBackend(seed: Record<string, string> = {}) {
   const files = new Map<string, string>(Object.entries(seed));
   const backend = {
     kind: 'browser', id: 'test', writable: true, isActive: true,
-    writeBlob: async (relPath: string, blob: Blob, opts?: { expectedRevision?: unknown }) => {
-      // `expectedRevision: null` is create-only. The migration relies on this
-      // refusal being real — without it a copy would replace live work.
-      if (opts && 'expectedRevision' in opts && opts.expectedRevision === null && files.has(relPath)) {
+    writeDocument: async (
+      ref: string | { path: string },
+      bytes: Uint8Array,
+      opts: { expectedRevision: string },
+    ) => {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
+      // `'create'` is create-only. The migration relies on this refusal being
+      // real — without it a copy would replace live work.
+      if (opts.expectedRevision === 'create' && files.has(relPath)) {
         throw new Error(`conflict: ${relPath} exists`);
       }
-      files.set(relPath, await blob.text());
+      files.set(relPath, new TextDecoder().decode(bytes));
+      return { revision: 'rev' };
     },
-    readBlobBytes: async (relPath: string) => {
+    readDocument: async (ref: string | { path: string }) => {
+      const relPath = typeof ref === 'string' ? ref : ref.path;
       const content = files.get(relPath);
       return content === undefined
         ? null
-        : (new TextEncoder().encode(content).buffer as ArrayBuffer);
+        : {
+          bytes: new TextEncoder().encode(content),
+          meta: { id: '', name: relPath, path: relPath },
+          revision: 'rev',
+        };
     },
   } as unknown as ProjectBackend;
   return { backend, files };

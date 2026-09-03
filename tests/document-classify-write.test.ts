@@ -16,10 +16,26 @@
  *  - it goes through the **same bake** the save path uses, on its fast path, so
  *    the block written here and the block written by a Save are one spelling
  *    and a 100 MB model costs its JSON chunk, not a re-export;
- *  - a scene body carries the plan-397 **compare-and-swap** token, so a body
+ *  - the write carries the plan-397 **compare-and-swap** token, so a body
  *    somebody else changed in the meantime is refused rather than clobbered;
  *  - a refused write **throws**, which is what keeps a caller's cache update
  *    from running after a write that did not happen.
+ *
+ * ## What plan-736 changed about this file
+ *
+ * It used to have two `describe` blocks — "a scene body" and "an asset body" —
+ * because `writeDocumentClassification` had two branches and chose between them
+ * with `sectionOfDocument(doc)`. The scene branch went through
+ * `readScene`/`writeScene` with a compare-and-swap; the asset branch went
+ * through `readBlobUrl`/`writeBlob`, unprotected until plan-709 and optionally
+ * protected after it. The result even reported which one had run (`surface`).
+ *
+ * That branch is gone, so the two blocks became one and the interesting
+ * assertion changed shape with them: it is no longer "each surface carries the
+ * same token" (a statement about two things agreeing) but "a scene row and a
+ * model row are **indistinguishable** to this verb" (a statement about there
+ * being one thing). The last test below is that claim, written so it would fail
+ * if a second surface ever came back.
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
@@ -29,10 +45,13 @@ import { objectToGlb } from '../src/core/import/rv-import-object';
 import { writeDocumentClassification } from '../src/core/project/rv-document-classify';
 import { classificationOfGlbBlob } from '../src/core/project/rv-project-documents';
 import { parseGlbChunks } from '../src/core/persistence/rv-glb-chunks';
-import { revisionOfBytes, type SceneRecord, type SceneWrite } from '../src/core/project/rv-scene-record';
-import type {
-  ProjectBackend,
-  WriteBlobOptions,
+import { revisionOfBytes } from '../src/core/project/rv-scene-record';
+import {
+  docPathOf,
+  type DocRef,
+  type DocumentRecord,
+  type ProjectBackend,
+  type WriteDocumentOptions,
 } from '../src/core/project/backends/project-backend';
 import type { RvDocumentEntry } from '../src/core/project/rv-project-types';
 
@@ -60,15 +79,15 @@ beforeEach(async () => {
 interface FakeBackend extends ProjectBackend {
   calls: string[];
   written: Uint8Array | null;
-  lastWrite: SceneWrite | null;
-  /** What the BLOB surface was asked to check (plan-709 §2.3). */
-  lastBlobOpts: WriteBlobOptions | undefined;
-  writeSceneImpl: ((relPath: string, write: SceneWrite) => Promise<string>) | null;
-  writeBlobImpl: ((relPath: string, blob: Blob) => Promise<void>) | null;
+  /** The DocRef the write named — `meta` is how the caller states identity. */
+  lastRef: DocRef | null;
+  /** The precondition the write carried. Mandatory since plan-736. */
+  lastOpts: WriteDocumentOptions | null;
+  writeImpl: ((ref: DocRef, bytes: Uint8Array) => Promise<{ revision: string }>) | null;
+  readImpl: (() => Promise<DocumentRecord | null>) | null;
 }
 
 function fakeBackend(writable = true): FakeBackend {
-  const urls: string[] = [];
   const b = {
     kind: 'folder',
     id: 'fake',
@@ -76,75 +95,67 @@ function fakeBackend(writable = true): FakeBackend {
     isActive: true,
     calls: [] as string[],
     written: null as Uint8Array | null,
-    lastWrite: null as SceneWrite | null,
-    lastBlobOpts: undefined as WriteBlobOptions | undefined,
-    writeSceneImpl: null as ((relPath: string, write: SceneWrite) => Promise<string>) | null,
-    writeBlobImpl: null as ((relPath: string, blob: Blob) => Promise<void>) | null,
+    lastRef: null as DocRef | null,
+    lastOpts: null as WriteDocumentOptions | null,
+    writeImpl: null as ((ref: DocRef, bytes: Uint8Array) => Promise<{ revision: string }>) | null,
+    readImpl: null as (() => Promise<DocumentRecord | null>) | null,
 
-    async readScene(relPath: string): Promise<SceneRecord | null> {
-      b.calls.push('readScene:' + relPath);
+    async readDocument(ref: DocRef): Promise<DocumentRecord | null> {
+      b.calls.push('readDocument:' + docPathOf(ref));
+      if (b.readImpl) return b.readImpl();
       return {
-        glb: bytes, revision,
-        meta: { id: 'doc-1', name: 'Line', path: relPath },
+        bytes, revision,
+        meta: { id: 'doc-1', name: 'Line', path: docPathOf(ref) },
       };
     },
-    async readBlobUrl(relPath: string) {
-      b.calls.push('readBlobUrl:' + relPath);
-      const url = URL.createObjectURL(new Blob([bytes as BlobPart]));
-      urls.push(url);
-      return { url, release: () => URL.revokeObjectURL(url) };
-    },
-    async writeScene(relPath: string, write: SceneWrite) {
-      b.calls.push('writeScene:' + relPath);
-      if (b.writeSceneImpl) return b.writeSceneImpl(relPath, write);
-      b.written = write.glb;
-      b.lastWrite = write;
-      return revisionOfBytes(write.glb);
-    },
-    async writeBlob(relPath: string, blob: Blob, opts?: WriteBlobOptions) {
-      b.calls.push('writeBlob:' + relPath);
-      b.lastBlobOpts = opts;
-      if (b.writeBlobImpl) return b.writeBlobImpl(relPath, blob);
-      b.written = new Uint8Array(await blob.arrayBuffer());
+    async readDocumentUrl() { return null; },
+    async writeDocument(ref: DocRef, written: Uint8Array, opts: WriteDocumentOptions) {
+      b.calls.push('writeDocument:' + docPathOf(ref));
+      b.lastRef = ref;
+      b.lastOpts = opts;
+      if (b.writeImpl) return b.writeImpl(ref, written);
+      b.written = written;
+      return { revision: await revisionOfBytes(written) };
     },
     // Unused by this verb, present because the contract has them.
     readManifest: async () => null,
     readSettings: async () => null,
-    listScenes: async () => [],
     listModels: async () => [],
     listLibrary: async () => [],
     listDocuments: async () => [],
     statDocuments: async () => [],
     activate: async () => {},
     deactivate: async () => {},
-    deleteScene: async () => {},
-    deleteBlob: async () => {},
+    deleteDocument: async () => {},
     flush: async () => {},
   } as unknown as FakeBackend;
   return b;
 }
 
 const sceneDoc: RvDocumentEntry = {
-  id: 'doc-1', path: 'scenes/Line.scene.glb', name: 'Line', section: 'scenes',
+  id: 'doc-1', path: 'scenes/Line.scene.glb', name: 'Line',
 };
 const modelDoc: RvDocumentEntry = {
-  id: 'doc-2', path: 'models/Press.glb', name: 'Press', section: 'models',
+  id: 'doc-2', path: 'models/Press.glb', name: 'Press',
 };
 
 // ─── tests ───────────────────────────────────────────────────────────────
 
-describe('writeDocumentClassification — a scene body', () => {
+describe('writeDocumentClassification', () => {
   it('reads, patches and writes back under the revision it read', async () => {
     const b = fakeBackend();
     const result = await writeDocumentClassification(
       b, sceneDoc, { v: 1, level: 'plant', tags: ['line3'] });
 
-    expect(b.calls).toEqual(['readScene:scenes/Line.scene.glb', 'writeScene:scenes/Line.scene.glb']);
+    expect(b.calls).toEqual([
+      'readDocument:scenes/Line.scene.glb',
+      'writeDocument:scenes/Line.scene.glb',
+    ]);
     // The compare-and-swap token of plan-397, handed straight back: a body
     // somebody else wrote in between changes the revision and the write is
     // refused instead of overwriting them.
-    expect(b.lastWrite?.expectedRevision).toBe(revision);
-    expect(result.surface).toBe('scene');
+    expect(b.lastOpts?.expectedRevision).toBe(revision);
+    expect(result.revision).toBe(await revisionOfBytes(b.written!));
     expect(result.classification).toEqual({ v: 1, level: 'plant', tags: ['line3'] });
   });
 
@@ -167,6 +178,14 @@ describe('writeDocumentClassification — a scene body', () => {
     expect(tail(after)).toEqual(tail(before));
   });
 
+  it('states the row it wrote, so the manifest cache can follow the bytes', async () => {
+    const b = fakeBackend();
+    await writeDocumentClassification(b, sceneDoc, { v: 1, level: 'plant' });
+    const ref = b.lastRef as { id?: string; meta?: { classification?: unknown } };
+    expect(ref.id).toBe('doc-1');
+    expect(ref.meta?.classification).toEqual({ v: 1, level: 'plant' });
+  });
+
   it('an empty classification is a removal, not a block that says nothing', async () => {
     const b = fakeBackend();
     await writeDocumentClassification(b, sceneDoc, { v: 1, level: 'part' });
@@ -183,54 +202,12 @@ describe('writeDocumentClassification — a scene body', () => {
 
   it('propagates a refused write instead of reporting success', async () => {
     const b = fakeBackend();
-    b.writeSceneImpl = async () => { throw new Error('changed since it was read'); };
+    b.writeImpl = async () => { throw new Error('changed since it was read'); };
     await expect(writeDocumentClassification(b, sceneDoc, { v: 1, level: 'part' }))
       .rejects.toThrow(/changed since it was read/);
     // Nothing landed. This is the whole reason the verb throws: a caller that
     // updates its cache after the await never reaches it.
     expect(b.written).toBeNull();
-  });
-});
-
-describe('writeDocumentClassification — an asset body', () => {
-  it('goes through the blob surface and says so', async () => {
-    const b = fakeBackend();
-    const result = await writeDocumentClassification(b, modelDoc, { v: 1, level: 'assembly' });
-    expect(b.calls).toEqual(['readBlobUrl:models/Press.glb', 'writeBlob:models/Press.glb']);
-    // `surface` still names WHICH store took the bytes. Since plan-709 §2.3 it
-    // no longer implies anything about safety — see the next test.
-    expect(result.surface).toBe('blob');
-    expect(await classificationOfGlbBlob(new Blob([b.written! as BlobPart])))
-      .toEqual({ v: 1, level: 'assembly' });
-  });
-
-  it('carries the SAME compare-and-swap token the scene branch does (§2.3)', async () => {
-    // This is the split plan-709 removed. It used to be a documented asymmetry:
-    // classifying a scene was conflict-safe, classifying a model was a
-    // last-writer-wins overwrite of whatever was on disk.
-    const b = fakeBackend();
-    await writeDocumentClassification(b, modelDoc, { v: 1, level: 'assembly' });
-    expect(b.lastBlobOpts?.expectedRevision).toBe(await revisionOfBytes(bytes));
-  });
-
-  it('propagates a refused BLOB write instead of reporting success', async () => {
-    const b = fakeBackend();
-    b.writeBlobImpl = async () => { throw new Error('changed since it was read'); };
-    await expect(writeDocumentClassification(b, modelDoc, { v: 1, level: 'part' }))
-      .rejects.toThrow(/changed since it was read/);
-    expect(b.written).toBeNull();
-  });
-
-  it('releases the object URL even when the read throws', async () => {
-    const b = fakeBackend();
-    const revoke = vi.spyOn(URL, 'revokeObjectURL');
-    const fetchSpy = vi.spyOn(globalThis, 'fetch')
-      .mockRejectedValueOnce(new Error('network'));
-    await expect(writeDocumentClassification(b, modelDoc, { v: 1, level: 'part' }))
-      .rejects.toThrow(/network/);
-    expect(revoke).toHaveBeenCalled();
-    fetchSpy.mockRestore();
-    revoke.mockRestore();
   });
 });
 
@@ -244,8 +221,60 @@ describe('writeDocumentClassification — refusals', () => {
 
   it('refuses a document whose body is not there', async () => {
     const b = fakeBackend();
-    b.readScene = async () => null;
+    b.readImpl = async () => null;
     await expect(writeDocumentClassification(b, sceneDoc, { v: 1, level: 'part' }))
       .rejects.toThrow(/could not be read/);
+  });
+});
+
+// ─── plan-736: the two surfaces were one operation all along ─────────────
+
+describe('a scene row and a model row are the same operation (plan-736 §2.3 #1)', () => {
+  it('takes the same calls, in the same order, with the same precondition', async () => {
+    const scene = fakeBackend();
+    const model = fakeBackend();
+    await writeDocumentClassification(scene, sceneDoc, { v: 1, level: 'assembly' });
+    await writeDocumentClassification(model, modelDoc, { v: 1, level: 'assembly' });
+
+    // Same verbs, same order — only the paths differ, which is the ONLY thing
+    // that ever legitimately differed between these two documents.
+    expect(scene.calls.map(c => c.split(':')[0]))
+      .toEqual(model.calls.map(c => c.split(':')[0]));
+    expect(model.calls).toEqual([
+      'readDocument:models/Press.glb',
+      'writeDocument:models/Press.glb',
+    ]);
+
+    // The split plan-709 narrowed and plan-736 removed: classifying a scene was
+    // conflict-safe, classifying a model was a last-writer-wins overwrite of
+    // whatever happened to be on disk. Both carry the read revision now, and
+    // there is no spelling of this call that does not carry one.
+    expect(model.lastOpts?.expectedRevision).toBe(revision);
+    expect(scene.lastOpts?.expectedRevision).toBe(model.lastOpts?.expectedRevision);
+
+    // And the bytes are equally real on both.
+    expect(await classificationOfGlbBlob(new Blob([model.written! as BlobPart])))
+      .toEqual({ v: 1, level: 'assembly' });
+  });
+
+  it('a refused write on a model body throws exactly as on a scene body', async () => {
+    const b = fakeBackend();
+    b.writeImpl = async () => { throw new Error('changed since it was read'); };
+    await expect(writeDocumentClassification(b, modelDoc, { v: 1, level: 'part' }))
+      .rejects.toThrow(/changed since it was read/);
+    expect(b.written).toBeNull();
+  });
+
+  it('never resolves an object URL — the read hands over bytes (plan-709 §2.5)', async () => {
+    // The asset branch used to `readBlobUrl` + `fetch` + `release()`, which is
+    // the object-URL leak the unified read has no way to create.
+    const revoke = vi.spyOn(URL, 'revokeObjectURL');
+    const create = vi.spyOn(URL, 'createObjectURL');
+    const b = fakeBackend();
+    await writeDocumentClassification(b, modelDoc, { v: 1, level: 'part' });
+    expect(create).not.toHaveBeenCalled();
+    expect(revoke).not.toHaveBeenCalled();
+    create.mockRestore();
+    revoke.mockRestore();
   });
 });

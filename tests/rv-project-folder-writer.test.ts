@@ -8,7 +8,7 @@
  *  - every mutation seam reaches disk (§4d — a hook in save() alone missed
  *    five of them);
  *  - the writer records the manifest row and nothing else: since plan-413
- *    phase 6 the body is a GLB written by `backend.writeScene()` *before* the
+ *    phase 6 the body is a GLB written by `writeSceneDocument(backend, )` *before* the
  *    mutation is emitted, and the writer's old `.scene.json` copy was actively
  *    harmful — the row it upserted named the JSON path, so the next save put
  *    GLB bytes into a file called `.scene.json`;
@@ -26,6 +26,7 @@ import { clearSceneMutationListeners, emitSceneMutation } from '../src/core/hmi/
 import { sceneGlbRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
 import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
+import { writeSceneDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 

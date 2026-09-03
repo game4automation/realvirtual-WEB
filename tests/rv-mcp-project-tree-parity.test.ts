@@ -52,10 +52,16 @@ const DOCS_INDEX = { '4112630': [{ title: 'BOM', path: 'docs/bom.pdf' }] };
 const backend = {
   writable: true,
   listAllFiles: async () => WALK,
-  readBlobBytes: async (relPath: string) =>
-    (relPath === 'docs-index.json'
-      ? new TextEncoder().encode(JSON.stringify(DOCS_INDEX)).buffer as ArrayBuffer
-      : null),
+  readDocument: async (ref: string | { path: string }) => {
+    const relPath = typeof ref === 'string' ? ref : ref.path;
+    return relPath === 'docs-index.json'
+      ? {
+        bytes: new TextEncoder().encode(JSON.stringify(DOCS_INDEX)),
+        meta: { id: '', name: relPath, path: relPath },
+        revision: 'rev',
+      }
+      : null;
+  },
 };
 
 const store = {

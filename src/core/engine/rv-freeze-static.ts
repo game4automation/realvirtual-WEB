@@ -54,8 +54,17 @@ import type { Object3D } from 'three';
  * Symptom: the signal toggles and the light switches, but the lever never
  * visibly moves. Being on this list makes the cap dynamic regardless of when it
  * is bound.
+ *
+ * `PlacementMeta` marks a planner placement (plan-397 phase 6): movable and
+ * deletable at runtime, exactly like a freshly dragged-in library object —
+ * which stays dynamic because it arrives AFTER this pass. Freezing a BAKED
+ * placement kept its drive subtrees dynamic (rolls) but froze the sibling
+ * frame nodes, and the planner's move paths write via `updateMatrixWorld(true)`,
+ * whose force flag never recomputes a `matrixWorldAutoUpdate=false` node —
+ * dragging moved only the rolls while the frame stood still (2026-09-01,
+ * DemoPlanner, second layer under the same-day batcher exclusion).
  */
-const MOVER_KEY = /^(Drive|Kinematic|Grip|TransportSurface|Source|Sink|MU|Cam|SceneButtonMoveable|Chain)/i;
+const MOVER_KEY = /^(Drive|Kinematic|Grip|TransportSurface|Source|Sink|MU|Cam|SceneButtonMoveable|Chain|PlacementMeta)/i;
 
 export interface FreezeStaticResult {
   /** Nodes whose matrixWorldAutoUpdate was turned off. */

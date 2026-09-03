@@ -50,10 +50,16 @@ function fakeBackend(overrides: Partial<ProjectBackend> = {}): ProjectBackend & 
   return {
     kind: 'browser', id: 'test', writable: true, isActive: true, writes,
     listModels: async () => [],
-    writeBlob: async (relPath: string) => { writes.push(relPath); },
+    writeDocument: async (ref: string | { path: string }) => {
+      writes.push(typeof ref === 'string' ? ref : ref.path);
+      return { revision: 'rev' };
+    },
     // The adoption re-reads what was just written (plan-709 §2.5). Serving the
     // same fixture back keeps the happy path actually reachable in these tests.
-    readBlobBytes: async () => demoGlbBytes().buffer as ArrayBuffer,
+    readDocument: async (ref: string | { path: string }) => {
+      const path = typeof ref === 'string' ? ref : ref.path;
+      return { bytes: demoGlbBytes(), meta: { id: '', name: path, path }, revision: 'rev' };
+    },
     ...overrides,
   } as unknown as ProjectBackend & { writes: string[] };
 }
@@ -230,10 +236,10 @@ describe('saveSettingsIntoModel is transactional', () => {
   it('removes the written file when a later step fails', async () => {
     const deleted: string[] = [];
     const backend = fakeBackend({
-      deleteBlob: async (relPath: string) => { deleted.push(relPath); },
+      deleteDocument: async (relPath: string) => { deleted.push(relPath); },
     } as Partial<ProjectBackend>);
     setBackend(backend);
-    // The written file cannot be resolved back → failure AFTER writeBlob
+    // The written file cannot be resolved back → failure AFTER writeDocument
     // succeeded. Since plan-709 §2.5 the adoption re-resolves through
     // `resolveAssetSource` (bytes, or a URL with an owner), not `resolveAssetUrl`.
     (getProjectStore() as unknown as { resolveAssetSource: (p: string) => Promise<null> })

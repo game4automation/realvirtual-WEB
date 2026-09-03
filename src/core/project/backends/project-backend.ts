@@ -45,10 +45,9 @@
  * exists.
  */
 
-import type {
-  SceneRecord,
-  SceneRevision,
-  SceneWrite,
+import {
+  revisionOfBytes,
+  type SceneRevision,
 } from '../rv-scene-record';
 export { WriteQueue } from './write-queue';
 import type { DocumentStat } from '../rv-project-documents';
@@ -57,6 +56,7 @@ import type {
   RvDocumentEntry,
   RvProject,
   RvProjectAssetEntry,
+  RvProjectSceneEntry,
 } from '../rv-project-types';
 
 // ─── Kind ───────────────────────────────────────────────────────────────
@@ -77,6 +77,128 @@ import type {
  */
 export type BackendKind = 'bundled' | 'browser' | 'folder';
 
+// ─── The document address (plan-736 §2.4) ───────────────────────────────
+
+/**
+ * How a caller names one document to a backend.
+ *
+ * A bare string is the common case and stays legal — the path IS the address
+ * for every backend with a folder behind it. The object form exists for the
+ * two facts a path cannot carry and that a backend keying bodies by identity
+ * (the browser one) needs:
+ *
+ *  - `id` — the document's manifest id, so a store that addresses bodies by id
+ *    can find the right one without reversing a filename. `sceneIdToken()` is
+ *    lossy on purpose (plan-454), so a filename is not an id and never was.
+ *  - `meta` — the manifest row this write should be recorded against. A save
+ *    that knows its row hands it over instead of making the backend guess.
+ *
+ * Note what is deliberately NOT here: nothing that says which *kind* of
+ * document this is. Storage routing by document kind is exactly what plan-736
+ * removes; a backend routes on what IT stores, never on a label the manifest
+ * carries.
+ */
+export type DocRef = string | {
+  path: string;
+  id?: string;
+  meta?: RvProjectSceneEntry;
+};
+
+/** `{ path, id, meta }` for either spelling of {@link DocRef}. */
+export function docRefOf(ref: DocRef): { path: string; id?: string; meta?: RvProjectSceneEntry } {
+  return typeof ref === 'string' ? { path: ref } : ref;
+}
+
+/** The project-relative path of a {@link DocRef}. */
+export function docPathOf(ref: DocRef): string {
+  return typeof ref === 'string' ? ref : (ref?.path ?? '');
+}
+
+/**
+ * One document as a backend hands it over: bytes, manifest metadata, revision.
+ *
+ * The merger of the former `SceneRecord` (bytes + meta + revision, scenes only)
+ * and the bare `ArrayBuffer` of `readBlobBytes` (everything else). Metadata and
+ * a revision were never scene-specific — they were only *offered* for scenes,
+ * which is why every non-scene write in the product was a last-writer-wins
+ * overwrite until plan-709 and why none of them could report what they had
+ * read. One record type, one answer.
+ */
+export interface DocumentRecord {
+  /** The stored body. GLB for a model or a scene, arbitrary bytes otherwise. */
+  bytes: Uint8Array;
+  /** Manifest metadata for this document (id, name, path, timestamps, …). */
+  meta: RvProjectSceneEntry;
+  /** Revision of what was read. Hand it back as {@link WriteDocumentOptions.expectedRevision}. */
+  revision: SceneRevision;
+}
+
+/**
+ * Wrap bytes as a {@link DocumentRecord}.
+ *
+ * The successor of `glbSceneRecord`, and it keeps that function's one real
+ * decision: `id` and `name` fall back to `''` rather than being invented from
+ * the filename. An empty id means "the manifest does not describe this path" —
+ * a real state (a GLB dropped into the folder by hand), and one a caller must
+ * be able to tell from a document that genuinely is called nothing.
+ */
+export async function documentRecord(
+  bytes: Uint8Array,
+  meta: Partial<RvProjectSceneEntry> & { path: string },
+  revision?: SceneRevision,
+): Promise<DocumentRecord> {
+  return {
+    bytes,
+    meta: { id: '', name: '', ...meta },
+    revision: revision ?? (await revisionOfBytes(bytes)),
+  };
+}
+
+/**
+ * The precondition of {@link ProjectBackend.writeDocument} — **mandatory**.
+ *
+ * | value | means | throws when |
+ * |---|---|---|
+ * | a revision | "I read this and am replacing it" | stored bytes hash differently |
+ * | `'create'` | "this must not exist yet" | anything is stored |
+ * | `'any'` | deliberate unconditional overwrite | never |
+ *
+ * There is no fourth spelling and, in particular, no way to *omit* it. Until
+ * plan-736 the precondition was optional (plan-709) and the default was
+ * `'any'` — spelled as "leave `opts` off" — which meant every caller that had
+ * simply never thought about concurrency got the unsafe mode by accident.
+ * Making the field required does not make those writes safer by itself; it
+ * makes each of them *state* which of the three it is, which is what turns a
+ * missing precondition from an invisible default into a reviewable line.
+ *
+ * `'any'` is therefore not deprecated — a screenshot overwriting last
+ * frame's screenshot genuinely has nothing to compare against — but it wants a
+ * comment saying why, and the ones in this tree have one.
+ */
+export type WriteExpectation = SceneRevision | 'any' | 'create';
+
+export interface WriteDocumentOptions {
+  /** See {@link WriteExpectation}. Required — that is the point. */
+  expectedRevision: WriteExpectation;
+}
+
+/**
+ * Translate a {@link WriteExpectation} into the three-valued token
+ * `assertRevisionPrecondition` has always compared.
+ *
+ * The mapping is the whole compatibility story between plan-709's optional
+ * precondition and plan-736's mandatory one, and it is deliberately total:
+ * `'any'` is the old `undefined` (unconditional), `'create'` is the old `null`
+ * ("must not exist"), and anything else is a revision to match exactly.
+ */
+export function preconditionOf(
+  expected: WriteExpectation,
+): SceneRevision | null | undefined {
+  if (expected === 'any') return undefined;
+  if (expected === 'create') return null;
+  return expected;
+}
+
 // ─── Read surface (moved verbatim from project-store.ts) ────────────────
 
 /**
@@ -90,14 +212,15 @@ export interface ProjectReadProvider {
   readonly writable: boolean;
   readManifest(): Promise<RvProject | null>;
   /**
-   * Read one scene body.
+   * Read one document body.
    *
-   * Returns a {@link SceneRecord} — bytes plus metadata plus a revision —
-   * **not** an `RvScene`. See `rv-scene-record.ts` for why the contract had to
-   * change rather than grow, and why `record.legacy` exists for exactly as
-   * long as plan-397 phase 7 takes.
+   * Returns a {@link DocumentRecord} — bytes plus metadata plus a revision —
+   * for EVERY document, not just for a scene. The `readScene`/`readBlobBytes`
+   * split this replaced was never about the documents; it was about which of
+   * the two write protocols the caller was heading for, and there is only one
+   * of those now.
    */
-  readScene(relPath: string): Promise<SceneRecord | null>;
+  readDocument(ref: DocRef): Promise<DocumentRecord | null>;
   readSettings(relPath?: string): Promise<unknown | null>;
 }
 
@@ -116,18 +239,6 @@ export interface ResolvedBackendBlob {
   release(): void;
 }
 
-/**
- * The optional precondition of {@link ProjectBackend.writeBlob}.
- *
- * Its own interface rather than a bare parameter so a later addition (a
- * content type, an "atomic rename" hint) does not change every implementation's
- * signature again.
- */
-export interface WriteBlobOptions {
-  /** See the table on {@link ProjectBackend.writeBlob}. */
-  expectedRevision?: SceneRevision | null;
-}
-
 export interface ProjectBackend extends ProjectReadProvider {
   readonly kind: BackendKind;
   /** Unique across all backends of one store. */
@@ -140,8 +251,9 @@ export interface ProjectBackend extends ProjectReadProvider {
   // `listScenes()` is gone (plan-716 Phase 6). It answered "which scenes does
   // this project have", which stopped being a question with its own answer once
   // a scene became an ordinary document: {@link listDocuments} returns them
-  // along with everything else, each row carrying the `section` that says which
-  // folder holds it.
+  // along with everything else, each row carrying the `path` that says where it
+  // is. (That sentence used to name the `section` field instead; plan-736
+  // removed it, because the path was already saying the same thing.)
   listModels(): Promise<RvProjectAssetEntry[]>;
   listLibrary(): Promise<RvProjectAssetEntry[]>;
   /**
@@ -223,85 +335,73 @@ export interface ProjectBackend extends ProjectReadProvider {
 
   // ── Write (queueing surface — see the file header) ──
   /**
-   * Store a scene body, atomically and under a precondition (§2.8).
+   * Store one document body, atomically and under a precondition.
    *
-   * Three properties every implementation owes the caller:
+   * ## One method, because there was only ever one operation
    *
-   *  1. **GLB only.** There is no way to put a JSON body in through this
-   *     surface. That is what stops the pre-397 format from being re-created
-   *     after the migration.
-   *  2. **Compare-and-swap.** `write.expectedRevision` is checked against
-   *     what is stored *now*; a mismatch throws
-   *     {@link SceneRevisionConflictError} instead of overwriting. This is
-   *     also how an edit made in the project folder behind our back surfaces —
-   *     it changed the bytes, so it changed the revision.
-   *  3. **All or nothing.** A failed write leaves the previous body exactly
-   *     as it was. Never a truncated file, never a zero-byte placeholder.
+   * This replaces `writeScene` **and** `writeBlob`. The two differed in three
+   * ways, and plan-736 dissolved all three: the return type (a revision vs.
+   * nothing), the precondition (mandatory vs. optional), and — the one that
+   * mattered — WHICH of them a caller had to pick, which was decided by the
+   * `section` field of the manifest row. A stored string chose a storage
+   * protocol, which is how a display category grew into a routing key.
    *
-   * Throws unless writable **and** active.
+   * A backend now routes on what IT stores, not on what the manifest says the
+   * document is. Where that distinction still exists at all (the browser
+   * backend keys scene bodies by id in its own store) it is a private
+   * implementation detail behind this one method, and {@link DocRef} carries
+   * the only two facts a caller can honestly supply about it.
    *
-   * @returns the revision of what is now stored.
+   * Four properties every implementation owes the caller:
+   *
+   *  1. **Compare-and-swap, always.** {@link WriteDocumentOptions.expectedRevision}
+   *     is required and is checked against what is stored *now*; a mismatch
+   *     throws {@link SceneRevisionConflictError} instead of overwriting. This
+   *     is also how an edit made in the project folder behind our back
+   *     surfaces — it changed the bytes, so it changed the revision.
+   *  2. **All or nothing.** A failed write leaves the previous body exactly as
+   *     it was. Never a truncated file, never a zero-byte placeholder.
+   *  3. **Ownership is checked, not assumed.** A path another document's row
+   *     owns is refused (the RR1 collision), because the failure mode is
+   *     silently replacing a different, still-valid document.
+   *  4. **Throws unless writable *and* active.**
+   *
+   * @returns the revision of what is now stored — so a caller that writes
+   *   twice in a row can hand the first result to the second write instead of
+   *   reading the file back.
    */
-  writeScene(relPath: string, write: SceneWrite): Promise<SceneRevision>;
-  /** Queue a scene deletion. Throws unless writable **and** active. */
-  deleteScene(relPath: string): Promise<void>;
+  writeDocument(
+    ref: DocRef,
+    bytes: Uint8Array,
+    opts: WriteDocumentOptions,
+  ): Promise<{ revision: SceneRevision }>;
   /**
-   * Store a binary artefact. Throws unless writable **and** active.
+   * Remove one document body. Throws unless writable **and** active.
    *
-   * ## The precondition is optional, and that is what makes it safe to add
+   * Replaces `deleteScene` + `deleteBlob`. Leaving those two split would have
+   * left a `section`-implicit routing decision on the delete path after the
+   * write path had lost it — a caller would still have had to know which kind
+   * of document it held in order to get rid of it (F2).
    *
-   * Until plan-709 this surface had **no** way to say "…unless somebody else
-   * changed it first", while `writeScene` right above it did. The asymmetry was
-   * not a policy: it was a missing capability, and it is why every asset write
-   * in the product (library rename/duplicate, classification, tree moves,
-   * settings-into-model) was a last-writer-wins overwrite.
-   *
-   * `opts` closes that gap **without touching a single existing caller**: with
-   * no `opts` the behaviour is byte-identical to before — unconditional. The
-   * three intents are exactly the ones {@link SceneWrite.expectedRevision}
-   * already defines, and they are checked by the same
-   * {@link assertRevisionPrecondition}, so a fourth backend cannot invent a
-   * fourth meaning of "conflict":
-   *
-   * | `expectedRevision` | means | throws when |
-   * |---|---|---|
-   * | omitted / `undefined` | unconditional (today's behaviour) | never |
-   * | a revision | "I read this and am replacing it" | stored bytes hash differently |
-   * | `null` | "create only — this must not exist yet" | anything is stored |
-   *
-   * The `null` mode is what a migration wants: copy in, never overwrite.
-   *
-   * A revision here is the same token as everywhere else — the SHA-256 of the
-   * stored bytes ({@link revisionOfBytes}) — so a caller can obtain one by
-   * hashing what it read, with no bookkeeping anywhere.
-   *
-   * @throws {@link SceneRevisionConflictError} when the precondition fails.
-   *   Nothing is written in that case.
-   */
-  writeBlob(relPath: string, blob: Blob, opts?: WriteBlobOptions): Promise<void>;
-  /**
-   * Remove a binary artefact. Throws unless writable **and** active.
-   *
-   * A missing file is NOT an error: the caller's intent ("this must not be
+   * A missing body is NOT an error: the caller's intent ("this must not be
    * there") is already satisfied, and making it throw would turn every
    * double-click of Delete into a spurious failure.
    */
-  deleteBlob(relPath: string): Promise<void>;
-  /** Resolve an artefact to something loadable. Read-only backends do this too. */
-  readBlobUrl(relPath: string): Promise<ResolvedBackendBlob | null>;
+  deleteDocument(ref: DocRef): Promise<void>;
   /**
-   * The artefact's raw bytes, or null when nothing is stored at `relPath`.
+   * Resolve a document to a loadable URL, without copying its bytes.
    *
-   * The sibling of {@link readBlobUrl} that hands over no resource (plan-709
-   * §2.5). Two of the three backends already hold the bytes and only wrap them
-   * in an object URL to satisfy the older contract — a wrapper the caller then
-   * has to own and revoke, which is the leak phase 4 removes. Reading bytes
-   * where bytes are what the caller wanted skips the whole question.
+   * The former `readBlobUrl`, renamed with the rest of the surface. It is NOT
+   * redundant with {@link readDocument}: a glTF with external buffers or
+   * textures resolves its siblings against a base URL, and the GLB render path
+   * hands the URL straight to the loader rather than a `Uint8Array` it would
+   * have to copy first. That is why this one survived the merge while
+   * `readBlobBytes` did not — the object-URL form is a capability, the bytes
+   * form was a second way of saying `readDocument`.
    *
-   * `readBlobUrl` remains for the cases that genuinely need a base URL: a
-   * glTF with external buffers or textures resolves its siblings against it.
+   * Read-only backends implement it too.
    */
-  readBlobBytes(relPath: string): Promise<ArrayBuffer | null>;
+  readDocumentUrl(ref: DocRef): Promise<ResolvedBackendBlob | null>;
   /** Await any queued write. Safe on a read-only or inactive backend. */
   flush(): Promise<void>;
 }
@@ -315,9 +415,14 @@ export interface ProjectBackend extends ProjectReadProvider {
  * is the attachment index — showing either would offer the user a row that
  * describes the list it appears in. Both are also written by machinery, so a
  * rename of one is a corruption, not an edit.
+ *
+ * `project.json.bak` is the manifest write's crash-recovery copy (see
+ * `rv-project-storage.ts`) — the same machinery, one step further from the
+ * user: it exists only so `readManifest` can recover an unparseable primary.
  */
 const INTERNAL_FILE_NAMES: ReadonlySet<string> = new Set([
   'project.json',
+  'project.json.bak',
   'docs-index.json',
 ]);
 

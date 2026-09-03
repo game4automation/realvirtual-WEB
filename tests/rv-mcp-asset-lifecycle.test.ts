@@ -34,6 +34,7 @@ import { decideSaveVerb } from '../src/core/editor/rv-save-document';
 import { glbNodeCensus, readGlbJson } from '../src/core/import/rv-glb-inspect';
 import { parseGlbChunks, rebuildGlbWithJson } from '../src/core/persistence/rv-glb-chunks';
 import type { ProjectBackend } from '../src/core/project/backends/project-backend';
+import { folderFields } from '../src/plugins/mcp-bridge/rv-mcp-project-tools';
 
 // ─── T9 — the open-document guard of web_document_update ────────────────
 
@@ -288,3 +289,39 @@ function makeGlb(json: unknown, bin: Uint8Array): ArrayBuffer {
   return buf;
 }
 
+
+// ─── plan-736 F7 — `folder` replaces `section` in the MCP file contract ────
+
+describe('plan-736 F7 — the MCP document row names its folder, not a section', () => {
+  it('folder is the first path segment, and the project root is the empty string', () => {
+    expect(folderFields('models/Press.glb').folder).toBe('models');
+    expect(folderFields('library/Custom/Belt.glb').folder).toBe('library');
+    expect(folderFields('scenes/Line.scene.glb').folder).toBe('scenes');
+    // The case the old field could not express. `sectionOfDocument` answered
+    // `'library'` for a root-level file because `library` was its fallback, so
+    // an agent filtering on it filed the project root under the library.
+    expect(folderFields('Root.glb').folder).toBe('');
+    // A folder nobody named a section after is simply its own name now.
+    expect(folderFields('cad/Imported.step').folder).toBe('cad');
+    expect(folderFields('knowledge/Sheet.pdf').folder).toBe('knowledge');
+  });
+
+  it('the deprecated `section` alias carries the IDENTICAL value as `folder`', () => {
+    // The alias exists so an agent prompt written against the old field keeps
+    // working for one release. Two fields that are meant to be one value must
+    // never be able to drift, which is what this pins.
+    for (const path of [
+      'models/Press.glb', 'library/Custom/Belt.glb', 'scenes/Line.scene.glb',
+      'cad/Imported.step', 'Root.glb', '', 'a/b/c/d.glb',
+    ]) {
+      const row = folderFields(path);
+      expect(row.section, path).toBe(row.folder);
+    }
+  });
+
+  it('a non-string path is the root, never a crash', () => {
+    for (const bad of [null, undefined, 42, {}, []]) {
+      expect(folderFields(bad)).toEqual({ folder: '', section: '' });
+    }
+  });
+});

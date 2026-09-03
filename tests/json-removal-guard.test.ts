@@ -152,18 +152,18 @@ describe('a manifest that stayed behind', () => {
 
   it('is refused by the folder backend even when asked for the body directly', async () => {
     const backend = new FolderBackend(asDirHandle(root), { writable: true });
-    await expect(backend.readScene('scenes/a.scene.json')).rejects.toThrow(LegacyFormatError);
+    await expect(backend.readDocument('scenes/a.scene.json')).rejects.toThrow(LegacyFormatError);
   });
 
   it('is refused by the browser backend on the same rule', async () => {
     const backend = new BrowserBackend('prj_b', { requestPersistence: false });
-    await expect(backend.readScene('scenes/a.scene.json')).rejects.toThrow(LegacyFormatError);
+    await expect(backend.readDocument('scenes/a.scene.json')).rejects.toThrow(LegacyFormatError);
   });
 
   it('a GLB path is not refused — the gate is the format, not the read', async () => {
     const backend = new FolderBackend(asDirHandle(root), { writable: true });
     // Nothing is there, so the honest answer is "no such scene", not an error.
-    await expect(backend.readScene('scenes/a.scene.glb')).resolves.toBeNull();
+    await expect(backend.readDocument('scenes/a.scene.glb')).resolves.toBeNull();
   });
 });
 

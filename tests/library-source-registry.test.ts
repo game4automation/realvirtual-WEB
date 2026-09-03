@@ -136,7 +136,7 @@ function fakeProjectStore(): FakeProjectStore {
       kind: 'folder',
       writable: true,
       listLibrary: async () => library,
-      readBlobUrl: async (relPath: string) => ({
+      readDocumentUrl: async (relPath: string) => ({
         url: 'blob:' + relPath,
         release: () => { api.released++; },
       }),
@@ -231,7 +231,7 @@ describe('active project as a library source', () => {
         kind: 'folder',
         writable: true,
         listLibrary: async () => { throw new Error('disk gone'); },
-        readBlobUrl: async () => null,
+        readDocumentUrl: async () => null,
       } as never),
     };
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

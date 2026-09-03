@@ -36,12 +36,29 @@
 
 import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
+import { arrayBufferOf } from '../../core/project/rv-scene-record';
 import { builtinSources } from '../../core/rv-model-catalog';
 import {
   publishedUrlNameOf,
   resolvePublishedAlias,
   resolvePublishedSceneParam,
 } from '../../core/hmi/scene/rv-published-scenes';
+
+/**
+ * The two folder fields every document row of these tools reports.
+ *
+ * `folder` is the first path segment — `''` at the project root — read off the
+ * path and nowhere else (plan-736 F7). `section` carries the identical value
+ * and is deprecated: it used to be `sectionOfDocument()`, a stored field with a
+ * three-way path heuristic behind it, which answered `'library'` for a
+ * root-level file and for a browser scene alike. An agent prompt written
+ * against `section` keeps working for one release; new ones read `folder`.
+ */
+export function folderFields(path: unknown): { folder: string; section: string } {
+  const p = typeof path === 'string' ? path : '';
+  const folder = p.includes('/') ? p.slice(0, p.indexOf('/')) : '';
+  return { folder, section: folder };
+}
 
 /** Normalised match key: case- and separator-insensitive. */
 function matchKey(s: string): string {
@@ -146,8 +163,9 @@ export class McpProjectTools {
 
   @McpTool(
     'List the DOCUMENTS of the open project — THE one list. Asset, model and scene are the same '
-    + 'thing: a GLB document; the folder (`section`: scenes/models/library) is a storage place, '
-    + 'not a type. Each row: id, name, path, section, sizeBytes, modified. `builtins` are '
+    + 'thing: a GLB document; the folder (`folder`: the first path segment, `""` at the root) '
+    + 'is a place, not a type. Each row: id, name, path, folder, sizeBytes, modified. '
+    + '(`section` is a deprecated alias of `folder` and carries the same value.) `builtins` are '
     + 'read-only SOURCES, not documents: opening one and saving materialises a new document. '
     + '`published` lists the DEV-ONLY documents (`devOnly: true` in the manifest) — repo '
     + 'fixtures that no delivered channel ships; they are ordinary rows of `documents` too. '
@@ -184,7 +202,11 @@ export class McpProjectTools {
     // carries bytes on disk, and `listLibrary()` sees a GLB dropped into the
     // folder by hand before anything adopts it. Neither alone is the whole list.
     interface DocumentRow {
-      id: string | null; name: string; path: string; section: string | null;
+      id: string | null; name: string; path: string;
+      /** First path segment, '' at the project root. */
+      folder: string;
+      /** @deprecated plan-736 — identical to `folder`. */
+      section: string;
       sizeBytes: number | null; modified: string | null; nodeCount?: number;
     }
     const byPath = new Map<string, DocumentRow>();
@@ -198,7 +220,7 @@ export class McpProjectTools {
         id: d.id,
         name: d.name,
         path: d.path,
-        section: documents.sectionOfDocument(d),
+        ...folderFields(d.path),
         sizeBytes: d.sizeBytes ?? stat?.size ?? null,
         modified: d.modifiedAt ?? (stat?.mtime ? new Date(stat.mtime).toISOString() : null),
       });
@@ -213,7 +235,7 @@ export class McpProjectTools {
         id: e.id ?? null,
         name: e.label || file.replace(/\.glb$/i, ''),
         path: e.path,
-        section: 'library',
+        ...folderFields(e.path),
         sizeBytes: e.sizeBytes ?? stat?.size ?? null,
         modified: stat?.mtime ? new Date(stat.mtime).toISOString() : null,
       });
@@ -227,11 +249,11 @@ export class McpProjectTools {
       const { readGlbJson, glbNodeCensus } = await import('../../core/import/rv-glb-inspect');
       for (const row of rows) {
         try {
-          const bytes = await backend.readBlobBytes(row.path);
+          const bytes = (await backend.readDocument(row.path))?.bytes ?? null;
           // Header-only: `readGlbJson` -> `parseGlbChunks`, which locates the BIN
           // chunk and never decodes it. The full `parseGlbSubtree*` path is
           // forbidden here (plan-713 F2).
-          if (bytes) row.nodeCount = glbNodeCensus(readGlbJson(bytes)).nodeCount;
+          if (bytes) row.nodeCount = glbNodeCensus(readGlbJson(arrayBufferOf(bytes))).nodeCount;
         } catch { /* an unreadable file simply reports no count */ }
       }
     }
@@ -369,7 +391,7 @@ export class McpProjectTools {
         id: doc.id,
         name: doc.name,
         path: doc.path,
-        section: documents.sectionOfDocument(doc),
+        ...folderFields(doc.path),
       });
     }
 
@@ -388,7 +410,7 @@ export class McpProjectTools {
         id: aliased.id,
         name: aliased.name,
         path: aliased.path,
-        section: documents.sectionOfDocument(aliased),
+        ...folderFields(aliased.path),
         note: 'Resolved through the legacy published:<name> alias — prefer the document id.',
       });
     }

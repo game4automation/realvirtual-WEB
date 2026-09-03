@@ -236,7 +236,7 @@ describe('the shipped manifest is the one the repo authored', () => {
     // User decision 2026-08-30: DemoRobotIK and DemoCSGMachining are internal
     // dev/test models and must NOT be declared here.
     const real = JSON.parse(readFileSync(
-      resolve(__dirname, '..', 'public', 'project.json'), 'utf8',
+      resolve(__dirname, '..', 'public', 'demo-realvirtual', 'project.json'), 'utf8',
     ));
     // User decision 2026-08-31: both demo documents live at the MAIN level of
     // public/ — sections are declared on the rows, not implied by folders.
@@ -249,6 +249,10 @@ describe('the shipped manifest is the one the repo authored', () => {
     expect(documents.filter((d) => d.devOnly !== true).map((d) => d.path)).toEqual([
       'DemoRealvirtualWeb.glb',
       'DemoPlanner.glb',
+      // plan-737 F8: the demo says out loud that it is a sandbox and that every
+      // delivery replaces it in full. It is a document like any other — the
+      // `.knowledge.md` ending is what routes it to the knowledge pane.
+      'demo.knowledge.md',
     ]);
 
     // ...and the row the filter removed is the dev-only turntable fixture
@@ -259,6 +263,7 @@ describe('the shipped manifest is the one the repo authored', () => {
       { path: 'DemoRealvirtualWeb.glb', devOnly: false },
       { path: 'DemoPlanner.glb', devOnly: false },
       { path: 'Test-DES-Turntable-Loop.glb', devOnly: true },
+      { path: 'demo.knowledge.md', devOnly: false },
     ]);
   });
 });
@@ -360,7 +365,7 @@ describe('readDemoPayload — the settings sidecar (plan-731 F5)', () => {
     // The end of the chain: our own `public/project.json` uses the new rule, so
     // the fallback is genuinely a fallback and not the live path.
     const demo = JSON.parse(readFileSync(
-      resolve(__dirname, '..', 'public', 'project.json'), 'utf8',
+      resolve(__dirname, '..', 'public', 'demo-realvirtual', 'project.json'), 'utf8',
     ));
     const start = demo.documents.find(
       (d: { path: string }) => d.path === demo.settings?.defaultModel,

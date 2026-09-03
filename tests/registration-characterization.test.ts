@@ -66,6 +66,7 @@ import type { RvDocumentEntry, RvProject } from '../src/core/project/rv-project-
 import { clearAllScenes, setDraftScope } from '../src/core/hmi/scene/rv-scene-storage';
 import { clearAllBlobs } from '../src/core/storage/rv-opfs-blobs';
 import { clearAllSceneOwners } from '../src/core/project/rv-scene-owner';
+import { writeBlobDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
 
@@ -117,11 +118,24 @@ function project(documents: RvDocumentEntry[] = []): RvProject {
 /** The blob surface `library-asset-ops` needs, over a FakeDir-free map. */
 class BlobBackend {
   files = new Map<string, string>();
-  async writeBlob(relPath: string, blob: Blob): Promise<void> {
-    this.files.set(relPath, await blob.text());
+  async writeDocument(
+    ref: string | { path: string },
+    bytes: Uint8Array,
+  ): Promise<{ revision: string }> {
+    this.files.set(typeof ref === 'string' ? ref : ref.path, new TextDecoder().decode(bytes));
+    return { revision: 'rev' };
   }
-  async deleteBlob(relPath: string): Promise<void> { this.files.delete(relPath); }
-  async readBlobUrl(relPath: string) {
+  async readDocument(ref: string | { path: string }) {
+    const relPath = typeof ref === 'string' ? ref : ref.path;
+    const body = this.files.get(relPath);
+    return body === undefined ? null : {
+      bytes: new TextEncoder().encode(body),
+      meta: { id: '', name: relPath, path: relPath },
+      revision: 'rev',
+    };
+  }
+  async deleteDocument(relPath: string): Promise<void> { this.files.delete(relPath); }
+  async readDocumentUrl(relPath: string) {
     const body = this.files.get(relPath);
     if (body === undefined) return null;
     const url = URL.createObjectURL(new Blob([body]));
@@ -165,11 +179,17 @@ describe('plan-717 §2.3 baseline — the listing is derived, not declared', () 
 
     // The scene keeps the id the MANIFEST gave it; the two assets get one
     // derived from their path, freshly, on this call.
-    expect(docs.map(d => [d.section, d.id])).toEqual([
-      ['scenes', 'scn_a'],
-      ['models', stableDocumentId('models/Press.glb')],
-      ['library', stableDocumentId('library/parts/Roll2m.glb')],
+    //
+    // Keyed by PATH since plan-736 — the row no longer restates the array it
+    // came from, so the pin is the pair that always carried the information.
+    expect(docs.map(d => [d.path, d.id])).toEqual([
+      ['scenes/Plant.scene.glb', 'scn_a'],
+      ['models/Press.glb', stableDocumentId('models/Press.glb')],
+      ['library/parts/Roll2m.glb', stableDocumentId('library/parts/Roll2m.glb')],
     ]);
+    // Only the scene branch still stamps one — the transitional Alt-Client
+    // guard on `documentOfSceneEntry`. See plan-736 Phase 3.
+    expect(docs.map(d => d.section)).toEqual(['scenes', undefined, undefined]);
   });
 
   it('the derived id is a pure function of the path — no row is created', () => {
@@ -183,17 +203,21 @@ describe('plan-717 §2.3 baseline — the listing is derived, not declared', () 
   });
 
   it('the declared overlay is keyed ID-FIRST, so it MISSES a bare folder listing', () => {
-    // Non-obvious and load-bearing: `sectionKeyOf` prefers the id, so a
-    // declared row keys as `library:doc_authored` while the file the folder
-    // scan found keys as `library:library/parts/Roll2m.glb`. The two never
-    // meet, and the listing shows the derived id — even though the manifest
-    // holds an authored row for that exact path. Whether Phase 1 keeps the
-    // id-first key or switches to a path key is a decision this pin forces.
+    // Non-obvious and load-bearing: `documentKeyOf` prefers the id, so a
+    // declared row keys as `doc_authored` while the file the folder scan found
+    // keys as `library/parts/Roll2m.glb`. The two never meet, and the listing
+    // shows the derived id — even though the manifest holds an authored row for
+    // that exact path.
+    //
+    // plan-736 dropped the section PREFIX from that key (`sectionKeyOf` →
+    // `documentKeyOf`) and left the id-first rule exactly as it was, so this
+    // pin still describes the behaviour it was written for. The decision it
+    // forces — id-first key or path key — is still open, and still not this
+    // plan's to make.
     const declared: RvDocumentEntry = {
       id: 'doc_authored',
       name: 'Roll 2m',
       path: 'library/parts/Roll2m.glb',
-      section: 'library',
       sizeBytes: 4242,
     };
     const docs = documentsFromLists(
@@ -553,7 +577,7 @@ describe('plan-717 R1-S2 baseline — only the content-addressed backend reports
   it('BrowserBackend (OPFS) reports the digest and no size', async () => {
     const backend = new BrowserBackend('prj_char_opfs', { requestPersistence: false });
     await backend.activate();
-    await backend.writeBlob('library/parts/Roll2m.glb', new Blob(['glTF-ROLL']));
+    await writeBlobDocument(backend, 'library/parts/Roll2m.glb', new Blob(['glTF-ROLL']));
 
     const stats = await backend.statDocuments();
     const stat = stats.find(s => s.path === 'library/parts/Roll2m.glb');
