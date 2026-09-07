@@ -105,7 +105,11 @@ npm install
 npm run dev          # Vite dev server with HMR
 ```
 
-Drop `.glb` files exported from [realvirtual.io](https://realvirtual.io) into `public/models/` — they appear automatically in the model selector as DEV BUILT-INS. That is a checkout convenience, not the product path: a delivered project keeps its documents in the project itself (root-level, `models/`, `library/` — the folder is a place, not a type) and the manifest lists them.
+Load your own model in one of three ways — there is no folder that gets scanned:
+
+- **Import it in the app** — open the import dialog and choose the **GLB File** tab, then drop `.glb` files or pick them from disk. Files stay in your browser; nothing is uploaded.
+- **Link to it** — `?glb=https://host/your-model.glb` loads a GLB from any host you control (GitHub raw, a CDN, your own server). Nothing is uploaded and no sign-in is needed.
+- **Put it in a project** — a project declares what it holds in its own `project.json` (`documents[]`), and that manifest is the single source of truth. The bundled demo in `public/demo-realvirtual/` is a working example. This is the path a delivered project uses: it keeps its documents in the project itself (root-level, `models/`, `library/` — the folder is a place, not a type).
 
 ```bash
 npm run build        # Production build -> dist/ (local only, nothing published)
