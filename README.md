@@ -199,7 +199,7 @@ src/
                      #   edition build and run without the private sibling repository
 tests/               # Vitest browser-mode tests
 e2e/                 # Playwright E2E tests
-public/models/       # Dev built-in GLBs (checkout convenience, not the product path)
+public/demo-realvirtual/  # Bundled demo project: its GLBs and its project.json manifest
 ```
 
 ## Extending realvirtual WEB
