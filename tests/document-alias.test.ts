@@ -70,6 +70,9 @@ vi.mock('../src/core/project/project-store', () => ({
     getProject: () => ({ id: 'prj_one' }),
     mintReferencedAssetIdentities: async () => {},
     setDirtyDocumentsProbe: () => {},
+    // `SceneStore._documentRowOrAdopt` rescans once on a row miss (plan-716);
+    // this fixture has no backend, so the rescan is a no-op.
+    rescanDocuments: async () => {},
   }),
 }));
 
@@ -124,6 +127,21 @@ import {
 import { legacySceneId } from './helpers/legacy-scene-id';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
+
+/**
+ * Poll `done` until it holds, or fail loudly at `timeoutMs`.
+ *
+ * A fixed sleep is a bet on how long the machine will take; this is a bet on
+ * what the code will do. The timeout is generous on purpose — it is a deadlock
+ * guard, not a performance assertion, and it never lengthens a passing run.
+ */
+async function waitUntil(done: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!done()) {
+    if (Date.now() > deadline) throw new Error(`waitUntil: condition never held within ${timeoutMs} ms`);
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+}
 
 function sceneFixture(id: string, name: string): RvScene {
   return {
@@ -471,7 +489,20 @@ describe('a tab holding the OLD identity when its save is refused', () => {
       id: `op_${aliased}`, ts: Date.now(), schemaV: 1, kind: 'setField',
       nodePath: 'Conv1', componentType: 'Drive', fieldName: 'TargetSpeed', value: 5, prev: 0,
     } as never);
-    await new Promise(resolve => setTimeout(resolve, 2400));
+    // Wait for the OUTCOME, not for a duration.
+    //
+    // This used to be `setTimeout(2400)`, which is the 2000 ms autosave debounce
+    // plus 400 ms for the write to run into the refusal and the notice to be
+    // published. 400 ms is nothing while other test files are loading their
+    // module graphs into the same browser: the notice arrived AFTER the
+    // assertion had already read an empty list, and the pair failed together
+    // with whatever else happened to be running — which is what made these two
+    // look like they depended on test ORDER rather than on machine load.
+    await waitUntil(() => notices.length > 0, 20_000);
+    // The two notices of one refusal are published back to back; give the
+    // second one its tick before the negative half of each assertion reads the
+    // list ("never conflict" / "never moved").
+    await new Promise(resolve => setTimeout(resolve, 250));
     off();
     expect(hasDocumentAlias(sceneId)).toBe(aliased);
     return notices;

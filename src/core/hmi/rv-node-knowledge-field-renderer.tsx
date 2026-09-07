@@ -36,7 +36,7 @@
  * in production.
  */
 
-import { Component, Suspense, lazy, memo, useMemo, type ReactNode } from 'react';
+import { memo } from 'react';
 import { Box, Chip, Tooltip, Typography } from '@mui/material';
 import { fieldRendererRegistry, type FieldRendererProps } from './rv-field-renderer-registry';
 import {
@@ -46,7 +46,7 @@ import {
   readNodeKnowledge,
   type NodeKnowledgeExtras,
 } from '../engine/rv-node-knowledge';
-import { loadMarkdown } from './rv-markdown-lazy';
+import { LazyMarkdown } from './rv-markdown-lazy';
 
 // ── Local ink / metric constants (same convention as rv-component-section) ──
 
@@ -180,65 +180,22 @@ function RawNote({ text }: { text: string }) {
   );
 }
 
-/**
- * Catches a REJECTED markdown chunk (offline, purged CDN, blocked asset).
- *
- * `Suspense` handles a pending promise and nothing else — a rejected dynamic
- * import throws, and without a boundary here that throw takes the surrounding
- * inspector subtree down with it. This is the single most common mistake in
- * code-split React, and it is the reason F7 names both mechanisms.
- */
-class MarkdownErrorBoundary extends Component<{ fallback: ReactNode; children: ReactNode }, { failed: boolean }> {
-  state = { failed: false };
-
-  static getDerivedStateFromError() {
-    return { failed: true };
-  }
-
-  componentDidCatch(error: unknown) {
-    console.warn('[NodeKnowledge] markdown chunk failed to load, showing raw note', error);
-  }
-
-  render() {
-    return this.state.failed ? this.props.fallback : this.props.children;
-  }
-}
-
 // ── Markdown body ─────────────────────────────────────────────────────────
 
 /**
- * The lazy half. The `lazy()` component is built per mount (`useMemo`), so each
- * mounted renderer asks {@link loadMarkdown} exactly once — that is what lets a
- * test swap in a pending or rejecting loader and actually observe the state.
+ * The lazy half, through the shared {@link LazyMarkdown} (plan-461 V11).
  *
- * `memo` is not decoration here. The inspector re-renders on its own live ticks,
- * and without it every one of those would re-parse the note — 2400 characters of
+ * The error boundary is explicitly ON here: a rejected chunk must fall back to
+ * the raw note rather than take the surrounding inspector subtree down with it.
+ *
+ * `memo` is not decoration. The inspector re-renders on its own live ticks, and
+ * without it every one of those would re-parse the note — 2400 characters of
  * Markdown through micromark, several times a second, for a value that did not
  * change. `text` is a string, so the default shallow compare is exactly right.
  */
 const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
-  const Lazy = useMemo(
-    () =>
-      lazy(async () => {
-        const { ReactMarkdown, remarkGfm } = await loadMarkdown();
-        return {
-          default: ({ source }: { source: string }) => (
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
-              {source}
-            </ReactMarkdown>
-          ),
-        };
-      }),
-    [],
-  );
-
-  const fallback = <RawNote text={text} />;
   return (
-    <MarkdownErrorBoundary fallback={fallback}>
-      <Suspense fallback={fallback}>
-        <Lazy source={text} />
-      </Suspense>
-    </MarkdownErrorBoundary>
+    <LazyMarkdown text={text} components={MD_COMPONENTS} fallback={<RawNote text={text} />} errorBoundary />
   );
 });
 

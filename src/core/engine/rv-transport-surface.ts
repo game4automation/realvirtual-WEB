@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { Box3, Object3D, Vector2, Vector3, Quaternion, MathUtils, Matrix4, Mesh, MeshBasicMaterial, PlaneGeometry, Shape, ShapeGeometry, DoubleSide, RepeatWrapping, EdgesGeometry, LineSegments, LineBasicMaterial } from 'three';
+import { Box3, Object3D, Vector2, Vector3, Quaternion, MathUtils, Matrix4, Mesh, MeshBasicMaterial, PlaneGeometry, Shape, ShapeGeometry, DoubleSide, EdgesGeometry, LineSegments, LineBasicMaterial } from 'three';
 import { debug } from './rv-debug';
 import { MM_TO_METERS } from './rv-constants';
-import type { MeshStandardMaterial, Texture } from 'three';
+import type { Texture } from 'three';
 import { AABB } from './rv-aabb';
 import type { PhysicsAABB } from './rv-physics-registry';
 import type { RVDrive } from './rv-drive';
@@ -12,6 +12,7 @@ import type { RVMovingUnit, InstancedMovingUnit } from './rv-mu';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
 import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import { traverseMeshes } from './rv-traverse-utils';
+import { cloneScrollableMaps, resetMapOffsets, scrollMaps } from './rv-texture-scroll';
 import type { GizmoOverlayManager } from './rv-gizmo-manager';
 import { subscribeOverlayVisibility, isOverlayVisible } from '../overlay-visibility-store';
 
@@ -748,7 +749,7 @@ export class RVTransportSurface implements RVComponent {
    * Drive's speed/position is reset separately by `RVDrive.reset()`.
    */
   reset(): void {
-    for (const tex of this._texMaps) tex.offset.set(0, 0);
+    resetMapOffsets(this._texMaps);
     this._radialOffsetX = 0;
     this._lastMatrixCaptured = false;
     this._hasTransformDelta = false;
@@ -1090,24 +1091,14 @@ export class RVTransportSurface implements RVComponent {
    */
   private _initTextureAnimation(): void {
     let meshCount = 0;
-    let texCount = 0;
-    traverseMeshes(this.node, (mesh) => {
-      meshCount++;
-      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      for (let i = 0; i < mats.length; i++) {
-        const mat = mats[i] as MeshStandardMaterial;
-        if (mat.map) {
-          // Clone texture to get independent offset (image data stays shared on GPU)
-          const tex = mat.map.clone();
-          tex.wrapS = RepeatWrapping;
-          tex.wrapT = RepeatWrapping;
-          tex.needsUpdate = true;
-          mat.map = tex;
-          this._texMaps.push(tex);
-          texCount++;
-        }
-      }
-    });
+    traverseMeshes(this.node, () => { meshCount++; });
+    // plan-459: the clone-per-map body used to sit inline here. It is now the
+    // shared primitive `cloneScrollableMaps` (rv-texture-scroll.ts), which the
+    // RibbonPath band uses as well — a pure extraction, byte-for-byte the same
+    // sampler state and the same "one GPU upload, N independent offsets" model.
+    const cloned = cloneScrollableMaps(this.node);
+    for (const tex of cloned) this._texMaps.push(tex);
+    const texCount = cloned.length;
     if (texCount > 0) {
       debug('transport', `TransportSurface "${this.node.name}": texture animation enabled (${texCount} textures on ${meshCount} meshes, uvDir=(${this._uvDirX.toFixed(2)}, ${this._uvDirZ.toFixed(2)}))`);
     } else {
@@ -1126,10 +1117,7 @@ export class RVTransportSurface implements RVComponent {
     const du = this._uvDirX * speedFactor;
     const dv = this._uvDirZ * speedFactor;
 
-    for (const tex of this._texMaps) {
-      tex.offset.x += du;
-      tex.offset.y += dv;
-    }
+    scrollMaps(this._texMaps, du, dv);
   }
 
   /**

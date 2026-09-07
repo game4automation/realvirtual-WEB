@@ -39,6 +39,8 @@ import {
   RV_CHAIN_SKIN,
   RV_CHAIN_SOURCE,
   RV_CHAIN_SOURCE_VISIBLE,
+  RV_RIBBON_BAND,
+  RV_RIBBON_ROLL_SCALE,
 } from '../engine/rv-traverse-utils';
 import { RV_SHARE_KEY, RV_SHARE_VERSION, type RvShareMeta } from '../share/rv-share-meta';
 import {
@@ -118,6 +120,15 @@ export function pruneRuntimeHelpers(root: Object3D): void {
       // reached the export from a simulating load. Without it a save would bake
       // in N copies, and the next round trip N per copy.
       || ud[RV_CHAIN_ELEMENT]
+      // The generated web band (plan-459). A `RibbonPath` computes its own geometry
+      // from the roller poses on every load, so the band is reproducible and has
+      // no business in the file — and its vertex count follows the roll
+      // diameters, so baking it in would freeze one arbitrary moment of the
+      // simulation as authored content.
+      || ud[RV_RIBBON_BAND]
+      // The procedural roll a RibbonWinder builds when no RollMesh was authored. Same
+      // rule: it exists because the file did NOT contain one.
+      || (ud['_rvGenerated'] === true && node.name.endsWith('_Roll'))
     ) junk.push(node);
   });
   for (const node of junk) node.removeFromParent();
@@ -404,6 +415,7 @@ export async function exportAssetGlb(
   }
   restoreAuthoredLampMaterials(assetRoot, clone);
   restoreEnergyChainSources(clone);
+  restoreWebRollScales(clone);
   // Before `pruneRuntimeHelpers`, and deliberately so: this drops whole composed
   // subtrees, which is strictly more than the helper prune would have to walk.
   pruneComposedReferenceSubtrees(clone);
@@ -554,6 +566,29 @@ function restoreEnergyChainSources(clone: Object3D): void {
     bare.deleteAttribute('skinIndex');
     bare.deleteAttribute('skinWeight');
     mesh.geometry = bare;
+  });
+}
+
+/**
+ * Put every winder roll back to its AUTHORED scale on the export clone
+ * (plan-459 F10, SOL round-2 finding 3).
+ *
+ * A `RibbonWinder` scales its `RollMesh` radially every tick, and this exporter clones
+ * the LIVE tree — so without this the saved GLB would carry whatever diameter
+ * the roll happened to have. Restoring `(1,1,1)` would be a different bug: a CAD
+ * roll may legitimately be authored with a non-unit scale, and forcing unity
+ * would silently resize the part on every save. The authored triple is stamped
+ * on the node by `RVRibbonWinder._bindRollMesh()` precisely because the clone cannot
+ * reach the component.
+ */
+function restoreWebRollScales(clone: Object3D): void {
+  clone.traverse((node) => {
+    const authored = (node.userData as Record<string, unknown>)[RV_RIBBON_ROLL_SCALE];
+    if (!Array.isArray(authored) || authored.length !== 3) return;
+    const [x, y, z] = authored as number[];
+    if ([x, y, z].every((v) => typeof v === 'number' && Number.isFinite(v))) {
+      node.scale.set(x, y, z);
+    }
   });
 }
 

@@ -350,15 +350,28 @@ describe('project kind', () => {
     }
   });
 
-  it('fails a customer project that has no vendor.managed globs to deliver through', () => {
+  /**
+   * T7 (plan-738): a `customer` project no longer needs a `vendor` block.
+   *
+   * It used to be a hard error, and for a good reason while the zones existed:
+   * without `vendor.managed` the three-way merge classified every path as
+   * customer-owned, so a delivery into that project silently changed nothing.
+   * Plan-738 removed the zones — the core is replaced in full at every delivery
+   * regardless of the manifest — so the field the rule demanded is gone and its
+   * absence carries no meaning at all.
+   *
+   * The other half matters just as much: a manifest in a customer's own
+   * repository may still CARRY an old block, and reading one must not fail the
+   * gate. It is an unknown key now, and unknown keys are tolerated.
+   */
+  it('accepts a customer project with no vendor block, and tolerates a leftover one', () => {
     const { vendor, ...noVendor } = BASE;
-    for (const broken of [{}, { vendor: {} }, { vendor: { managed: [] } }, { vendor: { handover: ['a/**'] } }]) {
-      const result = validateProject(project({ ...noVendor, kind: 'customer', ...broken }));
-      expect(result.ok).toBe(false);
-      expect(result.errors.some(e => /no "vendor.managed"/.test(e))).toBe(true);
+    for (const shape of [{}, { vendor: {} }, { vendor: { managed: [] } }, { vendor: { handover: ['a/**'] } },
+      { vendor: { managed: ['models/**'], handover: ['models/custom/**'] } }]) {
+      const result = validateProject(project({ ...noVendor, kind: 'customer', ...shape }));
+      expect(result.ok, JSON.stringify(shape)).toBe(true);
+      expect(result.errors.some(e => /vendor/.test(e)), JSON.stringify(shape)).toBe(false);
     }
-    // The same manifest as a demo or a fixture is fine: nothing is delivered
-    // into it, so "everything is customer-owned" is the right default.
     expect(validateProject(project({ ...noVendor, kind: 'internal' })).ok).toBe(true);
     expect(validateProject(project({ ...noVendor, kind: 'demo' })).ok).toBe(true);
   });
@@ -368,9 +381,10 @@ describe('project kind', () => {
  * plan-434 phase 2 — `local/` is a recognised project folder.
  *
  * `projects/wmyb/local` holds NDA material that is neither delivered nor
- * published. It is already zone C by construction (no vendor glob names it, and
- * unknown means customer-owned in `_vendor-merge.mjs`); the only thing missing
- * was that the validator called the spelling unrecognised.
+ * published. Nothing about a delivery could reach it anyway — it lives under
+ * `projects/`, which a delivery never writes into unless a human names the folder
+ * with `--projects` — so the only thing missing was that the validator called the
+ * spelling unrecognised.
  */
 describe('known top-level folders', () => {
   it('does not flag local/ as unrecognised, but still flags a folder nobody knows', () => {

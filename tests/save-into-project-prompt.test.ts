@@ -99,6 +99,12 @@ function makeDoc(base: AssetBase, name = 'Demo') {
     name,
     base,
     dirty: true,
+    // plan-462 B3 — `saveDocument` takes a short-lived `save` lock on the document
+    // before its first side effect. Three members, so this double stays a document;
+    // the lock itself is covered by `rv-asset-document-lock.test.ts`.
+    lockOwner: null,
+    tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
+    unlock: () => {},
     document: {
       opCount: 3,
       runExclusive<T>(work: () => Promise<T>): Promise<T> { return work(); },

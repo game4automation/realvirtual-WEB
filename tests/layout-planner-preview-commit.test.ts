@@ -17,7 +17,7 @@
  * by `layout-planner-async-placement.test.ts`. `_startDraft` still returns a
  * promise for this branch, hence the `await`s below.
  */
-import { describe, test, expect, vi } from 'vitest';
+import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Group, PerspectiveCamera } from 'three';
 import type { Object3D } from 'three';
 import { LayoutPlannerPlugin } from '../src/plugins/layout-planner';
@@ -75,12 +75,39 @@ const VIRTUAL_ENTRY: LibraryCatalogEntry = {
   gizmoSize: [500, 500, 500],
 };
 
+/**
+ * Every plugin built in a test, so the suite can dispose them again.
+ *
+ * `onModelLoaded` kicks off an async init that ends in `loadAutoSave()`. Left
+ * alive, a plugin from a previous test keeps that restore in flight and its
+ * store keeps auto-saving — which is how the COMMIT test's placement used to
+ * reappear in the CANCEL test and make `placed` non-empty (plan-901).
+ */
+const plugins: LayoutPlannerPlugin[] = [];
+
+/** localStorage keys the planner persists a layout under. */
+const LS_KEY_AUTOSAVE = 'rv-layout-autosave';
+
 function makePlugin() {
   const viewer = createMockViewer();
   const plugin = new LayoutPlannerPlugin();
+  plugins.push(plugin);
   plugin.onModelLoaded?.({ scene: new Group() } as never, viewer as never);
   return { plugin, viewer };
 }
+
+beforeEach(() => {
+  // A test starts from an EMPTY planner persistence — otherwise the plugin's
+  // boot restore carries the previous test's committed placements in.
+  try { localStorage.removeItem(LS_KEY_AUTOSAVE); } catch { /* ignore */ }
+});
+
+afterEach(() => {
+  for (const plugin of plugins.splice(0)) {
+    try { plugin.dispose?.(); } catch { /* teardown must not fail a test */ }
+  }
+  try { localStorage.removeItem(LS_KEY_AUTOSAVE); } catch { /* ignore */ }
+});
 
 /** Access the planner's private draft lifecycle for assertions. */
 function internals(plugin: LayoutPlannerPlugin) {

@@ -151,6 +151,29 @@ export type DashboardTreeRef =
   | { kind: 'plainFile'; path: string }
   | { kind: 'catalogAsset'; providerId: string; sourceId: string; assetId: string };
 
+/**
+ * The ref kinds that are a plain FILE of the project folder rather than a
+ * document row or a catalog asset (plan-461 V13).
+ *
+ * They behave alike wherever the dashboard asks "is this a file?": a `file`
+ * selection highlights them, a click selects them by path, and a double-click
+ * has no verb for any of them. The four used to be spelled out at each of those
+ * places, which is how the NEXT kind would quietly behave like a document.
+ */
+export type DashboardTreeFileRef = Extract<
+  DashboardTreeRef,
+  { kind: 'attachment' | 'connectConfig' | 'knowledgeFile' | 'plainFile' }
+>;
+
+const FILE_REF_KINDS = new Set<DashboardTreeRef['kind']>([
+  'attachment', 'connectConfig', 'knowledgeFile', 'plainFile',
+]);
+
+/** {@link DashboardTreeFileRef}, as a narrowing check. */
+export function isFileRef(ref: DashboardTreeRef): ref is DashboardTreeFileRef {
+  return FILE_REF_KINDS.has(ref.kind);
+}
+
 export interface DashboardTree {
   roots: ProjectTreeRootInput[];
   /** Tree path → what that row is. Only leaf rows appear. */

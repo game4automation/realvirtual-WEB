@@ -16,7 +16,24 @@ export function pointerToNDC(
   domElement: HTMLElement,
   out: Vector2 = _ndc,
 ): Vector2 {
-  const rect = domElement.getBoundingClientRect();
+  return ndcFromRect(clientX, clientY, domElement.getBoundingClientRect(), out);
+}
+
+/**
+ * The same conversion from an ALREADY MEASURED rect.
+ *
+ * A pointer handler that also needs the rect — for a bounds check, or to refuse
+ * a zero-sized canvas — must not pay for a second `getBoundingClientRect()`:
+ * that is a forced layout on every `pointermove`. So the measurement and the
+ * arithmetic are separable, and {@link pointerToNDC} is this function plus the
+ * measurement (plan-461 R8).
+ */
+export function ndcFromRect(
+  clientX: number,
+  clientY: number,
+  rect: { left: number; top: number; width: number; height: number },
+  out: Vector2 = _ndc,
+): Vector2 {
   out.x = ((clientX - rect.left) / rect.width) * 2 - 1;
   out.y = -((clientY - rect.top) / rect.height) * 2 + 1;
   return out;

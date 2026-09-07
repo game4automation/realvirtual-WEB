@@ -43,7 +43,7 @@ const CUSTOMER_MANIFEST = {
   id: 'prj_delivery_standard',
   name: 'ACME Line 4',
   canonicalName: 'acme-line-4',
-  kind: 'delivery',
+  kind: 'customer',
   settings: { defaultModel: 'models/Line4.glb' },
   documents: [{ id: 'doc_line4', name: 'Line 4', path: 'models/Line4.glb' }],
 };

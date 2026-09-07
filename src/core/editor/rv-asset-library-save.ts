@@ -39,6 +39,18 @@ export function sanitizeAssetFileName(name: string): string {
 /** Download the asset as a .glb file — the fallback when no work folder /
  *  unsupported browser. The document stays dirty (draft-safe). */
 export async function downloadAssetGlb(viewer: RVViewer, doc: AssetDocument, name: string): Promise<boolean> {
+  // plan-462 B3 — refused BEFORE the first side effect, not after the export.
+  // While a test run owns the document, `viewer.currentModelRoot` IS the
+  // materialised test scene: exporting it would hand the user a GLB with
+  // runtime poses baked in as the authored state. Same reason the save path
+  // refuses, and the download is just as irreversible once the file is on disk.
+  const owner = doc.lockOwner;
+  if (owner?.kind === 'test-run') {
+    console.warn(
+      '[asset-editor] GLB download refused: a test run is active, so the scene shows runtime '
+      + 'poses rather than the authored state. Stop the test run first.');
+    return false;
+  }
   await doc.whenIdle();
   const assetRoot = viewer.currentModelRoot;
   if (!assetRoot) return false;

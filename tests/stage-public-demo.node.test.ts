@@ -2,269 +2,193 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * CONNECT public-demo staging — the bundle carries a PROJECT (plan-726 Phase 4).
+ * CONNECT public-demo staging — the bundle carries the demo FOLDER (plan-739
+ * Phase 8, F11).
  *
- * The community download used to be reduced to exactly one model pair, and
- * `assertPublicDemoOutput()` restated that pair as a literal — so it could only
- * ever fail on a build accident, never on a wrong decision.
+ * ## What changed, and why the old tests could not see it
  *
- * Since plan-726 `public/project.json` is the single source of truth for what
- * the demo contains, on every channel, and this staging READS it instead of
- * carrying its own list. The guard therefore became a real gate: what shipped
- * has to match what the shipped manifest declares.
+ * plan-737 turned the demo from a set of documents spread over `public/`, each
+ * row carrying a `section` that said what kind of thing it was, into ONE folder
+ * — `public/demo-realvirtual/` — with its own `project.json`. A document is
+ * declared by a `documents[]` row; the folder is a place, not a type
+ * (plan-716/735).
  *
- * Two things this staging has to do that the hosted deploy does not, both
- * because `stagePublic()` calls `stageFilteredSourceTree()` WITHOUT
- * `includePublicDemoContent`: it restores `public/project.json` (which the F13
- * delivery filter now removes) and `public/scenes/` (which was already
- * filtered). Both are demo content this bundle genuinely wants.
+ * `stage-public.mjs` was never migrated, so `-PublicDemo` read
+ * `public/project.json`, a file plan-737 deleted, and threw. The tests did not
+ * catch it because their fixtures wrote the OLD layout and the two that touched
+ * the real repository only READ `public/demo-realvirtual/project.json` — they
+ * asserted a file, never a staging. A test that reads the same JSON the code
+ * reads, without running the code, is green in exactly the situation this one
+ * was: the manifest was fine and the staging was broken.
+ *
+ * So every fixture here is folder-shaped, and the real-repository tests go
+ * through `preparePublicDemoSource()` + `assertPublicDemoOutput()`.
+ *
+ * ## The two switches this file pins (plan-739 F11)
+ *
+ * - `-PublicDemo` ships the demo folder, minus the `devOnly` document. The
+ *   prune is `applyPublicScenePruning()` from `_bunny-lib.mjs` — the same pass
+ *   the hosted deploy runs, imported rather than re-spelled.
+ * - `-Public` ships no demo folder at all. It used to ship the whole thing:
+ *   `stagePublic()` omitted `includePublicDemoContent`, and the default
+ *   (`profile.tier === 'core' && !projectKey`) is exactly the shape CONNECT
+ *   passes — so the switch was ON in both modes.
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import {
+  mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import {
   assertPublicDemoOutput,
   preparePublicDemoSource,
   readDemoPayload,
 } from '../../realvirtual-Connect~/tools/stage-public.mjs';
+import { stageFilteredSourceTree } from '../scripts/_workspace-lib.mjs';
+import { PUBLIC_DEMO_FOLDER } from '../scripts/_bunny-lib.mjs';
 import { assertManifestResolves } from './helpers/assert-manifest-resolves';
 
-let fixture = '';
+/** The repository itself — the source tree the real staging runs against. */
+const REPO = resolve(__dirname, '..');
+
+const temporary: string[] = [];
 afterEach(() => {
-  if (fixture) rmSync(fixture, { recursive: true, force: true });
+  for (const dir of temporary.splice(0)) rmSync(dir, { recursive: true, force: true });
   delete process.env.RV_WEB_SOURCE_URL;
 });
 
-/** The real demo manifest shape: three models and the planner scene. */
+function temp(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  temporary.push(dir);
+  return dir;
+}
+
+function write(path: string, content: string) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, content);
+}
+
+/** Every file under a folder, as `/`-separated relative paths, sorted. */
+function filesUnder(root: string, prefix = '', out: string[] = []): string[] {
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) filesUnder(join(root, entry.name), rel, out);
+    else out.push(rel);
+  }
+  return out.sort();
+}
+
+/**
+ * The real demo manifest's shape: root-level documents inside the demo FOLDER,
+ * the start document naming its own sidecar, and one `devOnly` fixture.
+ */
 const DEMO_MANIFEST = {
   schemaVersion: 2,
   id: 'prj_sample',
   name: 'DemoRealvirtual',
   canonicalName: 'demorealvirtual',
   kind: 'demo',
-  settings: { defaultModel: 'models/DemoRealvirtualWeb.glb' },
+  settings: { defaultModel: 'DemoRealvirtualWeb.glb' },
   documents: [
-    { id: 'doc_a', name: 'realvirtual WEB Demo', path: 'models/DemoRealvirtualWeb.glb', section: 'models' },
-    { id: 'doc_b', name: 'Robot IK Demo', path: 'models/DemoRobotIK.glb', section: 'models' },
-    { id: 'doc_c', name: 'CSG Machining Demo', path: 'models/DemoCSGMachining.glb', section: 'models' },
-    { id: 'doc_d', name: 'Layout Planner Demo', path: 'scenes/DemoPlanner.glb', section: 'scenes' },
+    {
+      id: 'doc_a', name: 'realvirtual WEB Demo', path: 'DemoRealvirtualWeb.glb',
+      settingsPath: 'DemoRealvirtualWeb.settings.json',
+    },
+    { id: 'doc_b', name: 'Layout Planner Demo', path: 'DemoPlanner.glb', mode: 'planner' },
+    {
+      id: 'doc_f', name: 'Test DES Turntable Loop', path: 'Test-DES-Turntable-Loop.glb',
+      mode: 'des', devOnly: true,
+    },
+    { id: 'doc_k', name: 'About this demo project', path: 'demo.knowledge.md' },
   ],
 };
 
+/** The dev-only fixture, by name — T21 asserts it never reaches an artefact. */
+const DEV_ONLY_DOCUMENT = 'Test-DES-Turntable-Loop.glb';
+
 /**
  * A source tree that stands in for the WebViewer repo, plus a staged core that
- * has already been through `stageFilteredSourceTree()` — i.e. one whose
- * `scenes/` and `project.json` have been filtered out, which is exactly the
- * state `preparePublicDemoSource()` has to repair.
+ * has already been through `stageFilteredSourceTree()`.
+ *
+ * The staged core deliberately carries an INCOMPLETE demo folder plus scratch:
+ * that is what makes the restore and the prune observable. On the real
+ * `-PublicDemo` path the filtered staging keeps the folder intact, so both are
+ * normally no-ops — and they stay, because they are what makes the payload a
+ * function of the manifest instead of of whatever the filter left behind.
  */
 function makeFixture(manifest: unknown = DEMO_MANIFEST) {
-  fixture = mkdtempSync(join(tmpdir(), 'rv-public-demo-test-'));
+  const fixture = temp('rv-public-demo-test-');
   const sourceRoot = join(fixture, 'source');
-  const sourcePublic = join(sourceRoot, 'public');
-  mkdirSync(join(sourcePublic, 'models'), { recursive: true });
-  mkdirSync(join(sourcePublic, 'scenes'), { recursive: true });
+  const sourceDemo = join(sourceRoot, 'public', PUBLIC_DEMO_FOLDER);
   for (const name of [
     'DemoRealvirtualWeb.glb', 'DemoRealvirtualWeb.settings.json',
-    'DemoRobotIK.glb', 'DemoCSGMachining.glb', 'tests.glb',
-  ]) writeFileSync(join(sourcePublic, 'models', name), name);
-  for (const name of ['DemoPlanner.glb', 'Test-DES-Turntable-Loop.glb']) {
-    writeFileSync(join(sourcePublic, 'scenes', name), name);
-  }
-  writeFileSync(join(sourcePublic, 'scenes', 'index.json'), '[]');
-  writeFileSync(join(sourcePublic, 'project.json'), JSON.stringify(manifest));
-  writeFileSync(join(sourceRoot, 'LICENSE'), 'AGPL');
+    'DemoPlanner.glb', DEV_ONLY_DOCUMENT, 'demo.knowledge.md',
+  ]) write(join(sourceDemo, name), name);
+  write(join(sourceDemo, 'project.json'), JSON.stringify(manifest));
+  write(join(sourceRoot, 'LICENSE'), 'AGPL');
 
-  // The STAGED core: filtered, so it has models/ (with scratch still in it) but
-  // neither scenes/ nor project.json.
   const stagedCore = join(fixture, 'staged');
   const stagedPublic = join(stagedCore, 'public');
-  mkdirSync(join(stagedPublic, 'models', 'library'), { recursive: true });
-  for (const name of [
-    'DemoRealvirtualWeb.glb', 'DemoRealvirtualWeb.settings.json',
-    'DemoRobotIK.glb', 'tests.glb',
-  ]) writeFileSync(join(stagedPublic, 'models', name), name);
-  writeFileSync(join(stagedPublic, 'models', 'library', 'asset.glb'), 'library');
-  writeFileSync(join(stagedPublic, 'settings.json'), JSON.stringify({ defaultModel: 'models/tests.glb' }));
-  writeFileSync(join(stagedPublic, 'index.html'), '<!doctype html>');
+  const stagedDemo = join(stagedPublic, PUBLIC_DEMO_FOLDER);
+  write(join(stagedDemo, 'DemoRealvirtualWeb.glb'), 'DemoRealvirtualWeb.glb');
+  write(join(stagedDemo, 'Scratch.glb'), 'scratch');
+  write(join(stagedPublic, 'settings.json'), JSON.stringify({ defaultModel: 'models/tests.glb' }));
+  write(join(stagedPublic, 'index.html'), '<!doctype html>');
 
   process.env.RV_WEB_SOURCE_URL = 'https://example.invalid/source/tag';
-  return { sourceRoot, sourcePublic, stagedCore, stagedPublic };
+  return { sourceRoot, sourceDemo, stagedCore, stagedPublic, stagedDemo };
 }
 
-describe('readDemoPayload', () => {
-  it('reads models, scenes and the sidecars out of the manifest', () => {
-    const { sourcePublic } = makeFixture();
-    const payload = readDemoPayload(sourcePublic);
-    expect(payload.models.sort()).toEqual(
-      ['models/DemoCSGMachining.glb', 'models/DemoRealvirtualWeb.glb', 'models/DemoRobotIK.glb'],
-    );
-    expect(payload.scenes).toEqual(['scenes/DemoPlanner.glb']);
-    // Sidecars are addressed by filename convention, so no manifest row names
-    // them; only the ones that exist are picked up.
-    expect(payload.sidecars).toEqual(['models/DemoRealvirtualWeb.settings.json']);
-  });
+// ─── readDemoPayload: the folder's manifest, read as documents ────────────
 
-  it('reads root-level documents through their explicit section', () => {
-    // The real demo manifest since 2026-08-31: documents at the MAIN level of
-    // public/, typed by the row's `section` rather than a folder name.
-    const { sourcePublic } = makeFixture({
-      ...DEMO_MANIFEST,
-      settings: { defaultModel: 'DemoRealvirtualWeb.glb' },
-      documents: [
-        { id: 'doc_a', name: 'realvirtual WEB Demo', path: 'DemoRealvirtualWeb.glb', section: 'models' },
-        { id: 'doc_d', name: 'Layout Planner Demo', path: 'DemoPlanner.glb', section: 'scenes' },
-      ],
-    });
-    writeFileSync(join(sourcePublic, 'DemoRealvirtualWeb.glb'), 'model');
-    writeFileSync(join(sourcePublic, 'DemoRealvirtualWeb.settings.json'), 'sidecar');
-    writeFileSync(join(sourcePublic, 'DemoPlanner.glb'), 'scene');
-    const payload = readDemoPayload(sourcePublic);
-    expect(payload.models).toEqual(['DemoRealvirtualWeb.glb']);
-    expect(payload.scenes).toEqual(['DemoPlanner.glb']);
+describe('readDemoPayload', () => {
+  it('reads every document and the sidecars out of the manifest', () => {
+    const { sourceDemo } = makeFixture();
+    const payload = readDemoPayload(sourceDemo);
+    // Manifest order, folder-relative. No models/scenes split: the row says
+    // what a document is, the folder says nothing (plan-716).
+    expect(payload.documents).toEqual([
+      'DemoRealvirtualWeb.glb',
+      'DemoPlanner.glb',
+      DEV_ONLY_DOCUMENT,
+      'demo.knowledge.md',
+    ]);
     expect(payload.sidecars).toEqual(['DemoRealvirtualWeb.settings.json']);
   });
 
-  it('throws when the bundle has no manifest at all', () => {
-    const { sourcePublic } = makeFixture();
-    rmSync(join(sourcePublic, 'project.json'));
+  it('reports the devOnly row like any other — the PRUNE decides, not the reader', () => {
+    // Deliberate division of labour. If the reader dropped the row, the staging
+    // would never copy the file and `applyPublicScenePruning` would have nothing
+    // to delete — and the "no dev-only document shipped" assertion would then be
+    // true because nothing had happened, which is the failure mode plan-731 2k
+    // set out to remove.
+    const { sourceDemo } = makeFixture();
+    expect(readDemoPayload(sourceDemo).documents).toContain(DEV_ONLY_DOCUMENT);
+  });
+
+  it('throws when the folder has no manifest at all', () => {
+    const { sourceDemo } = makeFixture();
+    rmSync(join(sourceDemo, 'project.json'));
     // Guessing here would ship a bundle whose gate opens nothing.
-    expect(() => readDemoPayload(sourcePublic)).toThrow(/needs project\.json/i);
+    expect(() => readDemoPayload(sourceDemo)).toThrow(/needs project\.json/i);
   });
 
-  it('throws when the manifest declares no models', () => {
-    const { sourcePublic } = makeFixture({ ...DEMO_MANIFEST, documents: [] });
-    expect(() => readDemoPayload(sourcePublic)).toThrow(/declares no model document/i);
-  });
-});
-
-describe('CONNECT public-demo staging guard', () => {
-  it('stages all four documents, the manifest, and an authoritative gate config', () => {
-    const { sourceRoot, stagedCore, stagedPublic } = makeFixture();
-    preparePublicDemoSource(stagedCore, sourceRoot);
-    assertPublicDemoOutput(stagedPublic);
-
-    // All three models, restored from source where the staged tree lacked them.
-    const models = readdirSync(join(stagedPublic, 'models')).sort();
-    expect(models).toEqual([
-      'DemoCSGMachining.glb', 'DemoRealvirtualWeb.glb',
-      'DemoRealvirtualWeb.settings.json', 'DemoRobotIK.glb',
-    ]);
-    // Scratch and the library subtree are pruned — the bundle is the manifest.
-    expect(existsSync(join(stagedPublic, 'models', 'tests.glb'))).toBe(false);
-    expect(existsSync(join(stagedPublic, 'models', 'library'))).toBe(false);
-
-    // The planner scene, restored: `scenes/` is filtered out of the staged core.
-    expect(readdirSync(join(stagedPublic, 'scenes'))).toEqual(['DemoPlanner.glb']);
-
-    // The SSOT itself, verbatim — the whole point of Phase 4.
-    expect(JSON.parse(readFileSync(join(stagedPublic, 'project.json'), 'utf8')))
-      .toEqual(DEMO_MANIFEST);
-
-    const settings = JSON.parse(readFileSync(join(stagedPublic, 'settings.json'), 'utf8'));
-    // Still empty, and now it MEANS something: the gate starts the demo, and
-    // what it opens comes from project.json. A global default here would load a
-    // model behind the gate.
-    expect(settings.defaultModel).toBe('');
-    expect(settings.ui.initialContexts).toEqual(['connect-embed']);
-    expect(JSON.parse(readFileSync(join(stagedPublic, 'models.json'), 'utf8')))
-      .toEqual(['DemoCSGMachining.glb', 'DemoRealvirtualWeb.glb', 'DemoRobotIK.glb']);
+  it('throws when the manifest declares no documents', () => {
+    const { sourceDemo } = makeFixture({ ...DEMO_MANIFEST, documents: [] });
+    expect(() => readDemoPayload(sourceDemo)).toThrow(/declares no document/i);
   });
 
-  it('fails when a declared model is missing from the source tree', () => {
-    const { sourceRoot, sourcePublic, stagedCore } = makeFixture();
-    rmSync(join(sourcePublic, 'models', 'DemoCSGMachining.glb'));
-    expect(() => preparePublicDemoSource(stagedCore, sourceRoot))
-      .toThrow(/source artifact is missing: models\/DemoCSGMachining\.glb/);
-  });
-
-  it('fails when a declared scene is missing from the source tree', () => {
-    const { sourceRoot, sourcePublic, stagedCore } = makeFixture();
-    rmSync(join(sourcePublic, 'scenes', 'DemoPlanner.glb'));
-    expect(() => preparePublicDemoSource(stagedCore, sourceRoot))
-      .toThrow(/source artifact is missing: scenes\/DemoPlanner\.glb/);
-  });
-
-  it('the output guard catches a payload that drifted from the manifest', () => {
-    const { sourceRoot, stagedCore, stagedPublic } = makeFixture();
-    preparePublicDemoSource(stagedCore, sourceRoot);
-    // Something downstream deleted a model the manifest still names.
-    rmSync(join(stagedPublic, 'models', 'DemoRobotIK.glb'));
-    expect(() => assertPublicDemoOutput(stagedPublic))
-      .toThrow(/missing: models\/DemoRobotIK\.glb/);
-  });
-
-  it('the output guard catches an extra file smuggled into models/', () => {
-    const { sourceRoot, stagedCore, stagedPublic } = makeFixture();
-    preparePublicDemoSource(stagedCore, sourceRoot);
-    writeFileSync(join(stagedPublic, 'models', 'Smuggled.glb'), 'x');
-    expect(() => assertPublicDemoOutput(stagedPublic))
-      .toThrow(/Unexpected CONNECT public-demo model payload/);
-  });
-
-  it('the output guard catches a missing scene document', () => {
-    const { sourceRoot, stagedCore, stagedPublic } = makeFixture();
-    preparePublicDemoSource(stagedCore, sourceRoot);
-    rmSync(join(stagedPublic, 'scenes', 'DemoPlanner.glb'));
-    expect(() => assertPublicDemoOutput(stagedPublic))
-      .toThrow(/missing: scenes\/DemoPlanner\.glb/);
-  });
-
-  it('the output guard insists on the manifest itself', () => {
-    const { sourceRoot, stagedCore, stagedPublic } = makeFixture();
-    preparePublicDemoSource(stagedCore, sourceRoot);
-    rmSync(join(stagedPublic, 'project.json'));
-    expect(() => assertPublicDemoOutput(stagedPublic))
-      .toThrow(/missing: project\.json/);
-  });
-
-  it('is idempotent — re-staging an already-staged tree changes nothing', () => {
-    const { sourceRoot, stagedCore, stagedPublic } = makeFixture();
-    preparePublicDemoSource(stagedCore, sourceRoot);
-    const first = readdirSync(join(stagedPublic, 'models')).sort();
-    preparePublicDemoSource(stagedCore, sourceRoot);
-    expect(readdirSync(join(stagedPublic, 'models')).sort()).toEqual(first);
-    assertPublicDemoOutput(stagedPublic);
-  });
-});
-
-describe('the shipped manifest is the one the repo authored', () => {
-  it('public/project.json declares exactly the public demo documents', () => {
-    // The bundle reads the real file, so a drift between this test fixture and
-    // the repository would hide a change to what the community download ships.
-    // User decision 2026-08-30: DemoRobotIK and DemoCSGMachining are internal
-    // dev/test models and must NOT be declared here.
-    const real = JSON.parse(readFileSync(
-      resolve(__dirname, '..', 'public', 'demo-realvirtual', 'project.json'), 'utf8',
-    ));
-    // User decision 2026-08-31: both demo documents live at the MAIN level of
-    // public/ — sections are declared on the rows, not implied by folders.
-    const documents = real.documents as { path: string; devOnly?: boolean }[];
-
-    // The PUBLIC surface is what survives the `devOnly` prune: every staging
-    // path drops those rows (plan-731 2k), so a marked row is by definition not
-    // part of what the community download ships. Filtering here is what keeps
-    // this assertion about the shipped surface rather than about the file.
-    expect(documents.filter((d) => d.devOnly !== true).map((d) => d.path)).toEqual([
-      'DemoRealvirtualWeb.glb',
-      'DemoPlanner.glb',
-      // plan-737 F8: the demo says out loud that it is a sandbox and that every
-      // delivery replaces it in full. It is a document like any other — the
-      // `.knowledge.md` ending is what routes it to the knowledge pane.
-      'demo.knowledge.md',
-    ]);
-
-    // ...and the row the filter removed is the dev-only turntable fixture
-    // (plan-731 2a), still carrying its marking. Without this half the fixture
-    // could quietly lose `devOnly`, become public on every channel, and leave
-    // the filtered assertion above green — the exact drift F6 exists to catch.
-    expect(documents.map((d) => ({ path: d.path, devOnly: d.devOnly === true }))).toEqual([
-      { path: 'DemoRealvirtualWeb.glb', devOnly: false },
-      { path: 'DemoPlanner.glb', devOnly: false },
-      { path: 'Test-DES-Turntable-Loop.glb', devOnly: true },
-      { path: 'demo.knowledge.md', devOnly: false },
-    ]);
+  it('refuses a document path that escapes the demo folder', () => {
+    const { sourceDemo } = makeFixture({
+      ...DEMO_MANIFEST,
+      documents: [
+        { id: 'doc_a', name: 'Demo', path: 'DemoRealvirtualWeb.glb' },
+        { id: 'doc_x', name: 'Escape', path: '../../secret.glb' },
+      ],
+    });
+    expect(readDemoPayload(sourceDemo).documents).toEqual(['DemoRealvirtualWeb.glb']);
   });
 });
 
@@ -278,20 +202,14 @@ describe('the shipped manifest is the one the repo authored', () => {
  * does not follow it, and — the reason plan-731 moved it — it cannot be seen
  * from the manifest, so no release gate could assert the sidecar had travelled.
  *
- * The convention stays as the FALLBACK, the same shape as the one-folder
- * `models/` path fallback beside it: an older manifest keeps staging.
+ * The convention stays as the FALLBACK, so an older manifest keeps staging.
  */
 describe('readDemoPayload — the settings sidecar (plan-731 F5)', () => {
-  /** A minimal public/ tree written straight to disk: this is a FILE question. */
-  function publicDir(documents: unknown[], files: string[]): string {
-    fixture = mkdtempSync(join(tmpdir(), 'rv-sidecar-test-'));
-    const dir = join(fixture, 'public');
+  /** A minimal demo folder written straight to disk: this is a FILE question. */
+  function demoDir(documents: unknown[], files: string[]): string {
+    const dir = join(temp('rv-sidecar-test-'), PUBLIC_DEMO_FOLDER);
     mkdirSync(dir, { recursive: true });
-    for (const rel of files) {
-      const full = join(dir, ...rel.split('/'));
-      mkdirSync(resolve(full, '..'), { recursive: true });
-      writeFileSync(full, rel);
-    }
+    for (const rel of files) write(join(dir, ...rel.split('/')), rel);
     writeFileSync(join(dir, 'project.json'), JSON.stringify({
       schemaVersion: 2, id: 'prj_sample', name: 'DemoRealvirtual', documents,
     }));
@@ -299,97 +217,244 @@ describe('readDemoPayload — the settings sidecar (plan-731 F5)', () => {
   }
 
   it('resolves a sidecar the convention could never have found', () => {
-    const dir = publicDir(
-      [{ id: 'a', name: 'M', path: 'Demo.glb', section: 'models', settingsPath: 'hmi-config.json' }],
+    const dir = demoDir(
+      [{ id: 'a', name: 'M', path: 'Demo.glb', settingsPath: 'hmi-config.json' }],
       ['Demo.glb', 'hmi-config.json'],
     );
     expect(readDemoPayload(dir).sidecars).toEqual(['hmi-config.json']);
   });
 
   it('falls back to the convention for a row that declares none', () => {
-    const dir = publicDir(
-      [{ id: 'a', name: 'M', path: 'Demo.glb', section: 'models' }],
+    const dir = demoDir(
+      [{ id: 'a', name: 'M', path: 'Demo.glb' }],
       ['Demo.glb', 'Demo.settings.json'],
     );
     expect(readDemoPayload(dir).sidecars).toEqual(['Demo.settings.json']);
   });
 
   it('does not stage the same sidecar twice when both rules name it', () => {
-    const dir = publicDir(
-      [{
-        id: 'a', name: 'M', path: 'Demo.glb', section: 'models',
-        settingsPath: 'Demo.settings.json',
-      }],
+    const dir = demoDir(
+      [{ id: 'a', name: 'M', path: 'Demo.glb', settingsPath: 'Demo.settings.json' }],
       ['Demo.glb', 'Demo.settings.json'],
     );
     expect(readDemoPayload(dir).sidecars).toEqual(['Demo.settings.json']);
   });
 
   it('drops a declared sidecar with no file behind it', () => {
-    // A row naming a file nobody committed. Staging the NAME would put a 404
-    // in the bundle that only the visitor ever meets — the failure Phase 4's
-    // gate exists to catch, refused one step earlier here.
-    const dir = publicDir(
-      [{ id: 'a', name: 'M', path: 'Demo.glb', section: 'models', settingsPath: 'ghost.json' }],
+    // A row naming a file nobody committed. Staging the NAME would put a 404 in
+    // the bundle that only the visitor ever meets.
+    const dir = demoDir(
+      [{ id: 'a', name: 'M', path: 'Demo.glb', settingsPath: 'ghost.json' }],
       ['Demo.glb'],
     );
     expect(readDemoPayload(dir).sidecars).toEqual([]);
   });
 
-  it('refuses a settingsPath that traverses out of the project', () => {
-    const dir = publicDir(
-      [{
-        id: 'a', name: 'M', path: 'Demo.glb', section: 'models',
-        settingsPath: '../../secret.json',
-      }],
+  it('refuses a settingsPath that traverses out of the folder', () => {
+    const dir = demoDir(
+      [{ id: 'a', name: 'M', path: 'Demo.glb', settingsPath: '../../secret.json' }],
       ['Demo.glb'],
     );
     expect(readDemoPayload(dir).sidecars).toEqual([]);
   });
 
-  it('lets a scene row declare one too — it is a row property, not a model rule', () => {
-    const dir = publicDir(
+  it('never counts a document as its own sidecar', () => {
+    // `demo.knowledge.md` is a document, not a `.glb`, so the convention must
+    // not invent `demo.knowledge.settings.json` — and a document path must never
+    // reappear in `sidecars`, or the output gate would demand it twice.
+    const dir = demoDir(
       [
-        { id: 'a', name: 'M', path: 'Demo.glb', section: 'models' },
-        { id: 'b', name: 'S', path: 'Scene.glb', section: 'scenes', settingsPath: 'Scene.cfg.json' },
+        { id: 'a', name: 'M', path: 'Demo.glb' },
+        { id: 'k', name: 'K', path: 'demo.knowledge.md' },
       ],
-      ['Demo.glb', 'Scene.glb', 'Scene.cfg.json'],
+      ['Demo.glb', 'demo.knowledge.md'],
     );
     const payload = readDemoPayload(dir);
-    expect(payload.sidecars).toContain('Scene.cfg.json');
-    expect(payload.models).toEqual(['Demo.glb']);
-    expect(payload.scenes).toEqual(['Scene.glb']);
+    expect(payload.sidecars).toEqual([]);
+    expect(payload.documents).toEqual(['Demo.glb', 'demo.knowledge.md']);
+  });
+});
+
+// ─── The staging itself ───────────────────────────────────────────────────
+
+describe('CONNECT public-demo staging guard', () => {
+  it('stages the declared documents, the manifest, and an authoritative gate config', () => {
+    const { sourceRoot, stagedCore, stagedPublic, stagedDemo } = makeFixture();
+    preparePublicDemoSource(stagedCore, sourceRoot);
+    assertPublicDemoOutput(stagedPublic);
+
+    // Exactly the shipped documents plus the manifest. `DemoPlanner.glb`, the
+    // sidecar and `demo.knowledge.md` were restored from source; `Scratch.glb`
+    // is gone; the dev-only fixture never made it (T21, asserted on its own
+    // below as well).
+    expect(filesUnder(stagedDemo)).toEqual([
+      'DemoPlanner.glb',
+      'DemoRealvirtualWeb.glb',
+      'DemoRealvirtualWeb.settings.json',
+      'demo.knowledge.md',
+      'project.json',
+    ]);
+
+    // The SSOT, carried through: the same manifest minus the pruned row.
+    const shipped = JSON.parse(readFileSync(join(stagedDemo, 'project.json'), 'utf8'));
+    expect(shipped.id).toBe('prj_sample');
+    expect(shipped.kind).toBe('demo');
+    expect(shipped.documents.map((d: { path: string }) => d.path)).toEqual([
+      'DemoRealvirtualWeb.glb', 'DemoPlanner.glb', 'demo.knowledge.md',
+    ]);
+
+    const settings = JSON.parse(readFileSync(join(stagedPublic, 'settings.json'), 'utf8'));
+    // Still empty, and it MEANS something: the gate starts the demo, and what
+    // it opens comes from the demo's own project.json. A global default here
+    // would load a model behind the gate.
+    expect(settings.defaultModel).toBe('');
+    expect(settings.ui.initialContexts).toEqual(['connect-embed']);
+    expect(existsSync(join(stagedPublic, 'AGPL-3.0.txt'))).toBe(true);
+    expect(readFileSync(join(stagedPublic, 'WEB-SOURCE.txt'), 'utf8'))
+      .toContain('https://example.invalid/source/tag');
+
+    // No `models.json`. It was retired as a second catalogue in plan-737:
+    // `main.ts` resolves its entries to `<BASE>models/<name>`, a path the demo
+    // folder does not use, so writing one here would publish a list of 404s.
+    expect(existsSync(join(stagedPublic, 'models.json'))).toBe(false);
   });
 
-  it('the shipped demo manifest declares its own sidecar', () => {
-    // The end of the chain: our own `public/project.json` uses the new rule, so
-    // the fallback is genuinely a fallback and not the live path.
-    const demo = JSON.parse(readFileSync(
-      resolve(__dirname, '..', 'public', 'demo-realvirtual', 'project.json'), 'utf8',
+  // ── T21 ───────────────────────────────────────────────────────────────
+  it('the devOnly document never reaches the artefact — file nor row', () => {
+    const { sourceRoot, stagedCore, stagedPublic, stagedDemo } = makeFixture();
+    // It IS in the source folder, so this is a prune and not an absence.
+    expect(existsSync(join(sourceRoot, 'public', PUBLIC_DEMO_FOLDER, DEV_ONLY_DOCUMENT))).toBe(true);
+
+    preparePublicDemoSource(stagedCore, sourceRoot);
+
+    expect(existsSync(join(stagedDemo, DEV_ONLY_DOCUMENT))).toBe(false);
+    const shipped = JSON.parse(readFileSync(join(stagedDemo, 'project.json'), 'utf8'));
+    expect(shipped.documents.map((d: { path: string }) => d.path)).not.toContain(DEV_ONLY_DOCUMENT);
+    expect(shipped.documents.some((d: { devOnly?: boolean }) => d.devOnly === true)).toBe(false);
+    // …and the shared gate agrees, by its own rule.
+    assertManifestResolves(stagedDemo);
+    assertPublicDemoOutput(stagedPublic);
+  });
+
+  it('fails when a declared document is missing from the source tree', () => {
+    const { sourceRoot, sourceDemo, stagedCore } = makeFixture();
+    rmSync(join(sourceDemo, 'DemoPlanner.glb'));
+    expect(() => preparePublicDemoSource(stagedCore, sourceRoot))
+      .toThrow(/source artifact is missing: DemoPlanner\.glb/);
+  });
+
+  it('fails when a declared sidecar is missing from the source tree', () => {
+    const { sourceRoot, sourceDemo, stagedCore } = makeFixture();
+    rmSync(join(sourceDemo, 'DemoRealvirtualWeb.settings.json'));
+    // The reader drops a sidecar with no file behind it, so the failure lands
+    // one step later — on the gate, which is where a missing sidecar becomes a
+    // demo that comes up unconfigured.
+    preparePublicDemoSource(stagedCore, sourceRoot);
+    const staged = join(stagedCore, 'public', PUBLIC_DEMO_FOLDER);
+    expect(() => assertManifestResolves(staged)).toThrow(/did not travel/);
+  });
+
+  it('the output guard catches a payload that drifted from the manifest', () => {
+    const { sourceRoot, stagedCore, stagedPublic, stagedDemo } = makeFixture();
+    preparePublicDemoSource(stagedCore, sourceRoot);
+    rmSync(join(stagedDemo, 'DemoPlanner.glb'));
+    expect(() => assertPublicDemoOutput(stagedPublic))
+      .toThrow(/missing: demo-realvirtual\/DemoPlanner\.glb/);
+  });
+
+  it('the output guard catches an extra file smuggled into the demo folder', () => {
+    const { sourceRoot, stagedCore, stagedPublic, stagedDemo } = makeFixture();
+    preparePublicDemoSource(stagedCore, sourceRoot);
+    writeFileSync(join(stagedDemo, 'Smuggled.glb'), 'x');
+    expect(() => assertPublicDemoOutput(stagedPublic))
+      .toThrow(/Unexpected CONNECT public-demo payload/);
+  });
+
+  it('the output guard catches a devOnly row that survived the prune', () => {
+    // The negative case for T21. A guard that cannot refuse asserts nothing, so
+    // the prune is undone by hand here and the gate has to notice.
+    const { sourceRoot, stagedCore, stagedPublic, stagedDemo } = makeFixture();
+    preparePublicDemoSource(stagedCore, sourceRoot);
+    const shipped = JSON.parse(readFileSync(join(stagedDemo, 'project.json'), 'utf8'));
+    shipped.documents.push({
+      id: 'doc_f', name: 'Test DES Turntable Loop', path: DEV_ONLY_DOCUMENT, devOnly: true,
+    });
+    writeFileSync(join(stagedDemo, 'project.json'), JSON.stringify(shipped));
+    writeFileSync(join(stagedDemo, DEV_ONLY_DOCUMENT), 'fixture');
+    expect(() => assertPublicDemoOutput(stagedPublic)).toThrow(/Dev-only document reached/);
+  });
+
+  it('the output guard insists on the manifest itself', () => {
+    const { sourceRoot, stagedCore, stagedPublic, stagedDemo } = makeFixture();
+    preparePublicDemoSource(stagedCore, sourceRoot);
+    rmSync(join(stagedDemo, 'project.json'));
+    expect(() => assertPublicDemoOutput(stagedPublic))
+      .toThrow(/missing: demo-realvirtual\/project\.json/);
+  });
+
+  it('is idempotent — re-staging an already-staged tree changes nothing', () => {
+    const { sourceRoot, stagedCore, stagedPublic, stagedDemo } = makeFixture();
+    preparePublicDemoSource(stagedCore, sourceRoot);
+    const first = filesUnder(stagedDemo);
+    preparePublicDemoSource(stagedCore, sourceRoot);
+    expect(filesUnder(stagedDemo)).toEqual(first);
+    assertPublicDemoOutput(stagedPublic);
+  });
+});
+
+// ─── The repository's own demo, through the real staging ──────────────────
+
+/**
+ * The two tests that used to live here read `public/demo-realvirtual/project.json`
+ * and asserted its rows. That is a statement about a FILE, and the file was never
+ * the thing that broke: the staging was. Both are replaced by one test that runs
+ * the repository's real demo folder through the real staging functions and
+ * checks what came out.
+ */
+describe('the repository demo stages, and the fixture does not travel', () => {
+  it('the real public/demo-realvirtual/ passes the channel guard and the shared gate', () => {
+    const stagedCore = temp('rv-real-demo-stage-');
+    const stagedPublic = join(stagedCore, 'public');
+    write(join(stagedPublic, 'settings.json'), '{}');
+    write(join(stagedPublic, 'index.html'), '<!doctype html>');
+    process.env.RV_WEB_SOURCE_URL = 'https://example.invalid/source/tag';
+
+    preparePublicDemoSource(stagedCore, REPO);
+    assertPublicDemoOutput(stagedPublic);
+
+    const stagedDemo = join(stagedPublic, PUBLIC_DEMO_FOLDER);
+    const gate = assertManifestResolves(stagedDemo);
+
+    // The shipped surface, named. User decision 2026-08-30/31: only these
+    // documents are public, they live at the root of the demo folder, and the
+    // start document names its own sidecar (plan-731 F5).
+    expect(gate.documents.map(d => d.path)).toEqual([
+      'DemoRealvirtualWeb.glb',
+      'DemoPlanner.glb',
+      'demo.knowledge.md',
+    ]);
+    expect(gate.start.path).toBe('DemoRealvirtualWeb.glb');
+    expect(gate.sidecars).toEqual(['DemoRealvirtualWeb.settings.json']);
+
+    // The fixture the repository still authors is gone from the artefact — both
+    // the file and its row. Asserting it against the SOURCE would only repeat
+    // what the manifest says; asserting it here says the prune ran.
+    expect(existsSync(join(stagedDemo, DEV_ONLY_DOCUMENT))).toBe(false);
+    const source = JSON.parse(readFileSync(
+      join(REPO, 'public', PUBLIC_DEMO_FOLDER, 'project.json'), 'utf8',
     ));
-    const start = demo.documents.find(
-      (d: { path: string }) => d.path === demo.settings?.defaultModel,
-    );
-    expect(start?.settingsPath).toBe('DemoRealvirtualWeb.settings.json');
+    expect(source.documents.some((d: { path: string; devOnly?: boolean }) =>
+      d.path === DEV_ONLY_DOCUMENT && d.devOnly === true)).toBe(true);
   });
 });
 
 // ─── plan-731 Phase 4 (F6): the release gate on the staged payload ────────
 
 /**
- * The CONNECT-embed payload must fully resolve, by the SAME rule as every
- * other channel.
- *
- * `assertPublicDemoOutput()` already checks that what shipped matches what the
- * shipped manifest declares — which is most of the gate, and is why this
- * channel was the healthiest of the four. What it did not have was the
- * `devOnly` rule (there was nothing to check before plan-731 2a marked the
- * fixture) or the sidecar rule (F5 made the sidecar nameable), and it was a
- * private spelling of the rule rather than the shared one. Both harnesses run
- * now: the channel's own guard, then the common gate.
+ * The CONNECT-embed payload must fully resolve, by the SAME rule as every other
+ * channel — `assertManifestResolves`, applied to the demo FOLDER.
  */
 describe('the staged CONNECT payload passes the release gate (plan-731 F6)', () => {
-  /** The current manifest shape: root-level documents, a marked fixture. */
   const GATE_MANIFEST = {
     schemaVersion: 2,
     id: 'prj_sample',
@@ -400,33 +465,23 @@ describe('the staged CONNECT payload passes the release gate (plan-731 F6)', () 
     documents: [
       {
         id: 'doc_a', name: 'realvirtual WEB Demo', path: 'DemoRealvirtualWeb.glb',
-        section: 'models', settingsPath: 'DemoRealvirtualWeb.settings.json',
+        settingsPath: 'DemoRealvirtualWeb.settings.json',
       },
-      { id: 'doc_b', name: 'Layout Planner Demo', path: 'DemoPlanner.glb', section: 'scenes' },
-      {
-        id: 'doc_f', name: 'Fixture', path: 'Turntable-Fixture.glb',
-        section: 'scenes', devOnly: true,
-      },
+      { id: 'doc_b', name: 'Layout Planner Demo', path: 'DemoPlanner.glb' },
+      { id: 'doc_f', name: 'Fixture', path: 'Turntable-Fixture.glb', devOnly: true },
     ],
   };
 
-  /** A staged payload root, written directly — this is a question about files. */
+  /** A staged demo folder, written directly — this is a question about files. */
   function stagedPayload(manifest: unknown, files: string[]): string {
-    fixture = mkdtempSync(join(tmpdir(), 'rv-payload-gate-'));
-    const root = join(fixture, 'public');
+    const root = join(temp('rv-payload-gate-'), PUBLIC_DEMO_FOLDER);
     mkdirSync(root, { recursive: true });
-    for (const rel of files) {
-      const full = join(root, ...rel.split('/'));
-      mkdirSync(resolve(full, '..'), { recursive: true });
-      writeFileSync(full, rel);
-    }
+    for (const rel of files) write(join(root, ...rel.split('/')), rel);
     writeFileSync(join(root, 'project.json'), JSON.stringify(manifest, null, 2));
     return root;
   }
 
   it('a payload that still carries the dev-only fixture FAILS', () => {
-    // The negative case (4f). It is also the reason the positive one below
-    // means anything: a gate that cannot refuse is a gate that asserts nothing.
     const root = stagedPayload(GATE_MANIFEST, [
       'DemoRealvirtualWeb.glb', 'DemoRealvirtualWeb.settings.json',
       'DemoPlanner.glb', 'Turntable-Fixture.glb',
@@ -437,13 +492,13 @@ describe('the staged CONNECT payload passes the release gate (plan-731 F6)', () 
   it('a payload without the fixture passes, sidecar included', () => {
     const shipped = {
       ...GATE_MANIFEST,
-      documents: GATE_MANIFEST.documents.filter((d) => d.devOnly !== true),
+      documents: GATE_MANIFEST.documents.filter(d => d.devOnly !== true),
     };
     const root = stagedPayload(shipped, [
       'DemoRealvirtualWeb.glb', 'DemoRealvirtualWeb.settings.json', 'DemoPlanner.glb',
     ]);
     const gate = assertManifestResolves(root);
-    expect(gate.documents.map((d) => d.path))
+    expect(gate.documents.map(d => d.path))
       .toEqual(['DemoRealvirtualWeb.glb', 'DemoPlanner.glb']);
     expect(gate.sidecars).toEqual(['DemoRealvirtualWeb.settings.json']);
     expect(gate.start.path).toBe('DemoRealvirtualWeb.glb');
@@ -452,7 +507,7 @@ describe('the staged CONNECT payload passes the release gate (plan-731 F6)', () 
   it('a payload that declares a file it did not carry FAILS', () => {
     const shipped = {
       ...GATE_MANIFEST,
-      documents: GATE_MANIFEST.documents.filter((d) => d.devOnly !== true),
+      documents: GATE_MANIFEST.documents.filter(d => d.devOnly !== true),
     };
     const root = stagedPayload(shipped, [
       'DemoRealvirtualWeb.glb', 'DemoRealvirtualWeb.settings.json',
@@ -463,25 +518,112 @@ describe('the staged CONNECT payload passes the release gate (plan-731 F6)', () 
   it('a payload whose sidecar did not travel FAILS (F5)', () => {
     const shipped = {
       ...GATE_MANIFEST,
-      documents: GATE_MANIFEST.documents.filter((d) => d.devOnly !== true),
+      documents: GATE_MANIFEST.documents.filter(d => d.devOnly !== true),
     };
     const root = stagedPayload(shipped, ['DemoRealvirtualWeb.glb', 'DemoPlanner.glb']);
     expect(() => assertManifestResolves(root)).toThrow(/did not travel/);
   });
+});
 
-  it('the real staging output passes both guards, not just its own', () => {
-    // End to end through the channel's REAL harness — `preparePublicDemoSource`
-    // then `assertPublicDemoOutput` — with the shared gate applied to exactly
-    // what it produced. The manifest here is the module-level fixture, whose
-    // documents sit in `models/` and `scenes/` subfolders: the gate is about
-    // resolution, not about layout, and must not care which.
-    const { sourceRoot, stagedCore, stagedPublic } = makeFixture();
-    preparePublicDemoSource(stagedCore, sourceRoot);
-    assertPublicDemoOutput(stagedPublic);
+// ─── T22: the -Public shell carries no demo at all (plan-739 F11) ─────────
 
-    const gate = assertManifestResolves(stagedPublic);
-    expect(gate.documents.map((d) => d.path)).toEqual(
-      readDemoPayload(stagedPublic).models.concat(readDemoPayload(stagedPublic).scenes),
-    );
+/**
+ * The switch, and what it used to do.
+ *
+ * `stagePublic()` called `stageFilteredSourceTree()` WITHOUT
+ * `includePublicDemoContent`, so the default decided:
+ * `profile.tier === 'core' && !projectKey`. CONNECT passes exactly that shape —
+ * tier `core`, no project — so the default answered `true` in BOTH modes and the
+ * "app shell only, no project content" build carried the entire demo folder,
+ * 33.9 MB of it, plus a document the repository marks `devOnly`.
+ *
+ * The mode is known in `stagePublic()` and nowhere else, so it is stated there.
+ * This test pins both answers of the switch against the REAL staging function —
+ * the flag is what decides, not the tier it happens to be paired with.
+ */
+describe('-Public carries no demo folder (plan-739 F11)', () => {
+  /**
+   * The smallest core tree `stageFilteredSourceTree()` accepts for tier `core`:
+   * the files it copies unconditionally, the one static recipe it throws over,
+   * and the demo folder this test is about.
+   */
+  function coreFixture() {
+    const root = temp('rv-public-shell-');
+    const core = join(root, 'core');
+    const privateRoot = join(root, 'private');
+    mkdirSync(privateRoot, { recursive: true });
+    write(join(core, 'src', 'main.ts'), 'export {};');
+    write(join(core, 'tsconfig.json'), JSON.stringify({ compilerOptions: { paths: {} } }));
+    write(join(core, 'LICENSE'), 'AGPL');
+    write(join(core, 'recipes', 'kinematize-cad-import.md'), '# recipe fixture\n');
+    write(join(core, 'public', 'settings.json'), '{}');
+    const demo = join(core, 'public', PUBLIC_DEMO_FOLDER);
+    for (const name of ['DemoRealvirtualWeb.glb', 'DemoRealvirtualWeb.settings.json']) {
+      write(join(demo, name), name);
+    }
+    write(join(demo, 'project.json'), JSON.stringify({
+      schemaVersion: 2, id: 'prj_sample', name: 'DemoRealvirtual', kind: 'demo',
+      settings: { defaultModel: 'DemoRealvirtualWeb.glb' },
+      documents: [{
+        id: 'doc_a', name: 'Demo', path: 'DemoRealvirtualWeb.glb',
+        settingsPath: 'DemoRealvirtualWeb.settings.json',
+      }],
+    }));
+    return { core, privateRoot };
+  }
+
+  it('includePublicDemoContent:false leaves no demo folder in the staged core', () => {
+    const { core, privateRoot } = coreFixture();
+    const staged = stageFilteredSourceTree({
+      coreRoot: core,
+      privateRoot,
+      profile: { tier: 'core', restrictedFeatures: [] },
+      includePublicDemoContent: false,
+    });
+    temporary.push(staged.workspaceRoot);
+
+    // The staged core is what Vite builds into `dist/`, so this is the statement
+    // that decides what the `-Public` zip contains.
+    expect(existsSync(join(staged.coreRoot, 'public', PUBLIC_DEMO_FOLDER))).toBe(false);
+    // …and `public/settings.json`, the file the shell genuinely needs, still
+    // arrives — a filter that took everything would pass the line above too.
+    expect(existsSync(join(staged.coreRoot, 'public', 'settings.json'))).toBe(true);
+    // The demo is staged as a customer PROJECT on this branch (plan-737 F4),
+    // beside the core rather than inside it. That folder is not part of the
+    // build, so it never reaches the zip — but saying so here is what keeps a
+    // future reader from "fixing" the assertion above by deleting it.
+    expect(existsSync(join(staged.workspaceRoot, 'projects', PUBLIC_DEMO_FOLDER, 'project.json')))
+      .toBe(true);
+  });
+
+  it('includePublicDemoContent:true keeps it — the flag decides, not the tier', () => {
+    const { core, privateRoot } = coreFixture();
+    const staged = stageFilteredSourceTree({
+      coreRoot: core,
+      privateRoot,
+      profile: { tier: 'core', restrictedFeatures: [] },
+      includePublicDemoContent: true,
+    });
+    temporary.push(staged.workspaceRoot);
+
+    expect(existsSync(join(staged.coreRoot, 'public', PUBLIC_DEMO_FOLDER, 'project.json')))
+      .toBe(true);
+    // Not ALSO under projects/, or the bundle would list the demo twice.
+    expect(existsSync(join(staged.workspaceRoot, 'projects', PUBLIC_DEMO_FOLDER))).toBe(false);
+  });
+
+  it('the CONNECT profile shape is exactly the one the old default answered TRUE for', () => {
+    // The regression in one line: omitting the flag with CONNECT's own options
+    // still yields a staged core WITH the demo folder. This is not a bug in the
+    // default — it is the reason `stagePublic()` must state the mode instead of
+    // letting a delivery heuristic guess it.
+    const { core, privateRoot } = coreFixture();
+    const staged = stageFilteredSourceTree({
+      coreRoot: core,
+      privateRoot,
+      profile: { tier: 'core', restrictedFeatures: [] },
+    });
+    temporary.push(staged.workspaceRoot);
+    expect(existsSync(join(staged.coreRoot, 'public', PUBLIC_DEMO_FOLDER))).toBe(true);
   });
 });

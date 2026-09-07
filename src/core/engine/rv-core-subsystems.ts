@@ -107,6 +107,13 @@ export interface CoreSubsystemsHost {
    *  runtime, unit-test fakes) simply omit it, so adding the subsystem does not
    *  force a `null` on every existing host implementation. */
   readonly chainManager?: { update(dt: number): boolean } | null;
+  /** Web path advance (plan-459). A true return means BOTH render and shadow
+   *  dirty — the band and the rolls are real geometry moved outside the drive
+   *  loop.
+   *
+   *  OPTIONAL like `chainManager`: hosts that never load a web (the embed
+   *  runtime, unit-test fakes) simply omit it. */
+  readonly ribbonManager?: { update(dt: number): boolean } | null;
   /** CSG machining tick (plan-405): submits tool poses and applies the chunk
    *  meshes that came back from the worker. A true return means BOTH render and
    *  shadow dirty — a machined chunk changes the silhouette.
@@ -277,6 +284,16 @@ export class CoreSubsystems {
     // drive loop skips the shadow flag for transport-surface drives, and a chain
     // hanging off one would otherwise drag a frozen shadow behind it.
     if (h.chainManager?.update(dt)) {
+      h.markRenderDirty();
+      h.markShadowsDirty();
+    }
+
+    // ── Web paths (plan-459). Same placement and the same reason as the two
+    // above: the web speed and, in winder-master mode, the rotational master
+    // reading both come from the drive values of THIS tick, so the stage has to
+    // sit after `drives()`. Shadow dirty as well — a growing roll and a moving
+    // band change the silhouette without ever touching the drive loop.
+    if (h.ribbonManager?.update(dt)) {
       h.markRenderDirty();
       h.markShadowsDirty();
     }

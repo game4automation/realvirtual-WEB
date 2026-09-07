@@ -84,6 +84,11 @@ export const DELIVERY_CHANNELS: readonly string[];
 export const CONTACT_STATUSES: readonly string[];
 export const FORGEJO_PERMISSIONS: readonly string[];
 export const CUSTOMER_SECRET_KEYS: readonly string[];
+/**
+ * The hub, named once (plan-739 F6). Both `_workspace-lib.mjs` `hubBaseUrl()` and
+ * the private `scripts/deliver-release.mjs` read THIS constant; there is no second.
+ */
+export const DEFAULT_HUB_URL: string;
 /** Org of the one repository every shared standard customer receives (plan-434 §2.7). */
 export const SHARED_ORG: string;
 /** Repository name inside {@link SHARED_ORG}. */
@@ -101,7 +106,7 @@ export function listCustomers(privateRoot: string, options?: RvCustomerLoadOptio
 export function resolveCustomerForProject(
   privateRoot: string, projectKey: string, options?: RvCustomerLoadOptions,
 ): RvCustomer | null;
-export function customerRemoteUrl(customer: RvCustomer, hubBaseUrl: string): string;
+export function customerRemoteUrl(customer: RvCustomer, hubBaseUrl?: string): string;
 export function resolveCustomerSecrets(
   privateRoot: string,
   customer: RvCustomer,

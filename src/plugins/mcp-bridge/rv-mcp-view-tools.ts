@@ -416,10 +416,8 @@ export class McpViewTools {
     // D-A2 (plan-705): the three owners write the pose every frame, so an orbit
     // under them is a silent no-op. Newly applied here — `web_camera_fly` had
     // the guard and this one did not, which is the inconsistency F9 closes.
-    const blockedBy = this._cameraOwner(v);
-    if (blockedBy) {
-      return JSON.stringify({ error: `Camera is owned by ${blockedBy} — stop it before orbiting`, blockedBy });
-    }
+    const refusal = this._refuseIfCameraOwned(v, 'orbiting');
+    if (refusal) return refusal;
     const state = v.getCameraState();
     // Default is verbatim the old behaviour: the CURRENT target. `pivot` only
     // ever replaces it, so an existing caller sees no change at all.
@@ -492,13 +490,8 @@ export class McpViewTools {
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
-    const blockedBy = this._cameraOwner(v);
-    if (blockedBy) {
-      return JSON.stringify({
-        error: `Camera is owned by ${blockedBy} — stop it before changing the view`,
-        blockedBy,
-      });
-    }
+    const refusal = this._refuseIfCameraOwned(v, 'changing the view');
+    if (refusal) return refusal;
     const {
       CAMERA_PRESETS, isCameraPreset, presetPose, applyMeasuredDistance,
     } = await import('./rv-camera-presets-math');
@@ -556,6 +549,23 @@ export class McpViewTools {
     return null;
   }
 
+  /**
+   * The refusal envelope the four camera verbs share, or null when the camera is free.
+   *
+   * `verb` is the trailing phrase of the sentence — 'orbiting', 'changing the
+   * view', 'flying', 'sweeping' — so each tool keeps the wording it always had
+   * (plan-461 V14). The envelope is byte-identical to the four copies it
+   * replaced, key order included, because an MCP client reads these strings.
+   */
+  private _refuseIfCameraOwned(v: RVViewer, verb: string): string | null {
+    const blockedBy = this._cameraOwner(v);
+    if (!blockedBy) return null;
+    return JSON.stringify({
+      error: `Camera is owned by ${blockedBy} — stop it before ${verb}`,
+      blockedBy,
+    });
+  }
+
   @McpTool('Fly the camera RELATIVE to where it is now: forward/right/up in metres plus yawDeg/pitchDeg in degrees (+yaw = to the left, +pitch = up, clamped at ±85°). Unlike web_camera_orbit — which circles a fixed point — this MOVES THROUGH the plant, which is what a long line needs. ground=true walks instead of flying: forward/right stay horizontal and the camera is held at eyeHeight above the nearest surface below (no wall collision — flying through a wall is allowed). Refused while FPV, camera-follow or XR own the camera.', { readOnly: false, timeoutMs: 30_000 })
   async webCameraFly(
     @McpParam('forward', 'Metres along the view direction (default 0).', 'number', false) forward?: number,
@@ -568,13 +578,8 @@ export class McpViewTools {
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
-    const blockedBy = this._cameraOwner(v);
-    if (blockedBy) {
-      return JSON.stringify({
-        error: `Camera is owned by ${blockedBy} — stop it before flying`,
-        blockedBy,
-      });
-    }
+    const refusal = this._refuseIfCameraOwned(v, 'flying');
+    if (refusal) return refusal;
 
     const cur = v.getCameraState();
     const next = computeFlyPose(
@@ -637,13 +642,8 @@ export class McpViewTools {
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
-    const blockedBy = this._cameraOwner(v);
-    if (blockedBy) {
-      return JSON.stringify({
-        error: `Camera is owned by ${blockedBy} — stop it before sweeping`,
-        blockedBy,
-      });
-    }
+    const refusal = this._refuseIfCameraOwned(v, 'sweeping');
+    if (refusal) return refusal;
 
     const requested = parsePathsParam(paths ?? '');
     const nodes: Object3D[] = [];

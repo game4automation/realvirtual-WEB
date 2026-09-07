@@ -33,6 +33,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { stableDocumentId } from '../src/core/project/rv-project-documents';
+import demoManifest from '../public/demo-realvirtual/project.json';
 
 const rawSources = import.meta.glob('../src/**/*.{ts,tsx}', {
   query: '?raw', import: 'default', eager: true,
@@ -183,6 +185,16 @@ describe('plan-717 F9 — `stableDocumentId` is called only where an id is born'
     // reference resolving (§2.5) — and wrong everywhere else, because a display
     // path that re-derives is the scan-world registration model growing back.
     expect(filesMatching(/\bstableDocumentId\s*\(/)).toEqual([
+      // The welcome dialog's planner-demo href, when the shipped manifest
+      // cannot be read yet. Same function over the same path the manifest row
+      // carries, so the fallback and the row agree by construction — pinned
+      // against that row by the test below.
+      'WelcomeModal.tsx',
+      // A read-only manifest row that arrived WITHOUT an id (hand-edited
+      // bundled project.json): `listDocuments` mints one from the path so the
+      // row is addressable at all. Read-only — nothing is persisted from here,
+      // which is the same allowance `rv-project-documents.ts` carries below.
+      'bundled-backend.ts',
       // The mint itself: `previewAssetId()` is the intent-named wrapper the
       // adopt verb and the reference resolver share.
       'rv-asset-identity.ts',
@@ -203,6 +215,15 @@ describe('plan-717 F9 — `stableDocumentId` is called only where an id is born'
       // two agree by construction and cannot collide.
       'rv-workspace-migration.ts',
     ]);
+  });
+
+  it('the planner-demo fallback id equals the id the shipped manifest carries', () => {
+    // The WelcomeModal allowance above is only harmless while the two agree:
+    // if the manifest row's id were ever hand-set to something else, the
+    // fallback href would point at a document that does not exist.
+    const row = demoManifest.documents.find(d => d.path === 'DemoPlanner.glb');
+    expect(row, 'the demo project must still ship DemoPlanner.glb').toBeTruthy();
+    expect(row!.id).toBe(stableDocumentId('DemoPlanner.glb'));
   });
 
   it('no display or catalog module derives an id from a path', () => {

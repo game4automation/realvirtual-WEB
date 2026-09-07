@@ -124,6 +124,59 @@ export interface AssetDocumentSessionState {
   metaDirty: boolean;
 }
 
+// ─── Document lock (plan-462 B3) ──────────────────────────────────────────
+
+/**
+ * What a lock is being held FOR. Both kinds exclude each other, and both
+ * exclude a second holder of the same kind — see {@link AssetDocument.tryLock}.
+ */
+export type DocumentLockKind = 'test-run' | 'save';
+
+/** The receipt {@link AssetDocument.tryLock} hands out. Opaque on purpose. */
+export interface DocumentLockToken {
+  readonly kind: DocumentLockKind;
+  readonly token: symbol;
+  readonly generation: number;
+}
+
+/** What a caller may know about a lock it does not hold. */
+export interface DocumentLockOwner {
+  readonly kind: DocumentLockKind;
+  readonly startedAt: number;
+}
+
+/** The machine-readable code every refusal carries. */
+export const ERR_DOCUMENT_LOCKED = 'ERR_DOCUMENT_LOCKED';
+
+/**
+ * A mutation was refused because something else owns the document.
+ *
+ * Thrown, not returned, and never swallowed: the whole point of plan-462 B3 is
+ * that an edit made during a test run stops being accepted-then-silently-lost.
+ * An MCP tool turns it into its JSON envelope, the UI into a toast; both read
+ * {@link code}.
+ */
+export class DocumentLockedError extends Error {
+  readonly code = ERR_DOCUMENT_LOCKED;
+
+  constructor(readonly owner: DocumentLockOwner, message: string) {
+    super(message);
+    this.name = 'DocumentLockedError';
+  }
+}
+
+/** The operator-facing half of a refusal — one sentence per owner kind. */
+function lockedMessage(owner: DocumentLockOwner, what: string): string {
+  if (owner.kind === 'test-run') {
+    return `${what} was refused: a test run is active (in-place test session). The test session `
+      + 'freezes the document history at start and puts it back verbatim on stop, so an edit '
+      + 'accepted now would be discarded together with the test scene. Stop the test run first, '
+      + 'then repeat the edit.';
+  }
+  return `${what} was refused: this document is being saved. Wait for the save to finish, then `
+    + 'repeat the operation.';
+}
+
 export class AssetDocument {
   readonly id: string;
   private _base: AssetBase;
@@ -175,6 +228,28 @@ export class AssetDocument {
   /** Autosave is off while an editor test run holds the document (plan-410 F5). */
   private _autosaveSuspended = false;
   private _disposed = false;
+
+  /**
+   * Who holds the document, and with which token — see {@link tryLock}.
+   *
+   * Null whenever the document is free. The generation is stamped at
+   * acquisition and never reused, which is what makes a stale timeout harmless:
+   * it can only carry the token of the run it was armed for.
+   */
+  private _lock: {
+    kind: DocumentLockKind;
+    token: symbol;
+    generation: number;
+    startedAt: number;
+    /**
+     * A debounced draft write was armed when this lock was taken, and
+     * {@link tryLock} cancelled it. {@link unlock} owes it back — see there.
+     */
+    cancelledPendingWrite: boolean;
+  } | null = null;
+
+  /** Monotonic, never reset — the invalidation half of the token. */
+  private _lockGeneration = 0;
 
   /**
    * A base swap is in flight — see {@link beginBaseSwap} (plan-710 §2.4).
@@ -343,6 +418,7 @@ export class AssetDocument {
   /** Rename the DOCUMENT (not a scene node). Metadata only — not an op, but
    *  marks the document dirty so the exit guard prompts to save. */
   renameDocument(name: string): void {
+    this._assertUnlocked('Renaming the document');
     this._doc.renameDocument(name);
   }
 
@@ -376,6 +452,11 @@ export class AssetDocument {
    *  "the scene disagrees with its own history" — and inside a bulk edit, a scene
    *  half-rebuilt with nothing to undo (plan-359 Phase 3). */
   applyOp(op: RvAssetOp): Promise<void> {
+    try {
+      this._assertUnlocked('Applying an edit');
+    } catch (e) {
+      return Promise.reject(e);
+    }
     const unified: RvOp = op;
     const verdict = guardReferenceOp(unified, (nodePath) => {
       const node = this.viewer.registry?.getNode(nodePath);
@@ -406,6 +487,7 @@ export class AssetDocument {
    * original error is re-thrown at the caller.
    */
   async withTransaction(label: string, fn: () => Promise<void>): Promise<void> {
+    this._assertUnlocked(`"${label}"`);
     await this._doc.withTransaction(label, fn);
   }
 
@@ -420,6 +502,7 @@ export class AssetDocument {
    *  the decision is made by KIND, before anything is applied, and such an op is
    *  taken back by re-projecting the log without it. */
   async undo(): Promise<void> {
+    this._assertUnlocked('Undo');
     const newest = this._doc.ops[this._doc.opCount - 1];
     if (this._bound && newest && this._reprojectTree
         && needsRecomposeToUndo(newest, this._doc.mode)) {
@@ -465,6 +548,7 @@ export class AssetDocument {
 
   /** Redo the newest undone op. Same stack discipline as {@link undo}. */
   async redo(): Promise<void> {
+    this._assertUnlocked('Redo');
     await this._doc.redo();
   }
 
@@ -487,7 +571,10 @@ export class AssetDocument {
    * Always pair through `try/finally`: a flag left standing silently swallows
    * every subsequent edit, which is worse than the hazard it guards.
    */
-  beginBaseSwap(): void { this._baseSwapping = true; }
+  beginBaseSwap(): void {
+    this._assertUnlocked('Swapping the document base');
+    this._baseSwapping = true;
+  }
 
   /** End the window opened by {@link beginBaseSwap}. */
   endBaseSwap(): void { this._baseSwapping = false; }
@@ -514,6 +601,7 @@ export class AssetDocument {
    * import-equals-reload invariant. Its local transform is what gets recorded.
    */
   async importCad(result: CadImportResult, opts?: { name?: string; root?: Object3D }): Promise<string> {
+    this._assertUnlocked('Importing CAD');
     const { Sha256, Quality } = result.cadlink;
     const tier = await putCadGlb(Sha256, Quality, result.glb);
     if (tier === 'none') {
@@ -1089,6 +1177,7 @@ export class AssetDocument {
 
   /** Replay a recovered draft's ops onto the freshly loaded base. */
   async replayOps(ops: readonly RvOp[]): Promise<void> {
+    this._assertUnlocked('Replaying ops');
     await this._doc.replayOps(ops);
   }
 
@@ -1109,6 +1198,10 @@ export class AssetDocument {
    * and a plain flush would write nothing at all.
    */
   async flushDraft(): Promise<void> {
+    // Guarded even though it looks like a read: it WRITES the draft slot, and
+    // during a test run that slot must keep describing the pre-test authoring
+    // state. It ignored the suspend flag outright before plan-462 B3.
+    this._assertUnlocked('Flushing the draft');
     await this._autosave.writeNow(this._doc);
   }
 
@@ -1150,8 +1243,119 @@ export class AssetDocument {
     this._autosaveSuspended = false;
   }
 
-  /** True while autosave is suspended (test run in progress). */
-  get isAutosaveSuspended(): boolean { return this._autosaveSuspended; }
+  /**
+   * True while autosave is suspended — which a held lock implies (plan-462 B3).
+   *
+   * Suspension is now DERIVED from the lock rather than set beside it. That is
+   * the whole reason the lock exists: "the draft must keep describing the
+   * pre-test state" and "no one may edit the document" were the same fact, kept
+   * in two places, and only one of them was ever checked.
+   */
+  get isAutosaveSuspended(): boolean {
+    return this._autosaveSuspended || this._lock !== null;
+  }
+
+  // ─── Document lock (plan-462 B3) ─────────────────────────────────────
+
+  /**
+   * Take the document, or fail — never wait.
+   *
+   * **Fail-fast by design.** A queue here would mean a second test run, or a
+   * save racing a test run, silently waiting for a window it cannot reason
+   * about; the caller is told no and says so, which is the only outcome a user
+   * can act on. So a second test run is refused at its own entry, and a test
+   * start during a save is refused too — and vice versa.
+   *
+   * Acquisition also cancels a pending debounced draft write: the draft slot
+   * must keep describing the state as it was when the lock was taken. That
+   * cancellation is a LOAN, not a discard — whether one happened is remembered
+   * on the lock and {@link unlock} re-arms it. Dropping it outright is how a
+   * cancelled Save As used to lose the crash-recovery draft.
+   *
+   * @returns the token to hand back to {@link unlock}, or null when the
+   *   document is already held (read {@link lockOwner} to say by what).
+   */
+  tryLock(kind: DocumentLockKind): DocumentLockToken | null {
+    if (this._lock) return null;
+    const generation = ++this._lockGeneration;
+    const token = Symbol(`rv-asset-document-lock:${kind}:${generation}`);
+    const cancelledPendingWrite = this._autosave.hasPendingWrite;
+    this._lock = { kind, token, generation, startedAt: Date.now(), cancelledPendingWrite };
+    this._autosave.cancel();
+    return { kind, token, generation };
+  }
+
+  /**
+   * Release a lock — only for the token that is actually holding it.
+   *
+   * A foreign token, a token from an earlier generation, or a call when nothing
+   * is held is a no-op with a warning rather than an error. That asymmetry is
+   * deliberate: releasing is what error paths do, often more than once and
+   * often out of order, and a throwing release would turn a recoverable failure
+   * into a lost document. What it must never do is let a timeout armed for run
+   * N release the lock of run N+1 — which is exactly what the generation check
+   * prevents.
+   *
+   * Releasing also GIVES BACK the debounced draft write {@link tryLock} took
+   * away. The case that made this necessary: edit, hit Save As before the
+   * debounce fires, then cancel the name prompt. The lock had cancelled the
+   * armed write, nothing rescheduled it, and unless the user happened to touch
+   * the document again the crash-recovery draft stayed at the state before that
+   * edit — silently, which is the worst shape a draft can fail in.
+   *
+   * The re-arm is guarded by `dirty` rather than by the remembered flag alone,
+   * and that guard is what keeps a SUCCESSFUL save from writing the slot it
+   * just cleared: `markSaved` re-bases the log inside the save's own lock, so
+   * by the time the save releases, the document is clean and there is nothing
+   * left to describe. A save the user cancelled never reaches `markSaved`, so
+   * the document is still dirty and the write comes back.
+   */
+  unlock(token: DocumentLockToken | null | undefined): void {
+    const held = this._lock;
+    if (!held) return;
+    if (!token || token.token !== held.token || token.generation !== held.generation) {
+      console.warn(
+        `[asset-document] unlock ignored — the token does not hold this lock `
+        + `(held by '${held.kind}', generation ${held.generation}).`);
+      return;
+    }
+    this._lock = null;
+    if (!held.cancelledPendingWrite) return;
+    // An edit DURING the lock already armed its own write (`onChanged` checks
+    // `_autosaveSuspended`, not the lock), and re-arming would only push that
+    // debounce further out.
+    if (this._disposed || this._autosaveSuspended) return;
+    if (!this._doc.dirty || this._autosave.hasPendingWrite) return;
+    this._autosave.onChanged(this._doc);
+  }
+
+  /** What holds the document, or null when it is free. */
+  get lockOwner(): DocumentLockOwner | null {
+    return this._lock ? { kind: this._lock.kind, startedAt: this._lock.startedAt } : null;
+  }
+
+  /** Does `token` currently hold this document? */
+  holdsLock(token: DocumentLockToken | null | undefined): boolean {
+    const held = this._lock;
+    return !!held && !!token
+      && token.token === held.token && token.generation === held.generation;
+  }
+
+  /**
+   * Refuse a mutation while a TEST RUN owns the document.
+   *
+   * Only a test run, and that is the contract rather than an oversight: a save
+   * legitimately calls {@link markSaved} and re-bases the log from inside its
+   * own lock, so making the save owner block the document's own methods would
+   * make the save block itself. Saves exclude each other, and exclude test
+   * runs, at ACQUISITION — {@link tryLock} is where that is decided.
+   */
+  private _assertUnlocked(what: string): void {
+    const held = this._lock;
+    if (!held || held.kind !== 'test-run') return;
+    const owner: DocumentLockOwner = { kind: held.kind, startedAt: held.startedAt };
+    throw new DocumentLockedError(owner, lockedMessage(owner, what));
+  }
 
   /**
    * Freeze everything the document's HISTORY consists of, so a test run can put
@@ -1183,7 +1387,18 @@ export class AssetDocument {
    * it. Autosave resumes — the document is exactly as dirty (or clean) as it
    * was before the test.
    */
-  restoreFromSnapshot(state: AssetDocumentSessionState): void {
+  restoreFromSnapshot(
+    state: AssetDocumentSessionState,
+    token?: DocumentLockToken | null,
+  ): void {
+    // The one mutation a test run must be able to make while it holds the
+    // document — putting the frozen history back is what ENDS the run. So it is
+    // allowed for the token holder and refused for everyone else, rather than
+    // refused outright (which would make the lock unreleasable) or allowed
+    // outright (which would let any caller overwrite a live run's history).
+    if (this._lock && !this.holdsLock(token)) {
+      this._assertUnlocked('Restoring the document from a snapshot');
+    }
     this._base = state.shell.base;
     this._doc.restoreHistory({
       ops: [...state.ops],
@@ -1195,7 +1410,9 @@ export class AssetDocument {
     // The name is metadata, not history: put it back WITHOUT `renameDocument`,
     // which would set the meta-dirty flag `restoreHistory` just restored.
     this._doc.setNameSilently(state.shell.name);
-    this.resumeAutosave();
+    // Autosave is NOT resumed here any more (plan-462 B3): it is derived from
+    // the lock, and the run that owns the lock is the one that releases it —
+    // after this call, once its scene restore has actually finished.
     this._snapshot = null;
   }
 
@@ -1213,6 +1430,10 @@ export class AssetDocument {
    *  The returned promise resolves once the clear has landed; callers that may
    *  race a page reload (the save flow) await it. */
   markSaved(base: AssetBase, name?: string, _opts?: { clearDraft?: boolean }): Promise<void> {
+    // Guarded although it is "not an op": it CLEARS the draft slot, which
+    // during a test run is the only record of the pre-test authoring state.
+    // A save holding its own lock passes — see `_assertUnlocked`.
+    this._assertUnlocked('Marking the document saved');
     this._base = base;
     this.executor.flushTrash();
     // Re-base the op log. This notifies, which schedules an autosave — so the
@@ -1256,6 +1477,7 @@ export class AssetDocument {
    * (rv-asset-document.ts `markSaved` → `RvDocument.markSaved`).
    */
   async discardBoundEdits(): Promise<number> {
+    this._assertUnlocked('Discarding edits');
     if (!this._bound) return 0;
     const undone = await this._doc.rollbackTo(this._bindFloor);
     this._snapshot = null;
@@ -1265,6 +1487,11 @@ export class AssetDocument {
 
   dispose(): void {
     this._disposed = true;
+    // Whatever held the document is gone with it. The generation is bumped so a
+    // timeout still armed for that holder cannot release a lock taken later on
+    // a document that outlives this one's token.
+    this._lock = null;
+    this._lockGeneration++;
     this._autosave.dispose();
     this._unsubDoc();
     this._detachCommitHook?.();

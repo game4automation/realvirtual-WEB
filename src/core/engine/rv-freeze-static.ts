@@ -64,7 +64,18 @@ import type { Object3D } from 'three';
  * dragging moved only the rolls while the frame stood still (2026-09-01,
  * DemoPlanner, second layer under the same-day batcher exclusion).
  */
-const MOVER_KEY = /^(Drive|Kinematic|Grip|TransportSurface|Source|Sink|MU|Cam|SceneButtonMoveable|Chain|PlacementMeta)/i;
+const MOVER_KEY = /^(Drive|Kinematic|Grip|TransportSurface|Source|Sink|MU|Cam|SceneButtonMoveable|Chain|PlacementMeta|RibbonPath|RibbonWinder|RibbonRoller|RibbonDancer)/i;
+
+/**
+ * plan-460 F11: a `RibbonRoller` with `SpinMode: Texture` deliberately does NOT
+ * move — it scrolls its mantle map and leaves the node quaternion alone, which
+ * makes it the one web component that may be frozen. Any other value, and a
+ * missing field, keep the plan-459 behaviour (dynamic).
+ *
+ * `RibbonDancer` extends the roller but TRANSLATES, so it must never qualify —
+ * hence the anchored `RibbonRoller` prefix rather than a loose `Ribbon` one.
+ */
+const RIBBON_ROLLER_KEY = /^RibbonRoller/i;
 
 export interface FreezeStaticResult {
   /** Nodes whose matrixWorldAutoUpdate was turned off. */
@@ -84,7 +95,13 @@ function isMoverNode(node: Object3D): boolean {
   const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
   if (!rv) return false;
   for (const key in rv) {
-    if (rv[key] && MOVER_KEY.test(key)) return true;
+    if (!rv[key]) continue;
+    if (RIBBON_ROLLER_KEY.test(key)) {
+      const mode = (rv[key] as { SpinMode?: unknown }).SpinMode;
+      if (mode === 'Texture') continue;
+      return true;
+    }
+    if (MOVER_KEY.test(key)) return true;
   }
   return false;
 }

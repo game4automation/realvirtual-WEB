@@ -102,7 +102,14 @@ const RETIRED_SINCE_BASELINE: Record<string, string> = {
  * edit rewrite the description into anything at all.
  */
 const REDESCRIBED_SINCE_BASELINE: Record<string, string> = {
-  // (empty since the 2026-08-19 re-freeze.)
+  // plan-736 renamed the row field `section` → `folder` (a place, not a type)
+  // and kept `section` as a deprecated alias. Both listings had to say so.
+  // `web_document_list` was additionally shortened back under the 110-word
+  // description budget of `rv-mcp-tool-conventions.test.ts` (plan-901); the
+  // substring pinned here is the part that matters — the deprecation is still
+  // announced, so an agent written against the frozen surface still works.
+  web_document_list: '`section` is a deprecated alias',
+  web_editor_project_files: 'modified, folder, documentId',
 };
 
 /**

@@ -302,5 +302,8 @@ describe('PostProcessingManager — exported via rv-viewer barrel', () => {
   it('is re-exported from rv-viewer.ts (backwards-compat shim)', async () => {
     const mod = await import('../src/core/rv-viewer');
     expect(mod.PostProcessingManager).toBe(PostProcessingManager);
-  });
+    // The budget covers the IMPORT, not the assertion: this pulls the entire
+    // rv-viewer barrel through Vite's on-demand transform, which is 20-25 s on
+    // a loaded machine. The two lines above are microseconds.
+  }, 60_000);
 });

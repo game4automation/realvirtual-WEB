@@ -326,36 +326,6 @@ export interface RvProjectLibraryRef {
 }
 
 /**
- * Which parts of a project WE own and update, and which parts belong to the
- * customer (plan-700 §2.3).
- *
- * A delivered project folder is two things at once: our shipped material and
- * the customer's working directory. Without a marking, an update can only
- * choose between overwriting everything (destroying their scenes) or nothing
- * (no update ever arrives). This block draws the line.
- *
- * The default when this block is **absent** is deliberately the safe one:
- * everything in the project is customer-owned and nothing is overwritten. A
- * forgotten glob costs one update that did not arrive; a glob that is too wide
- * costs customer data. Only the first mistake is repairable.
- */
-export interface RvProjectVendorBlock {
-  /**
-   * Vendor-managed paths inside the project, as globs (same syntax as the
-   * delivery pipeline's `globRegex`: `*` within a segment, `**` across).
-   * Order is irrelevant.
-   */
-  managed?: string[];
-  /**
-   * Exceptions INSIDE `managed` that belong to the customer. More specific
-   * beats more general — `handover` always wins over `managed`, with no
-   * ordering semantics of its own.
-   */
-  handover?: string[];
-  [key: string]: unknown;
-}
-
-/**
  * What a project folder IS (plan-434 §2.6).
  *
  * Operator-facing metadata: the browser neither sets nor reads it, but it must
@@ -401,11 +371,6 @@ export interface RvProject {
    * `isValidProjectV1` never rejects a manifest over a missing optional field.
    */
   kind?: RvProjectKind;
-  /**
-   * Vendor/customer split used by the customer-delivery merge (plan-700).
-   * Absent means "the whole project is customer-owned" — nothing is updated.
-   */
-  vendor?: RvProjectVendorBlock;
 
   // ── pre-existing deploy-manifest fields — unchanged in name and place ──
   /** Deploy code. `loadProject()` in `_bunny-lib.mjs` requires this. */
@@ -691,19 +656,10 @@ export function isValidProjectV1(value: unknown): value is RvProject {
       if (typeof (raw as Record<string, unknown>).path !== 'string') return false;
     }
   }
-  // `vendor` is a shape check only — whether a glob is *sensible* (not too
-  // wide) is a delivery-time question and lives in scripts/validate-project.mjs,
-  // where it can fail a build. Rejecting it here would make an over-wide glob
-  // un-openable in the browser instead of un-deliverable, which helps nobody.
-  if (p.vendor !== undefined) {
-    if (!isPlainObject(p.vendor)) return false;
-    const v = p.vendor as Record<string, unknown>;
-    for (const key of ['managed', 'handover'] as const) {
-      if (v[key] === undefined) continue;
-      if (!Array.isArray(v[key])) return false;
-      if (!(v[key] as unknown[]).every(g => typeof g === 'string' && g.trim() !== '')) return false;
-    }
-  }
+  // `vendor` was a three-zone glob block, checked for shape here and for sense in
+  // scripts/validate-project.mjs. Plan-738 removed the zones; a manifest that still
+  // carries the field is neither read nor rejected — an unknown key like any other,
+  // which is what the index signature on RvProject has always allowed.
   for (const key of ['docs', 'aasx', 'connect', 'rag', 'plugins', 'provenance', 'settings'] as const) {
     if (p[key] !== undefined && !isPlainObject(p[key])) return false;
   }

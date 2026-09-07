@@ -48,6 +48,47 @@ export const RV_CHAIN_SOURCE_VISIBLE = '_rvEnergyChainSourceVisible';
 /** `userData` flag on every runtime element clone built by an `RVChain`. */
 export const RV_CHAIN_ELEMENT = '_rvChainElement';
 
+// ─── Runtime-web markers (plan-459, RibbonPath / RibbonWinder) ────────────
+//
+// Same rationale as the two blocks above: the asset exporter's prune pass and
+// the batcher must recognise the web runtime helpers WITHOUT importing the
+// component modules (which would drag the component-registry side-effect chain
+// into the editor's export path).
+
+/** `userData` flag on the band mesh a `RibbonPath` generates from its rollers. */
+export const RV_RIBBON_BAND = '_rvRibbonBand';
+
+/**
+ * `userData` copy of a winder `RollMesh`'s AUTHORED local scale, as a plain
+ * `[x, y, z]` triple.
+ *
+ * A `RibbonWinder` scales that node radially every tick, and the exporter works on a
+ * CLONE of the live tree — so without this the saved GLB would freeze whatever
+ * roll diameter the simulation happened to be at. Restoring `(1,1,1)` would be
+ * just as wrong: a CAD roll may be authored with a non-unit scale, and forcing
+ * unity would silently resize the part. The triple is the only way the clone can
+ * know what the author meant.
+ */
+export const RV_RIBBON_ROLL_SCALE = '_rvRibbonRollScale';
+
+/**
+ * `userData` flag on the mantle mesh of a `RibbonRoller` with `SpinMode: Texture`
+ * (plan-460 F11).
+ *
+ * Such a roller clones its mantle material and its colour map so it can scroll
+ * an offset nobody else sees. The dedup pass must therefore leave the mesh out
+ * of the value-fingerprint map, exactly as it leaves out a Lamp clone: an
+ * identical-looking static material would otherwise be handed to the roller and
+ * every mesh sharing it would start scrolling too.
+ */
+export const RV_RIBBON_SPIN_MESH = '_rvRibbonSpinMesh';
+
+/** True when a mesh is (or is under) a `SpinMode: Texture` roller mantle. */
+export function isTextureSpinRoller(node: Object3D): boolean {
+  return node.userData?.[RV_RIBBON_SPIN_MESH] === true
+    || node.parent?.userData?.[RV_RIBBON_SPIN_MESH] === true;
+}
+
 /**
  * True when a mesh belongs to a runtime deformation rig and must be kept out
  * of the material-collapsing pipelines (`deduplicateMaterials`,

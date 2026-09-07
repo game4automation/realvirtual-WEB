@@ -9,24 +9,29 @@
  *
  * 1. Does every register entry on disk load? A register that validates only in
  *    a fixture is a register nobody can trust.
- * 2. Does a delivery driven by the register behave exactly like the delivery
+ * 2. Does a delivery driven by the register still behave the way the delivery
  *    driven by `delivery/<key>.json` did?
  *
  * (2) is deliberately NOT a field-by-field equality. The migration changes
  * identity on purpose — `customer` is now the customer slug, not the project
  * file name — and the loader adds `configName`, `path` and `projectKey`. What
- * must be identical is the *normalised delivery contract*: the fields that
- * steer the pipeline, plus the resolved secrets. The wanted identity changes
- * are asserted separately, so they can never hide inside a passing equality.
+ * must hold is the *normalised delivery contract*: the fields that steer the
+ * pipeline, plus the provenance of the secrets. The wanted identity changes are
+ * asserted separately, so they can never hide inside a passing equality.
+ *
+ * Since plan-739 the legacy files are DELETED, so (2) compares against a frozen
+ * expectation in this file rather than against a second file on disk — see the
+ * MIGRATED block below for why that is a replacement, not a downgrade.
  *
  * Skips entirely without the private sibling repository (community checkout).
  */
 
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_HUB_URL,
   customerRegistryPath,
   isSharedForgejo,
   listCustomerSlugs,
@@ -48,41 +53,19 @@ const PRIVATE_ROOT = resolve(
 const HAS_PRIVATE = existsSync(join(PRIVATE_ROOT, 'tier-manifest.json'));
 
 /**
- * The hub base URL, DERIVED — never typed.
+ * Runs `action` with the hub base URL pinned, and restores the variable afterwards
+ * so no other test in the same process inherits it.
  *
- * `assert-public-safe.mjs` runs over this repository before every mirror push, so
- * the Forgejo host name must not appear in its source. It is read the same way
- * `hubBaseUrl()` in the library reads it: from the origin of a legacy
- * `delivery/*.json` remote, which is where the URL came from before the register
- * existed and is therefore provably the right one.
- *
- * It is needed because a register entry WITHOUT a legacy config beside it (the
- * rehearsal customer, and every customer onboarded from now on) cannot derive it
- * for itself — enumerating all customers therefore fails without the variable set.
+ * It used to scavenge the origin out of a legacy `delivery/*.json`, mirroring what
+ * `hubBaseUrl()` did. Both are gone with plan-739 F6: the library now answers with
+ * the shared {@link DEFAULT_HUB_URL} whenever the variable is unset, so this helper
+ * pins that same constant. Keeping it (rather than deleting the call sites) means
+ * these tests still say out loud which hub they expect, and a future change of the
+ * constant shows up here rather than passing silently.
  */
-function derivedHubBaseUrl(): string | null {
-  const deliveryRoot = join(PRIVATE_ROOT, 'delivery');
-  if (!existsSync(deliveryRoot)) return null;
-  for (const name of readdirSync(deliveryRoot).filter(entry => entry.endsWith('.json')).sort()) {
-    let remote: unknown;
-    try {
-      remote = JSON.parse(readFileSync(join(deliveryRoot, name), 'utf8'))?.remote;
-    } catch { continue; }
-    if (typeof remote !== 'string' || !/^https?:\/\//i.test(remote)) continue;
-    try {
-      return new URL(remote).origin;
-    } catch { /* an unparsable legacy remote is no source of truth */ }
-  }
-  return null;
-}
-
-//! Runs `action` with RV_FORGEJO_HUB_URL set to the derived origin, and restores it
-//! afterwards so no other test in the same process inherits it.
 function withHubBaseUrl<T>(action: () => T): T {
-  const derived = derivedHubBaseUrl();
-  if (!derived) return action();
   const before = process.env.RV_FORGEJO_HUB_URL;
-  process.env.RV_FORGEJO_HUB_URL = derived;
+  process.env.RV_FORGEJO_HUB_URL = DEFAULT_HUB_URL;
   try {
     return action();
   } finally {
@@ -213,28 +196,76 @@ describe.skipIf(!HAS_PRIVATE)('customer register — the real files', () => {
   });
 });
 
-// One block per migrated customer: the legacy config is still on disk, so the
-// contract can be compared against its actual source rather than a transcript.
-const MIGRATED: Array<{ slug: string; legacy: string; projectKey: string }> = [
-  { slug: 'mauser', legacy: 'mauser3dhmi', projectKey: 'mauser3dhmi' },
-  { slug: 'wmyb', legacy: 'wmyb', projectKey: 'wmyb' },
+/**
+ * The delivery contract of the two migrated customers, FROZEN (plan-739 F7/T18).
+ *
+ * This block used to read `delivery/<legacy>.json` and compare the register
+ * against it — the honest thing to do while both sources were on disk. Phase 3
+ * deleted those two files (they were the last tracked carriers of the plaintext
+ * licence and inference keys), and the block was gated on
+ * `existsSync(legacyPath)`: deleting the files alone would have turned four real
+ * assertions per customer into a silent `skip`. That is the failure class plan-739
+ * exists to remove, so the expectation moves into the test instead of vanishing.
+ *
+ * The values below are the ones the deleted files carried, verified identical to
+ * what the register resolves on 2026-09-07 before the deletion. Secrets stay out:
+ * they are asserted by SHAPE and by provenance (they must come from the gitignored
+ * `customers/<slug>.secrets.json`), never by value — writing a licence key into a
+ * mirrored test file would re-create exactly the leak the deletion closed.
+ */
+const MIGRATED: Array<{
+  slug: string;
+  projectKey: string;
+  legacyConfigName: string;
+  contract: { remote: string; tier: string; restrictedFeatures: string[]; connectChannel: string; mirror: string | null };
+}> = [
+  {
+    slug: 'mauser',
+    projectKey: 'mauser3dhmi',
+    legacyConfigName: 'mauser3dhmi',
+    contract: {
+      remote: `${DEFAULT_HUB_URL}/rv-mauser/rv-project-mauser.git`,
+      tier: 'commercial',
+      restrictedFeatures: [],
+      connectChannel: 'stable',
+      mirror: null,
+    },
+  },
+  {
+    slug: 'wmyb',
+    projectKey: 'wmyb',
+    legacyConfigName: 'wmyb',
+    contract: {
+      remote: `${DEFAULT_HUB_URL}/rv-wmyb/rv-project-wmyb.git`,
+      tier: 'commercial',
+      restrictedFeatures: [],
+      connectChannel: 'stable',
+      mirror: null,
+    },
+  },
 ];
 
-for (const { slug, legacy, projectKey } of MIGRATED) {
-  const legacyPath = join(PRIVATE_ROOT, 'delivery', `${legacy}.json`);
-  describe.skipIf(!HAS_PRIVATE || !existsSync(legacyPath))(`delivery contract — ${slug}`, () => {
-    it('is unchanged by the migration', () => {
-      const before = JSON.parse(readFileSync(legacyPath, 'utf8'));
-      const after = loadDeliveryConfig(PRIVATE_ROOT, projectKey);
-      expect(deliveryContract(after)).toEqual(deliveryContract({
-        ...before,
-        projects: before.projects ?? [legacy],
-      }));
+for (const { slug, projectKey, legacyConfigName, contract } of MIGRATED) {
+  describe.skipIf(!HAS_PRIVATE)(`delivery contract — ${slug}`, () => {
+    it('matches the frozen contract the deleted legacy config carried', () => {
+      const after = withHubBaseUrl(() => loadDeliveryConfig(PRIVATE_ROOT, projectKey));
+      expect({
+        remote: after.remote,
+        tier: after.tier,
+        restrictedFeatures: [...after.restrictedFeatures].sort(),
+        connectChannel: after.connectChannel,
+        mirror: after.mirror ?? null,
+      }).toEqual(contract);
+      // The contract shape itself stays exercised, so a field added to it is not
+      // quietly dropped from this comparison.
+      expect(Object.keys(deliveryContract(after)).sort()).toEqual([
+        'connectChannel', 'connectLicenseKey', 'mirror', 'projects',
+        'remote', 'requestyApiKey', 'requestyBaseUrl', 'restrictedFeatures', 'tier',
+      ]);
     });
 
     it('changes identity, deliberately and visibly', () => {
-      const before = JSON.parse(readFileSync(legacyPath, 'utf8'));
-      const after = loadDeliveryConfig(PRIVATE_ROOT, projectKey);
+      const after = withHubBaseUrl(() => loadDeliveryConfig(PRIVATE_ROOT, projectKey));
       // The customer is now the CUSTOMER, not the file name of a project.
       expect(after.customer).toBe(slug);
       expect(after.configName).toBe(slug);
@@ -245,11 +276,9 @@ for (const { slug, legacy, projectKey } of MIGRATED) {
       // project title the legacy config carried.
       expect(typeof after.project).toBe('string');
       expect(String(after.project).trim().length).toBeGreaterThan(0);
-      // The legacy identity was implicit in the file name. Recording it here
-      // makes the rename visible in the test output rather than in a diff:
-      // mauser3dhmi -> mauser, wmyb -> wmyb.
-      expect({ legacyIdentity: before.customer ?? legacy, registryIdentity: after.customer })
-        .toEqual({ legacyIdentity: before.customer ?? legacy, registryIdentity: slug });
+      // The legacy identity was the file name: mauser3dhmi -> mauser, wmyb -> wmyb.
+      expect({ legacyIdentity: legacyConfigName, registryIdentity: after.customer })
+        .toEqual({ legacyIdentity: legacyConfigName, registryIdentity: slug });
     });
 
     it('resolves the licence key out of the gitignored secrets file, not the register', () => {
@@ -258,15 +287,22 @@ for (const { slug, legacy, projectKey } of MIGRATED) {
       expect(secrets.path.endsWith(`${slug}.secrets.json`)).toBe(true);
       expect(secrets.connectLicenseKey).toMatch(/^LIC(-[A-Z0-9]{4}){3}$/i);
       // The same value the pipeline puts into settings.json as connectLicensePrefill.
-      expect(loadDeliveryConfig(PRIVATE_ROOT, projectKey).connectLicenseKey).toBe(secrets.connectLicenseKey);
+      const config = withHubBaseUrl(() => loadDeliveryConfig(PRIVATE_ROOT, projectKey));
+      expect(config.connectLicenseKey).toBe(secrets.connectLicenseKey);
     });
 
     it('is reachable by customer name and appears in the enumeration', () => {
-      expect(loadDeliveryConfigByCustomer(PRIVATE_ROOT, slug).projectKey).toBe(projectKey);
+      expect(withHubBaseUrl(() => loadDeliveryConfigByCustomer(PRIVATE_ROOT, slug)).projectKey).toBe(projectKey);
       const configs = withHubBaseUrl(() => listDeliveryConfigs(PRIVATE_ROOT));
       expect(configs.map(config => config.configName)).toContain(slug);
-      // The legacy file is shadowed, not read twice.
+      // Exactly one config claims the key — the register's.
       expect(configs.filter(config => (config.projects ?? []).includes(projectKey))).toHaveLength(1);
+    });
+
+    it('has no legacy delivery config left on disk', () => {
+      // The point of the deletion, asserted where the migration is described.
+      // `hub-base-url.node.test.ts` T17 owns the repo-wide version of this.
+      expect(existsSync(join(PRIVATE_ROOT, 'delivery', `${legacyConfigName}.json`))).toBe(false);
     });
   });
 }

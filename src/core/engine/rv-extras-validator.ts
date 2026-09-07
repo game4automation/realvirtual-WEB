@@ -42,6 +42,7 @@ const CONSUMED: Record<string, string[]> = {
   ConnectSignal: [], // all fields in RVConnectSignal.schema
   Lamp: ['OnColor'], // Unity Color is read raw; scalar fields are schema-derived
 
+
   // plan-417 — 3D scene buttons. Only the material NAMES are read raw (they
   // decide whether the cap has a light at all); the rest is schema-derived.
   SceneButtonBase: [],
@@ -234,6 +235,14 @@ const IGNORED: Record<string, string[]> = {
   // metadata; `renderer`/`colliders` are Unity component references the viewer
   // resolves by traversal instead; `currentOffset` is Unity runtime state and
   // the UnityEvents have no web equivalent.
+  // plan-466 — `Active` is the realvirtualBehavior ActiveOnly flag that every Unity
+  // component carries (Connected/Disconnected playback). The ribbon components have no
+  // web equivalent for it, exactly like the signals and LogicSteps above.
+  RibbonRoller: ['Active'],
+  RibbonWinder: ['Active'],
+  RibbonDancer: ['Active'],
+  RibbonPath: ['Active'],
+
   SceneButtonBase: ['Name', 'Active', 'OnToggleOn', 'OnToggleOff'],
   SceneButtonMoveable: ['renderer', 'currentOffset', 'Name', 'Active'],
   PushButton3D: ['Name', 'Active'],

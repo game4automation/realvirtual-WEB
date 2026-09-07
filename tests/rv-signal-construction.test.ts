@@ -36,6 +36,7 @@ describe('rv-signal-construction', () => {
         'Drive_FollowPosition',
         'Drive_Gear',
         'Drive_PositionSwitch',
+        'Drive_SEWMovilink',
         'Drive_Simple',
         'Drive_Speed',
       ]);

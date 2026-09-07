@@ -24,7 +24,7 @@ import { Alert, Badge, Box, Button, Chip, Collapse, Divider, IconButton, InputAd
 import { SectionHeader } from '../shared-components';
 import {
   Add, ChevronRight, CreateNewFolderOutlined, DeleteOutline, FilterList,
-  MoreVert, NoteAddOutlined, Refresh, Search, SettingsEthernet,
+  MoreHoriz, MoreVert, NoteAddOutlined, Refresh, Search, SettingsEthernet,
 } from '@mui/icons-material';
 import type { LibraryCatalogEntry } from '../../library/library-types';
 import { debug } from '../../engine/rv-debug'; // TEMP open-perf instrumentation
@@ -45,6 +45,7 @@ import {
   normaliseFolderPath,
   readProjectFolders,
   withProjectFolders,
+  type RvDocumentEntry,
 } from '../../project/rv-project-types';
 import {
   adoptWorkspace,
@@ -107,6 +108,7 @@ import { ProjectTree } from './ProjectTree';
 import {
   buildDashboardTree,
   catalogRootId,
+  isFileRef,
   type CatalogRootInput,
   type TreeCatalogEntryInput,
 } from '../../project/rv-project-tree-sources';
@@ -140,6 +142,11 @@ import { reportDocumentIdCollisions } from '../problems-store';
 import { selectionPointsIntoGroup, type SelectedAssetRef } from './assets-library-groups';
 import type { ProjectCardMenuAction } from './ProjectCard';
 import { ProjectsDetailPane, type DetailAction, type DetailField } from './ProjectsDetailPane';
+import { ProjectsDetailSheet } from './ProjectsDetailSheet';
+import {
+  collapseCrumbs, isCollapsedCrumbs, mobileLibraryTiles,
+} from './mobile-folder-view';
+import { useMobileLayout, useTouchDevice } from '../../../hooks/use-mobile-layout';
 import { DestructiveConfirmDialog, type DestructiveConfirmRequest } from './DestructiveConfirmDialog';
 import {
   beginProjectsOpening,
@@ -204,6 +211,39 @@ function baseNameOf(path: string): string {
  * The empty case keeps its sentence — a row of nothing would read as a loading
  * state.
  */
+/**
+ * The CONNECT and Knowledge reference rows of one document — one fact, both routes.
+ *
+ * The detail pane reaches a document by ID (a tree row) or by PATH (a card), and
+ * both branches used to write these two rows out by hand (plan-461 V13). A
+ * reference whose file is not in the listing is marked "— missing": a dead
+ * reference is exactly what these rows exist to surface.
+ */
+function refFields(
+  doc: RvDocumentEntry | null | undefined,
+  connectConfigs: readonly string[],
+  knowledgeFiles: readonly string[],
+): DetailField[] {
+  const rows: DetailField[] = [];
+  const connectRef = readDocumentRef(doc, 'connectRef');
+  if (connectRef) {
+    const shown = stripConnectConfigSuffix(connectRef);
+    rows.push({
+      label: 'CONNECT',
+      value: connectConfigs.includes(connectRef) ? shown : `${shown} — missing`,
+    });
+  }
+  const knowledgeRef = readDocumentRef(doc, 'knowledgeRef');
+  if (knowledgeRef) {
+    const shown = stripKnowledgeFileSuffix(knowledgeRef);
+    rows.push({
+      label: 'Knowledge',
+      value: knowledgeFiles.includes(knowledgeRef) ? shown : `${shown} — missing`,
+    });
+  }
+  return rows;
+}
+
 function usedByChips(usedBy: readonly RefUsage[]) {
   return (
     <>
@@ -334,6 +374,21 @@ export async function openDocumentAsWorkingScene(
 
 export function ProjectsDashboardHost() {
   const dash = useSyncExternalStore(subscribeProjectsDashboard, getProjectsDashboardSnapshot);
+  /**
+   * Two independent questions, asked once here and handed down as booleans
+   * (plan-458 §2.1).
+   *
+   * `compactLayout` is about WIDTH: below 900px the three columns do not fit,
+   * so the grid becomes the screen, the tree goes and the detail pane becomes
+   * a sheet. `touchInput` is about the POINTER: a long-press replaces the
+   * right-click and inputs grow to 16px so iOS does not zoom on focus.
+   *
+   * They are deliberately not one flag. A narrow desktop window is compact but
+   * still has a mouse; a wide touch tablet keeps the three columns but has no
+   * right-click. Merging them would give each of those the wrong half.
+   */
+  const compactLayout = useMobileLayout();
+  const touchInput = useTouchDevice();
   const store = getProjectStore();
   const project = useSyncExternalStore(store.subscribe, store.getSnapshot);
   // The registry publishes a version counter, never an object — see §2.6.4.
@@ -441,10 +496,16 @@ export function ProjectsDashboardHost() {
   );
 
   /**
-   * The rows of the list screen: the open project, then workspace entries,
-   * then recents from elsewhere. All are projects to the user, so they share
+   * The rows of the list screen: the open project, then the local projects —
+   * workspace entries and recents from elsewhere, interleaved and ordered by
+   * when they were last opened. All are projects to the user, so they share
    * one list rather than headed groups — the origin only decides whether the
    * row can be forgotten.
+   *
+   * The recency ordering is deliberately SILENT (user decision 2026-09-07):
+   * there is no badge, no timestamp and no "Recent" heading, only position.
+   * A project that was never opened has no `lastOpenedAt` and sorts last,
+   * which is the honest place for it.
    *
    * The open project leads the list even when it belongs to neither source.
    *
@@ -462,16 +523,12 @@ export function ProjectsDashboardHost() {
     const match = (name: string) => !term || name.toLowerCase().includes(term);
     const onDisk = [...workspaceProjects, ...recentOutside]
       .some(p => p.id === DEMO_PROJECT_ID || p.name === DEMO_PROJECT_NAME);
-    const rows: ProjectListRow[] = [
-      ...(!onDisk && match(DEMO_PROJECT_NAME)
-        ? [{
-            id: DEMO_PROJECT_ID,
-            name: DEMO_PROJECT_NAME,
-            caption: 'realvirtual demo scenes & library',
-            origin: 'workspace' as const,
-            hint: 'bundled' as const,
-          }]
-        : []),
+    // `readRecentProjects()` is newest-first and carries `lastOpenedAt`, so the
+    // ordering costs one lookup table and no new state. ISO-8601 sorts
+    // lexicographically in chronological order, which is why this compares the
+    // strings rather than parsing dates.
+    const openedAt = new Map(recent.map(r => [r.id, r.lastOpenedAt]));
+    const localRows: ProjectListRow[] = [
       ...workspaceProjects
         .filter(p => match(p.name))
         .map(p => ({
@@ -491,6 +548,19 @@ export function ProjectsDashboardHost() {
           origin: 'recent' as const,
           hint: 'local' as const,
         })),
+    ].sort((a, b) => (openedAt.get(b.id) ?? '').localeCompare(openedAt.get(a.id) ?? ''));
+
+    const rows: ProjectListRow[] = [
+      ...(!onDisk && match(DEMO_PROJECT_NAME)
+        ? [{
+            id: DEMO_PROJECT_ID,
+            name: DEMO_PROJECT_NAME,
+            caption: 'realvirtual demo scenes & library',
+            origin: 'workspace' as const,
+            hint: 'bundled' as const,
+          }]
+        : []),
+      ...localRows,
     ];
 
     const open = project.project;
@@ -511,7 +581,7 @@ export function ProjectsDashboardHost() {
       });
     }
     return rows;
-  }, [workspaceProjects, recentOutside, dash.search,
+  }, [workspaceProjects, recentOutside, recent, dash.search,
       project.project, project.folderName, project.backendKind]);
 
   const projectLibraries = useMemo(
@@ -757,6 +827,26 @@ export function ProjectsDashboardHost() {
     { kind: 'renameAsset' | 'collections' | 'renameNode'; relPath: string; value: string } | null
   >(null);
 
+  /**
+   * Re-read BOTH listings after a mutation (plan-461 V13).
+   *
+   * The document scan feeds the tree rows, the folder cards and the detail
+   * pane; the provider catalog feeds thumbnails and drag-into-scene. Skipping
+   * either leaves an old name — or a deleted card — standing until the next
+   * open, which is the finding this pair exists for. Seven call sites wrote it
+   * out identically; they now share this one so a third listing can only be
+   * forgotten once.
+   *
+   * It refreshes the LISTINGS only. Whatever renders the LIVING document — the
+   * hero card, the hierarchy card — reads the open document's own name, which
+   * no rescan touches.
+   */
+  const refreshListings = useCallback(async () => {
+    await store.rescanDocuments();
+    await listLibrarySources()
+      .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
+  }, [store]);
+
   /** Run an asset op, surfacing its typed failure rather than swallowing it. */
   const runAssetOp = useCallback((
     label: string,
@@ -771,9 +861,7 @@ export function ProjectsDashboardHost() {
       // scan feeds the tree rows, the folder cards and the detail pane; the
       // provider catalog feeds thumbnails and drag-into-scene. Skipping either
       // leaves an old name (or a deleted card) standing until the next open.
-      await store.rescanDocuments();
-      await listLibrarySources()
-        .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
+      await refreshListings();
     });
   }, [runVerb, store]);
 
@@ -1048,6 +1136,25 @@ export function ProjectsDashboardHost() {
   }, [openAssetInEditor, runAssetOp, handleDeleteAsset, transferActionsFor, documentByPath, store]);
 
   const [addLibraryOpen, setAddLibraryOpen] = useState(false);
+  /**
+   * Is the compact layout's detail sheet up? (plan-458 §2.3)
+   *
+   * Driven by the KIND of the selection, not by the click that made it: a
+   * folder or a project is navigation and stays in the grid, while a document,
+   * a file or a library asset is a thing with facts and verbs and is what the
+   * sheet exists for. Closing it leaves the selection standing — the user
+   * dismissed a panel, not a choice.
+   */
+  const [detailSheetOpen, setDetailSheetOpen] = useState(false);
+  /** The folded breadcrumb levels behind the ellipsis, and what anchors them. */
+  const [crumbMenu, setCrumbMenu] = useState<
+    { anchor: HTMLElement; hidden: { path: string; name: string; rootId: string; relPath: string }[] }
+    | null>(null);
+  useEffect(() => {
+    const kind = dash.selection.kind;
+    setDetailSheetOpen(kind === 'document' || kind === 'documentPath'
+      || kind === 'file' || kind === 'asset');
+  }, [dash.selection]);
   // The planner plugin owns the private cloud store when it is loaded. Reading
   // it through the plugin registry keeps this file free of a private import.
   const cloudStore = (viewer.getPlugin('layout-planner') as
@@ -1217,9 +1324,7 @@ export function ProjectsDashboardHost() {
       // In the project ROOT ('' — a real target since the folder rule was
       // generalised), so the newborn project is one file, not a `scenes/` tree.
       const created = await createDocument(store, 'empty', { folder: '' });
-      await store.rescanDocuments();
-      await listLibrarySources()
-        .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
+      await refreshListings();
       setProjectsSelection({ kind: 'document', documentId: created.documentId });
       await store.flush();
 
@@ -1316,9 +1421,7 @@ export function ProjectsDashboardHost() {
           // finding: the tree and the cards render the document SCAN, not the
           // manifest — without the rescan the deleted card stands until the
           // next reload (2026-08-19 — "delete leaves the card").
-          await store.rescanDocuments();
-          await listLibrarySources()
-            .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
+          await refreshListings();
         });
       },
     });
@@ -1329,9 +1432,7 @@ export function ProjectsDashboardHost() {
     void runVerb('Duplicate scene', async () => {
       await sceneStore.duplicate(id);
       // The copy's card has the same scan dependency as the deleted card above.
-      await store.rescanDocuments();
-      await listLibrarySources()
-        .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
+      await refreshListings();
     });
   }, [sceneStore, runVerb, store]);
 
@@ -1349,9 +1450,7 @@ export function ProjectsDashboardHost() {
     if (!sceneStore) return;
     void runVerb('Rename', async () => {
       await sceneStore.rename(id, name);
-      await store.rescanDocuments();
-      await listLibrarySources()
-        .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
+      await refreshListings();
     });
   }, [sceneStore, runVerb, store]);
 
@@ -1775,9 +1874,7 @@ export function ProjectsDashboardHost() {
       // up, exactly like clicking an object field pings the asset in Unity.
       // Every non-document leaf answers to a `file` selection — the four
       // reference kinds and the inert plain files of the full view.
-      if (sel.kind === 'file'
-        && (ref.kind === 'attachment' || ref.kind === 'connectConfig'
-          || ref.kind === 'knowledgeFile' || ref.kind === 'plainFile')
+      if (sel.kind === 'file' && isFileRef(ref)
         && path === `${sel.rootId}/${sel.relPath}`) return path;
     }
     return null;
@@ -1799,8 +1896,7 @@ export function ProjectsDashboardHost() {
       });
       return;
     }
-    if (ref.kind === 'attachment' || ref.kind === 'connectConfig'
-      || ref.kind === 'knowledgeFile' || ref.kind === 'plainFile') {
+    if (isFileRef(ref)) {
       setProjectsSelection({ kind: 'file', rootId: node.rootId, relPath: node.relPath });
       return;
     }
@@ -1896,9 +1992,7 @@ export function ProjectsDashboardHost() {
       // the document scan (tree rows + folder cards) and the project-library
       // catalog (thumbnails, drag-into-scene). The row itself is already in the
       // manifest — this is the display catching up, not the registration.
-      await store.rescanDocuments();
-      await listLibrarySources()
-        .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
+      await refreshListings();
       setProjectsSelection({ kind: 'document', documentId: created.documentId });
       // The manifest write is queued by the folder writer; wait for it so a
       // reload right after the click cannot lose the row.
@@ -2135,6 +2229,25 @@ export function ProjectsDashboardHost() {
     [subfoldersInView, dash.search, treeRoots, project.project?.id, handleTreeSelect],
   );
 
+  /**
+   * The attached libraries as root-level tiles (plan-458 F3).
+   *
+   * Only on the compact layout and only AT the project root: the tree column
+   * that is their entrance on the desktop is not rendered on a phone, and a
+   * library tile repeated in every subfolder would read as something that
+   * lives there.
+   */
+  const libraryTiles = useMemo<FolderTileModel[]>(() => {
+    if (!compactLayout) return [];
+    if (selectedFolderPath !== (projectTreeRoots[0]?.path ?? null)) return [];
+    return mobileLibraryTiles(libraryTreeRoots).map(tile => ({
+      key: tile.key,
+      name: tile.name,
+      holdsSomething: tile.holdsSomething,
+      onOpen: () => setProjectsSelection({ kind: 'folder', rootId: tile.rootId, relPath: '' }),
+    }));
+  }, [compactLayout, selectedFolderPath, projectTreeRoots, libraryTreeRoots]);
+
   // ── The move write path (plan-703 Phase 5 rest, F12/F13) ──────────────
   /**
    * The IO `applyTreeMove` writes through, or null when nothing can be written.
@@ -2220,9 +2333,7 @@ export function ProjectsDashboardHost() {
       }
       // The document scan AND the provider listing both re-read, or the tree
       // row, the card and the pane keep the old name until the next open.
-      await store.rescanDocuments();
-      await listLibrarySources()
-        .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
+      await refreshListings();
       // Those two refresh the LISTINGS. Whatever renders the LIVING document —
       // the hero card, the hierarchy card — reads the open document's own name,
       // which no rescan touches: renaming the open document from the tree left
@@ -2272,12 +2383,12 @@ export function ProjectsDashboardHost() {
       // Show it NOW — the listing effect re-scans later and merely confirms.
       setConnectConfigs(prev => (prev.includes(rel) ? prev : [...prev, rel]));
       setProjectsSelection({ kind: 'file', rootId, relPath: rel });
-      // plan-725 §2.7 — this is the ONE config-bearing write in the app that
-      // never touches the manifest: a raw `writeDocument` and nothing else. No
-      // notify site in the project store can see it, so it says so itself, or
-      // the file a user just made stays invisible to a running gateway until
-      // some unrelated write or a restart happens to reveal it.
-      store.notifyProjectChanged();
+      // plan-725 §2.7 — this is a config-bearing write that never touches the
+      // manifest: a raw `writeDocument` and nothing else. It no longer says so
+      // by hand. Since plan-462 B2 the backend the store hands out announces a
+      // written `*.connect.json` body itself (`withConnectConfigNotifier`), so
+      // this path and every other producer of one are covered by the same rule
+      // instead of by whoever remembered.
     });
   }, [runVerb, store, project.project?.id, selectedFolderPath, connectConfigs]);
 
@@ -2789,22 +2900,7 @@ export function ProjectsDashboardHost() {
       // Shown whenever set — and marked when the file it names is not in the
       // config listing, because a dead reference is exactly what this row
       // exists to surface.
-      const connectRef = readDocumentRef(scene, 'connectRef');
-      if (connectRef) {
-        const shown = stripConnectConfigSuffix(connectRef);
-        fields.push({
-          label: 'CONNECT',
-          value: connectConfigs.includes(connectRef) ? shown : `${shown} — missing`,
-        });
-      }
-      const knowledgeRef = readDocumentRef(scene, 'knowledgeRef');
-      if (knowledgeRef) {
-        const shown = stripKnowledgeFileSuffix(knowledgeRef);
-        fields.push({
-          label: 'Knowledge',
-          value: knowledgeFiles.includes(knowledgeRef) ? shown : `${shown} — missing`,
-        });
-      }
+      fields.push(...refFields(scene, connectConfigs, knowledgeFiles));
       const actions: DetailAction[] = [
         { key: 'open', label: 'Open', primary: true, onClick: () => openScene(scene.id) },
       ];
@@ -2883,26 +2979,7 @@ export function ProjectsDashboardHost() {
         fields: [
           { label: 'Source', value: sel.path },
           // Same reference rows as the id-selected branch — one fact, both routes.
-          ...(() => {
-            const rows: DetailField[] = [];
-            const connectRef = readDocumentRef(doc, 'connectRef');
-            if (connectRef) {
-              const shown = stripConnectConfigSuffix(connectRef);
-              rows.push({
-                label: 'CONNECT',
-                value: connectConfigs.includes(connectRef) ? shown : `${shown} — missing`,
-              });
-            }
-            const knowledgeRef = readDocumentRef(doc, 'knowledgeRef');
-            if (knowledgeRef) {
-              const shown = stripKnowledgeFileSuffix(knowledgeRef);
-              rows.push({
-                label: 'Knowledge',
-                value: knowledgeFiles.includes(knowledgeRef) ? shown : `${shown} — missing`,
-              });
-            }
-            return rows;
-          })(),
+          ...refFields(doc, connectConfigs, knowledgeFiles),
         ],
         actions: [
           {
@@ -3322,6 +3399,26 @@ export function ProjectsDashboardHost() {
     // The folder the grid is showing, as a tree node — what "New folder" from
     // the grid's own menu needs as its parent.
     const folderNode = selectedFolderPath ? findTreeNode(treeRoots, selectedFolderPath) : null;
+    /**
+     * The trail the compact layout shows (plan-458 F4).
+     *
+     * A library's own trail starts at the library, which on a phone leaves no
+     * way back to the project that attached it — the tree that used to be that
+     * way is not rendered. So the project is prepended whenever the selection
+     * sits in a catalog root. Past three levels the MIDDLE folds behind an
+     * ellipsis: the root is where you came from and the tail is where you are,
+     * and neither survives a trail that simply scrolls off the left edge.
+     */
+    const inLibrary = folderCrumbs.length > 0
+      && treeRoots.find(r => r.rootId === folderCrumbs[0].rootId)?.rootKind === 'catalog';
+    const projectRoot = projectTreeRoots[0];
+    const trail = compactLayout && inLibrary && projectRoot
+      ? [{
+        path: projectRoot.path!, name: projectRoot.name,
+        rootId: projectRoot.rootId, relPath: '',
+      }, ...folderCrumbs]
+      : folderCrumbs;
+    const crumbEntries = compactLayout ? collapseCrumbs(trail, 3) : trail;
     return (
       <ProjectsDashboard
         title={project.project?.name ?? 'Project'}
@@ -3331,7 +3428,7 @@ export function ProjectsDashboardHost() {
           project.writable ? null : 'read-only',
         ].filter(Boolean).join(' · ')}
         onBack={() => setProjectsView('projects')}
-        hero={<DocumentHeroSection onReveal={handleHeroReveal} />}
+        hero={<DocumentHeroSection onReveal={handleHeroReveal} compactLayout={compactLayout} />}
         // The tools moved down onto the grid's own toolbar, where the things
         // they filter are: a separate full-width bar carrying nothing but a
         // centred search field was a third horizontal rule between the user
@@ -3379,6 +3476,18 @@ export function ProjectsDashboardHost() {
               >
                 Import .rvproject…
               </MenuItem>
+              {/* The verb lives on the Libraries header of the tree column,
+                  and that column is not rendered on the compact layout — so
+                  it moves here rather than growing a second header nobody
+                  asked for. The desktop keeps the header button. */}
+              {compactLayout && (
+                <MenuItem
+                  onClick={() => { setProjectMenuAnchor(null); setAddLibraryOpen(true); }}
+                  sx={{ fontSize: 13 }}
+                >
+                  Add library…
+                </MenuItem>
+              )}
             </Menu>
           </>
         }
@@ -3386,8 +3495,15 @@ export function ProjectsDashboardHost() {
         {/* Folders left, contents right — the Unity project window (Lauf 13).
             The tree is a fixed column rather than a flex share: it holds names
             of a known length, while the grid is what should take the space a
-            wider window offers. */}
+            wider window offers.
+
+            Not RENDERED at all on the compact layout (plan-458 F2): 280px of
+            tree plus 260px of detail leaves the grid nothing on a 390px phone,
+            and a hidden column would still pay for its subscriptions. The
+            breadcrumb drill-down is the navigation there. */}
+        {!compactLayout && (
         <Box
+          data-testid="projects-tree-column"
           sx={{
             width: 280,
             flexShrink: 0,
@@ -3495,6 +3611,7 @@ export function ProjectsDashboardHost() {
             />
           </Box>
         </Box>
+        )}
         <Box sx={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           {/* ONE toolbar for the grid: where you are, what you are filtering
               it by, and what you can make in it — left to right in the order
@@ -3508,15 +3625,41 @@ export function ProjectsDashboardHost() {
               // the three columns open on one shared 40px header line.
               px: 1.5, minHeight: 40, flexShrink: 0,
               borderBottom: '1px solid rgba(255,255,255,0.06)',
+              // Narrow: the trail takes a row of its own and the verbs the
+              // next one. Squeezed onto one row, either the trail or the
+              // search field ends up too small to use.
+              ...(compactLayout ? { flexWrap: 'wrap', rowGap: 0.5, py: 0.5 } : {}),
             }}
           >
             <Box
               data-testid="folder-header-name"
               sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 1, minWidth: 0,
-                overflow: 'hidden', whiteSpace: 'nowrap' }}
+                overflow: 'hidden', whiteSpace: 'nowrap',
+                ...(compactLayout ? { flex: '1 1 100%', minHeight: 44 } : {}) }}
             >
-              {folderCrumbs.map((crumb, i) => {
-                const last = i === folderCrumbs.length - 1;
+              {crumbEntries.map((entry, i) => {
+                const last = i === crumbEntries.length - 1;
+                if (isCollapsedCrumbs(entry)) {
+                  return (
+                    <Box
+                      key="crumb-ellipsis"
+                      sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 0 }}
+                    >
+                      <ChevronRight sx={{ fontSize: 13, color: 'text.disabled', flexShrink: 0 }} />
+                      <IconButton
+                        size="small"
+                        aria-label="Show hidden folders"
+                        onClick={(e) => setCrumbMenu({
+                          anchor: e.currentTarget, hidden: entry.hidden,
+                        })}
+                        sx={{ p: 0, width: compactLayout ? 44 : 24, height: compactLayout ? 44 : 24 }}
+                      >
+                        <MoreHoriz sx={{ fontSize: 16 }} />
+                      </IconButton>
+                    </Box>
+                  );
+                }
+                const crumb = entry;
                 return (
                   <Box key={crumb.path} sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0 }}>
                     {i > 0 && (
@@ -3537,6 +3680,10 @@ export function ProjectsDashboardHost() {
                         fontWeight: last ? 600 : 400,
                         color: last ? 'text.primary' : 'text.secondary',
                         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        // A trail segment is a navigation target, so on a
+                        // finger it is a 44px one — the type stays 12px, the
+                        // box around it grows.
+                        ...(compactLayout ? { display: 'inline-flex', alignItems: 'center', minHeight: 44 } : {}),
                         ...(last ? {} : {
                           background: 'none', border: 'none', p: 0, cursor: 'pointer',
                           '&:hover': { color: 'text.primary', textDecoration: 'underline' },
@@ -3548,6 +3695,28 @@ export function ProjectsDashboardHost() {
                   </Box>
                 );
               })}
+              {/* The folded levels. Anchored to the ellipsis rather than the
+                  pointer: unlike the card menus this one has a button. */}
+              <Menu
+                anchorEl={crumbMenu?.anchor ?? null}
+                open={crumbMenu !== null}
+                onClose={() => setCrumbMenu(null)}
+              >
+                {(crumbMenu?.hidden ?? []).map(crumb => (
+                  <MenuItem
+                    key={crumb.path}
+                    onClick={() => {
+                      setCrumbMenu(null);
+                      setProjectsSelection({
+                        kind: 'folder', rootId: crumb.rootId, relPath: crumb.relPath,
+                      });
+                    }}
+                    sx={{ fontSize: 13 }}
+                  >
+                    {crumb.name}
+                  </MenuItem>
+                ))}
+              </Menu>
             </Box>
 
             <Box sx={{ flex: 1, minWidth: 8 }} />
@@ -3597,10 +3766,14 @@ export function ProjectsDashboardHost() {
                       <Search sx={{ fontSize: 16, color: 'text.disabled' }} />
                     </InputAdornment>
                   ),
-                  sx: { fontSize: 12, height: 24 },
+                  // 16px on a coarse pointer, whatever the layout: below it
+                  // iOS zooms the page on focus and never zooms back.
+                  sx: { fontSize: touchInput ? 16 : 12, height: touchInput ? 36 : 24 },
                 },
               }}
-              sx={{ width: 200, flexShrink: 0 }}
+              sx={compactLayout
+                ? { flex: '1 1 140px', minWidth: 0 }
+                : { width: 200, flexShrink: 0 }}
             />
             {/*
               The PRIMARY way in (plan-445 F5). "New document" was a 16px plus
@@ -3697,6 +3870,11 @@ export function ProjectsDashboardHost() {
           <ProjectFolderContents
             cards={folderCards}
             folders={subfolderTiles}
+            tileGroups={libraryTiles.length > 0
+              ? [{ key: 'libraries', label: 'Libraries', tiles: libraryTiles }]
+              : []}
+            compactLayout={compactLayout}
+            touchInput={touchInput}
             onBackgroundContextMenu={handleGridContextMenu}
             emptyMessage={folderRows.length > 0 || subfoldersInView.length > 0
               ? 'Nothing in this folder matches the filter.'
@@ -3768,9 +3946,19 @@ export function ProjectsDashboardHost() {
             </MenuItem>
           </Menu>
         </Box>
-        {/* Always present, so the layout never jumps when a selection comes
-            and goes; without one it says so ("Nothing selected"). */}
-        <ProjectsDetailPane {...detail} />
+        {/* Desktop: always present, so the layout never jumps when a
+            selection comes and goes; without one it says so ("Nothing
+            selected"). Compact: a sheet over the grid, which is only up while
+            there IS something to describe — so it never needs that state. */}
+        {compactLayout
+          ? (
+            <ProjectsDetailSheet
+              open={detailSheetOpen}
+              onClose={() => setDetailSheetOpen(false)}
+              detail={detail}
+            />
+          )
+          : <ProjectsDetailPane {...detail} />}
       </ProjectsDashboard>
     );
   }

@@ -25,7 +25,7 @@
  * default is the whole security story of the field renderer (plan-431 F9).
  */
 
-import type { ComponentType } from 'react';
+import { Component, Suspense, lazy, useMemo, type ComponentType, type ReactNode } from 'react';
 
 /** What a loaded markdown chunk hands back. Typed structurally so a test double
  *  does not have to import the real packages. */
@@ -67,4 +67,94 @@ export function loadMarkdown(): Promise<MarkdownModule> {
  */
 export function __setMarkdownLoader(fn?: MarkdownLoader): void {
   loader = fn ?? defaultLoader;
+}
+
+// ─── The one rendering boundary ─────────────────────────────────────────
+
+/**
+ * Catches a REJECTED markdown chunk (offline, purged CDN, blocked asset).
+ *
+ * `Suspense` handles a pending promise and nothing else — a rejected dynamic
+ * import throws, and without a boundary here that throw takes the surrounding
+ * subtree down with it. This is the single most common mistake in code-split
+ * React, and it is the reason plan-431 F7 names both mechanisms.
+ */
+class MarkdownErrorBoundary extends Component<
+  { fallback: ReactNode; children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: unknown) {
+    console.warn('[NodeKnowledge] markdown chunk failed to load, showing raw note', error);
+  }
+
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
+
+/**
+ * Render `text` as Markdown through the one lazy chunk.
+ *
+ * Built per mount (`useMemo` with no deps), so each mounted instance asks
+ * {@link loadMarkdown} exactly once — that is what lets a test swap in a pending
+ * or rejecting loader and actually observe the state.
+ *
+ * The two call sites keep the behaviour they had before they shared this
+ * component (plan-461 V11):
+ *
+ *  - the node-knowledge field renderer passes `components` and
+ *    `errorBoundary: true`, so a rejected chunk falls back to the raw note;
+ *  - the project browser's detail pane passes neither, so a rejected chunk
+ *    still throws to whatever boundary is above it, exactly as it always did.
+ *
+ * `fallback` is used by BOTH mechanisms — the pending state and, when the
+ * boundary is on, the failed one.
+ */
+export function LazyMarkdown({
+  text,
+  components,
+  fallback,
+  errorBoundary = false,
+}: {
+  text: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  components?: any;
+  fallback: ReactNode;
+  errorBoundary?: boolean;
+}) {
+  const Lazy = useMemo(
+    () => lazy(async () => {
+      const { ReactMarkdown, remarkGfm } = await loadMarkdown();
+      return {
+        default: ({ source }: { source: string }) => (
+          components
+            ? (
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+                {source}
+              </ReactMarkdown>
+            )
+            : <ReactMarkdown remarkPlugins={[remarkGfm]}>{source}</ReactMarkdown>
+        ),
+      };
+    }),
+    // Deliberately empty: both call sites hand over a module-level constant (or
+    // nothing), and re-creating the lazy component would re-request the chunk.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  const body = (
+    <Suspense fallback={fallback}>
+      <Lazy source={text} />
+    </Suspense>
+  );
+  return errorBoundary
+    ? <MarkdownErrorBoundary fallback={fallback}>{body}</MarkdownErrorBoundary>
+    : body;
 }

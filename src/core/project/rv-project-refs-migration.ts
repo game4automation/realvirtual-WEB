@@ -35,7 +35,17 @@
  */
 
 import type { RvDocumentEntry, RvProject } from './rv-project-types';
-import { assertContainedRef, isContainedRef, normalizeRefPath } from './rv-project-refs';
+import { assertContainedRef, isContainedRef } from './rv-project-refs';
+import {
+  applyRefMigration, planRefMigration, rollbackRefMigration,
+  type RefMigrationBinding,
+} from './rv-project-ref-migration-core';
+
+/** A flattened declaration, carrying the two names this module reports back. */
+interface ScriptRefBinding extends RefMigrationBinding {
+  declared: string;
+  scriptRef: string;
+}
 
 // ─── Marker ─────────────────────────────────────────────────────────────
 
@@ -164,47 +174,44 @@ export function migrateProjectScriptRefs(
     return { outcome: 'skipped', project, ...empty(), reason: 'nothing to migrate' };
   }
 
-  // First row wins for a name two documents share — the same rule the runtime's
-  // first-match-wins loop already applies, so the migration cannot change which
-  // of the two a module bound to.
-  const byName = new Map<string, RvDocumentEntry>();
-  const byLowerName = new Map<string, RvDocumentEntry>();
-  for (const doc of documents) {
-    const name = modelNameOfDocumentPath(String(doc.path ?? ''));
-    if (name === '') continue;
-    if (!byName.has(name)) byName.set(name, doc);
-    if (!byLowerName.has(name.toLowerCase())) byLowerName.set(name.toLowerCase(), doc);
-  }
-
-  const assigned: ScriptRefMigrationResult['assigned'] = [];
-  const caseMismatches: ScriptRefCaseMismatch[] = [];
-  const refByDocument = new Map<RvDocumentEntry, string>();
-
+  // One declaration per (module, model), flattened — the core walks a flat list
+  // and the module grouping carries no meaning past this point.
+  const bindings: ScriptRefBinding[] = [];
   for (const mod of modules) {
     const scriptRef = assertContainedRef(mod.scriptRef, 'scriptRef');
     for (const declared of mod.models ?? []) {
       if (typeof declared !== 'string' || declared.trim() === '') continue;
-      const exact = byName.get(declared);
-      if (!exact) {
-        const loose = byLowerName.get(declared.toLowerCase());
-        if (loose) {
-          caseMismatches.push({
-            declared,
-            scriptRef,
-            documentId: String(loose.id ?? ''),
-            documentPath: String(loose.path ?? ''),
-          });
-        }
-        continue;
-      }
-      const current = exact.scriptRef;
-      if (typeof current === 'string' && normalizeRefPath(current) !== '') continue;
-      if (refByDocument.has(exact)) continue;
-      refByDocument.set(exact, scriptRef);
-      assigned.push({ declared, scriptRef, documentId: String(exact.id ?? '') });
+      bindings.push({ key: declared, ref: scriptRef, declared, scriptRef });
     }
   }
 
+  // `report`, not `bind`: the runtime matcher is case-SENSITIVE, so a
+  // declaration that differs only in case binds nothing today. Assigning it
+  // would change how the project behaves — see the module header (K3).
+  const plan = planRefMigration(documents, bindings, {
+    field: 'scriptRef',
+    documentKey: modelNameOfDocumentPath,
+    // The declaration is compared as written; only the DOCUMENT side is reduced
+    // to a model name.
+    bindingKey: declared => declared,
+    caseMismatch: 'report',
+  });
+
+  const assigned: ScriptRefMigrationResult['assigned'] = plan.assigned.map(a => ({
+    declared: a.binding.declared,
+    scriptRef: a.binding.scriptRef,
+    documentId: a.documentId,
+  }));
+  const caseMismatches: ScriptRefCaseMismatch[] = plan.caseMismatches.map(m => ({
+    declared: m.binding.declared,
+    scriptRef: m.binding.scriptRef,
+    documentId: m.documentId,
+    documentPath: m.documentPath,
+  }));
+
+  // This migration's own no-op rule: an unmatched declaration is NOT news — it
+  // names a model this project does not have, which is a normal state for a
+  // plugin shared between projects.
   if (assigned.length === 0 && caseMismatches.length === 0) {
     return { outcome: 'skipped', project, ...empty(), reason: 'no declaration matched a document' };
   }
@@ -215,14 +222,11 @@ export function migrateProjectScriptRefs(
     assignedIds: assigned.map(a => a.documentId),
     caseMismatches,
   };
-  const migrated: RvProject = {
-    ...project,
-    documents: documents.map(doc => {
-      const ref = refByDocument.get(doc);
-      return ref ? { ...doc, scriptRef: ref } : doc;
-    }),
-    [SCRIPT_REF_MIGRATION_MARKER]: marker,
-  };
+  const migrated = applyRefMigration(project, plan, {
+    field: 'scriptRef',
+    markerKey: SCRIPT_REF_MIGRATION_MARKER,
+    marker: marker as unknown as Record<string, unknown>,
+  });
   return { outcome: 'migrated', project: migrated, assigned, caseMismatches };
 }
 
@@ -237,15 +241,11 @@ export function migrateProjectScriptRefs(
 export function rollbackScriptRefMigration(project: RvProject): RvProject {
   const marker = readScriptRefMigrationMarker(project);
   if (!marker) return project;
-  // Only the rows THIS migration bound. A `scriptRef` a human authored
-  // afterwards is not ours to remove.
-  const assignedRefs = new Set(marker.assignedIds);
-  const out: Record<string, unknown> = { ...(project as Record<string, unknown>) };
-  delete out[SCRIPT_REF_MIGRATION_MARKER];
-  out.documents = (project.documents ?? []).map(doc => {
-    if (!assignedRefs.has(String(doc.id ?? ''))) return doc;
-    const { scriptRef: _dropped, ...rest } = doc;
-    return rest as RvDocumentEntry;
+  return rollbackRefMigration(project, {
+    field: 'scriptRef',
+    markerKey: SCRIPT_REF_MIGRATION_MARKER,
+    // Only the rows THIS migration bound. A `scriptRef` a human authored
+    // afterwards is not ours to remove.
+    assignedIds: marker.assignedIds,
   });
-  return out as RvProject;
 }

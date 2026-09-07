@@ -609,6 +609,7 @@ specific authoring state.
 | `?mode=planner` | Boots a fresh empty scene and opens the Layout Planner in authoring mode. If an explicit `?scene=` or `?model=` is also given, that scene/model loads instead of the empty one and the Planner still opens on top. |
 | `?doc=<doc_…>` | Boots the project document with that id — the form the viewer MINTS for anything the project owns (plan-716 §2.5). `?scene=<id>` still resolves for old links via the permanent alias map, but nothing writes it for a document any more. |
 | `?scene=empty` | Boots a fresh empty scene (no base GLB). The Planner is wired but not auto-opened. |
+| `?doc=new` | Reserved value: same fresh empty scene as `?scene=empty`, meant for the editor entry `?doc=new&mode=editor` — the asset editor then creates a real document in the project in view and opens it directly, without the projects dashboard. Never collides with a stored document (those ids carry the `doc_` prefix). |
 | `?library=<url>` | Appends a catalog source on top of the standard library (§4). Repeatable: `?library=<a>&library=<b>`. Accepts catalog-JSON URLs and GitHub repo-scan URLs. |
 
 A shareable "start planning" link is simply:

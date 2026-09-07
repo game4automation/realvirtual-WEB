@@ -80,7 +80,7 @@ import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from '
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { DEFAULT_VENDOR_BLOCK, PROJECT_KINDS, isProjectKind } from './_rv-guards.mjs';
+import { PROJECT_KINDS, isProjectKind } from './_rv-guards.mjs';
 import {
   DOCUMENTS_MIGRATION_MARKER,
   LEGACY_DOCUMENT_KEYS,
@@ -256,16 +256,6 @@ export function migrateManifest(manifest, context = {}) {
           + `"${miss.documentPath}" — case differs, NOT bound. Fix one of the two by hand.`);
       }
     }
-  }
-  if (next.vendor === undefined) {
-    // The conservative default from _rv-guards.mjs. A human sharpens it per
-    // project afterwards; it deliberately contains neither scenes/ nor
-    // settings/ nor layouts/, so the first delivery after migration cannot
-    // touch customer data even if nobody reviews it.
-    set('vendor', {
-      managed: [...DEFAULT_VENDOR_BLOCK.managed],
-      handover: [...DEFAULT_VENDOR_BLOCK.handover],
-    }, 'conservative default added (sharpen per project)');
   }
   return { manifest: next, changes };
 }

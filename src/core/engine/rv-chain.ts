@@ -49,6 +49,7 @@ import {
 import { ChainPathTable } from './rv-chain-path';
 import type { ChainManager } from './rv-chain-manager';
 import type { RVDrive } from './rv-drive';
+import { asDrive } from './rv-drive-utils';
 import { applyShadowFlags } from './rv-mesh-classifier';
 // The marker lives in the marker module, not here: the asset exporter's prune
 // pass needs it and must not import a component module (see rv-traverse-utils.ts).
@@ -385,13 +386,6 @@ function asTemplateNode(value: unknown): Object3D | null {
   if (direct) return direct;
   const owner = (value as { node?: unknown } | null)?.node;
   return asNode(owner);
-}
-
-function asDrive(value: unknown): RVDrive | null {
-  const candidate = value as RVDrive | null;
-  return candidate && typeof (candidate as { currentPosition?: unknown }).currentPosition === 'number'
-    ? candidate
-    : null;
 }
 
 function extrasOf(node: Object3D, key: string): Record<string, unknown> | null {

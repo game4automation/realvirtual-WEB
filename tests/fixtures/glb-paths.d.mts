@@ -20,4 +20,8 @@ export const DEV_GLB: {
   readonly robotIK: string;
   readonly europalletEmpty: string;
   readonly csgMachining: string;
+  readonly ribbonSlitter: string;
+  readonly ribbonSlitterUnity: string;
+  readonly ribbonSlitterUnityAxisY: string;
+  readonly ribbonUnityState: string;
 };

@@ -81,9 +81,19 @@ const ROW_MAX_WIDTH = 760;
  * The list's groups, in render order — the shipped demo first (user decision
  * 2026-09-03), then the user's own work.
  *
- * Membership is exclusive by construction: `origin` separates recents, `hint`
- * separates the storage kinds within the rest, so no row can appear twice. A
- * section with no rows renders nothing, headers included.
+ * Membership is exclusive by construction: `hint` separates the storage kinds,
+ * so no row can appear twice. A section with no rows renders nothing, headers
+ * included — except `bundled`, which is always on screen (user decision
+ * 2026-09-07): it is the one project every deployment has, and a viewer whose
+ * list is otherwise empty must still see the way in.
+ *
+ * **There is no `recent` section** (user decision 2026-09-07). Recents used to
+ * be a group of their own, which split one folder-backed project list in two on
+ * a distinction the user never made — "in the picked workspace" versus "opened
+ * from somewhere else" is our bookkeeping, not theirs. They now sit among the
+ * local projects, ordered by when they were last opened, so recency shows up as
+ * position rather than as a heading. `origin` still separates them, but only to
+ * decide whether a row can be forgotten.
  */
 const SECTIONS: {
   key: string;
@@ -94,10 +104,11 @@ const SECTIONS: {
   {
     key: 'workspace',
     label: 'Local workspace',
-    member: row => row.origin === 'workspace' && row.hint !== 'bundled' && row.hint !== 'browser',
+    // Deliberately NOT filtered by `origin`: a recents entry from outside the
+    // picked workspace is still a project in a local folder, and belongs here.
+    member: row => row.hint !== 'bundled' && row.hint !== 'browser',
   },
   { key: 'browser', label: 'This browser', member: row => row.hint === 'browser' },
-  { key: 'recent', label: 'Recent', member: row => row.origin === 'recent' },
 ];
 
 export function ProjectsList({
@@ -220,7 +231,12 @@ export function ProjectsList({
               // The workspace section is the workspace's home in this screen:
               // with one open it renders even empty, because its header is
               // where the name lives and where switching happens.
-              if (members.length === 0 && !(isWorkspaceSection && hasWorkspace)) return null;
+              //
+              // Bundled renders unconditionally (user decision 2026-09-07): it
+              // anchors the top of the list, and on a deploy that serves the
+              // demo over HTTP it is the only project there is.
+              const alwaysVisible = section.key === 'bundled' || (isWorkspaceSection && hasWorkspace);
+              if (members.length === 0 && !alwaysVisible) return null;
               return (
                 <Box key={section.key}>
                   {/* A labeled hairline, not a heading: the label says where

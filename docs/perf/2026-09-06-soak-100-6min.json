@@ -1,0 +1,346 @@
+{
+  "fingerprint": {
+    "timestamp": "2026-09-06T17:06:42.940Z",
+    "host": "desktopmsi",
+    "os": "win32 10.0.26200",
+    "cpu": "Intel(R) Core(TM) i5-9600K CPU @ 3.70GHz",
+    "logicalCpus": 6,
+    "totalMemoryBytes": 34291945472,
+    "freeMemoryBytes": 348909568,
+    "node": "v24.19.0",
+    "chromium": "145.0.7632.6",
+    "gitCommit": "2abcc7483b0812676dcdb56b6b03de1021da5d65",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "hardwareConcurrency": 6,
+    "deviceMemoryGiB": 8,
+    "devicePixelRatio": 1,
+    "viewport": {
+      "width": 1600,
+      "height": 900
+    },
+    "longTaskObserver": true,
+    "preciseHeap": true,
+    "gpu": {
+      "vendor": "Google Inc. (NVIDIA)",
+      "renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB (0x00001C03) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+    },
+    "hours": 0.1,
+    "gcIntervalMin": 1,
+    "load": "none",
+    "cfg": {
+      "mu": 100,
+      "sensors": 4,
+      "lanes": 24,
+      "plcs": 2,
+      "segments": 9,
+      "seglen": 5,
+      "speed": 1000,
+      "templates": 1,
+      "seed": 465
+    },
+    "headless": false
+  },
+  "options": {
+    "hours": 0.1,
+    "gcIntervalMin": 1,
+    "load": "none",
+    "cfg": {
+      "mu": 100,
+      "sensors": 4,
+      "lanes": 24,
+      "plcs": 2,
+      "segments": 9,
+      "seglen": 5,
+      "speed": 1000,
+      "templates": 1,
+      "seed": 465
+    },
+    "headless": false
+  },
+  "verdict": {
+    "supported": false,
+    "checks": [
+      {
+        "name": "frame p95 <= 33.3 ms",
+        "ok": false,
+        "value": 451.75
+      },
+      {
+        "name": "frame p99 <= 66 ms",
+        "ok": false,
+        "value": 2990.1000000089407
+      },
+      {
+        "name": "lost sim time <= 0.1 %",
+        "ok": false,
+        "value": 0.46841225500330996
+      },
+      {
+        "name": "heap slope <= 5 MiB/h",
+        "ok": true,
+        "value": -132.48576992956154
+      }
+    ]
+  },
+  "heapSamples": [
+    {
+      "t": 36945,
+      "heapUsed": 94216432
+    },
+    {
+      "t": 106250,
+      "heapUsed": 95123472
+    },
+    {
+      "t": 169745,
+      "heapUsed": 95448880
+    },
+    {
+      "t": 232370,
+      "heapUsed": 86690376
+    },
+    {
+      "t": 294086,
+      "heapUsed": 85131460
+    },
+    {
+      "t": 355080,
+      "heapUsed": 84752844
+    }
+  ],
+  "final": {
+    "probe": {
+      "durationMs": 406748.299999997,
+      "frameMs": {
+        "p50": 37.75,
+        "p95": 451.75,
+        "p99": 2990.1000000089407,
+        "max": 2990.1000000089407,
+        "count": 4033
+      },
+      "stepMs": {
+        "p50": 3.25,
+        "p95": 10,
+        "p99": 24.25,
+        "max": 428.79999999701977,
+        "count": 13083
+      },
+      "transportMs": {
+        "p50": 3,
+        "p95": 9.25,
+        "p99": 22.75,
+        "max": 428.59999999403954,
+        "count": 13083
+      },
+      "jitterMs": {
+        "p50": 0,
+        "p95": 0,
+        "p99": 0,
+        "max": 0,
+        "count": 0
+      },
+      "flushMs": {
+        "p50": 0,
+        "p95": 0,
+        "p99": 0,
+        "max": 0,
+        "count": 0
+      },
+      "excluded": {
+        "frameMs": {
+          "p50": 52.75,
+          "p95": 926.8999999910593,
+          "p99": 926.8999999910593,
+          "max": 926.8999999910593,
+          "count": 52
+        },
+        "stepMs": {
+          "p50": 3.25,
+          "p95": 18.75,
+          "p99": 47.75,
+          "max": 59.29999999701977,
+          "count": 206
+        },
+        "transportMs": {
+          "p50": 3,
+          "p95": 16,
+          "p99": 44.5,
+          "max": 58.599999994039536,
+          "count": 206
+        }
+      },
+      "histograms": {
+        "frameMs": {
+          "binWidthMs": 0.25,
+          "overflow": 156,
+          "count": 4033,
+          "max": 2990.1000000089407
+        },
+        "stepMs": {
+          "binWidthMs": 0.25,
+          "overflow": 0,
+          "count": 13083,
+          "max": 428.79999999701977
+        },
+        "transportMs": {
+          "binWidthMs": 0.25,
+          "overflow": 0,
+          "count": 13083,
+          "max": 428.59999999403954
+        },
+        "jitterMs": {
+          "binWidthMs": 1,
+          "overflow": 0,
+          "count": 0,
+          "max": 0
+        },
+        "flushMs": {
+          "binWidthMs": 0.25,
+          "overflow": 0,
+          "count": 0,
+          "max": 0
+        }
+      },
+      "latency": {
+        "jitter": {
+          "p50": 0,
+          "p95": 0,
+          "p99": 0,
+          "max": 0,
+          "count": 0
+        },
+        "flush": {
+          "p50": 0,
+          "p95": 0,
+          "p99": 0,
+          "max": 0,
+          "count": 0
+        },
+        "samples": 0,
+        "coalescedGaps": 0,
+        "restarts": 0,
+        "minOffsetMs": 0
+      },
+      "lostSimSeconds": 185.79010000000284,
+      "clampedSeconds": 185.79010000000284,
+      "droppedBacklogSeconds": 0,
+      "pausedSeconds": 0,
+      "longTasks": 1339,
+      "longTaskMsMax": 2008,
+      "samples": 593,
+      "first": {
+        "t": 546.6999999880791,
+        "visible": true,
+        "gcForced": false,
+        "frames": 9,
+        "frameMsP50": 55.25,
+        "frameMsP95": 127.75,
+        "frameMsP99": 127.75,
+        "frameMsMax": 127.5,
+        "steps": 36,
+        "stepMsP95": 13.25,
+        "stepMsMax": 20.5,
+        "transportMsP95": 12.75,
+        "drawCalls": 522,
+        "triangles": 1751692,
+        "geometries": 120,
+        "textures": 113,
+        "liveMUs": 4,
+        "pools": 24,
+        "poolCapacity": 3072,
+        "spawned": 4,
+        "consumed": 0,
+        "maxLiveMUs": 120,
+        "signals": 55,
+        "listeners": 85,
+        "resolveCache": 0,
+        "forced": 0,
+        "clampedSeconds": 0.23449999999997997,
+        "droppedBacklogSeconds": 0,
+        "pausedSeconds": 0,
+        "longTasks": 3,
+        "longTaskMsMax": 117
+      },
+      "last": {
+        "t": 406748.299999997,
+        "visible": true,
+        "gcForced": false,
+        "frames": 10,
+        "frameMsP50": 49,
+        "frameMsP95": 637.2000000029802,
+        "frameMsP99": 637.2000000029802,
+        "frameMsMax": 637.2000000029802,
+        "steps": 36,
+        "stepMsP95": 15.75,
+        "stepMsMax": 16.5,
+        "transportMsP95": 14.5,
+        "drawCalls": 718,
+        "triangles": 2343629,
+        "geometries": 120,
+        "textures": 120,
+        "liveMUs": 125,
+        "pools": 24,
+        "poolCapacity": 3072,
+        "spawned": 583,
+        "consumed": 458,
+        "maxLiveMUs": 120,
+        "signals": 83,
+        "listeners": 101,
+        "resolveCache": 0,
+        "forced": 0,
+        "clampedSeconds": 185.66830000000292,
+        "droppedBacklogSeconds": 0,
+        "pausedSeconds": 0,
+        "longTasks": 6,
+        "longTaskMsMax": 81
+      },
+      "heapSlopeMiBPerHour": -132.5242903949273
+    },
+    "results": null,
+    "rendererInfo": {
+      "triangles": 2343629,
+      "drawCalls": 718,
+      "geometries": 120,
+      "textures": 120,
+      "programs": 113,
+      "materialsOriginal": 211,
+      "materialsUnique": 52,
+      "uberBakedMeshCount": 39,
+      "uberSharedGeometryReuses": 39,
+      "uberClonedGeometryCount": 0,
+      "uberDisposedSourceGeometries": 0,
+      "uberMergeOriginal": 15,
+      "uberMergeCreated": 1,
+      "kinGroupsMerged": 9,
+      "kinSourceMeshes": 48,
+      "kinChunksCreated": 13,
+      "texMergeOriginal": 44,
+      "texMergeCreated": 10,
+      "texMaterialGroups": 10,
+      "batchCount": 24,
+      "batchInstances": 107,
+      "batchUniqueGeometries": 80,
+      "batchArenaVertices": 1518450
+    },
+    "store": {
+      "signals": 83,
+      "paths": 314,
+      "types": 83,
+      "meta": 80,
+      "listenerKeys": 71,
+      "listeners": 101,
+      "resolveCache": 0,
+      "forced": 0,
+      "lastUpdateTs": 67,
+      "providers": 1,
+      "writerInventory": 67,
+      "writeConflicts": 0,
+      "version": 464
+    }
+  },
+  "runtimeSeconds": 396.638,
+  "pageErrors": [
+    "Failed to load resource: the server responded with a status of 409 (Conflict)",
+    "Fetch API cannot load rvproject:DemoRealvirtualWeb.settings.json. URL scheme \"rvproject\" is not supported."
+  ]
+}

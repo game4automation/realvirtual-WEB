@@ -438,6 +438,52 @@ const INTERNAL_FILE_NAMES: ReadonlySet<string> = new Set([
 const INTERNAL_FOLDERS: readonly string[] = ['thumbnails'];
 
 /**
+ * Wrap a backend so a written CONNECT configuration BODY announces itself
+ * (plan-462 B2).
+ *
+ * ## Why the wrapper, and why here
+ *
+ * A running gateway has to hear about two different things, and only one of
+ * them is a manifest change. `documents[].connectRef` moving is a manifest
+ * write and the project store's commit hook covers it. A `*.connect.json`
+ * BODY appearing or changing is not: it is a plain `writeDocument` that never
+ * touches `project.json`, so nothing the store commits can observe it. Before
+ * this, one call site said so by hand — and every other way of producing such
+ * a file (a cross-source copy, a duplicate, an import, a future one) stayed
+ * silent, and the file remained invisible to the gateway until some unrelated
+ * write happened to reveal it.
+ *
+ * Wrapping the write path states it once, for every producer: a config body
+ * that lands notifies, exactly once, independent of any manifest.
+ *
+ * A `Proxy` rather than a copied object, because backends are class instances
+ * with private state — every member other than `writeDocument` is read from,
+ * and bound to, the real instance.
+ *
+ * @param notify fire-and-forget; it must not throw and must not be awaited,
+ *   because it runs on the tail of a write a user is waiting on.
+ */
+export function withConnectConfigNotifier(
+  backend: ProjectBackend,
+  notify: () => void,
+): ProjectBackend {
+  const writeDocument: ProjectBackend['writeDocument'] = async (ref, bytes, opts) => {
+    const result = await backend.writeDocument(ref, bytes, opts);
+    // After the write, never before: a refused precondition or a failed write
+    // has produced nothing for the gateway to read.
+    if (isConnectConfigPath(docPathOf(ref))) notify();
+    return result;
+  };
+  return new Proxy(backend, {
+    get(target, property) {
+      if (property === 'writeDocument') return writeDocument;
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+/**
  * Is `relPath` viewer machinery rather than project content?
  *
  * The ONE internals rule (plan-445 §2.3), applied by the backend so that every

@@ -18,6 +18,19 @@
  * the reserved-system-folder and validity rules themselves.
  */
 
+/**
+ * The display stem of a project file: leaf name with a trailing `.glb` removed.
+ *
+ * The label a listing shows when the row carries none. One spelling for the two
+ * MCP listings that used to write it out by hand (plan-461 V10). Deliberately
+ * NOT the same function as `baseLabelOfUrl` in `rv-mcp-link-tools.ts`, which
+ * also strips a query and a fragment and answers `null` for an empty leaf —
+ * that one takes a URL, this one takes a project-relative path.
+ */
+export function glbStem(path: string): string {
+  return (path.split('/').pop() ?? path).replace(/\.glb$/i, '');
+}
+
 /** True when two project-relative paths name the same file. */
 export function samePath(a: string | null | undefined, b: string | null | undefined): boolean {
   if (!a || !b) return false;

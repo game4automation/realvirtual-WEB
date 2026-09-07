@@ -390,6 +390,27 @@ Drive behavior: speed-controlled motion via PLC target-speed signal with feedbac
 { "Drive_Speed": { "TargetSpeed": 500 } }
 ```
 
+#### 7a.52 Drive_SEWMovilink
+
+Drive behavior: SEW-EURODRIVE MOVILINK unit profile. The PLC writes control word 1 and a speed setpoint, the drive returns status word 1 and the actual speed. Note the inverted low-byte bits — bit 0 is the controller inhibit and bits 1/2 are active low, so the enable byte is `0x06`, not `0x07`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `ControlWord1` | ComponentReference | - | MOVILINK control word 1 (PO1). Bit 0 is the inverted controller inhibit, bits 1 and 2 are active low, bit 6 is the fault reset. |
+| `SpeedSetpoint` | ComponentReference | - | MOVILINK speed setpoint (PO2), encoded as selected by Encoding. |
+| `StatusWord1` | ComponentReference | - | MOVILINK status word 1 (PI1) written back to the PLC every tick. |
+| `SpeedActual` | ComponentReference | - | MOVILINK actual speed (PI2) written back to the PLC every tick. |
+| `MaxSpeed` | number | 100 | Drive speed in millimeters per second (or degrees per second) at 100 percent of the maximum speed. |
+| `Encoding` | enum(PercentNmax, Rpm) | "PercentNmax" | Speed setpoint encoding: SPEED[%] with 0x4000 = 100 percent, or SPEED with 0.2 rpm per bit. |
+| `MaxSpeedRpm` | number | 3000 | Maximum speed in rpm, used to convert the 0.2 rpm per bit encoding to a fraction. |
+| `Acceleration` | number | 1000 | Drive acceleration in millimeters per second squared (or degrees per second squared). |
+| `SimulateFault` | boolean | false | If true the drive reports a fault in status word bit 5 until the PLC acknowledges with control word bit 6. |
+| `FaultCode` | number | 6 | Fault code reported in the status word high byte while a fault is active. |
+
+```json
+{ "Drive_SEWMovilink": { "MaxSpeed": 500, "Encoding": "Rpm", "MaxSpeedRpm": 3000 } }
+```
+
 #### 7a.5 Drive_Gear
 
 Drive behavior: slaves this node's Drive to a master Drive with gear ratio and offset.
@@ -1423,6 +1444,224 @@ these fields and poses every clone, mirroring Unity's batch update
 
 ```json
 { "ChainElement": { "AlignWithChain": true, "OffsetToDrivePosition": 0 } }
+```
+
+#### 7a.53 RibbonRoller
+
+A roller an endless web runs over — paper, film, foil, textile, sheet coil. It is
+purely geometric: a contact radius, a rotation axis and the side the web lies on.
+The reader turns it at `omega = v / r`, so a small idler visibly spins faster than
+a large one, which is the cheapest and most convincing motion cue a converting
+machine has.
+
+Every roller of one `RibbonPath` must have a **parallel axis** (2 deg tolerance).
+That is what makes the path a planar two-circle tangent problem rather than a
+3D spline fit, and it is the reason turn bars and angled web guides are out of
+scope for this component. `RadiusMm = 0` measures the radius from the mesh bounds
+in the plane perpendicular to `Axis`, in the node's OWN local frame, so a scaled
+parent cannot distort it.
+
+`RibbonSide` is the wrap orientation seen along `+Axis`: `Left` wraps
+counter-clockwise, `Right` clockwise. Two neighbouring rollers with the SAME side
+are joined by an outer tangent, two with DIFFERENT sides by a crossed one — which
+is precisely how an S-wrap is authored.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `RadiusMm` | number | 0 | Contact radius in millimeters; 0 measures it from the mesh bounds perpendicular to `Axis` in the node's own local frame. |
+| `Axis` | enum(X, Y, Z) | "X" | Local rotation axis of the roller and the common axis of the web path. |
+| `RibbonSide` | enum(Auto, Left, Right) | "Auto" | Which side of the roller the web runs on. Leave it on `Auto`: for every normal machine `Auto` picks the short wrap, the only one a real web can take (on an end roller it means `Left`). Set `Left` or `Right` by hand only for an S-wrap or a wrap of more than 180 degrees. `Left` and `Right` are the turning sense seen along `+Axis` — `Left` counter-clockwise, `Right` clockwise. |
+| `RotationDirection` | number | 1 | Which way the roller is drawn turning: `1` or `-1`. Set `-1` when the roller visibly turns against the web (the imported CAD axis points the other way). Picture only — it never enters the web speed. |
+| `SpinMode` | enum(Transform, Texture) | "Transform" | How the roller shows that it is turning. `Transform` turns the roller object. `Texture` leaves it standing still and scrolls the pattern on its barrel instead — the same at a glance, and free of per-frame work, which is worth having on a machine with many idlers. Only effective on a roller WITHOUT a drive. |
+| `MantleMesh` | ComponentReference | - | Which part scrolls in `SpinMode: Texture` — normally the barrel. Leave it empty: the roller's own mesh is used, or the largest textured part under it outside a `Faces` node, so the end discs stay still. Wire `componentType` `UnityEngine.Transform` (the schema convention for a node reference). |
+
+**Driven or follower.** A roller is **driven** when a ROTATIONAL `Drive` sits on
+the SAME node with an axis parallel or antiparallel to `Axis`. Its surface speed
+`v = omega * pi / 180 * r * dot(driveAxis, rollerAxis)` — with `omega` taken from
+the drive POSITION difference of the tick, so it is signed for jog, `DriveTo`,
+playback and `positionOverwrite` alike — is the web speed of its section. Every
+other roller is a **follower** the path turns at `v / r`. A linear drive, or one
+whose axis is not parallel to the roller axis, warns once and leaves the roller a
+follower. `RotationDirection` is presentation only and never enters the web speed.
+
+```json
+{ "RibbonRoller": { "RadiusMm": 60, "Axis": "X", "RibbonSide": "Left", "SpinMode": "Transform" } }
+```
+
+#### 7a.54 RibbonWinder
+
+An unwinder or rewinder at one END of a `RibbonPath`. It is a `RibbonRoller` whose
+radius follows the wound length,
+
+```
+R(L) = sqrt(CoreRadiusMm^2 + L * RibbonThicknessMm / pi)
+```
+
+the standard integration-technology roll build-up written in radii. The length is
+integrated and the radius derived from it (never the other way round), so a
+rewinder run backwards returns exactly to its authored radius instead of drifting.
+
+A `RibbonWinder` must be the **first or the last** entry of the path's `Rollers` list;
+in the middle the path is inert with a warning. The growing roll is shown by
+scaling the roll node radially in the two axes perpendicular to `Axis` — a CAD roll
+needs no remodelling and no geometry is rebuilt per tick. The authored scale of
+that node is remembered and restored on export, so a non-unit CAD scale survives a
+round trip.
+
+The roll node is **the winder node itself** whenever it carries geometry: the roll
+IS the mesh, and its core is a `_Core` SIBLING, never a child — a child would scale
+with the roll and the core would visibly grow. `RollMesh` exists for the two cases
+that structure does not cover: an empty parent node with mesh children (the
+plan-459 shape) and a separately modelled CAD roll. A winder with no geometry at
+all gets a procedural cylinder, so it is never invisible.
+
+`CoreRadiusMm` and `RibbonThicknessMm` must both be `> 0`; otherwise the winder is
+inert with a warning and nothing in the scene ever sees a NaN. An empty roll
+(`Empty`) or one that reached `MaxDiameterMm` (`Full`) clamps the web speed of its
+whole path group to zero in the SAME tick — a slitter's strips all stop together.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `RadiusMm` | number | 0 | Measured outer radius of the authored roll in millimeters; 0 measures it from the mesh bounds. |
+| `Axis` | enum(X, Y, Z) | "X" | Local winding axis; must be parallel to every other roller axis of the path. |
+| `RibbonSide` | enum(Auto, Left, Right) | "Left" | Side the web leaves or enters the roll on, as the wrap orientation seen along `+Axis`. |
+| `RotationDirection` | number | 1 | Sign correction for the visible roll rotation; `-1` flips it. |
+| `CoreRadiusMm` | number | 76.2 | Radius of the bare core in millimeters; must be `> 0`. The default is the 3 inch core of the converting industry. |
+| `RibbonThicknessMm` | number | 0.1 | Thickness of one wound layer in millimeters (the caliper). With the core radius it decides how fast the roll grows and shrinks. Must be the SAME value as `RibbonPath.RibbonThicknessMm` — it is the same material — and `> 0`. |
+| `InitialWoundLengthMm` | number | -1 | How much material is on the roll at load and after a reset. `-1` = a full roll exactly as modelled (derived from the modelled outer radius), `0` = an empty core, any other value = that many millimeters on the roll. |
+| `MaxDiameterMm` | number | 0 | Diameter in millimeters at which the roll counts as full and the group stops; 0 = no limit. |
+| `RollMesh` | ComponentReference | - | Which part grows and shrinks with the roll. Leave it empty: the winder object IS the roll and is scaled directly. Model the core as a SIBLING, never a child. Set it only for a separately modelled roll or a winder object without geometry of its own (which then gets a plain cylinder). Wire `componentType` `UnityEngine.Transform` (the schema convention for a node reference). |
+| `DiameterMm` | ComponentReference | - | Signal carrying the current roll diameter in millimeters; written only on a change of more than 0.1 mm. |
+| `WoundLengthMm` | ComponentReference | - | Signal carrying the currently wound web length in millimeters. |
+| `Empty` | ComponentReference | - | Signal is true while the roll is down to its bare core; an empty winder stops its whole path group. |
+| `Full` | ComponentReference | - | Signal is true once `MaxDiameterMm` is reached; a full winder stops its whole path group. |
+
+```json
+{ "RibbonWinder": { "CoreRadiusMm": 76.2, "RibbonThicknessMm": 0.1, "InitialWoundLengthMm": -1, "MaxDiameterMm": 800, "RollMesh": { "type": "ComponentReference", "path": "Slitter/Unwinder/Roll", "componentType": "UnityEngine.Transform" } } }
+```
+
+#### 7a.55 RibbonPath
+
+One taut web running over an ordered, **OPEN** chain of rollers — from the first
+entry of `Rollers` to the last, both usually winders. Nothing about the path
+geometry is exported: the reader computes the tangents and wrap arcs from the
+roller poses and radii itself, and rebuilds them only when a winder radius or a
+roller transform actually changed. Plain motion costs a texture offset and one
+rotation per roller.
+
+The web is **taut**: there is no sag and no tension control, so the path is
+exactly the tangents plus the wrap arcs. Lengths, radii and thicknesses are
+**millimeters**, speeds **millimeters per second**; the only conversion to glTF
+metres happens where the band mesh is written.
+
+A slitter is modelled as N `RibbonPath`s that share one unwinder (and the rollers up to the cutter, which is their `SlitAtRoller`). Paths sharing a
+roller form ONE group, so an empty or full roll anywhere in the group stops every
+strip in the same tick, and each winder's length is integrated exactly once.
+
+**Where the cut is.** The slit sits at the **arrival** tangent point of
+`SlitAtRoller` — where the web first touches the cutting roller, which is where
+the blade sits. It is deliberately not the departure point: two strips cut at one
+roller LEAVE it at different angles, because their next rollers differ, so a cut
+at the departure point made the strip that draws the shared full-width web cover
+an arc its sibling was already drawing in its own lane, and the two z-fought on
+the roller. Cutting on arrival gives every strip the same slit sample, and each
+of them draws only itself from there on.
+
+That only holds because the band's samples sit on an **absolute** arc-length
+grid: sample `i` at `i * 1000 / SamplesPerMeter` mm, with the last sample on the
+path end and therefore a shorter final interval. A grid derived from the total
+length instead would put the same physical point at different arc positions for
+two strips that end at different rewinders, and the cut would drift by up to one
+sample between them. Strips slit at one roller must share `SamplesPerMeter`.
+
+Up to the cut the strips are ONE web, so their wrap **side** at every shared
+roller must agree. With `RibbonSide: Auto` the side is resolved per PATH, and two
+strips that leave the cutter in different directions can resolve a shared roller
+differently — which would put the shared part on two different tangent lines. The
+reader reports that once per document and keeps drawing; the fix is to move the
+offending roller or to pin `RibbonSide` on the shared rollers.
+
+**Sections.** Each `RibbonDancer` in `Rollers` splits the path into sections at its
+own departure tangent point. A section runs at the surface speed of its **last**
+driven roller in running direction (the pulling one); several driven rollers in one
+section that differ by more than 1 % warn once, because slip is not simulated. A
+section without a driven roller takes the next driven section in running direction,
+and a trailing one the previous; a path with no driven roller at all stands still
+with a warning. Each section scrolls its own band material, so the two sides of a
+dancer visibly run at different speeds.
+
+An unresolvable roller, a winder in the middle of the list, a roller axis
+deviating by more than 2 deg, or two rollers whose circles admit no tangent all
+make the path inert with a named warning; the rollers then simply stand still.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Rollers` | ComponentReference[] | - | Rollers in running order; first and last entry are the ends of the open path and are usually winders. |
+| `ConnectedDrive` | ComponentReference | - | **Deprecated and ignored** since plan-460; kept so a plan-459 document still validates (`deprecated: true`, so the inspector hides the row while it is empty). The web is moved by rotational drives on the rollers instead. Loading a document that still sets it logs one warning. |
+| `SpeedSource` | enum(Drive, RibbonWinder) | "Drive" | **Deprecated and ignored** since plan-460 (`deprecated: true`); see `ConnectedDrive`. The speed source is always the driven rollers of the path. |
+| `RibbonWidthMm` | number | 500 | Width of the web in millimeters, extruded along the common roller axis. |
+| `RibbonThicknessMm` | number | 0.1 | Thickness of the material in millimeters; half of it lifts the web off the roller surface so the two do not intersect. Must be the SAME value as `RibbonWinder.RibbonThicknessMm` on the winders of this path. |
+| `TextureLengthMm` | number | 1000 | How much web one repetition of the surface pattern covers, in millimeters. It is what makes a running web look like it is running; a larger value gives a coarser pattern that appears to move more slowly. |
+| `SamplesPerMeter` | number | 64 | How finely the web strip is subdivided, in points per meter of path. Raise it when a tight wrap looks angular, lower it on a very long run. Samples sit on an ABSOLUTE grid of one point every `1000 / SamplesPerMeter` mm, so strips slit at one roller must share the value to be cut at the same place. A path that outgrows its sample buffer has its density reduced automatically (with a console message); it is then on a coarser grid than its siblings and its cut moves by a fraction of a sample, which the reader reports naming both webs. |
+| `Material` | ComponentReference | - | Optional. A NODE whose material the web copies — a printed pattern, a coloured film. It points at an object in the scene, not at a material asset; the web takes the first textured material found on it, copies ALL of its maps (colour, normal, roughness, …) and owns the copies, so scaling and scrolling the web never touches the donor part. Empty = a plain paper-white surface with a pattern. Wire `componentType` `UnityEngine.Transform`. |
+| `SlitAtRoller` | ComponentReference | - | Optional inner roller (the cutter) at which the full web is slit into this strip. The cut sits where the web MEETS that roller (its **arrival** tangent point), which is where the blade is: full web (`FullWidthMm`, centred on the first roller) before it, this strip (`RibbonWidthMm`) in its own lane at the last roller's axial offset from it on. Every strip cut at the same roller therefore reports the same slit point. Only the first strip (by node path) of those slit at one roller draws the shared part. |
+| `FullWidthMm` | number | 0 | Width of the full web before `SlitAtRoller`; 0 = not a slit strip. |
+
+```json
+{ "RibbonPath": { "Rollers": [ { "type": "ComponentReference", "path": "Slitter/Unwinder", "componentType": "UnityEngine.Transform" }, { "type": "ComponentReference", "path": "Slitter/Idler_01", "componentType": "UnityEngine.Transform" }, { "type": "ComponentReference", "path": "Slitter/Rewinder_A", "componentType": "UnityEngine.Transform" } ], "RibbonWidthMm": 500, "TextureLengthMm": 1000 } }
+```
+
+#### 7a.56 RibbonDancer
+
+A dancer roller: a `RibbonRoller` that also **travels** along an axis and thereby
+stores web. It is the component that lets two drives of one machine run at slightly
+different surface speeds without the web going slack or tearing — the store takes
+up the difference, and the PLC regulates on the carriage position.
+
+The dancer splits its `RibbonPath` into an upstream and a downstream section at its
+own departure tangent point, and integrates the difference of the two section
+speeds:
+
+```
+L = L + (v_up - v_down) * dt          position = HomeMm + L / Strands
+```
+
+It is an **integrator with anti-windup**, not a spring: when the carriage is
+clamped at a stop, `L` is recomputed from the clamped position, so a reversal takes
+effect immediately instead of first running out a length the machine never had.
+
+The limits are **directional and never stop a drive**. At `TravelMaxMm` only further
+filling is prevented (`v_up` is held at `v_down`); at `TravelMinMm` only further
+emptying (`v_down` is held at `v_up`). The web keeps running at the slower side and
+the opposite delta always frees the carriage again — a symmetric stop would deadlock
+at zero. Winder `Empty` / `Full`, by contrast, still stop every section of the group.
+
+Exactly **one** dancer per path is supported; a second is ignored with a warning, and
+so is a dancer at the first or last position of `Rollers` (it would have no section on
+one side). A dancer shared by several strips is only legal when both of its
+neighbouring sections resolve to the same driven roller for every strip — in practice,
+when it sits before the slit; otherwise it is held at `HomeMm` for the whole group with
+one warning.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `RadiusMm` | number | 0 | Contact radius in millimeters; 0 measures it from the mesh bounds perpendicular to `Axis`. |
+| `Axis` | enum(X, Y, Z) | "X" | Local rotation axis; must be parallel to every other roller axis of the path. |
+| `RibbonSide` | enum(Auto, Left, Right) | "Auto" | Which side of the dancer roller the web runs on. Leave it on `Auto`: the carriage moves, and `Auto` follows it by always picking the short wrap. `Left` / `Right` (the turning sense along `+Axis`) only for an S-wrap or a wrap over 180 degrees. |
+| `RotationDirection` | number | 1 | Which way the dancer roller is drawn turning: `1` or `-1`. Set `-1` when it visibly turns against the web. Picture only. |
+| `SpinMode` | enum(Transform, Texture) | "Transform" | How the dancer roller shows its rotation; see `RibbonRoller.SpinMode`. |
+| `MantleMesh` | ComponentReference | - | Mesh scrolled in `SpinMode: Texture`; see `RibbonRoller.MantleMesh`. |
+| `TravelAxis` | enum(X, Y, Z) | "Y" | The direction the carriage runs in, in the frame of the object the dancer hangs under — the same axis letters as `RibbonRoller.Axis`. Place the dancer so that moving along the POSITIVE axis lengthens the web path. |
+| `TravelMinMm` | number | -200 | Lower stop in millimeters relative to `HomeMm`; must be `<= 0`. Reaching it sets `AtMin`. |
+| `TravelMaxMm` | number | 200 | Upper stop in millimeters relative to `HomeMm`; must be `>= 0`. Reaching it sets `AtMax`. |
+| `HomeMm` | number | 0 | Rest position in millimeters along `TravelAxis`, relative to the authored node position; 0 starts and resets exactly where it was modelled. |
+| `Strands` | number | 2 | How many runs of web pass through the carriage. `1` = a single pass over the roller, `2` (default) = the usual loop down to the carriage and back up. 1 mm of travel then stores `Strands` mm of web; must be at least 1. |
+| `PositionMm` | ComponentReference | - | Signal carrying the carriage position in millimeters; written only on a change of more than 0.1 mm. This is the variable a tension controller regulates. |
+| `AtMin` | ComponentReference | - | Signal is true while the carriage sits at `TravelMinMm` (the store is empty). |
+| `AtMax` | ComponentReference | - | Signal is true while the carriage sits at `TravelMaxMm` (the store is full). |
+
+```json
+{ "RibbonDancer": { "Axis": "Z", "TravelAxis": "Y", "TravelMinMm": -150, "TravelMaxMm": 150, "Strands": 2, "PositionMm": { "type": "ComponentReference", "path": "Slitter/Signals/DancerPos", "componentType": "realvirtual.PLCInputFloat" } } }
 ```
 
 ### 7b. Logic Steps

@@ -23,7 +23,8 @@
  * only announces which card is in flight (see `ProjectTree.externalDragPath`).
  */
 
-import { useCallback, useState } from 'react';
+import { Fragment, useCallback, useState } from 'react';
+import { useLongPress } from '../../../hooks/use-long-press';
 import { Box, Menu, MenuItem, Slider, Tooltip, Typography } from '@mui/material';
 import {
   Folder, FolderOutlined, GridViewOutlined, ViewModuleOutlined,
@@ -81,18 +82,34 @@ export interface FolderTileModel {
  * the preview square's aspect — so the folder's label sits on exactly the
  * baseline of the card labels beside it, at every card size.
  */
-function FolderTile({ tile }: { tile: FolderTileModel }) {
+function FolderTile({ tile, touchInput = false }: {
+  tile: FolderTileModel;
+  touchInput?: boolean;
+}) {
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
   const hasMenu = (tile.menuActions?.length ?? 0) > 0;
   const iconSx = { width: '68%', height: '68%', color: 'rgba(255,255,255,0.5)' };
+  const longPress = useLongPress({
+    enabled: touchInput && hasMenu,
+    onLongPress: (x, y) => setCtxPos({ x, y }),
+  });
   return (
     <>
       <Box
-        onClick={tile.onOpen}
+        // The trailing click of a long-press must not navigate: the user asked
+        // for the menu, not for the folder behind it.
+        onClick={() => { if (!longPress.consumedLastGesture()) tile.onOpen(); }}
         onDoubleClick={tile.onOpen}
         onContextMenu={hasMenu
           ? (e) => { e.preventDefault(); e.stopPropagation(); setCtxPos({ x: e.clientX, y: e.clientY }); }
           : undefined}
+        {...(touchInput && hasMenu ? {
+          onPointerDown: longPress.onPointerDown,
+          onPointerMove: longPress.onPointerMove,
+          onPointerUp: longPress.onPointerUp,
+          onPointerLeave: longPress.onPointerLeave,
+          onPointerCancel: longPress.onPointerCancel,
+        } : {})}
         sx={{
           display: 'flex',
           flexDirection: 'column',
@@ -103,7 +120,11 @@ function FolderTile({ tile }: { tile: FolderTileModel }) {
           border: '1px solid transparent',
           cursor: 'pointer',
           userSelect: 'none',
-          '&:hover': { bgcolor: 'rgba(255,255,255,0.06)' },
+          // A hover wash on a device that cannot hover sticks after the tap and
+          // reads as a selection. Touch gets a press flash instead.
+          ...(touchInput
+            ? { '&:active': { bgcolor: 'rgba(255,255,255,0.10)' } }
+            : { '&:hover': { bgcolor: 'rgba(255,255,255,0.06)' } }),
         }}
       >
         <Box
@@ -186,6 +207,23 @@ export interface ProjectFolderContentsProps {
    * user is already looking.
    */
   emptyAction?: React.ReactNode;
+  /**
+   * Extra tile sections under the folder's own contents, each with a heading
+   * spanning the grid (plan-458 F3).
+   *
+   * The compact layout hangs the project's attached libraries here, because the
+   * tree column that used to be their entrance is not rendered on a phone. A
+   * named section rather than more tiles in the same run: a library is not a
+   * subfolder, and an unheaded row of them would claim it is.
+   */
+  tileGroups?: readonly { key: string; label: string; tiles: readonly FolderTileModel[] }[];
+  /**
+   * Narrow, single-column layout: a card carries no drag, because the tree that
+   * is the only drop target is not rendered there.
+   */
+  compactLayout?: boolean;
+  /** Coarse pointer: long-press stands in for right-click, no hover states. */
+  touchInput?: boolean;
 }
 
 export function ProjectFolderContents({
@@ -194,6 +232,9 @@ export function ProjectFolderContents({
   emptyMessage = 'This folder is empty.',
   onBackgroundContextMenu,
   emptyAction,
+  tileGroups = [],
+  compactLayout = false,
+  touchInput = false,
 }: ProjectFolderContentsProps) {
   const [cardSize, setCardSize] = useState(readCardSize);
 
@@ -203,6 +244,26 @@ export function ProjectFolderContents({
     if (e.target !== e.currentTarget) return;
     onBackgroundContextMenu(e);
   }, [onBackgroundContextMenu]);
+
+  /**
+   * The same menu by finger. Its own hook instance, and the same
+   * `target === currentTarget` guard the right-click path has: pointer events
+   * from a card bubble to the grid, so without it one press would arm two
+   * timers and open two menus.
+   */
+  const backgroundPress = useLongPress({
+    enabled: touchInput && Boolean(onBackgroundContextMenu),
+    onLongPress: (x, y) => onBackgroundContextMenu?.({
+      clientX: x, clientY: y, preventDefault() {}, stopPropagation() {},
+    } as React.MouseEvent),
+  });
+  const backgroundPointerDown = useCallback((e: React.PointerEvent) => {
+    if (e.target !== e.currentTarget) return;
+    backgroundPress.onPointerDown(e);
+  }, [backgroundPress]);
+
+  const hasSomething = cards.length > 0 || folders.length > 0
+    || tileGroups.some(group => group.tiles.length > 0);
 
   // Written on every drag step. The value is one small number and the grid
   // reflows anyway, so a debounce would only add a way for the last change to
@@ -214,7 +275,7 @@ export function ProjectFolderContents({
 
   return (
     <Box sx={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-      {cards.length === 0 && folders.length === 0 ? (
+      {!hasSomething ? (
         <Box
           data-folder-contents
           onContextMenu={onBackgroundContextMenu}
@@ -240,8 +301,18 @@ export function ProjectFolderContents({
         <Box
           data-folder-contents
           role="list"
-          aria-label="Folder contents"
+          aria-label="Documents"
+          // Focusable programmatically only: where the detail sheet hands focus
+          // back when the card it described has gone.
+          tabIndex={-1}
           onContextMenu={backgroundMenu}
+          {...(touchInput && onBackgroundContextMenu ? {
+            onPointerDown: backgroundPointerDown,
+            onPointerMove: backgroundPress.onPointerMove,
+            onPointerUp: backgroundPress.onPointerUp,
+            onPointerLeave: backgroundPress.onPointerLeave,
+            onPointerCancel: backgroundPress.onPointerCancel,
+          } : {})}
           sx={{
             flex: 1,
             minWidth: 0,
@@ -255,22 +326,61 @@ export function ProjectFolderContents({
           }}
         >
           {folders.map(tile => (
-            <Box key={tile.key} role="listitem" data-card-path={tile.key} sx={{ minWidth: 0 }}>
-              <FolderTile tile={tile} />
+            <Box
+              key={tile.key}
+              role="listitem"
+              aria-label={tile.name}
+              data-card-path={tile.key}
+              sx={{ minWidth: 0 }}
+            >
+              <FolderTile tile={tile} touchInput={touchInput} />
             </Box>
           ))}
           {cards.map(card => (
             <Box
               key={card.key}
               role="listitem"
+              aria-label={card.entry.name}
               data-card-path={card.key}
-              draggable={card.draggable || undefined}
-              onDragStart={card.onDragStart}
-              onDragEnd={card.onDragEnd}
+              data-card-selected={card.selected ? 'true' : undefined}
+              tabIndex={-1}
+              draggable={(!compactLayout && card.draggable) || undefined}
+              onDragStart={compactLayout ? undefined : card.onDragStart}
+              onDragEnd={compactLayout ? undefined : card.onDragEnd}
               sx={{ minWidth: 0 }}
             >
-              <ProjectCard card={card} />
+              <ProjectCard card={card} touchInput={touchInput} />
             </Box>
+          ))}
+          {tileGroups.filter(group => group.tiles.length > 0).map(group => (
+            <Fragment key={group.key}>
+              <Typography
+                // Spans the whole grid, so the heading reads as the boundary
+                // between two runs of tiles and not as a tile of its own.
+                sx={{
+                  gridColumn: '1 / -1',
+                  mt: 0.5,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.06em',
+                  color: 'rgba(255,255,255,0.55)',
+                }}
+              >
+                {group.label}
+              </Typography>
+              {group.tiles.map(tile => (
+                <Box
+                  key={tile.key}
+                  role="listitem"
+                  aria-label={tile.name}
+                  data-card-path={tile.key}
+                  sx={{ minWidth: 0 }}
+                >
+                  <FolderTile tile={tile} touchInput={touchInput} />
+                </Box>
+              ))}
+            </Fragment>
           ))}
         </Box>
       )}

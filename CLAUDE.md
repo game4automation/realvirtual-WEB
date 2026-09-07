@@ -119,10 +119,14 @@ until a manifest declares it — add a `documents[]` row to
 Since plan-737 the demo is **one folder artefact** (`public/demo-realvirtual/`),
 delivered byte-identically to every channel: in place on the hosted demo and in
 the Git mirror, and as a normal writable project (`projects/demo-realvirtual/`)
-in a customer workspace, where every delivery **replaces it in full**. The
-component library is *not* part of it — `public/library/` is app-level, shared
-by every project, and the demo merely subscribes to it through its
-`libraries[]`.
+in a customer workspace. There it **arrives once**, with the customer's first
+delivery, and is **never overwritten** afterwards — since plan-738 it obeys the
+same territorial rule as every other folder under `projects/`, with no demo
+exception; only an explicit, preview-confirmed `--projects demo-realvirtual`
+run replaces it. The delete-then-copy in `copyDemoRealvirtualFolder()` rebuilds
+the STAGING folder, not the customer's. The component library is *not* part of
+it — `public/library/` is app-level, shared by every project, and the demo
+merely subscribes to it through its `libraries[]`.
 
 The rule is now the same everywhere and has no exceptions: **a document exists
 because a `project.json` says so.** Every channel publishes one — the hosted demo,

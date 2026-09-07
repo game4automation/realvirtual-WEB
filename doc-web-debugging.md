@@ -402,6 +402,115 @@ test('my test', async ({ page }) => {
 
 ---
 
+## 4b. Large-Scale Performance Harness (plan-465)
+
+Three DEV-only globals turn the running viewer into a measurable rig. They exist
+because the viewer's own metrics cannot answer scale questions: `currentFps` /
+`currentFrameTime` average over 500 ms **and** read a frame delta the simulation
+loop has already clamped to 0.1 s, so a 400 ms hitch is invisible in them.
+
+| Global | Purpose |
+|---|---|
+| `window.__rvSyntheticLine` | build / dispose a parameterised transport line without a GLB |
+| `window.__rvPerfProbe` | per-frame (unclamped) and per-step timing, histograms, lost sim time, latency clock |
+| `window.__rvSyntheticLoad` | in-browser PLC signal load through the real buffer/flush path |
+
+```js
+// Plan first — this NEVER builds, it just tells you whether the config is sane.
+__rvSyntheticLine.plan({ targetMUs: 2400, lanes: 24, segments: 9 })
+// → { capacityMUs, spawnCapMUs, fillTimeS, sourceIntervalS, valid, reason, ... }
+
+__rvSyntheticLine.build({ targetMUs: 2400, sensorsPerSegment: 4, signalBinding: 'browser' })
+__rvPerfProbe.start()
+// … let it run …
+__rvPerfProbe.report()      // frameMs/stepMs/transportMs p50/p95/p99 from whole-run histograms
+__rvPerfProbe.stop()
+__rvSyntheticLine.dispose() // gives back components, MUs, pools, drives, signals, geometry
+```
+
+`build()` **throws** on an invalid configuration (target above 80 % of geometric
+capacity, of the spawn ceiling, or below the spawn gate) rather than running a
+line that can never fill — a half-empty line still produces confident numbers.
+
+### URL-driven runs
+
+`?perf&scenario=line` makes `PerfTestPlugin` do all of the above and publish to
+`window.__PERF_RESULTS__`:
+
+```
+/?perf&scenario=line&mode=smoke&mu=2400&duration=30&sensors=1&speed=5000
+/?perf&scenario=line&mode=supported&mu=2400&sensors=4&load=connect&duration=300
+```
+
+Parameters: `mode` (`supported` grades against the §1.3 criteria, `smoke` only
+checks that it ran), `mu`, `sensors`, `lanes`, `plcs`, `segments`, `seglen`,
+`speed`, `templates`, `mulen`, `mugap`, `seed`, `originx`/`originz`, `load`
+(`none|browser|connect`), `duration`. `scenario=model` (the default) is the
+original FPS+benchmark run, unchanged.
+
+Three **environment** parameters decide what the run is measured in (all recorded
+in the report's `env` block):
+
+| Parameter | Default for `scenario=line` | Effect |
+|---|---|---|
+| `keepmodel=on\|off` | `off` | keep the loaded demo GLB standing next to the line. Off = its scene root is removed and its drives/surfaces/sensors/sources/sinks/MUs are dropped from the tick lists, so `draws`, the shadow pass and the transport cost belong to the LINE. Not `model=` — that is the viewer's model selector. |
+| `shadows=on\|off` | `on` (production) | prices the shadow pass as its own axis. The product's "shadows dirty on every MU-count change" rule is unchanged. |
+| `effects=on\|off` | `on` (production) | the MU spawn/vanish clip effects, which clone every material of the MU per spawn. Instanced MUs never get them; the axis bites on the clone path. |
+
+Under `?perf` the `DebugEndpointPlugin` and the MCP bridge are **not installed**:
+the debug endpoint serialises the whole drive/sensor/surface/signal inventory once
+a second and POSTs it, which on a 216-sensor line was ~14 % of CPU. The Node
+runners additionally set `rv-welcome-dismissed` so the first-visit modal does not
+cover the canvas.
+
+The line is parked at `(1000, 0, 1000)` when a model is kept: the transport
+manager picks an MU's driving surface from every overlapping surface, so a
+synthetic line built on top of a loaded model would hand its parts to that
+model's belts. With `keepmodel=off` the origin defaults to `(0, 0, 0)` instead —
+1.4 km away it fell outside the camera frustum and nothing was actually rendered.
+The camera is framed on the line **after** the warmup, because an MU pool's
+`InstancedMesh` does not exist until its source has spawned the first part.
+
+### Lost simulation time
+
+`viewer.loop` now counts what the accumulator threw away, in **both** tick paths:
+
+```js
+viewer.loop.clampedSeconds          // real time dropped by the 0.1 s frame clamp
+viewer.loop.droppedBacklogSeconds   // backlog dropped at the maxSubSteps ceiling
+viewer.loop.pausedSeconds           // integration deliberately off — NOT drift
+viewer.loop.lostSimSeconds          // clamped + dropped
+viewer.loop.resetLostTimeCounters()
+```
+
+A growing `lostSimSeconds` means the displayed simulation is falling behind wall
+clock — the number to look at when "it looks slower than the PLC".
+
+### Store inventory
+
+`signalStore.stats()` returns the size of every internal index (signals, paths,
+listeners, resolve cache, force pins, providers, writer inventory). Stable signal
+count with a climbing listener count is the classic teardown bug.
+`signalStore.unregisterByPrefix('LINE/')` removes one namespace and leaves every
+other signal, listener, alias and force pin untouched.
+
+### Runners
+
+See `docs/perf/README.md` for the full method, the acceptance criteria and the
+CONNECT setup.
+
+```bash
+npm run perf:matrix -- --mu 500,1000,2400 --sensors 1,4 --duration 300 --runs 3
+npm run perf:soak   -- --hours 8 --mu 2400 --load connect --base http://localhost:5100 --gc-interval 5
+npm run perf:load   -- --source browser --rates 1000,5000,20000
+```
+
+They hold the shared `test-lock`, write to `docs/perf/`, and stamp a machine
+fingerprint into every report. Headless runs are marked as non-citable: Chromium
+falls back to SwiftShader and the frame times then describe the rasteriser.
+
+---
+
 ## 5. Debugging Workflow
 
 ### Typical Debug Session

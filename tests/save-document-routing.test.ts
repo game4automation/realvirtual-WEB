@@ -142,6 +142,12 @@ interface FakeDoc {
   base: AssetBase;
   dirty: boolean;
   markSavedCalls: { base: AssetBase; name?: string }[];
+  // plan-462 B3 — `saveDocument` takes a short-lived `save` lock on the document
+  // before its first side effect. Three members, so this double stays a document;
+  // the lock itself is covered by `rv-asset-document-lock.test.ts`.
+  lockOwner: null;
+  tryLock: () => { kind: string; token: symbol; generation: number };
+  unlock: () => void;
   document: {
     opCount: number;
     runExclusive<T>(work: () => Promise<T>): Promise<T>;
@@ -158,6 +164,12 @@ function makeDoc(base: AssetBase, name = 'Belt', dirty = true): FakeDoc {
     base,
     dirty,
     markSavedCalls,
+    // plan-462 B3 — `saveDocument` takes a short-lived `save` lock on the document
+    // before its first side effect. Three members, so this double stays a document;
+    // the lock itself is covered by `rv-asset-document-lock.test.ts`.
+    lockOwner: null,
+    tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
+    unlock: () => {},
     document: {
       opCount: 3,
       savedFloors: [] as number[],

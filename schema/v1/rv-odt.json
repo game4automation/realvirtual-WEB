@@ -396,6 +396,68 @@
         }
       }
     },
+    "Drive_SEWMovilink": {
+      "type": "object",
+      "description": "Drive behavior: SEW-EURODRIVE MOVILINK unit profile. The PLC writes control word 1 and a speed setpoint, the drive returns status word 1 and the actual speed.",
+      "properties": {
+        "ControlWord1": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputInt",
+          "description": "MOVILINK control word 1 (PO1). Bit 0 is the inverted controller inhibit, bits 1 and 2 are active low, bit 6 is the fault reset."
+        },
+        "SpeedSetpoint": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCOutputInt",
+          "description": "MOVILINK speed setpoint (PO2), encoded as selected by Encoding."
+        },
+        "StatusWord1": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputInt",
+          "description": "MOVILINK status word 1 (PI1) written back to the PLC every tick."
+        },
+        "SpeedActual": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputInt",
+          "description": "MOVILINK actual speed (PI2) written back to the PLC every tick."
+        },
+        "MaxSpeed": {
+          "type": "number",
+          "default": 100,
+          "unit": "mm/s",
+          "description": "Drive speed in millimeters per second (or degrees per second) at 100 percent of the maximum speed."
+        },
+        "Encoding": {
+          "type": "string",
+          "enum": [
+            "PercentNmax",
+            "Rpm"
+          ],
+          "default": "PercentNmax",
+          "description": "Speed setpoint encoding: SPEED[%] with 0x4000 = 100 percent, or SPEED with 0.2 rpm per bit."
+        },
+        "MaxSpeedRpm": {
+          "type": "number",
+          "default": 3000,
+          "description": "Maximum speed in rpm, used to convert the 0.2 rpm per bit encoding to a fraction."
+        },
+        "Acceleration": {
+          "type": "number",
+          "default": 1000,
+          "unit": "mm/s2",
+          "description": "Drive acceleration in millimeters per second squared (or degrees per second squared)."
+        },
+        "SimulateFault": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the drive reports a fault in status word bit 5 until the PLC acknowledges with control word bit 6."
+        },
+        "FaultCode": {
+          "type": "number",
+          "default": 6,
+          "description": "Fault code reported in the status word high byte while a fault is active."
+        }
+      }
+    },
     "Drive_Gear": {
       "type": "object",
       "description": "Drive behavior: slaves this node's Drive to a master Drive position with gear ratio and offset.",
@@ -1031,7 +1093,12 @@
           "description": "Total centerline length. 0 = measure from the rest pose."
         },
         "Axis": {
-          "enum": ["Auto", "X", "Y", "Z"],
+          "enum": [
+            "Auto",
+            "X",
+            "Y",
+            "Z"
+          ],
           "default": "Auto",
           "description": "Travel axis in the chain-local frame. Auto = longest AABB extent."
         },
@@ -1062,7 +1129,10 @@
         },
         "chainOrientation": {
           "type": "string",
-          "enum": ["Horizontal", "Vertical"],
+          "enum": [
+            "Horizontal",
+            "Vertical"
+          ],
           "default": "Horizontal",
           "description": "Vertical applies Unity's tangent-side flip of the element up vector (tangent.z < 0, or tangent.z == 0 and tangent.x > 0)."
         },
@@ -1142,6 +1212,317 @@
         }
       }
     },
+    "RibbonRoller": {
+      "type": "object",
+      "description": "A roller the web (endless material: paper, film, foil, textile, sheet coil) runs over. Purely geometric: radius, rotation axis and the side the web lies on. Every roller of one RibbonPath must have a parallel axis (2 deg tolerance); the path solves the classic two-circle tangent problem in the plane perpendicular to it. The roller turns at omega = v / r, so a small idler spins faster than a large one, exactly as in the machine.",
+      "properties": {
+        "RadiusMm": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Contact radius of the roller. 0 measures it from the mesh bounds in the plane perpendicular to Axis, in the node's own local frame, so a scaled parent does not distort it."
+        },
+        "Axis": {
+          "type": "string",
+          "enum": [
+            "X",
+            "Y",
+            "Z"
+          ],
+          "default": "X",
+          "description": "Local rotation axis of the roller and the common axis of the web path."
+        },
+        "RibbonSide": {
+          "type": "string",
+          "enum": [
+            "Auto",
+            "Left",
+            "Right"
+          ],
+          "default": "Auto",
+          "description": "Which side of the roller the web runs on. Leave it on Auto: for every normal machine Auto picks the short wrap, the only one a real web can take. Set Left or Right by hand only for an S-wrap or a wrap of more than 180 degrees, where the short wrap is the wrong one. Left and Right are the turning sense seen looking along +Axis - Left counter-clockwise, Right clockwise. Default Auto."
+        },
+        "RotationDirection": {
+          "type": "number",
+          "default": 1,
+          "description": "Which way the roller is drawn turning: 1 or -1. Set it to -1 when the roller visibly turns against the web, which happens when the imported CAD axis points the other way. It changes the picture only, never the web speed. Default 1."
+        },
+        "SpinMode": {
+          "type": "string",
+          "enum": [
+            "Transform",
+            "Texture"
+          ],
+          "default": "Transform",
+          "description": "How the roller shows that it is turning. Transform turns the roller object itself. Texture leaves the object standing still and scrolls the pattern on its barrel instead - it looks the same at a glance and costs no per-frame work, which is worth having on a machine with many idlers. Texture works only on a roller WITHOUT a drive; a driven roller is always turned by its drive. Default Transform."
+        },
+        "MantleMesh": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Which part scrolls in SpinMode Texture - normally the barrel of the roller. Leave it empty: the roller's own mesh is used, or the largest textured part under it that is not inside a Faces group, so the end discs stay still. Wire componentType UnityEngine.Transform (the schema convention for a node reference)."
+        }
+      }
+    },
+    "RibbonWinder": {
+      "type": "object",
+      "description": "An unwinder or rewinder at one end of a RibbonPath: a roller whose radius grows or shrinks with the wound length, R(L) = sqrt(CoreRadiusMm^2 + L * RibbonThicknessMm / pi). It must be the FIRST or the LAST entry of the path's Rollers list; in the middle it is inert with a warning. The wound roll is shown by scaling RollMesh radially in the two axes perpendicular to Axis, so a CAD roll needs no remodelling and no geometry is rebuilt per tick.",
+      "properties": {
+        "RadiusMm": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Measured outer radius of the authored roll. 0 measures it from the mesh bounds; it is the reference the wound roll is scaled against and, with InitialWoundLengthMm = -1, the source of the initial length."
+        },
+        "Axis": {
+          "type": "string",
+          "enum": [
+            "X",
+            "Y",
+            "Z"
+          ],
+          "default": "X",
+          "description": "Local winding axis. Must be parallel to every other roller axis of the path."
+        },
+        "RibbonSide": {
+          "type": "string",
+          "enum": [
+            "Auto",
+            "Left",
+            "Right"
+          ],
+          "default": "Left",
+          "description": "Side the web leaves or enters the roll on; the wrap orientation seen along +Axis."
+        },
+        "RotationDirection": {
+          "type": "number",
+          "default": 1,
+          "description": "Sign correction for the visible roll rotation (-1 flips it)."
+        },
+        "SpinMode": {
+          "type": "string",
+          "enum": [
+            "Transform",
+            "Texture"
+          ],
+          "default": "Transform",
+          "description": "How the winder shows that it is turning; see RibbonRoller.SpinMode. A winder that carries a drive is always turned by it, so Texture only applies to a dragged reel. Default Transform."
+        },
+        "MantleMesh": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Which part scrolls in SpinMode Texture; see RibbonRoller.MantleMesh. Leave it empty to use the winder's own mesh. Wire componentType UnityEngine.Transform (the schema convention for a node reference)."
+        },
+        "CoreRadiusMm": {
+          "type": "number",
+          "default": 76.2,
+          "unit": "mm",
+          "description": "Radius of the bare core (sleeve). Must be > 0, otherwise the winder is inert with a warning. 76.2 mm is the 3 inch core of the converting industry."
+        },
+        "RibbonThicknessMm": {
+          "type": "number",
+          "default": 0.1,
+          "unit": "mm",
+          "description": "Thickness of one wound layer of the material, in millimeters (the caliper). With the core radius it decides how fast the roll grows and shrinks. It must be the SAME value as RibbonPath.RibbonThicknessMm - it is the same material - or the roll builds up at a rate the web does not run at. Must be > 0, otherwise the winder is inert with a warning. Default 0.1 mm."
+        },
+        "InitialWoundLengthMm": {
+          "type": "number",
+          "default": -1,
+          "unit": "mm",
+          "description": "How much material is on the roll at the start and after a reset. -1 (the default) means a full roll exactly as modelled - the length is derived from the modelled outer radius, so a full parent reel needs no number typed in. 0 means an empty core, which is what a rewinder starts at. Any other value is the length on the roll in millimeters."
+        },
+        "MaxDiameterMm": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Diameter at which the roll counts as full: the whole web group stops and the Full signal goes true. 0 = no limit."
+        },
+        "RollMesh": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Which part grows and shrinks with the roll. Leave it empty: the winder object IS the roll and is scaled directly, which is the normal case. Model the core as a SIBLING next to it, never as a child - a child would scale with the paper and the core would visibly grow. Set this only when the roll is a separate part, or when the winder object has no geometry of its own; a winder with nothing to scale gets a plain cylinder so it is never invisible. The modelled scale is remembered and restored on export. Wire componentType UnityEngine.Transform (the schema convention for a node reference)."
+        },
+        "DiameterMm": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputFloat",
+          "description": "Signal carrying the current roll diameter in millimeters; written only when it changed by more than 0.1 mm."
+        },
+        "WoundLengthMm": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputFloat",
+          "description": "Signal carrying the currently wound web length in millimeters."
+        },
+        "Empty": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true while the roll is down to its bare core. An empty winder clamps the web speed of its whole path group to zero."
+        },
+        "Full": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true once MaxDiameterMm is reached. A full winder clamps the web speed of its whole path group to zero."
+        }
+      }
+    },
+    "RibbonPath": {
+      "type": "object",
+      "description": "One taut web running over an ordered, OPEN chain of rollers (RibbonRoller / RibbonWinder), from the first entry to the last. The reader computes the tangents and wrap arcs itself and builds a band mesh along the resulting arc length; nothing about the path geometry is exported. A slitter is modelled as N RibbonPaths sharing an unwinder: paths that share a winder form ONE group with a single effective speed per tick, so an empty or full roll stops every strip in the same tick.",
+      "properties": {
+        "Rollers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ComponentReference"
+          },
+          "description": "Rollers in running order. The first and last entry are the ends of the open path and are usually winders; a winder in the middle makes the path inert."
+        },
+        "ConnectedDrive": {
+          "$ref": "#/$defs/ComponentReference",
+          "deprecated": true,
+          "description": "DEPRECATED and IGNORED since plan-460; kept so a plan-459 document still validates. The web is moved exclusively by rotational drives on the rollers: a RibbonRoller or RibbonWinder whose node carries a rotational Drive about the roller axis is driven, and its surface speed v = omega * pi / 180 * r is the speed of its section. Loading a document that still sets this field logs one warning."
+        },
+        "SpeedSource": {
+          "type": "string",
+          "enum": [
+            "Drive",
+            "RibbonWinder"
+          ],
+          "default": "Drive",
+          "deprecated": true,
+          "description": "DEPRECATED and IGNORED since plan-460; kept so a plan-459 document still validates. See ConnectedDrive: the speed source is now always the driven rollers of the path."
+        },
+        "RibbonWidthMm": {
+          "type": "number",
+          "default": 500,
+          "unit": "mm",
+          "description": "Width of the web, extruded along the common roller axis."
+        },
+        "RibbonThicknessMm": {
+          "type": "number",
+          "default": 0.1,
+          "unit": "mm",
+          "description": "Thickness of the material, in millimeters. Half of it lifts the web off the roller surface so the two do not intersect. It must be the SAME value as RibbonWinder.RibbonThicknessMm on the winders of this path. Default 0.1 mm."
+        },
+        "TextureLengthMm": {
+          "type": "number",
+          "default": 1000,
+          "unit": "mm",
+          "description": "How much web one repetition of the surface pattern covers, in millimeters. This is what makes a running web look like it is running: the pattern scrolls by the distance the web has travelled. A larger value gives a coarser pattern that appears to move more slowly. Default 1000 mm."
+        },
+        "SamplesPerMeter": {
+          "type": "number",
+          "default": 64,
+          "description": "How finely the web strip is subdivided, in points per meter of path. Raise it when a tight wrap looks angular; lower it on a very long run to save geometry. Give every strip slit at the same roller the SAME value: the sample points sit on an absolute grid of one point every 1000 / SamplesPerMeter millimeters, which is what lets strips of different total length cut at exactly the same place. A path that grows past its sample buffer has its density reduced automatically (with a console message), which can leave it on a coarser grid than its siblings and move its cut by a fraction of a sample; the console names both webs when that happens, and the fix is a lower SamplesPerMeter for the whole slitter or a shorter longest strip. Default 64."
+        },
+        "Material": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Optional. A NODE whose material the web copies - a printed pattern, a coloured film. It points at an object in the scene, not at a material asset: the web takes the first textured material found on that object, including its normal and roughness maps, and gets its own copies of them - scaling and scrolling the web never touches the part it was copied from. Leave it empty and the web gets a plain paper-white surface with a pattern, so its motion is always visible. Wire componentType UnityEngine.Transform (the schema convention for a node reference)."
+        },
+        "SlitAtRoller": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Optional INNER roller (the cutter) at which the full web is slit into this strip. The cut sits where the web MEETS that roller (its arrival tangent point), which is where the blade is: before it the path draws the full web (FullWidthMm, centred on the first roller), from that point on this strip (RibbonWidthMm) in its own lane at the last roller's axial offset. Every strip cut at the same roller therefore reports the same slit point and draws only itself from there on. Of all strips slit at one roller only the first (by node path) draws the shared part. Requires FullWidthMm > 0."
+        },
+        "FullWidthMm": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Width of the full web before SlitAtRoller; 0 = this path is not a slit strip."
+        }
+      }
+    },
+    "RibbonDancer": {
+      "type": "object",
+      "description": "A dancer roller: a RibbonRoller that also TRAVELS along an axis and thereby stores web. It splits its RibbonPath into an upstream and a downstream section at its own departure tangent point and integrates the difference of the two section speeds, L = L + (v_up - v_down) * dt, into a carriage position home + L / Strands. At its stops the limit is directional and never stops a drive: at TravelMaxMm only further filling is prevented (v_up becomes min(v_up, v_down)), at TravelMinMm only further emptying - so the opposite delta always frees it again. Exactly one dancer per path is supported; a dancer at the first or last position of Rollers is ignored with a warning.",
+      "properties": {
+        "RadiusMm": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Contact radius of the dancer roller. 0 measures it from the mesh bounds in the plane perpendicular to Axis."
+        },
+        "Axis": {
+          "type": "string",
+          "enum": [
+            "X",
+            "Y",
+            "Z"
+          ],
+          "default": "X",
+          "description": "Local rotation axis of the roller. Must be parallel to every other roller axis of the path."
+        },
+        "RibbonSide": {
+          "type": "string",
+          "enum": [
+            "Auto",
+            "Left",
+            "Right"
+          ],
+          "default": "Auto",
+          "description": "Which side of the dancer roller the web runs on. Leave it on Auto: the carriage moves, and Auto follows it by always picking the short wrap. Set Left or Right by hand only for an S-wrap or a wrap of more than 180 degrees. Left and Right are the turning sense seen looking along +Axis. Default Auto."
+        },
+        "RotationDirection": {
+          "type": "number",
+          "default": 1,
+          "description": "Which way the dancer roller is drawn turning: 1 or -1. Set it to -1 when the roller visibly turns against the web. It changes the picture only. Default 1."
+        },
+        "SpinMode": {
+          "type": "string",
+          "enum": [
+            "Transform",
+            "Texture"
+          ],
+          "default": "Transform",
+          "description": "How the dancer roller shows its rotation; see RibbonRoller.SpinMode."
+        },
+        "MantleMesh": {
+          "$ref": "#/$defs/ComponentReference",
+          "description": "Mesh scrolled in SpinMode Texture; see RibbonRoller.MantleMesh."
+        },
+        "TravelAxis": {
+          "type": "string",
+          "enum": [
+            "X",
+            "Y",
+            "Z"
+          ],
+          "default": "Y",
+          "description": "The direction the carriage runs in, given in the frame of the object the dancer hangs under - the same axis letters as RibbonRoller.Axis. Place the dancer so that moving along the POSITIVE axis lengthens the web path; that is the direction more material stored points in. Usually perpendicular to Axis, but a guide at an angle is allowed and not checked. Default Y."
+        },
+        "TravelMinMm": {
+          "type": "number",
+          "default": -200,
+          "unit": "mm",
+          "description": "Lower stop relative to HomeMm; must be <= 0. Reaching it sets AtMin and holds the downstream speed at the upstream one, so the store cannot empty further."
+        },
+        "TravelMaxMm": {
+          "type": "number",
+          "default": 200,
+          "unit": "mm",
+          "description": "Upper stop relative to HomeMm; must be >= 0. Reaching it sets AtMax and holds the upstream speed at the downstream one, so the store cannot fill further."
+        },
+        "HomeMm": {
+          "type": "number",
+          "default": 0,
+          "unit": "mm",
+          "description": "Rest position along TravelAxis, relative to the authored node position; 0 means the carriage starts and resets exactly where it was modelled."
+        },
+        "Strands": {
+          "type": "number",
+          "default": 2,
+          "description": "How many runs of web pass through the carriage. 1 is a single pass over the roller; 2 is the usual loop that goes down to the carriage and back up again. One millimeter of carriage travel then stores that many millimeters of web. Must be at least 1. Default 2."
+        },
+        "PositionMm": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputFloat",
+          "description": "Signal carrying the carriage position in millimeters; written only when it changed by more than 0.1 mm. This is the regulated variable a web tension controller reads."
+        },
+        "AtMin": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true while the carriage sits at TravelMinMm (the store is empty)."
+        },
+        "AtMax": {
+          "$ref": "#/$defs/ComponentReference",
+          "signal": "PLCInputBool",
+          "description": "Signal is true while the carriage sits at TravelMaxMm (the store is full)."
+        }
+      }
+    },
     "CollisionRole": {
       "type": "object",
       "description": "Collision role of this node's subtree. Bodies of different roles are checked against each other while the simulation runs; identical roles never collide.",
@@ -1168,31 +1549,49 @@
       "properties": {
         "gridResolution": {
           "$ref": "#/$defs/Vector3",
-          "default": { "x": 64, "y": 64, "z": 64 },
+          "default": {
+            "x": 64,
+            "y": 64,
+            "z": 64
+          },
           "description": "Voxel lattice resolution (x/y/z), including one padding voxel per side. Clamped to 4..256 per axis. Memory and cost scale with the product - 64^3 is the interactive default, 128^3 is usable with a visible mesh lag."
         },
         "workpieceSize": {
           "$ref": "#/$defs/Vector3",
-          "default": { "x": 200, "y": 100, "z": 200 },
+          "default": {
+            "x": 200,
+            "y": 100,
+            "z": 200
+          },
           "unit": "mm",
           "description": "Stock dimensions in millimeters (no coordinate flip - this is an extent, not a position). Ignored when Shape is Mesh, where the domain follows the render geometry's bounds."
         },
         "Shape": {
           "type": "string",
-          "enum": ["Box", "Cylinder", "Mesh"],
+          "enum": [
+            "Box",
+            "Cylinder",
+            "Mesh"
+          ],
           "default": "Box",
           "readonly": true,
           "description": "Starting stock shape - this defines the MATERIAL, not the display mesh. Mesh voxelizes the node's own render geometry (WYSIWYG); the Unity StockMesh reference is not transferred. Read-only: the bare field name 'Shape' is shared with MachiningTool, so the generic enum editor cannot offer the right options."
         },
         "CylinderAxis": {
           "type": "string",
-          "enum": ["X", "Y", "Z"],
+          "enum": [
+            "X",
+            "Y",
+            "Z"
+          ],
           "default": "X",
           "description": "Axis a Cylinder workpiece lies along (X or Z = lying, Y = upright)."
         },
         "Tools": {
           "type": "array",
-          "items": { "$ref": "#/$defs/ComponentReference" },
+          "items": {
+            "$ref": "#/$defs/ComponentReference"
+          },
           "default": [],
           "description": "MachiningTool references that cut this volume, IN ORDER - the subtraction is sequential, so the order is part of the result."
         },
@@ -1213,7 +1612,10 @@
         },
         "Meshing": {
           "type": "string",
-          "enum": ["MarchingCubes", "DualContouring"],
+          "enum": [
+            "MarchingCubes",
+            "DualContouring"
+          ],
           "default": "MarchingCubes",
           "description": "Surface extraction: MarchingCubes (robust default, edges rounded within one voxel) or DualContouring (sharper edges, experimental)."
         },
@@ -1263,7 +1665,13 @@
       "properties": {
         "Shape": {
           "type": "string",
-          "enum": ["Sphere", "Cylinder", "BallNose", "Torus", "ConicalEnd"],
+          "enum": [
+            "Sphere",
+            "Cylinder",
+            "BallNose",
+            "Torus",
+            "ConicalEnd"
+          ],
           "default": "Cylinder",
           "readonly": true,
           "description": "Cutter shape, evaluated as an analytic signed distance function. Read-only: the bare field name 'Shape' is shared with MachiningVolume, so the generic enum editor cannot offer the right options."
@@ -3287,7 +3695,11 @@
         },
         "align": {
           "type": "array",
-          "default": [0, 1, 0],
+          "default": [
+            0,
+            1,
+            0
+          ],
           "description": "Up vector [x,y,z] for the traveler pose (default [0,1,0])."
         },
         "zone": {
@@ -3627,6 +4039,9 @@
     "Drive_Speed": {
       "$ref": "#/$defs/Drive_Speed"
     },
+    "Drive_SEWMovilink": {
+      "$ref": "#/$defs/Drive_SEWMovilink"
+    },
     "Drive_Gear": {
       "$ref": "#/$defs/Drive_Gear"
     },
@@ -3689,6 +4104,18 @@
     },
     "ChainElement": {
       "$ref": "#/$defs/ChainElement"
+    },
+    "RibbonRoller": {
+      "$ref": "#/$defs/RibbonRoller"
+    },
+    "RibbonWinder": {
+      "$ref": "#/$defs/RibbonWinder"
+    },
+    "RibbonPath": {
+      "$ref": "#/$defs/RibbonPath"
+    },
+    "RibbonDancer": {
+      "$ref": "#/$defs/RibbonDancer"
     },
     "KinematicMechanism": {
       "$ref": "#/$defs/KinematicMechanism"

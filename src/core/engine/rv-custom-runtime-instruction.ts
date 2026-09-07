@@ -205,6 +205,11 @@ export class RVCustomRuntimeInstruction implements RVComponent {
   private _active = false;
   /** Static (no-signal) mode → show once in onSceneReady, never re-show (F7). */
   private _static = false;
+  /** Step index of the highlight currently shown (-1 = none). Kept so the
+   *  highlight can be rebuilt once the load has finished - see _onModelLoaded. */
+  private _highlightedStep = -1;
+  /** Unsubscribe from the one-shot 'model-loaded' rebuild. */
+  private _unsubscribeModelLoaded?: () => void;
 
   constructor(node: Object3D) {
     this.node = node;
@@ -232,6 +237,21 @@ export class RVCustomRuntimeInstruction implements RVComponent {
     this.node.userData._rvType = 'CustomRuntimeInstruction';
     Object.defineProperty(this.node.userData, '_rvComponentInstance', {
       value: this, writable: true, configurable: true, enumerable: false,
+    });
+
+    // The step highlight and the owning-node gizmo copy SOURCE GEOMETRY and
+    // WORLD TRANSFORMS at creation time. This component activates in
+    // onSceneReady (scene-loader Phase 8d), which runs BEFORE the uber-material
+    // bake and the motion-blob batching (Phases 10b-10d) dispose and re-bake
+    // that geometry, and before the home pose is restored (Phase 10e). A
+    // highlight built there therefore references freed geometry at a stale
+    // pose: the card comes up with NO visible highlight until the operator
+    // navigates a step, which rebuilds it against the finished scene.
+    // Rebuild once when the load completes - 'model-loaded' is emitted after
+    // all geometry phases.
+    this._unsubscribeModelLoaded = ctx.events?.once('model-loaded', () => {
+      this._unsubscribeModelLoaded = undefined;
+      this._onModelLoaded();
     });
 
     // Subscribe only when a signal is bound. Read the initial level here but apply
@@ -394,6 +414,7 @@ export class RVCustomRuntimeInstruction implements RVComponent {
    *  absent or a target path cannot be resolved. */
   highlightStep(index: number): void {
     this.clearStepHighlight();
+    this._highlightedStep = index;
     const gm = this._ctx?.gizmoManager;
     const registry = this._ctx?.registry;
     if (!gm || !registry) return;
@@ -430,6 +451,7 @@ export class RVCustomRuntimeInstruction implements RVComponent {
 
   /** Dispose the current step's target highlight gizmos + status outline. */
   clearStepHighlight(): void {
+    this._highlightedStep = -1;
     for (const g of this._stepGizmos) g.dispose();
     this._stepGizmos = [];
     if (this._statusOutlineShown) {
@@ -438,6 +460,27 @@ export class RVCustomRuntimeInstruction implements RVComponent {
       const scene = this._ctx?.scene;
       if (om && scene) hideStatusOutline({ scene, outlineManager: om }, this.path);
     }
+  }
+
+  /** Rebuild every visual this component owns against the FINISHED scene.
+   *  Runs once, on 'model-loaded'. A highlight created during the load points
+   *  at geometry the batching phases have since disposed, so it draws nothing;
+   *  recreating it here is what makes the very first step of an instruction
+   *  that was already active at load time highlight like every later one. */
+  private _onModelLoaded(): void {
+    const ctx = this._ctx;
+    if (!ctx) return;
+    // Owning-node blink gizmo - same staleness, same remedy.
+    if (this._highlightGizmo && ctx.gizmoManager) {
+      this._highlightGizmo.dispose();
+      this._highlightGizmo = createErrorHighlightGizmo(
+        ctx.gizmoManager, this.node, 'Auto', this._highlightHex, this._blinkHz,
+      );
+      this._highlightGizmo.setVisible(this._active);
+    }
+    // Step highlight - only when one is actually shown right now.
+    const step = this._highlightedStep;
+    if (step >= 0) this.highlightStep(step);
   }
 
   /** Resolve the target nodes of a step (for camera framing by the panel). */
@@ -453,6 +496,8 @@ export class RVCustomRuntimeInstruction implements RVComponent {
   dispose(): void {
     this._unsubscribe?.();
     this._unsubscribe = undefined;
+    this._unsubscribeModelLoaded?.();
+    this._unsubscribeModelLoaded = undefined;
     this._highlightGizmo?.dispose();
     this._highlightGizmo = undefined;
     this.clearStepHighlight();

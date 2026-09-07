@@ -30,17 +30,16 @@
  *
  * ## Writing goes through the CAS funnel, always
  *
- * {@link setDocumentRef} is a thin delta on top of `updateManifestCas` — read,
+ * This module only produces the *edited manifest*: {@link setDocumentRefOn} is a
+ * pure function of the manifest it is handed. Persisting it is
+ * `ProjectStore._setDocumentRefField`, which drives `updateManifestCas` — read,
  * change one field, write under a compare-and-swap precondition, retry against
- * the fresh state on conflict. It never calls `commitDocuments()` or
- * `replaceManifest()`: those write a manifest built from an earlier read, which
- * is how a concurrent writer's row disappears (plan-717 R2-F1). The `apply`
- * callback here is a pure function of the manifest it is handed, which is what
- * makes retrying it safe.
+ * the fresh state on conflict — and then updates the in-memory rows and tells a
+ * running CONNECT gateway. There is deliberately no second door here that writes
+ * the manifest behind the store's back (plan-725 §2.7, plan-461 V1).
  */
 
 import type { RvDocumentEntry, RvProject } from './rv-project-types';
-import { updateManifestCas } from './rv-project-storage';
 
 // ─── The fields ─────────────────────────────────────────────────────────
 
@@ -363,37 +362,3 @@ export function repointDocumentRefs(
   return { project: { ...project, documents }, rewritten };
 }
 
-// ─── Writing: persistent ────────────────────────────────────────────────
-
-/**
- * Persist one reference change through the manifest's compare-and-swap funnel.
- *
- * Durable first, then in-memory: the caller re-reads the returned project rather
- * than patching its own copy, so a conflict retry cannot leave the two
- * disagreeing (plan-717 R2-F3).
- *
- * @deprecated **Dead as of plan-725 §2.7 — verified, not assumed.**
- * `grep -rn "setDocumentRef\b" src tests` finds only this definition and the
- * doc reference at the top of this file: nothing calls it. Every live write of
- * a document reference goes through `ProjectStore._setDocumentRefField`, which
- * also updates the in-memory rows and — since plan-725 — tells a running
- * CONNECT gateway. This second door does neither, so a caller that found it
- * would get a manifest the app does not know it wrote. Delete it or route it
- * through the store; do not build on it.
- */
-export async function setDocumentRef(
-  dir: FileSystemDirectoryHandle,
-  documentId: string,
-  field: DocumentRefField,
-  ref: string | null,
-): Promise<{ project: RvProject; revision: string }> {
-  // Refuse before the first read: a containment error is a caller bug, and
-  // discovering it inside a retry loop would report it three times.
-  if (ref !== null) assertContainedRef(ref, field);
-  return updateManifestCas(dir, current => {
-    if (!current) {
-      throw new Error(`Cannot set ${field} — this project has no manifest.`);
-    }
-    return setDocumentRefOn(current, documentId, field, ref);
-  });
-}

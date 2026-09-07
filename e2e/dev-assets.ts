@@ -27,7 +27,7 @@
  * ```
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -51,3 +51,45 @@ export const HAS_DEV_ASSETS = DEV_PROJECT_DIR !== null;
 //! sends the next person hunting a bug that is not there.
 export const DEV_ASSETS_SKIP_REASON =
   'needs the private sibling repository (projects/Development assets, plan-395)';
+
+// ─── Named fixtures out of the project's own manifest (plan-458 §9.3) ────
+
+/**
+ * The manifest, or `null` when there is no dev project (or it is unreadable).
+ *
+ * Read HERE rather than hard-coded in a spec: a spec that names a document by
+ * a string somebody typed months ago silently stops testing anything the day
+ * that document is renamed — it just clicks nothing and times out with a
+ * message about a selector. The project says what it holds; the spec asks it.
+ */
+function readManifest(): { documents?: { path?: string }[]; folders?: string[] } | null {
+  if (DEV_PROJECT_DIR === null) return null;
+  try {
+    return JSON.parse(readFileSync(resolve(DEV_PROJECT_DIR, 'project.json'), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+const MANIFEST = readManifest();
+
+/**
+ * File name of a document the dev project actually holds — the tail of a
+ * `data-card-path`, so a spec can click a NAMED card instead of `first()`.
+ */
+export const DEV_PROJECT_DOCUMENT: string | null =
+  MANIFEST?.documents?.map(d => d.path).find((p): p is string => typeof p === 'string')
+    ?.split('/').pop() ?? null;
+
+/**
+ * Name of a folder the dev project actually holds — a declared one, else the
+ * first directory a document path names.
+ */
+export const DEV_PROJECT_FOLDER: string | null = (() => {
+  const declared = MANIFEST?.folders?.find(f => typeof f === 'string' && f !== '');
+  if (declared) return declared.split('/')[0];
+  const nested = MANIFEST?.documents
+    ?.map(d => d.path)
+    .find((p): p is string => typeof p === 'string' && p.includes('/'));
+  return nested ? nested.split('/')[0] : null;
+})();

@@ -143,7 +143,7 @@ function sideOf(endpoint: DocumentTransferEndpoint): DocumentTransferSide {
     },
     updateManifestEntry: async (apply) => {
       if (!dir) return false;
-      await updateManifestCas(dir, (current) => {
+      const written = await updateManifestCas(dir, (current) => {
         if (!current) {
           throw new Error(`"${label}" has no manifest to update.`);
         }
@@ -153,10 +153,17 @@ function sideOf(endpoint: DocumentTransferEndpoint): DocumentTransferSide {
         return { ...current, documents: apply(readDocuments(current) ?? []) };
       });
       // plan-725 §2.7. A copy across sources rewrites `documents[]` through this
-      // own CAS wrapper, not through the store's — so none of the store's own
-      // notify sites can see it, and it has to say so itself. Fire-and-forget by
-      // construction: `notifyProjectChanged` never throws and never awaits.
-      getProjectStore().notifyProjectChanged();
+      // own CAS wrapper, not through the store's — and it has to stay that way:
+      // `dir` here is whichever SIDE of the transfer is being written, which is
+      // not in general the project the store has open, so the store's commit
+      // hook is the wrong instrument. What it does borrow from that hook is its
+      // rule (plan-462 B2): announce only a manifest that actually changed,
+      // compared by revision, which is the hash of the serialised content.
+      // Fire-and-forget by construction: `notifyProjectChanged` never throws
+      // and never awaits.
+      if (written.revision !== written.previousRevision) {
+        getProjectStore().notifyProjectChanged();
+      }
       return true;
     },
   };

@@ -113,7 +113,6 @@ describe('DocumentCard dirty state', () => {
     // The shared mark, not a bullet glued to the label — the same element the
     // breadcrumb and the ActivityBar render.
     expect(card.querySelector('[data-testid="dirty-dot"]')).not.toBeNull();
-    expect(card.textContent).toContain('Unsaved');
   });
 
   it('shows no mark on a clean document', () => {
@@ -121,6 +120,23 @@ describe('DocumentCard dirty state', () => {
     const card = screen.getByTestId('document-card');
     expect(card.querySelector('[data-testid="dirty-dot"]')).toBeNull();
     expect(card.textContent).not.toContain('Unsaved');
+  });
+
+  /**
+   * The compact header states unsaved work ONCE (2026-09-07).
+   *
+   * It used to say it three times on the tightest row in the app: an amber dot
+   * in front, the word "UNSAVED" behind the trail, and a Save button that goes
+   * blue at the same instant. The dot is the one that survives — it is the
+   * product's shared mark and it costs the breadcrumb no width — and it stays
+   * reachable to a screen reader through its own label.
+   */
+  it('the compact header says "unsaved" with the dot alone, not the word', () => {
+    mount(makeView({ dirty: true }), 'compact');
+    const card = screen.getByTestId('document-card');
+    expect(card.querySelectorAll('[data-testid="dirty-dot"]').length).toBe(1);
+    expect(card.textContent).not.toContain('Unsaved');
+    expect(screen.getByLabelText(/unsaved changes/i)).toBeTruthy();
   });
 });
 

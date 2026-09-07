@@ -317,13 +317,15 @@ A relay server is a Node.js WebSocket multiplexer that enables multiuser session
 
 > **The relay server source code lives in a separate repository.** It is no longer bundled with realvirtual WEB. The settings store ships with a default hosted relay URL (`wss://download.realvirtual.io/relay`) and the realvirtual WEB plugin handles both `local` and `relay` connection modes (see `connectionMode` in [multiuser-settings-store.ts](src/core/hmi/multiuser-settings-store.ts)).
 
-> **Two relay URLs appear in the sources and they do not agree.** The browser
-> default is `wss://download.realvirtual.io/relay` (`relayUrl` in
-> `src/core/hmi/multiuser-settings-store.ts`); the Unity `RelayServerUrl`
-> inspector tooltip gives `wss://portal.realvirtual.io/relay` as its example.
-> Only one of them can be the relay a given deployment actually runs — set
-> `RelayServerUrl` on the Unity host and `relayUrl` in the browser settings to
-> the *same* endpoint explicitly rather than trusting either default.
+> **The hosted relay endpoint is `wss://download.realvirtual.io/relay`.** That is the value
+> every shipped artefact carries: the browser default (`relayUrl` in
+> `src/core/hmi/multiuser-settings-store.ts`), the Multiuser panel fallback, the Teams
+> configuration page, and the demo project's `settings.json`. A different URL appears in the
+> tooltip of Unity's `RelayServerUrl` field — that is an illustrative example only, not a
+> default; the field itself ships empty and you must fill it in.
+>
+> Whichever endpoint you use, `RelayServerUrl` on the Unity host and `relayUrl` in the browser
+> settings must name the *same* endpoint. Unity will not adopt the browser default for you.
 
 > **Everything in this section describes code that is not in this repository.**
 > The **relay repo's own README is the authoritative source** for the relay's

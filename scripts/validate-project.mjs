@@ -32,7 +32,6 @@ import {
   isProjectKind,
   isSecretFileName,
   plaintextSecretPaths,
-  vendorGlobProblems,
 } from './_rv-guards.mjs';
 import {
   documentRefsOf,
@@ -53,9 +52,7 @@ const KNOWN_FOLDERS = new Set([
   'scripts', 'knowledge',
   // plan-434 phase 2: material that stays on this machine. `projects/wmyb/local`
   // is the real instance — NDA customer data that is neither delivered nor
-  // published. It is customer-owned by construction, since no vendor glob names
-  // it and unknown means zone C (`_vendor-merge.mjs`), so the only thing missing
-  // was the spelling being recognised here.
+  // published, so the only thing missing was the spelling being recognised here.
   'local',
   // plan-395: the internal Development project's two extra places. `fixtures/`
   // holds the synthetic GLBs the test suites load, `scratch/` is the documented
@@ -301,11 +298,12 @@ function validateSecrets(root) {
  *  - **outside the enum → error.** A typo (`"Customer"`, the retired `"seed"`)
  *    silently turns off every rule keyed on `customer`, which is the failure
  *    that must never pass quietly.
- *  - **`customer` without a `vendor` block → error.** No `vendor` means the
- *    whole project is customer-owned and no update can ever reach it (see
- *    `_vendor-merge.mjs`: unknown is zone C). For a demo or a fixture that is a
- *    fine default; for a project we deliver it is a delivery that silently
- *    changes nothing, and it should be said before the delivery, not after.
+ *
+ * A `customer` project used to additionally need a `vendor.managed` block, because
+ * without one the three-way merge classified every path as customer-owned and no
+ * update could reach the project. Plan-738 removed the zones: the core is replaced
+ * in full at every delivery no matter what the manifest says, so the field it
+ * demanded no longer exists and its absence means nothing.
  */
 function validateKind(manifest) {
   if (!manifest) return;
@@ -318,29 +316,6 @@ function validateKind(manifest) {
   if (!isProjectKind(kind)) {
     fail(`${MANIFEST}: "kind" is ${JSON.stringify(kind)} — must be one of ${PROJECT_KINDS.join(', ')}.`);
     return;
-  }
-  if (kind !== 'customer') return;
-  const vendor = manifest.vendor;
-  const managed = Array.isArray(vendor?.managed) ? vendor.managed : [];
-  if (managed.length === 0) {
-    fail(`${MANIFEST}: "kind" is "customer" but there is no "vendor.managed" — `
-      + 'without it every path is customer-owned and no delivered update can ever reach this project.');
-  }
-}
-
-/**
- * Refuses a vendor block that could overwrite customer data (plan-700 §2.3, T6).
- *
- * The `vendor` globs decide, at every future delivery, which files we are
- * allowed to replace in a customer's repository. A wrong entry here is not a
- * lint issue: `managed: ["**"]` hands us permission to overwrite the scenes the
- * customer built. The rule is therefore mechanical and lives in the gate that
- * runs before every delivery and every deploy, not in a review checklist.
- */
-function validateVendorBlock(manifest) {
-  if (!manifest) return;
-  for (const problem of vendorGlobProblems(manifest.vendor)) {
-    fail(`${MANIFEST}: ${problem}`);
   }
 }
 
@@ -478,7 +453,6 @@ export function validateProject(root) {
   validateReferences(root, manifest);
   validateDocumentRefs(root, manifest);
   validateConnectSecrets(root, manifest);
-  validateVendorBlock(manifest);
   validateKind(manifest);
   validateCanonicalName(root, manifest);
   validateAssetHashes(root, manifest);

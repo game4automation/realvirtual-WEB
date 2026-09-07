@@ -172,3 +172,94 @@ describe('useLongPress', () => {
     expect(onLongPress).toHaveBeenCalledWith(200, 200);
   });
 });
+
+/**
+ * plan-458 §9.2b — the two additions, and the promise that they ARE additions.
+ *
+ * `HierarchyNodeRow` wires this hook in two places and passes neither of them,
+ * so both have to keep behaving exactly as the block above describes. What is
+ * new is only asked for by a caller that wants it.
+ */
+describe('useLongPress — gesture consumption and pointercancel (plan-458)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('reports the gesture as consumed once the long-press has fired', () => {
+    const onLongPress = vi.fn();
+    const { result } = renderHook(() => useLongPress({ onLongPress, delayMs: 500 }));
+
+    expect(result.current.consumedLastGesture()).toBe(false);
+    act(() => {
+      result.current.onPointerDown(pointerEvent({ pointerType: 'touch' }));
+      vi.advanceTimersByTime(500);
+    });
+    expect(onLongPress).toHaveBeenCalledTimes(1);
+    // The browser's synthetic click is still to come — this is what the card's
+    // onClick asks before it acts.
+    expect(result.current.consumedLastGesture()).toBe(true);
+  });
+
+  it('does not report a consumed gesture for a press that never fired', () => {
+    const onLongPress = vi.fn();
+    const { result } = renderHook(() => useLongPress({ onLongPress, delayMs: 500 }));
+
+    act(() => {
+      result.current.onPointerDown(pointerEvent({ pointerType: 'touch' }));
+      vi.advanceTimersByTime(200);
+      result.current.onPointerUp();
+    });
+    expect(result.current.consumedLastGesture()).toBe(false);
+  });
+
+  it('resets consumption on the next pointerdown', () => {
+    const onLongPress = vi.fn();
+    const { result } = renderHook(() => useLongPress({ onLongPress, delayMs: 500 }));
+
+    act(() => {
+      result.current.onPointerDown(pointerEvent({ pointerType: 'touch' }));
+      vi.advanceTimersByTime(500);
+      result.current.onPointerUp();
+    });
+    expect(result.current.consumedLastGesture()).toBe(true);
+    act(() => { result.current.onPointerDown(pointerEvent({ pointerType: 'touch' })); });
+    expect(result.current.consumedLastGesture()).toBe(false);
+  });
+
+  it('clears the flag even for a pointer type it does not time', () => {
+    const onLongPress = vi.fn();
+    const { result } = renderHook(() => useLongPress({ onLongPress, delayMs: 500 }));
+
+    act(() => {
+      result.current.onPointerDown(pointerEvent({ pointerType: 'touch' }));
+      vi.advanceTimersByTime(500);
+    });
+    // A mouse press after a touch long-press must not be swallowed.
+    act(() => { result.current.onPointerDown(pointerEvent({ pointerType: 'mouse' })); });
+    expect(result.current.consumedLastGesture()).toBe(false);
+  });
+
+  it('onPointerCancel clears the pending timer', () => {
+    const onLongPress = vi.fn();
+    const { result } = renderHook(() => useLongPress({ onLongPress, delayMs: 500 }));
+
+    act(() => {
+      result.current.onPointerDown(pointerEvent({ pointerType: 'touch' }));
+      // The browser took the gesture over to scroll.
+      result.current.onPointerCancel();
+      vi.advanceTimersByTime(600);
+    });
+    expect(onLongPress).not.toHaveBeenCalled();
+    expect(result.current.consumedLastGesture()).toBe(false);
+  });
+
+  it('still ignores mouse and pen pointers', () => {
+    const onLongPress = vi.fn();
+    const { result } = renderHook(() => useLongPress({ onLongPress }));
+
+    act(() => {
+      result.current.onPointerDown(pointerEvent({ pointerType: 'pen' }));
+      vi.advanceTimersByTime(2000);
+    });
+    expect(onLongPress).not.toHaveBeenCalled();
+  });
+});

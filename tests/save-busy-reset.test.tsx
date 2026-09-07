@@ -44,9 +44,16 @@ afterEach(() => {
   resetSaveDialogsForTests();
 });
 
-/** The app mounts both: the card in the header, the dialogs in the overlay slot. */
+/**
+ * The app mounts both: the card in the header, the dialogs in the overlay slot.
+ *
+ * `hero`, because these tests reach the save paths that live behind the
+ * overflow menu, and the menu is the hero's (2026-09-07 — the compact header
+ * dropped its kebab, the verbs have one home). The save MACHINERY under test
+ * is the card's own and identical in both variants.
+ */
 function renderCard() {
-  return render(<><DocumentCard activeMode="editor" /><SaveDialogs /></>);
+  return render(<><DocumentCard variant="hero" activeMode="editor" /><SaveDialogs /></>);
 }
 
 /** A minimal published view; every test overrides only what it is about. */

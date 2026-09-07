@@ -638,6 +638,7 @@ src/
 │   │   ├── rv-drive-recorder.ts         # Drive data recording
 │   │   ├── rv-replay-recording.ts       # ReplayRecording component
 │   │   ├── rv-erratic.ts                # Drive_ErraticPosition
+│   │   ├── rv-drive-sew-movilink.ts     # Drive_SEWMovilink (SEW MOVI-C control/status word)
 │   │   ├── rv-mu.ts                     # MovingUnit (incl. instanced MU pool)
 │   │   ├── rv-source.ts                 # MU spawner
 │   │   ├── rv-sink.ts                   # MU consumer
@@ -1264,6 +1265,183 @@ kept matrix-dynamic by the static-freeze pass. Degrading is quiet and total: a
 missing or under-sampled `Spline`, or an unresolvable template, makes the chain
 inert with a warning; an unresolvable `ConnectedDrive` places the elements and
 never moves them — matching Unity, which logs and keeps running.
+
+### Web handling (fabric, paper, film, foil, coil)
+
+`RibbonRoller`, `RibbonWinder`, `RibbonDancer` and `RibbonPath` bring **endless
+material** to the viewer.
+Everything else that moves in realvirtual WEB is a discrete part on a conveyor or
+a chain; a web is a single continuous strip that runs over rollers, is paid out
+by one roll and taken up by another, and gets shorter on one end exactly as fast
+as it gets longer on the other.
+
+**`RibbonRoller`** is a roller: a contact radius (`RadiusMm`, or `0` to measure it
+from the mesh), a local `Axis`, and the side the web lies on.
+
+A roller is **driven** when a ROTATIONAL `Drive` sits on the SAME node with an axis
+parallel (or antiparallel) to `Axis`. Its surface speed
+
+```
+v = omega · π/180 · r · dot(driveAxis, rollerAxis)
+```
+
+is the web speed of its section, and that is the **only** speed source a web has.
+`omega` comes from the drive POSITION difference of the tick, not from
+`currentSpeed` — which is a magnitude in `DriveTo` reverse travel and under
+`positionOverwrite`, and would run a web forward while its drive turns back.
+Every other roller is a **follower** the path turns at `omega = v / r`, so a small
+idler visibly spins faster than a large one. A LINEAR drive, or one whose axis is
+not parallel to the roller axis, warns once and leaves the roller a follower;
+`RotationDirection` is presentation only and never enters the web speed.
+
+The drive is looked up in the node registry on **every** read, so adding or
+removing one in the editor takes effect on the next tick.
+
+`SpinMode: Texture` (followers only) is the cheap way to show a spinning roller:
+the node stays still and its MANTLE material scrolls by `v / (2πr)·dt` instead.
+Such a roller costs no per-tick transform and is frozen as static geometry (it
+stays out of the BatchedMesh arenas all the same — an arena shares one material
+and has no per-instance UV offset). `MantleMesh` names the mesh that scrolls;
+left empty it is the roller node itself, or the largest mapped mesh child outside
+a `Faces` node, so the end discs stay put. The effective mode is decided per tick:
+a roller that gains a drive goes back to turning immediately, and one that loses it
+returns to its authored pose and resumes scrolling.
+
+**`RibbonWinder`** is a roller whose radius follows the wound length,
+`R(L) = sqrt(CoreRadiusMm² + L·RibbonThicknessMm/π)` — the standard
+integration-technology roll build-up, written in radii. **Length is the state and
+the radius is derived from it**, never the other way round: that keeps the roll
+exactly reversible, so a rewinder run backwards returns to its authored diameter
+instead of drifting. The roll is shown by scaling a node radially, so a CAD reel
+needs no remodelling and no geometry is rebuilt per tick.
+
+That node is **the winder node itself** whenever it carries geometry: the roll IS
+the mesh, and its core is a `_Core` SIBLING, never a child — a child would scale
+with the paper and the core would visibly grow. `RollMesh` is for the two cases
+that structure does not cover: an empty parent node with mesh children, and a
+separately modelled CAD roll.
+
+A winder must be the FIRST or the LAST entry of its path's `Rollers`; it feeds
+`DiameterMm`, `WoundLengthMm`, `Empty` and `Full` back as PLC input signals. A
+winder with a rotational drive is a driven roller like any other, with `R(t)` for
+its radius — so its surface speed rises as its roll grows.
+
+**`RibbonDancer`** is a roller that also **travels** and thereby stores web. It is
+what lets two drives of one machine run at slightly different surface speeds
+without the web going slack or tearing. It splits its path into an upstream and a
+downstream section at its own departure tangent point and integrates the
+difference:
+
+```
+L = L + (v_up − v_down)·dt        position = HomeMm + L / Strands
+```
+
+It is an **integrator with anti-windup**, not a spring: at a stop, `L` is
+recomputed from the clamped position, so a reversal takes effect at once instead
+of first running out a length the machine never held.
+
+The limits are **directional and never stop a drive**. At `TravelMaxMm` only
+further filling is prevented (`v_up` is held at `v_down`), at `TravelMinMm` only
+further emptying. The web keeps running at the slower side and the opposite delta
+always frees the carriage — a symmetric stop would deadlock at zero. (Winder
+`Empty` / `Full`, by contrast, still stop every section of the group.) The PLC
+regulates on `PositionMm`, `AtMin` and `AtMax`.
+
+One dancer per path is supported; a second, or one at either end of `Rollers`, is
+ignored with a warning. A dancer shared by several strips is only legal when both
+of its neighbouring sections resolve to the same driven roller for every strip —
+in practice, when it sits before the slit; otherwise it is held at `HomeMm` for
+the whole group.
+
+**`RibbonPath`** is the web itself: an ordered, **open** chain of rollers and a
+band mesh built along the arc length. The tangents and wrap arcs are computed
+from the roller poses and radii — nothing about the path geometry is exported,
+and a rebuild only happens when a winder radius or a roller transform actually
+changed (a moving dancer is such a change, so its path rebuilds per tick). Plain
+motion costs one texture offset per section and N roller rotations.
+
+Each dancer splits the path into **sections**. A section runs at the surface speed
+of its **last** driven roller in running direction (the pulling one); several
+driven rollers in one section that differ by more than 1 % warn once, because slip
+is not simulated. A section without a driven roller takes the next driven section
+in running direction, and a trailing one the previous; a path with no driven roller
+at all stands still with a warning. Each section is a `geometry.addGroup` range on
+the one band mesh with its own cloned material, so the two sides of a dancer
+visibly run at different speeds — the clones share `map.image`, so N sections cost
+one texture upload and N draw calls.
+
+> `RibbonPath.ConnectedDrive` and `SpeedSource` are **deprecated and ignored**
+> since plan-460. They remain in the v1 schema so a plan-459 document still
+> validates; loading one that sets them logs a single warning naming the fix (put
+> a rotational `Drive` on the driving roller).
+
+Sides matter: two neighbouring rollers with the SAME `RibbonSide` are joined by an
+outer tangent, two with DIFFERENT sides by a crossed one. That is how an S-wrap
+is authored, and alternating sides along a zig-zag is what keeps every wrap a
+short arc.
+
+A **slitter** is N `RibbonPath`s sharing one unwinder. Paths that share a roller
+form one **group**, so an empty or full roll anywhere in the group stops every
+strip in the same tick and each winder's length is integrated exactly once. The
+strips do NOT have to run at the same speed: each section reads its own driven
+roller, and two rewinders pulling at different rates is exactly what the dancers
+in between are for.
+
+The mathematics lives in three modules that import nothing at all — not even
+`three`: `engine/ribbon/ribbon-geometry.ts` (tangents, arcs, arc-length sampling),
+`engine/ribbon/ribbon-winder-math.ts` (roll build-up) and
+`engine/ribbon/ribbon-dancer-math.ts` (the store balance and its anti-windup). Everything is **millimetres**
+up to and including the sample table; `RVRibbonBandMesh.write()` is the single
+mm → m boundary. The later Unity port is a transcription of those two files.
+
+`RibbonSide` defaults to **Auto**: an inner roller is wrapped on the face that looks at
+the chord between its neighbours, which is the wrap under 180° — the only one a real web
+can take (an explicit side on the far face makes the strands cross). A slitter's strips
+name the cutter as `SlitAtRoller` with the web's `FullWidthMm`: before it the path draws
+the full web centred on the first roller, after it the strip in its own lane at the last
+roller's axial offset, and of all strips slit at one roller only the first (by node path)
+draws the shared part. Paths that share ANY roller form one group with one speed.
+
+The cut is at the **arrival** tangent point of the slit roller — where the web
+meets it, which is where the blade sits — and not at the departure point. Two
+strips cut at one roller leave it at DIFFERENT angles (their next rollers
+differ), so cutting on departure made the pre-slit owner draw full-width web over
+an arc its sibling was already drawing in its own lane, and the two z-fought on
+the roller. On arrival every strip reports the same slit sample and draws only
+itself from there on.
+
+That identity rests on the sampling grid being **absolute**: `sampleArcLength`
+puts sample `i` at `i * 1000 / SamplesPerMeter` mm and the last sample on the
+path end, so the only non-uniform interval is the last one. The earlier
+`total / (count - 1)` spacing made every sample position depend on the TOTAL
+length, and two strips ending at different rewinders then rounded the same
+physical point to indices up to a sample apart — the shared web stopping short of
+the blade, or running past it. `RVRibbonBandMesh.setTextureLength` absorbs the
+short last interval as a uniform, sub-per-mille scale rather than a visible
+stretch at the winder; see its doc comment.
+
+Up to the cut the strips are one web, so their resolved wrap SIDE at each shared
+roller must agree; `RibbonManager` compares them and warns once per document when
+`RibbonSide: Auto` resolves two strips differently (it keeps drawing — the repair
+is a modelling one). The comparison is re-run whenever a path reports a changed
+`sidesVersion`, not only when the groups are built: `Auto` is re-resolved on every
+solve, so a travelling dancer can flip a shared side in the middle of a run.
+
+Web subtrees are excluded from BatchedMesh arenas and kept matrix-dynamic by the
+static-freeze pass, exactly like `Chain`. Degrading is quiet and total: an
+unresolvable roller, a winder in the middle of the list, a roller axis off by
+more than 2°, or two circles that admit no tangent make the path inert with a
+named warning, and the rollers simply stand still. Demo document:
+`../realvirtual-WebViewer-Private~/projects/Development/models/DemoRibbonSlitter.glb`
+— one unwinder, four idlers, a driven nip, a dancer per strip and two driven
+rewinders, on 3 mm material so the roll diameters visibly migrate within minutes.
+The rewinders turn at a constant angular speed, so they start slower than the nip,
+fill their dancers to `AtMax`, and overtake it as their rolls grow — the whole
+point of a dancer, on screen. `Idler_02` runs in `SpinMode: Texture`.
+
+It is **internal**, not in the public demo project; tests reach it through
+`DEV_GLB.ribbonSlitter`. Generated by the private
+`scripts/build-demo-ribbon-slitter.mjs`.
 
 ### Mechanisms (rigid-body kinematics)
 
@@ -2978,6 +3156,33 @@ discarded: it renders as a labelled wireframe placeholder and gets an entry in
 the **Problems** panel naming what was searched for (both the asset id and the
 path).
 
+**The projects dashboard on phones** (plan-458). Below the compact breakpoint
+(`MOBILE_BREAKPOINT = 900`, `src/hooks/use-mobile-layout.ts`) the three columns
+do not fit, so the window becomes one: the shell drops the activity-bar offset
+and fills the viewport, the **tree column is not rendered at all**, and the grid
+IS the screen. Navigation is a drill-down — a single tap on a folder tile goes
+in, the breadcrumb goes back up, and past three levels its middle folds behind
+an ellipsis menu (`collapseCrumbs`, `mobile-folder-view.ts`). The attached
+libraries, whose entrance is the tree column on the desktop, appear at the
+project root as tiles in their own **Libraries** section, and *Add library…*
+moves into the project menu.
+
+A tap on a document **selects** it and raises the detail pane as a bottom sheet
+(55 dvh, 72 dvh ceiling — the same measures as `MobileSelectionSheet`); opening
+is a second tap on **Open** inside it, so a mistyped tap never loads a large
+model. Closing the sheet leaves the selection standing. **Long-press** replaces
+the right-click on cards, tiles and the blank grid; it consumes its own trailing
+click, so the menu never opens with a navigation behind it. The hero band
+shrinks to a 44px row (`DocumentCard variant="compact"`).
+
+Two axes decide this, not one: `useMobileLayout()` is about WIDTH (columns,
+sheet, drill-down) and `useTouchDevice()` about the POINTER (long-press, 16px
+inputs so iOS does not zoom on focus). A narrow desktop window is compact but
+keeps its right-click; a wide touch tablet keeps three columns and gains the
+long-press. Not offered on the compact layout: touch drag-and-drop — moving a
+document stays a desktop verb, because the tree that is its only drop target is
+not there. Desktop measures are unchanged (tree 280, detail 260, search 200).
+
 **The tree shows the whole folder** (plan-445). It used to show four curated
 listings — manifest documents, `docs-index.json` targets, `*.connect.json`,
 `*.knowledge.md` — and a file in none of them was simply not there, which is why
@@ -3159,8 +3364,16 @@ explicitly (`?debug=plugins`).
 - OnSignal spawn mode not implemented for Sources
 
 Ported DriveBehaviours: `Drive_Simple`, `Drive_Cylinder`, `Drive_DestinationMotor`,
-`Drive_Speed`, `Drive_FollowPosition`, `Drive_Gear`, `Drive_PositionSwitch` and
-`Drive_ErraticPosition`. Behaviours outside that list are not ported.
+`Drive_Speed`, `Drive_FollowPosition`, `Drive_Gear`, `Drive_PositionSwitch`,
+`Drive_ErraticPosition` and `Drive_SEWMovilink` (`RVDriveSEWMovilink`,
+`rv-drive-sew-movilink.ts` — MOVILINK control word 1 / status word 1 with both
+speed encodings). Behaviours outside that list are not ported.
+
+A SEW station is connected through CONNECT's MQTT **Json** topic mode: the
+Connect panel imports a SEW symbol table (`Name;Typ;Richtung`,
+`src/core/import/sew-symbol-table.ts`) and creates the two Json topics
+`SEW/SimOUT` (receive, encoding `Auto`) and `SEW/SimIN` (publish, encoding
+`WString`, 100 ms) from it — no addresses, the signal name is the JSON key.
 
 ## Multiuser
 

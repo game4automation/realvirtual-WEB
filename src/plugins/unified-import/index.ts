@@ -46,3 +46,4 @@ export class UnifiedImportPlugin extends BaseViewerPlugin {
 
 export { createGlbFileProvider, resolveGlbFiles, glbBaseName } from './glb-file-provider';
 export { UnifiedImportDialog } from './UnifiedImportDialog';
+export { requestUnifiedImportOpen } from './UnifiedImportButton';

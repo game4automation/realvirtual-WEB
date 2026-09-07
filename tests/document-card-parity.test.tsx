@@ -184,14 +184,38 @@ describe('AssetActiveCard parity — the card', () => {
     expect((screen.getByTestId('document-card-save') as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it('renders undo/redo, disabled exactly as the document reports', () => {
+  /**
+   * Changed on purpose (2026-09-07): the compact header shows no undo/redo.
+   *
+   * `AssetActiveCard` put the arrows in the panel header because it had no
+   * other home. It has one now — Ctrl+Z / Ctrl+Shift+Z are bound globally in
+   * `HMIShell` — and the pair cost the breadcrumb the width it needed to be
+   * readable. The CAPABILITY is unchanged and still asserted above on the view;
+   * only its most cramped presentation is gone.
+   */
+  it('does not put undo/redo in the compact header — the shortcuts own that', () => {
     mountEditorCard();
-    expect((screen.getByTestId('document-card-undo') as HTMLButtonElement).disabled).toBe(false);
-    expect((screen.getByTestId('document-card-redo') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByTestId('document-card-undo')).toBeNull();
+    expect(screen.queryByTestId('document-card-redo')).toBeNull();
+    // Still published by the seam, so nothing downstream lost the verb.
+    expect(editorDocumentView(stubAssetContext()).actions.undo).toBeTypeOf('function');
   });
 
-  it('renders every old verb in the overflow menu', () => {
-    mountEditorCard();
+  /**
+   * Changed on purpose (2026-09-07): one doorway to the verbs, on the hero.
+   *
+   * The kebab used to sit in BOTH cards, and the compact one competed with the
+   * document's own name for a row barely wide enough for the name. The hero on
+   * the projects dashboard is where document-level actions live.
+   */
+  it('renders every old verb in the hero overflow menu, and offers none in compact', () => {
+    setActiveDocumentView(editorDocumentView(stubAssetContext()));
+    const compact = render(<DocumentCard variant="compact" activeMode="editor" />);
+    expect(screen.queryByLabelText('More actions')).toBeNull();
+    compact.unmount();
+
+    setActiveDocumentView(editorDocumentView(stubAssetContext()));
+    render(<DocumentCard variant="hero" activeMode="editor" />);
     fireEvent.click(screen.getByLabelText('More actions'));
     for (const id of ['save-as', 'rename', 'download', 'discard', 'share']) {
       expect(screen.getByTestId(`document-card-verb-${id}`)).toBeTruthy();
@@ -199,12 +223,22 @@ describe('AssetActiveCard parity — the card', () => {
   });
 
   it('runs a verb when it is chosen', () => {
-    const ctx = stubAssetContext();
-    setActiveDocumentView(editorDocumentView(ctx));
-    render(<DocumentCard variant="compact" activeMode="editor" />);
-    fireEvent.click(screen.getByTestId('document-card-undo'));
-    expect((ctx as never as { doc: { undo: ReturnType<typeof vi.fn> } }).doc.undo)
-      .toHaveBeenCalledTimes(1);
+    const view = editorDocumentView(stubAssetContext());
+    const ran = vi.fn(async () => {});
+    // The verb's own `run`, wrapped: what is under test is that choosing a
+    // menu item invokes the verb the seam published, not what that verb does.
+    setActiveDocumentView({
+      ...view,
+      actions: {
+        ...view.actions,
+        menu: (view.actions.menu ?? []).map(v =>
+          v.id === 'rename' ? { ...v, run: ran } : v),
+      },
+    });
+    render(<DocumentCard variant="hero" activeMode="editor" />);
+    fireEvent.click(screen.getByLabelText('More actions'));
+    fireEvent.click(screen.getByTestId('document-card-verb-rename'));
+    expect(ran).toHaveBeenCalledTimes(1);
   });
 });
 

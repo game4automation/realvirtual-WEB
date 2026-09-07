@@ -162,18 +162,15 @@ export class McpProjectTools {
   }
 
   @McpTool(
-    'List the DOCUMENTS of the open project — THE one list. Asset, model and scene are the same '
-    + 'thing: a GLB document; the folder (`folder`: the first path segment, `""` at the root) '
-    + 'is a place, not a type. Each row: id, name, path, folder, sizeBytes, modified. '
-    + '(`section` is a deprecated alias of `folder` and carries the same value.) `builtins` are '
-    + 'read-only SOURCES, not documents: opening one and saving materialises a new document. '
-    + '`published` lists the DEV-ONLY documents (`devOnly: true` in the manifest) — repo '
-    + 'fixtures that no delivered channel ships; they are ordinary rows of `documents` too. '
-    + 'filter matches name or path (case-insensitive substring); withNodeCount '
-    + 'reads each GLB header to add nodeCount (slower). Pass an id, name or path to '
-    + 'web_document_open, or its path to web_document_update / web_editor_open(source=library). '
-    + 'Note the difference from web_project_list: a PROJECT decides what project-relative paths '
-    + 'resolve against, a DOCUMENT is what is loaded in the viewport.',
+    'List the DOCUMENTS of the open project — THE one list. Asset, model and scene are one '
+    + 'thing: a GLB document. Each row: id, name, path, folder, sizeBytes, modified. `folder` '
+    + 'is the first path segment (`""` at the root) — a place, not a type; `section` is a '
+    + 'deprecated alias carrying the same value. `builtins` are read-only SOURCES; saving one '
+    + 'materialises a new document. `published` lists the DEV-ONLY documents (`devOnly: true` '
+    + 'in the manifest) — repo fixtures no delivered channel ships, and ordinary `documents` '
+    + 'rows. filter: case-insensitive substring of name/path; withNodeCount adds nodeCount by '
+    + 'reading each GLB header (slower). Pass id/name/path to web_document_open, path to '
+    + 'web_document_update or web_editor_open(source=library).',
     { readOnly: true, timeoutMs: 60_000 },
   )
   async webDocumentList(
@@ -230,10 +227,9 @@ export class McpProjectTools {
     for (const e of libEntries) {
       if (byPath.has(e.path)) continue;
       const stat = statByPath.get(e.path);
-      const file = e.path.split('/').pop() ?? e.path;
       byPath.set(e.path, {
         id: e.id ?? null,
-        name: e.label || file.replace(/\.glb$/i, ''),
+        name: e.label || listing.glbStem(e.path),
         path: e.path,
         ...folderFields(e.path),
         sizeBytes: e.sizeBytes ?? stat?.size ?? null,

@@ -25,24 +25,49 @@ export interface DeliveryProfile {
   connectLicenseKey?: string;
 }
 
-export interface MergedSnapshotProject {
-  seeded: boolean;
-  added: string[];
-  updated: string[];
-  removed: string[];
-  addPending: string[];
-  /** Paths the customer kept; carried into the next delivery so it cannot overwrite them. */
-  keptByCustomer: string[];
-  conflicts: Array<{ path: string; reason: string; sidecar: boolean; sidecarPath: string | null }>;
-}
-
-export interface MergedSnapshot {
+/** What one delivery wrote into a customer repository (plan-738 §2.4). */
+export interface DeliverySnapshot {
   version: string;
   generatedAt: string;
   remoteEmpty: boolean;
+  /** The remote was EMPTY, so every project folder was seeded. */
+  firstDelivery: boolean;
+  /**
+   * The remote had content but no `delivery/*` tag. Not a first delivery: only
+   * the project folders genuinely missing from the clone are seeded.
+   */
+  untagged: boolean;
+  /** Newest existing delivery tag; the tier gate reads its inventory from it. */
   baselineTag: string | null;
-  projects: Record<string, MergedSnapshotProject>;
-  drift: Array<{ status: string; path: string }>;
+  /** Project folders written because they did not exist in the clone. */
+  seeded: string[];
+  /** Project folders replaced because `--projects` named them. */
+  replaced: string[];
+  /** Leftover pre-738 `.vendor-*` conflict sidecars removed from `projects/` (F11). */
+  sidecarsRemoved: string[];
+}
+
+/** The baseline of a customer clone, decided by a real tag scan (§2.4.5). */
+export interface DeliveryBaseline {
+  remoteEmpty: boolean;
+  tags: string[];
+  /** Content, but no `delivery/*` tag — an existing delivery whose tags are gone. */
+  untagged: boolean;
+  /** The remote is empty. The ONLY case that seeds every project folder. */
+  firstDelivery: boolean;
+  baselineTag: string | null;
+}
+
+/** One project folder's answer to "what would a `--projects` replace destroy?" */
+export interface ProjectReplacePreviewEntry {
+  name: string;
+  diff: { added: string[]; changed: string[]; removed: string[] };
+  affected: number;
+}
+
+export interface ProjectReplacePreview {
+  projects: ProjectReplacePreviewEntry[];
+  total: number;
 }
 export interface TierManifest { defaults: string; rules: Array<Record<string, any>>; registrations: Record<string, any>; path: string }
 export function loadTierManifest(path: string): TierManifest;
@@ -75,25 +100,94 @@ export function renderFeatureMatrix(
  * Returns false when the core tree carries no demo folder.
  */
 export function copyDemoRealvirtualFolder(coreRoot: string, destinationRoot: string): boolean;
+/**
+ * Documents delivered only with a matching tier entitlement. EMPTY since plan-739 — the mechanism
+ * is kept, its two former members are unconditional now.
+ */
+export const CONDITIONAL_DELIVERED_DOCS: Map<string, string>;
+/**
+ * Rewrites links in the copied core Markdown so a target the delivery does not carry degrades to
+ * plain text instead of reaching {@link assertNoBrokenDocLinks} as a hard failure. `workspaceRoot`
+ * is the delivery destination root; `coreOutput` the `realvirtual-web/` tree inside it.
+ */
+export function curateCoreMarkdownLinks(workspaceRoot: string, coreOutput: string): void;
+/** Fails when a delivered Markdown file links a relative path that is absent from the tree. */
+export function assertNoBrokenDocLinks(stagingRoot: string): void;
 export function stageFilteredSourceTree(options: Record<string, any>): { workspaceRoot: string; coreRoot: string; privateRoot: string | null; project: any; projectKey: string | null; projectKeys: string[]; delivery: any; manifest: TierManifest };
 export function assertNoCrossTierLeak(workspaceRoot: string, manifest: TierManifest, profile: DeliveryProfile): void;
 export function assertWorkspaceGuards(workspaceRoot: string, options?: Record<string, any>): void;
 export function assertLfsPointer(repoRoot: string): void;
+/** Fails when a tracked file of `projects/<key>` is still an unfetched Git LFS pointer. */
+export function assertNoUnfetchedLfsObjects(privateRoot: string, key: string, files: Iterable<string>): void;
+/** Fails when `projects/<key>` carries any change or untracked, unignored file. */
+export function assertProjectTreeClean(privateRoot: string, key: string): void;
 export function assertNoSentinelInArtifacts(distRoot: string, sentinels: string[]): void;
 export function gitProvenance(repoRoot: string, options?: { requireTag?: boolean }): { commit: string; tags: string[] };
 export function hashTree(root: string, excludes?: string[]): string;
 export function runBuild(workspaceRoot: string, options?: Record<string, any>): { coreRoot: string; distDir: string; dryRun: boolean };
 export function assertBuildProvenance(distDir: string, expected?: Record<string, any>): Record<string, any>;
-export function applyMergedSnapshot(
+export function applySnapshot(
   stagedRoot: string,
   cloneRoot: string,
-  options: { projects: Array<{ key: string; vendor?: { managed?: string[]; handover?: string[] } | null }>; version: string; seedMissing?: boolean },
-): MergedSnapshot;
-export function renderDeliveryReport(snapshot: MergedSnapshot): string;
-export function formatMergeSummary(snapshot: MergedSnapshot): string;
-export function mergeCommitNote(snapshot: MergedSnapshot): string;
-export function summariseMerge(result: { actions: Record<string, string>; conflicts: unknown[] }): Record<string, number>;
+  options?: {
+    version?: string;
+    /** Project folders to replace as an exact snapshot; ignored on a first delivery. */
+    replaceProjects?: string[];
+    log?: (line: string) => void;
+  },
+): DeliverySnapshot;
+export function detectDeliveryBaseline(clone: string): DeliveryBaseline;
+/**
+ * Resolves `--projects` names against what this delivery carries. `all` means
+ * every vendor project plus the demo, never a folder the customer created.
+ * Throws on an unknown name, naming the right spelling for a case-only miss.
+ */
+export function resolveRequestedProjects(requested: string[] | string, available: string[]): string[];
+/** Lists what a `--projects` replace would overwrite or delete — call BEFORE applySnapshot. */
+export function previewProjectReplace(
+  stagedRoot: string,
+  cloneRoot: string,
+  names: string[],
+  options?: { log?: (line: string) => void },
+): ProjectReplacePreview;
+/** Thrown when a `--projects` replace was neither confirmed nor forced; carries exitCode 1. */
+export class ProjectReplaceAbort extends Error {
+  exitCode: number;
+}
+export function confirmProjectReplace(
+  preview: ProjectReplacePreview,
+  options?: {
+    force?: boolean;
+    log?: (line: string) => void;
+    interactive?: boolean;
+    ask?: (question: string) => string;
+  },
+): { confirmed: boolean; reason: 'no-deviation' | 'force' | 'interactive' };
+export function formatSnapshotSummary(snapshot: DeliverySnapshot): string;
+/** The paragraph the first delivery under the new model puts in its commit message (F9). */
+export function changeoverCommitNote(
+  previousManifestVersion: number | null,
+  snapshot?: DeliverySnapshot | { sidecarsRemoved?: string[] } | null,
+): string;
 export function createDeliveryManifest(options: Record<string, any>): Record<string, any>;
+
+// ─── delivery-manifest baseline (plan-738 §2.8) ──────────────────────────
+export const DELIVERY_MANIFEST_VERSION: number;
+export function baselineTagFor(version: string): string;
+export function readDeliveryManifest(raw: unknown): {
+  manifestVersion: number;
+  baselineTag: string | null;
+  projects: Record<string, any>;
+  [key: string]: any;
+};
+export function withDeliveryBaseline(
+  base: Record<string, any>,
+  // Extra keys on a project entry are accepted and ignored: a caller may still be
+  // handing over an old-shaped entry, and v3 simply has nowhere to put the rest.
+  options: { version: string; projects?: Record<string, { schemaVersion?: number | null; [key: string]: any }> },
+): Record<string, any>;
+export function parseLsFiles(output: string): Record<string, string>;
+export function parseLsTree(output: string): Record<string, string>;
 export interface PrivateSourceInventory { count: number; sha256: string; paths: string[] }
 export interface BaselineSourceInventory { paths: string[]; trusted: boolean; reason: string | null }
 export interface PrivateSourceDiff {

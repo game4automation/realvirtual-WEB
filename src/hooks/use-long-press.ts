@@ -37,8 +37,22 @@ export interface UseLongPressHandlers {
   onPointerMove: (e: React.PointerEvent) => void;
   onPointerUp: () => void;
   onPointerLeave: () => void;
+  /**
+   * The browser took the gesture over (a scroll started, a system menu opened).
+   * Same effect as a leave — the finger is no longer ours to time.
+   */
+  onPointerCancel: () => void;
   /** Cancel imperatively (e.g. when a parent handler decides the gesture was something else). */
   cancel: () => void;
+  /**
+   * Did the pointer cycle that just ended fire a long-press?
+   *
+   * A touch long-press still emits a synthetic `click` after `pointerup` in
+   * every browser, so a card that navigates on click would navigate right
+   * behind the context menu it just opened. Callers ask this FIRST in their
+   * `onClick` and return without acting. Reset on the next `pointerdown`.
+   */
+  consumedLastGesture: () => boolean;
 }
 
 export function useLongPress({
@@ -49,6 +63,7 @@ export function useLongPress({
 }: UseLongPressOptions = {}): UseLongPressHandlers {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const posRef = useRef<{ x: number; y: number } | null>(null);
+  const consumedRef = useRef(false);
 
   const cancel = useCallback(() => {
     if (timerRef.current) {
@@ -58,7 +73,12 @@ export function useLongPress({
     posRef.current = null;
   }, []);
 
+  const consumedLastGesture = useCallback(() => consumedRef.current, []);
+
   const onPointerDown = useCallback((e: React.PointerEvent) => {
+    // Cleared for EVERY pointer, not only the touches we time: a mouse click
+    // after a touch long-press must not be swallowed by a stale flag.
+    consumedRef.current = false;
     if (!enabled || !onLongPress || e.pointerType !== 'touch') return;
     // Clear any leftover timer from a previous gesture before starting a new one.
     if (timerRef.current) {
@@ -70,6 +90,7 @@ export function useLongPress({
       timerRef.current = null;
       const start = posRef.current;
       if (start && onLongPress) {
+        consumedRef.current = true;
         onLongPress(start.x, start.y);
         navigator.vibrate?.(50);
       }
@@ -100,6 +121,8 @@ export function useLongPress({
     onPointerMove,
     onPointerUp: cancel,
     onPointerLeave: cancel,
+    onPointerCancel: cancel,
     cancel,
+    consumedLastGesture,
   };
 }

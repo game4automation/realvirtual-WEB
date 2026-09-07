@@ -281,8 +281,6 @@ export class ModelPluginManager {
   private moduleCache = new Map<string, ModelPluginModule>();
   /** `ref:<scriptRef>` / `name:<modelName>` → module path. The lookup index. */
   private _moduleKeyByLookup = new Map<string, string>();
-  /** Cache project folder names for private project plugins, keyed by module path. */
-  private _projectFolderCache = new Map<string, string>();
   private readonly _importers: Record<string, () => Promise<ModelPluginModule>>;
   private readonly _scriptRefProvider: ModelPluginManagerOptions['scriptRefProvider'];
   private readonly _runtimeScriptSource: ModelPluginManagerOptions['runtimeScriptSource'];
@@ -313,7 +311,6 @@ export class ModelPluginManager {
     );
     for (const key of keys) {
       this.moduleCache.delete(key);
-      this._projectFolderCache.delete(key);
       for (const [lookup, moduleKey] of [...this._moduleKeyByLookup]) {
         if (moduleKey === key) this._moduleKeyByLookup.delete(lookup);
       }
@@ -358,7 +355,6 @@ export class ModelPluginManager {
     const mod = cached ?? await importer();
     const projectFolder = this.extractProjectFolder(path);
     this.moduleCache.set(path, mod);
-    if (projectFolder) this._projectFolderCache.set(path, projectFolder);
     for (const lookup of lookups) this._moduleKeyByLookup.set(lookup, path);
     return { mod, projectFolder };
   }
@@ -369,7 +365,11 @@ export class ModelPluginManager {
     if (!key) return null;
     const mod = this.moduleCache.get(key);
     if (!mod) return null;
-    return { mod, projectFolder: this._projectFolderCache.get(key) ?? null };
+    // Derived, not remembered: every key in the lookup index came from
+    // `_loadModule`, which stored exactly `extractProjectFolder(key)` and only
+    // when it was truthy — so `|| null` reproduces the former map byte for byte
+    // without a third map to keep in step with the other two (plan-461 V5).
+    return { mod, projectFolder: this.extractProjectFolder(key) || null };
   }
 
   /**

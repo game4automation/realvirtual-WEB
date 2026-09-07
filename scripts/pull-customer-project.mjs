@@ -21,53 +21,23 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { loadDeliveryConfig, loadTierManifest } from './_workspace-lib.mjs';
 import { assertNoSecrets, isSecretPath } from './_rv-guards.mjs';
 import { walk } from './_rv-fs-utils.mjs';
+// The tree comparison used to live here, privately — which is why the DELIVERY
+// direction had no preview at all until plan-738 gave it one. Both directions
+// now ask the same module the same question.
+import { diffTrees, fingerprintTree, printDiff } from './_tree-diff.mjs';
 import { assertValidProject } from './validate-project.mjs';
+
+export { diffTrees, fingerprintTree };
 
 const coreRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const privateRoot = resolve(coreRoot, '../realvirtual-WebViewer-Private~');
-
-//! Reads a tree into `path -> sha256`, skipping build output and Git metadata.
-//! Content, not timestamps: a Git checkout has no meaningful mtimes.
-export function fingerprintTree(root) {
-  const map = new Map();
-  if (!existsSync(root)) return map;
-  walk(root, (absolute, rel, entry) => {
-    const first = rel.split('/')[0];
-    if (entry.isDirectory()) return !['.git', 'node_modules', 'dist'].includes(entry.name);
-    if (first === '.git') return;
-    map.set(rel, createHash('sha256').update(readFileSync(absolute)).digest('hex'));
-  });
-  return map;
-}
-
-/**
- * Compares the incoming tree against the internal one.
- *
- * Returns added/changed/removed as plain path lists — the caller prints them and
- * decides. "Removed" is the interesting one: those are files that exist here and
- * would disappear, which is exactly what nobody saw before.
- */
-export function diffTrees(internalRoot, incomingRoot) {
-  const internal = fingerprintTree(internalRoot);
-  const incoming = fingerprintTree(incomingRoot);
-  const added = [];
-  const changed = [];
-  const removed = [];
-  for (const [path, hash] of incoming) {
-    if (!internal.has(path)) added.push(path);
-    else if (internal.get(path) !== hash) changed.push(path);
-  }
-  for (const path of internal.keys()) if (!incoming.has(path)) removed.push(path);
-  return { added: added.sort(), changed: changed.sort(), removed: removed.sort() };
-}
 
 /**
  * Rejects an incoming customer tree before anything is written.
@@ -128,16 +98,11 @@ export function backupInternalProject(internalRoot, projectKey) {
   return backup;
 }
 
-function printDiff(projectKey, diff) {
-  const total = diff.added.length + diff.changed.length + diff.removed.length;
-  console.log(`[pull] projects/${projectKey}: +${diff.added.length} neu  ~${diff.changed.length} geaendert  -${diff.removed.length} entfernt`);
-  for (const path of diff.added) console.log(`  +  ${path}`);
-  for (const path of diff.changed) console.log(`  ~  ${path}`);
-  // The removals are the dangerous half: these files exist internally and the
-  // customer tree does not have them, so applying makes them disappear here.
-  for (const path of diff.removed) console.log(`  -  ${path}   (verschwindet im internen Repo)`);
-  if (!total) console.log('  (keine Unterschiede)');
-  return total;
+//! Prints the pull diff. The removals are the dangerous half here: those files
+//! exist internally and the customer tree does not have them, so applying makes
+//! them disappear in OUR repository — hence the note only this direction carries.
+function printPullDiff(projectKey, diff) {
+  return printDiff(`[pull] projects/${projectKey}`, diff, { removedNote: '   (verschwindet im internen Repo)' });
 }
 
 //! Runs the whole pull; exported so the test can drive it without a real remote.
@@ -153,7 +118,7 @@ export async function pullCustomerProject({ projectKey, remote, apply = false, i
     // before anything is written is the whole point.
     assertIncomingTreeIsSafe(incoming, `incoming projects/${projectKey}`);
     const diff = diffTrees(target, incoming);
-    printDiff(projectKey, diff);
+    printPullDiff(projectKey, diff);
 
     if (!apply) {
       console.log('[dry-run] nichts geschrieben. Mit --apply uebernehmen.');

@@ -271,16 +271,25 @@ describe('active-document notify', () => {
     await settle();
     expect(posted).toHaveLength(1);
 
-    // … and the raw-`writeBlob` path actually walks through it. Pinned in
-    // source because that path writes no manifest at all, so nothing in the
-    // store can observe it — this assertion is the only thing standing between
-    // a new configuration and a gateway that never hears about it.
+    // … and the raw-write path actually reaches it. Since plan-462 B2 it no
+    // longer says so by hand: the backend the store hands out announces a
+    // written `*.connect.json` body itself. So what is pinned in source is the
+    // one thing that path still has to do — go through `backend.writeDocument`,
+    // which is where the notifier now sits. Writing the file by any other means
+    // is what would leave a new configuration invisible to a running gateway.
+    // The behaviour itself is covered in `project-store-connect-notify.test.ts`.
     const handler = hostSource.slice(hostSource.indexOf('const handleNewConnectConfig'));
     expect(handler.slice(0, handler.indexOf('const handleNewFolder')))
-      .toContain('notifyProjectChanged()');
+      .toContain('backend.writeDocument(');
   });
 
-  it('does NOT fire for setDocumentClassification (no config bearing)', async () => {
+  // plan-462 B2 turned the premise of this test around: a classification IS
+  // config-bearing, and `setDocumentClassification` notifies now — but only
+  // when it committed a manifest that actually changed. What is left here is
+  // the OTHER half of that rule, which this fixture is the natural home for: a
+  // store with no directory commits nothing, so it announces nothing. The
+  // classification contract itself lives in `project-store-connect-notify.test.ts`.
+  it('does NOT fire for setDocumentClassification when there is no manifest to commit', async () => {
     await connect();
     const entry = doc('d1', 'models/linie1.glb');
     stubProject(store, [entry]);

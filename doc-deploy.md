@@ -111,7 +111,7 @@ There is no longer any channel on which the viewer works out what it has by look
 | --- | --- |
 | Dev checkout | `public/demo-realvirtual/project.json`, checked in (plan-737) |
 | Bunny public / `--demo` | `public/demo-realvirtual/` → `dist/demo-realvirtual/` (Vite copies `public/` recursively) |
-| CONNECT embed | `public/demo-realvirtual/` → payload — **`realvirtual-Connect~/tools/stage-public.mjs` still expects the pre-737 root layout and must be updated in its own lane before the next CONNECT bundle** |
+| CONNECT embed | `public/demo-realvirtual/` → payload, staged by `realvirtual-Connect~/tools/stage-public.mjs` (migrated onto this layout by plan-739 Phase 8; `-PublicDemo` now asserts the folder against the shipped manifest, `-Public` carries no demo folder at all) |
 | Customer, project-bearing | `projects/<key>/project.json`, plus their own `models.json` on a CDN deploy |
 | Customer, projectless (`kind: standard`) | **generated at staging time** into `realvirtual-web/public/project.json` |
 | Foreign host (`discover: true`) | its own `project.json` — otherwise there is no project (see below) |
@@ -119,7 +119,7 @@ There is no longer any channel on which the viewer works out what it has by look
 Two consequences worth knowing before you touch a staging script:
 
 - **The build-time glob is gone.** `import.meta.glob('/public/models/*.glb')` used to seed the model catalogue from whatever sat in the dev checkout, and `BundledBackend` used to turn that into a synthetic project when a deploy had no manifest. Both are removed. A deploy root that serves no readable `project.json` has **no project**: `readManifest()` returns `null` and logs a named line naming the three causes it cannot tell apart (404, CORS, `file://`). This includes a *foreign* host that publishes `models.json` but no manifest — a deliberate, accepted narrowing of plan-700 F12.
-- **The generated projectless manifest is vendor-owned and lives in Zone A.** It is written by `writeGeneratedDeliveryManifest()` in `scripts/_workspace-lib.mjs`, *after* `copyCore()` has filtered the demo's own `public/project.json` out of the delivery — the order is load-bearing, since generating it earlier would delete it. It carries a `_generated` header saying so, the delivered README repeats it, and every update replaces it wholesale. There is no sidecar protection and none is intended: a standard customer who wants documents of their own creates a project under `projects/`, which is the only place an update never touches.
+- **The generated projectless manifest is vendor-owned and sits outside `projects/`.** It is written by `writeGeneratedDeliveryManifest()` in `scripts/_workspace-lib.mjs`, *after* `copyCore()` has filtered the demo's own `public/project.json` out of the delivery — the order is load-bearing, since generating it earlier would delete it. It carries a `_generated` header saying so, the delivered README repeats it, and every update replaces it wholesale. That is the point: a standard customer who wants documents of their own creates a project under `projects/`, which is the only place an update never touches.
 
 ### Public model allowlist
 
@@ -746,8 +746,14 @@ Secret values are **never** in the register: `connectLicenseKey`, `requestyApiKe
 `requestyBaseUrl` resolve from the environment first, then from the gitignored
 `customers/<slug>.secrets.json` (`secretsRef`). A credential-shaped value found inside the register
 itself is a hard error, not a warning. The remote URL is assembled from `forgejo.org` /
-`forgejo.repo` plus a hub base URL the caller supplies (`RV_FORGEJO_HUB_URL`) — the register holds
-no host name.
+`forgejo.repo` plus a hub base URL — the register holds no host name. Resolving that base URL is
+two steps and no third (plan-739): the `RV_FORGEJO_HUB_URL` environment override, otherwise
+`DEFAULT_HUB_URL` from `scripts/_rv-customers.mjs` — the one place the hub is named, imported both
+by `hubBaseUrl()` in `scripts/_workspace-lib.mjs` and by the private `scripts/deliver-release.mjs`,
+so a release run and a single delivery cannot disagree about where it is. No caller supplies it any
+more: the `delivery/<name>.json` URL fallback that used to sit between the two steps is gone with
+those files, and with it the defect that a register-only customer had no legacy file to scavenge a
+host name from.
 
 Check the register against the file system before delivering — exit 1 means a real contradiction,
 warnings do not gate:
@@ -761,108 +767,222 @@ The full command surface (`list`, `show`, `doctor`, `forgejo-sync`) is documente
 `.claude/commands/customers.md` in the Unity project; onboarding a contact is
 `.claude/commands/onboard-customer.md`.
 
-### The three zones
+### The territorial rule
 
-A customer repository is not one block. Since plan-700 it has three zones, each with its own update
-rule, because the project folder is *simultaneously* our deliverable and the customer's working file.
-Before this, the whole of `projects/<key>/` was preserved byte-for-byte — which meant no
-project-side update ever reached a delivered customer again — while everything outside it was deleted
-and replaced without a word.
+**We deliver the application; the customer's projects are theirs.** A customer repository has exactly
+one boundary, and it is a folder:
 
 ```
 rv-project-<customer>/
-├── realvirtual-web/          ZONE A — ours, replaced every delivery
-├── realvirtual-web-pro/      ZONE A
-├── connect/                  ZONE A
-├── delivery-manifest.json    ZONE A — carries the merge basis
-├── DELIVERY-REPORT.md        ZONE A — regenerated every delivery
-└── projects/
-    ├── <key-1>/
-    │   ├── models/ docs/ connect/ …   ZONE B — ours, three-way merged
-    │   ├── scenes/ settings/ layouts/ ZONE C — the customer's, never touched
-    │   └── project.json               ZONE B+C — merged field by field
-    └── <key-2>/ …
+├── realvirtual-web/          OURS — replaced in full at every delivery
+├── realvirtual-web-pro/      OURS
+├── connect/                  OURS
+├── delivery-manifest.json    OURS — records the version and the baseline tag
+└── projects/                 THEIRS
+    ├── <key-1>/              seeded once, then only written by an explicit --projects
+    ├── demo-realvirtual/     the same rule — no special case since plan-738
+    └── <anything they made>/ never read, never written, never reported
 ```
 
-| Zone | Rule | On conflict |
-|------|------|-------------|
-| **A** — everything outside `projects/**` | Replaced on every delivery | Customer changes are detected against the previous delivery tag and **listed in the report**; the replacement still happens |
-| **B** — the `vendor.managed` globs inside a project | Three-way merged against the previous delivery | **The customer's version wins.** Ours is parked beside it as `<name>.vendor-<version>.<ext>` and named in the report |
-| **C** — everything else inside a project | Never written | — |
+| Territory | What a delivery does |
+|-----------|----------------------|
+| Everything outside `projects/` | Deleted and re-copied from the staging tree. Never a file sync: delete-then-copy is what survives a case-only rename and a file↔folder swap on Windows |
+| `projects/`, first delivery | Seeded whole — every folder this delivery carries, each one delete-then-copy |
+| `projects/`, afterwards | **Nothing**, unless `--projects <name…\|all>` names a folder, and then that folder becomes an exact snapshot of what we ship |
 
-The default is deliberately asymmetric: **anything unclassified is Zone C**. A forgotten vendor glob
-costs one update that did not arrive; a glob that is too wide costs the customer's work. Only the
-first mistake is repairable.
+Customer protection comes from Git rather than from our own merge engine: the paths are disjoint, an
+update is an ordinary commit on the remote head, and the branch is never force-pushed. The two rules
+the generated README states are the whole customer-facing contract — *commit your work before you
+pull*, and *we never force-push; the core is ours, `projects/` is yours*.
 
-### The `vendor` block
+#### What this replaced, and why
 
-Zone B is declared per project, in its `project.json`:
+Until plan-738 the repository had three zones with per-file three-way merges, conflict sidecars
+(`<name>.vendor-<version>.<ext>`), a `vendor` block per project declaring managed/handover globs, a
+`DELIVERY-REPORT.md`, and drift detection. It was not wrong; it was unaffordable. All three
+development customer repositories carried **zero** customer-authored files in the delivered project
+folders (`git ls-tree` against each, 2026-09-03), so ~600 lines of merge engine plus ~900 lines of
+test had to stay correct at every future delivery to protect a case that had never once occurred.
+Package managers have never solved the same problem either — `dpkg`'s `.dpkg-new` and RPM's
+`.rpmnew` are the same parked-copy compromise.
 
-```jsonc
-"vendor": {
-  // Ours. Merged on every delivery.
-  "managed": ["models/**", "library/**", "docs/**", "connect/**", "plugins/**", "rag/**"],
-  // Exceptions INSIDE managed that belong to the customer. These win.
-  "handover": ["connect/secrets.local.json", "models/custom/**"]
-}
+The `vendor` block is gone from `project.json`. A leftover one in a customer's copy is tolerated in
+silence: it is an unknown key now, read by nothing.
+
+### Replacing a project folder on purpose
+
+`--projects` is the only way a delivery writes into `projects/` after the first one, and it is exact:
+files we no longer ship are removed, and anything the customer changed is overwritten.
+
+```bash
+node scripts/deliver.mjs mauser --push                            # core only; projects/ untouched
+node scripts/deliver.mjs mauser --projects mauser3dhmi --push     # replace that one folder, exactly
+node scripts/deliver.mjs toray  --projects all --force --push     # unattended, no confirmation
 ```
 
-A project with no `vendor` block is entirely Zone C — the pre-plan-700 behaviour, so nothing breaks by
-omission. `validate-project.mjs` refuses `**`, a bare `*`, and any glob that could reach `scenes/`,
-`settings/` or `layouts/`; that check runs before every delivery and every deploy, not in a review
-checklist. Sidecars are always Zone C, so the next delivery never cleans up the copy it left behind —
-removing one is the customer's decision.
+- **Names are case-sensitive.** `Toray` is a project and `toray` is a customer slug; a case-only miss
+  is refused with the right spelling rather than resolved (`--projects: unknown project "toray" — did
+  you mean "Toray"?`).
+- **`all` means every vendor project of this delivery plus `demo-realvirtual`** — never "everything in
+  `projects/`". No spelling of the flag can reach a folder the customer created.
+- **Before anything is deleted**, the delivery lists every file in the customer's current head that
+  the replace would overwrite or delete, and stops. The listing runs against the freshly cloned tree
+  *before* the replace; run afterwards it would compare the new content against itself and report
+  nothing. `--force` applies it unattended.
+- **On a first delivery `--projects` is a warned no-op**: the seed writes every folder anyway. That is
+  deliberate, so `deliver-release` runs across customers in mixed states without failing.
 
-### The merge basis
+Exit codes are a contract: `0` delivered (nothing of the customer's needed replacing), `1` a
+`--projects` replace was listed and nobody confirmed it, `2` the delivery failed.
 
-Every push tags the customer repository `delivery/<version>`. That tag **is** the basis the next
-delivery merges against: the customer repository already keeps a complete, trustworthy hash tree, and
-a second one carried in JSON would be ~150 KB of churn per delivery that still could not see files the
-customer created on their own. Blob OIDs are read straight out of Git (`git ls-tree` for the basis,
-`git ls-files -s` for both working sides), which is immune to LFS smudge state, CRLF conversion and
-Windows' case folding all at once.
+### The baseline tag
 
-Two situations have no basis, and they are not the same:
+Every push tags the customer repository `delivery/<version>`. The tag is what answers *has this
+repository ever received a delivery?* — scanned for real with `git tag -l 'delivery/*'`, not read as a
+name out of `delivery-manifest.json`. That indirection was a genuine hazard: a delivery whose branch
+push landed and whose tag push did not leaves a manifest naming a tag that does not exist, "no
+baseline" then reads as "first delivery", and a first delivery seeds every project folder over the
+customer's work.
 
-| Situation | What happens |
-|-----------|--------------|
-| Remote is empty (first delivery) | Full seeding — everything is written, nothing is reported |
-| Remote has content but no `delivery/<version>` tag | Files present on both sides are left alone. Vendor files **missing** at the customer are **not** silently created; they are reported as `add-pending`, because "never delivered" and "deleted on purpose" look identical without a basis. `--seed-missing` creates them after a human has read the report |
+The tag also still carries the private-source inventory the tier gate compares against, which is why
+`applySnapshot()` returns `baselineTag` with exactly its pre-738 meaning: the manifest's own tag while
+it really exists, otherwise the most recent delivery tag that does.
 
-**For the two existing customers this means the first delivery after plan-700 delivers nothing into
-Zone B.** It sets the basis and reports what is missing; the second delivery brings the updates. Say
-so when delivering, or pass `--seed-missing` deliberately.
+`delivery-manifest.json` is at **v3**. It dropped `vendorGlobs` and `keptByCustomer` — there are no
+zones left to describe and no merge outcome to record. A v2 manifest is read, not refused, so the
+first delivery after the changeover finds its baseline normally. The other direction is deliberately
+unsupported: rolling the code back means reverting the manifest with it.
+
+#### When the tag push did not land
+
+`snapshotPush()` (`scripts/generate-customer-workspace.mjs`) pushes the branch and the tag as **two
+separate** Git calls, in this order, with no transaction across them:
+
+```bash
+git push origin HEAD:main
+git push --force origin refs/tags/delivery/<version>
+```
+
+If the run dies in between — a dropped connection, a closed terminal, a hub that goes away — the
+delivery is **live at the customer and carries no tag**. That is the one delivery state a re-run
+does not repair.
+
+**How to recognise it.** The run's own output stops after the `HEAD:main` push, or the second push
+reports an error. Confirm against the remote, not against the log:
+
+```bash
+git ls-remote --tags <remote> 'refs/tags/delivery/*'   # the version just delivered is missing
+git ls-remote <remote> refs/heads/main                 # but main moved
+```
+
+**Why running the delivery again does not fix it.** The core replace is deterministic: it produces
+byte-identical content, `git add -A` stages nothing, and `git commit` exits non-zero with *nothing
+to commit, working tree clean*. The run aborts there, before it ever reaches the tag push, so the
+second attempt leaves the repository exactly as the first one did.
+
+**Recovery** — put the tag on the commit the first run pushed, by hand:
+
+```bash
+git clone <remote> rv-tag-recovery && cd rv-tag-recovery
+git log -1 --format='%H %s'                          # must be the delivery commit: "viewer <version>"
+git tag -f delivery/<version> <sha of that commit>
+git push --force origin refs/tags/delivery/<version>
+git ls-remote --tags origin 'refs/tags/delivery/*'   # verify it is there now
+```
+
+Take the SHA out of the log rather than trusting `HEAD`: if the customer has committed since, `HEAD`
+is their commit and the tag still belongs on the delivery. Forcing is not a special measure here —
+the delivery force-pushes this tag itself by design, so that re-delivering a corrected build of the
+same version needs no manual tag surgery.
+
+**Do it before the next delivery, not later.** The tag is the baseline the next delivery reads, and
+it carries the private-source inventory the tier gate compares against. With an older `delivery/*`
+tag still present the next run silently falls back to that one and gates against the wrong baseline.
+If the failed push was the repository's **first** delivery there is no `delivery/*` tag at all, the
+next run reads the repository as a first delivery, and a first delivery seeds every project folder —
+over whatever the customer has put there in the meantime.
+
+### Migrating an existing customer repository
+
+The changeover needs no state anywhere and no customer mail (a deliberate decision — the delivery is
+passive):
+
+1. Every delivery deletes any leftover `projects/**/*.vendor-*` sidecar. They sit in customer
+   territory, so the core replace never reached them, but they are vendor-produced by construction
+   and were only ever a copy of something we shipped. The step is idempotent: after the first run the
+   glob matches nothing.
+2. `DELIVERY-REPORT.md` and the old manifest sit at the repository root, i.e. in our territory, and
+   disappear with the first core replace on their own.
+3. The commit message of the first delivery under the new model carries a German paragraph explaining
+   it. It says itself exactly once — it is keyed on the manifest version that was in the repository
+   *before* the delivery, so from the second one on the repository already carries v3.
+
+Before the first real changeover delivery, run it against a throw-away repository on
+`git.realvirtual.io` first, and scan each customer repository for leftovers:
+
+```bash
+git ls-tree -r HEAD --name-only | grep -E '\.vendor-|DELIVERY-REPORT|delivery-manifest'
+```
+
+#### A repository delivered before the demo folder existed never gets it on its own
+
+`projects/demo-realvirtual/` obeys the territorial rule like every other project folder: it is
+seeded on the **first** delivery and never written again unless `--projects` names it. A repository
+whose first delivery predates plan-737 therefore does not have it, will not get it from an ordinary
+delivery, and nothing notices — there is no trigger that detects the state later. Somebody has to
+look, and then run the catch-up by hand.
+
+**Look first**, per repository, against the remote:
+
+```bash
+git clone <remote> rv-demo-check && cd rv-demo-check
+git ls-tree -d --name-only HEAD projects/            # is projects/demo-realvirtual/ among them?
+git ls-remote --tags origin 'refs/tags/delivery/*'   # which version the repository last received
+```
+
+**Then catch up**, and only with the preview in front of you. `--projects` is exact: the named folder
+becomes a snapshot of what we ship, so anything the customer put under `projects/demo-realvirtual/`
+is overwritten and anything we no longer ship there is deleted. Since plan-739 the dry run clones,
+renders the same before-view the push path renders, and writes nothing at all — no `git add`, no
+commit, no tag, no push:
+
+```bash
+node scripts/deliver.mjs <slug> --dry-run --projects demo-realvirtual   # preview only, writes nothing
+node scripts/deliver.mjs <slug> --projects demo-realvirtual --push      # only after reading the list
+```
+
+The preview lists every file the replace would overwrite or delete. If anything on it looks
+customer-authored, stop and ask them: the replace has no merge and no sidecar, and after the push
+there is no way back other than a corrective delivery.
 
 ### Several projects in one repository
 
-`delivery/<config>.json` names the customer and lists their projects:
+`customers/<slug>.json` names the customer and lists their projects:
 
 ```jsonc
 {
   "customer": "mauser",
-  "projects": ["mauser3dhmi", "mauser-line2"],   // absent → [<filename>]
-  "tier": "commercial",
-  "remote": "https://git.realvirtual.io/rv-mauser/rv-project-mauser.git"
+  "delivery": { "projects": ["mauser3dhmi", "mauser-line2"] }
 }
 ```
 
-`project` stays what it always was — the display name ("Mauser 3D HMI") — and is **not** the key.
-Merge, guards, manifest and report work per project; the generated workspace files (README,
-`settings.json`, start scripts, the CONNECT/RAG payload) are still produced for the primary project
-only. A project key resolves against every config, and an ambiguous key throws rather than guessing.
+The generated workspace files (README, `settings.json`, start scripts, the CONNECT/RAG payload) are
+produced for the primary project only. The delivery is addressed by **customer slug**:
 
 ```bash
-node scripts/deliver.mjs mauser3dhmi          # by project key
-node scripts/deliver.mjs --customer mauser    # every project of that customer
+node scripts/deliver.mjs mauser               # the customer repository, whatever it carries
+node scripts/deliver.mjs mauser3dhmi          # a project key still resolves — deprecation warning
+node scripts/deliver.mjs --customer mauser    # so does this — deprecation warning
 ```
+
+Both older forms resolve to the same repository rather than failing: they are typed from memory and
+appear in existing scripts, and a hard error would cost a release run to buy nothing.
 
 ### What the customer sees
 
-`DELIVERY-REPORT.md`, in German, at the repository root, regenerated every time: conflicts (their
-version was kept, ours is at *this* path), what was updated, added and removed, and their own changes
-outside `projects/`. A short version goes into the commit message so it is visible in Forgejo, and
-onto stdout. **A conflict exits 0** — it is a normal outcome, not a failure. Only guard violations
-abort.
+The commit in Forgejo, and the README. There is no `DELIVERY-REPORT.md` any more and no conflict file
+to resolve — the delivery either replaced our side (and says which project folders it touched on
+stdout) or it did not touch `projects/` at all.
 
 ### Publish provenance
 

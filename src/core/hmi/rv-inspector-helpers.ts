@@ -13,6 +13,7 @@ import { getConsumedFields, getIgnoredFields, isKnownComponentType } from '../en
 import { getCapabilities } from '../engine/rv-component-registry';
 import { COLLISION_ROLES } from '../engine/rv-collision-role';
 import { NODE_KNOWLEDGE_PROVENANCE_FIELDS, NODE_KNOWLEDGE_TYPE } from '../engine/rv-node-knowledge';
+import type { FieldDescriptor } from '../engine/rv-component-registry';
 import type { SignalStore } from '../engine/rv-signal-store';
 import { readSignalValue, formatValue } from './rv-value-resolver';
 import {
@@ -171,6 +172,35 @@ export function isFieldHidden(componentType: string, fieldName: string): boolean
   if (HIDDEN_FIELD_NAMES.has(fieldName)) return true;
   const perType = HIDDEN_FIELDS_PER_TYPE[componentType];
   return !!perType?.has(fieldName);
+}
+
+// ── Deprecated fields ────────────────────────────────────────────────────
+
+/**
+ * True when a schema field marked `deprecated: true` should be hidden entirely.
+ *
+ * A deprecated field drives nothing, so offering an editor for it is a lie —
+ * but silently dropping a value a document actually carries is worse, because
+ * the user would have no way of seeing WHY the machine ignores what the file
+ * says. The rule is therefore: hide it while it is empty (the overwhelmingly
+ * common case — the default of a field nobody set), and show it read-only with
+ * a "(deprecated)" tag as soon as it holds a value.
+ *
+ * "Empty" is `undefined`, `null`, `''` and `[]`. A schema default (e.g.
+ * `SpeedSource: "Drive"`) counts as a value only when it DIFFERS from the
+ * default — a document stamped with the default never set anything.
+ */
+export function isDeprecatedFieldHidden(desc: FieldDescriptor | undefined, value: unknown): boolean {
+  if (desc?.deprecated !== true) return false;
+  return !hasDeprecatedValue(desc, value);
+}
+
+/** True when a deprecated field carries a value worth showing (see above). */
+export function hasDeprecatedValue(desc: FieldDescriptor | undefined, value: unknown): boolean {
+  if (value === undefined || value === null || value === '') return false;
+  if (Array.isArray(value) && value.length === 0) return false;
+  if (desc?.default !== undefined && value === desc.default) return false;
+  return true;
 }
 
 // ── Component type suffix stripping ──────────────────────────────────────

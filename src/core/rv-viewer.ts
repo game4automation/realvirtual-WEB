@@ -158,6 +158,7 @@ import {
 } from './engine/rv-signal-reapply-registry';
 import { EnergyChainManager } from './engine/rv-energy-chain-manager';
 import { ChainManager } from './engine/rv-chain-manager';
+import { RibbonManager } from './engine/rv-ribbon-manager';
 import { MachiningManager } from './engine/rv-machining-manager';
 import {
   registerOverlayProducer, resetOverlayProducers,
@@ -465,6 +466,12 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
    *  (plan-733). Ticked from CoreSubsystems.visuals() AFTER the drive stage and
    *  re-posed from resetSimulation() AFTER the drive resets. */
   readonly chainManager: ChainManager;
+  /** Viewer-owned registry for RibbonPath components and their per-tick web
+   *  advance (plan-459). Ticked from CoreSubsystems.visuals() AFTER the drive
+   *  stage — which is also what makes the winder-master speed source a plain
+   *  read rather than a drive behaviour — and reset from resetSimulation()
+   *  AFTER the drive resets. */
+  readonly ribbonManager: RibbonManager;
   /** Viewer-owned registry for CSG machining volumes and their per-tick cut +
    *  chunk-mesh apply (plan-405). Survives model loads; `clear()` on every
    *  model switch destroys the worker-side grids and the chunk geometries,
@@ -869,6 +876,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       get sceneButtonManager() { return viewer.sceneButtonManager; },
       get energyChainManager() { return viewer.energyChainManager; },
       get chainManager() { return viewer.chainManager; },
+      get ribbonManager() { return viewer.ribbonManager; },
       get machiningManager() { return viewer.machiningManager; },
       get collisionManager() { return viewer.collisionManager; },
       markRenderDirty: () => viewer.markRenderDirty(),
@@ -1663,6 +1671,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       lampManager: this.lampManager, sceneButtonManager: this.sceneButtonManager,
       energyChainManager: this.energyChainManager,
       chainManager: this.chainManager,
+      ribbonManager: this.ribbonManager,
       machiningManager: this.machiningManager,
       collisionManager: this.collisionManager,
       errorStore: this.errorStore,
@@ -2228,6 +2237,11 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // chain reacting to it would re-pose from the stale drive position and stay
     // visibly offset until the next movement.
     this.chainManager.resetAll();
+    // plan-459 F7: the web follows the drives for the same reason the chain
+    // does — wound lengths, roll radii, roller angles and the texture offset are
+    // all derived from drive state, so this must run after the loop above and
+    // never from the 'simulation-reset' event.
+    this.ribbonManager.resetAll();
 
     // Engine-level clear: live MUs, sensor occupancy, sources, grips, counters,
     // plus per-surface texture/transform accumulators.
@@ -2696,6 +2710,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     this.sceneButtonManager = new SceneButtonManager();
     this.energyChainManager = new EnergyChainManager();
     this.chainManager = new ChainManager();
+    this.ribbonManager = new RibbonManager();
+    // plan-459 F8: winder feedback (diameter, wound length, empty, full) goes
+    // through ONE viewer-owned writer identity, like every other component that
+    // drives PLC inputs.
+    this.ribbonManager.setSignalWriter((address, value) => {
+      this.signalStore?.setByPath(address, value);
+    });
     this.machiningManager = new MachiningManager();
     // plan-394: collided bodies get the OutlinePass STATUS outline — the same
     // pulsing severity silhouette the error-message system uses (user decision
@@ -3642,6 +3663,7 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
       sceneButtonManager: this.sceneButtonManager,
       energyChainManager: this.energyChainManager,
       chainManager: this.chainManager,
+      ribbonManager: this.ribbonManager,
       machiningManager: this.machiningManager,
       collisionManager: this.collisionManager,
       outlineManager: this.outlineManager,
@@ -4291,6 +4313,13 @@ export class RVViewer extends EventEmitter<ViewerEvents> {
     // Same for Chain elements: dispose removes the runtime clones BEFORE the
     // shared template geometry/materials they reference are freed.
     this.chainManager.clear();
+    // Same for the web: dispose drops the generated band geometry, the cloned
+    // band texture and the procedural rolls BEFORE the generic geometry
+    // teardown below frees what they reference.
+    this.ribbonManager.clear();
+    this.ribbonManager.setSignalWriter((address, value) => {
+      this.signalStore?.setByPath(address, value);
+    });
     // plan-405: destroy the worker-side SDF grids (frees their WASM linear
     // memory and unsubscribes every grid-bound listener) and dispose the chunk
     // geometries — BEFORE the generic geometry teardown below, which would

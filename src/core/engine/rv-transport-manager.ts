@@ -317,6 +317,19 @@ export class RVTransportManager implements IAccumulationQuery {
   /** Seconds the sci-fi burn dissolve plays after the dwell delay, before the
    *  MU is finally removed. */
   readonly vanishDurationSec = 0.6;
+  /**
+   * Master switch for the MU spawn/vanish clip effects (plan-465, `?effects=off`).
+   *
+   * Default `true` — production behaviour is unchanged. The perf harness turns
+   * it off to make the effect its OWN measurement axis: each effect install
+   * CLONES every material of the MU (`rv-mu-dissolve.ts`), and a fresh material
+   * instance costs three.js a full `getParameters` + `getProgram` pass on its
+   * first draw. With clone-path MUs spawning continuously that is a per-spawn
+   * renderer cost which, left in, is indistinguishable from the transport cost
+   * the matrix is trying to measure. Instanced MUs never had the effect
+   * (`_startGrow` returns early), so the switch only bites on the clone path.
+   */
+  spawnVanishEffects = true;
   /** True while at least one MU is mid-dissolve — the viewer uses this to keep
    *  the (otherwise on-demand) renderer awake so the burn animates. */
   private _hasVanishing = false;
@@ -822,6 +835,7 @@ export class RVTransportManager implements IAccumulationQuery {
    */
   private _startGrow(mu: RVMovingUnit | InstancedMovingUnit, source: RVSource): void {
     if (mu.isInstanced) return;
+    if (!this.spawnVanishEffects) return;                // `?effects=off` measurement axis
     if (!source.getDischargeDirection(_growDir)) return; // free-standing source → no effect
 
     const m = mu as RVMovingUnit;
@@ -868,6 +882,12 @@ export class RVTransportManager implements IAccumulationQuery {
       return;
     }
     const m = mu as RVMovingUnit;
+    if (!this.spawnVanishEffects) {
+      // `?effects=off`: skip the burn entirely and remove the MU right away —
+      // the dwell delay has already elapsed by the time we get here.
+      mu.markedForRemoval = true;
+      return;
+    }
     if (!m.dissolve) {
       // Sweep the burn edge across the MU's current world-Y bounds.
       m.dissolve = createMUDissolve(m.node, m.aabb.min.y, m.aabb.max.y, this.isWebGPU);

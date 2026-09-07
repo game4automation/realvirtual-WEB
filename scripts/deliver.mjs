@@ -8,18 +8,31 @@
  *   node scripts/generate-customer-workspace.mjs --project <k> --push \
  *     --seed-index <...> --diagnosis-config <...> --connect-lock <tempfile>
  * with
- *   node scripts/deliver.mjs <projectKey> --push [--fast] [--dry-run]
+ *   node scripts/deliver.mjs <slug> --push [--fast] [--dry-run]
  *
  * It runs the provenance preflight up front (clean trees + release tag), auto-resolves
  * the three long path arguments (diagnosis preset, RAG seed index, CONNECT pin), then
  * spawns generate-customer-workspace.mjs and forwards its exit code.
+ *
+ * The positional is the customer SLUG (plan-738 F5) — one identity for every
+ * customer, whether they carry projects or not. The two older forms still resolve,
+ * with a deprecation warning rather than an error: a project key (`mauser3dhmi`),
+ * and `--customer <slug>`. Breaking a command somebody's fingers already know is
+ * not worth the tidiness.
  */
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { RELEASE_TAG_PATTERN, loadDeliveryConfig, loadDeliveryConfigByCustomer, readPlasticChangeset } from './_workspace-lib.mjs';
+import {
+  RELEASE_TAG_PATTERN,
+  loadDeliveryConfig,
+  loadDeliveryConfigByCustomer,
+  readPlasticChangeset,
+  resolveRequestedProjects,
+} from './_workspace-lib.mjs';
+import { customerRegistryPath } from './_rv-customers.mjs';
 import { assertValidProject } from './validate-project.mjs';
 import { ragSeedIndex, tmpDir } from './lib/rv-machine-paths.mjs';
 
@@ -59,32 +72,83 @@ function assertCleanTree(label, dir) {
   }
 }
 
+/**
+ * HEAD must carry the release tag of the version that is about to be shipped —
+ * `realvirtual-v<package.json version>`, that exact one.
+ *
+ * "Some release-shaped tag" was not enough. A HEAD that still carries only the
+ * PREVIOUS release's tag passed this check and shipped a build stamped with a
+ * version nobody ever tagged, so the artifact in the customer's hands could not
+ * be traced back to a commit. The two values are therefore named side by side
+ * in the failure: what package.json says the release is, and what HEAD claims.
+ */
 function assertReleaseTag(dir, version) {
   const tags = git(['tag', '--points-at', 'HEAD'], dir).split(/\r?\n/).filter(Boolean);
-  if (!tags.some((tag) => RELEASE_TAG.test(tag))) {
+  const releaseTags = tags.filter((tag) => RELEASE_TAG.test(tag));
+  if (releaseTags.length === 0) {
     fail(`Core HEAD carries no realvirtual-vX.Y.Z release tag:\n  ${dir}\n  Tag the release first, e.g.: git -C "${dir}" tag realvirtual-v${version}`);
   }
+  const expected = `realvirtual-v${version}`;
+  if (!releaseTags.includes(expected)) {
+    fail(`Core HEAD is tagged for a different release than package.json declares:\n`
+      + `  package.json version: ${version}, so HEAD must carry ${expected}\n`
+      + `  release tag(s) on HEAD: ${releaseTags.join(', ')}\n  ${dir}\n`
+      + `  Bump package.json, or tag this commit: git -C "${dir}" tag ${expected}`);
+  }
+  return releaseTags;
+}
+
+//! True when `token` names a register entry (`customers/<slug>.json`). That file is
+//! the identity, so the check is a file test and not a guess about spelling.
+function isRegisterSlug(token) {
+  return typeof token === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(token)
+    && existsSync(customerRegistryPath(privateRoot, token));
 }
 
 /**
- * Resolves what is to be delivered, from either form of the request.
+ * Resolves what is to be delivered — one customer repository — from any of the
+ * three accepted request forms (§2.7).
  *
- * The config file name is no longer the project key (§2.10): one file may name a
- * customer and several of their projects. `deliver.mjs <projectKey>` therefore
- * asks "which config claims this key?" rather than reading a same-named file,
- * and `deliver.mjs --customer <name>` delivers that customer's whole repository.
+ * The slug is the target form and resolves silently. The two legacy forms warn
+ * and then work: they are what is written in shell history, in the runbooks, and
+ * in `deliver-release`'s own child commands, and a hard error there would cost a
+ * release run to buy nothing.
  */
-function resolveDelivery({ projectKey, customer }) {
+export function resolveDelivery({ token, customerFlag }) {
   let config;
-  try {
-    config = customer
-      ? loadDeliveryConfigByCustomer(privateRoot, customer)
-      : loadDeliveryConfig(privateRoot, projectKey);
-  } catch (error) {
-    fail(customer
-      ? `No delivery config for customer "${customer}":\n  ${error.message}`
-      : `Cannot resolve project "${projectKey}":\n  ${error.message}\n  Is it a known customer project?`);
+  let deprecation = null;
+  if (customerFlag) {
+    try {
+      config = loadDeliveryConfigByCustomer(privateRoot, customerFlag);
+    } catch (error) {
+      fail(`No delivery config for customer "${customerFlag}":\n  ${error.message}`);
+    }
+    deprecation = `--customer is deprecated; the slug is the positional now: node scripts/deliver.mjs ${customerFlag}`;
+  } else if (isRegisterSlug(token)) {
+    try {
+      config = loadDeliveryConfigByCustomer(privateRoot, token);
+    } catch (error) {
+      fail(`Cannot deliver customer "${token}":\n  ${error.message}`);
+    }
+  } else {
+    // Not a register slug: a project key, or a legacy delivery config name. Both
+    // resolve to exactly one customer repository, and both are deprecated.
+    let projectError = null;
+    try {
+      config = loadDeliveryConfig(privateRoot, token);
+    } catch (error) {
+      projectError = error;
+      try {
+        config = loadDeliveryConfigByCustomer(privateRoot, token);
+      } catch {
+        fail(`Cannot resolve "${token}":\n  ${projectError.message}\n`
+          + '  Pass the customer slug (the name of customers/<slug>.json), e.g. node scripts/deliver.mjs mauser');
+      }
+    }
+    deprecation = `"${token}" is ${projectError ? 'a legacy delivery config name' : 'a project key'}; `
+      + `deliver.mjs takes the customer slug now: node scripts/deliver.mjs ${config.customer}`;
   }
+  if (deprecation) console.warn(`[deliver] DEPRECATED: ${deprecation}`);
   const channel = config.connectChannel ?? 'stable';
   if (!['stable', 'beta'].includes(channel)) {
     fail(`delivery.connectChannel must be "stable" or "beta" (got "${channel}") in ${config.path}`);
@@ -178,28 +242,36 @@ export async function resolveConnectLock(channel, tmpBase, fetchImpl = fetch) {
 }
 
 function printUsage() {
-  console.log(`Usage: node scripts/deliver.mjs <projectKey> [--push] [--fast] [--dry-run] [--no-rag]
-       node scripts/deliver.mjs --customer <name> [--push] ...
+  console.log(`Usage: node scripts/deliver.mjs <slug> [--push] [--fast] [--dry-run] [--no-rag]
+                                   [--projects <name…|all> [--force]]
 
 One-shot customer delivery around generate-customer-workspace.mjs.
 
+We deliver the application; the customer's projects are theirs. Everything OUTSIDE
+projects/ is replaced in full at every delivery. projects/ is seeded once, on the
+first delivery into an empty repository, and afterwards written only for the folders
+--projects names.
+
 Arguments:
-  <projectKey>   e.g. mauser3dhmi. Resolved against every delivery config in
-                 ../realvirtual-WebViewer-Private~/delivery/ — the file name no longer
-                 has to match, because one config may carry several projects.
+  <slug>         the customer, e.g. mauser — the name of
+                 ../realvirtual-WebViewer-Private~/customers/<slug>.json.
+                 A project key (mauser3dhmi) still resolves, with a deprecation warning.
 
 Flags:
-  --customer     deliver every project of one customer repository instead of one key.
-                 The only way to reach a "standard" customer: they carry no projects,
-                 so a positional <projectKey> cannot address them. Such a delivery is
-                 projectless — an empty projects/ folder, and no diagnosis package.
+  --projects     replace these project folders with THIS delivery's snapshot, exactly:
+                 files we no longer ship are removed, and anything the customer changed
+                 in them is overwritten. Names are case-sensitive (Toray, not toray).
+                 "all" means every vendor project of this delivery plus demo-realvirtual
+                 — never a folder the customer created under projects/.
+                 Without --force, everything that would be replaced or deleted is listed
+                 first and the delivery stops unless it is confirmed.
+                 On a FIRST delivery this flag is a warned no-op: the seed writes
+                 every project folder anyway.
+  --force        apply --projects unattended, without the confirmation.
+  --customer     deprecated synonym for the positional slug.
   --push         build + push the workspace to the customer remote (omit for a dry run)
   --dry-run      stage + build only, never push (the default when --push is absent)
   --fast         reuse the build cache when the lockfiles are unchanged
-  --seed-missing create vendor files that are missing at the customer's end. Only ever
-                 needed for a repository delivered before plan-700 (no baseline tag),
-                 where "never delivered" and "deleted on purpose" cannot be told apart
-                 and the report therefore only asks.
   --accept-new-private-files
                  confirm private source files that this customer has never received before.
                  Without it the delivery aborts and lists them by name: the manifest default
@@ -207,6 +279,11 @@ Flags:
                  rule says otherwise, and this is the one place that says so out loud.
   --no-rag       deliver without the CONNECT diagnosis package (no rag.zip, no connect/ folder).
                  Neither the RAG seed index nor a <projectKey>.diagnosis.json preset is needed.
+
+Exit codes:
+  0  delivered (or dry-run staged); --projects found nothing of the customer's to replace
+  1  --projects would replace or delete customer files and nobody confirmed it
+  2  the delivery failed
 
 Preflight (runs before anything is built):
   - both WebViewer git trees clean (core + private)
@@ -228,23 +305,42 @@ async function main() {
     return;
   }
 
+  if (argv.includes('--seed-missing')) {
+    fail('--seed-missing was removed with plan-738. There is no per-file merge left to seed into; '
+      + 'update a project folder with --projects <name…|all> instead.');
+  }
+
   const customerIndex = argv.indexOf('--customer');
   const customer = customerIndex >= 0 ? argv[customerIndex + 1] : null;
   if (customerIndex >= 0 && (!customer || customer.startsWith('-'))) fail('--customer needs a name, e.g. --customer mauser');
+  // Every argv slot that belongs to a flag rather than to the positional slug.
+  // `--projects` is variadic, so its values look exactly like a project key: without
+  // this, `deliver.mjs mauser --projects Toray` would read Toray as a second key and
+  // fail with "Only one <projectKey> is allowed" (plan-738 §2.7).
+  const consumed = new Set();
   // -1 + 1 === 0, so without --customer this used to drop argv[0] — the project key itself, making
   // the documented `deliver.mjs <projectKey>` form fail with "Missing <projectKey>". Only skip the
   // value slot when there actually is a --customer to consume it.
-  const customerValueIndex = customerIndex >= 0 ? customerIndex + 1 : -1;
-  const positional = argv.filter((token, index) => !token.startsWith('-') && index !== customerValueIndex);
-  if (!customer && positional.length === 0) fail('Missing <projectKey>. Try: node scripts/deliver.mjs <projectKey> --push [--fast] [--dry-run]');
-  if (positional.length > 1) fail(`Only one <projectKey> is allowed, got: ${positional.join(', ')}`);
-  if (customer && positional.length) fail(`Pass either <projectKey> or --customer, not both (got "${positional[0]}" and "${customer}").`);
+  if (customerIndex >= 0) consumed.add(customerIndex + 1);
+  const projectsIndex = argv.indexOf('--projects');
+  const requestedProjects = [];
+  if (projectsIndex >= 0) {
+    for (let i = projectsIndex + 1; i < argv.length && !argv[i].startsWith('--'); i++) {
+      consumed.add(i);
+      requestedProjects.push(...argv[i].split(',').map((entry) => entry.trim()).filter(Boolean));
+    }
+    if (!requestedProjects.length) fail('--projects needs at least one name, e.g. --projects all');
+  }
+  const positional = argv.filter((token, index) => !token.startsWith('-') && !consumed.has(index));
+  if (!customer && positional.length === 0) fail('Missing <slug>. Try: node scripts/deliver.mjs <slug> --push [--fast] [--dry-run]');
+  if (positional.length > 1) fail(`Only one <slug> is allowed, got: ${positional.join(', ')}`);
+  if (customer && positional.length) fail(`Pass either <slug> or --customer, not both (got "${positional[0]}" and "${customer}").`);
   const requestedKey = positional[0] ?? null;
-  if (requestedKey && !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(requestedKey)) fail(`Invalid project key: ${requestedKey}`);
+  if (requestedKey && !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(requestedKey)) fail(`Invalid slug: ${requestedKey}`);
 
   const push = argv.includes('--push');
   const fast = argv.includes('--fast');
-  const seedMissing = argv.includes('--seed-missing');
+  const force = argv.includes('--force');
   const acceptNewPrivateFiles = argv.includes('--accept-new-private-files');
   const dryRun = !push; // never push unless explicitly asked
 
@@ -252,7 +348,7 @@ async function main() {
 
   // ── Resolve the request to ONE customer repository. ────────────────────────────────────
   const { channel, remote, projects, primary, kind, customer: customerSlug, requestyApiKey, requestyBaseUrl } =
-    resolveDelivery({ projectKey: requestedKey, customer });
+    resolveDelivery({ token: requestedKey, customerFlag: customer });
   const projectKey = primary;
   // A `standard` customer receives the product with an empty `projects/` folder.
   // There is no corpus to embed and no diagnosis preset to read, so --no-rag is
@@ -340,7 +436,8 @@ async function main() {
   const args = projectless
     ? [generator, '--customer', customerSlug, '--connect-lock', lockPath]
     : [generator, '--project', projectKey, '--connect-lock', lockPath];
-  if (seedMissing) args.push('--seed-missing');
+  if (requestedProjects.length) args.push('--projects', ...requestedProjects);
+  if (force) args.push('--force');
   if (acceptNewPrivateFiles) args.push('--accept-new-private-files');
   if (noRag) args.push('--no-rag');
   else args.push('--seed-index', seedIndex, '--diagnosis-config', diagnosisConfig);
@@ -385,6 +482,10 @@ async function main() {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
     console.error(`[deliver] ${error.message}`);
-    process.exitCode = 1;
+    // F4's machine-readable contract, shared with the generator: 1 is reserved for
+    // "a --projects replace was shown and nobody confirmed it" — which only the
+    // generator can decide and which arrives here as its forwarded exit code.
+    // Everything that fails in THIS process is a real failure, i.e. 2.
+    process.exitCode = 2;
   });
 }

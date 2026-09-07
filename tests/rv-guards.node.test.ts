@@ -29,15 +29,12 @@ import {
   knownProjectKeys,
   assertNoSecrets,
   secretContentViolation,
-  containsHighEntropyFragment,
-  vendorGlobProblems,
+  containsHighEntropyFragment,
   isAllowedSecretSchemaPath,
   isCredentialPropertyName,
   isSecretReferenceValue,
   plaintextSecretPaths,
-  collectSecretRefKeys,
-  CUSTOMER_OWNED_FOLDERS,
-  DEFAULT_VENDOR_BLOCK,
+  collectSecretRefKeys,
 } from '../scripts/_rv-guards.mjs';
 
 const SCRIPTS = resolve(__dirname, '../scripts');
@@ -224,49 +221,6 @@ describe('secretContentViolation', () => {
     const random = 'A7bK9mQ2xR4tY6wL1zN8vC3hJ5sF0pT1uV2';
     expect(containsHighEntropyFragment(`prefix_${random.slice(0, 30)}`)).toBe(true);
     expect(containsHighEntropyFragment(`prefix_${random.slice(0, 29)}`)).toBe(false);
-  });
-});
-
-describe('vendor globs', () => {
-  it('accepts the conservative default', () => {
-    expect(vendorGlobProblems({
-      managed: [...DEFAULT_VENDOR_BLOCK.managed],
-      handover: [...DEFAULT_VENDOR_BLOCK.handover],
-    })).toEqual([]);
-  });
-
-  it('accepts an absent vendor block (the safe default is "all customer-owned")', () => {
-    expect(vendorGlobProblems(undefined)).toEqual([]);
-    expect(vendorGlobProblems(null)).toEqual([]);
-  });
-
-  it('refuses a glob that claims the whole project', () => {
-    for (const glob of ['**', '*', '**/*']) {
-      expect(vendorGlobProblems({ managed: [glob] }), glob).toHaveLength(1);
-    }
-  });
-
-  it('refuses any glob that can reach a customer-owned folder', () => {
-    for (const folder of CUSTOMER_OWNED_FOLDERS) {
-      expect(vendorGlobProblems({ managed: [folder + '/**'] }), folder).toHaveLength(1);
-    }
-    // The non-obvious one: a wildcard first segment reaches scenes/ too.
-    expect(vendorGlobProblems({ managed: ['*/*.json'] })).toHaveLength(1);
-  });
-
-  it('reports a handover glob that no managed glob covers', () => {
-    expect(vendorGlobProblems({ managed: ['models/**'], handover: ['docs/x.md'] })).toHaveLength(1);
-    expect(vendorGlobProblems({ managed: ['models/**'], handover: ['models/custom/**'] })).toEqual([]);
-  });
-
-  it('refuses a glob that escapes the project', () => {
-    expect(vendorGlobProblems({ managed: ['../other/**'] }).length).toBeGreaterThan(0);
-    expect(vendorGlobProblems({ managed: ['/etc/passwd'] }).length).toBeGreaterThan(0);
-  });
-
-  it('refuses a vendor block of the wrong shape', () => {
-    expect(vendorGlobProblems({ managed: 'models/**' })).toHaveLength(1);
-    expect(vendorGlobProblems([])).toHaveLength(1);
   });
 });
 

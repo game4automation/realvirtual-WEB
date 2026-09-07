@@ -90,6 +90,20 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     ScaleFeedbackPosition: { type: 'boolean', default: true },
   },
 
+  // plan-457 — port of Drive_SEWMovilink.cs (SEW MOVILINK unit profile).
+  Drive_SEWMovilink: {
+    ControlWord1:  { type: 'componentRef', signal: 'PLCOutputInt' },
+    SpeedSetpoint: { type: 'componentRef', signal: 'PLCOutputInt' },
+    StatusWord1:   { type: 'componentRef', signal: 'PLCInputInt' },
+    SpeedActual:   { type: 'componentRef', signal: 'PLCInputInt' },
+    MaxSpeed:      { type: 'number',  default: 100 },
+    Encoding:      { type: 'enum',    default: 'PercentNmax', enumMap: { PercentNmax: 'PercentNmax', Rpm: 'Rpm' } },
+    MaxSpeedRpm:   { type: 'number',  default: 3000 },
+    Acceleration:  { type: 'number',  default: 1000 },
+    SimulateFault: { type: 'boolean', default: false },
+    FaultCode:     { type: 'number',  default: 6 },
+  },
+
   Drive_Gear: {
     MasterDrive: { type: 'componentRef' },
     GearFactor: { type: 'number', default: 1 },
@@ -285,6 +299,72 @@ export const INLINE_SCHEMA_BASELINE: Record<string, ComponentSchema> = {
     AlignVector:           { type: 'vector3', unityCoords: true },
     InitialPosition:       { type: 'number', default: 0 },
     OffsetToDrivePosition: { type: 'number', default: 0 },
+  },
+
+  // plan-459 — fabric / web handling. Added AFTER the rv-ODT migration: not a
+  // pre-migration snapshot but the frozen reference for the determinism test.
+  // Millimetres throughout; the `Mm` suffix is part of the contract.
+  // plan-460 added SpinMode + MantleMesh. Intentional schema change: spec,
+  // JSON and baseline updated together, as this file's header prescribes.
+  RibbonRoller: {
+    RadiusMm:          { type: 'number', default: 0 },
+    Axis:              { type: 'enum', enumMap: { X: 'X', Y: 'Y', Z: 'Z' }, default: 'X' },
+    RibbonSide:           { type: 'enum', enumMap: { Auto: 'Auto', Left: 'Left', Right: 'Right' }, default: 'Auto' },
+    RotationDirection: { type: 'number', default: 1 },
+    SpinMode:          { type: 'enum', enumMap: { Transform: 'Transform', Texture: 'Texture' }, default: 'Transform' },
+    MantleMesh:        { type: 'componentRef' },
+  },
+
+  RibbonWinder: {
+    RadiusMm:             { type: 'number', default: 0 },
+    Axis:                 { type: 'enum', enumMap: { X: 'X', Y: 'Y', Z: 'Z' }, default: 'X' },
+    RibbonSide:              { type: 'enum', enumMap: { Auto: 'Auto', Left: 'Left', Right: 'Right' }, default: 'Left' },
+    RotationDirection:    { type: 'number', default: 1 },
+    CoreRadiusMm:         { type: 'number', default: 76.2 },
+    RibbonThicknessMm:       { type: 'number', default: 0.1 },
+    InitialWoundLengthMm: { type: 'number', default: -1 },
+    MaxDiameterMm:        { type: 'number', default: 0 },
+    RollMesh:             { type: 'componentRef' },
+    DiameterMm:           { type: 'componentRef', signal: 'PLCInputFloat' },
+    WoundLengthMm:        { type: 'componentRef', signal: 'PLCInputFloat' },
+    Empty:                { type: 'componentRef', signal: 'PLCInputBool' },
+    Full:                 { type: 'componentRef', signal: 'PLCInputBool' },
+  },
+
+  RibbonPath: {
+    Rollers:         { type: 'componentRefArray' },
+    // plan-460 follow-up: both fields are IGNORED and now carry the `deprecated`
+    // keyword so the inspector hides an empty one. Intentional schema change:
+    // spec JSON and baseline updated together, as this file's header prescribes.
+    ConnectedDrive:  { type: 'componentRef', deprecated: true },
+    SpeedSource:     { type: 'enum', enumMap: { Drive: 'Drive', RibbonWinder: 'RibbonWinder' }, default: 'Drive', deprecated: true },
+    RibbonWidthMm:      { type: 'number', default: 500 },
+    RibbonThicknessMm:  { type: 'number', default: 0.1 },
+    TextureLengthMm: { type: 'number', default: 1000 },
+    SamplesPerMeter: { type: 'number', default: 64 },
+    Material:        { type: 'componentRef' },
+    SlitAtRoller:    { type: 'componentRef' },
+    FullWidthMm:     { type: 'number', default: 0 },
+  },
+
+  // plan-460 — the dancer roller. It IS a RibbonRoller (same first six fields,
+  // same defaults) plus the travel axis, the store geometry and three feedback
+  // signals.
+  RibbonDancer: {
+    RadiusMm:          { type: 'number', default: 0 },
+    Axis:              { type: 'enum', enumMap: { X: 'X', Y: 'Y', Z: 'Z' }, default: 'X' },
+    RibbonSide:        { type: 'enum', enumMap: { Auto: 'Auto', Left: 'Left', Right: 'Right' }, default: 'Auto' },
+    RotationDirection: { type: 'number', default: 1 },
+    SpinMode:          { type: 'enum', enumMap: { Transform: 'Transform', Texture: 'Texture' }, default: 'Transform' },
+    MantleMesh:        { type: 'componentRef' },
+    TravelAxis:        { type: 'enum', enumMap: { X: 'X', Y: 'Y', Z: 'Z' }, default: 'Y' },
+    TravelMinMm:       { type: 'number', default: -200 },
+    TravelMaxMm:       { type: 'number', default: 200 },
+    HomeMm:            { type: 'number', default: 0 },
+    Strands:           { type: 'number', default: 2 },
+    PositionMm:        { type: 'componentRef', signal: 'PLCInputFloat' },
+    AtMin:             { type: 'componentRef', signal: 'PLCInputBool' },
+    AtMax:             { type: 'componentRef', signal: 'PLCInputBool' },
   },
 
   // plan-394 — collision role marker. Added AFTER the rv-ODT migration: not a

@@ -33,6 +33,12 @@ import { useSearchDiagnosisAvailable } from './diagnose/search-diagnose-registry
 
 // ─── Engine bridge helpers ──────────────────────────────────────────────────
 
+/** Floor for the camera distance when revealing a step target, in metres. The
+ *  plain bounding-box fit dives right onto small parts (a sensor, a chain link)
+ *  and loses the surrounding machine context that tells the operator WHERE the
+ *  part sits. */
+const REVEAL_MIN_DISTANCE = 1.0;
+
 /** Resolve the RVCustomRuntimeInstruction engine instance for a node path. */
 function getInstance(viewer: RVViewer, path: string): RVCustomRuntimeInstruction | undefined {
   const node = viewer.registry?.getNode(path);
@@ -122,7 +128,7 @@ function InstructionCard({
     if (nodes.length === 0) return;
     // isolateNodes frames the nodes itself — avoid a double camera animation.
     if (entry.isolate) viewer.isolateNodes(nodes);
-    else viewer.fitToNodes(nodes);
+    else viewer.fitToNodes(nodes, undefined, { minDistance: REVEAL_MIN_DISTANCE });
   };
 
   const onView = () => reveal(targetPaths);

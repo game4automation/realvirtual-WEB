@@ -128,6 +128,29 @@ App.tsx siblings (outside HMIShell):
 
 Individual UI elements mark themselves with `data-ui-panel` attribute for identification. The `RaycastManager` checks `data-ui-panel` to avoid 3D raycasts when clicking on UI.
 
+#### Pointer coordinates: use `rv-pointer-utils`, never your own arithmetic
+
+A plugin that raycasts from a pointer event converts client coordinates to
+Normalized Device Coordinates. There is exactly one place that does it:
+
+```typescript
+import { pointerToNDC, ndcFromRect } from '../core/engine/rv-pointer-utils';
+
+// The common case — one getBoundingClientRect() inside the helper.
+pointerToNDC(e.clientX, e.clientY, canvas, this._ndc);
+
+// When the handler ALSO needs the rect (a bounds check, a zero-size guard),
+// measure once and hand the rect over. A second getBoundingClientRect() in a
+// pointermove handler is a second forced layout on every mouse move.
+const rect = canvas.getBoundingClientRect();
+if (e.clientX < rect.left || e.clientX > rect.right) return null;
+ndcFromRect(e.clientX, e.clientY, rect, this._ndc);
+```
+
+Both write into the `out` vector you pass and return it; omit `out` and you get a
+shared module-level scratch vector that the NEXT call overwrites — fine to hand
+straight to `Raycaster.setFromCamera`, never something to store.
+
 ---
 
 ## 2. Components, Signals, and Unity Mapping
@@ -142,6 +165,7 @@ The Unity scene is exported as a **GLB file** with custom `extras` data on each 
 | `Drive_Simple` | `RVDriveSimple` | `rv-drive-simple.ts` |
 | `Drive_Cylinder` | `RVDriveCylinder` | `rv-drive-cylinder.ts` |
 | `Drive_ErraticPosition` | `RVErraticDriver` | `rv-erratic.ts` |
+| `Drive_SEWMovilink` | `RVDriveSEWMovilink` | `rv-drive-sew-movilink.ts` |
 | `Sensor` | `RVSensor` | `rv-sensor.ts` |
 | `TransportSurface` | `RVTransportSurface` | `rv-transport-surface.ts` |
 | `Source` | `RVSource` | `rv-source.ts` |
@@ -387,6 +411,29 @@ fieldRendererRegistry.register({
 });
 ```
 
+#### Rendering Markdown in a renderer: use `LazyMarkdown`
+
+`react-markdown` and `remark-gfm` must never be imported statically — a static
+import pulls both into the main chunk and undoes the code split. `LazyMarkdown`
+(`core/hmi/rv-markdown-lazy.tsx`) is the one entry point:
+
+```typescript
+import { LazyMarkdown } from '../rv-markdown-lazy';
+
+<LazyMarkdown
+  text={note}
+  components={MD_COMPONENTS}          // optional react-markdown overrides
+  fallback={<RawNote text={note} />}  // shown while loading AND on failure
+  errorBoundary                       // catch a REJECTED chunk (offline, purged CDN)
+/>
+```
+
+`Suspense` handles a pending chunk and nothing else; a rejected dynamic import
+throws, and without `errorBoundary` that throw takes your surrounding subtree
+down with it. Never add `rehype-raw` — it turns note text back into executable
+HTML, and `react-markdown` refusing raw HTML by default is the whole security
+story of the field renderer.
+
 **The step that is easy to miss: side-effect-import your module in `App.tsx`.**
 Nothing imports a renderer module for its exports — registration IS the module's
 effect, so a module nobody imports never runs. `App.tsx` carries the list:
@@ -463,6 +510,41 @@ it owns the `'collision'` aux-emphasis set and the `CollisionActive` /
    shadow.
 5. The component registers itself in `init()`/`onSceneReady()` and unregisters
    in `dispose()`.
+
+`RibbonManager` (`rv-ribbon-manager.ts`, plan-459/460) is the same pattern with one
+thing added, and it is worth reading when your components are not independent of
+each other. Web paths that share a roller are ONE machine: a slitter's strips run
+off one parent roll, so integrating that roll once per path would consume it N
+times over, and letting each path decide on its own whether to stop would leave
+its siblings running off a roll that is no longer there.
+
+So the manager groups its components (union-find over "shares a roller", rebuilt
+on register/unregister) and ticks a GROUP rather than a component:
+
+1. sample every roller's drive ONCE, so a roller shared by three strips is read
+   once and all three see the same number;
+2. read each path's SECTION speeds from its driven rollers;
+3. clamp — a winder that is empty or full zeroes every section of the whole group
+   in the same tick, a dancer at a stop clamps directionally;
+4. integrate each dancer and each winder exactly once, through its owner (the path
+   with the smallest node path — a tie-break that does not depend on registration
+   order);
+5. pose every member with its own section speeds.
+
+It is also where the alternative to a drive behaviour is on show. A web reads its
+drives directly — `(drive.currentPosition − last) / dt` on every driven roller —
+rather than through an `IDriveBehavior`, because the manager already ticks in
+`CoreSubsystems.visuals()` AFTER `drives()` and therefore sees the drive values of
+the same tick. The behaviour contract would have bought nothing the tick order
+does not already give — and would have cost an entry in `DRIVE_BEHAVIOR_MAP` and a
+sort rule in `DriveOrderPlugin`.
+
+The reverse lesson is in the same file: plan-460 REMOVED the "every path of a
+group must name the same drive" rule together with the `ConnectedDrive` field. Once
+each section reads its own driven roller there is no single group speed left to
+disagree about, and two rewinders pulling at different rates stopped being a
+modelling error and became the thing dancers exist for. When a consistency check
+is the only thing holding a design together, the design is usually the problem.
 
 **Querying capabilities:**
 

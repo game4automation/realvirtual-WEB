@@ -282,9 +282,17 @@ describe('share boot — main.ts routing', () => {
     // exactly why it needs a pinned assertion. `!urlDoc` joined 2026-08-31 for
     // the identical reason — the planner demo's own `?doc=…&mode=planner` link
     // was silently outranked by the synthesised empty scene.
+    // 2026-09-05: `?doc=new` (Option C) joined the expression as a SIBLING of
+    // the planner fallback — `urlDocNew || (plannerMode && …)` — so the guard
+    // list is now nested one level deeper. What is pinned is unchanged: the
+    // planner fallback must still exclude BOTH `?glb=` and `?doc=`.
     expect(mainSource).toMatch(
-      /const urlScene = params\.get\('scene'\)\s*\?\?\s*\(plannerMode && !params\.get\('model'\) && !urlGlb && !urlDoc \? 'empty' : null\)/,
+      /const urlScene = params\.get\('scene'\)\s*\?\?\s*\(\(urlDocNew \|\| \(plannerMode && !params\.get\('model'\) && !urlGlb && !urlDoc\)\) \? 'empty' : null\)/,
     );
+    // …and `?doc=new` is a reserved value that never becomes a document id,
+    // otherwise the new-document branch would swallow real `?doc=` links.
+    expect(mainSource).toContain("const urlDocNew = rawUrlDoc === 'new';");
+    expect(mainSource).toContain('const urlDoc = urlDocNew ? null : rawUrlDoc;');
   });
 
   it('share_SkipsActiveSceneResume: a shared link never opens in the visitor\'s last scene', async () => {

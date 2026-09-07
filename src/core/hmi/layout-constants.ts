@@ -58,6 +58,18 @@ export const PROJECTS_DASHBOARD_ZINDEX = 10500;
  */
 export const MOBILE_CHROME_ZINDEX = 10600;
 
+/**
+ * Height of a mobile bottom sheet, and the ceiling it may not pass.
+ *
+ * `dvh` rather than `vh`: on iOS Safari the URL bar makes `vh` overshoot the
+ * visible viewport, which is precisely where a sheet anchored to the bottom
+ * ends up half under the browser chrome. The ceiling keeps enough of the
+ * surface behind it visible in landscape to prove the sheet is an overlay on
+ * something and not a screen of its own.
+ */
+export const MOBILE_SHEET_HEIGHT = '55dvh';
+export const MOBILE_SHEET_MAX_HEIGHT = '72dvh';
+
 /** Width of the Settings panel. */
 export const SETTINGS_PANEL_WIDTH = 540;
 

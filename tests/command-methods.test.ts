@@ -50,8 +50,22 @@ function buildBehavior(type: 'Drive_Simple' | 'Drive_Cylinder' | 'Drive_Destinat
 
 describe('component command methods', () => {
   it('covers every schema control slot of the v1 direct drive set in both directions', () => {
-    const v1Types = bindingSlotRvKeys().filter((key) => key in DRIVE_BEHAVIOR_MAP);
-    for (const type of v1Types) {
+    // The v1 DIRECT set is named here, not derived. `bindingSlotRvKeys()` is
+    // schema-derived since the resolver rewrite: it answers with every
+    // registered type that has signal slots — Drive_SEWMovilink included —
+    // whose slots are deliberately reported as `unavailable` for lack of a
+    // command contract rather than carrying invented command methods. Deriving
+    // the list here would therefore demand command/neutralize pairs the design
+    // says must not exist. The three below are the drives that DO carry them.
+    const V1_DIRECT_TYPES = ['Drive_Simple', 'Drive_Cylinder', 'Drive_DestinationMotor'] as const;
+    // Still cross-checked against the schema registry, so a typo cannot make
+    // this loop vacuous.
+    const derived = new Set(bindingSlotRvKeys());
+    for (const type of V1_DIRECT_TYPES) {
+      expect(type in DRIVE_BEHAVIOR_MAP, `${type} is in DRIVE_BEHAVIOR_MAP`).toBe(true);
+      expect(derived.has(type), `${type} is a schema-derived binding slot key`).toBe(true);
+    }
+    for (const type of V1_DIRECT_TYPES) {
       const behavior = DRIVE_BEHAVIOR_MAP[type];
       const instance = new behavior.ctor(new Object3D()) as RVComponent & Record<string, unknown>;
       const controlSlots = Object.entries(behavior.schema)

@@ -585,6 +585,41 @@ async function saveAssetDocument(
   doc: AssetDocument,
   opts: SaveDocumentOptions = {},
 ): Promise<SaveDocumentResult> {
+  // plan-462 B3 — the lock is taken HERE, before the first side effect of the
+  // save: before the export, before the write, before `markSaved`. The old
+  // guard sat in `save-flow.ts` and covered only the editor's own button; the
+  // MCP save tool, the exit-guard save and every other caller reached the
+  // export with a test scene in `currentModelRoot` and baked its runtime poses
+  // in as the authored zero position.
+  //
+  // The owner is `save`, which is short-lived and excludes a test START for its
+  // duration (`tryLock` is fail-fast, so the test says no rather than waiting)
+  // — and is deliberately NOT refused by the document's own mutation guards,
+  // because the save legitimately calls `markSaved` from inside it.
+  const lock = doc.tryLock('save');
+  if (!lock) {
+    const owner = doc.lockOwner;
+    return {
+      kind: 'blocked',
+      reason: owner?.kind === 'test-run'
+        ? 'A test run is active (in-place test session): the scene shows runtime poses, '
+          + 'and saving now would bake them into the GLB as the authored zero position. '
+          + 'Stop the test run first, then save.'
+        : 'This document is already being saved — wait for that save to finish.',
+    };
+  }
+  try {
+    return await saveAssetDocumentLocked(viewer, doc, opts);
+  } finally {
+    doc.unlock(lock);
+  }
+}
+
+async function saveAssetDocumentLocked(
+  viewer: RVViewer,
+  doc: AssetDocument,
+  opts: SaveDocumentOptions = {},
+): Promise<SaveDocumentResult> {
   // A document addressed BY SLOT is saved by the SCENE writer, whichever
   // lineage holds it (plan-711 R2-F-A, plan-716 §2.6). `decideSaveVerb` states
   // the verb for this identity; this is where the write is actually routed, and

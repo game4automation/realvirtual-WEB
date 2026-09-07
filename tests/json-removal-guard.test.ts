@@ -100,12 +100,24 @@ describe('no JSON scene code survives under src/ (plan-413 F9)', () => {
 });
 
 describe('the shipped examples carry no .scene.json (plan-413 phase 3)', () => {
-  it('public/scenes holds GLBs and the catalogue only', () => {
+  it('the shipped demo project holds GLB bodies — no scene JSON beside them', () => {
+    // `public/scenes/` was retired in fc73a46 (plan-716: a document lives in a
+    // project, not in a folder named after its type). The shipped demo
+    // documents are under `public/demo-realvirtual/` now, declared by that
+    // project's own manifest — so THAT is what has to stay JSON-free.
     const files = Object.keys(
-      import.meta.glob('../public/scenes/*', { query: '?url', eager: true }),
+      import.meta.glob('../public/demo-realvirtual/*', { query: '?url', eager: true }),
     ).map(p => p.split('/').pop()!);
-    expect(files.length).toBeGreaterThan(0);
-    expect(files.filter(f => f.endsWith('.json') && f !== 'index.json')).toEqual([]);
+
+    // Non-vacuous: the demo bodies really are there, and they really are GLB.
+    expect(files).toContain('DemoPlanner.glb');
+    expect(files.filter(f => f.endsWith('.glb')).length).toBeGreaterThan(0);
+
+    // A scene body is a GLB. The only JSON allowed beside one is project
+    // metadata — the manifest and per-document settings — never a body.
+    const ALLOWED_JSON = /^(project\.json|.*\.settings\.json)$/;
+    expect(files.filter(f => f.endsWith('.json') && !ALLOWED_JSON.test(f))).toEqual([]);
+    expect(files.filter(f => f.endsWith('.scene.json'))).toEqual([]);
   });
 });
 

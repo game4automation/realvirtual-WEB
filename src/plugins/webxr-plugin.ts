@@ -29,6 +29,8 @@ import {
   CanvasTexture,
   PlaneGeometry,
   DoubleSide,
+  FrontSide,
+  Quaternion,
   Float32BufferAttribute,
   Color,
 } from 'three';
@@ -119,6 +121,8 @@ export class WebXRPlugin implements RVViewerPlugin {
   // Info panel
   private infoPanel: Mesh | null = null;
   private infoPanelDismissed = false;
+  private readonly infoPanelQuat = new Quaternion();
+  private readonly dollyQuat = new Quaternion();
 
   // Reusable vectors
   private readonly _headDir = new Vector3();
@@ -430,7 +434,7 @@ export class WebXRPlugin implements RVViewerPlugin {
 
     const texture = new CanvasTexture(canvas);
     const geo = new PlaneGeometry(0.8, 0.6);
-    const mat = new MeshBasicMaterial({ map: texture, transparent: true, side: DoubleSide, depthTest: false });
+    const mat = new MeshBasicMaterial({ map: texture, transparent: true, side: FrontSide, depthTest: false });
     const mesh = new Mesh(geo, mat);
     mesh.renderOrder = 9999;
     return mesh;
@@ -626,13 +630,17 @@ export class WebXRPlugin implements RVViewerPlugin {
     if (this.dolly) this.dolly.worldToLocal(worldTarget);
     this.infoPanel.position.copy(worldTarget);
 
-    // lookAt() expects world coordinates and points -Z toward the target.
-    // PlaneGeometry texture is on the +Z face. To show the texture toward the camera,
-    // we look at the reflection of the camera THROUGH the panel (i.e. away from camera).
-    const panelWorld = new Vector3();
-    this.infoPanel.getWorldPosition(panelWorld);
-    const awayFromCam = panelWorld.clone().multiplyScalar(2).sub(camPos);
-    this.infoPanel.lookAt(awayFromCam);
+    // Face the panel toward the headset. Object3D.lookAt() points the object's +Z axis
+    // at the target for non-camera objects (only cameras/lights use -Z), and the
+    // PlaneGeometry texture sits on the +Z face - so aim straight at the camera.
+    // Copying the XR camera orientation instead of lookAt() keeps the panel upright
+    // even when the head points straight down/up (degenerate lookAt roll).
+    xrCamera.getWorldQuaternion(this.infoPanelQuat);
+    if (this.dolly) {
+      this.dolly.getWorldQuaternion(this.dollyQuat);
+      this.infoPanelQuat.premultiply(this.dollyQuat.invert());
+    }
+    this.infoPanel.quaternion.copy(this.infoPanelQuat);
 
     const session = this.glRenderer!.xr.getSession();
     if (!session) return;

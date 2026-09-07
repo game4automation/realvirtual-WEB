@@ -177,18 +177,49 @@ describe('body bounds', () => {
     expect(bodyOf(manager, root).aabbOnly).toBe(false);
   });
 
-  it('marks a body aabbOnly when a REAL mesh has no boundsTree, warning once (F14)', () => {
+  it('BUILDS the missing boundsTree of a body mesh rather than falling back (F14)', () => {
+    // 2026-09-02: the batched loader stopped emitting per-mesh trees, so every
+    // role-carrying body fell to the AABB check and a Workpiece inside a
+    // Machine was a permanent box overlap. `_ensureBoundsTree` now builds the
+    // tree on the spot for an eligible mesh — a plain box qualifies, so the
+    // body keeps triangle precision and nothing is warned about.
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const scene = new Scene();
     const root = new Object3D();
     root.name = 'Machine';
-    root.add(boxMesh({ name: 'NoBVH', bvh: false }));
+    const mesh = boxMesh({ name: 'NoBVH', bvh: false });
+    root.add(mesh);
     scene.add(root);
     scene.updateMatrixWorld(true);
 
     const manager = new RVCollisionManager();
     manager.register(root, 'Machine');
     manager.rebuild();
+
+    expect(mesh.geometry.boundsTree).toBeTruthy();   // built, not skipped
+    expect(bodyOf(manager, root).aabbOnly).toBe(false);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes('boundsTree'))).toHaveLength(0);
+  });
+
+  it('keeps the AABB fallback (warning once) past the triangle budget (F14)', () => {
+    // The budget is the one case that still falls back: a body far too big to
+    // tessellate synchronously at rebuild time. 12·200² = 480 000 triangles is
+    // comfortably over the 300 000 budget in `rv-collision-manager.ts`.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const scene = new Scene();
+    const root = new Object3D();
+    root.name = 'Machine';
+    const huge = new Mesh(new BoxGeometry(1, 1, 1, 200, 200, 200), MAT);
+    huge.name = 'TooBig';
+    root.add(huge);
+    scene.add(root);
+    scene.updateMatrixWorld(true);
+
+    const manager = new RVCollisionManager();
+    manager.register(root, 'Machine');
+    manager.rebuild();
+
+    expect(huge.geometry.boundsTree).toBeFalsy();    // over budget → not built
     expect(bodyOf(manager, root).aabbOnly).toBe(true);
 
     manager.invalidate();

@@ -114,6 +114,9 @@ import { readActiveId, listMetas } from './core/hmi/scene/rv-scene-storage';
 import { setActiveSceneId } from './core/hmi/scene/rv-scene-mutations';
 import { arrayBufferOf } from './core/project/rv-scene-record';
 import { getProjectStore } from './core/project/project-store';
+import { createDocument } from './core/project/rv-document-ops';
+import { newDocumentFolderFor, newDocumentNameFor } from './core/hmi/projects/dashboard-documents';
+import { setPendingAssetOpen } from '@rv-private/plugins/asset-editor/pending-open-store';
 import { scriptRefForModelUrl } from './core/project/rv-project-refs';
 import { requestProjectCodeConsent } from './core/project/rv-project-code-consent';
 
@@ -1574,7 +1577,49 @@ async function init() {
     // the same turn, so letting `?doc=` win first would make an old bookmark
     // resolve against a parameter that is not there yet. Both end in the same
     // `openDocument` call.
-    const urlDoc = params.get('doc');
+    // `?doc=new` is a RESERVED value (2026-09-05, Option C): it never names a
+    // stored document — those ids carry the `doc_` prefix the project mints —
+    // and boots the same fresh empty scene as `?scene=empty`. It exists for the
+    // editor entry `?doc=new&mode=editor`, where the asset editor then mints a
+    // real document in the project in view (plan-719 F3) instead of showing
+    // the dashboard.
+    const rawUrlDoc = params.get('doc');
+    const urlDocNew = rawUrlDoc === 'new';
+    const urlDoc = urlDocNew ? null : rawUrlDoc;
+    // `?doc=new&mode=editor`: the document is minted HERE, before the routing
+    // and before the editor activates, for two reasons found on 2026-09-05:
+    //  - the bundled demo project is read-only, so the editor's own create
+    //    returned null and it fell back to the dashboard (plan-719 §2.11).
+    //    User decision: switch to My Workspace silently, which always exists
+    //    and is writable (plan-716 §2.2 / plan-726 follow-up).
+    //  - handing the document over as a PENDING open makes the editor take
+    //    its explicit-open branch and skip the resume chain (crash draft,
+    //    last-edited asset) that would otherwise reopen an old asset.
+    if (urlDocNew && params.get('mode') === 'editor') {
+      const store = getProjectStore();
+      const writable = store.getBackend()?.writable
+        ? true
+        : await store.openWorkspaceProject().catch(() => false);
+      if (writable) {
+        try {
+          const folder = newDocumentFolderFor(store.getProject()?.id, null);
+          const target = await createDocument(store, newDocumentNameFor(folder), { folder });
+          setPendingAssetOpen({ kind: 'document', documentId: target.documentId, path: target.relPath, name: target.name });
+          showInstruction({
+            id: 'doc-new-created',
+            text: `New asset created in ${[store.getProject()?.name, target.relPath].filter(Boolean).join('/')}`,
+            anchor: { kind: 'edge', edge: 'bottom' },
+            style: 'toast',
+            autoClearAfterMs: 4000,
+            source: 'doc-new',
+          });
+        } catch (e) {
+          // The editor's own "nothing to open" branch is the fallback — it
+          // will try the create again and, failing that, show the dashboard.
+          console.warn('[main] ?doc=new: could not create a document up front:', e);
+        }
+      }
+    }
     // ?mode=planner boots a fresh empty scene (unless an explicit ?scene/?model
     // is given) so a published link drops the user straight into layout authoring.
     //
@@ -1589,7 +1634,7 @@ async function init() {
     // empty scene silently outranked the document it pointed at.
     const plannerMode = params.get('mode') === 'planner';
     const urlScene = params.get('scene')
-      ?? (plannerMode && !params.get('model') && !urlGlb && !urlDoc ? 'empty' : null);
+      ?? ((urlDocNew || (plannerMode && !params.get('model') && !urlGlb && !urlDoc)) ? 'empty' : null);
     if (urlScene) {
       try {
         if (urlScene === 'empty') {
@@ -2127,6 +2172,13 @@ async function init() {
     const urlMode = params.get('mode');
     if (urlMode && viewer.modes.has(urlMode)) {
       viewer.modes.setMode(urlMode);
+      // `?doc=new&mode=editor` means "I want to build something": the empty
+      // document is on screen, so put the CAD import dialog up right away
+      // instead of leaving an empty stage and an unlabelled cube button.
+      if (params.get('doc') === 'new' && urlMode === 'editor') {
+        const { requestUnifiedImportOpen } = await import('./plugins/unified-import');
+        requestUnifiedImportOpen();
+      }
     } else if (publishedBootMode && viewer.modes.has(publishedBootMode)) {
       viewer.modes.setMode(publishedBootMode);
     } else if (resumeBootMode && viewer.modes.has(resumeBootMode)) {
@@ -2145,8 +2197,18 @@ async function init() {
   // --- Dev-only: test runner + debug endpoint ---
   if (import.meta.env.DEV) {
     initTestRunner();
-    const { DebugEndpointPlugin } = await import('./plugins/debug-endpoint-plugin');
-    viewer.use(new DebugEndpointPlugin(), 'core');
+    // NOT under `?perf` (plan-465 fix 2026-09-06): DebugEndpointPlugin walks
+    // every drive/sensor/surface/signal once a second, `serializeProps`-es the
+    // lot and POSTs it to Vite. On the synthetic line (216 sensors + 216
+    // surfaces) that measured ~14 % of CPU and produced fetch stalls INSIDE the
+    // observation window — the harness was largely profiling its own telemetry.
+    // Removing it took frame p50 at 100 MUs from ~45 ms to ~22 ms. Every perf
+    // report records `debugPlugins: 'off'` so a run can never be misread as
+    // having measured the normal dev configuration.
+    if (!perfMode) {
+      const { DebugEndpointPlugin } = await import('./plugins/debug-endpoint-plugin');
+      viewer.use(new DebugEndpointPlugin(), 'core');
+    }
 
     // --- Dev-only: expose the viewer for Playwright E2E + manual QA ---
     (window as unknown as { __rvViewer?: unknown }).__rvViewer = viewer;
@@ -2160,7 +2222,64 @@ async function init() {
       list: instrStore.getInstructions,
     };
 
+    // --- Dev-only: large-scale performance harness (plan-465) ---
+    // Three globals, all driven by scripts/perf-*.mjs through page.evaluate:
+    //   window.__rvSyntheticLine — build/dispose the parameterised line
+    //   window.__rvPerfProbe     — per-frame / per-step probe + report
+    //   window.__rvSyntheticLoad — in-browser signal-load generator
+    // They live behind this DEV guard (and are reached from PerfTestPlugin via
+    // globalThis, never by import), so the perf harness is 0 KB in production.
+    {
+      const { installSyntheticLineHook } = await import('./core/engine/perf/rv-synthetic-line');
+      const { RVPerfProbe } = await import('./core/engine/perf/rv-perf-probe');
+
+      installSyntheticLineHook({
+        get scene() { return viewer.scene; },
+        get transportManager() { return viewer.transportManager!; },
+        get signalStore() { return viewer.signalStore!; },
+        get drives() { return viewer.drives; },
+        fixedTimeStep: viewer.loop.fixedTimeStep,
+      });
+
+      const probe = new RVPerfProbe();
+      (window as unknown as { __rvPerfProbe?: unknown }).__rvPerfProbe = {
+        instance: probe,
+        start: () => probe.start({
+          loop: viewer.loop,
+          transport: viewer.transportManager,
+          rendererInfo: () => viewer.getRendererInfo(),
+          signalStats: () => viewer.signalStore!.stats(),
+          readSignal: (name: string) => viewer.signalStore?.get(name),
+        }),
+        stop: () => probe.stop(),
+        reset: () => probe.reset(),
+        markGc: (on: boolean) => probe.markGc(on),
+        setHeapUsed: (bytes: number | undefined) => probe.setHeapUsed(bytes),
+        report: () => probe.report(),
+        reportJSON: () => probe.reportJSON(),
+        samples: () => probe.samples(),
+      };
+
+      const { SyntheticLoadInterface } = await import('./interfaces/synthetic-load-interface');
+      let loadIface: InstanceType<typeof SyntheticLoadInterface> | null = null;
+      (window as unknown as { __rvSyntheticLoad?: unknown }).__rvSyntheticLoad = {
+        async start(cfg: Record<string, unknown> = {}) {
+          if (loadIface) loadIface.dispose();
+          loadIface = new SyntheticLoadInterface();
+          loadIface.configure(cfg);
+          viewer.use(loadIface, 'core');
+          const { INTERFACE_DEFAULTS } = await import('./interfaces/interface-settings-store');
+          await loadIface.connect({ ...INTERFACE_DEFAULTS, autoConnect: false });
+        },
+        stop() { loadIface?.dispose(); loadIface = null; },
+        stats: () => loadIface?.stats() ?? null,
+      };
+    }
+
     // --- Dev-only: MU compute-transform spike benchmark (plan-271 Phase 4) ---
+    // Installed LAST: its module graph reaches the WebGPU/TSL material factory,
+    // which a cold Vite dev server needs tens of seconds to transform. Anything
+    // installed after it would be unavailable for that whole window (plan-465).
     // window.__rvMuComputeBench(counts?, frames?) — driven by
     // scripts/mu-compute-bench.mjs (headed Chromium, real GPU).
     const { installMuComputeBench } = await import('./core/engine/rv-mu-compute-bench');
@@ -2173,7 +2292,10 @@ async function init() {
   // disabled until the user enables it in the AI tab (loadSettings defaults
   // enabled=false), so a normal page load makes no localhost connection
   // attempts. DEV / ?mcp=1 are no longer required just to see the tab.
-  {
+  // Skipped under `?perf` for the same reason as DebugEndpointPlugin above: a
+  // measurement run has no AI client and no Settings UI, so the bridge can only
+  // add work to the frame it is supposed to be measuring (plan-465 fix).
+  if (!perfMode) {
     const { McpBridgePlugin } = await import('./plugins/mcp-bridge-plugin');
     viewer.use(new McpBridgePlugin(), 'core');
   }

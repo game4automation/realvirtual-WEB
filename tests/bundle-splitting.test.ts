@@ -295,8 +295,33 @@ const distFiles = import.meta.glob('../dist/**/*.{html,js}', {
  *    satisfy is a budget that gets ignored. Public builds keep ~165 kB of headroom
  *    under it; if that slack ever matters, split the number in two rather than
  *    pinning the smaller flavour and calling the larger one broken.
+ *
+ * D) 2026-09-05 (plan-901) — re-pinned to 3_700_000 after a fresh internal
+ *    `npm run build`: 3_628_050 bytes, ~2.0 % headroom. The growth over (C) is
+ *    four merged features, none of them a splitting regression:
+ *      · the attribution chain          77cdd7e (rv-scene-loader.ts)
+ *      · the ribbon rework    0694cd9 / 46186f1 / 84434ac (rv-viewer.ts)
+ *      · the SEW Movilink drive         099fd0e (rv-signal-construction.ts)
+ *    The lazy-load candidate named in (C) — `register-des-runner`, still reached
+ *    statically from `rv-viewer.ts` and worth ~115 kB — remains the lever if this
+ *    number is to come DOWN; it needs plugin-lifecycle work and was deliberately
+ *    not attempted here. Measurement changed with this re-pin: the budget is now
+ *    read in real UTF-8 bytes (see `entryByteLength`), not UTF-16 code units, so
+ *    the constant finally means what its name says.
  */
-const ENTRY_BUDGET_BYTES = 3_515_000;
+const ENTRY_BUDGET_BYTES = 3_700_000;
+
+/**
+ * The entry chunk's size in BYTES, which is what the budget above is named in.
+ *
+ * `entryText.length` counts UTF-16 code units, and the minified bundle carries
+ * enough non-ASCII (the UI's `…`, `→`, `×`) that the two numbers differ by
+ * ~2 kB — small, but it made the budget mean something other than what it said.
+ * `TextEncoder` measures what a server actually ships.
+ */
+function entryByteLength(): number {
+  return new TextEncoder().encode(entryText).length;
+}
 
 /** Panels that MUST have their own chunk and be gone from the entry.
  *  `marker` is a literal that only exists in the panel's IMPLEMENTATION — the
@@ -402,7 +427,7 @@ describe('bundle splitting — panel chunks', () => {
   });
 
   it('T5 the entry chunk stays inside its size budget', () => {
-    expect(entryText.length).toBeLessThan(ENTRY_BUDGET_BYTES);
+    expect(entryByteLength()).toBeLessThan(ENTRY_BUDGET_BYTES);
   });
 
   it('T6 the deliberate non-targets are still in the entry', () => {
@@ -495,6 +520,6 @@ describe('bundle cost — plan-707 self-describing MCP tooling', () => {
 
   it('T9 the entry budget still holds with the feature in', () => {
     // The whole feature is bounded by the number the file already defends.
-    expect(entryText.length).toBeLessThan(ENTRY_BUDGET_BYTES);
+    expect(entryByteLength()).toBeLessThan(ENTRY_BUDGET_BYTES);
   });
 });

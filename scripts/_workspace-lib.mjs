@@ -9,13 +9,16 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import {
+  closeSync,
   cpSync,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -46,6 +49,7 @@ import {
 // deprecated fallback. Cycle note: `_rv-customers.mjs` imports `resolveTier` and
 // `loadTierManifest` from this file — see the header there.
 import {
+  DEFAULT_HUB_URL,
   SHARED_ORG,
   SHARED_REPO,
   customerRegistryPath,
@@ -56,25 +60,10 @@ import {
   resolveCustomerForProject,
   resolveCustomerSecrets,
 } from './_rv-customers.mjs';
-// The three-way decision layer (plan-700 §2.5). It is pure — maps in, actions out —
-// and this file supplies the I/O around it: the Git blob maps, the copying, the
-// sidecars and the report. _vendor-merge.mjs imports nothing from here.
-import {
-  CONFLICT_REASON,
-  MERGE_ACTION,
-  mergeProjectManifest,
-  mergeVendorTree,
-  nextCustomerOwned,
-  parseCheckAttr,
-  parseLsFiles,
-  parseLsTree,
-  projectSubtree,
-  readDeliveryManifest,
-  sidecarIsSafe,
-  sidecarPathFor,
-  summariseMerge,
-  withDeliveryBaseline,
-} from './_vendor-merge.mjs';
+// The one filesystem comparison, shared with pull-customer-project.mjs. The
+// delivery side needs it for the `--projects` preview (plan-738 §2.5), which has
+// to run BEFORE anything is deleted — see previewProjectReplace below.
+import { diffSize, diffTrees, printDiff } from './_tree-diff.mjs';
 
 export const DELIVERY_TIERS = Object.freeze(['core', 'commercial', 'restricted', 'internal']);
 // A STRICT allowlist: assertKnownKeys throws on anything not named here, so the
@@ -108,11 +97,33 @@ const REGISTRATION_KEYS = new Set(['adapter', 'requires', 'status']);
 // and still be young; `beta` says so to the customer without withholding it. Absent means
 // `stable`, so every existing registration keeps its meaning unchanged.
 const REGISTRATION_STATUSES = Object.freeze(['stable', 'beta']);
+// The `.gitattributes` written into every customer workspace. Each line must name a path that
+// something actually STAGES there — a rule for a path nobody writes is not harmless, it is a
+// silent absence of LFS.
+//
+// That is exactly what happened until plan-739 (F12): the library line read
+// `realvirtual-web/public/models/library/**/*.glb`, one segment too many. `copyLibraryIntoCore()`
+// stages the bundled library to `<workspace>/realvirtual-web/public/library/<category>/`
+// (`LIBRARY_ROOT = 'library'`, beside `models/`, never inside it), so no filter matched and
+// 17 GLB files — 68,217,972 bytes measured 2026-09-07 — went into every customer repository as
+// raw blobs, in the history, forever.
+//
+// The two `public/models/` lines are gone with it: `deliveredPublicModels()` returns an EMPTY set
+// in both of its branches, so nothing is ever staged under `realvirtual-web/public/models/`. The
+// demo travels as `projects/demo-realvirtual/` and is covered by the `projects/**` line.
+//
+// The core rule is deliberately the WHOLE core tree, not `public/library/`, because enumerating
+// the places that happen to hold a GLB today is precisely the mistake above. Measured against a
+// real `hs-heilbronn` staging on 2026-09-07, a library-only rule still left seven core GLBs as
+// raw blobs — `public/embed/vignettes/` and the six `schema/v1/conformance/` fixtures, 1,854,588
+// bytes — none of which anybody had thought to name.
+//
+// tests/customer-workspace.node.test.ts asserts the invariant behind this list rather than the
+// list itself: every staged `*.glb` outside `projects/` is covered by one of these patterns.
 const GENERATED_GIT_ATTRIBUTES = [
   'connect/rag.zip filter=lfs diff=lfs merge=lfs -text',
   'projects/**/*.glb filter=lfs diff=lfs merge=lfs -text',
-  'realvirtual-web/public/models/*.glb filter=lfs diff=lfs merge=lfs -text',
-  'realvirtual-web/public/models/library/**/*.glb filter=lfs diff=lfs merge=lfs -text',
+  'realvirtual-web/**/*.glb filter=lfs diff=lfs merge=lfs -text',
 ];
 //! Node.js major version the workspace is delivered for. Single source for `.nvmrc`,
 //! the start-script preflight, and the README prerequisites.
@@ -141,14 +152,26 @@ const ALWAYS_DELIVERED_DOCS = [
   // rv-path.ts lives in src/core/engine and `Path` is a normative component in rv-odt.json — so
   // it ships unconditionally rather than behind an entitlement.
   'doc-path-fleet-control.md',
+  // Unconditional since plan-739. Both used to sit in CONDITIONAL_DELIVERED_DOCS behind the
+  // `layout-planner` / `multiuser` entitlements, which gated the DOCUMENT while the code shipped
+  // to everyone anyway: the layout planner is statically imported by src/main.ts (see
+  // LIBRARY_CONSUMER_DIR below) and the multiuser connection modes live in src/core/hmi. Gating a
+  // guide to code every customer receives only produced customers who could not read about what
+  // they had.
+  'doc-layout-planner.md',
+  'doc-multiuser-system.md',
 ];
+// Documents delivered only when the customer holds the matching tier entitlement.
+//
+// EMPTY since plan-739, and deliberately kept as a mechanism rather than deleted: its two former
+// entries (doc-layout-planner.md / doc-multiuser-system.md) moved to ALWAYS_DELIVERED_DOCS
+// because the code they document ships to every customer regardless. The gate itself is still
+// wired — `selectedDocumentation` reads this map, and `curateCoreMarkdownLinks` degrades links to
+// its members — so the next genuinely entitlement-bound guide is one line of work, not a rebuild.
+export const CONDITIONAL_DELIVERED_DOCS = new Map([]);
 // DESIGN.md and PRODUCT.md used to be delivered from here. They now live in the private sibling
 // (brand and strategy are not published on the public mirror), so this tree cannot deliver them;
 // the code itself — src/core/hmi/theme.ts and signal-colors.ts — is the authority a customer has.
-const CONDITIONAL_DELIVERED_DOCS = new Map([
-  ['doc-layout-planner.md', 'layout-planner'],
-  ['doc-multiuser-system.md', 'multiuser'],
-]);
 const NEVER_DELIVERED_DOCS = new Set([
   'doc-deploy.md', 'doc-plc-programming.md', 'doc-render-picking.md', 'PRODUCT.md',
 ]);
@@ -158,6 +181,23 @@ const DELIVERY_DOC_LINK_REDIRECTS = new Map([
 const NON_DELIVERED_DOC_LINK_PREFIXES = [
   'tests/', 'e2e/', 'scripts/', 'mcp-bridge/', '.claude/', '.github/', 'public/models/', 'public/scenes/',
 ];
+// A link into a SIBLING CHECKOUT: `../realvirtual-Connect~/doc-connect.md` and friends. The `~`
+// suffix marks a Unity-hidden sibling folder in the Assets tree; no such folder is ever staged.
+//
+// This predicate exists because `isWithin()` is structurally blind to that case
+// (plan-739 section 2.4). `curateCoreMarkdownLinks` runs with `workspaceRoot = destinationRoot`
+// and the document sitting in `destinationRoot/realvirtual-web`, so
+// `resolve(destinationRoot/realvirtual-web, '../realvirtual-Connect~/doc-connect.md')` lands on
+// `destinationRoot/realvirtual-Connect~/doc-connect.md` — INSIDE the workspace root by
+// `isWithin()`, even though that folder is never created. No other predicate fired either, so the
+// link survived curation and `assertNoBrokenDocLinks` then failed its real `existsSync` check and
+// took every delivery channel down with it.
+//
+// KNOWN LIMITATION, accepted: the pattern anchors exactly ONE `../` hop. A sibling link written
+// with two or more hops from a more deeply nested document would still reach
+// `assertNoBrokenDocLinks` and throw hard. No such link exists today; the real-doc staging test in
+// tests/customer-workspace.node.test.ts catches the first commit that introduces one.
+const SIBLING_CHECKOUT_LINK = /^\.\.\/[^/]+~\//;
 // Delivered content from the core `public/models/` tree, relative to `public/`. The rest of
 // that tree stays internal: test GLBs, CAD import scratch files and work-in-progress library
 // assets are only partially tracked by Git and can hold other customers' geometry, so the
@@ -471,28 +511,24 @@ function warnLegacyDeliveryConfig(configName) {
 }
 
 /**
- * Base URL of the git hub, resolved without a host name in this repository.
+ * Base URL of the git hub: the environment override, else the shared constant.
  *
- * `assert-public-safe.mjs` runs over this file before every mirror push, so the
- * hub host is never typed here. Order: an explicit environment override, then
- * the host of the legacy `delivery/*.json` remote of this very customer — which
- * is where the URL came from before the register existed and is therefore
- * provably the right one. Neither available is a clear error, not a guess.
+ * Two steps, and no third (plan-739 F6). `RV_FORGEJO_HUB_URL` points a rehearsal
+ * at another hub; with nothing set, {@link DEFAULT_HUB_URL} from
+ * `_rv-customers.mjs` answers — the ONE place the hub is named, imported here and
+ * by the private `scripts/deliver-release.mjs`.
+ *
+ * The `delivery/*.json` URL fallback that used to sit between the two is gone
+ * with those files. It only ever answered for a customer that HAD a legacy
+ * config: mauser and wmyb resolved, hs-heilbronn, iotsolution and toray threw
+ * "no hub base URL" unless the operator remembered the variable. That is the
+ * defect this replaces, not a capability it removes. `loadDeliveryConfig`'s
+ * legacy LOAD mode is untouched — only the URL scavenging is.
  */
-function hubBaseUrl(privateRoot, customer) {
+function hubBaseUrl() {
   const override = process.env.RV_FORGEJO_HUB_URL;
   if (typeof override === 'string' && /^https?:\/\//i.test(override.trim())) return override.trim();
-  for (const name of [...customer.delivery.projects, customer.customer]) {
-    const legacy = join(privateRoot, 'delivery', `${name}.json`);
-    if (!existsSync(legacy)) continue;
-    const remote = readJson(legacy, `delivery/${name}.json`)?.remote;
-    if (typeof remote !== 'string' || !/^https?:\/\//i.test(remote)) continue;
-    try {
-      return new URL(remote).origin;
-    } catch { /* an unparsable legacy remote is no source of truth */ }
-  }
-  throw new Error(`Cannot build the git remote of customer "${customer.customer}": no hub base URL. `
-    + 'Set RV_FORGEJO_HUB_URL, or keep the legacy delivery config until the host is configured elsewhere.');
+  return DEFAULT_HUB_URL;
 }
 
 /**
@@ -561,7 +597,7 @@ function deliveryConfigFromCustomer(privateRoot, customer, manifest) {
     kind: customer.kind,
     tier: customer.delivery.tier,
     restrictedFeatures: [...customer.delivery.restrictedFeatures],
-    remote: customerRemoteUrl(customer, hubBaseUrl(privateRoot, customer)),
+    remote: customerRemoteUrl(customer, hubBaseUrl()),
     mirror: customer.delivery.mirror,
     connectChannel: customer.delivery.connectChannel,
     connectLicenseKey: secrets.connectLicenseKey,
@@ -644,7 +680,7 @@ export function sharedDeliveryTarget(privateRoot, manifest = loadTierManifest(pr
   return {
     org: SHARED_ORG,
     repo: SHARED_REPO,
-    remote: customerRemoteUrl(shared[0], hubBaseUrl(privateRoot, shared[0])),
+    remote: customerRemoteUrl(shared[0], hubBaseUrl()),
     customers: shared.map((customer) => customer.customer).sort(),
   };
 }
@@ -1017,6 +1053,117 @@ function deliveredPublicModels(coreRoot) {
   return new Set();
 }
 
+//! The Git-tracked files under `projects/<key>`, as paths RELATIVE TO THAT FOLDER.
+//!
+//! The working tree of a project folder is a workshop: deleted geometry parked in `.trash/`,
+//! autosaved `*-draft_*.glb`, `*.bak` copies of manifests. `PRIV/.gitignore` already keeps all
+//! of it out of the repository, so the Git index — not the directory listing — is the statement
+//! of what a project actually IS. 31 files and 153 MB of it were measured on 2026-09-07,
+//! including 45 MB of deleted customer geometry that the working-tree copy would have handed to
+//! the next customer (plan-739 F8).
+//!
+//! **The prefix strip is normative.** `git ls-files` answers in repository-relative form
+//! (`projects/<key>/project.json`) while `copyTree` builds its `rel` against
+//! `sourceRoot = projects/<key>` and therefore asks about `project.json`. Without the strip no
+//! path ever matches, `copyTree` copies nothing, and the customer receives an EMPTY project
+//! folder with no error anywhere.
+//!
+//! Returns null when the private tree carries no usable Git index — exactly like
+//! {@link trackedPublicModels}, and for the same reason: test fixtures assemble a private root
+//! on disk without a repository and must keep staging what is there. A real delivery cannot
+//! take that branch, because `deliver.mjs` refuses to run unless the private repo is a clean
+//! Git checkout.
+function gitTrackedProjectFiles(privateRoot, key) {
+  if (!existsSync(join(privateRoot, '.git'))) return null;
+  const prefix = `projects/${key}/`;
+  let listed;
+  try {
+    listed = execFileSync('git', ['ls-files', '-z', '--', `projects/${key}`],
+      { cwd: privateRoot, maxBuffer: 256 * 1024 * 1024 }).toString('utf8');
+  } catch {
+    return null;
+  }
+  const files = new Set(listed.split('\0').filter(Boolean).map(toPosix)
+    .filter((path) => path.startsWith(prefix))
+    .map((path) => path.slice(prefix.length)));
+  // A folder that answers with nothing would be staged empty and shipped empty. That is the
+  // exact silent failure the prefix rule above exists to prevent, so it is stated out loud
+  // here as well rather than trusted to one line of string arithmetic.
+  if (files.size === 0) {
+    throw new Error(`No Git-tracked file under projects/${key} in ${privateRoot}. `
+      + 'The delivery would ship an empty project folder — commit the project before delivering it.');
+  }
+  return files;
+}
+
+//! Every directory that holds a tracked file somewhere beneath it, in `copyTree`'s `rel` form.
+//!
+//! `copyTree` calls its filter for DIRECTORIES too, and `git ls-files` lists only files. A
+//! filter that answers "not tracked" for a directory stops the descent right there and no
+//! subdirectory is ever entered — so this set is not an optimisation, it is what lets nested
+//! project content reach the customer at all.
+function trackedDirectories(files) {
+  const directories = new Set();
+  for (const file of files) {
+    const segments = file.split('/');
+    for (let index = 1; index < segments.length; index++) {
+      directories.add(segments.slice(0, index).join('/'));
+    }
+  }
+  return directories;
+}
+
+const LFS_POINTER_PREFIX = 'version https://git-lfs.github.com/spec/v1';
+
+//! Aborts when a tracked project file is an unfetched Git LFS pointer.
+//!
+//! The same 100-byte probe as {@link assertLfsPointer}, read the other way round: there the
+//! pointer is what must be staged, here it is what must never be. A pointer whose object was
+//! never pulled is a 130-byte text file where a model belongs, and nothing downstream notices
+//! — not the build, not the size guard, not the customer until they open the project. Failing
+//! the delivery is strictly better than completing it wrong (plan-739 F9).
+export function assertNoUnfetchedLfsObjects(privateRoot, key, files) {
+  const root = join(privateRoot, 'projects', key);
+  for (const rel of files) {
+    const absolute = join(root, rel);
+    // A tracked path that is not on disk is a deleted-but-not-committed file; the untracked
+    // guard reports that case with a far better message, so it is not duplicated here.
+    if (!existsSync(absolute) || !statSync(absolute).isFile()) continue;
+    const buffer = Buffer.alloc(100);
+    const handle = openSync(absolute, 'r');
+    let read = 0;
+    try {
+      read = readSync(handle, buffer, 0, buffer.length, 0);
+    } finally {
+      closeSync(handle);
+    }
+    if (buffer.subarray(0, read).toString('utf8').startsWith(LFS_POINTER_PREFIX)) {
+      throw new Error(`projects/${key}/${rel} is an unfetched Git LFS pointer, not the file itself.\n`
+        + `  Run "git lfs pull" in ${privateRoot} before delivering.`);
+    }
+  }
+}
+
+//! Aborts when the project folder carries anything Git does not track.
+//!
+//! Modelled on `assertCleanTree` (deliver.mjs), narrowed to one project folder and widened to
+//! untracked files: `--untracked-files=all` lists every file individually, and `.gitignore`
+//! keeps the local junk out of the answer — ignored material reports as `!!`, which porcelain
+//! omits. What is left is either work someone forgot to commit or material with no business in
+//! a customer repository. Both are a decision for a human, not for the staging, which is why
+//! this runs BEFORE anything is copied (plan-739 F9).
+export function assertProjectTreeClean(privateRoot, key) {
+  const status = execFileSync('git',
+    ['status', '--porcelain', '--untracked-files=all', '--', `projects/${key}`],
+    { cwd: privateRoot, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 }).trim();
+  if (!status) return;
+  const lines = status.split(/\r?\n/).filter(Boolean);
+  throw new Error(`projects/${key} has ${lines.length} uncommitted change(s) in ${privateRoot}:\n`
+    + lines.slice(0, 20).map((line) => `  ${line}`).join('\n')
+    + (lines.length > 20 ? `\n  ... and ${lines.length - 20} more` : '')
+    + '\n  Commit, delete or ignore them first — a delivery ships the Git index, never the working tree.');
+}
+
 //! Copies the curated component library out of the core tree into the delivered
 //! `realvirtual-web/public/library/`.
 //!
@@ -1151,7 +1298,16 @@ function writeGeneratedDeliveryManifest(coreOutput, delivery) {
     id: `prj_delivery_${slug || 'standard'}`,
     name: String(delivery?.project ?? '').trim() || 'realvirtual WEB',
     canonicalName: slug || 'delivery',
-    kind: 'delivery',
+    // `customer`, not the `delivery` this used to write (plan-739 F14). There is no `delivery`
+    // kind: `PROJECT_KINDS` in scripts/_rv-guards.mjs is `customer | demo | internal`, and
+    // `validate-project.mjs` FAILS — not warns — on anything outside it, so the manifest the two
+    // standard customers receive could not pass the validator that guards their own repository.
+    // `customer` is also the truthful answer: this file is the deploy-root project OF a customer,
+    // still empty because they have not authored anything yet. Widening the enum was the
+    // alternative and was rejected: a fourth kind would have to be taught to the browser type
+    // (RvProjectKind), the migrator, the ambient declarations and the foreign-name guard, all to
+    // describe a folder that is already exactly what `customer` means.
+    kind: 'customer',
     activeSceneId: null,
     settings: {},
     documents: [],
@@ -1160,22 +1316,31 @@ function writeGeneratedDeliveryManifest(coreOutput, delivery) {
   writeFileSync(destination, JSON.stringify(manifest, null, 2) + '\n');
 }
 
-//! Stages the whole demo project into a customer workspace as `projects/demo-realvirtual/`,
-//! REPLACING whatever was there (plan-737 F4).
+//! Stages the whole demo project into the STAGING TREE as `projects/demo-realvirtual/`
+//! (plan-737 F4).
 //!
-//! ## Delete-then-copy, deliberately
+//! ## Delete-then-copy — of the STAGING folder only
 //!
-//! Every other vendor→customer copy in this file merges. This one does not, and the
-//! user decision behind it is explicit: *"immer komplett ueberschreiben"*. The demo is
-//! vendor-owned sample content and a sandbox — a customer is invited to break it — so
-//! there is nothing here worth a three-way merge, and a merge would instead accumulate
-//! deleted-upstream documents forever. `demo.knowledge.md` inside the folder says so to
-//! the customer in the same words.
+//! The `rmSync` below deletes a folder in the freshly built staging tree, never anything
+//! in a customer's repository. Staging is rebuilt from scratch on every run, and the
+//! delete makes that rebuild total: a document we stopped shipping must not survive in
+//! the staged demo because a previous run put it there. Nothing here is anybody's work,
+//! so there is nothing to merge.
 //!
-//! This is why `projects/demo-realvirtual/` must be classified ZONE A ("replaced on
-//! every delivery") in the delivery push, even though everything else under `projects/`
-//! is Zone B/C and protected as the customer's. Without that, the SECOND delivery would
-//! keep the customer's edited copy and the report would show phantom conflicts.
+//! ## What reaches the customer is decided elsewhere, and it is SEED-ONCE (plan-738)
+//!
+//! `applySnapshot()` owns that, and it treats this folder exactly like every other folder
+//! under `projects/`: it arrives once, seeded on the FIRST delivery into a repository, and
+//! is never overwritten afterwards unless the operator names it in `--projects`, with a
+//! preview and a confirmation. An ordinary update replaces everything OUTSIDE `projects/`
+//! and writes nothing inside it.
+//!
+//! This paragraph used to say the opposite — that the folder is ZONE A, "replaced on every
+//! delivery", the one exception to the customer's territory. Plan-738 removed the zones and
+//! with them that exception: one rule for all of `projects/`, demo included. The demo's own
+//! `demo.knowledge.md`, `WEB/CLAUDE.md` and the generated README all state the seed-once
+//! rule; tests/demo-project-contract.node.test.ts keeps the four of them from drifting apart
+//! again, because a customer who is told their edits are doomed will not make any.
 //!
 //! ## Windows failure paths
 //!
@@ -1194,8 +1359,8 @@ export function copyDemoRealvirtualFolder(coreRoot, destinationRoot) {
     throw new Error(
       `Cannot replace the delivered demo project at ${target}: ${error?.message ?? error}. `
       + 'Something is holding a file inside it (an open viewer, an editor, a virus scanner). '
-      + 'Close it and run the delivery again — the folder is replaced in full every time, so a '
-      + 'half-deleted one is repaired by the next run.',
+      + 'Close it and run the delivery again — this STAGED folder is rebuilt from scratch every '
+      + 'time, so a half-deleted one is repaired by the next run.',
     );
   }
   copyTree(source, target);
@@ -1581,25 +1746,27 @@ function generateReadme(delivery, projectKey, model, features, projectPlugins = 
       : `### Submit changes\n\n`
         + `Create a branch, commit your changes, and open a pull request in this repository. realvirtual reviews the pull request. See \`CONTRIBUTING.md\` for details.\n\n`) +
     `### Receiving an update\n\n` +
+    // The whole delivery contract, in one sentence and two rules. It used to be a
+    // three-zone table plus a conflict-sidecar procedure; the zones are gone
+    // (plan-738) and so is everything a customer had to learn about them.
+    `**We deliver the application; your projects are yours.**\n\n` +
+    `An update arrives as a commit pushed to this repository by realvirtual. Take it with \`git pull\`. It replaces everything OUTSIDE \`projects/\` - \`realvirtual-web/\`, \`realvirtual-web-pro/\`, the scripts and the manifests - and it writes nothing inside \`projects/\`. There is no file-by-file merge, no conflict file to resolve, and no report to read: the boundary is a folder, and Git does the rest.\n\n` +
+    `Two rules make that safe:\n\n` +
+    `1. **Commit your work before you pull.** Anything you have committed is protected by Git itself - an update lands as an ordinary commit and cannot silently overwrite committed work under \`projects/\`. Uncommitted edits outside \`projects/\` have no such protection.\n` +
+    `2. **We never force-push this branch.** The history you have keeps growing; it is never rewritten under you. The core is ours to replace, \`projects/\` is yours to keep.\n\n` +
+    `Do not edit anything outside \`projects/\`: those files are replaced in full at every update, so changes there are lost. Anything you want to survive an update belongs in a project under \`projects/\`.\n\n` +
     (projectless
-      ? `An update arrives as a commit pushed to this repository by realvirtual. Take it with \`git pull\`. It replaces everything outside \`projects/\` - \`realvirtual-web/\`, \`realvirtual-web-pro/\`, the scripts and the manifests - and it never touches anything inside \`projects/\`. Your projects are yours: they are neither updated, nor merged, nor removed by a delivery.\n\n`
-        + `\`realvirtual-web/public/project.json\` is one of those replaced files. It is generated by realvirtual, it is the empty starting point of your own deploy-root project, and every update overwrites it in full - so do not keep your own documents in it. Anything you want to survive an update belongs in a project under \`projects/\`.\n\n`
-        + `\`projects/demo-realvirtual/\` is the realvirtual demo project. It is yours to open, edit and break - but it is vendor-owned sample content, and every update REPLACES THE WHOLE FOLDER without merging. If you want to keep something you built from it, copy it into a project of your own first.\n\n`
-        + `After every update, read \`DELIVERY-REPORT.md\` in the repository root. It is regenerated each time and lists, in German, what was updated, added and removed, and any changes of yours outside \`projects/\` that the update overwrote.\n\n`
-      : `An update arrives as a commit pushed to this repository by realvirtual. It touches three kinds of file, and the rule differs for each:\n\n`) +
-    (projectless ? `` : `| What | What an update does |\n` +
-    `| --- | --- |\n` +
-      `| \`realvirtual-web/\`, \`realvirtual-web-pro/\`, \`connect/\` and everything else outside \`projects/\` | **Replaced.** Do not edit these; changes here are overwritten. If you did change something, the update lists it in the report so you can see what was lost. |\n` +
-      `| Parts of \`${projectPath}/\` that realvirtual maintains - typically \`models/\`, \`docs/\`, \`connect/\`, \`plugins/\`, \`rag/\` | **Merged.** If you did not change a file, it is updated. If you did, **your version stays** and ours is put beside it (see below). |\n` +
-      `| Everything else in \`${projectPath}/\` - \`scenes/\`, \`settings/\`, \`layouts/\`, and anything not listed above | **Never touched.** This is yours. |\n\n` +
-      `After every update, read \`DELIVERY-REPORT.md\` in the repository root. It is regenerated each time and lists, in German, what was updated, added and removed, which of your files were kept, and any changes of yours outside \`projects/\` that the update overwrote.\n\n` +
-      `**When your version was kept.** The report names a file such as \`${projectPath}/connect/project-config.json\` and, next to it, a second file with \`.vendor-<version>\` in its name - for example \`project-config.vendor-6.3.0.json\`. That is our new version, parked there unopened. Nothing about your file changed. To resolve it:\n\n` +
-      `1. Compare the two files (\`git diff --no-index <yours> <the .vendor- one>\`).\n` +
-      `2. Decide what to keep. Usually you want your change plus whatever we changed - merge by hand.\n` +
-      `3. Delete the \`.vendor-<version>\` file and commit.\n\n` +
-      `Leaving it in place is safe: later updates never overwrite or remove a \`.vendor-\` file, so nothing is lost if you get to it next week. But each conflicting update adds another one, so they accumulate until you clear them.\n\n` +
-      `**A file you deleted on purpose is not restored.** If you removed one of our files, the update reports it and leaves it removed. Ask us if you want it back.\n\n` +
-      `**The first update after August 2026 is a special case.** It establishes the baseline that all later updates compare against, so it deliberately changes nothing inside \`${projectPath}/\` and instead reports which of our files are missing on your side. The update after it carries the actual changes. If you would rather not wait, tell us after reading that report and we will send the missing files immediately.\n\n`) +
+      ? `\`realvirtual-web/public/project.json\` is one of those replaced files. It is generated by realvirtual and is the empty starting point of your own deploy-root project, so do not keep your own documents in it.\n\n`
+      : `\`${projectPath}/\` is the project we develop together. It arrives once, with your first delivery. After that an update does not touch it - not \`models/\`, not \`docs/\`, not \`plugins/\`, not \`scenes/\` or \`settings/\`. If you edit a file of ours in there, it stays edited.\n\n`
+        + `**When we need to send you a new version of that project**, we say so first. That delivery replaces the named project folder with our current state exactly - files we no longer ship are removed, and anything you changed in it is overwritten. It is never automatic: we run it deliberately, and it lists every file of yours it would replace or delete before it does anything. Commit your work, and tell us if you want to keep something from that folder.\n\n`) +
+    // The demo folder, for BOTH relationships. Every customer channel receives it
+    // (`copyDemoRealvirtualFolder` runs whenever `includePublicDemoContent` is false), but this
+    // paragraph used to be inside the projectless branch only — so a development customer was
+    // handed a vendor folder in their own territory that no delivered document explained. It is
+    // one of the four places that must agree on the seed-once rule (plan-739 F5); the other
+    // three are demo.knowledge.md inside the folder, the copyDemoRealvirtualFolder docstring
+    // and the core CLAUDE.md.
+    `\`projects/demo-realvirtual/\` is the realvirtual demo project. It arrives once, with your first delivery, and after that it is treated exactly like any other folder under \`projects/\`: yours to open, edit and break, and never overwritten by an update.\n\n` +
     `## Reference\n\n` +
     `### Features\n\n` +
     `Every delivery includes the AGPL core (${CORE_FEATURES.length} capabilities: drives, sensors, transport surfaces, sources and sinks, grippers, signals and PLC connectivity, HMI panels, camera presets, PDF document linking, and the layout planner). The categories below add to that core; they do not replace it.\n\n` +
@@ -1873,14 +2040,38 @@ function deliveryName(projectKey) {
 //! read-only for the customer, so there is no contribution route to describe and no
 //! CLA to state. Saying so is the point — an unchanged PR text would send a customer
 //! with read permission at a review process that does not exist for them (§2.2).
+//!
+//! ## Where the commercial terms live (plan-739 F4)
+//!
+//! Not in this repository. A `LICENSE-commercial.md` placeholder used to be copied in
+//! beside `LICENSE`, and it announced in its own text that it was pending legal review —
+//! so the only licence statement a customer could find was one that disclaimed itself.
+//! The authority is the signed delivery contract, and this file now says so rather than
+//! shipping a second, weaker answer next to it. `LICENSE` (AGPL, for the core) stays: it
+//! is a real licence, not a placeholder.
+const COMMERCIAL_TERMS_NOTE =
+  '## Licence\n\n'
+  // Deliberately NOT a Markdown link: `assertNoBrokenDocLinks` checks every relative link in
+  // every staged document against the file system, and a generated document must not depend on
+  // a core file that a caller could legitimately stage without.
+  + 'The core under `realvirtual-web/` is AGPL-3.0; the licence text is `realvirtual-web/LICENSE`.\n\n'
+  + 'Everything else in this delivery - the commercial extensions under `realvirtual-web-pro/`, '
+  + 'realvirtual CONNECT, and the bundled library - is licensed to you by the **delivery contract '
+  + 'signed between your organisation and realvirtual GmbH**. That contract is the only authority '
+  + 'on your commercial terms; this repository carries no separate commercial licence file. '
+  + 'For a copy of it, or any question about scope, seats or redistribution, contact '
+  + '[professional@realvirtual.io](mailto:professional@realvirtual.io).\n';
+
 function generateContributing(projectKey) {
   if (!projectKey) {
     return `# Contributing\n\nThis repository is published by realvirtual and is **read-only for you**. There is no pull request to open here and no review step; take updates with \`git pull\`.\n\n` +
       `Everything under \`projects/\` is yours. Version it on your side - your own branch, remote, or backup - as your organisation prefers; a delivery never reads, changes or removes anything in that folder.\n\n` +
-      `If you want realvirtual to look at something you built, or you would like a project developed together with us, contact [professional@realvirtual.io](mailto:professional@realvirtual.io).\n`;
+      `If you want realvirtual to look at something you built, or you would like a project developed together with us, contact [professional@realvirtual.io](mailto:professional@realvirtual.io).\n\n` +
+      COMMERCIAL_TERMS_NOTE;
   }
   return `# Contributing\n\nCustomer changes belong only in \`projects/${projectKey}/\` and are submitted through a reviewed pull request.\n\n` +
-    `By submitting a contribution, you confirm that you may provide it and grant realvirtual GmbH the rights required to maintain, merge, license, and redistribute it as part of the delivered product. This clause is a placeholder pending legal review and must be replaced before the first customer contribution.\n`;
+    `By submitting a contribution, you confirm that you may provide it and grant realvirtual GmbH the rights required to maintain, merge, license, and redistribute it as part of the delivered product. This clause is a placeholder pending legal review and must be replaced before the first customer contribution.\n\n` +
+    COMMERCIAL_TERMS_NOTE;
 }
 
 // plan-363 Phase 6 — setup.ps1/setup.sh prepare, start.ps1/start.sh only start.
@@ -2189,9 +2380,14 @@ function writeWorkspaceFiles(root, coreRoot, privateRoot, project, projectKey, d
   writeFileSync(join(root, 'AGENTS.md'), workspaceGuide);
   writeCustomerCommands(root);
   writeCustomerAgents(root);
-  const licence = join(privateRoot, 'LICENSE-commercial.md');
-  if (!existsSync(licence)) throw new Error(`Commercial licence placeholder not found: ${licence}`);
-  copyFileSync(licence, join(root, 'LICENSE-commercial.md'));
+  // NO `LICENSE-commercial.md` (plan-739 F4). It used to be copied out of the private
+  // sibling, and it was a PLACEHOLDER that said so in its own first line — "pending legal
+  // review". A licence file that disqualifies itself is worse than none: the customer's
+  // commercial terms are the signed delivery contract, and a stray file in the repository
+  // can only ever contradict it. The draft stays in the private repository as internal
+  // material; `generateContributing()` names the contract instead. `applySnapshot` replaces
+  // everything outside `projects/`, so the file also disappears from the repositories that
+  // already received it at their next delivery.
   writeFileSync(join(root, '.nvmrc'), `${REQUIRED_NODE_MAJOR}\n`);
   writeFileSync(join(root, '.gitattributes'), GENERATED_GIT_ATTRIBUTES.join('\n') + '\n');
   writeFileSync(join(root, '.gitignore'), '.runtime/\ntools/connect/\n**/node_modules/\n**/dist/\n.env*\n.npmrc\n');
@@ -2342,7 +2538,9 @@ function rewriteCustomerWorkspaceNames(root) {
   });
 }
 
-function curateCoreMarkdownLinks(workspaceRoot, coreOutput) {
+//! Rewrites links in the copied core Markdown so a target the delivery does not carry degrades to
+//! plain text instead of reaching {@link assertNoBrokenDocLinks} as a hard failure.
+export function curateCoreMarkdownLinks(workspaceRoot, coreOutput) {
   const managedRootTargets = new Map([
     ['CLAUDE.md', '../CLAUDE.md'],
     ['CONTRIBUTING.md', '../CONTRIBUTING.md'],
@@ -2371,6 +2569,7 @@ function curateCoreMarkdownLinks(workspaceRoot, coreOutput) {
         const normalizedTarget = target.replace(/\\/g, '/');
         if (NEVER_DELIVERED_DOCS.has(fileName) || CONDITIONAL_DELIVERED_DOCS.has(fileName)
             || normalizedTarget.startsWith('../realvirtual/') || normalizedTarget.includes('/Packages/')
+            || SIBLING_CHECKOUT_LINK.test(normalizedTarget)
             || NON_DELIVERED_DOC_LINK_PREFIXES.some((prefix) => normalizedTarget.startsWith(prefix))
             || !isWithin(workspaceRoot, destination)) return label;
         return full;
@@ -2471,10 +2670,21 @@ export function stageFilteredSourceTree(options) {
         + 'Load it with loadDeliveryConfigByCustomer() and pass it as options.delivery.');
     }
     if (!projectless) delivery ??= loadDeliveryConfig(privateRoot, projectKey, manifest);
+    // The project folders are read from the Git index, and the two guards that make that
+    // statement true run HERE — before the first byte is copied anywhere (plan-739 F8/F9).
+    // A delivery that aborts has cost nothing; one that half-copied a folder and then
+    // discovered the problem would have to be reasoned about.
+    const trackedProjectFiles = new Map();
     for (const key of projectKeys) {
       if (!existsSync(join(privateRoot, 'projects', key))) {
         throw new Error(`Project not found: ${join(privateRoot, 'projects', key)}`);
       }
+      const tracked = gitTrackedProjectFiles(privateRoot, key);
+      if (tracked) {
+        assertProjectTreeClean(privateRoot, key);
+        assertNoUnfetchedLfsObjects(privateRoot, key, tracked);
+      }
+      trackedProjectFiles.set(key, tracked);
     }
     if (!projectless) project ??= readJson(join(privateRoot, 'projects', projectKey, 'project.json'));
     privateOutput = join(destinationRoot, 'realvirtual-web-pro');
@@ -2534,8 +2744,20 @@ export function stageFilteredSourceTree(options) {
     }
     for (const key of projectKeys) {
       const projectOutput = join(destinationRoot, 'projects', key);
-      copyTree(join(privateRoot, 'projects', key), projectOutput,
-        (rel) => !rel.split('/').some((s) => projectExcluded.has(s)));
+      const tracked = trackedProjectFiles.get(key);
+      // Directories get their own answer, because `copyTree` asks about them and
+      // `git ls-files` never mentions them — see trackedDirectories().
+      const trackedDirs = tracked ? trackedDirectories(tracked) : null;
+      copyTree(join(privateRoot, 'projects', key), projectOutput, (rel, entry) => {
+        if (rel.split('/').some((segment) => projectExcluded.has(segment))) return false;
+        if (!tracked) return true;
+        return entry.isDirectory() ? trackedDirs.has(rel) : tracked.has(rel);
+      });
+      if (tracked) {
+        const staged = [...tracked].filter((rel) =>
+          !rel.split('/').some((segment) => projectExcluded.has(segment)));
+        console.log(`[staging] projects/${key}: ${staged.length} Git-tracked file(s) staged.`);
+      }
       const customerProjectConfig = readJson(join(projectOutput, 'project.json'));
       delete customerProjectConfig.delivery;
       // plan-735 Phase 1a (F1), RESOLVED THE OTHER WAY — deliberately.
@@ -2888,8 +3110,9 @@ function gitIn(cwd, args, { allowFailure = false } = {}) {
 }
 
 //! Reads a delivery manifest out of a clone, tolerating absence and damage. Both
-//! mean the same thing to the caller: there is no baseline to merge against.
-function readCloneDeliveryManifest(clone) {
+//! mean the same thing to the caller: this repository does not say what it last
+//! received, so nothing may be inferred from it.
+export function readCloneDeliveryManifest(clone) {
   const path = join(clone, 'delivery-manifest.json');
   if (!existsSync(path)) return readDeliveryManifest(null);
   try {
@@ -2899,310 +3122,449 @@ function readCloneDeliveryManifest(clone) {
   }
 }
 
-//! Renders the customer-facing report (§2.6). German, no internal paths or commits:
-//! the customer reads it directly in Forgejo, next to the commit it arrived with.
-export function renderDeliveryReport({ version, generatedAt, projects, drift }) {
-  const lines = [`# Delivery-Report — viewer ${version} — ${generatedAt.slice(0, 10)}`, ''];
-  const rows = (title, collect) => {
-    const entries = [];
-    for (const [key, project] of Object.entries(projects)) {
-      for (const path of collect(project)) entries.push([key, path]);
-    }
-    if (!entries.length) return;
-    lines.push(`## ${title}`, '', '| Projekt | Datei |', '| --- | --- |');
-    for (const [key, path] of entries) lines.push(`| ${key} | \`${path}\` |`);
-    lines.push('');
-  };
+// ─── delivery-manifest.json (plan-738 §2.3, §2.8) ────────────────────────
+//
+// What survived the vendor-merge abriss. The three-way merge is gone; the
+// delivery BASELINE is not. The tag a delivery leaves behind is still what the
+// tier gate reads its private-source inventory out of, and the manifest is still
+// how a repository states which version it last received.
 
-  const conflicts = Object.entries(projects).flatMap(([key, project]) =>
-    project.conflicts.map((conflict) => ({ key, ...conflict })));
-  if (conflicts.length) {
-    lines.push('## Konflikte (Ihre Version wurde behalten)', '');
-    lines.push('| Projekt | Datei | Was passiert ist | Neue Version liegt unter |');
-    lines.push('| --- | --- | --- | --- |');
-    for (const conflict of conflicts) {
-      lines.push(`| ${conflict.key} | \`${conflict.path}\` | ${CONFLICT_TEXT[conflict.reason] ?? conflict.reason}`
-        + ` | ${conflict.sidecarPath ? `\`${conflict.sidecarPath}\`` : '— (nicht ablegbar, siehe unten)'} |`);
-    }
-    lines.push('');
-    if (conflicts.some((conflict) => conflict.sidecar && !conflict.sidecarPath)) {
-      lines.push('Fuer die mit — markierten Dateien konnte die neue Version in diesem Repository nicht',
-        'abgelegt werden, weil sie dort nicht unter dieselbe Git-LFS-Regel faellt wie das Original.',
-        'Ihre Version bleibt unveraendert; bitte melden Sie sich, wenn Sie die neue Fassung brauchen.', '');
-    }
-  }
+/** Current delivery-manifest schema version. v3 dropped `vendorGlobs`/`keptByCustomer`. */
+export const DELIVERY_MANIFEST_VERSION = 3;
 
-  rows('Aktualisiert', (project) => project.updated);
-  rows('Neu hinzugefuegt', (project) => project.added);
-  rows('Entfernt', (project) => project.removed);
-  rows('Fehlt bei Ihnen (nicht automatisch ergaenzt)', (project) => project.addPending);
+//! The oldest schema whose `baselineTag` still means something. v1 predates the
+//! field entirely, which is the honest answer "there is no basis"; v2 carried it
+//! with exactly the meaning v3 gives it, so a v2 manifest is read, not refused.
+const OLDEST_MANIFEST_WITH_BASELINE = 2;
 
-  if (drift.length) {
-    lines.push('## Ihre Aenderungen ausserhalb von projects/', '',
-      'Dieser Bereich enthaelt den ausgelieferten Programmcode und wird bei jeder Auslieferung',
-      'ersetzt. Die folgenden Abweichungen wurden dabei ueberschrieben bzw. entfernt:', '',
-      '| Datei | Abweichung |', '| --- | --- |');
-    for (const entry of drift) lines.push(`| \`${entry.path}\` | ${DRIFT_TEXT[entry.status] ?? entry.status} |`);
-    lines.push('');
-  }
-
-  if (lines.length === 2) lines.push('Keine Aenderungen an Ihren Projektdaten.', '');
-  return lines.join('\n');
+/** The Git tag a delivery leaves behind, and reads back as its next baseline. */
+export function baselineTagFor(version) {
+  return `delivery/${version}`;
 }
 
-const CONFLICT_TEXT = Object.freeze({
-  'both-changed': 'Sie und wir haben die Datei geaendert',
-  'added-both-sides': 'Sie haben die Datei selbst angelegt, wir liefern sie jetzt ebenfalls',
-  'deleted-by-vendor-changed-by-customer': 'Wir liefern die Datei nicht mehr, Sie haben sie geaendert',
-  'deleted-by-customer': 'Sie haben die Datei geloescht — sie wurde nicht erneut geliefert',
-  'missing-without-baseline': 'Die Datei gehoert zur Auslieferung, fehlt bei Ihnen',
-});
-
-const DRIFT_TEXT = Object.freeze({ A: 'von Ihnen angelegt', M: 'von Ihnen geaendert', D: 'von Ihnen geloescht' });
+/**
+ * Reads the baseline out of a delivery manifest, tolerating v1 and v2.
+ *
+ * A v1 manifest (every repository delivered before plan-700) carries no
+ * `baselineTag`, which is the honest answer "there is no basis". A v2 one does,
+ * and it means there exactly what it means in v3, so it is read rather than
+ * refused — the two fields v3 dropped are simply never looked at again.
+ *
+ * Forwards compatibility is deliberately NOT offered in the other direction: a
+ * rollback to the pre-738 code has to revert the manifest with it (§5.10).
+ */
+export function readDeliveryManifest(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { manifestVersion: 1, baselineTag: null, projects: {} };
+  }
+  const version = Number.isInteger(raw.manifestVersion) ? raw.manifestVersion : 1;
+  if (version < OLDEST_MANIFEST_WITH_BASELINE) {
+    return { ...raw, manifestVersion: version, baselineTag: null, projects: {} };
+  }
+  return {
+    ...raw,
+    manifestVersion: version,
+    baselineTag: typeof raw.baselineTag === 'string' && raw.baselineTag ? raw.baselineTag : null,
+    projects: raw.projects && typeof raw.projects === 'object' && !Array.isArray(raw.projects) ? raw.projects : {},
+  };
+}
 
 /**
- * Writes one delivery into a freshly cloned customer repository, applying the
- * three-zone model (§2.2) instead of the old all-or-nothing per folder.
+ * Adds the v3 baseline fields to an existing delivery manifest.
  *
- * Its predecessor `applySnapshotToClone` preserved `projects/<key>/`
- * byte-for-byte, which is why no project-side update ever reached a delivered
- * customer, and deleted everything outside it without a word, which is why
- * their own files there vanished silently. Here:
+ * Additive: `coreCommit`, `privateCommit`, `profile` and the rest keep their
+ * names and meaning. What v3 no longer writes is the per-project `vendorGlobs`
+ * block — there are no zones left for it to describe — and `keptByCustomer`,
+ * which recorded the outcome of a merge that no longer happens.
  *
- *   Zone A — everything outside `projects/`: replaced, and the difference
- *            against the previous delivery tag is reported instead of being
- *            quietly dropped.
- *   Zone B — vendor-managed paths inside a project: three-way merged; the
- *            customer always wins a conflict and the new version is parked
- *            beside theirs as a sidecar.
- *   Zone C — everything else in a project: not touched, not even read.
+ * Still deliberately absent, as in v2: a per-file hash map. The customer
+ * repository already maintains a complete, trustworthy hash tree — its own
+ * history — and a second one in JSON would be churn that is *also* incomplete,
+ * because it can only know the paths we sent.
+ */
+export function withDeliveryBaseline(base, { version, projects }) {
+  return {
+    manifestVersion: DELIVERY_MANIFEST_VERSION,
+    ...base,
+    baselineTag: baselineTagFor(version),
+    projects: Object.fromEntries(Object.entries(projects ?? {}).map(([key, project]) => [key, {
+      projectSchemaVersion: project?.schemaVersion ?? null,
+    }])),
+  };
+}
+
+/**
+ * Parses the output of `git ls-files -s -z` into a `path -> blobOid` map.
+ *
+ * Kept separate from the process call so the parsing is testable and so the
+ * caller can decide how to run Git — `git hash-object` in a directory without a
+ * `.git` bypasses the LFS clean filter and would hash the real binary on one
+ * side and the pointer on the other.
+ */
+export function parseLsFiles(output) {
+  const map = {};
+  for (const record of output.split('\0')) {
+    if (!record) continue;
+    const tab = record.indexOf('\t');
+    if (tab < 0) continue;
+    const [, oid] = record.slice(0, tab).split(/\s+/);
+    const path = record.slice(tab + 1);
+    if (oid && path) map[path] = oid;
+  }
+  return map;
+}
+
+/**
+ * Parses the output of `git ls-tree -r -z <tree>` into a `path -> blobOid` map.
+ *
+ * Its records are `<mode> <type> <oid>\t<path>`, one field more than
+ * `ls-files -s`, hence the separate parser rather than a shared one with a
+ * positional argument nobody would get right twice.
+ */
+export function parseLsTree(output) {
+  const map = {};
+  for (const record of output.split('\0')) {
+    if (!record) continue;
+    const tab = record.indexOf('\t');
+    if (tab < 0) continue;
+    const [, type, oid] = record.slice(0, tab).split(/\s+/);
+    const path = record.slice(tab + 1);
+    if (type === 'blob' && oid && path) map[path] = oid;
+  }
+  return map;
+}
+
+// ─── the territorial snapshot (plan-738 §2.4) ────────────────────────────
+//
+// One rule, in one sentence: **we deliver the application; your projects are
+// yours.** Everything outside `projects/` is replaced in full at every delivery.
+// `projects/` is seeded once, at the first delivery, and afterwards written only
+// when a human names a folder with `--projects` and confirms what that destroys.
+//
+// This replaced a three-zone glob model with a per-file three-way merge,
+// conflict sidecars and a delivery report. The model was not wrong so much as
+// unaffordable: no customer repository ever carried a single file it protected
+// (`git ls-tree` against all three, 2026-09-03), and the protection came from
+// ~600 lines of merge engine that had to be right at every future delivery.
+// Git already does this: disjoint paths, a pull-merge, a history.
+
+//! A leftover conflict sidecar from the pre-738 merge (`a.vendor-6.3.0.glb`).
+//! Loose on purpose, exactly as the matcher it replaces was: the version segment
+//! may itself contain dots and nothing delimits it from the extension.
+const SIDECAR_NAME = /\.vendor-[0-9][0-9A-Za-z.+_-]*$/;
+
+//! The project folders this delivery carries, read off the staging tree.
+function stagedProjectFolders(staged) {
+  const root = join(staged, 'projects');
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+}
+
+/**
+ * Removes the conflict sidecars an earlier delivery parked in the customer's
+ * project folders (F11).
+ *
+ * They sit under `projects/`, i.e. in customer territory, so the core replace
+ * never reaches them — but they are vendor-produced by construction and were
+ * only ever a copy of something we shipped, so nothing of the customer's is at
+ * risk. It stays here as a standing safety net rather than a one-off migration:
+ * after the first run the glob matches nothing, so a second run is a no-op.
+ */
+function removeVendorSidecars(projectsRoot) {
+  if (!existsSync(projectsRoot)) return [];
+  const removed = [];
+  walk(projectsRoot, (absolute, rel, entry) => {
+    if (entry.isDirectory()) return entry.name !== '.git' && !isNonDeliveredBuildDir(entry);
+    if (!SIDECAR_NAME.test(entry.name)) return;
+    rmSync(absolute, { force: true });
+    removed.push(`projects/${toPosix(rel)}`);
+  });
+  return removed.sort();
+}
+
+/**
+ * Answers "has this repository ever received a delivery?" from Git, not from a
+ * file (§2.4.5).
+ *
+ * The tag scan is the point. Reading the tag NAME out of `delivery-manifest.json`
+ * — the pre-738 behaviour — is one indirection too many: a delivery whose branch
+ * push landed and whose tag push did not leaves a manifest naming a tag that does
+ * not exist, and "no baseline" then reads as "first delivery", which would seed
+ * every project folder over the customer's work. Asking Git which
+ * `refs/tags/delivery/*` actually exist cannot make that mistake.
+ *
+ * `baselineTag` keeps exactly its pre-738 meaning for its one consumer, the tier
+ * gate (`readBaselineSourceInventory`): the manifest's own tag when it is really
+ * there, and otherwise the most recent delivery tag that is.
+ */
+export function detectDeliveryBaseline(clone) {
+  const remoteEmpty = gitIn(clone, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true }) === null;
+  // Two sort keys: the later option is the primary one, so this is "newest
+  // first, ties broken by name" — deterministic even for two tags on one commit.
+  const listed = remoteEmpty ? null
+    : gitIn(clone, ['tag', '-l', 'delivery/*', '--sort=-refname', '--sort=-creatordate'], { allowFailure: true });
+  const tags = (listed ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const named = readCloneDeliveryManifest(clone).baselineTag;
+  const baselineTag = named && tags.includes(named) ? named : (tags[0] ?? null);
+  // `firstDelivery` means SEED EVERYTHING, so it is tied to an empty remote and
+  // to nothing else. A repository that has content but carries no delivery tag is
+  // a different animal — see `untagged` — and used to be folded in here, which is
+  // how a customer whose tags were never pushed (or were pruned) had every one of
+  // their edited project folders replaced by a delivery that believed it was the
+  // first one.
+  const untagged = !remoteEmpty && tags.length === 0;
+  return { remoteEmpty, tags, untagged, firstDelivery: remoteEmpty, baselineTag };
+}
+
+/**
+ * Resolves what `--projects` was asked for against what may be asked for.
+ *
+ * `all` means every VENDOR project of this delivery plus the demo — never
+ * "everything in `projects/`". A folder the customer created there is not ours
+ * to snapshot, and no spelling of this flag can reach it.
+ *
+ * Matching is case-sensitive, and a case-only miss says so by name: `Toray` is a
+ * real project and `toray` is a real customer slug, so silently accepting either
+ * spelling would one day replace a folder nobody named.
+ */
+export function resolveRequestedProjects(requested, available) {
+  const known = [...new Set([...(available ?? []), DEMO_PROJECT_FOLDER])].sort();
+  const names = (Array.isArray(requested) ? requested : [requested]).filter(Boolean);
+  if (names.includes('all')) {
+    if (names.length > 1) {
+      throw new Error(`--projects: "all" cannot be combined with individual names (got ${names.join(', ')}).`);
+    }
+    return known;
+  }
+  const resolved = [];
+  for (const name of names) {
+    if (known.includes(name)) {
+      if (!resolved.includes(name)) resolved.push(name);
+      continue;
+    }
+    const spelled = known.find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+    if (spelled) {
+      throw new Error(`--projects: unknown project "${name}" — did you mean "${spelled}"? `
+        + 'Project names are matched case-sensitively.');
+    }
+    throw new Error(`--projects: unknown project "${name}". This delivery carries: ${known.join(', ')}. `
+      + '"all" means every vendor project of this delivery plus the demo, never a folder of your own under projects/.');
+  }
+  return resolved;
+}
+
+/**
+ * Shows what a `--projects` replace would destroy — **before** it destroys it.
+ *
+ * The order is the whole safety function (§2.5). `diffTrees` compares the two
+ * directories on disk, so it has to see the clone as the customer left it; run
+ * after `applySnapshot`, the same call would compare the new content against
+ * itself, report nothing, and look exactly like a clean delivery.
+ *
+ * Only `~` (would be replaced) and `-` (would be deleted) are listed. A `+` is
+ * something we are about to add and destroys nothing, so putting it in front of
+ * a confirmation prompt would only dilute the list that matters.
+ */
+export function previewProjectReplace(stagedRoot, cloneRoot, names, { log = console.log } = {}) {
+  const staged = resolve(stagedRoot);
+  const clone = resolve(cloneRoot);
+  const projects = [];
+  let total = 0;
+  for (const name of names) {
+    const diff = diffTrees(join(clone, 'projects', name), join(staged, 'projects', name));
+    const affected = diff.changed.length + diff.removed.length;
+    total += affected;
+    projects.push({ name, diff, affected });
+    if (affected === 0) {
+      log(`[projects] ${name}: identisch mit dem Lieferstand — nichts wird ueberschrieben.`);
+      continue;
+    }
+    log(`[projects] ${name}: ${affected} Datei(en) im Kundenrepository werden ersetzt oder geloescht`);
+    printDiff(`[projects] ${name}`, diff, {
+      log,
+      include: ['changed', 'removed'],
+      removedNote: '   (verschwindet im Kundenrepository)',
+    });
+  }
+  return { projects, total };
+}
+
+//! Thrown when a `--projects` replace was neither confirmed nor forced. Carries the
+//! exit code F4 pins: 1 = "differences were shown and nobody said yes", never 2.
+export class ProjectReplaceAbort extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ProjectReplaceAbort';
+    this.exitCode = 1;
+  }
+}
+
+//! Reads one line from stdin synchronously. Only ever reached on a TTY, where a
+//! human is by definition there to answer; a pipe or a CI runner takes the
+//! non-interactive path above it and aborts instead of blocking for ever.
+function promptLine(question) {
+  process.stdout.write(question);
+  const buffer = Buffer.alloc(256);
+  try {
+    const bytes = readSync(0, buffer, 0, buffer.length, null);
+    return buffer.subarray(0, bytes).toString('utf8').trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * The gate in front of a destructive `--projects` replace, after the
+ * `assertPrivateSourceInventory` pattern: list, then stop, then name the flag.
+ *
+ * Three outcomes and they are the exit codes of F4: nothing would be destroyed
+ * (0, no prompt at all — the common case must not train anyone to type "yes"),
+ * confirmed or `--force` (0), or shown and not confirmed (1).
+ */
+export function confirmProjectReplace(preview, {
+  force = false, log = console.log,
+  interactive = process.stdin.isTTY === true, ask = promptLine,
+} = {}) {
+  if (preview.total === 0) return { confirmed: true, reason: 'no-deviation' };
+  if (force) {
+    log(`[projects] --force: ${preview.total} Datei(en) werden ohne Rueckfrage ersetzt/geloescht.`);
+    return { confirmed: true, reason: 'force' };
+  }
+  if (interactive) {
+    const answer = ask(`[projects] ${preview.total} Datei(en) im Kundenrepository ueberschreiben? [yes/no] `).toLowerCase();
+    if (answer === 'yes' || answer === 'ja') return { confirmed: true, reason: 'interactive' };
+  }
+  throw new ProjectReplaceAbort(
+    `${preview.total} file(s) in the customer repository would be replaced or deleted by --projects `
+    + `${preview.projects.map((entry) => entry.name).join(', ')}, and nobody confirmed it.\n`
+    + '  Review the list above, then re-run with --force to apply it unattended.');
+}
+
+/**
+ * Writes one delivery into a freshly cloned customer repository (§2.4).
+ *
+ * Three writes, in this order, and nothing else:
+ *
+ *   1. **The core** — everything except `.git/` and `projects/` is deleted and
+ *      re-copied from the staging tree. Delete-then-copy, never a file sync: a
+ *      case-only rename and a file↔folder swap both survive it on Windows, and
+ *      neither survives a per-file update.
+ *   2. **`projects/`** — seeded whole only when the remote is EMPTY (per folder,
+ *      with the same delete-then-copy), and afterwards written only for the
+ *      folders `--projects` named. A repository that has content but no
+ *      `delivery/*` tag is not a first delivery: only the folders genuinely
+ *      absent from it are seeded, the rest need `--projects` like any other.
+ *      Every other folder under `projects/`, ours or the customer's, is not
+ *      read, not written and not reported.
+ *   3. **Sidecars** — the leftovers of the pre-738 merge are removed (F11).
  *
  * **Only ever call this on a fresh `git clone` temp directory.** Verified, not
- * assumed: on a working checkout the zone-A loop would delete untracked local
- * files, and the customer-side blob map would describe a tree nobody delivered.
+ * assumed: on a working checkout step 1 would delete untracked local work.
  *
  * Nothing is pushed here. The caller pushes after this returns, so an abort
- * mid-merge leaves the customer repository exactly as it was.
+ * halfway through leaves the customer repository exactly as it was.
  *
- * @param options.projects  `[{ key, vendor }]` — the vendor block per project
- * @param options.version   viewer version; names the sidecars and the new tag
- * @param options.seedMissing  create `add-pending` paths after a human said so
+ * @param options.version          viewer version; names the delivery tag
+ * @param options.replaceProjects  project folders to replace as an exact snapshot
  */
-export function applyMergedSnapshot(stagedRoot, cloneRoot, options) {
+export function applySnapshot(stagedRoot, cloneRoot, options = {}) {
   const staged = resolve(stagedRoot);
   const clone = resolve(cloneRoot);
   const version = options.version;
-  const projects = options.projects ?? [];
-  const seedMissing = options.seedMissing ?? false;
+  const requested = options.replaceProjects ?? [];
+  const log = options.log ?? console.log;
   const skipBuildDirs = (_rel, entry) => !isNonDeliveredBuildDir(entry);
 
-  if (!existsSync(join(clone, '.git'))) throw new Error(`applyMergedSnapshot needs a git clone, but ${clone} has no .git.`);
-  // R2-6. A dirty tree here means this is not a fresh clone, and the zone-A
-  // deletion loop would take local work with it.
+  if (!existsSync(join(clone, '.git'))) throw new Error(`applySnapshot needs a git clone, but ${clone} has no .git.`);
+  // A dirty tree here means this is not a fresh clone, and the core deletion
+  // loop would take local work with it.
   const status = gitIn(clone, ['status', '--porcelain', '--untracked-files=all']);
   if (status.trim()) {
-    throw new Error('applyMergedSnapshot requires a clean, freshly cloned working tree; '
+    throw new Error('applySnapshot requires a clean, freshly cloned working tree; '
       + `${clone} has local modifications and would lose them.`);
   }
 
-  const remoteEmpty = gitIn(clone, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true }) === null;
-  const previous = readCloneDeliveryManifest(clone);
-  // A tag named in the manifest but absent from the repository is no basis: the
-  // tag push may have failed, or the customer may have deleted it. Treating a
-  // missing tag as "no baseline" costs an update; trusting it would cost data.
-  const baselineTag = !remoteEmpty && previous.baselineTag
-    && gitIn(clone, ['rev-parse', '--verify', `refs/tags/${previous.baselineTag}`], { allowFailure: true }) !== null
-    ? previous.baselineTag : null;
+  const { remoteEmpty, firstDelivery, untagged, baselineTag } = detectDeliveryBaseline(clone);
+  const stagedProjects = stagedProjectFolders(staged);
 
-  // Zone-A drift, read from Git itself so it also names files the customer created
-  // and we never delivered — the case a hash map carried in the manifest could not
-  // have known about (§2.4, R2-3).
-  const drift = [];
-  if (baselineTag) {
-    const output = gitIn(clone, ['diff', '--name-status', '-z', baselineTag, 'HEAD', '--', '.', ':!projects'],
-      { allowFailure: true }) ?? '';
-    const fields = output.split('\0').filter(Boolean);
-    for (let i = 0; i + 1 < fields.length; i += 2) drift.push({ status: fields[i][0], path: fields[i + 1] });
+  // Validated BEFORE the first deletion. An unknown name must never become a
+  // delete candidate, and a folder we would replace with nothing is a deletion
+  // wearing an update's clothes.
+  if (!firstDelivery) {
+    for (const name of requested) {
+      if (!stagedProjects.includes(name)) {
+        throw new Error(`--projects names "${name}", which this delivery does not carry `
+          + `(staged: ${stagedProjects.join(', ') || 'none'}). Refusing to replace a folder with nothing.`);
+      }
+    }
+  } else if (requested.length) {
+    // Not an error: `deliver-release` runs across customers whose repositories
+    // are in different states, and a seed writes every folder anyway (§2.4.4).
+    log(`[snapshot] WARNING: --projects ${requested.join(', ')} ignored — this is the FIRST delivery into `
+      + 'this repository, and the seed writes every project folder regardless.');
   }
 
-  const stagedIndex = parseLsFiles(gitIn(staged, ['ls-files', '-s', '-z']));
-  const customerIndex = remoteEmpty ? {} : parseLsFiles(gitIn(clone, ['ls-files', '-s', '-z']));
-  const baselineIndex = baselineTag ? parseLsTree(gitIn(clone, ['ls-tree', '-r', '-z', baselineTag])) : null;
-
-  // ── Zone A: replace wholesale, exactly as before, but never reaching into
-  // projects/ — every project folder, ours or a foreign one, is decided below.
+  // ── 1. The core: everything outside projects/ ─────────────────────────
   for (const entry of readdirSync(clone, { withFileTypes: true })) {
     if (entry.name === '.git' || entry.name === 'projects') continue;
-    rmSync(join(clone, entry.name), { recursive: true, force: true });
+    rmSync(join(clone, entry.name), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
-  // ── The one project folder that is ZONE A (plan-737) ──────────────────
-  //
-  // `projects/demo-realvirtual/` sits under `projects/` and is therefore
-  // structurally Zone B/C — the customer's, protected, merged at most. It is
-  // neither: it is vendor-owned sample content that `copyDemoRealvirtualFolder()`
-  // staged as a whole folder, and the user decision behind plan-737 F4 is
-  // "immer komplett ueberschreiben".
-  //
-  // Without this exception the delivery would be quietly wrong in BOTH
-  // directions, and neither would look like a failure:
-  //
-  //  - the FIRST delivery ships no demo at all — the filter below drops every
-  //    staged path under `projects/`, and the per-project loop iterates only
-  //    the customer's own keys (for a standard customer: none), so F4 silently
-  //    delivers nothing;
-  //  - a LATER delivery keeps whatever the customer edited the demo into, and
-  //    the report lists their sandbox scribbles as conflicts against content
-  //    nobody was defending.
-  //
-  // So it is deleted and re-copied with the rest of Zone A. `projects/` itself
-  // stays the customer's — this names exactly one folder inside it.
-  const demoRel = `projects/${DEMO_PROJECT_FOLDER}`;
-  rmSync(join(clone, 'projects', DEMO_PROJECT_FOLDER), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   copyTree(staged, clone, (rel, entry) => rel !== '.git' && !rel.startsWith('.git/')
     && !isNonDeliveredBuildDir(entry)
-    // `projects/` itself is traversed only so that `projects/.gitkeep` and the
-    // vendor-owned demo folder can be copied; every other path below it is
-    // rejected here. The `.gitkeep` is not a merge decision — it only makes the
-    // customer-owned folder exist in a repository that cannot carry an empty
-    // directory (plan-434 Phase 4).
-    // Everything else under `projects/` is decided by the per-project loop below,
-    // which for a projectless delivery has nothing to iterate — so the whole
-    // folder stays the customer's, untouched (§6.7).
-    && (!rel.startsWith('projects/') || rel === 'projects/.gitkeep'
-      || rel === demoRel || rel.startsWith(`${demoRel}/`)));
+    // `projects/` itself is traversed only so `projects/.gitkeep` can be copied:
+    // it makes the customer-owned folder exist in a repository that cannot carry
+    // an empty directory. Everything below it is decided in step 2.
+    && (!rel.startsWith('projects/') || rel === 'projects/.gitkeep'));
 
-  const report = {};
-  for (const { key, vendor } of projects) {
-    const stagedProject = projectSubtree(stagedIndex, key);
-    const customerProject = projectSubtree(customerIndex, key);
-    const baselineProject = baselineIndex ? projectSubtree(baselineIndex, key) : null;
-    const projectOut = join(clone, 'projects', key);
-    const stagedProjectDir = join(staged, 'projects', key);
-    const entry = { seeded: false, added: [], updated: [], removed: [], addPending: [], conflicts: [], keptByCustomer: [] };
-
-    // Seeding, deliberately narrow: an empty remote, or a project that is absent
-    // from the clone AND provably never delivered (the baseline exists and does not
-    // mention it). Without that proof, "absent" could be a deliberate deletion, and
-    // re-creating it would undo one silently — the case F4 exists to prevent.
-    const neverDelivered = baselineProject !== null && Object.keys(baselineProject).length === 0;
-    if (remoteEmpty || (Object.keys(customerProject).length === 0 && neverDelivered)) {
-      entry.seeded = true;
-      rmSync(projectOut, { recursive: true, force: true });
-      if (existsSync(stagedProjectDir)) copyTree(stagedProjectDir, projectOut, skipBuildDirs);
-      report[key] = entry;
-      continue;
+  // ── 2. projects/ — the customer's territory ───────────────────────────
+  const seeded = [];
+  const replaced = [];
+  // A repository with content but no delivery tag (`untagged`) is NOT a seed.
+  // Its project folders may already carry the customer's work, so only the ones
+  // that are genuinely ABSENT are written; everything already there is left to
+  // the ordinary `--projects` path, with its preview and its confirmation.
+  const absent = untagged
+    ? stagedProjects.filter((name) => !existsSync(join(clone, 'projects', name)))
+    : [];
+  if (untagged) {
+    log('[snapshot] WARNING: this repository has content but carries no delivery/* tag. '
+      + 'Treating it as an EXISTING delivery, not a first one: the tags were probably never '
+      + 'pushed or have been deleted. Verify the delivery history before you trust the tier gate.');
+    if (absent.length) {
+      log(`[snapshot] projects/ missing here and therefore seeded: ${absent.join(', ')}`);
     }
-
-    const previouslyKept = previous.projects?.[key]?.keptByCustomer;
-    const merge = mergeVendorTree({
-      baseline: baselineProject,
-      customer: customerProject,
-      staged: stagedProject,
-      vendorGlobs: vendor,
-      remoteEmpty: false,
-      seedMissing,
-      customerOwned: Array.isArray(previouslyKept) ? previouslyKept : [],
-    });
-    entry.keptByCustomer = nextCustomerOwned(previouslyKept, merge);
-
-    for (const [rel, action] of Object.entries(merge.actions)) {
-      const target = join(projectOut, rel);
-      if (action === MERGE_ACTION.add || action === MERGE_ACTION.update
-        || (action === MERGE_ACTION.addPending && seedMissing)) {
-        mkdirSync(dirname(target), { recursive: true });
-        copyFileSync(join(stagedProjectDir, rel), target);
-        (action === MERGE_ACTION.update ? entry.updated : entry.added).push(rel);
-      } else if (action === MERGE_ACTION.delete) {
-        rmSync(target, { force: true });
-        entry.removed.push(rel);
-      } else if (action === MERGE_ACTION.addPending) {
-        entry.addPending.push(rel);
-      }
+    const untouched = stagedProjects.filter((name) => !absent.includes(name) && !requested.includes(name));
+    if (untouched.length) {
+      log(`[snapshot] projects/ left alone (name them with --projects to replace): ${untouched.join(', ')}`);
     }
-
-    // Sidecars. `.gitattributes` is already the delivered one at this point (zone A
-    // ran above), so check-attr answers for the tree the customer will actually
-    // commit — not for the one they had before.
-    const attributeOf = (path) => parseCheckAttr(
-      gitIn(clone, ['check-attr', 'filter', '--', `projects/${key}/${path}`], { allowFailure: true }) ?? '');
-    for (const conflict of merge.conflicts) {
-      const record = { ...conflict, sidecarPath: null };
-      if (conflict.sidecar && existsSync(join(stagedProjectDir, conflict.path))) {
-        const sidecar = sidecarPathFor(conflict.path, version);
-        if (sidecarIsSafe(conflict.path, sidecar, attributeOf)) {
-          const target = join(projectOut, sidecar);
-          mkdirSync(dirname(target), { recursive: true });
-          copyFileSync(join(stagedProjectDir, conflict.path), target);
-          record.sidecarPath = sidecar;
-        }
-      }
-      entry.conflicts.push(record);
-    }
-
-    mergeCustomerProjectManifest({ projectOut, stagedProjectDir, vendor, version, entry, attributeOf });
-    report[key] = entry;
+  }
+  const toSeed = firstDelivery ? stagedProjects : absent;
+  // A folder that is being seeded is not also being replaced — there is nothing
+  // there to replace, and reporting it twice would make the summary lie.
+  const toReplace = firstDelivery ? [] : requested.filter((name) => !toSeed.includes(name));
+  for (const name of [...toSeed, ...toReplace]) {
+    rmSync(join(clone, 'projects', name), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    copyTree(join(staged, 'projects', name), join(clone, 'projects', name), skipBuildDirs);
+    (toSeed.includes(name) ? seeded : replaced).push(name);
   }
 
-  // The kept-set is delivery state, not staging state — it can only be known after
-  // the merge — so it is patched into the manifest that zone A just wrote. It is a
-  // short list of paths, not a hash map: the thing §2.4 rejected was carrying a
-  // second copy of Git's hash tree, not carrying a decision Git cannot express.
-  const manifestPath = join(clone, 'delivery-manifest.json');
-  if (existsSync(manifestPath)) {
-    const manifest = readJson(manifestPath, 'delivery-manifest.json');
-    manifest.projects ??= {};
-    for (const [key, entry] of Object.entries(report)) {
-      manifest.projects[key] = { ...manifest.projects[key], keptByCustomer: entry.keptByCustomer };
-    }
-    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
-  }
+  // ── 3. Sidecars left behind by the pre-738 merge (F11) ────────────────
+  const sidecarsRemoved = removeVendorSidecars(join(clone, 'projects'));
 
-  const generatedAt = new Date().toISOString();
-  const summary = { version, generatedAt, remoteEmpty, baselineTag, projects: report, drift };
-  writeFileSync(join(clone, 'DELIVERY-REPORT.md'), renderDeliveryReport(summary));
-  return summary;
-}
-
-/**
- * Merges `project.json`, the one file that carries both zones (§2.7).
- *
- * It sits at the project root and matches no vendor glob, so the tree merge
- * leaves it alone — which would mean `schemaVersion` and the vendor block, i.e.
- * the entire schema-update channel, could never reach a delivered customer.
- */
-function mergeCustomerProjectManifest({ projectOut, stagedProjectDir, vendor, version, entry, attributeOf }) {
-  const vendorPath = join(stagedProjectDir, 'project.json');
-  if (!existsSync(vendorPath)) return;
-  const customerPath = join(projectOut, 'project.json');
-  const vendorManifest = readJson(vendorPath, 'delivered project.json');
-  if (!existsSync(customerPath)) {
-    mkdirSync(projectOut, { recursive: true });
-    writeFileSync(customerPath, JSON.stringify(vendorManifest, null, 2) + '\n');
-    entry.added.push('project.json');
-    return;
-  }
-  let customerManifest = null;
-  try {
-    customerManifest = JSON.parse(readFileSync(customerPath, 'utf8'));
-  } catch {
-    customerManifest = null;
-  }
-  const { merged, unreadable, changed } = mergeProjectManifest(customerManifest, vendorManifest, vendor);
-  if (unreadable) {
-    // Merging into a file we cannot parse is a guess, and the guess overwrites a
-    // project index. The customer's file stays; ours goes beside it.
-    const record = { path: 'project.json', reason: CONFLICT_REASON.bothChanged, sidecar: true, sidecarPath: null };
-    const sidecar = sidecarPathFor('project.json', version);
-    if (sidecarIsSafe('project.json', sidecar, attributeOf)) {
-      writeFileSync(join(projectOut, sidecar), JSON.stringify(vendorManifest, null, 2) + '\n');
-      record.sidecarPath = sidecar;
-    }
-    entry.conflicts.push(record);
-    return;
-  }
-  if (!changed.length) return;
-  writeFileSync(customerPath, JSON.stringify(merged, null, 2) + '\n');
-  entry.updated.push('project.json');
+  return {
+    version,
+    generatedAt: new Date().toISOString(),
+    remoteEmpty,
+    firstDelivery,
+    untagged,
+    baselineTag,
+    seeded,
+    replaced,
+    sidecarsRemoved,
+  };
 }
 
 //! Renders the customer-facing change summary between the previously delivered core commit
@@ -3377,37 +3739,58 @@ export function readBaselineSourceInventory(clone, baselineTag) {
   return parseBaselineSourceInventory(text ?? '');
 }
 
-//! One-line merge summary per project for the delivery CLI (§3.1).
-export function formatMergeSummary(snapshot) {
-  const lines = [];
-  for (const [key, project] of Object.entries(snapshot.projects)) {
-    if (project.seeded) {
-      lines.push(`[merge]   ${key}: erstmalig eingerichtet (Seeding)`);
-      continue;
-    }
-    lines.push(`[merge]   ${key}: +${project.added.length} neu   ~${project.updated.length} aktualisiert`
-      + `   -${project.removed.length} entfernt   !${project.conflicts.length} Konflikt`
-      + (project.addPending.length ? `   ?${project.addPending.length} fehlend (--seed-missing)` : ''));
+//! One line per territory, for the delivery CLI (§3). Deliberately short: the
+//! interesting output of a delivery is now the `--projects` preview, and a
+//! standard delivery has nothing to say about `projects/` except that it did
+//! not touch it.
+export function formatSnapshotSummary(snapshot) {
+  const lines = [`[snapshot] core replaced in full (viewer ${snapshot.version})`];
+  if (snapshot.seeded.length) {
+    // Seeding happens on a first delivery and, folder by folder, in the untagged
+    // case — where the repository is NOT new and saying so would be a lie.
+    lines.push(snapshot.firstDelivery
+      ? `[snapshot] projects/ seeded — first delivery into this repository: ${snapshot.seeded.join(', ')}`
+      : `[snapshot] projects/ seeded — these folders did not exist in the customer repository yet: ${snapshot.seeded.join(', ')}`);
   }
-  if (snapshot.drift.length) {
-    lines.push(`[drift]   ${snapshot.drift.length} Kundenaenderung(en) ausserhalb projects/ erkannt (ueberschrieben, siehe Report)`);
+  for (const name of snapshot.replaced) {
+    lines.push(`[snapshot] projects/${name}: replaced with this delivery's snapshot (--projects)`);
   }
-  for (const [key, project] of Object.entries(snapshot.projects)) {
-    for (const conflict of project.conflicts) {
-      lines.push(`  KONFLIKT  ${key}/${conflict.path}`
-        + (conflict.sidecarPath ? `\n            Ihre Version wurde behalten. Neu: ${conflict.sidecarPath}` : ''));
-    }
+  if (!snapshot.seeded.length && !snapshot.replaced.length) {
+    lines.push('[snapshot] projects/ untouched — the customer\'s territory.');
+  }
+  if (snapshot.sidecarsRemoved.length) {
+    lines.push(`[snapshot] ${snapshot.sidecarsRemoved.length} leftover .vendor-* sidecar(s) removed from projects/`);
   }
   return lines.join('\n');
 }
 
-//! Short conflict note for the delivery commit message, so it is visible in Forgejo.
-export function mergeCommitNote(snapshot) {
-  const conflicting = Object.entries(snapshot.projects)
-    .filter(([, project]) => project.conflicts.length)
-    .map(([key, project]) => `${key} (${project.conflicts.length})`);
-  if (!conflicting.length) return '';
-  return `Conflicts kept on your side: ${conflicting.join(', ')} — see DELIVERY-REPORT.md`;
+/**
+ * The paragraph the FIRST delivery under the new model puts in its commit
+ * message (F9) — the whole customer communication this change gets.
+ *
+ * Passive on purpose (Grill decision, 2026-09-03): no customer mail, no
+ * announcement. The new README states the rules, and the one commit that
+ * changes the rules says so where the customer already looks — in Forgejo, on
+ * the commit that arrived.
+ *
+ * "First" is decided by the manifest that was in the repository before this
+ * delivery, so it says itself exactly once and needs no changeover state
+ * anywhere: from the second delivery on, the repository already carries v3.
+ */
+export function changeoverCommitNote(previousManifestVersion, snapshot = null) {
+  if (Number.isInteger(previousManifestVersion) && previousManifestVersion >= DELIVERY_MANIFEST_VERSION) return '';
+  const lines = [
+    'Neues Liefermodell ab dieser Auslieferung.',
+    '',
+    'Wir liefern die Anwendung: alles ausserhalb von projects/ wird bei jeder Auslieferung',
+    'vollstaendig ersetzt. projects/ gehoert Ihnen — eine Auslieferung schreibt dort nichts,',
+    'ausser Sie bitten uns ausdruecklich, ein bestimmtes Projekt zu aktualisieren.',
+    '',
+    'Damit entfallen der dateiweise Merge, die .vendor-<Version>-Dateien und DELIVERY-REPORT.md.',
+    'Zwei Regeln bleiben: committen Sie Ihre Arbeit, bevor Sie pullen — und wir force-pushen nie.',
+  ];
+  if (snapshot?.sidecarsRemoved?.length) {
+    lines.push('', `Aufgeraeumt: ${snapshot.sidecarsRemoved.length} zurueckgebliebene .vendor-Datei(en) aus projects/ entfernt.`);
+  }
+  return lines.join('\n');
 }
-
-export { summariseMerge };

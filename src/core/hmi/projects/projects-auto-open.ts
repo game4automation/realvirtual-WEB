@@ -66,8 +66,13 @@ export interface AutoOpenInputs {
   restoreFailed?: boolean | undefined;
 }
 
-/** URL parameters that mean "the session already knows what to show". */
-const ROUTING_PARAMS = ['project', 'scene', 'model'] as const;
+/**
+ * URL parameters that mean "the session already knows what to show".
+ * `doc` joined on 2026-09-05: a `?doc=<id>` deep link (and the reserved
+ * `?doc=new`) names its document as clearly as `?scene=` does, and the
+ * dashboard used to open over it anyway.
+ */
+const ROUTING_PARAMS = ['project', 'scene', 'model', 'doc'] as const;
 
 /**
  * True when the Projects dashboard should open itself at startup.
@@ -80,10 +85,16 @@ const ROUTING_PARAMS = ['project', 'scene', 'model'] as const;
 export function shouldAutoOpenProjects(inputs: AutoOpenInputs): boolean {
   if (inputs.suppress) return false;
   if (inputs.modeLocked) return false;
+
+  const params = new URLSearchParams(inputs.search);
+  // `?doc=new` is an explicit "give me an empty editor" (2026-09-05). It
+  // outranks even `force` and a failed restore: the boot has already put a
+  // fresh document on screen, and a dashboard over it would undo the request.
+  if ((params.get('doc') ?? '').trim() === 'new') return false;
+
   if (inputs.force) return true;
   if (inputs.restoreFailed) return true;
 
-  const params = new URLSearchParams(inputs.search);
   if (ROUTING_PARAMS.some(p => (params.get(p) ?? '').trim() !== '')) return false;
 
   if ((inputs.defaultModel ?? '').trim() !== '') return false;

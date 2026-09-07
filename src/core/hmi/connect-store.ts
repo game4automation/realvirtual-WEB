@@ -12,6 +12,11 @@
 
 import { createStore } from './create-store';
 import { deriveWireType, type S7Tag, type ParsedTopic } from '../import/s7-tag-table';
+import {
+  buildJsonTopicsFromRows,
+  type SewJsonTopicOptions,
+  type SewSymbolRow,
+} from '../import/sew-symbol-table';
 import { connectRestFetch } from './connect-rest';
 import { clearLicenseStatus, fetchLicenseStatus } from './license-store';
 import { fetchConnectNews } from '../news-store';
@@ -38,14 +43,29 @@ export interface ConnectInterfaceSignal {
   record: boolean;
 }
 
-/** MQTT topic config — one topic carries either a Single scalar or a ProcessImage byte array. */
+/**
+ * Payload mode of one MQTT topic (CONNECT `MqttTopicConfig.Mode`).
+ *   Single       — one scalar per topic
+ *   ProcessImage — a raw Siemens byte image decoded by tag-table offsets
+ *   Json         — a flat JSON object `{"Name": value, …}` (plan-457, SEW MOVI-C)
+ */
+export type MqttTopicMode = 'Single' | 'ProcessImage' | 'Json';
+
+/** Payload encoding of a Json topic (CONNECT `MqttTopicConfig.Encoding`). */
+export type MqttEncoding = 'Utf8' | 'WString' | 'Auto';
+
+/** MQTT topic config — one topic carries a Single scalar, a ProcessImage byte array or a Json object. */
 export interface ConnectMqttTopic {
   topic: string;
-  mode: string; // 'Single' | 'ProcessImage'
+  mode: MqttTopicMode;
   /** MQTT QoS level (CONNECT `MqttTopicConfig.Qos`). Default 1. */
   qos?: number;
   /** MQTT retained flag (CONNECT `MqttTopicConfig.Retained`). Default true. */
   retained?: boolean;
+  /** Json mode only: payload encoding. Default `Auto` (BOM, then null-byte heuristic). */
+  encoding?: MqttEncoding;
+  /** Json mode only: cyclic publish interval in milliseconds for PLCInput signals. Default 100. */
+  publishIntervalMs?: number;
   signals?: ConnectInterfaceSignal[];
 }
 
@@ -2017,6 +2037,78 @@ export async function importTagTable(params: ImportTagTableParams): Promise<void
 export async function importS7TagTable(interfaceId: string, tags: S7Tag[]): Promise<void> {
   const signals = _tagsToSignals(tags);
   await updateInterface(interfaceId, { signals });
+}
+
+// ── SEW Symbol Table Import (plan-457) ───────────────────────────────────────
+
+export interface ImportSewSymbolTableParams extends SewJsonTopicOptions {
+  /** Parsed and validated symbol rows. */
+  rows: SewSymbolRow[];
+  /** MQTT broker URL for the target interface. */
+  brokerUrl: string;
+  /**
+   * Target interface id, or null to create a new MQTT interface.
+   * When set and the interface exists, it is updated (PUT) and the same-named
+   * topics are replaced in place — a re-import never duplicates a topic.
+   */
+  targetInterfaceId?: string | null;
+}
+
+/**
+ * Push a parsed SEW symbol table to CONNECT as two MQTT **Json** topics.
+ *
+ * PLC_OUT signals land on the receive topic (CONNECT subscribes and decodes),
+ * PLC_IN signals on the publish topic (CONNECT publishes the whole object every
+ * `publishIntervalMs`). Both carry their `encoding` and the publish topic its
+ * interval, so the gateway needs no defaults of its own.
+ *
+ * Update-vs-New follows {@link importTagTable}: an existing target is PUT with
+ * the same-named topics replaced (other topics untouched), otherwise a new MQTT
+ * interface is POSTed.
+ */
+export async function importSewSymbolTable(params: ImportSewSymbolTableParams): Promise<void> {
+  const { rows, brokerUrl, targetInterfaceId, ...topicOptions } = params;
+  const newTopics = buildJsonTopicsFromRows(rows, topicOptions) as ConnectMqttTopic[];
+  if (newTopics.length === 0) return;
+
+  const existing = targetInterfaceId
+    ? _store.getSnapshot().interfaces.find(i => i.id === targetInterfaceId)
+    : undefined;
+
+  if (existing) {
+    const byName = new Map(newTopics.map(t => [t.topic, t]));
+    const kept = (existing.topics ?? []).map(t => byName.get(t.topic) ?? t);
+    const keptNames = new Set(kept.map(t => t.topic));
+    const topics = [...kept, ...newTopics.filter(t => !keptNames.has(t.topic))];
+    await updateInterface(existing.id, { brokerUrl, topics });
+  } else {
+    await addInterface({
+      type: 'MQTT',
+      enabled: true,
+      brokerUrl,
+      topics: newTopics,
+    } as Omit<ConnectInterface, 'id' | 'signals'>);
+  }
+}
+
+/**
+ * Patch one MQTT topic's transport settings (mode / encoding / publish interval /
+ * QoS / retain) on an existing interface and PUT the whole config back.
+ *
+ * The topic's `signals` are never touched — this is the topic editor's write
+ * path, not a signal edit. Leaving the mode alone but switching the encoding is
+ * therefore a one-field patch, and the round-trip through
+ * `PUT /config/interfaces/{id}` carries exactly the fields CONNECT reads.
+ */
+export async function updateMqttTopic(
+  interfaceId: string,
+  topicName: string,
+  patch: Partial<Pick<ConnectMqttTopic, 'mode' | 'encoding' | 'publishIntervalMs' | 'qos' | 'retained'>>,
+): Promise<void> {
+  const existing = _store.getSnapshot().interfaces.find(i => i.id === interfaceId);
+  if (!existing) throw new Error(`Unknown interface "${interfaceId}"`);
+  const topics = (existing.topics ?? []).map(t => (t.topic === topicName ? { ...t, ...patch } : t));
+  await updateInterface(interfaceId, { topics });
 }
 
 // ── Multi-Tab Tag Table Import ───────────────────────────────────────────────

@@ -32,8 +32,14 @@ describe('opens when the session asked for nothing', () => {
 });
 
 describe('stays shut when the session already knows what to show', () => {
-  it.each(['?project=demo', '?scene=abc', '?model=/models/x.glb'])('%s', (search) => {
+  it.each(['?project=demo', '?scene=abc', '?model=/models/x.glb', '?doc=doc_abc', '?doc=new&mode=editor'])('%s', (search) => {
     expect(shouldAutoOpenProjects({ ...base, search })).toBe(false);
+  });
+
+  it('?doc=new outranks force and a failed restore', () => {
+    const search = '?doc=new&mode=editor';
+    expect(shouldAutoOpenProjects({ ...base, search, force: true })).toBe(false);
+    expect(shouldAutoOpenProjects({ ...base, search, restoreFailed: true })).toBe(false);
   });
 
   it('stays shut with a configured defaultModel', () => {

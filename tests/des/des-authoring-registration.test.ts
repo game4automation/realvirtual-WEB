@@ -44,7 +44,10 @@ describe('DES registration and planner authoring', () => {
     for (const type of MATERIAL_FLOW_TYPES) {
       expect(registry.getMaterialFlow(type), `${type} is registered`).toBeDefined();
     }
-  });
+    // The budget covers the IMPORT, not the assertions: `vi.resetModules()`
+    // forces the whole DES plugin graph back through Vite's on-demand
+    // transform, which is 20-25 s on a loaded machine.
+  }, 60_000);
 
   it('round-trips virtual catalog nodes and binds the authored DES components', async () => {
     vi.resetModules();
@@ -109,5 +112,7 @@ describe('DES registration and planner authoring', () => {
     const runner = new DESRunner({ subMode: 'animated' });
     expect(bindSceneToRunner(runner, scene, makeHost())).toBe(4);
     expect(runner.liveInstances.map((instance) => instance.def.type)).toEqual(authoredTypes);
-  });
+    // Same budget, same reason as the test above: `vi.resetModules()` plus the
+    // DES plugin graph is a whole-graph re-transform, not slow test logic.
+  }, 60_000);
 });

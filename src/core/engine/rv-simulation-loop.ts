@@ -48,6 +48,18 @@ export class SimulationLoop {
    *  resurrect simulation there. */
   private _integrationEnabled = true;
 
+  // ── Lost-simulation-time accounting (plan-465 F2/SOL #2) ──────────────
+  /** Real seconds discarded by the 0.1 s frame-time clamp (spiral-of-death
+   *  guard). Simulated time falls behind wall-clock by exactly this much. */
+  private _clampedSeconds = 0;
+  /** Real seconds discarded because the accumulator still held more than one
+   *  fixed step after the `maxSubSteps` ceiling was hit (backlog drop). */
+  private _droppedBacklogSeconds = 0;
+  /** Real seconds during which time integration was intentionally off
+   *  (pause reason held or `_integrationEnabled === false`). NOT a loss —
+   *  reported separately so a paused tab is never counted as drift. */
+  private _pausedSeconds = 0;
+
   onFixedUpdate: (dt: number) => void = () => {};
   onRender: (frameTime: number) => void = () => {};
 
@@ -89,6 +101,71 @@ export class SimulationLoop {
     this._integrationEnabled = enabled;
   }
 
+  /** Real seconds dropped by the frame-time clamp since the last reset. */
+  get clampedSeconds(): number { return this._clampedSeconds; }
+
+  /** Real seconds dropped as fixed-update backlog since the last reset. */
+  get droppedBacklogSeconds(): number { return this._droppedBacklogSeconds; }
+
+  /** Real seconds spent paused / with integration disabled since the last reset. */
+  get pausedSeconds(): number { return this._pausedSeconds; }
+
+  /**
+   * Simulated time lost relative to wall clock while the simulation was
+   * *supposed* to run: clamp + backlog. Pause time is excluded on purpose —
+   * a deliberately paused simulation has not drifted.
+   */
+  get lostSimSeconds(): number { return this._clampedSeconds + this._droppedBacklogSeconds; }
+
+  /** Zero all lost-time counters (used by the perf probe between runs). */
+  resetLostTimeCounters(): void {
+    this._clampedSeconds = 0;
+    this._droppedBacklogSeconds = 0;
+    this._pausedSeconds = 0;
+  }
+
+  /**
+   * Shared accumulator step for BOTH tick paths (`tick` and `tickFromRenderer`).
+   *
+   * Having exactly one implementation is the point: the two paths drifted apart
+   * trivially before, and the lost-time counters must be identical in both
+   * (plan-465, SOL #2). Returns the CLAMPED frame time the caller passes on to
+   * `onRender`.
+   */
+  private advanceAccumulator(rawFrameTime: number): number {
+    let frameTime = rawFrameTime;
+
+    // Clamp frame time to avoid spiral of death — the discarded part is real
+    // time the simulation will never see again.
+    if (frameTime > 0.1) {
+      this._clampedSeconds += frameTime - 0.1;
+      frameTime = 0.1;
+    }
+
+    if (this.isPaused || !this._integrationEnabled) {
+      // Drain accumulator so on resume we don't do a catch-up burst that
+      // would fast-forward drives, sensors, and logic steps by seconds.
+      this._pausedSeconds += frameTime;
+      this.accumulator = 0;
+      return frameTime;
+    }
+
+    this.accumulator += frameTime;
+    let substeps = 0;
+    while (this.accumulator >= this.fixedTimeStep && substeps < this.maxSubSteps) {
+      this.onFixedUpdate(this.fixedTimeStep);
+      this.accumulator -= this.fixedTimeStep;
+      substeps++;
+    }
+    // Hit the sub-step ceiling: drop the unprocessed backlog so a slow frame
+    // doesn't snowball into an ever-growing catch-up burst (real-time pacing).
+    if (this.accumulator > this.fixedTimeStep) {
+      this._droppedBacklogSeconds += this.accumulator;
+      this.accumulator = 0;
+    }
+    return frameTime;
+  }
+
   start() {
     this.running = true;
     if (this.renderer) {
@@ -113,30 +190,10 @@ export class SimulationLoop {
     requestAnimationFrame(() => this.tick());
 
     const now = performance.now() / 1000;
-    let frameTime = now - this.lastTime;
+    const rawFrameTime = now - this.lastTime;
     this.lastTime = now;
 
-    // Clamp frame time to avoid spiral of death
-    if (frameTime > 0.1) frameTime = 0.1;
-
-    if (this.isPaused || !this._integrationEnabled) {
-      // Drain accumulator so on resume we don't do a catch-up burst that
-      // would fast-forward drives, sensors, and logic steps by seconds.
-      this.accumulator = 0;
-    } else {
-      this.accumulator += frameTime;
-      let substeps = 0;
-      while (this.accumulator >= this.fixedTimeStep && substeps < this.maxSubSteps) {
-        this.onFixedUpdate(this.fixedTimeStep);
-        this.accumulator -= this.fixedTimeStep;
-        substeps++;
-      }
-      // Hit the sub-step ceiling: drop the unprocessed backlog so a slow frame
-      // doesn't snowball into an ever-growing catch-up burst (real-time pacing).
-      if (this.accumulator > this.fixedTimeStep) this.accumulator = 0;
-    }
-
-    this.onRender(frameTime);
+    this.onRender(this.advanceAccumulator(rawFrameTime));
   };
 
   /** Renderer-driven path: called by renderer.setAnimationLoop (supports WebXR). */
@@ -153,29 +210,9 @@ export class SimulationLoop {
       return;
     }
 
-    let frameTime = now - this.lastTime;
+    const rawFrameTime = now - this.lastTime;
     this.lastTime = now;
 
-    // Clamp frame time to avoid spiral of death
-    if (frameTime > 0.1) frameTime = 0.1;
-
-    if (this.isPaused || !this._integrationEnabled) {
-      // Drain accumulator so on resume we don't do a catch-up burst that
-      // would fast-forward drives, sensors, and logic steps by seconds.
-      this.accumulator = 0;
-    } else {
-      this.accumulator += frameTime;
-      let substeps = 0;
-      while (this.accumulator >= this.fixedTimeStep && substeps < this.maxSubSteps) {
-        this.onFixedUpdate(this.fixedTimeStep);
-        this.accumulator -= this.fixedTimeStep;
-        substeps++;
-      }
-      // Hit the sub-step ceiling: drop the unprocessed backlog so a slow frame
-      // doesn't snowball into an ever-growing catch-up burst (real-time pacing).
-      if (this.accumulator > this.fixedTimeStep) this.accumulator = 0;
-    }
-
-    this.onRender(frameTime);
+    this.onRender(this.advanceAccumulator(rawFrameTime));
   }
 }

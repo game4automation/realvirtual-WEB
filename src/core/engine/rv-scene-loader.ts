@@ -37,6 +37,11 @@ import './rv-emergency-button3d';
 import './rv-handle-switch3d';
 import './rv-energy-chain';
 import './rv-chain';
+// plan-459 - RibbonRoller / RibbonWinder / RibbonPath self-register on import.
+import './rv-ribbon-roller';
+import './rv-ribbon-winder';
+import './rv-ribbon-dancer';
+import './rv-ribbon-path';
 import './rv-safety-door';
 import './rv-physics-zone';
 import './rv-collision-role';
@@ -70,6 +75,7 @@ import type { LampManager } from './rv-lamp-manager';
 import type { SceneButtonManager } from './rv-scene-button-manager';
 import type { EnergyChainManager } from './rv-energy-chain-manager';
 import type { ChainManager } from './rv-chain-manager';
+import type { RibbonManager } from './rv-ribbon-manager';
 import type { MachiningManager } from './rv-machining-manager';
 import type { CollisionRoleRegistrar } from './rv-collision-role';
 // plan-404: the rigid-body mechanism manager is a PRIVATE implementation behind
@@ -336,6 +342,8 @@ export interface LoadGLBOptions {
   energyChainManager?: EnergyChainManager;
   /** plan-733 - so a Chain reaches the per-tick pose registry. */
   chainManager?: ChainManager;
+  /** plan-459 - so a RibbonPath reaches the per-tick web registry. */
+  ribbonManager?: RibbonManager;
   /** Optional viewer-owned CSG machining registry (plan-405) — passed into
    *  ComponentContext so `MachiningVolume` components can register themselves. */
   machiningManager?: MachiningManager;
@@ -570,12 +578,48 @@ export function processMeshes(root: Object3D): MeshProcessResult {
   // subtrees (a mechanism container is typically an ancestor of everything).
   const MOTION_KEY = /^Drive|^Kinematic(_\d+)?$/i;
 
+  // Web handling (plan-459/460) moves nodes WITHOUT a Drive: `RVRibbonPath`
+  // writes the quaternion of every FOLLOWER roller, `RVRibbonDancer` writes a
+  // position and `RVRibbonWinder` a scale, all of them straight onto the node.
+  // Classified as static below they get `matrixAutoUpdate = false`, those writes
+  // never reach `matrixWorld`, and only the DRIVEN rollers of a slitter appear
+  // to turn while every idler, dancer and roll stands frozen. Same reasoning
+  // (and the same exception) as `MOVER_KEY` in `rv-freeze-static.ts`, whose
+  // freeze is the second half of the same bug.
+  //
+  // Deliberately a SEPARATE set from `driveNodeSet`: that set is also the arena
+  // anchor and the raycast grouping key, and a web subtree is already kept out
+  // of the batched arenas by `EXCLUDED_SUBTREE_KEYS` (rv-batched-render.ts).
+  // Only the `matrixAutoUpdate` question is answered here.
+  const WEB_MOTION_KEY = /^Ribbon(Path|Roller|Winder|Dancer)/i;
+  // A `RibbonRoller` with `SpinMode: Texture` deliberately does NOT move — it
+  // scrolls its mantle map and leaves the node pose alone — so it may stay
+  // static, exactly as `rv-freeze-static.ts` decides. `RibbonDancer` TRANSLATES,
+  // so the exception is carried by the anchored `RibbonRoller` prefix rather
+  // than a loose `Ribbon` one.
+  const RIBBON_ROLLER_KEY = /^RibbonRoller/i;
+  const webMotionNodeSet = new Set<Object3D>();
+
   root.traverse((node: Object3D) => {
     const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
     if (!rv) return;
+    // ONE pass over the component keys, answering both questions. Two loops
+    // read more clearly and cost a second walk of every node's component map on
+    // every load of every document — the overwhelming majority of which carry no
+    // web at all — so the two `break`s become two flags instead.
+    let isDriveNode = false;
+    let isWebMotionNode = false;
     for (const key in rv) {
-      if (rv[key] && MOTION_KEY.test(key)) { driveNodeSet.add(node); break; }
+      if (!rv[key]) continue;
+      if (!isDriveNode && MOTION_KEY.test(key)) isDriveNode = true;
+      if (!isWebMotionNode && WEB_MOTION_KEY.test(key)
+        && !(RIBBON_ROLLER_KEY.test(key) && (rv[key] as { SpinMode?: unknown }).SpinMode === 'Texture')) {
+        isWebMotionNode = true;
+      }
+      if (isDriveNode && isWebMotionNode) break;
     }
+    if (isDriveNode) driveNodeSet.add(node);
+    if (isWebMotionNode) webMotionNodeSet.add(node);
     if (rv['TransportSurface']) transportSurfaceNodeSet.add(node);
   });
 
@@ -594,6 +638,26 @@ export function processMeshes(root: Object3D): MeshProcessResult {
     let current: Object3D | null = node;
     while (current) {
       if (transportSurfaceNodeSet.has(current)) return true;
+      current = current.parent;
+    }
+    return false;
+  }
+
+  /**
+   * True when the node itself, or an ancestor, is posed by a web component.
+   *
+   * The empty-set early-out is not micro-optimisation: this is asked for EVERY
+   * mesh that is not already under a drive — which in an ordinary factory
+   * document is nearly all of them — and without it every one of those meshes
+   * walks its whole ancestor chain to the root to learn that a document with no
+   * web in it has no web in it. The set is built one traverse earlier, so the
+   * answer is already known before the walk starts.
+   */
+  function isUnderWebMotion(node: Object3D): boolean {
+    if (webMotionNodeSet.size === 0) return false;
+    let current: Object3D | null = node;
+    while (current) {
+      if (webMotionNodeSet.has(current)) return true;
       current = current.parent;
     }
     return false;
@@ -626,7 +690,7 @@ export function processMeshes(root: Object3D): MeshProcessResult {
         // renderer never rebuilds its matrix from the quaternion applyToNode()
         // sets — so the drive reports running/rotating but the geometry never
         // visibly moves. A drive node is always dynamic.
-        const underDrive = driveNodeSet.has(node) || isUnderDrive(node);
+        const underDrive = driveNodeSet.has(node) || isUnderDrive(node) || isUnderWebMotion(node);
         const underTS = isUnderTransportSurface(node);
         const isStatic = !underDrive || underTS;
         if (isStatic) {
@@ -1560,6 +1624,8 @@ export interface RuntimeNodeDeps {
   energyChainManager?: EnergyChainManager;
   /** plan-733 - so a Chain reaches the per-tick pose registry. */
   chainManager?: ChainManager;
+  /** plan-459 - so a RibbonPath reaches the per-tick web registry. */
+  ribbonManager?: RibbonManager;
   /** plan-405 — so a runtime-created `MachiningVolume` reaches the manager. */
   machiningManager?: MachiningManager;
   /** plan-394 — so a runtime-created `CollisionRole` reaches the manager. */
@@ -1646,6 +1712,7 @@ export function createRuntimeNode(deps: RuntimeNodeDeps, spec: RuntimeNodeSpec):
     sceneButtonManager: deps.sceneButtonManager,
     energyChainManager: deps.energyChainManager,
     chainManager: deps.chainManager,
+    ribbonManager: deps.ribbonManager,
     machiningManager: deps.machiningManager,
     collisionManager: deps.collisionManager,
     outlineManager: deps.outlineManager,
@@ -1740,6 +1807,7 @@ function runtimeComponentContext(deps: RuntimeNodeDeps, root: Object3D): Compone
     sceneButtonManager: deps.sceneButtonManager,
     energyChainManager: deps.energyChainManager,
     chainManager: deps.chainManager,
+    ribbonManager: deps.ribbonManager,
     machiningManager: deps.machiningManager,
     collisionManager: deps.collisionManager,
     outlineManager: deps.outlineManager,
@@ -2472,6 +2540,7 @@ export async function loadGLB(url: string, scene: Scene, options?: LoadGLBOption
     sceneButtonManager: options?.sceneButtonManager,
     energyChainManager: options?.energyChainManager, expectSceneReady: true,
     chainManager: options?.chainManager,
+    ribbonManager: options?.ribbonManager,
     // plan-733 R4 - the asset editor saves the tree it sees, so components that
     // materialise runtime geometry (RVChain element clones) must not build it.
     // Keyed to `preserveAuthoringHierarchy`, NOT `preserveHierarchy`: the latter
@@ -2879,6 +2948,8 @@ export interface ProcessExtrasOptions {
   machiningManager?: MachiningManager;
   /** plan-733 - so a placed Chain reaches the per-tick pose registry. */
   chainManager?: ChainManager;
+  /** plan-459 - so a placed RibbonPath reaches the per-tick web registry. */
+  ribbonManager?: RibbonManager;
   /**
    * plan-727 — AUTHORING call: never mutate the subtree's hierarchy. Same
    * meaning as {@link LoadGLBOptions.preserveAuthoringHierarchy}, for the
@@ -3018,6 +3089,7 @@ export function processExtras(
     gizmoManager, lampManager, outlineManager, events, errorStore, instructionStore,
     energyChainManager, sceneButtonManager, expectSceneReady: true,
     chainManager: options?.chainManager,
+    ribbonManager: options?.ribbonManager,
     // plan-733 R4 — same authoring gate as loadGLB above; the asset editor's
     // `_rebuildComponents()` is the caller that sets it here.
     authoring: options?.preserveAuthoringHierarchy === true,

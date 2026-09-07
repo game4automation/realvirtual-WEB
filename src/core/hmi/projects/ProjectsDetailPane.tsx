@@ -30,10 +30,11 @@
  */
 
 import { lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Box, Button, Divider, Stack, TextField, Typography } from '@mui/material';
+import { Box, Button, Divider, IconButton, Stack, TextField, Typography } from '@mui/material';
+import { Close } from '@mui/icons-material';
 import { RV_SCROLL_CLASS } from '../shared-sx';
 import { SectionHeader } from '../shared-components';
-import { loadMarkdown } from '../rv-markdown-lazy';
+import { LazyMarkdown } from '../rv-markdown-lazy';
 
 // ─── Markdown preview + editor (plan-445 F7) ────────────────────────────
 
@@ -48,17 +49,6 @@ import { loadMarkdown } from '../rv-markdown-lazy';
  * worth more than an error box.
  */
 function MarkdownPreview({ text }: { text: string }) {
-  const Lazy = useMemo(
-    () => lazy(async () => {
-      const { ReactMarkdown, remarkGfm } = await loadMarkdown();
-      return {
-        default: ({ source }: { source: string }) => (
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{source}</ReactMarkdown>
-        ),
-      };
-    }),
-    [],
-  );
   const raw = (
     <Typography
       component="pre"
@@ -81,9 +71,7 @@ function MarkdownPreview({ text }: { text: string }) {
         '& img': { maxWidth: '100%' },
       }}
     >
-      <Suspense fallback={raw}>
-        <Lazy source={text} />
-      </Suspense>
+      <LazyMarkdown text={text} fallback={raw} />
     </Box>
   );
 }
@@ -258,6 +246,19 @@ export interface ProjectsDetailPaneProps {
    * the bytes (which is storage). Only `.md` selections supply it.
    */
   markdown?: MarkdownPaneModel;
+  /**
+   * How the pane is framed (plan-458 §2.4).
+   *
+   * `column` is the desktop's third column — a fixed 260px with a hairline on
+   * its left edge. `sheet` is the compact layout's bottom sheet: full width,
+   * no border, and a close button in the header band, because a sheet is
+   * something you dismiss whereas a column is simply there. Only the CHROME
+   * differs; the body — preview, fields, verbs — is the same pane, which is
+   * the point of a variant rather than a second component.
+   */
+  variant?: 'column' | 'sheet';
+  /** Dismiss the sheet. Ignored by the `column` variant, which has no exit. */
+  onClose?: () => void;
 }
 
 export interface MarkdownPaneModel {
@@ -285,7 +286,10 @@ export function ProjectsDetailPane({
   extra,
   onRename,
   markdown,
+  variant = 'column',
+  onClose,
 }: ProjectsDetailPaneProps) {
+  const sheet = variant === 'sheet';
   const [editValue, setEditValue] = useState<string | null>(null);
   // A different selection means a different name — never carry a half-typed
   // rename from one asset onto the next.
@@ -336,14 +340,24 @@ export function ProjectsDetailPane({
 
   return (
     <Box
-      sx={{
-        width: 260,
-        flexShrink: 0,
-        minHeight: 0,
-        display: 'flex',
-        flexDirection: 'column',
-        borderLeft: '1px solid rgba(255,255,255,0.06)',
-      }}
+      sx={sheet
+        ? {
+          // Inside the sheet the pane IS the surface: it takes the whole
+          // width and the sheet's own edges carry the frame.
+          width: '100%',
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+        }
+        : {
+          width: 260,
+          flexShrink: 0,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          borderLeft: '1px solid rgba(255,255,255,0.06)',
+        }}
     >
       {!title ? (
         // Says what the pane IS, not just that it is idle: "Nothing selected"
@@ -440,6 +454,17 @@ export function ProjectsDetailPane({
                   {text}
                 </Typography>
               ))}
+            {sheet && onClose && (
+              <IconButton
+                size="small"
+                onClick={onClose}
+                aria-label="Close details"
+                // 44px: the sheet only ever exists on a coarse pointer.
+                sx={{ width: 44, height: 44, flexShrink: 0, ml: 'auto' }}
+              >
+                <Close sx={{ fontSize: 18 }} />
+              </IconButton>
+            )}
           </Box>
 
           {/* The pane BODY — scrolls under the fixed header band. */}

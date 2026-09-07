@@ -66,11 +66,9 @@ import {
   FileDownload,
   MenuBookOutlined,
   MoreVert,
-  Redo,
   SaveAlt,
   SettingsEthernet,
   Share as ShareIcon,
-  Undo,
 } from '@mui/icons-material';
 import type { SvgIconComponent } from '@mui/icons-material';
 import { formatBytes } from '../../engine/rv-glb-flatten';
@@ -691,17 +689,33 @@ export function DocumentCard({
   );
 
   /**
-   * The compact identity: the trail IS the name.
+   * The compact identity: the trail IS the name, and the row is ONE line.
    *
    * The hierarchy header used to print the model name and the card repeated it
    * one line below, with the location trail on a third. Since the trail already
    * ends in the current document — in high ink at weight 600 — the name line
    * was the redundant one, so compact drops it and keeps the full breadcrumb.
-   * The hero keeps both: there the trail sits under a title that has room.
+   *
+   * What the header does NOT carry any more (2026-09-07):
+   *
+   *  - **The "UNSAVED" caption.** The dot in front already says it, in the ink
+   *    the whole product uses for exactly this, and the Save button next to it
+   *    turns blue at the same instant. Three tellings of one bit, and the word
+   *    was the one that cost the trail its width. The dot keeps the statement
+   *    reachable — it carries `aria-label="Unsaved changes"` and a tooltip.
+   *  - **The dirty dots inside the trail.** One amber dot per row, in front,
+   *    where a user's eye already looks for it (see `DocumentCrumbs`).
+   *  - **Undo / redo.** Ctrl+Z and Ctrl+Shift+Z are global (`HMIShell`), and a
+   *    disabled pair of arrows in the tightest row of the app bought nothing.
+   *  - **The kebab.** Every verb behind it is on the hero card of the projects
+   *    dashboard, which is where document-level actions live. A second entry
+   *    point in the panel header made the row compete with its own title.
    */
   const compactIdentity = (
     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0, flex: 1 }}>
-      {view.dirty ? <DirtyDot /> : <Box sx={{ width: 7, minWidth: 7 }} />}
+      {view.dirty
+        ? <DirtyDot title="Unsaved changes — click Save to write them" />
+        : <Box sx={{ width: 7, minWidth: 7 }} />}
       <DocumentCrumbs
         crumbs={view.crumbs}
         location={view.location}
@@ -710,55 +724,14 @@ export function DocumentCard({
         fontSize={12}
         ariaLabel="Document breadcrumb"
       />
-      {view.dirty && (
-        <Typography
-          sx={{
-            color: DIRTY_INK, fontSize: 10, textTransform: 'uppercase',
-            letterSpacing: 0.5, flexShrink: 0,
-          }}
-        >
-          Unsaved
-        </Typography>
-      )}
     </Box>
   );
 
-  const historyButtons = (view.actions.undo || view.actions.redo) && (
-    <>
-      {view.actions.undo && (
-        <Tooltip title={view.undoLabel ? `Undo: ${view.undoLabel}` : 'Undo'}>
-          <span>
-            <IconButton
-              size="small"
-              aria-label="Undo"
-              data-testid="document-card-undo"
-              disabled={view.canUndo === false}
-              onClick={() => { void view.actions.undo?.(); }}
-            >
-              <Undo sx={{ fontSize: 16 }} />
-            </IconButton>
-          </span>
-        </Tooltip>
-      )}
-      {view.actions.redo && (
-        <Tooltip title={view.redoLabel ? `Redo: ${view.redoLabel}` : 'Redo'}>
-          <span>
-            <IconButton
-              size="small"
-              aria-label="Redo"
-              data-testid="document-card-redo"
-              disabled={view.canRedo === false}
-              onClick={() => { void view.actions.redo?.(); }}
-            >
-              <Redo sx={{ fontSize: 16 }} />
-            </IconButton>
-          </span>
-        </Tooltip>
-      )}
-    </>
-  );
-
-  const kebab = hasMenu && (
+  // Hero only. The compact header is a panel title with a Save button; the
+  // document's verbs have ONE home, and it is the card on the dashboard that
+  // has room to show them. Two doorways to one menu is how a user learns that
+  // neither is the real one.
+  const kebab = hero && hasMenu && (
     <Tooltip title="More actions" placement="top">
       <IconButton
         size="small"
@@ -885,11 +858,13 @@ export function DocumentCard({
             </Box>
           </Box>
         ) : (
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+          /* Two items, and one of them is the name. Everything the row used to
+             carry between them (undo, redo, kebab, the "UNSAVED" word) is
+             either global, on the hero, or already said by the dot — and each
+             of them was width the trail did not have. */
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
             {compactIdentity}
-            {historyButtons}
             <Box sx={{ flexShrink: 0 }}>{saveButton}</Box>
-            {kebab}
           </Box>
         )}
 

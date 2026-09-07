@@ -11,7 +11,7 @@
  * also stays mounted (`keepMounted`) so the provider tabs keep their state.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Tooltip, IconButton, CircularProgress } from '@mui/material';
 import { ViewInAr } from '@mui/icons-material';
 import type { UISlotProps } from '../../core/rv-ui-plugin';
@@ -19,10 +19,37 @@ import { UnifiedImportDialog } from './UnifiedImportDialog';
 import { ImportJobAnnouncer, ImportProgressTile } from './ImportProgressTile';
 import { useImportJob } from './import-job-store';
 
+// ─── Open-on-request (2026-09-05) ────────────────────────────────────────
+// The dialog's open flag is local to the button, which is right for clicks
+// but leaves a deep link with no way in. `?doc=new&mode=editor` wants the
+// import dialog up as soon as the editor is on screen — so the request is
+// parked here and consumed by the button when it mounts (the button exists
+// only in editor mode, which is exactly the moment the request is for).
+let _openRequested = false;
+const _openListeners = new Set<() => void>();
+
+/** Ask the next mounted import button to open its dialog. */
+export function requestUnifiedImportOpen(): void {
+  _openRequested = true;
+  for (const l of _openListeners) l();
+}
+
+function consumeUnifiedImportOpenRequest(): boolean {
+  const was = _openRequested;
+  _openRequested = false;
+  return was;
+}
+
 export function UnifiedImportButton({ viewer }: UISlotProps) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(() => consumeUnifiedImportOpenRequest());
   const job = useImportJob();
   const running = job.status === 'running';
+
+  useEffect(() => {
+    const onRequest = () => { if (consumeUnifiedImportOpenRequest()) setOpen(true); };
+    _openListeners.add(onRequest);
+    return () => { _openListeners.delete(onRequest); };
+  }, []);
 
   return (
     <>

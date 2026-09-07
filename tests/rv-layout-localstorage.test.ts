@@ -53,8 +53,13 @@ describe('Layout localStorage Persistence', () => {
     expect(fetchSpy.mock.calls.every(c => !String(c[0]).includes('github'))).toBe(true);
   });
 
-  test('manually added GitHub catalog is session-only — never persisted to localStorage', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+  test('a MANUALLY added GitHub catalog persists with user origin and is restored', async () => {
+    // plan-372 replaced the blanket GitHub exclusion with an ORIGIN rule: a
+    // repo the user typed into the Add-Library dialog carries origin `user`,
+    // is persisted, and comes back on the next boot. Only an UNMARKED legacy
+    // GitHub URL is still dropped — pinned by the test above, which must keep
+    // failing loudly if that self-heal is ever removed.
+    const github = (input: RequestInfo | URL) => {
       const u = String(input);
       if (/\/repos\/[^/]+\/[^/]+$/.test(u)) {
         return new Response(JSON.stringify({ default_branch: 'main' }), { status: 200 });
@@ -63,13 +68,23 @@ describe('Layout localStorage Persistence', () => {
         return new Response(JSON.stringify({ tree: [{ path: 'A.glb', type: 'blob' }], truncated: false }), { status: 200 });
       }
       return new Response('not found', { status: 404 });
-    });
+    };
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => github(input));
+
     const store = new LayoutStore();
-    await store.addCatalog('https://github.com/acme/assets'); // explicit manual add → loads this session
+    await store.addCatalog('https://github.com/acme/assets'); // explicit manual add
     expect(store.getSnapshot().catalogUrls).toContain('https://github.com/acme/assets');
-    // ...but it is NOT written to storage, so it won't auto-load next boot.
+
+    // It IS written to storage, together with the origin that earns it that.
     const stored = JSON.parse(localStorage.getItem('rv-layout-library-urls') ?? '[]');
-    expect(stored).not.toContain('https://github.com/acme/assets');
+    expect(stored).toContain('https://github.com/acme/assets');
+    const origins = JSON.parse(localStorage.getItem('rv-layout-library-origins') ?? '{}');
+    expect(origins['https://github.com/acme/assets']).toBe('user');
+
+    // …and a fresh store restores it rather than silently dropping it.
+    const next = new LayoutStore();
+    await next.restoreFromStorage();
+    expect(next.getSnapshot().catalogUrls).toContain('https://github.com/acme/assets');
   });
 
   test('removeCatalog removes URL from localStorage', async () => {

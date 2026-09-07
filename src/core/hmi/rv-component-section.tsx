@@ -36,6 +36,7 @@ import {
   inferFieldType,
   isComponentRef,
   isScriptableObject,
+  isDeprecatedFieldHidden,
   isFieldHidden,
   isSignalComponentType,
   signalTypeLabel,
@@ -273,10 +274,16 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
       // their only render path (also for value === null/undefined, where
       // inferFieldType would misclassify them as 'string' and open an editor).
       if (isSignalSlotField(base, key)) continue;
+      // A DEPRECATED field drives nothing. While it is empty it gets no row at
+      // all; once a document actually carries a value it is shown read-only with
+      // a "(deprecated)" tag (added by FieldRow), so the user can see why the
+      // value has no effect instead of being offered an editor for a dead field.
+      const descriptor = getFieldDescriptor(base, key);
+      if (isDeprecatedFieldHidden(descriptor, value)) continue;
       // A read-only schema field (readonly:true OR scope:'des') renders its value
       // but never an editor → route it into the read-only ("other") branch rather
       // than the consumed/editable one. The "(DES)" tag is added by FieldRow.
-      const isReadonly = isFieldDisplayReadonly(getFieldDescriptor(base, key));
+      const isReadonly = isFieldDisplayReadonly(descriptor) || descriptor?.deprecated === true;
       if (consumed.has(key) && !isReadonly) {
         consumedRaw.push([key, value]);
       } else {

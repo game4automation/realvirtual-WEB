@@ -95,6 +95,28 @@ confusion when comparing a Unity scene with the WEB Demo side-by-side.
 | Industrial interfaces (WebSocket, MQTT, ctrlX) | **no** | yes — adapters in `src/interfaces/` |
 | Lock / kiosk mode, login gate, settings persistence | **no** | yes — WEB-only |
 
+Drive behaviours are ported one for one and keep their Unity name in
+`rv_extras`; the WEB loader instantiates the matching `RV…` class:
+
+| Unity DriveBehaviour | TypeScript port | File |
+|----------------------|-----------------|------|
+| `Drive_Simple` | `RVDriveSimple` | `rv-drive-simple.ts` |
+| `Drive_Speed` | `RVDriveSpeed` | `rv-drive-speed.ts` |
+| `Drive_Cylinder` | `RVDriveCylinder` | `rv-drive-cylinder.ts` |
+| `Drive_DestinationMotor` | `RVDriveDestinationMotor` | `rv-drive-destination-motor.ts` |
+| `Drive_FollowPosition` | `RVDriveFollowPosition` | `rv-drive-follow-position.ts` |
+| `Drive_Gear` | `RVDriveGear` | `rv-drive-gear.ts` |
+| `Drive_PositionSwitch` | `RVDrivePositionSwitch` | `rv-drive-position-switch.ts` |
+| `Drive_ErraticPosition` | `RVErraticDriver` | `rv-erratic.ts` |
+| `Drive_SEWMovilink` | `RVDriveSEWMovilink` | `rv-drive-sew-movilink.ts` |
+
+Behaviours outside that list are not ported. `Drive_SEWMovilink` carries the
+SEW MOVI-C profile — MOVILINK control word 1 / status word 1 with the priority
+cascade fault > inhibit > rapid stop > stop > enable and both speed encodings
+(`PercentNmax`, `Rpm`) — so a station modelled with SEW drives also runs in
+Standalone mode. Live, it is fed through CONNECT's MQTT **Json** topic mode
+(see [doc-connect.md § MQTT Json topic mode (SEW)](https://realvirtual.io/doc/web/connect/)).
+
 The rule of thumb: **if it is about the machine, it belongs in Unity. If it
 is about the application around the machine, it belongs in the WEB
 codebase.** Adding more Unity components for things in the lower half of
@@ -611,6 +633,44 @@ mental model is: *"I describe the machine and the HMI; an agent writes the
 plugin pack; I review and ship."*
 
 ---
+
+## 6b. Web handling: a component designed to be ported back
+
+Fabric / web handling (`RibbonRoller`, `RibbonWinder`, `RibbonPath`) is the first feature
+built **web-first with the Unity port in mind**, and it is the template for the
+next one.
+
+The whole of the mathematics sits in two files under
+`src/core/engine/ribbon/` that import **nothing** — not `three`, not an engine
+module, not a utility:
+
+| File | What it owns |
+|------|--------------|
+| `ribbon-geometry.ts` | two-circle tangents with side logic, wrap arcs, arc-length sampling |
+| `ribbon-winder-math.ts` | roll build-up `R(L)`, its inverse, and `omega = v/r` |
+
+They work on plain `{x, y}` tuples and numbers, so the C# port is a
+transcription rather than a re-derivation. The guard is a grep that must stay
+empty:
+
+```bash
+rg -n "from 'three'" src/core/engine/ribbon/
+```
+
+**The unit contract is the part to copy first.** Lengths, radii and thicknesses
+are **millimetres**, speeds **mm/s** (linear) or **deg/s** (rotational, exactly
+as `Drive.currentSpeed`), angles **radians** internally. Field names carry the
+unit (`WoundLengthMm`, `CoreRadiusMm`) so a mixed-unit assignment does not
+type-check past a reviewer. Metres appear in exactly one place: the band mesh
+writes them, because glTF world units are metres. A second conversion point is
+how a unit contract rots — there is not one.
+
+What Unity has to export is the three rv_extras blocks in
+`schema/v1/specification.md` §7a.53–7a.55, and nothing else: the path geometry,
+the sample table and the band mesh are all recomputed in the reader from the
+roller poses. `GLBComponentSerializer.cs` therefore gains three component
+writers and no baking step — unlike `Chain`, whose spline Unity must bake
+because Unity's spline evaluator is the source of truth for it.
 
 ## 7. Where to go from here
 

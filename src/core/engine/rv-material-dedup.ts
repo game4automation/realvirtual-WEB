@@ -3,7 +3,7 @@
 
 import { Object3D, Mesh, Material, Color, Texture, MeshStandardMaterial } from 'three';
 import { debug } from './rv-debug';
-import { isRuntimeRigMesh, traverseMeshes } from './rv-traverse-utils';
+import { isRuntimeRigMesh, isTextureSpinRoller, traverseMeshes } from './rv-traverse-utils';
 
 export interface DedupResult {
   /** Number of Material references present in the scene before dedup */
@@ -70,6 +70,10 @@ export function deduplicateMaterials(root: Object3D): DedupResult {
       // Scene-button cap material clones are instance-local runtime state too
       // (plan-417) — same treatment as a Lamp clone.
       || mesh.userData?._rvSceneButtonMesh || mesh.parent?.userData?._rvSceneButtonMesh
+      // A `SpinMode: Texture` roller mantle (plan-460 F11) clones its material
+      // and its map to scroll an offset of its own. Collapsing it onto an
+      // identical static material would make every sharer scroll with it.
+      || isTextureSpinRoller(mesh)
     ) {
       const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       for (const material of materials) {

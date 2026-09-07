@@ -127,9 +127,21 @@ export interface DocumentHeroSectionProps {
    * not the document's.
    */
   onReveal?: () => void;
+  /**
+   * Narrow, single-column layout (plan-458 F9).
+   *
+   * The hero band becomes a 44px row: the open document still has to be the
+   * first thing on the screen, but on 844px of height it may not spend a
+   * quarter of it on a preview. The drop zone goes with it — there is no drag
+   * on a phone, so an outline promising one would be a lie.
+   *
+   * Passed in rather than measured here: the host already asks the width once,
+   * and a second media query in a child is a second answer that can disagree.
+   */
+  compactLayout?: boolean;
 }
 
-export function DocumentHeroSection({ onReveal }: DocumentHeroSectionProps) {
+export function DocumentHeroSection({ onReveal, compactLayout = false }: DocumentHeroSectionProps) {
   const viewVersion = useSyncExternalStore(
     subscribeActiveDocumentView, getActiveDocumentViewVersion);
   // `null` — the dashboard is a place, not a mode, so the band shows whatever
@@ -290,6 +302,52 @@ export function DocumentHeroSection({ onReveal }: DocumentHeroSectionProps) {
         ? { tone: '229, 115, 115', text: gateway.writeBackError }
         : null;
 
+  /**
+   * The gateway's answer to the last binding change — one node, rendered
+   * under the card in BOTH layouts. A notice the compact band dropped
+   * would be a refusal the user never sees.
+   */
+  const noticeBox = notice && (
+    <Box
+      data-testid="document-hero-connect-notice"
+      sx={{
+        mt: 0.75,
+        px: 1,
+        py: 0.5,
+        display: 'flex',
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        gap: 1,
+        borderRadius: '4px',
+        border: `1px solid rgba(${notice.tone}, 0.45)`,
+        bgcolor: `rgba(${notice.tone}, 0.08)`,
+      }}
+    >
+      <Typography sx={{ fontSize: 11, flex: 1, color: `rgb(${notice.tone})` }}>
+        {notice.text}
+      </Typography>
+      {notice.confirm && (
+        <Button
+          size="small"
+          data-testid="document-hero-connect-confirm"
+          disabled={gateway.confirming}
+          onClick={() => { void confirmPendingActivation(); }}
+          sx={{ fontSize: 11, minWidth: 0, px: 1, py: 0, color: `rgb(${notice.tone})` }}
+        >
+          {notice.confirm}
+        </Button>
+      )}
+      <Button
+        size="small"
+        data-testid="document-hero-connect-dismiss"
+        onClick={clearActiveDocumentState}
+        sx={{ fontSize: 11, minWidth: 0, px: 1, py: 0, color: 'text.disabled' }}
+      >
+        Dismiss
+      </Button>
+    </Box>
+  );
+
   return (
     <Box
       data-testid="document-hero"
@@ -303,7 +361,7 @@ export function DocumentHeroSection({ onReveal }: DocumentHeroSectionProps) {
         justifyContent: 'center',
         alignItems: 'center',
         px: 1.5,
-        py: 1.25,
+        py: compactLayout ? 0.5 : 1.25,
         borderBottom: '1px solid rgba(255,255,255,0.06)',
         flexShrink: 0,
         // Anchor for the open-in-place overlay (OpeningHero).
@@ -321,7 +379,24 @@ export function DocumentHeroSection({ onReveal }: DocumentHeroSectionProps) {
         }}
       >
       {open
-        ? (
+        ? compactLayout ? (
+          // One row, no drop zone and no outline: the whole band is the card.
+          <Box
+            data-testid="document-card-compact"
+            sx={{ width: '100%', display: 'flex', flexDirection: 'column' }}
+          >
+            <Box sx={{ minHeight: 44, display: 'flex', alignItems: 'center', width: '100%' }}>
+              <DocumentCard
+                variant="compact"
+                onReveal={onReveal}
+                previewVisible={dashboard.open}
+                connect={connect}
+                knowledge={knowledge}
+              />
+            </Box>
+            {noticeBox}
+          </Box>
+        ) : (
           <Box
             data-testid="document-hero-dropzone"
             onDragOver={onDragOver}
@@ -349,50 +424,16 @@ export function DocumentHeroSection({ onReveal }: DocumentHeroSectionProps) {
               connect={connect}
               knowledge={knowledge}
             />
-            {notice && (
-              <Box
-                data-testid="document-hero-connect-notice"
-                sx={{
-                  mt: 0.75,
-                  px: 1,
-                  py: 0.5,
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 1,
-                  borderRadius: '4px',
-                  border: `1px solid rgba(${notice.tone}, 0.45)`,
-                  bgcolor: `rgba(${notice.tone}, 0.08)`,
-                }}
-              >
-                <Typography sx={{ fontSize: 11, flex: 1, color: `rgb(${notice.tone})` }}>
-                  {notice.text}
-                </Typography>
-                {notice.confirm && (
-                  <Button
-                    size="small"
-                    data-testid="document-hero-connect-confirm"
-                    disabled={gateway.confirming}
-                    onClick={() => { void confirmPendingActivation(); }}
-                    sx={{ fontSize: 11, minWidth: 0, px: 1, py: 0, color: `rgb(${notice.tone})` }}
-                  >
-                    {notice.confirm}
-                  </Button>
-                )}
-                <Button
-                  size="small"
-                  data-testid="document-hero-connect-dismiss"
-                  onClick={clearActiveDocumentState}
-                  sx={{ fontSize: 11, minWidth: 0, px: 1, py: 0, color: 'text.disabled' }}
-                >
-                  Dismiss
-                </Button>
-              </Box>
-            )}
+            {noticeBox}
           </Box>
         )
         : (
           <Typography data-testid="document-hero-empty" sx={{ fontSize: 12, color: 'text.disabled' }}>
-            Nothing open — double-click an asset to start.
+            {/* The instruction has to name the gesture the device HAS: there is
+                no double-click on a phone, and the sheet's Open is the route. */}
+            {compactLayout
+              ? 'Nothing open — tap a document, then Open.'
+              : 'Nothing open — double-click an asset to start.'}
           </Typography>
         )}
       </Box>

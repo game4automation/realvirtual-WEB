@@ -44,6 +44,12 @@ const HIT_MIN = 24;
  * that IS editable — as Unlink/Change through the SignalSlotRow binding path,
  * never through a value editor. Pass `isSignalRef` to open the gate for them;
  * sensor/drive/other structural references stay read-only.
+ *
+ * A `deprecated` field is never editable either: it only reaches a row when the
+ * document carries a value, and the row exists to EXPLAIN that value, not to
+ * invite the user to tune a field nothing reads. This is display only — the
+ * overlay/MCP write guards read `isFieldDisplayReadonly`, so a migration tool
+ * can still clear the value.
  */
 export function isFieldEditable(
   status: FieldStatus,
@@ -53,6 +59,7 @@ export function isFieldEditable(
 ): boolean {
   return status === 'consumed'
     && (!isReference || isSignalRef)
+    && descriptor?.deprecated !== true
     && !isFieldDisplayReadonly(descriptor);
 }
 
@@ -84,6 +91,11 @@ export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onRes
   // DES-only config: shown read-only with a "(DES)" tag so the user knows the
   // value is consumed by the discrete-event scheduler, not the live view.
   const isDes = descriptor?.scope === 'des';
+  // Deprecated config: the field survives in the schema so an older document
+  // still loads, but nothing reads it. It only reaches a row at all when the
+  // document carries a value (see `isDeprecatedFieldHidden`), and then the tag
+  // is the whole point — it explains why the value is ignored.
+  const isDeprecated = descriptor?.deprecated === true;
 
   // Tooltip text \u2014 NOTE: reference fields intentionally get no row tooltip.
   // The ReferenceDisplay / ScriptableObjectDisplay chip carries its own (richer)
@@ -110,13 +122,25 @@ export function FieldRow({ fieldName, value, status, isOverridden, onEdit, onRes
           (DES)
         </Box>
       )}
+      {isDeprecated && (
+        <Box
+          component="span"
+          sx={{ ml: 0.5, fontSize: 11, color: INK_LOW, fontStyle: 'italic' }}
+        >
+          (deprecated)
+        </Box>
+      )}
     </>
   );
 
   return (
     <InspectorRow
       label={labelNode}
-      labelTitle={isDes ? `${fieldName} — DES-only config (read-only in live view)` : fieldName}
+      labelTitle={
+        isDeprecated
+          ? `${fieldName} — deprecated: the value is kept in the document but nothing reads it`
+          : isDes ? `${fieldName} — DES-only config (read-only in live view)` : fieldName
+      }
       labelColor={isEditable || isReference ? 'text.primary' : INK_LOW}
       fullWidthField={fullWidthField}
       alignField={isReference ? 'end' : 'stretch'}

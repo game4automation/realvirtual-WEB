@@ -150,6 +150,12 @@ function beltDocument() {
     dirty: true,
     whenIdle: async () => {},
     async markSaved(next: AssetBase) { doc.base = next; },
+    // plan-462 B3 — `saveDocument` takes a short-lived `save` lock on the document
+    // before its first side effect. Three members, so this double stays a document;
+    // the lock itself is covered by `rv-asset-document-lock.test.ts`.
+    lockOwner: null,
+    tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
+    unlock: () => {},
     document: {
       opCount: 0,
       runExclusive: <T,>(work: () => Promise<T>) => work(),

@@ -61,8 +61,14 @@ const backend = {
   id: 'fake',
   writable: true,
   isActive: true,
-  async writeBlob(relPath: string) { writes.push(relPath); },
+  // plan-736 moved the writer to the document API; both the GLB and the
+  // thumbnail PNG arrive here, which is what point 2 above is about.
+  async writeDocument(ref: string | { path: string }) {
+    writes.push(typeof ref === 'string' ? ref : ref.path);
+    return { revision: 'rev' };
+  },
   // Nothing is stored, so every save is a first save of its path.
+  async readDocument() { return null; },
   async readDocumentUrl() { return null; },
   async listDocuments() { return []; },
 };
@@ -109,6 +115,13 @@ function context(name: string) {
     // saving, so an unnamed document's first save stays in place).
     renameDocument(n: string) { this.name = n; },
     whenIdle: async () => {},
+    // plan-462 B3 — `saveDocument` takes a short-lived `save` lock on the
+    // document before its first side effect. The stub answers the three
+    // members that path uses; nothing here is testing the lock itself (see
+    // `rv-asset-document-lock.test.ts`), it just has to be a document.
+    lockOwner: null,
+    tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
+    unlock: () => {},
     markSaved: async (base: AssetBase, n?: string) => { saved.push({ base, name: n }); },
     // The unified document underneath. `runExclusive` really does run the work
     // (the save must not be skipped) and the op floor never moves here.

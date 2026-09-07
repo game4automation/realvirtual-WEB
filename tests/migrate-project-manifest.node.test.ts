@@ -25,7 +25,6 @@ import {
   discoverPluginModules,
   canonicalNameOf,
 } from '../scripts/migrate-project-manifest.mjs';
-import { vendorGlobProblems, CUSTOMER_OWNED_FOLDERS } from '../scripts/_rv-guards.mjs';
 import {
   DOCUMENTS_MIGRATION_MARKER,
   DOCUMENT_REF_FIELDS,
@@ -104,13 +103,9 @@ describe('migrateManifest', () => {
     expect(manifest.library).toBeUndefined();
   });
 
-  it('adds a conservative vendor block that cannot reach customer folders', () => {
+  it('no longer invents a vendor block — the zones are gone (plan-738)', () => {
     const { manifest } = migrateManifest(LEGACY, { folderName: 'p' });
-    const vendor = manifest.vendor as { managed: string[]; handover: string[] };
-    expect(vendorGlobProblems(vendor)).toEqual([]);
-    for (const folder of CUSTOMER_OWNED_FOLDERS) {
-      expect(vendor.managed.some(g => g.startsWith(folder + '/'))).toBe(false);
-    }
+    expect(manifest.vendor).toBeUndefined();
   });
 
   it('never rewrites a field that is already there', () => {
@@ -193,7 +188,6 @@ describe('migrateProjectDir', () => {
     const first = migrateProjectDir(dir, { apply: true });
     expect(first.changes).toEqual([
       'kind: set to "internal" (one of customer/demo/internal)',
-      'vendor: conservative default added (sharpen per project)',
     ]);
     const contents = readFileSync(join(dir, 'project.json'), 'utf8');
     expect(migrateProjectDir(dir, { apply: true }).status).toBe('unchanged');

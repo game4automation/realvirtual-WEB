@@ -42,7 +42,10 @@ const backend = {
   id: 'backend-1',
   writable: true,
   isActive: true,
-  writeBlob: vi.fn(async () => {}),
+  // plan-736: the document writer is what a save actually reaches, so the
+  // "nothing was written" assertions below have to spy on THAT.
+  writeDocument: vi.fn(async () => ({ revision: 'rev' })),
+  async readDocument() { return null; },
   async listDocuments() { return []; },
 };
 
@@ -99,6 +102,12 @@ function makeBoundDoc(base: AssetBase) {
     name: 'Line 1',
     base,
     dirty: true,
+    // plan-462 B3 — `saveDocument` takes a short-lived `save` lock on the document
+    // before its first side effect. Three members, so this double stays a document;
+    // the lock itself is covered by `rv-asset-document-lock.test.ts`.
+    lockOwner: null,
+    tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
+    unlock: () => {},
     document: {
       opCount: 3,
       runExclusive<T>(work: () => Promise<T>): Promise<T> { return work(); },
@@ -144,7 +153,7 @@ beforeEach(async () => {
   await __clearDraftStoresForTests();
   localStorage.clear();
   h.sceneStore = null;
-  backend.writeBlob.mockClear();
+  backend.writeDocument.mockClear();
   exportSpy.mockClear();
 });
 
@@ -163,7 +172,7 @@ describe('Editor-Save am gebundenen Dokument routet auf SceneStore.save()', () =
     // The two things a mis-route would show: an authored GLB export, and a
     // blob written to a project path. Neither may happen for a scene.
     expect(exportSpy).not.toHaveBeenCalled();
-    expect(backend.writeBlob).not.toHaveBeenCalled();
+    expect(backend.writeDocument).not.toHaveBeenCalled();
     // No `relPath` is reported, because a scene has none — it is addressed by
     // catalogue id (`decideSaveVerb` states the same thing).
     if (result.kind === 'saved') expect(result.relPath).toBe('');
@@ -178,7 +187,7 @@ describe('Editor-Save am gebundenen Dokument routet auf SceneStore.save()', () =
     // Saving "the scene document" into whatever scene happens to be open is the
     // mis-binding the identity work exists to prevent.
     expect(result.kind).toBe('blocked');
-    expect(backend.writeBlob).not.toHaveBeenCalled();
+    expect(backend.writeDocument).not.toHaveBeenCalled();
   });
 
   it('is BLOCKED when no scene store exists at all', async () => {

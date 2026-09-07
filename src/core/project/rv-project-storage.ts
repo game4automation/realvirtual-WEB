@@ -380,23 +380,31 @@ export class ManifestRevisionConflictError extends Error {
  * very small. What it buys is the difference between "the other writer's change
  * is gone" and "the other writer's change is the base of ours" — which is the
  * difference that costs data.
+ *
+ * `previousRevision` is the revision of the state the WINNING attempt read —
+ * not the first one. Since a revision is the hash of the serialised manifest
+ * (see {@link writeManifest}), comparing it with `revision` is what tells a
+ * caller whether the write actually changed anything, and that is the only
+ * no-op signal there is: this function always writes, and a mutator cannot be
+ * trusted to report its own effect after a CAS retry rebased it (plan-462 B2).
  */
 export async function updateManifestCas(
   dir: FileSystemDirectoryHandle,
   apply: (current: RvProject | null) => RvProject | Promise<RvProject>,
   opts: { retries?: number } = {},
-): Promise<{ project: RvProject; revision: string }> {
+): Promise<{ project: RvProject; revision: string; previousRevision: string | null }> {
   const retries = Math.max(0, opts.retries ?? 3);
   let lastError: unknown = null;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     const read = await readManifest(dir);
+    const previousRevision = read?.revision ?? null;
     const next = await apply(read?.project ?? null);
     try {
       const revision = await writeManifest(dir, next, {
-        expectedRevision: read?.revision ?? null,
+        expectedRevision: previousRevision,
       });
-      return { project: next, revision };
+      return { project: next, revision, previousRevision };
     } catch (e) {
       if (!(e instanceof ManifestRevisionConflictError)) throw e;
       lastError = e;

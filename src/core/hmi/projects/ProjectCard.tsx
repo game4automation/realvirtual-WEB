@@ -21,7 +21,8 @@
  */
 
 import { useState } from 'react';
-import { Menu, MenuItem } from '@mui/material';
+import { Box, Menu, MenuItem } from '@mui/material';
+import { useLongPress } from '../../../hooks/use-long-press';
 import { AssetCard } from '../../library/AssetCard';
 import type { LibraryCatalogEntry } from '../../library/library-types';
 import { useOptionalViewer } from '../../../hooks/use-viewer';
@@ -78,7 +79,17 @@ export interface ProjectCardModel {
  * observer/effect scoped to the card, so a card leaving the grid takes its
  * pending request with it.
  */
-export function ProjectCard({ card }: { card: ProjectCardModel }) {
+export interface ProjectCardProps {
+  card: ProjectCardModel;
+  /**
+   * The primary input is a finger: a long-press stands in for the right-click
+   * the card has no other way of offering. Independent of the LAYOUT axis — a
+   * wide touch tablet keeps three columns and still needs this.
+   */
+  touchInput?: boolean;
+}
+
+export function ProjectCard({ card, touchInput = false }: ProjectCardProps) {
   const viewer = useOptionalViewer();
   const { ref, url, empty } = useAssetThumbnail<HTMLDivElement>({
     service: viewer?.thumbnails ?? null,
@@ -97,28 +108,65 @@ export function ProjectCard({ card }: { card: ProjectCardModel }) {
 
   const hasMenu = (card.menuActions?.length ?? 0) > 0;
 
+  /**
+   * The long-press is the right-click — with one deliberate difference: it
+   * does NOT select.
+   *
+   * A right-click selects so the permanently visible detail pane is about the
+   * card whose menu is open. On a coarse pointer there is no such pane: the
+   * selection raises a bottom sheet, which would cover the very menu the press
+   * just asked for. The menu needs no selection to be correct anyway — each
+   * entry closes over its own card.
+   */
+  const longPress = useLongPress({
+    enabled: touchInput && hasMenu,
+    onLongPress: (x, y) => setCtxPos({ x, y }),
+  });
+
+  const body = (
+    <AssetCard
+      ref={ref}
+      entry={entry}
+      variant="comfortable"
+      tier={card.tier}
+      selected={card.selected}
+      empty={empty}
+      glyph={card.glyph}
+      // A touch long-press still emits a click after `pointerup`; without
+      // this guard the card would select behind the menu it just opened.
+      onClick={() => { if (!longPress.consumedLastGesture()) card.onSelect(); }}
+      onDoubleClick={card.onOpen}
+      onContextMenu={hasMenu
+        ? (e) => {
+            e.preventDefault();
+            // Right-click also selects, so the detail pane and the menu are
+            // about the same card while the menu is open.
+            card.onSelect();
+            setCtxPos({ x: e.clientX, y: e.clientY });
+          }
+        : undefined}
+    />
+  );
+
   return (
     <>
-      <AssetCard
-        ref={ref}
-        entry={entry}
-        variant="comfortable"
-        tier={card.tier}
-        selected={card.selected}
-        empty={empty}
-        glyph={card.glyph}
-        onClick={card.onSelect}
-        onDoubleClick={card.onOpen}
-        onContextMenu={hasMenu
-          ? (e) => {
-              e.preventDefault();
-              // Right-click also selects, so the detail pane and the menu are
-              // about the same card while the menu is open.
-              card.onSelect();
-              setCtxPos({ x: e.clientX, y: e.clientY });
-            }
-          : undefined}
-      />
+      {touchInput && hasMenu
+        ? (
+          // A wrapper only where the handlers are needed: on a mouse the DOM
+          // stays exactly what it was, which is what keeps the desktop grid
+          // tests honest about the structure they walk.
+          <Box
+            onPointerDown={longPress.onPointerDown}
+            onPointerMove={longPress.onPointerMove}
+            onPointerUp={longPress.onPointerUp}
+            onPointerLeave={longPress.onPointerLeave}
+            onPointerCancel={longPress.onPointerCancel}
+            sx={{ minWidth: 0 }}
+          >
+            {body}
+          </Box>
+        )
+        : body}
       {hasMenu && (
         <Menu
           open={ctxPos !== null}

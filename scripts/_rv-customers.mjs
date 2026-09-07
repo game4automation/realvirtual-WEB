@@ -20,11 +20,14 @@
  * ## What this module is and is not
  *
  * Loader and validator. **No network I/O** — the Forgejo comparison is the
- * doctor's job (Phase 3) and lives elsewhere. **No hard-coded host names**:
- * `assert-public-safe.mjs` runs over this repository before every mirror push,
- * so the hub host is never written here. A remote URL is assembled from the
- * register's building blocks plus a base URL the *caller* supplies
- * ({@link customerRemoteUrl}).
+ * doctor's job (Phase 3) and lives elsewhere. A remote URL is assembled from
+ * the register's building blocks plus a base URL ({@link customerRemoteUrl}),
+ * which the caller may supply and which otherwise defaults to
+ * {@link DEFAULT_HUB_URL} — the one place the hub is named (plan-739 F6).
+ * `assert-public-safe.mjs` deliberately keeps the hub host OFF its denied-content
+ * list (`git.realvirtual.io` is a public domain, named legitimately in the
+ * delivery instructions generated for customers), so naming it here is safe for
+ * the public mirror; the internal markers that guard stops are unaffected.
  *
  * ## Errors versus warnings
  *
@@ -81,9 +84,9 @@ export const FORGEJO_PERMISSIONS = Object.freeze(['read', 'write']);
  * Own-repo (`rv-<slug>/rv-project-<slug>`) stays available for a standard
  * customer who needs it; the register decides, one entry at a time.
  *
- * Only the org and the repo are named here — no host. `assert-public-safe.mjs`
- * runs over this file before every mirror push; the remote is assembled from
- * these two plus a base URL the caller supplies ({@link customerRemoteUrl}).
+ * Only the org and the repo are named here; the remote is assembled from these
+ * two plus a base URL ({@link customerRemoteUrl}), which defaults to
+ * {@link DEFAULT_HUB_URL}.
  */
 export const SHARED_ORG = 'rv-commercial';
 export const SHARED_REPO = 'realvirtual-commercial';
@@ -518,12 +521,28 @@ export function resolveCustomerForProject(privateRoot, projectKey, options = {})
 }
 
 /**
+ * The hub, named once. Every other statement about it is derived from this or
+ * from the `RV_FORGEJO_HUB_URL` environment override (plan-739 F6).
+ *
+ * It lives HERE because this is the one module both sides already import:
+ * `_workspace-lib.mjs` (`hubBaseUrl()`, and through it every delivery remote) and
+ * the private `scripts/deliver-release.mjs`. A second copy in either place is how
+ * a release run and a single delivery start disagreeing about where the hub is.
+ *
+ * Before plan-739 `hubBaseUrl()` scavenged the origin out of a legacy
+ * `delivery/*.json`. Those files are gone, and a register-only customer
+ * (hs-heilbronn, iotsolution, toray) had no legacy file to scavenge from, so the
+ * direct path resolved for two of five customers and threw for the other three.
+ */
+export const DEFAULT_HUB_URL = 'https://git.realvirtual.io';
+
+/**
  * Assembles the customer's git remote from the register plus a base URL.
  *
- * The base URL is a parameter on purpose: this file is mirrored to a public
- * remote, and `assert-public-safe.mjs` refuses infrastructure host names in it.
+ * The base URL stays a parameter so a caller can point a rehearsal at another
+ * hub; omitted, it is {@link DEFAULT_HUB_URL}.
  */
-export function customerRemoteUrl(customer, hubBaseUrl) {
+export function customerRemoteUrl(customer, hubBaseUrl = DEFAULT_HUB_URL) {
   if (!isPlainObject(customer.forgejo)) {
     throw new Error(`Customer "${customer.customer}" has no forgejo block, so it has no git remote.`);
   }

@@ -255,7 +255,23 @@ export class WebSocketRealtimeInterface extends BaseIndustrialInterface {
 
       case 'delta':
         // Already coalesced by the worker — feed the existing buffer/flush path.
-        if (Object.keys(msg.signals).length > 0) this.bufferIncoming(msg.signals);
+        if (Object.keys(msg.signals).length > 0) {
+          // plan-465 §2.4 (SOL R2#2): the WebSocket lives in the worker and the
+          // `delta` we get here is ALREADY coalesced, so this is the earliest
+          // main-thread instant at which the payload exists. It is therefore the
+          // defined `tRecv` measuring point of the latency contract — anything
+          // earlier would need worker instrumentation, which the plan excludes.
+          // The hook slot lives on globalThis (not an import) so the perf module
+          // stays out of the production bundle; Vite eliminates the whole branch
+          // for a production build.
+          if (import.meta.env.DEV) {
+            const stamp = (globalThis as {
+              __rvDeltaArrival?: (signals: Record<string, boolean | number>, tRecvMs: number) => void;
+            }).__rvDeltaArrival;
+            if (stamp) stamp(msg.signals, performance.now());
+          }
+          this.bufferIncoming(msg.signals);
+        }
         break;
 
       case 'import_answer':

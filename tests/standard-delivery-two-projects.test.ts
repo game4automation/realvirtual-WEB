@@ -57,7 +57,7 @@ const GENERATED_DELIVERY_MANIFEST = {
   id: 'prj_delivery_standard',
   name: 'ACME',
   canonicalName: 'acme',
-  kind: 'delivery',
+  kind: 'customer',
   settings: {},
   documents: [],
 };

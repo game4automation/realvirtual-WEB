@@ -49,7 +49,6 @@ import {
   getFolderHandle,
   getHandle,
   putHandle,
-  readTextFile,
   selectFolderForKey,
 } from '../engine/rv-local-filesystem';
 import { FolderBackend } from './backends/folder-backend';
@@ -212,8 +211,14 @@ export async function forgetWorkspace(): Promise<void> {
 async function hasManifestFile(dir: FileSystemDirectoryHandle): Promise<boolean> {
   for (const name of [PROJECT_MANIFEST_FILE, PROJECT_MANIFEST_BAK_FILE]) {
     try {
-      if ((await readTextFile(dir, name)) !== null) return true;
-    } catch {
+      await dir.getFileHandle(name);
+      return true;
+    } catch (e) {
+      // "Does the file exist" needs only the handle lookup — reading the bytes
+      // here would duplicate the read `readManifest()` does right after, per
+      // folder, on the dashboard-open path.
+      if (e instanceof DOMException && e.name === 'NotFoundError') continue;
+      if (e instanceof Error && e.name === 'NotFoundError') continue;
       // Permission or I/O trouble on this one file — treat the folder as a
       // candidate so the parse step below can report it properly.
       return true;
@@ -248,37 +253,50 @@ export async function discoverWorkspaceProjects(
     };
   }
 
-  for (const [name, handle] of entries) {
-    if (handle.kind !== 'directory') continue;
-    const sub = handle as FileSystemDirectoryHandle;
+  // Folders are probed concurrently: every await below is an out-of-process
+  // FSA round-trip, so a sequential loop pays the full latency once per
+  // folder — the dominant cost of opening the dashboard. Results are
+  // collected in entry order to keep warnings deterministic.
+  const scanned = await Promise.all(entries.map(
+    async ([name, handle]): Promise<
+      { project: WorkspaceProjectEntry } | { warning: string } | null
+    > => {
+      if (handle.kind !== 'directory') return null;
+      const sub = handle as FileSystemDirectoryHandle;
 
-    // NB: no queryPermission here. The root grant covers descendants; asking
-    // again would raise one prompt per project on every reload.
-    if (!(await hasManifestFile(sub))) continue;   // not a project — silent, by design
+      // NB: no queryPermission here. The root grant covers descendants; asking
+      // again would raise one prompt per project on every reload.
+      if (!(await hasManifestFile(sub))) return null;   // not a project — silent, by design
 
-    let manifest: RvProject | null = null;
-    try {
-      manifest = (await readManifest(sub))?.project ?? null;
-    } catch (e) {
-      warnings.push(`"${name}" has a project.json that could not be read: ${errText(e)}`);
-      continue;
-    }
-    if (!manifest) {
-      warnings.push(`"${name}" has an unreadable project.json and was skipped.`);
-      continue;
-    }
+      let manifest: RvProject | null = null;
+      try {
+        manifest = (await readManifest(sub))?.project ?? null;
+      } catch (e) {
+        return { warning: `"${name}" has a project.json that could not be read: ${errText(e)}` };
+      }
+      if (!manifest) {
+        return { warning: `"${name}" has an unreadable project.json and was skipped.` };
+      }
 
-    projects.push({
-      id: manifest.id,
-      slug: manifest.canonicalName || canonicalNameOf(manifest.name),
-      name: manifest.name || name,
-      folderName: name,
-      dir: sub,
-      manifest,
-      // Read-only and inert (§2.2.1b): no writer host, `writable: false`.
-      // The store constructs its own writable backend when it opens one.
-      backend: new FolderBackend(sub, { writable: false, id: `folder:${manifest.id}` }),
-    });
+      return {
+        project: {
+          id: manifest.id,
+          slug: manifest.canonicalName || canonicalNameOf(manifest.name),
+          name: manifest.name || name,
+          folderName: name,
+          dir: sub,
+          manifest,
+          // Read-only and inert (§2.2.1b): no writer host, `writable: false`.
+          // The store constructs its own writable backend when it opens one.
+          backend: new FolderBackend(sub, { writable: false, id: `folder:${manifest.id}` }),
+        },
+      };
+    },
+  ));
+  for (const result of scanned) {
+    if (!result) continue;
+    if ('warning' in result) warnings.push(result.warning);
+    else projects.push(result.project);
   }
 
   projects.sort((a, b) => a.name.localeCompare(b.name));

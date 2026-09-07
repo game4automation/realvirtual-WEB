@@ -21,11 +21,13 @@
  * ## Deliberately NOT a focus trap
  *
  * This is an overlay, not a modal dialog: the simulation keeps running behind
- * it and the user may legitimately tab to the mobile ActivityBar pill (which
- * sits above it at {@link MOBILE_CHROME_ZINDEX}) to get out. A trap would make
- * the only exit unreachable by keyboard. It is announced as
- * `role="region"` + `aria-label` rather than `role="dialog"` for the same
- * reason — it does not take over the application.
+ * it and the user must be able to tab to the header's own close button, which
+ * is the exit on every viewport. (The mobile ActivityBar pill is NOT that
+ * exit: it sits at {@link LEFT_PANEL_ZINDEX}, BELOW this overlay, and is
+ * covered while the dashboard is up.) A trap would make the one exit
+ * unreachable by keyboard. It is announced as `role="region"` + `aria-label`
+ * rather than `role="dialog"` for the same reason — it does not take over the
+ * application.
  *
  * ## Insets, not fixed offsets
  *
@@ -40,6 +42,7 @@ import { createPortal } from 'react-dom';
 import { Box, IconButton, TextField, Tooltip, Typography, InputAdornment } from '@mui/material';
 import { ArrowBack, Close, Search } from '@mui/icons-material';
 import { useViewportInsets } from '../../../hooks/use-viewport-insets';
+import { useMobileLayout } from '../../../hooks/use-mobile-layout';
 import { getFloatingPanelRoot } from '../HMIShell';
 import { PROJECTS_DASHBOARD_ZINDEX, ACTIVITY_BAR_WIDTH } from '../layout-constants';
 import {
@@ -96,6 +99,12 @@ export function ProjectsDashboard({
 }: ProjectsDashboardProps) {
   const snap = useSyncExternalStore(subscribeProjectsDashboard, getProjectsDashboardSnapshot);
   const insets = useViewportInsets();
+  // The compact layout is a WIDTH decision, so the shell asks the width hook
+  // and hands the answer down as a boolean — a child that asks a media query
+  // of its own cannot be rendered at a stated viewport in a test.
+  const isMobile = useMobileLayout();
+  /** 44px window chrome on the compact layout (Apple HIG, DESIGN.md §Touch). */
+  const touchTarget = isMobile ? { width: 44, height: 44 } : undefined;
 
   /**
    * Exit choreography: a close SLIDES the dashboard off to the left instead
@@ -145,9 +154,16 @@ export function ProjectsDashboard({
       sx={{
         position: 'fixed',
         top: insets.top,
-        left: ACTIVITY_BAR_WIDTH,
+        // Flush left on a phone: there IS no activity bar there — it is a
+        // floating pill — so the 46px it reserves is just a stripe of scene
+        // showing through the one screen that needs every pixel of width.
+        left: isMobile ? 0 : ACTIVITY_BAR_WIDTH,
         right: 0,
         bottom: 0,
+        // The detail sheet is positioned against this box; without the clip it
+        // would slide in from outside the viewport rather than from the edge.
+        overflow: 'hidden',
+        pb: 'env(safe-area-inset-bottom, 0px)',
         zIndex: PROJECTS_DASHBOARD_ZINDEX,
         display: snap.open || closing ? 'flex' : 'none',
         flexDirection: 'column',
@@ -184,13 +200,31 @@ export function ProjectsDashboard({
       >
         {onBack && (
           <Tooltip title="Back to projects">
-            <IconButton size="small" onClick={onBack} aria-label="Back to projects">
+            <IconButton
+              size="small"
+              onClick={onBack}
+              aria-label="Back to projects"
+              sx={touchTarget}
+            >
               <ArrowBack sx={{ fontSize: 18 }} />
             </IconButton>
           </Tooltip>
         )}
-        <Typography sx={{ fontSize: 15, fontWeight: 600 }}>{title}</Typography>
-        {subtitle && (
+        <Typography
+          sx={{
+            fontSize: 15, fontWeight: 600,
+            // A long project name must never push the close button off a
+            // 390px header.
+            minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {title}
+        </Typography>
+        {/* The facts beside the title are `nowrap` and would collide with the
+            title and the menu on a phone. The document count is in the grid
+            anyway, so the header drops them rather than truncating them. */}
+        {subtitle && !isMobile && (
           <Typography
             data-testid="projects-header-subtitle"
             sx={{ fontSize: 11, color: 'text.secondary', whiteSpace: 'nowrap', mt: '2px' }}
@@ -202,7 +236,12 @@ export function ProjectsDashboard({
         <Box sx={{ flex: 1 }} />
         {titleActions}
         <Tooltip title="Close (Esc)">
-          <IconButton size="small" onClick={closeProjectsDashboard} aria-label="Close Projects">
+          <IconButton
+            size="small"
+            onClick={closeProjectsDashboard}
+            aria-label="Close Projects"
+            sx={touchTarget}
+          >
             <Close sx={{ fontSize: 18 }} />
           </IconButton>
         </Tooltip>
@@ -264,7 +303,7 @@ export function ProjectsDashboard({
                   sx: { fontSize: 12, height: 28 },
                 },
               }}
-              sx={{ width: 240 }}
+              sx={{ width: isMobile ? '100%' : 240 }}
             />
           )}
           <Box sx={{ flex: 1 }} />
@@ -272,7 +311,15 @@ export function ProjectsDashboard({
       )}
 
       {/* The active screen. A row, so a detail pane can sit beside the body. */}
-      <Box sx={{ flex: 1, display: 'flex', minHeight: 0, bgcolor: 'rgba(18, 20, 24, 0.94)' }}>
+      <Box
+        sx={{
+          flex: 1, display: 'flex', minHeight: 0,
+          bgcolor: 'rgba(18, 20, 24, 0.94)',
+          // Anchor for the compact layout's detail sheet: it rises over the
+          // grid, not over the header and the tools above it.
+          position: 'relative',
+        }}
+      >
         {children}
       </Box>
     </Box>

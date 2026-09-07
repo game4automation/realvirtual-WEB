@@ -7,26 +7,31 @@ import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-  applyMergedSnapshot,
+  applySnapshot,
   assertLfsPointer,
   assertNoCrossTierLeak,
   assertPrivateSourceInventory,
   assertWorkspaceGuards,
+  baselineTagFor,
+  changeoverCommitNote,
   collectPrivateSourceInventory,
+  confirmProjectReplace,
   createDeliveryManifest,
   deliveryChangelog,
-  formatMergeSummary,
+  detectDeliveryBaseline,
+  formatSnapshotSummary,
   gitProvenance,
   loadDeliveryConfig,
   loadDeliveryConfigByCustomer,
   loadTierManifest,
-  mergeCommitNote,
+  previewProjectReplace,
   readBaselineSourceInventory,
+  readCloneDeliveryManifest,
   readPlasticChangeset,
+  resolveRequestedProjects,
   runBuild,
   stageFilteredSourceTree,
 } from './_workspace-lib.mjs';
-import { baselineTagFor } from './_vendor-merge.mjs';
 import { knownProjectKeys } from './_rv-guards.mjs';
 import { recordPublishProvenance } from './_rv-provenance.mjs';
 
@@ -37,6 +42,24 @@ const connectTools = resolve(coreRoot, '../realvirtual-Connect~/tools');
 function arg(args, name, fallback = null) {
   const index = args.indexOf(`--${name}`);
   return index >= 0 && args[index + 1] && !args[index + 1].startsWith('--') ? args[index + 1] : fallback;
+}
+
+/**
+ * Reads a list-valued flag: `--projects a b c`, `--projects a,b`, or both.
+ *
+ * Returns `[]` when the flag is absent, which is the standard delivery — the one
+ * that writes nothing under `projects/` at all. Not the same as `--projects` with
+ * no value, which is a typo and says so.
+ */
+export function listArg(args, name) {
+  const index = args.indexOf(`--${name}`);
+  if (index < 0) return [];
+  const values = [];
+  for (let i = index + 1; i < args.length && !args[i].startsWith('--'); i++) {
+    values.push(...args[i].split(',').map((entry) => entry.trim()).filter(Boolean));
+  }
+  if (!values.length) throw new Error(`--${name} needs at least one name, e.g. --${name} all`);
+  return values;
 }
 
 function requireArg(args, name) {
@@ -130,35 +153,82 @@ function previousCoreCommit(clone) {
 }
 
 /**
- * Clones the customer repository, merges this delivery into it and pushes.
+ * Clones the customer repository, writes this delivery into it and pushes.
  *
  * Atomicity is the whole point of the temp clone and is preserved here: every
  * write lands in a throwaway directory, and the push happens only after the
- * merge has completed for ALL projects. An abort anywhere in between leaves the
- * customer's repository exactly as it was.
+ * snapshot has been applied in full. An abort anywhere in between — including
+ * the `--projects` confirmation gate — leaves the customer's repository exactly
+ * as it was.
  *
- * `projects` carries the vendor block per project — the merge needs it, and it
- * comes from the manifest we are delivering, not from the customer's copy.
+ * The ORDER inside is normative (plan-738 §2.5): the preview reads the clone
+ * before `applySnapshot` deletes anything. Run the other way round it would
+ * compare the new content against itself, report nothing, and be indis-
+ * tinguishable from a delivery that destroyed nothing.
+ *
+ * The branch is pushed WITHOUT `--force`, and that is the TOCTOU backstop: a
+ * customer commit landing between the preview and the push makes the push a
+ * non-fast-forward, so it fails and nothing is published. Only the tag is
+ * force-pushed, exactly as before.
+ *
+ * A dry run (`push: false`) with `--projects` takes the same path as far as the
+ * preview and then stops: it clones, renders the before-view and returns without
+ * writing anything at all. Without `--projects` a dry run does not clone.
+ *
+ * @param replaceProjects  project folders `--projects` named, already resolved
+ * @param force            apply the replace unattended, without the confirmation
  */
 export function snapshotPush({
-  workspaceRoot, remote, projects, version, plasticChangeset = null,
-  push = false, coreRoot = null, seedMissing = false, acceptNewPrivateFiles = false,
+  workspaceRoot, remote, version, plasticChangeset = null,
+  push = false, coreRoot = null, replaceProjects = [], force = false, acceptNewPrivateFiles = false,
 }) {
   const header = Number.isInteger(plasticChangeset) ? `viewer ${version}-${plasticChangeset}` : `viewer ${version}`;
   let message = header;
-  if (!push) return { pushed: false, remote, message, snapshot: null };
+  // A dry run WITH `--projects` still clones and still renders the before-view (plan-739 F15).
+  // Until this existed, the preview only ever ran on the push path, so the first time an
+  // operator saw what a `--projects` run would destroy was the run that destroyed it. The
+  // preview is pure reading — `previewProjectReplace` diffs two directories on disk — so the
+  // dry run returns before the first write of any kind: no `git add`, no commit, no tag, no
+  // push, and not even the local LFS filter install below.
+  // Without `--projects` there is nothing to preview and the clone is pure cost, so the old
+  // immediate return is kept for exactly that case.
+  if (!push && replaceProjects.length === 0) return { pushed: false, remote, message, snapshot: null, preview: null };
   const clone = mkdtempSync(join(tmpdir(), 'rv-customer-snapshot-'));
   try {
     execFileSync('git', ['clone', remote, clone], { stdio: 'inherit' });
+
+    // ── The `--projects` gate, BEFORE anything is deleted (§2.5). ──────────
+    const baseline = detectDeliveryBaseline(clone);
+    // A first delivery seeds every project folder anyway, so `--projects` has
+    // nothing to add and nothing to destroy — warned about in applySnapshot,
+    // and skipped here so no confirmation is asked for a no-op (§2.4.4).
+    const replace = baseline.firstDelivery ? [] : replaceProjects;
+    const preview = replace.length ? previewProjectReplace(workspaceRoot, clone, replace) : null;
+    if (!push) {
+      if (!preview) {
+        console.log('[dry-run] --projects has nothing to preview: the customer remote is empty, '
+          + 'so this would be a first delivery and every project folder is seeded anyway.');
+      } else {
+        console.log(`[dry-run] --projects preview only: ${preview.total} file(s) would be replaced or deleted. `
+          + 'Nothing was committed, tagged or pushed.');
+      }
+      return { pushed: false, remote, message, snapshot: null, preview };
+    }
     // Read the manifest before the snapshot overwrites it: it names the previously
     // delivered core commit, which bounds the change summary for the customer.
     const changelog = coreRoot ? deliveryChangelog(coreRoot, previousCoreCommit(clone)) : '';
+    // Read while the clone still carries the customer's copy: it is what decides whether this
+    // is the first delivery under the new model, and therefore whether the commit explains it.
+    const previousManifestVersion = readCloneDeliveryManifest(clone).manifestVersion;
     // LFS filters must be active in the clone before any large file is added, so that
     // `git add` stages LFS pointers instead of full blobs (verified by assertLfsPointer).
+    // It only affects the `git add` far below, so its place after the dry-run return costs
+    // the push path nothing and keeps the dry run free of every write.
     execFileSync('git', ['lfs', 'install', '--local'], { cwd: clone, stdio: 'ignore' });
-    const snapshot = applyMergedSnapshot(workspaceRoot, clone, { projects, version, seedMissing });
-    const summary = formatMergeSummary(snapshot);
-    if (summary) console.log(summary);
+    if (preview) confirmProjectReplace(preview, { force });
+
+    const snapshot = applySnapshot(workspaceRoot, clone, { version, replaceProjects: replaceProjects });
+    console.log(formatSnapshotSummary(snapshot));
     // The tier diff gate (§2.4). It runs before `git add`, so an abort here leaves the
     // customer repository untouched — the clone is thrown away by the finally block.
     const inventoryDiff = assertPrivateSourceInventory(
@@ -177,10 +247,11 @@ export function snapshotPush({
       // being delivered is how a customer loses a feature without anyone noticing.
       for (const path of inventoryDiff.removed) console.log(`[tier-gate]   - ${path} (no longer delivered)`);
     }
-    // A conflict is a normal, expected outcome, not a failure: the customer keeps
-    // their file and we say so. It belongs in the commit message so it is visible
-    // in the Forgejo history, and on stdout — never in an exit code.
-    message = [header, changelog, mergeCommitNote(snapshot)].filter(Boolean).join('\n\n');
+    // The one place the customer is told the delivery model changed: the commit
+    // that changes it (F9). It appears exactly once, because from the next
+    // delivery on the repository already carries a v3 manifest.
+    message = [header, changelog, changeoverCommitNote(previousManifestVersion, snapshot)]
+      .filter(Boolean).join('\n\n');
     execFileSync('git', ['add', '-A'], { cwd: clone, stdio: 'inherit' });
     assertLfsPointer(clone);
     execFileSync('git', ['commit', '-m', message], { cwd: clone, stdio: 'inherit' });
@@ -201,7 +272,12 @@ async function main() {
   const args = process.argv.slice(2);
   const push = args.includes('--push');
   const fast = args.includes('--fast');
-  const seedMissing = args.includes('--seed-missing');
+  const force = args.includes('--force');
+  const requestedProjects = listArg(args, 'projects');
+  if (args.includes('--seed-missing')) {
+    throw new Error('--seed-missing was removed with plan-738. There is no per-file merge left to seed into; '
+      + 'update a project folder with --projects <name…|all> instead.');
+  }
   const acceptNewPrivateFiles = args.includes('--accept-new-private-files');
   const manifest = loadTierManifest(privateRoot);
   // Either one project (the primary; its customer's other projects come along) or a
@@ -289,15 +365,15 @@ async function main() {
     const result = snapshotPush({
       workspaceRoot: staged.workspaceRoot,
       remote: delivery.remote,
-      // The vendor globs come from the manifest we are DELIVERING. Reading them from
-      // the customer's copy would let an edited vendor block widen the zone that may
-      // be overwritten — the one direction of this design that costs data (§2.2).
-      projects: staged.projectKeys.map((key) => ({ key, vendor: stagedProjects[key]?.vendor ?? null })),
       version: packageJson.version,
       plasticChangeset,
       push,
       coreRoot,
-      seedMissing,
+      // Resolved against what this delivery CARRIES, never against what is in the
+      // customer's `projects/`: `all` means our project folders plus the demo, and
+      // no spelling of the flag can reach a folder they created (§2.4.3).
+      replaceProjects: resolveRequestedProjects(requestedProjects, staged.projectKeys),
+      force,
       acceptNewPrivateFiles,
     });
     // Provenance is recorded only for a push that actually landed, and on the
@@ -323,5 +399,12 @@ async function main() {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch((error) => { console.error(`[customer-workspace] ${error.message}`); process.exitCode = 1; });
+  main().catch((error) => {
+    console.error(`[customer-workspace] ${error.message}`);
+    // The machine-readable contract of F4: 1 means "differences were shown and
+    // nobody confirmed them" — a decision, not a defect — and 2 is every real
+    // failure. A caller that treats them the same still stops; one that tells
+    // them apart can retry with --force without retrying a broken build.
+    process.exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 2;
+  });
 }

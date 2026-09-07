@@ -24,6 +24,7 @@ import { RVDriveGear } from './rv-drive-gear';
 import { RVDriveFollowPosition } from './rv-drive-follow-position';
 import { RVDriveSpeed } from './rv-drive-speed';
 import { RVDrivePositionSwitch } from './rv-drive-position-switch';
+import { RVDriveSEWMovilink } from './rv-drive-sew-movilink';
 import { applySchema, getSchemaDefaults, resolveComponentRefs, type RVComponent, type ComponentSchema, type ComponentContext, type PlcSignalType } from './rv-component-registry';
 import type { SignalStore } from './rv-signal-store';
 import type { RVTransportManager } from './rv-transport-manager';
@@ -57,6 +58,7 @@ export const DRIVE_BEHAVIOR_MAP: Record<string, { ctor: new (n: Object3D) => RVC
   Drive_FollowPosition: { ctor: RVDriveFollowPosition, schema: RVDriveFollowPosition.schema },
   Drive_Speed: { ctor: RVDriveSpeed, schema: RVDriveSpeed.schema },
   Drive_PositionSwitch: { ctor: RVDrivePositionSwitch, schema: RVDrivePositionSwitch.schema },
+  Drive_SEWMovilink: { ctor: RVDriveSEWMovilink, schema: RVDriveSEWMovilink.schema },
 };
 
 /** Signal type names recognized from GLB extras. */

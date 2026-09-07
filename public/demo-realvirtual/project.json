@@ -19,7 +19,10 @@
       "id": "doc_demorealvirtualweb_7l7hfw",
       "name": "realvirtual WEB Demo",
       "path": "DemoRealvirtualWeb.glb",
-      "settingsPath": "DemoRealvirtualWeb.settings.json"
+      "settingsPath": "DemoRealvirtualWeb.settings.json",
+      "sizeBytes": 33906532,
+      "mtimeMs": 1788357225212,
+      "sha256": "d8d746d2ec0e464bf0ab05b31bbe077b791855f24aba6ff5e4f765a14c229c9a"
     },
     {
       "id": "doc_demoplanner_gf4m6v",
@@ -29,7 +32,10 @@
       "classification": {
         "v": 1,
         "level": "scene"
-      }
+      },
+      "sizeBytes": 6920,
+      "mtimeMs": 1788782723024,
+      "sha256": "fe193fb45f36d980376d28d39a51245a6df18f1089880c46b5cf1fae3a72a919"
     },
     {
       "id": "doc_test-des-turntable-loop_1y3v7m0",
@@ -40,12 +46,17 @@
       "classification": {
         "v": 1,
         "level": "scene"
-      }
+      },
+      "sizeBytes": 2500,
+      "mtimeMs": 1788357225214,
+      "sha256": "22828e57948094c6630e36dbb46f9aab751bf62475009d0e4bc54344afc3a2a9"
     },
     {
       "id": "doc_demo-knowledge-md_1bio4kv",
       "name": "About this demo project",
-      "path": "demo.knowledge.md"
+      "path": "demo.knowledge.md",
+      "missingSince": "2026-09-07T12:04:25.069Z"
     }
-  ]
+  ],
+  "modifiedAt": "2026-09-07T12:06:06.333Z"
 }

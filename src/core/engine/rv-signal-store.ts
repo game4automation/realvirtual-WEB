@@ -191,6 +191,25 @@ class SignalWriterHandle implements SignalWriter {
   }
 }
 
+/** Size snapshot of every SignalStore index — see {@link SignalStore.stats}. */
+export interface SignalStoreStats {
+  signals: number;
+  paths: number;
+  types: number;
+  meta: number;
+  /** Number of signal names that have at least one listener. */
+  listenerKeys: number;
+  /** Total number of listener callbacks across all signals. */
+  listeners: number;
+  resolveCache: number;
+  forced: number;
+  lastUpdateTs: number;
+  providers: number;
+  writerInventory: number;
+  writeConflicts: number;
+  version: number;
+}
+
 export class SignalStore {
   /** Canonical value store keyed by name (Signal.Name if set, otherwise node name). */
   private byName = new Map<string, boolean | number>();
@@ -1230,6 +1249,105 @@ export class SignalStore {
   /** Get all registered path→name mappings (for debugging). */
   getAllPaths(): Map<string, string> {
     return new Map(this.pathToName);
+  }
+
+  /**
+   * Cheap size snapshot of every internal index (plan-465 F2).
+   *
+   * Read-only and allocation-light: one small result object per call, no map
+   * copies. The perf probe samples this at most twice per second, so the
+   * O(#listener keys) sum below is free in practice while giving the soak
+   * report a leak indicator that `size` alone cannot ("signals stable, listener
+   * count climbing" is the classic teardown bug).
+   */
+  stats(): SignalStoreStats {
+    let listeners = 0;
+    for (const set of this.listeners.values()) listeners += set.size;
+    return {
+      signals: this.byName.size,
+      paths: this.pathToName.size,
+      types: this.typeByName.size,
+      meta: this.metaByName.size,
+      listenerKeys: this.listeners.size,
+      listeners,
+      resolveCache: this.resolveCache.size,
+      forced: this.forced.size,
+      lastUpdateTs: this.lastUpdateTs.size,
+      providers: this.providerRefs.size,
+      writerInventory: this.writerInventory.size,
+      writeConflicts: this.writeConflicts.size,
+      version: this._version,
+    };
+  }
+
+  /**
+   * Remove every signal whose NAME starts with `prefix`, together with all
+   * index entries that reference it (plan-465, SOL R2#6).
+   *
+   * The store only had `clear()` before, which is useless for a harness that
+   * builds and tears down a synthetic line inside a scene that already holds
+   * the model's own signals. Deliberately additive and strictly scoped:
+   * signals outside the prefix — including their listeners, alias paths, force
+   * pins and provider registrations — are left bit-identical, which is what
+   * the teardown test asserts.
+   *
+   * `pathToName` is swept by VALUE, not by key prefix: `buildIndex()` registers
+   * suffix aliases whose keys bear no relation to the signal name, so a
+   * key-prefix sweep would leave dangling aliases behind.
+   *
+   * @returns how many signals were removed.
+   */
+  unregisterByPrefix(prefix: string): number {
+    if (!prefix) return 0;
+    const removed = new Set<string>();
+    for (const name of this.byName.keys()) {
+      if (name.startsWith(prefix)) removed.add(name);
+    }
+    // A name can be registered in nameToPath without a byName entry only in
+    // pathological cases, but sweep it too so nothing survives the teardown.
+    for (const name of this.nameToPath.keys()) {
+      if (name.startsWith(prefix)) removed.add(name);
+    }
+    if (removed.size === 0) return 0;
+
+    for (const name of removed) {
+      this.byName.delete(name);
+      this.nameToPath.delete(name);
+      this.typeByName.delete(name);
+      this.metaByName.delete(name);
+      this.listeners.delete(name);
+      this.forced.delete(name);
+      this.lastUpdateTs.delete(name);
+      this.writerInventory.delete(name);
+      this.writeConflicts.delete(name);
+      // Provider reverse index: drop this signal from every provider that
+      // advertised it; a provider left with no signals loses its key too.
+      const providers = this.providersBySignal.get(name);
+      if (providers) {
+        for (const key of providers) {
+          const signals = this.providerSignals.get(key);
+          signals?.delete(name);
+          if (signals && signals.size === 0) {
+            this.providerSignals.delete(key);
+            this.providerRefs.delete(key);
+            this.providerConnected.delete(key);
+          }
+        }
+        this.providersBySignal.delete(name);
+      }
+    }
+
+    for (const [path, name] of [...this.pathToName]) {
+      if (removed.has(name)) this.pathToName.delete(path);
+    }
+    for (const [path, name] of [...this.resolveCache]) {
+      if (name !== null && removed.has(name)) this.resolveCache.delete(path);
+    }
+
+    this._version++;
+    this._notifyForce();
+    debug('signal', `unregisterByPrefix "${prefix}": removed ${removed.size} signals`);
+    return removed.size;
   }
 
   /** Clear all signals and listeners. */

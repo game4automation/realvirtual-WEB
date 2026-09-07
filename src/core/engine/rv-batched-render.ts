@@ -136,7 +136,18 @@ const FILL_YIELD_VERTEX_BUDGET = 500_000;
  *  static arena would freeze the whole chain at its start pose. Excluding the
  *  subtree keeps the elements individual meshes, exactly like MU/TransportSurface
  *  geometry; an instanced fast path is a separate follow-up, not a batch entry. */
-const EXCLUDED_SUBTREE_KEYS = ['TransportSurface', 'Source', 'Sink', 'MU', 'Cam', 'MachiningVolume', 'PlacementMeta', 'Chain'] as const;
+/** `RibbonPath` / `RibbonWinder` / `RibbonRoller` (plan-459) are movers like `Chain`: the
+ *  path rewrites its band's position buffer whenever a roll changes size, the
+ *  winder scales its roll mesh every tick, and every roller spins. A static
+ *  arena would freeze the whole web at its load pose — the exact symptom the
+ *  `Chain` entry above exists for.
+ *
+ *  plan-460: a `SpinMode: Texture` roller is static for `freezeStaticMatrices`
+ *  but stays EXCLUDED here all the same — a `BatchedMesh` arena shares ONE
+ *  material and has no per-instance UV offset (`doc-render-picking.md` §1.6),
+ *  so batching it would scroll either every arena member or none. Instancing
+ *  texture rollers is explicitly out of scope (F14). */
+const EXCLUDED_SUBTREE_KEYS = ['TransportSurface', 'Source', 'Sink', 'MU', 'Cam', 'MachiningVolume', 'PlacementMeta', 'Chain', 'RibbonPath', 'RibbonWinder', 'RibbonRoller', 'RibbonDancer'] as const;
 
 function isSkinnedOrMorphed(mesh: Mesh): boolean {
   if ((mesh as Mesh & { skeleton?: unknown }).skeleton) return true;

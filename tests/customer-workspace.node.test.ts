@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { closeSync, existsSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  applyMergedSnapshot,
+  CONDITIONAL_DELIVERED_DOCS,
+  applySnapshot,
   assertNoCrossTierLeak,
+  assertNoUnfetchedLfsObjects,
+  assertProjectTreeClean,
   assertWorkspaceGuards,
   collectPrivateSourceInventory,
   copyDemoRealvirtualFolder,
@@ -19,7 +22,10 @@ import {
   runBuild,
   stageFilteredSourceTree,
 } from '../scripts/_workspace-lib.mjs';
-import { knownProjectKeys } from '../scripts/_rv-guards.mjs';
+import { PROJECT_KINDS, knownProjectKeys } from '../scripts/_rv-guards.mjs';
+// T8 runs the REAL validator over the REAL generated manifest. Importing it in-process is the
+// form the delivery gate uses too — a child process would only give us stdout to parse.
+import { validateProject } from '../scripts/validate-project.mjs';
 import { findStartDocument } from '../src/core/project/rv-project-documents';
 import { assertManifestResolves } from './helpers/assert-manifest-resolves';
 
@@ -52,7 +58,20 @@ const alwaysDeliveredDocs = [
   // And again, from the 6.3.19 release branch: doc-webviewer.md sends the reader here for the
   // path/AGV task primitive, so the delivered guide links a file the staged workspace must carry.
   'doc-path-fleet-control.md',
+  // Moved out of CONDITIONAL_DELIVERED_DOCS by plan-739: the layout planner is statically
+  // imported by src/main.ts and the multiuser connection modes live in src/core/hmi, so both
+  // documents describe code every customer already receives. The gate map is now empty.
+  'doc-layout-planner.md',
+  'doc-multiuser-system.md',
 ];
+// The REAL repositories, for the real-doc staging test (T4) — same resolution order as
+// vitest.node.config.ts. This file is already private-dependent, so reaching for the sibling here
+// costs nothing that was not already paid.
+const realCoreRoot = resolve(__dirname, '..');
+const realPrivateRoot = [
+  resolve(realCoreRoot, '../realvirtual-WebViewer-Private~'),
+  resolve(realCoreRoot, '../realvirtual-web-pro'),
+].find(existsSync) ?? resolve(realCoreRoot, '../realvirtual-WebViewer-Private~');
 const workspaceRecipes = [
   'README.md', 'replace-machine-model.md', 'kinematize-cad-import.md', 'connect-live-signals.md',
   'setup-influxdb-historian.md', 'deploy-production-web.md',
@@ -218,7 +237,9 @@ function fixture() {
       },
     },
   }));
-  write(join(privateRoot, 'LICENSE-commercial.md'), 'PLACEHOLDER - pending legal review');
+  // NO `LICENSE-commercial.md` here any more (plan-739 F4). Staging used to THROW without it,
+  // and every fixture had to carry it for that reason alone; the guard and the copy are both
+  // gone, so its absence from the default fixture is now part of what T6 proves.
   write(join(privateRoot, 'tier-manifest.json'), JSON.stringify({
     defaults: 'internal',
     rules: [
@@ -257,6 +278,30 @@ function fixture() {
     mirror: null, connectChannel: 'stable' as const, connectLicenseKey: 'RVC1-PLACEHOLDER', projectKey: 'acme',
   };
   return { core, privateRoot, delivery };
+}
+
+// The rules PRIV/.gitignore really carries for project working-tree junk (verified 2026-09-07
+// against `.gitignore` lines 20-32). The fixture reproduces them rather than inventing its own,
+// because the whole point of T9 is that the junk is INVISIBLE to Git — ignored, therefore never
+// tracked and never reported as untracked either.
+const PRIVATE_PROJECT_GITIGNORE = [
+  'projects/*/project.json.bak',
+  'projects/**/*-draft_*.glb',
+  'projects/*/.trash/',
+  '',
+].join('\n');
+
+//! Turns the fixture private root into a Git repository whose index IS the delivery contract
+//! (plan-739 F8). Everything on disk at call time is committed; anything written afterwards is
+//! either ignored junk (invisible) or an untracked file the guard must refuse.
+function commitPrivateFixture(privateRoot: string) {
+  write(join(privateRoot, '.gitignore'), PRIVATE_PROJECT_GITIGNORE);
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: privateRoot });
+  execFileSync('git', ['add', '-A'], { cwd: privateRoot });
+  execFileSync('git', [
+    '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=Fixture',
+    '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'fixture project state',
+  ], { cwd: privateRoot });
 }
 
 //! Turns the fixture core into a Git repository with a known index: the delivery intersects its
@@ -612,8 +657,11 @@ describe('customer workspace generator', () => {
     // their names in the planner library UI.
     const catalog = JSON.parse(readFileSync(join(library, 'catalog.json'), 'utf8'));
     expect(catalog.entries.map((entry: { id: string }) => entry.id)).toEqual(['pallethandling-roll-conveyor-1m']);
+    // …and the delivered library is under the LFS filter. This line used to name
+    // `realvirtual-web/public/models/*.glb`, a path nothing stages — see T7 below for why that
+    // mattered and what it cost (plan-739 F12).
     expect(readFileSync(join(staged.workspaceRoot, '.gitattributes'), 'utf8'))
-      .toContain('realvirtual-web/public/models/*.glb filter=lfs diff=lfs merge=lfs -text');
+      .toContain('realvirtual-web/**/*.glb filter=lfs diff=lfs merge=lfs -text');
   });
 
   // ── plan-726 F13: the demo manifest must not leak into a delivery ─────
@@ -783,16 +831,53 @@ describe('customer workspace generator', () => {
     expect(existsSync(join(staged.privateRoot!, 'src', 'internal', 'sentinel.ts'))).toBe(false);
   });
 
-  it('delivers entitlement-bound documentation only with the matching feature', () => {
+  // T5 (plan-739 section 9.2). This replaces "delivers entitlement-bound documentation only with
+  // the matching feature": there is no entitlement-bound documentation left. Both former members
+  // of CONDITIONAL_DELIVERED_DOCS document code that ships to every customer regardless, so
+  // gating the guides only produced customers who could not read about what they had.
+  it('delivers the formerly entitlement-bound documentation unconditionally', () => {
     const { core, privateRoot, delivery } = fixture();
+    // No restricted features at all: the weakest possible profile must still carry both docs.
     const staged = stageFilteredSourceTree({
       coreRoot: core, privateRoot, projectKey: 'acme', delivery,
-      profile: { ...delivery, restrictedFeatures: ['layout-planner'] },
+      profile: { ...delivery, restrictedFeatures: [] },
     });
     temporary.push(staged.workspaceRoot);
     expect(existsSync(join(staged.coreRoot, 'doc-layout-planner.md'))).toBe(true);
-    expect(existsSync(join(staged.coreRoot, 'doc-multiuser-system.md'))).toBe(false);
+    expect(existsSync(join(staged.coreRoot, 'doc-multiuser-system.md'))).toBe(true);
+    // The gate stays wired as a mechanism — it is empty, not deleted.
+    expect(CONDITIONAL_DELIVERED_DOCS.size).toBe(0);
   });
+
+  // T4 (plan-739 section 9.2). Every test above stages a FIXTURE core whose documents are
+  // one-line stubs, so none of them can see a bad link in a real document. On 2026-09-04 exactly
+  // that gap let a single cross-repo link in doc-unity-to-web.md take down every delivery channel
+  // at once — customer delivery, Bunny deploy, embed build, CONNECT bundle, mirror precheck — and
+  // the whole suite stayed green. This test stages the REAL documentation instead.
+  //
+  // Scope: `workspaceFiles: false` stages code and documentation without generating the customer
+  // workspace files (README, recipes, start scripts), which a projectless commercial staging
+  // cannot produce without a delivery config. The doc curation and the broken-link assertion run
+  // either way — they are the last two steps of stageFilteredSourceTree — so this covers exactly
+  // the gate that was blocking.
+  for (const tier of ['core', 'commercial']) {
+    it(`stages the real documentation tree for the ${tier} profile`, () => {
+      const staged = stageFilteredSourceTree({
+        coreRoot: realCoreRoot,
+        privateRoot: realPrivateRoot,
+        profile: { tier, restrictedFeatures: [] },
+        workspaceFiles: false,
+      });
+      temporary.push(staged.workspaceRoot);
+      // Both docs are unconditional now, so they must be present at BOTH tiers.
+      expect(existsSync(join(staged.coreRoot, 'doc-layout-planner.md'))).toBe(true);
+      expect(existsSync(join(staged.coreRoot, 'doc-multiuser-system.md'))).toBe(true);
+      // The link that caused the outage is gone from the staged copy in every form: not as a
+      // sibling-checkout link, and not silently rewritten into something that resolves nowhere.
+      const unityToWeb = readFileSync(join(staged.coreRoot, 'doc-unity-to-web.md'), 'utf8');
+      expect(unityToWeb).not.toMatch(/\]\(\.\.\/[^/)]+~\//);
+    }, 180_000);
+  }
 
   it('generates only ASCII-printable text in delivered workspace documents', () => {
     // Regression guard: a customer delivery once shipped mojibake ("â€”", "â†’", U+FFFD)
@@ -999,12 +1084,12 @@ describe('customer workspace generator', () => {
 
     const clone = mkdtempSync(join(tmpdir(), 'rv-snapshot-clone-'));
     temporary.push(clone);
-    // applyMergedSnapshot reads blob OIDs out of Git on both sides, so both are real
+    // applySnapshot refuses anything but a clean git clone, so both are real
     // repositories now; an empty clone is the first-delivery (seeding) case.
     execFileSync('git', ['init', '-b', 'main'], { cwd: clone, stdio: 'ignore' });
     execFileSync('git', ['init', '-b', 'main'], { cwd: staged.workspaceRoot, stdio: 'ignore' });
     execFileSync('git', ['add', '-A'], { cwd: staged.workspaceRoot, stdio: 'ignore' });
-    applyMergedSnapshot(staged.workspaceRoot, clone, { projects: [{ key: 'acme', vendor: null }], version: '9.9.9' });
+    applySnapshot(staged.workspaceRoot, clone, { version: '9.9.9' });
     expect(existsSync(join(clone, 'realvirtual-web', 'node_modules'))).toBe(false);
     expect(existsSync(join(clone, 'realvirtual-web', 'dist'))).toBe(false);
     expect(existsSync(join(clone, 'realvirtual-web', 'package.json'))).toBe(true);
@@ -1022,15 +1107,105 @@ describe('customer workspace generator', () => {
     expect(() => assertWorkspaceGuards(staged.workspaceRoot)).toThrow(/Links are not allowed/);
   });
 
+  // ── plan-739 Phase 4 (F8/F9), T9-T13 ────────────────────────────────────────────────────
+  //
+  // Measured in the real private repository on 2026-09-07: 31 files and 153,289,691 bytes of
+  // working-tree junk under `projects/`, including `wmyb/.trash/P1002_SAIER.glb` at 45,226,652
+  // bytes of DELETED customer geometry. All of it is ignored by PRIV/.gitignore, and all of it
+  // would have been copied into the next customer repository, because the staging read the
+  // directory instead of the index.
+
+  //! One staged workspace whose private project folder is Git-backed, with the same three kinds
+  //! of ignored junk the real repository carries and one nested tracked file.
+  function stageTrackedProject() {
+    const { core, privateRoot, delivery } = fixture();
+    // A tracked file two levels down: the directory-descent rule (T11) is the only reason it
+    // can be reached at all, because `git ls-files` never names the directories above it.
+    write(join(privateRoot, 'projects', 'acme', 'models', 'sub', 'deep.glb'), 'fixture:deep');
+    commitPrivateFixture(privateRoot);
+    // Written AFTER the commit: invisible to Git, exactly like the real junk.
+    write(join(privateRoot, 'projects', 'acme', '.trash', 'P1002_deleted.glb'), 'deleted customer geometry');
+    write(join(privateRoot, 'projects', 'acme', 'models', 'machine-draft_gnqvqp.glb'), 'autosaved draft');
+    write(join(privateRoot, 'projects', 'acme', 'project.json.bak'), '{"stale":true}');
+    const staged = stageFilteredSourceTree({
+      coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery,
+    });
+    temporary.push(staged.workspaceRoot);
+    return { staged, project: join(staged.workspaceRoot, 'projects', 'acme') };
+  }
+
+  it('T9 stages only the Git-tracked files of a project folder', () => {
+    const { project } = stageTrackedProject();
+    expect(existsSync(join(project, '.trash'))).toBe(false);
+    expect(existsSync(join(project, '.trash', 'P1002_deleted.glb'))).toBe(false);
+    expect(existsSync(join(project, 'models', 'machine-draft_gnqvqp.glb'))).toBe(false);
+    expect(existsSync(join(project, 'project.json.bak'))).toBe(false);
+  });
+
+  it('T10 strips the repository prefix, so the project folder is not delivered empty', () => {
+    // `git ls-files` answers `projects/acme/project.json`; copyTree asks about `project.json`.
+    // Without the strip nothing matches and this folder arrives at the customer EMPTY, with no
+    // error anywhere — which is why the assertion is on emptiness and not only on one name.
+    const { project } = stageTrackedProject();
+    expect(existsSync(join(project, 'project.json'))).toBe(true);
+    expect(readdirSync(project).length).toBeGreaterThan(0);
+  });
+
+  it('T11 descends into subdirectories that hold tracked files', () => {
+    // copyTree calls its filter for directories too, and `git ls-files` lists only files. A
+    // filter that answers "not tracked" for `models/` never enters it, and the machine model —
+    // the actual product — is silently left behind.
+    const { project } = stageTrackedProject();
+    expect(existsSync(join(project, 'models', 'machine.glb'))).toBe(true);
+    expect(existsSync(join(project, 'models', 'sub', 'deep.glb'))).toBe(true);
+    expect(existsSync(join(project, 'plugins', 'chart.tsx'))).toBe(true);
+  });
+
+  it('T12 aborts on a tracked file that is still an unfetched Git LFS pointer', () => {
+    const { core, privateRoot, delivery } = fixture();
+    write(join(privateRoot, 'projects', 'acme', 'models', 'unfetched.glb'), [
+      'version https://git-lfs.github.com/spec/v1',
+      `oid sha256:${'a'.repeat(64)}`,
+      'size 45226652',
+      '',
+    ].join('\n'));
+    commitPrivateFixture(privateRoot);
+    expect(() => stageFilteredSourceTree({
+      coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery,
+    })).toThrow(/unfetched Git LFS pointer/);
+    // …and the guard says the same thing on its own, so a caller that stages projects some
+    // other way can reach it too.
+    expect(() => assertNoUnfetchedLfsObjects(privateRoot, 'acme', new Set(['models/unfetched.glb'])))
+      .toThrow(/git lfs pull/);
+  });
+
+  it('T13 aborts on an untracked, unignored file before any project content is copied', () => {
+    const { core, privateRoot, delivery } = fixture();
+    commitPrivateFixture(privateRoot);
+    // Not covered by any ignore rule: either forgotten work or material that has no business
+    // in a customer repository. Both are a decision for a human.
+    write(join(privateRoot, 'projects', 'acme', 'models', 'forgotten.glb'), 'never committed');
+    expect(() => assertProjectTreeClean(privateRoot, 'acme'))
+      .toThrow(/projects\/acme has 1 uncommitted change/);
+    expect(() => stageFilteredSourceTree({
+      coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery,
+    })).toThrow(/uncommitted change/);
+    // The ignored junk of T9 must NOT reach this guard — it is `!!`, not `??`.
+    rmSync(join(privateRoot, 'projects', 'acme', 'models', 'forgotten.glb'));
+    write(join(privateRoot, 'projects', 'acme', '.trash', 'deleted.glb'), 'ignored');
+    write(join(privateRoot, 'projects', 'acme', 'project.json.bak'), '{"stale":true}');
+    expect(() => assertProjectTreeClean(privateRoot, 'acme')).not.toThrow();
+  });
+
   it('pushes the snapshot of an LFS-indexed staging tree to an empty bare remote with pointer blobs', async () => {
     // generate-customer-workspace.mjs has no .d.mts; a non-literal specifier keeps tsc out of it.
     const generatorModule = (await import(
       new URL('../scripts/generate-customer-workspace.mjs', import.meta.url).href
     )) as {
       snapshotPush: (options: {
-        workspaceRoot: string; remote: string;
-        projects: Array<{ key: string; vendor?: unknown }>; version: string;
-        plasticChangeset?: number | null; push?: boolean; coreRoot?: string | null; seedMissing?: boolean;
+        workspaceRoot: string; remote: string; version: string;
+        plasticChangeset?: number | null; push?: boolean; coreRoot?: string | null;
+        replaceProjects?: string[]; force?: boolean; acceptNewPrivateFiles?: boolean;
       }) => { pushed: boolean; remote: string; message: string; snapshot: any; baselineTag?: string };
     };
     const root = mkdtempSync(join(tmpdir(), 'rv-snapshot-push-test-'));
@@ -1065,13 +1240,20 @@ describe('customer workspace generator', () => {
     Object.assign(process.env, identity);
     try {
       const result = generatorModule.snapshotPush({
-        workspaceRoot: staged, remote: pathToFileURL(bare).href, projects: [{ key: 'acme' }], version: '9.9.9',
+        workspaceRoot: staged, remote: pathToFileURL(bare).href, version: '9.9.9',
         plasticChangeset: 9434, push: true,
       });
-      expect(result).toMatchObject({ pushed: true, message: 'viewer 9.9.9-9434' });
+      expect(result.pushed).toBe(true);
+      expect(result.message.split('\n')[0]).toBe('viewer 9.9.9-9434');
       // Without a coreRoot (and against a remote that carries no manifest) the message
       // stays the bare header — the changelog is additive, never a hard requirement.
       expect(result.message).not.toContain('Changes since core');
+      // The remote carried no v3 manifest, so this is a changeover delivery and its
+      // commit explains the new model (plan-738 F9). That it says so exactly ONCE is
+      // a property of the previous manifest version, unit-tested in
+      // delivery-baseline.node.test.ts — this fixture writes a v1 manifest every
+      // time, so it cannot show the second half here.
+      expect(result.message).toContain('Neues Liefermodell ab dieser Auslieferung.');
     } finally {
       for (const [key, value] of Object.entries(previous)) {
         if (value === undefined) delete process.env[key];
@@ -1091,7 +1273,7 @@ describe('customer workspace generator', () => {
     Object.assign(process.env, identity);
     try {
       const second = generatorModule.snapshotPush({
-        workspaceRoot: staged, remote: pathToFileURL(bare).href, projects: [{ key: 'acme' }], version: '9.9.10',
+        workspaceRoot: staged, remote: pathToFileURL(bare).href, version: '9.9.10',
         plasticChangeset: 9435, push: true, coreRoot: core,
       });
       expect(second.message).toContain('viewer 9.9.10-9435');
@@ -1580,7 +1762,9 @@ describe('projectless customer workspace', () => {
     // the demo project (projects/demo-realvirtual/) is that something now, so this
     // file stops naming a file it does not own.
     const generated = JSON.parse(readFileSync(manifestPath, 'utf8'));
-    expect(generated.kind).toBe('delivery');
+    // `customer`, inside PROJECT_KINDS. It said `delivery` until plan-739 (F14), which is not a
+    // kind any validator knows — see T8 for the consequence that had.
+    expect(generated.kind).toBe('customer');
     expect(generated.documents).toEqual([]);
     expect(generated.settings?.defaultModel).toBeUndefined();
 
@@ -1854,22 +2038,24 @@ describe('projectless customer workspace', () => {
   });
 
   /**
-   * The §6.7 zone-C proof, as a unit test.
+   * The territorial proof, as a unit test (plan-738 §2.4).
    *
-   * A projectless delivery delivers nothing OF THE CUSTOMER'S under `projects/`, so
-   * nothing of theirs is vendor-managed — and the merge must leave their own project
-   * exactly as it found it. This follows from the existing logic without a special
-   * case (the per-project loop has nothing to iterate), which is precisely what
-   * makes it worth pinning: a future "seed the folder" convenience would break it.
+   * A projectless delivery carries no project folder of ours, so `applySnapshot`
+   * has nothing to write under `projects/` — and the customer's own project must
+   * come through byte-identical. This follows from the rule without a special
+   * case (the seed loop iterates the staged folders, and there are none of theirs
+   * in it), which is precisely what makes it worth pinning: a future "seed the
+   * folder" convenience would break it.
    *
-   * ## The one exception, since plan-737
+   * ## The one arrival
    *
-   * `projects/demo-realvirtual/` DOES arrive, on this channel too (F5). It is
-   * vendor-owned sample content, classified Zone A and replaced in full on every
-   * delivery — see the dedicated case in `merged-snapshot.node.test.ts`. So the
-   * claim here is no longer "nothing appears under projects/" but the sharper and
-   * more useful one: nothing appears there EXCEPT the demo, and nothing of the
-   * customer's is touched either way.
+   * `projects/demo-realvirtual/` DOES arrive, on this channel too. This clone
+   * has content but no `delivery/*` tag — the UNTAGGED case, which is not a
+   * first delivery — so nothing is seeded wholesale; the demo arrives because
+   * that one folder does not exist here yet, with no special case of its own
+   * (the plan-737 F4 rule was withdrawn). The claim here is therefore not
+   * "nothing appears under projects/" but the sharper one: nothing appears
+   * there EXCEPT what we shipped, and nothing of the customer's is touched.
    */
   it('leaves a customer-created project under projects/ byte-identical across an update', () => {
     const { staged } = stageProjectless();
@@ -1893,10 +2079,16 @@ describe('projectless customer workspace', () => {
     execFileSync('git', ['-c', 'user.email=t@example.invalid', '-c', 'user.name=t',
       'commit', '-m', 'customer state'], { cwd: clone, stdio: 'ignore' });
 
-    const snapshot = applyMergedSnapshot(staged.workspaceRoot, clone, { projects: [], version: '9.9.9' });
+    const snapshot = applySnapshot(staged.workspaceRoot, clone, { version: '9.9.9' });
 
-    // Nothing was reported for any project, because nothing was delivered into one.
-    expect(snapshot.projects).toEqual({});
+    // NOT a first delivery: the clone has a commit. It carries no delivery/* tag
+    // either, which is the untagged case — only the folders genuinely absent are
+    // written, which for a projectless customer is the demo and nothing else.
+    // `mymachine` is not in that list because it is not ours to seed.
+    expect(snapshot.firstDelivery).toBe(false);
+    expect(snapshot.untagged).toBe(true);
+    expect(snapshot.seeded).toEqual(['demo-realvirtual']);
+    expect(snapshot.replaced).toEqual([]);
     // Every one of the customer's files is still there, byte for byte.
     for (const [rel, content] of Object.entries(own)) {
       expect(readFileSync(join(clone, rel), 'utf8'), rel).toBe(content);
@@ -2082,5 +2274,363 @@ describe('a delivered project passes the release gate (plan-731 F6)', () => {
       ],
     );
     expect(() => assertManifestResolves(root)).toThrow(/dev-only/);
+  });
+});
+
+// ─── plan-738 F9/F7: the delivery contract as the customer reads it ───────
+//
+// The README is the ONLY place the delivery model is explained to the person who
+// receives it. When the model changed from three zones to one folder boundary,
+// the text describing zones, conflict sidecars and DELIVERY-REPORT.md stopped
+// being merely stale and became actively wrong: it told customers to look for
+// files that are no longer produced and to resolve conflicts that can no longer
+// happen. That is what these two cases pin.
+describe('T-README: the generated README states the territorial rule', () => {
+  const readmeFor = (projectless: boolean) => {
+    const { core, privateRoot, delivery } = fixture();
+    const staged = projectless
+      ? stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: null, profile: delivery, delivery })
+      : stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
+    temporary.push(staged.workspaceRoot);
+    return readFileSync(join(staged.workspaceRoot, 'README.md'), 'utf8');
+  };
+
+  it.each([['with a project', false], ['projectless', true]] as const)(
+    'carries both customer rules and no zone vocabulary (%s)', (_label, projectless) => {
+      const readme = readmeFor(projectless);
+
+      // Rule 1 and rule 2, the two things a customer has to know.
+      expect(readme).toMatch(/Commit your work before you pull/);
+      expect(readme).toMatch(/never force-push/i);
+      // The one-sentence model.
+      expect(readme).toContain('We deliver the application; your projects are yours.');
+
+      // And nothing at all about the machinery that no longer exists. Each of
+      // these would send a customer looking for a file we stopped writing.
+      expect(readme).not.toContain('DELIVERY-REPORT');
+      expect(readme).not.toMatch(/\.vendor-/);
+      expect(readme).not.toMatch(/\*\*Merged\.\*\*/);
+      expect(readme).not.toMatch(/your version stays/i);
+    });
+});
+
+describe('T-SWEEP: no private project manifest still declares a vendor block', () => {
+  const projectsRoot = join(__dirname, '..', '..', 'realvirtual-WebViewer-Private~', 'projects');
+  const projectKeys = existsSync(projectsRoot)
+    ? readdirSync(projectsRoot, { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => entry.name)
+      .filter(name => existsSync(join(projectsRoot, name, 'project.json')))
+    : [];
+
+  it('found the private projects to sweep', () => {
+    // A silent empty sweep would report green while checking nothing.
+    expect(projectKeys.length).toBeGreaterThan(0);
+  });
+
+  it.each(projectKeys)('%s has no "vendor" key', (key) => {
+    // Readers tolerate a leftover block in a customer's copy (that is T7), but
+    // OUR manifests are the source and must not carry one: it would travel into
+    // every future delivery as a field nothing reads.
+    const manifest = JSON.parse(readFileSync(join(projectsRoot, key, 'project.json'), 'utf8'));
+    expect(manifest.vendor).toBeUndefined();
+  });
+});
+
+// ─── plan-738 follow-up: a repository with content but no delivery tag ────
+//
+// `detectDeliveryBaseline` used to answer "first delivery" for BOTH an empty
+// remote and a repository whose `delivery/*` tags were never pushed or had been
+// deleted. The second case is not a first delivery at all — the customer has the
+// application, and very possibly weeks of work inside `projects/` — and the seed
+// that followed deleted and re-wrote every project folder this delivery carries,
+// silently and without the `--projects` preview that exists to make exactly that
+// visible.
+//
+// The rule now: seed everything only when the REMOTE IS EMPTY. A repository with
+// content and no tags seeds only what is genuinely missing; anything already
+// there goes through `--projects` like any other update.
+describe('an untagged customer repository is not a first delivery', () => {
+  /** A delivery carrying two project folders, and a clone that has only one of them. */
+  function stageTwoProjects() {
+    const root = mkdtempSync(join(tmpdir(), 'rv-untagged-'));
+    temporary.push(root);
+    const staged = join(root, 'staged');
+    write(join(staged, 'realvirtual-web', 'main.ts'), 'export const delivered = true;');
+    write(join(staged, 'projects', 'acme', 'project.json'), '{"canonicalName":"acme"}\n');
+    write(join(staged, 'projects', 'acme', 'models', 'line.glb'), 'the vendor copy of the model');
+    write(join(staged, 'projects', 'newone', 'project.json'), '{"canonicalName":"newone"}\n');
+
+    const clone = join(root, 'clone');
+    mkdirSync(clone, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: clone, stdio: 'ignore' });
+    write(join(clone, 'README.md'), '# an older delivery\n');
+    // `acme` is here already, and the customer has been working in it.
+    write(join(clone, 'projects', 'acme', 'project.json'), '{"canonicalName":"acme","edited":true}\n');
+    write(join(clone, 'projects', 'acme', 'models', 'line.glb'), 'THE CUSTOMER EDITED THIS');
+    write(join(clone, 'projects', 'acme', 'notes.md'), '# three weeks of work\n');
+    execFileSync('git', ['add', '-A'], { cwd: clone, stdio: 'ignore' });
+    execFileSync('git', ['-c', 'user.email=t@example.invalid', '-c', 'user.name=t',
+      'commit', '-m', 'customer state'], { cwd: clone, stdio: 'ignore' });
+    // The delivery that produced this state left no tag behind — the bug's premise.
+    expect(execFileSync('git', ['tag', '-l'], { cwd: clone, encoding: 'utf8' }).trim()).toBe('');
+    return { staged, clone };
+  }
+
+  it('keeps the customer-edited folder and seeds only the one that is missing', () => {
+    const { staged, clone } = stageTwoProjects();
+    const logged: string[] = [];
+
+    const snapshot = applySnapshot(staged, clone, {
+      version: '9.9.9', log: (line: string) => logged.push(line),
+    });
+
+    expect(snapshot.firstDelivery).toBe(false);
+    expect(snapshot.untagged).toBe(true);
+    expect(snapshot.seeded).toEqual(['newone']);
+    expect(snapshot.replaced).toEqual([]);
+    // The edited folder survived, byte for byte — including the file the delivery
+    // also carries, which is what the seed used to overwrite.
+    expect(readFileSync(join(clone, 'projects', 'acme', 'models', 'line.glb'), 'utf8'))
+      .toBe('THE CUSTOMER EDITED THIS');
+    expect(readFileSync(join(clone, 'projects', 'acme', 'notes.md'), 'utf8'))
+      .toBe('# three weeks of work\n');
+    expect(existsSync(join(clone, 'projects', 'newone', 'project.json'))).toBe(true);
+    // And the operator is told why this repository looked like a first delivery.
+    expect(logged.join('\n')).toContain('carries no delivery/* tag');
+    // Zone A still happened.
+    expect(readFileSync(join(clone, 'realvirtual-web', 'main.ts'), 'utf8'))
+      .toBe('export const delivered = true;');
+  }, 30000);
+
+  it('still replaces an existing folder when --projects asks for it', () => {
+    const { staged, clone } = stageTwoProjects();
+
+    const snapshot = applySnapshot(staged, clone, { version: '9.9.9', replaceProjects: ['acme'], log: () => {} });
+
+    // Named explicitly, it goes down the ordinary replace path — the one the
+    // caller gates behind the preview and the confirmation.
+    expect(snapshot.seeded).toEqual(['newone']);
+    expect(snapshot.replaced).toEqual(['acme']);
+    expect(readFileSync(join(clone, 'projects', 'acme', 'models', 'line.glb'), 'utf8'))
+      .toBe('the vendor copy of the model');
+    expect(existsSync(join(clone, 'projects', 'acme', 'notes.md'))).toBe(false);
+  }, 30000);
+
+  it('reports a folder that is both missing and named by --projects as seeded, once', () => {
+    const { staged, clone } = stageTwoProjects();
+
+    const snapshot = applySnapshot(staged, clone, {
+      version: '9.9.9', replaceProjects: ['acme', 'newone'], log: () => {},
+    });
+
+    expect(snapshot.seeded).toEqual(['newone']);
+    expect(snapshot.replaced).toEqual(['acme']);
+  }, 30000);
+
+  it('still seeds everything into a genuinely empty remote', () => {
+    const { staged } = stageTwoProjects();
+    const empty = mkdtempSync(join(tmpdir(), 'rv-untagged-empty-'));
+    temporary.push(empty);
+    execFileSync('git', ['init', '-b', 'main'], { cwd: empty, stdio: 'ignore' });
+
+    const snapshot = applySnapshot(staged, empty, { version: '9.9.9', log: () => {} });
+
+    expect(snapshot.remoteEmpty).toBe(true);
+    expect(snapshot.firstDelivery).toBe(true);
+    expect(snapshot.untagged).toBe(false);
+    expect(snapshot.seeded).toEqual(['acme', 'newone']);
+    expect(snapshot.replaced).toEqual([]);
+  }, 30000);
+});
+
+// ─── plan-739 Phase 2: what actually arrives in the customer's repository ──
+//
+// Three defects that a green suite did not see, because nothing asserted the
+// INVARIANT — only the individual settings, each of which looked fine.
+describe('T6/T7/T8: the delivered workspace carries no placeholder licence, tracks its GLBs, and validates', () => {
+  //! The projectless delivery config, shaped like loadDeliveryConfigByCustomer's result.
+  //! Duplicated from the `projectless customer workspace` describe above rather than hoisted:
+  //! that one is a fixture of its suite, and sharing it would couple two independent groups.
+  const standardDelivery = {
+    project: 'Hochschule Beispiel',
+    customer: 'beispiel',
+    projects: [] as string[],
+    kind: 'standard' as const,
+    tier: 'commercial' as const,
+    restrictedFeatures: [] as string[],
+    remote: 'git@example.invalid:beispiel.git',
+    mirror: null,
+    connectChannel: 'stable' as const,
+    connectLicenseKey: 'RVC1-PLACEHOLDER',
+    projectKey: null,
+  };
+
+  //! Adds the bundled component library to a fixture core, exactly where the real repository
+  //! keeps it: `public/library/<category>/`, beside `models/` and never inside it. The layout
+  //! planner has to be present too — `copyLibraryIntoCore()` skips the library without it.
+  function withLibrary(core: string) {
+    write(join(core, 'src', 'plugins', 'layout-planner', 'index.ts'), 'export const LayoutPlannerPlugin = null;');
+    write(join(core, 'public', 'library', 'catalog.json'), JSON.stringify({
+      version: '1.0',
+      entries: [{ id: 'pallethandling-roll-conveyor-1m', name: 'Roll Conveyor 1m', category: 'Pallet Handling', glbUrl: 'PalletHandling/RollConveyor-1m.glb' }],
+    }));
+    write(join(core, 'public', 'library', 'PalletHandling', 'RollConveyor-1m.glb'), 'fixture:roll');
+  }
+
+  //! One `.gitattributes` pattern as a matcher over repo-relative POSIX paths.
+  //!
+  //! Git's own rules, reduced to the two shapes this file uses: a pattern containing a slash is
+  //! anchored at the repository root, `**/` spans zero or more directories, and a lone `*` stops
+  //! at a separator. Deliberately not a dependency — a matcher that agreed with a buggy pattern
+  //! for the same reason the pattern was buggy would prove nothing.
+  function gitAttributeMatcher(pattern: string): (path: string) => boolean {
+    const segments = pattern.split('/');
+    let source = '';
+    segments.forEach((segment, index) => {
+      const last = index === segments.length - 1;
+      if (segment === '**') {
+        source += last ? '.*' : '(?:[^/]+/)*';
+        return;
+      }
+      source += segment.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*');
+      if (!last) source += '/';
+    });
+    return (path: string) => new RegExp(`^${source}$`).test(path);
+  }
+
+  //! Every file under `root`, as repo-relative POSIX paths.
+  function allFiles(root: string, prefix = ''): string[] {
+    const out: string[] = [];
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) out.push(...allFiles(join(root, entry.name), rel));
+      else out.push(rel);
+    }
+    return out;
+  }
+
+  // ── T6 ──────────────────────────────────────────────────────────────
+  //
+  // The delivery used to copy `LICENSE-commercial.md` out of the private repo and to THROW when
+  // it was missing. The file was a placeholder that said so in its own text, so the only licence
+  // statement a customer could find was one that disclaimed itself; the customer's terms are the
+  // signed delivery contract. Both halves are gone: the guard (so a private checkout without the
+  // draft can still deliver) and the copy (so no customer receives it).
+  it('T6: stages without the commercial licence placeholder and never ships one', () => {
+    const { core, privateRoot, delivery } = fixture();
+
+    const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
+    temporary.push(staged.workspaceRoot);
+
+    expect(existsSync(join(privateRoot, 'LICENSE-commercial.md'))).toBe(false);
+    expect(existsSync(join(staged.workspaceRoot, 'LICENSE-commercial.md'))).toBe(false);
+    // CONTRIBUTING.md carries the pointer that replaced it, so the customer is not left
+    // without an answer to "what licenses the commercial half".
+    const contributing = readFileSync(join(staged.workspaceRoot, 'CONTRIBUTING.md'), 'utf8');
+    expect(contributing).toMatch(/delivery contract/i);
+    expect(contributing).toMatch(/professional@realvirtual\.io/);
+  });
+
+  it('T6: does not ship the placeholder even when the private repo still holds the draft', () => {
+    const { core, privateRoot, delivery } = fixture();
+    // The draft stays in the private repository as internal material — its presence must not
+    // reintroduce the copy.
+    write(join(privateRoot, 'LICENSE-commercial.md'), 'PLACEHOLDER - pending legal review');
+
+    const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
+    temporary.push(staged.workspaceRoot);
+
+    expect(existsSync(join(staged.workspaceRoot, 'LICENSE-commercial.md'))).toBe(false);
+  });
+
+  // ── T7 ──────────────────────────────────────────────────────────────
+  //
+  // THE test this phase exists for. `GENERATED_GIT_ATTRIBUTES` tracked
+  // `realvirtual-web/public/models/library/**/*.glb`; the library is staged to
+  // `realvirtual-web/public/library/`. One path segment too many, so no LFS filter matched and
+  // the bundled library — 17 files, 68,217,972 bytes measured in the real repository on
+  // 2026-09-07 — went into every customer repository as raw blobs, permanently, in the history.
+  //
+  // Asserting the pattern string would not have caught it: the string was there, spelled
+  // plausibly, and read correctly. Only the INVARIANT catches it, so that is what this asserts —
+  // every staged GLB outside `projects/` is covered by some rule in the generated file.
+  it.each([['with a project', 'acme'], ['projectless', null]] as const)(
+    'T7: every staged GLB outside projects/ is under the LFS filter (%s)', (_label, projectKey) => {
+      const { core, privateRoot, delivery } = fixture();
+      withLibrary(core);
+      const staged = projectKey === null
+        ? stageFilteredSourceTree({
+          coreRoot: core, privateRoot, projectKeys: [], profile: standardDelivery,
+          delivery: standardDelivery, hasDiagnosis: false,
+        })
+        : stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey, profile: delivery, delivery });
+      temporary.push(staged.workspaceRoot);
+
+      const patterns = readFileSync(join(staged.workspaceRoot, '.gitattributes'), 'utf8')
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line && !line.startsWith('#') && line.includes('filter=lfs'))
+        .map(line => line.split(/\s+/)[0]);
+      const matchers = patterns.map(gitAttributeMatcher);
+      const glbs = allFiles(staged.workspaceRoot)
+        .filter(path => path.toLowerCase().endsWith('.glb') && !path.startsWith('projects/'));
+
+      // A silent empty list would make every assertion below vacuous, and the bug WAS an
+      // empty intersection.
+      expect(glbs.length).toBeGreaterThan(0);
+      expect(glbs).toContain('realvirtual-web/public/library/PalletHandling/RollConveyor-1m.glb');
+      const uncovered = glbs.filter(path => !matchers.some(match => match(path)));
+      expect(uncovered).toEqual([]);
+    });
+
+  it('T7: the matcher itself rejects the pattern that caused the defect', () => {
+    // Without this, a matcher that accidentally matched everything would make the case above
+    // pass against the broken rule too — and the whole point is that it must not.
+    const broken = gitAttributeMatcher('realvirtual-web/public/models/library/**/*.glb');
+    const fixed = gitAttributeMatcher('realvirtual-web/**/*.glb');
+    const staged = 'realvirtual-web/public/library/PalletHandling/RollConveyor-1m.glb';
+    expect(broken(staged)).toBe(false);
+    expect(fixed(staged)).toBe(true);
+    // The rule is the whole core tree, not a list of the places that hold a GLB today: a
+    // library-only rule still left the schema conformance fixtures as raw blobs.
+    expect(fixed('realvirtual-web/schema/v1/conformance/01-empty-scene.glb')).toBe(true);
+    // `**/` spans zero directories too, and `*` stops at a separator.
+    expect(fixed('realvirtual-web/loose.glb')).toBe(true);
+    expect(gitAttributeMatcher('projects/**/*.glb')('projects/acme/models/machine.glb')).toBe(true);
+    expect(gitAttributeMatcher('projects/**/*.glb')('realvirtual-web/projects/acme/a.glb')).toBe(false);
+  });
+
+  // ── T8 ──────────────────────────────────────────────────────────────
+  //
+  // `writeGeneratedDeliveryManifest()` wrote `kind: 'delivery'`, which is not in `PROJECT_KINDS`
+  // (`customer | demo | internal`). `validate-project.mjs` FAILS on a kind outside that enum, so
+  // the deploy-root manifest of the two standard customers could not pass the validator that
+  // guards their own repository — and nothing noticed, because nothing ever ran the two together.
+  it('T8: validate-project.mjs accepts the generated deploy-root manifest', () => {
+    const { core, privateRoot } = fixture();
+    const staged = stageFilteredSourceTree({
+      coreRoot: core, privateRoot, projectKeys: [], profile: standardDelivery,
+      delivery: standardDelivery, hasDiagnosis: false,
+    });
+    temporary.push(staged.workspaceRoot);
+    const manifest = JSON.parse(readFileSync(join(staged.coreRoot, 'public', 'project.json'), 'utf8'));
+
+    // The validator reads a project FOLDER and checks `canonicalName` against the folder name,
+    // so the generated manifest is validated in a folder of its own name. The deploy root is
+    // `realvirtual-web/public/`, whose basename would fail that unrelated rule and hide the one
+    // under test.
+    const root = mkdtempSync(join(tmpdir(), 'rv-generated-manifest-'));
+    temporary.push(root);
+    const projectDir = join(root, manifest.canonicalName);
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, 'project.json'), JSON.stringify(manifest, null, 2) + '\n');
+
+    const result = validateProject(projectDir);
+
+    expect(result.errors).toEqual([]);
+    expect(result.ok).toBe(true);
+    // Named explicitly, because "no errors" would also hold if the kind rule stopped running.
+    expect(PROJECT_KINDS).toContain(manifest.kind);
   });
 });

@@ -39,6 +39,7 @@ import type { ActiveAssetContext } from '../../core/editor/active-asset-store';
 // private plugin's RvDocumentStack (see `_breadcrumbFields`).
 import { getActiveDocumentView } from '../../core/editor/active-document-view';
 import { libraryDocumentBase } from '../../core/editor/active-asset-store';
+import { ERR_DOCUMENT_LOCKED } from '../../core/editor/rv-asset-document';
 import type { AssetBase } from '../../core/editor/rv-asset-document';
 // Type-only: the module itself is dynamically imported inside the mechanism
 // tools so the asset-editor chunk stays lazy (see the module header).
@@ -130,10 +131,18 @@ function rvOf(node: Object3D): Record<string, unknown> {
  *  recorded during the run is DISCARDED with the test scene. An edit accepted
  *  now would report ok, verify ok against the live (test) scene, and silently
  *  revert minutes later — the exact silent-loss shape Bug #9 is about.
- *  `isAutosaveSuspended` is true exactly for the duration of a test run. */
-function testRunGuard(ctx: ActiveAssetContext): { error: string } | null {
-  if (!ctx.doc.isAutosaveSuspended) return null;
+ *  Since plan-462 B3 the DOCUMENT refuses every mutation entry itself, with a
+ *  `DocumentLockedError` carrying `ERR_DOCUMENT_LOCKED` — so this guard is no
+ *  longer the only thing standing between a test run and a silent loss. It is
+ *  kept, and re-pointed at `lockOwner`, because it answers BEFORE the tool does
+ *  any of its own work (node lookups, schema validation, JSON parsing) and can
+ *  therefore say something specific about the tool that was refused. It will be
+ *  removed only once every tool is demonstrably covered by the document guard
+ *  ahead of its first side effect. */
+function testRunGuard(ctx: ActiveAssetContext): { error: string; code: string } | null {
+  if (ctx.doc.lockOwner?.kind !== 'test-run') return null;
   return {
+    code: ERR_DOCUMENT_LOCKED,
     error: 'A test run is active (in-place test session): edits made now are rolled back '
       + 'together with the test scene when the run stops, so they would be lost silently. '
       + 'Stop the test run first, then repeat the edit.',
@@ -263,6 +272,12 @@ export class McpEditorTools {
   ): Promise<string | null> {
     if (!ctx.doc.dirty) return null;
     const policy = (ifDirty || 'fail').toLowerCase();
+    // plan-462 B3 — BEFORE the draft is deleted, not after. `discard` clears the
+    // draft slot and then re-bases the log; during a test run that slot is the
+    // only record of the pre-test authoring state, so a discard accepted here
+    // destroys the very work the test session promised to put back.
+    const locked = testRunGuard(ctx);
+    if (locked) return locked.error;
     const mods = await this._load();
     if (policy === 'discard') {
       await mods.draft.clearDocumentDraft(ctx.doc.draftFrame);
@@ -646,7 +661,7 @@ export class McpEditorTools {
     for (const d of documents) {
       put(d.path, d.name, d.id, d.sizeBytes ?? null, d.modifiedAt ?? null);
     }
-    const fileStem = (p: string): string => (p.split('/').pop() ?? p).replace(/\.glb$/i, '');
+    const fileStem = listing.glbStem;
     for (const m of models) put(m.path, m.label || fileStem(m.path), m.id ?? null, m.sizeBytes ?? null, null);
     for (const l of library) put(l.path, l.label || fileStem(l.path), l.id ?? null, l.sizeBytes ?? null, null);
     for (const s of stats) put(s.path, fileStem(s.path), null, s.size, s.mtime ? new Date(s.mtime).toISOString() : null);
@@ -712,7 +727,7 @@ export class McpEditorTools {
     // same save. Taken before the write, because that is when it describes what
     // is about to happen: after a `save-into-project` the document's identity is
     // already the new one and the same call would answer `save`.
-    const decision = await this._saveVerb('asset', finalName);
+    const decision = await this._saveVerb(finalName);
     const mods = await this._load();
     const outcome = await mods.save.saveAssetAs(ctx, finalName);
     if (outcome.kind === 'saved') {
@@ -745,7 +760,7 @@ export class McpEditorTools {
    * computed.
    */
   private async _saveVerb(
-    lineage: 'asset', name: string,
+    name: string,
   ): Promise<{ saveVerb?: string; saveReason?: string; copies?: boolean }> {
     try {
       const ctx = this._ctx();
@@ -755,7 +770,11 @@ export class McpEditorTools {
         import('../../core/editor/rv-save-document'),
       ]);
       const d = decideSaveVerb(
-        { lineage, base: ctx.doc.getSnapshot().base, name },
+        // The lineage used to be a parameter with exactly one value; the editor
+        // tools only ever save assets. The scene lineage has its own helper in
+        // `rv-mcp-scene-tools.ts` because its INPUT fields and its RESULT shape
+        // both differ (`open`/`transient` in, no `copies` out) — plan-461 V15.
+        { lineage: 'asset', base: ctx.doc.getSnapshot().base, name },
         getProjectStore().getBackend(),
       );
       return {

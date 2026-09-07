@@ -132,7 +132,10 @@ import {
   type BundledBackendOptions,
 } from './backends/bundled-backend';
 import { FolderBackend } from './backends/folder-backend';
-import type { DocumentRecord, ProjectBackend, ProjectReadProvider } from './backends/project-backend';
+import {
+  withConnectConfigNotifier,
+  type DocumentRecord, type ProjectBackend, type ProjectReadProvider,
+} from './backends/project-backend';
 import { isSelfContainedGlb, type ProjectAssetSource } from './rv-project-asset-source';
 import { arrayBufferOf, revisionOfBytes } from './rv-scene-record';
 import {
@@ -638,6 +641,47 @@ export class ProjectStore {
     }
   }
 
+  /**
+   * The one door every manifest write in this class goes through (plan-462 B2).
+   *
+   * Before this, each writer ran `updateManifestCas` itself and then decided,
+   * on its own, whether to call {@link _notifyConnectAsync} — which is how two
+   * of them ended up never notifying at all and why "does it fire twice on a
+   * CAS retry?" had to be answered per call site. Three rules, stated once:
+   *
+   *  1. **After the final commit, never inside `apply`.** `apply` re-runs on
+   *     every CAS attempt; the notify hangs off the return value, so a retried
+   *     write still notifies once.
+   *  2. **Only when something changed.** A revision is the hash of the
+   *     serialised manifest, so `written !== read` is a true content compare —
+   *     it catches a structurally identical replacement and a mutator that a
+   *     rebase turned into a no-op alike. No mutator is asked to report its own
+   *     effect, because after a retry it cannot know it.
+   *  3. **Only when the caller says the write is config-bearing.** That is a
+   *     property of the verb, not of the bytes: a marker-driven migration
+   *     rewrites rows the gateway already has, and telling it so on every
+   *     project open would be noise.
+   *
+   * @param reason names the verb, for the diagnostic when a commit fails.
+   * @returns the committed manifest and whether it differs from what was on
+   *   disk, or `null` when this project has no directory to commit to.
+   */
+  private async _commitManifest(
+    reason: string,
+    apply: (current: RvProject | null) => RvProject | Promise<RvProject>,
+    opts: { notify: boolean },
+  ): Promise<{ project: RvProject; changed: boolean } | null> {
+    const dir = this._dir;
+    if (!dir) return null;
+    const written = await updateManifestCas(dir, apply);
+    const changed = written.revision !== written.previousRevision;
+    if (opts.notify && changed) this._notifyConnectAsync();
+    if (!changed) {
+      console.debug(`[project-store] ${reason}: manifest unchanged, nothing announced.`);
+    }
+    return { project: written.project, changed };
+  }
+
   // ─── Subscription ─────────────────────────────────────────────────────
 
   subscribe = (listener: () => void): (() => void) => {
@@ -1050,7 +1094,11 @@ export class ProjectStore {
    *     the reads are settled, so reconciliation can never echo back to disk.
    */
   private async _adoptProject(backend: ProjectBackend, project: RvProject): Promise<void> {
-    this._backend = backend;
+    // Wrapped once, here, because this is the only place a backend is adopted —
+    // so every writer that ever reaches one, inside this class or through
+    // `getBackend()`, writes a CONNECT configuration body through the notifier
+    // (plan-462 B2). `_provider` stays the raw backend: it is the read surface.
+    this._backend = withConnectConfigNotifier(backend, () => this._notifyConnectAsync());
     this._provider = backend;
     this._project = project;
     this._writable = backend.writable;
@@ -2464,16 +2512,16 @@ export class ProjectStore {
     this._bundledDocuments = apply(this._bundledDocuments);
     this._publish();
 
-    const dir = this._dir;
-    if (dir) {
-      await updateManifestCas(dir, current => {
-        const base = current ?? this._project;
-        if (!base) throw new Error('This project has no manifest to update.');
-        const documents = (base.documents ?? []).map(
-          e => documentKeyOf(e) === key ? { ...e, classification: next } : e);
-        return { ...base, documents };
-      });
-    }
+    // `notify: true` since plan-462 B2. A classification IS config-bearing —
+    // it is what tells the gateway a document is a configuration at all — and
+    // this write used to be one of the two that never said anything.
+    await this._commitManifest('setDocumentClassification', current => {
+      const base = current ?? this._project;
+      if (!base) throw new Error('This project has no manifest to update.');
+      const documents = (base.documents ?? []).map(
+        e => documentKeyOf(e) === key ? { ...e, classification: next } : e);
+      return { ...base, documents };
+    }, { notify: true });
     return result.classification;
   }
 
@@ -2522,17 +2570,17 @@ export class ProjectStore {
     this._bundledDocuments = apply(this._bundledDocuments);
     this._publish();
 
-    const dir = this._dir;
-    if (dir) {
-      const written = await updateManifestCas(dir, (current) => {
-        const base = current ?? this._project;
-        if (!base) throw new Error('This project has no manifest to update.');
-        return setDocumentRefOn(base, documentId, field, next);
-      });
-      this._project = written.project;
-    }
     // The hero drop itself (plan-725 F1): the whole reason the notify exists.
-    this._notifyConnectAsync();
+    const written = await this._commitManifest(`set ${field}`, (current) => {
+      const base = current ?? this._project;
+      if (!base) throw new Error('This project has no manifest to update.');
+      return setDocumentRefOn(base, documentId, field, next);
+    }, { notify: true });
+    if (written) this._project = written.project;
+    // A project with no directory persists no manifest here at all, so there is
+    // no revision to compare — it announces the in-memory change, exactly as it
+    // did before plan-462 B2.
+    else this._notifyConnectAsync();
   }
 
   /**
@@ -2567,14 +2615,17 @@ export class ProjectStore {
     this._bundledDocuments = apply(this._bundledDocuments);
     this._publish();
 
-    const dir = this._dir;
     // `() => next` on purpose: the caller derived this manifest from the one
     // currently open and is stating it as the new truth. The CAS wrapper is
     // still what serialises the write against the folder writer's own queue.
-    if (dir) await updateManifestCas(dir, () => next);
+    //
     // The tree move/rename path (plan-725 F7): a configuration that changed its
-    // name or folder must stop being written back to where it no longer is.
-    this._notifyConnectAsync();
+    // name or folder must stop being written back to where it no longer is. It
+    // is also the reason the no-op rule is a content compare (plan-462 B2) —
+    // a caller that re-states an unchanged manifest states no news.
+    const committed = await this._commitManifest('replaceManifest', () => next, { notify: true });
+    // No directory, no revision to compare: announce it, as before plan-462 B2.
+    if (!committed) this._notifyConnectAsync();
   }
 
   // ─── Adopt (plan-717 §2.2) ────────────────────────────────────────────
@@ -2611,22 +2662,26 @@ export class ProjectStore {
     if (!base || !backend?.writable) return null;
 
     let next: RvProject;
-    const dir = this._dir;
-    if (dir) {
-      next = (await updateManifestCas(dir, current => apply(current ?? base))).project;
+    const committed = await this._commitManifest(
+      'applyManifestDelta', current => apply(current ?? base), { notify: true });
+    if (committed) {
+      next = committed.project;
     } else {
       const writing = backend as ProjectBackend & Partial<ManifestWritingBackend>;
       if (typeof writing.writeManifest !== 'function') return null;
       const current = await backend.readManifest().catch(() => null);
       next = apply(current ?? base);
       await writing.writeManifest(next);
+      // A backend that writes its own manifest reports no revision, so there is
+      // no no-op signal on this path: it announces every write, exactly as it
+      // did before plan-462 B2.
+      this._notifyConnectAsync();
     }
 
     // Only now — the write survived, so the rows are real.
     this._project = next;
     this._userDocuments = repointToManifestRows(this._userDocuments, next);
     if (opts.publish !== false) this._publish();
-    this._notifyConnectAsync();
     return next;
   }
 
@@ -2836,9 +2891,13 @@ export class ProjectStore {
 
       // Durable first, then in-memory (plan-717 R2-F3), and re-derived inside the
       // CAS callback so a retry runs against what is actually on disk.
-      const written = await updateManifestCas(dir, current =>
-        migrateProjectScriptRefs(current ?? project, { modules }).project);
-      this._project = written.project;
+      //
+      // `notify: false` (plan-462 B2, Tabelle 2): this is a marker-driven
+      // migration that runs once per project and rewrites bindings the gateway
+      // can already read. It stays silent, as it always has.
+      const written = await this._commitManifest('migrate scriptRefs', current =>
+        migrateProjectScriptRefs(current ?? project, { modules }).project, { notify: false });
+      if (written) this._project = written.project;
       this._publish();
       if (dry.caseMismatches.length > 0) {
         for (const miss of dry.caseMismatches) {
@@ -2873,18 +2932,22 @@ export class ProjectStore {
       const bindings = parseConnectMigrationHandoff(
         (await readSettingsFile(dir, CONNECT_MIGRATION_HANDOFF)) as object | null);
       if (bindings.length === 0) return;
-      if (migrateConnectRefs(project, bindings).outcome !== 'migrated') return;
+      // One dry run, used twice: `migrateConnectRefs` is pure and `unmatched` is
+      // derived from `project` and `bindings` alone, so the report below is the
+      // same list this gate already computed (plan-461 V4). Only the CAS call
+      // re-runs it, because it runs against the FRESH manifest, not this one.
+      const dry = migrateConnectRefs(project, bindings);
+      if (dry.outcome !== 'migrated') return;
 
-      const written = await updateManifestCas(dir, current =>
-        migrateConnectRefs(current ?? project, bindings).project);
-      this._project = written.project;
-      this._publish();
       // This one writes `connectRef` rows at project-open time — the state the
-      // gateway most needs to hear about, and the earliest it can.
-      this._notifyConnectAsync();
+      // gateway most needs to hear about, and the earliest it can. So unlike
+      // the scriptRef migration above it keeps `notify: true` (plan-462 B2).
+      const written = await this._commitManifest('adopt CONNECT handoff', current =>
+        migrateConnectRefs(current ?? project, bindings).project, { notify: true });
+      if (written) this._project = written.project;
+      this._publish();
 
-      const result = migrateConnectRefs(project, bindings);
-      for (const model of result.unmatched) {
+      for (const model of dry.unmatched) {
         console.warn(
           `[project-store] CONNECT had a configuration bound to model "${model}", but no document `
           + 'row matches that name — the binding was not adopted. Set connectRef by hand.');
@@ -2928,17 +2991,18 @@ export class ProjectStore {
       this._userDocuments = [...this._userDocuments, ...result.minted];
       this._publish();
 
-      const dir = this._dir;
-      if (dir) {
-        await updateManifestCas(dir, current => {
-          const base = current ?? result.project;
-          // Re-run against what is actually on disk: another writer may have
-          // added rows since, and re-deriving is what keeps the CAS retry loop
-          // from writing a manifest built on a stale read.
-          return mintReferencedAssets(base, due).project;
-        });
-      }
-      this._notifyConnectAsync();
+      // Minting keeps its notify (plan-462 B2, Tabelle 2): the rows it writes
+      // are the durable ids a gateway resolves references by.
+      const committed = await this._commitManifest('mint asset identities', (current) => {
+        const base = current ?? result.project;
+        // Re-run against what is actually on disk: another writer may have
+        // added rows since, and re-deriving is what keeps the CAS retry loop
+        // from writing a manifest built on a stale read.
+        return mintReferencedAssets(base, due).project;
+      }, { notify: true });
+      // No directory means no revision to compare, so this path announces the
+      // mint the way it always did — the rows are real either way.
+      if (!committed) this._notifyConnectAsync();
       return result.minted;
     } catch (e) {
       console.warn('[project-store] could not imprint referenced asset ids:', e);

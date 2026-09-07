@@ -25,6 +25,7 @@ import type { LampManager } from './rv-lamp-manager';
 import type { SceneButtonManager } from './rv-scene-button-manager';
 import type { EnergyChainManager } from './rv-energy-chain-manager';
 import type { ChainManager } from './rv-chain-manager';
+import type { RibbonManager } from './rv-ribbon-manager';
 import type { MachiningManager } from './rv-machining-manager';
 import type { CollisionRoleRegistrar } from './rv-collision-role';
 import type { KinematicManagerLike } from './rv-kinematic-registry';
@@ -80,6 +81,16 @@ export interface FieldDescriptor {
    *            as a "consumed" field (no overlay path).
    */
   scope?: 'live' | 'des' | 'none';
+  /**
+   * The field is kept in the schema so an older document still validates, but it
+   * drives nothing. The inspector HIDES such a row while the field is empty and
+   * shows it read-only with a "(deprecated)" tag once a document actually
+   * carries a value — so the user sees why the value has no effect instead of
+   * being offered an editor for a dead field. Orthogonal to `readonly`/`scope`:
+   * it changes only what the inspector renders, never the write guards, because
+   * a migration tool must still be able to clear the value.
+   */
+  deprecated?: boolean;
 }
 
 /**
@@ -116,6 +127,8 @@ interface OdtProperty {
   readonly?: boolean;
   /** Custom keyword: field scope ('live' | 'des' | 'none'). */
   scope?: string;
+  /** Custom keyword: field is kept for compatibility but drives nothing. */
+  deprecated?: boolean;
 }
 
 interface OdtComponentDef {
@@ -186,6 +199,7 @@ export function loadSchemaFromSpec(name: string): ComponentSchema {
       }
     }
     if (p.readonly === true) desc.readonly = true;
+    if (p.deprecated === true) desc.deprecated = true;
     if (p.scope === 'live' || p.scope === 'des' || p.scope === 'none') desc.scope = p.scope;
 
     out[field] = desc;
@@ -248,6 +262,14 @@ export interface ComponentContext {
    * drive resets. Absent → the chain is built and placed but never ticks.
    */
   chainManager?: ChainManager;
+  /**
+   * Optional viewer-owned registry for `RibbonPath` components (plan-459). An
+   * `RVRibbonPath` registers itself here so `CoreSubsystems.visuals()` can advance
+   * the web AFTER the drive stage — which is also what lets the winder-master
+   * mode read a rotational drive without an `IDriveBehavior`. Absent → the web
+   * is built and shaped correctly but never runs.
+   */
+  ribbonManager?: RibbonManager;
   /**
    * Optional viewer-owned CSG machining registry (plan-405). `MachiningVolume`
    * components register themselves here in `onSceneReady()` (after Kinematic

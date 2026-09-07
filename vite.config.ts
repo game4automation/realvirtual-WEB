@@ -865,6 +865,15 @@ export default defineConfig(({ command }) => ({
     // FBXLoader is lazy-imported by the FBX import provider (@rv-private) —
     // same reason again; without it every fbx-to-three test times out on the
     // reload rather than failing with an assertion.
+    // occt-import-js is lazy-imported by the STEP import WORKER (@rv-private,
+    // step-import-worker.ts). A worker's dynamic import is not part of the
+    // startup scan, so on a cold dep cache the FIRST browser-route STEP import
+    // discovered it mid-session — Vite answered with "new dependencies
+    // optimized: occt-import-js" / "optimized dependencies changed. reloading"
+    // and full-reloaded the page while the import was still running. What the
+    // user sees: press Import, the page reloads, nothing was imported.
+    // The CONNECT route never loads this module, which is why converting via
+    // CONNECT always worked and only the in-browser route failed.
     // echarts sub-entries (core/charts/components/renderers, all via
     // echarts-setup.ts) MUST be pre-bundled together: without pinning, a
     // mid-session dep re-optimization can split echarts into two optimized
@@ -878,6 +887,7 @@ export default defineConfig(({ command }) => ({
       'three/examples/jsm/loaders/USDZLoader.js',
       'three/examples/jsm/loaders/FBXLoader.js',
       'three/examples/jsm/libs/fflate.module.js',
+      'occt-import-js',
       'echarts/core',
       'echarts/charts',
       'echarts/components',

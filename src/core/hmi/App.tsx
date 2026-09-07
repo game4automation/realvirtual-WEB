@@ -65,6 +65,7 @@ import { tooltipStore } from './tooltip/tooltip-store';
 // Import custom field renderers to trigger self-registration
 import './rv-metadata-field-renderer';
 import './rv-ik-path-field-renderer';
+import './rv-ribbon-path-rollers-field-renderer';
 import './rv-custom-runtime-instruction-field-renderer';
 import './rv-node-knowledge-field-renderer';
 

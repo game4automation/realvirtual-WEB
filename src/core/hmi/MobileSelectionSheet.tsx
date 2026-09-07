@@ -24,7 +24,9 @@ import { computeAncestors } from './hierarchy-utils';
 import { PropertyInspector } from './rv-property-inspector';
 import { RV_SCROLL_CLASS } from './shared-sx';
 import { WINDOW_DARK_BG } from './LeftPanel';
-import { LEFT_PANEL_MOBILE_ZINDEX } from './layout-constants';
+import {
+  LEFT_PANEL_MOBILE_ZINDEX, MOBILE_SHEET_HEIGHT, MOBILE_SHEET_MAX_HEIGHT,
+} from './layout-constants';
 
 /** Display label for a path = its last segment. */
 function leafName(path: string): string {
@@ -86,7 +88,9 @@ export function MobileSelectionSheet() {
       data-ui-panel
       sx={{
         position: 'fixed', left: 0, right: 0, bottom: 0,
-        height: '55dvh', maxHeight: '72dvh',
+        // Shared with the projects dashboard's detail sheet: two bottom sheets
+        // that differ in height read as two different mechanisms.
+        height: MOBILE_SHEET_HEIGHT, maxHeight: MOBILE_SHEET_MAX_HEIGHT,
         zIndex: LEFT_PANEL_MOBILE_ZINDEX,
         backgroundColor: `${WINDOW_DARK_BG} !important`,
         borderRadius: '8px 8px 0 0',

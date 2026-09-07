@@ -97,6 +97,8 @@ import {
   importTagTable,
   importMultiTabTagTable,
   importS7TagTable,
+  importSewSymbolTable,
+  updateMqttTopic,
   fetchInterfaces,
   fetchLogs,
   fetchStatus,
@@ -153,6 +155,9 @@ import {
   type DensoControllerType,
   type AbbRobotStudioSettings,
   type ConnectSignalIssue,
+  type ConnectMqttTopic,
+  type MqttTopicMode,
+  type MqttEncoding,
 } from './connect-store';
 import {
   parseTagTable,
@@ -161,6 +166,17 @@ import {
   type ParsedTagTable,
   type ParsedMultiTabTable,
 } from '../import/s7-tag-table';
+import {
+  detectFormat,
+  parseSewSymbolTable,
+  SEW_DEFAULT_RECEIVE_TOPIC,
+  SEW_DEFAULT_PUBLISH_TOPIC,
+  SEW_DEFAULT_RECEIVE_ENCODING,
+  SEW_DEFAULT_PUBLISH_ENCODING,
+  SEW_DEFAULT_PUBLISH_INTERVAL_MS,
+  type SewEncoding,
+  type SewImportResult,
+} from '../import/sew-symbol-table';
 import { ISA_GREEN, ISA_RED, ISA_AMBER, connectionStateColor } from './isa-colors';
 import { SignalBadge } from './rv-signal-badge';
 import { SignalEditDialog } from './SignalEditDialog';
@@ -2402,7 +2418,9 @@ const GROUP_ROW_HEIGHT = 24;
 const LONG_PRESS_MS = 500;
 
 type SignalListRow =
-  | { kind: 'group'; topic: string; total: number }
+  /** `mode` is the topic's payload mode — it drives the topic editor and, for
+   *  'Json', the address-less rendering of the signals below (plan-457). */
+  | { kind: 'group'; topic: string; total: number; mode?: MqttTopicMode }
   /** A level of the derived MQTT topic tree (plan-352 F1). `path` is its collapse identity,
    *  `count` the number of signals in its subtree. */
   | { kind: 'treeNode'; path: string; label: string; depth: number; count: number }
@@ -2410,7 +2428,9 @@ type SignalListRow =
    *  and, for MQTT, the leaves of the derived topic tree; MQTT ProcessImage topic signals carry
    *  import-owned byte offsets and stay import-only.
    *  `depth` is set for tree leaves and drives their indentation (undefined = flat rendering). */
-  | { kind: 'signal'; sig: ConnectInterfaceSignal; flat?: boolean; topic?: string; depth?: number };
+  | { kind: 'signal'; sig: ConnectInterfaceSignal; flat?: boolean; topic?: string; depth?: number;
+      /** Signal of a Json topic — rendered without an address column (plan-457). */
+      jsonMode?: boolean };
 
 /**
  * Derive the transient set of topics opened by the active signal filter.
@@ -2466,6 +2486,9 @@ interface SignalRowItemProps {
    * `false` → exactly the pre-indicator rendering (no opacity / status icon).
    */
   indicatorOn: boolean;
+  /** Json-mode topic signal (plan-457): the JSON key IS the name, so there is no
+   *  address to show — the second line falls back to the data type / comment. */
+  hideAddress?: boolean;
   /** Linked-target label (e.g. "Turntable · Destination"), or undefined if unlinked. */
   linkedLabel?: string;
   /** Node path of the linked target, to navigate to on click. */
@@ -2506,7 +2529,8 @@ interface SignalRowItemProps {
  * Active/local rows render neutrally at full opacity.
  */
 const SignalRowItem = memo(function SignalRowItem({
-  sig, direction, plcType, inModel, hasTopics, depth, viewer, indicatorOn, linkedLabel, linkedPath,
+  sig, direction, plcType, inModel, hasTopics, depth, viewer, indicatorOn, hideAddress,
+  linkedLabel, linkedPath,
   onEdit, onDelete, onBridge, onRecordChange, topic, interfaceId, recordPending, limitExceeded,
   selected, onSelect, onContextMenu,
 }: SignalRowItemProps) {
@@ -2573,6 +2597,14 @@ const SignalRowItem = memo(function SignalRowItem({
   }, [viewer, sig, sig.name, sig.protocolAddress, sig.comment, direction, plcType, interfaceId, topic,
       onContextMenu, cancelLongPress]);
 
+  // Second row line: address · dataType · comment. Json topic signals (plan-457)
+  // drop the address part — the JSON key is the name on the line above.
+  const subLine = [
+    hideAddress ? '' : sig.protocolAddress,
+    sig.dataType ?? '',
+    sig.comment ?? '',
+  ].filter(part => part.length > 0).join(' · ');
+
   return (
     <Box
       onPointerDown={onRowPointerDown}
@@ -2624,12 +2656,14 @@ const SignalRowItem = memo(function SignalRowItem({
           {sig.name}
         </Typography>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0 }}>
+          {/* plan-457: a Json topic signal has no address (its name IS the JSON
+              key), so the address column is dropped rather than rendered empty. */}
           <Typography
             noWrap
-            title={`${sig.protocolAddress}${sig.dataType ? ` · ${sig.dataType}` : ''}${sig.comment ? ` · ${sig.comment}` : ''}`}
+            title={subLine}
             sx={{ fontSize: 10, color: 'rgba(255,255,255,0.6)', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', flex: 1, minWidth: 0 }}
           >
-            {`${sig.protocolAddress}${sig.dataType ? ` · ${sig.dataType}` : ''}${sig.comment ? ` · ${sig.comment}` : ''}`}
+            {subLine}
           </Typography>
           {StatusIcon && (
             <Tooltip title={hint} placement="left" disableInteractive>
@@ -2889,6 +2923,8 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
   const [filterAutoOpen, setFilterAutoOpen] = useState<Set<string>>(new Set());
   const [recordPending, setRecordPending] = useState<Set<string>>(new Set());
   const [recordError, setRecordError] = useState<string | null>(null);
+  /** Topic whose transport settings are being edited (plan-457), or null. */
+  const [topicEditor, setTopicEditor] = useState<string | null>(null);
 
   // Persist filter + collapsed groups per interface so they survive a browser reload.
   useEffect(() => { saveSignalFilter(iface.id, filterState); }, [iface.id, filterState]);
@@ -3160,9 +3196,10 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
     for (const t of iface.topics ?? []) {
       const sigs = filteredTopicSignals.get(t.topic) ?? [];
       if (filterActive && sigs.length === 0) continue;   // hide empty groups while filtering
-      out.push({ kind: 'group', topic: t.topic, total: t.signals?.length ?? 0 });
+      out.push({ kind: 'group', topic: t.topic, total: t.signals?.length ?? 0, mode: t.mode });
       const open = isGroupOpen(topicKey(t.topic));
-      if (open) for (const s of sigs) out.push({ kind: 'signal', sig: s, topic: t.topic });
+      const jsonMode = t.mode === 'Json';
+      if (open) for (const s of sigs) out.push({ kind: 'signal', sig: s, topic: t.topic, jsonMode });
     }
     // Pass 2 — flat (interface-level) signals: the manually editable ones. For MQTT they are
     // emitted as the derived topic tree; every other protocol keeps the plain flat list.
@@ -3507,6 +3544,23 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
                     <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.7)', fontFamily: 'monospace', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {row.topic}
                     </Typography>
+                    {row.mode && (
+                      <Typography sx={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', fontFamily: 'monospace' }}>
+                        {row.mode}
+                      </Typography>
+                    )}
+                    {/* plan-457: transport settings of the topic (mode / encoding /
+                        publish interval) — signals stay untouched by this editor. */}
+                    <Tooltip title="Topic settings (mode, encoding, publish interval)" disableInteractive>
+                      <IconButton
+                        size="small"
+                        aria-label={`Topic settings for '${row.topic}'`}
+                        onClick={(e) => { e.stopPropagation(); setTopicEditor(row.topic); }}
+                        sx={{ p: 0.25 }}
+                      >
+                        <Settings sx={{ fontSize: 12, color: 'rgba(255,255,255,0.6)' }} />
+                      </IconButton>
+                    </Tooltip>
                     <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.55)', fontFamily: 'monospace' }}>{row.total}</Typography>
                   </Box>
                 );
@@ -3562,6 +3616,7 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
                     depth={row.depth}
                     viewer={viewer}
                     indicatorOn={indicatorOn}
+                    hideAddress={row.jsonMode}
                     linkedLabel={linkedLabel}
                     linkedPath={firstLink?.path}
                     onEdit={manualEdit && row.flat ? handleEditSignal : undefined}
@@ -3582,6 +3637,16 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
           </Box>
         )}
       </Box>
+
+      {/* Topic transport settings: mode / encoding / publish interval (plan-457). */}
+      {topicEditor !== null && (
+        <MqttTopicEditDialog
+          open
+          interfaceId={iface.id}
+          topic={(iface.topics ?? []).find(t => t.topic === topicEditor) ?? null}
+          onClose={() => setTopicEditor(null)}
+        />
+      )}
 
       {/* Manual add/edit-signal dialog (generic — rendered from the gateway's per-type schema). */}
       {signalDialog && (
@@ -3991,9 +4056,131 @@ function ConnectLogDialog({ open, onClose }: { open: boolean; onClose: () => voi
   );
 }
 
+// ── MQTT Topic Settings Dialog (plan-457) ─────────────────────────────────
+
+const MQTT_TOPIC_MODES: MqttTopicMode[] = ['Single', 'ProcessImage', 'Json'];
+const MQTT_ENCODINGS: MqttEncoding[] = ['Auto', 'Utf8', 'WString'];
+
+/**
+ * Transport settings of ONE MQTT topic: payload mode, and — for the Json mode
+ * only — the payload encoding and the cyclic publish interval.
+ *
+ * Encoding and interval are Json-only on the gateway too, so showing them for a
+ * Single or ProcessImage topic would offer a setting that does nothing. The
+ * signals of the topic are never touched here.
+ */
+export function MqttTopicEditDialog({
+  open,
+  interfaceId,
+  topic,
+  onClose,
+}: {
+  open: boolean;
+  interfaceId: string;
+  topic: ConnectMqttTopic | null;
+  onClose: () => void;
+}) {
+  const [mode, setMode] = useState<MqttTopicMode>(topic?.mode ?? 'Single');
+  const [encoding, setEncoding] = useState<MqttEncoding>(topic?.encoding ?? 'Auto');
+  const [interval, setInterval] = useState<string>(String(topic?.publishIntervalMs ?? 100));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const topicName = topic?.topic ?? '';
+  useEffect(() => {
+    if (!open || !topic) return;
+    setMode(topic.mode ?? 'Single');
+    setEncoding(topic.encoding ?? 'Auto');
+    setInterval(String(topic.publishIntervalMs ?? 100));
+    setError(null);
+  }, [open, topicName]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const isJson = mode === 'Json';
+
+  const handleSave = useCallback(async () => {
+    if (!topic) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const parsedInterval = Number.parseInt(interval, 10);
+      await updateMqttTopic(interfaceId, topic.topic, {
+        mode,
+        // Json-only fields are sent ONLY in Json mode, so switching a topic back
+        // to Single does not leave a meaningless encoding in the config.
+        ...(isJson
+          ? {
+            encoding,
+            publishIntervalMs: Number.isFinite(parsedInterval) ? parsedInterval : 100,
+          }
+          : {}),
+      });
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Saving the topic settings failed.');
+    }
+    setSaving(false);
+  }, [topic, interfaceId, mode, encoding, interval, isJson, onClose]);
+
+  if (!topic) return null;
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="xs" fullWidth>
+      <DialogTitle sx={{ fontSize: 14 }}>Topic settings — {topic.topic}</DialogTitle>
+      <DialogContent>
+        <FormControl fullWidth size="small" sx={{ mt: 1, mb: 1.5 }}>
+          <InputLabel id="topic-mode-label">Mode</InputLabel>
+          <Select
+            labelId="topic-mode-label"
+            value={mode}
+            label="Mode"
+            onChange={(e) => setMode(e.target.value as MqttTopicMode)}
+          >
+            {MQTT_TOPIC_MODES.map(m => <MenuItem key={m} value={m}>{m}</MenuItem>)}
+          </Select>
+        </FormControl>
+
+        {isJson && (
+          <>
+            <FormControl fullWidth size="small" sx={{ mb: 1.5 }}>
+              <InputLabel id="topic-encoding-label">Encoding</InputLabel>
+              <Select
+                labelId="topic-encoding-label"
+                value={encoding}
+                label="Encoding"
+                onChange={(e) => setEncoding(e.target.value as MqttEncoding)}
+              >
+                {MQTT_ENCODINGS.map(enc => <MenuItem key={enc} value={enc}>{enc}</MenuItem>)}
+              </Select>
+            </FormControl>
+            <TextField
+              fullWidth
+              size="small"
+              type="number"
+              label="Publish interval (ms)"
+              value={interval}
+              onChange={(e) => setInterval(e.target.value)}
+              helperText="Cyclic publish of all PLC-input signals of this topic."
+            />
+          </>
+        )}
+
+        {error && (
+          <Typography sx={{ fontSize: 11, color: ISA_RED, mt: 1 }}>{error}</Typography>
+        )}
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose} sx={{ textTransform: 'none' }}>Cancel</Button>
+        <Button variant="contained" onClick={handleSave} disabled={saving} sx={{ textTransform: 'none' }}>
+          {saving ? 'Saving…' : 'Save'}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
 // ── Import S7 Tag Table Dialog ────────────────────────────────────────────
 
-function ImportTagTableDialog({
+export function ImportTagTableDialog({
   open,
   interfaces,
   initialTargetId,
@@ -4028,6 +4215,17 @@ function ImportTagTableDialog({
   const [parseError, setParseError] = useState<string | null>(null);
   const [pushing, setPushing] = useState(false);
   const [pushError, setPushError] = useState<string | null>(null);
+
+  // SEW symbol-table import state (plan-457) — two Json topics, receive + publish.
+  const [sew, setSew] = useState<SewImportResult | null>(null);
+  const [sewReceiveTopic, setSewReceiveTopic] = useState(SEW_DEFAULT_RECEIVE_TOPIC);
+  const [sewPublishTopic, setSewPublishTopic] = useState(SEW_DEFAULT_PUBLISH_TOPIC);
+  const [sewReceiveEncoding, setSewReceiveEncoding] = useState<SewEncoding>(SEW_DEFAULT_RECEIVE_ENCODING);
+  const [sewPublishEncoding, setSewPublishEncoding] = useState<SewEncoding>(SEW_DEFAULT_PUBLISH_ENCODING);
+  const [sewInterval, setSewInterval] = useState(String(SEW_DEFAULT_PUBLISH_INTERVAL_MS));
+  const isSew = sew !== null;
+  const sewOutCount = sew ? sew.rows.filter(r => r.direction === 'PLC_OUT').length : 0;
+  const sewInCount = sew ? sew.rows.filter(r => r.direction === 'PLC_IN').length : 0;
 
   // Multi-Tab (xlsx) import state — one MQTT topic per matching tab.
   const [multiTab, setMultiTab] = useState<ParsedMultiTabTable | null>(null);
@@ -4091,6 +4289,12 @@ function ImportTagTableDialog({
     setTarget(tgt);
     setParsed(null);
     setMultiTab(null);
+    setSew(null);
+    setSewReceiveTopic(SEW_DEFAULT_RECEIVE_TOPIC);
+    setSewPublishTopic(SEW_DEFAULT_PUBLISH_TOPIC);
+    setSewReceiveEncoding(SEW_DEFAULT_RECEIVE_ENCODING);
+    setSewPublishEncoding(SEW_DEFAULT_PUBLISH_ENCODING);
+    setSewInterval(String(SEW_DEFAULT_PUBLISH_INTERVAL_MS));
     setXlsxSheets(null);
     setFileName('');
     setParseError(null);
@@ -4130,13 +4334,23 @@ function ImportTagTableDialog({
     // Multi-Tab (one MQTT topic per tab) applies only to xlsx pushed to an MQTT
     // target. An S7 target always takes the flat single-sheet path (csv / sdf / xlsx).
     const isXlsx = /\.xlsx?$/i.test(file.name);
+    // plan-457: a plain csv pushed at an MQTT target may be a SEW symbol table
+    // (Name;Type;Direction, no address column). `.sdf` is always a TIA export.
+    const mayBeSew = !targetIsS7 && !isXlsx && !/\.sdf$/i.test(file.name);
     try {
-      if (isXlsx && !targetIsS7) {
+      if (mayBeSew && detectFormat(await file.text()) === 'sew') {
+        setXlsxSheets(null);
+        setSew(parseSewSymbolTable(await file.text()));
+        setParsed(null);
+        setMultiTab(null);
+        setParseError(null);
+      } else if (isXlsx && !targetIsS7) {
         // Multi-Tab: read the workbook once, then filter synchronously.
         const sheets = await readWorkbookSheets(file);
         setXlsxSheets(sheets);
         setMultiTab(buildTopicsFromRows(sheets, { sheetPattern, forceAllAsOutput, topicPrefix }));
         setParsed(null);
+        setSew(null);
         setParseError(null);
       } else {
         // Single-Sheet (csv / sdf / S7-target xlsx): flat tag list.
@@ -4144,6 +4358,7 @@ function ImportTagTableDialog({
         const result = await parseTagTable(file);
         setParsed(result);
         setMultiTab(null);
+        setSew(null);
         setParseError(null);
       }
       // Privacy: only metadata is persisted — never file contents.
@@ -4157,6 +4372,7 @@ function ImportTagTableDialog({
     } catch (err) {
       setParsed(null);
       setMultiTab(null);
+      setSew(null);
       setParseError(err instanceof Error ? err.message : 'Import failed.');
     }
   }, [sheetPattern, forceAllAsOutput, topicPrefix, targetIsS7]);
@@ -4243,6 +4459,24 @@ function ImportTagTableDialog({
         if (!parsed || parsed.tags.length === 0) { setPushing(false); return; }
         await importS7TagTable(target, parsed.tags);
         await fetchInterfaces();
+      } else if (isSew) {
+        // SEW symbol table → two Json topics (receive + cyclic publish), plan-457.
+        if (!sew || sew.rows.length === 0) { setPushing(false); return; }
+        if (target !== '__new__') await fetchInterfaces();
+        const parsedInterval = Number.parseInt(sewInterval, 10);
+        await importSewSymbolTable({
+          rows: sew.rows,
+          brokerUrl,
+          targetInterfaceId: target === '__new__' ? null : target,
+          receiveTopic: sewReceiveTopic.trim(),
+          publishTopic: sewPublishTopic.trim(),
+          receiveEncoding: sewReceiveEncoding,
+          publishEncoding: sewPublishEncoding,
+          publishIntervalMs: Number.isFinite(parsedInterval)
+            ? parsedInterval
+            : SEW_DEFAULT_PUBLISH_INTERVAL_MS,
+        });
+        await fetchInterfaces();
       } else if (isMultiTab) {
         // Multi-Tab → one InterfaceConfig with the selected topics (F9/F10).
         if (!multiTab || chosenTopics.length === 0) { setPushing(false); return; }
@@ -4274,14 +4508,19 @@ function ImportTagTableDialog({
       setPushError(err instanceof Error ? err.message : 'Push to CONNECT failed.');
     }
     setPushing(false);
-  }, [targetIsS7, isMultiTab, multiTab, chosenTopics, parsed, brokerUrl, topic, target, onClose]);
+  }, [targetIsS7, isSew, sew, sewReceiveTopic, sewPublishTopic, sewReceiveEncoding, sewPublishEncoding,
+      sewInterval, isMultiTab, multiTab, chosenTopics, parsed, brokerUrl, topic, target, onClose]);
 
   const canPush = !pushing && (
     targetIsS7
       ? !!parsed && parsed.tags.length > 0
-      : isMultiTab
-        ? chosenTopics.length > 0
-        : !!parsed && parsed.tags.length > 0 && topic.trim().length > 0
+      : isSew
+        ? !!sew && sew.rows.length > 0
+          && (sewOutCount === 0 || sewReceiveTopic.trim().length > 0)
+          && (sewInCount === 0 || sewPublishTopic.trim().length > 0)
+        : isMultiTab
+          ? chosenTopics.length > 0
+          : !!parsed && parsed.tags.length > 0 && topic.trim().length > 0
   );
 
   return (
@@ -4334,8 +4573,81 @@ function ImportTagTableDialog({
             sx={{ mb: 1 }}
           />
         )}
+        {/* SEW symbol table (plan-457): two Json topics — the station publishes on
+            the receive topic, CONNECT publishes the PLC inputs on the other. */}
+        {isSew && (
+          <>
+            <Typography sx={{ fontSize: 11, color: 'text.secondary', mb: 1 }}>
+              Detected: SEW symbol table
+            </Typography>
+            <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+              <TextField
+                size="small"
+                label="Receive topic (PLC → WEB)"
+                value={sewReceiveTopic}
+                onChange={(e) => setSewReceiveTopic(e.target.value)}
+                sx={{ flex: 1 }}
+              />
+              <FormControl size="small" sx={{ minWidth: 120 }}>
+                <InputLabel id="sew-receive-encoding-label">Encoding</InputLabel>
+                <Select
+                  labelId="sew-receive-encoding-label"
+                  value={sewReceiveEncoding}
+                  label="Encoding"
+                  onChange={(e) => setSewReceiveEncoding(e.target.value as SewEncoding)}
+                >
+                  {MQTT_ENCODINGS.map(enc => <MenuItem key={enc} value={enc}>{enc}</MenuItem>)}
+                </Select>
+              </FormControl>
+            </Box>
+            <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+              <TextField
+                size="small"
+                label="Publish topic (WEB → PLC)"
+                value={sewPublishTopic}
+                onChange={(e) => setSewPublishTopic(e.target.value)}
+                sx={{ flex: 1 }}
+              />
+              <FormControl size="small" sx={{ minWidth: 120 }}>
+                <InputLabel id="sew-publish-encoding-label">Encoding</InputLabel>
+                <Select
+                  labelId="sew-publish-encoding-label"
+                  value={sewPublishEncoding}
+                  label="Encoding"
+                  onChange={(e) => setSewPublishEncoding(e.target.value as SewEncoding)}
+                >
+                  {MQTT_ENCODINGS.map(enc => <MenuItem key={enc} value={enc}>{enc}</MenuItem>)}
+                </Select>
+              </FormControl>
+            </Box>
+            <TextField
+              size="small"
+              type="number"
+              label="Publish interval (ms)"
+              value={sewInterval}
+              onChange={(e) => setSewInterval(e.target.value)}
+              sx={{ mb: 1.5, width: 180 }}
+            />
+            <Typography sx={{ fontSize: 11, color: 'text.secondary', mb: 1 }}>
+              {sewOutCount} PLC_OUT signals · {sewInCount} PLC_IN signals ·{' '}
+              <Box component="span" sx={{ color: sew!.errors.length > 0 ? ISA_RED : 'text.secondary' }}>
+                {sew!.errors.length} errors
+              </Box>
+            </Typography>
+            {sew!.errors.length > 0 && (
+              <Box className={RV_SCROLL_CLASS} sx={{ maxHeight: 80, overflow: 'auto', mb: 1 }}>
+                {sew!.errors.map((e, idx) => (
+                  <Typography key={idx} sx={{ fontSize: 9, color: ISA_RED, fontFamily: 'monospace' }}>
+                    Row {e.line}: {e.reason}
+                  </Typography>
+                ))}
+              </Box>
+            )}
+          </>
+        )}
+
         {/* Single-Sheet (csv): a single explicit topic with broker discovery — MQTT only. */}
-        {!targetIsS7 && !isMultiTab && (
+        {!targetIsS7 && !isMultiTab && !isSew && (
           <>
             <TextField
               fullWidth

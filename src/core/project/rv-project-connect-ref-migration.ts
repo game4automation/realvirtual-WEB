@@ -36,6 +36,9 @@
 
 import type { RvDocumentEntry, RvProject } from './rv-project-types';
 import { isContainedRef, normalizeRefPath } from './rv-project-refs';
+import {
+  applyRefMigration, planRefMigration, rollbackRefMigration,
+} from './rv-project-ref-migration-core';
 
 /** Project-relative path of the handoff CONNECT writes. */
 export const CONNECT_MIGRATION_HANDOFF = 'connect/migration-bindings.json';
@@ -154,38 +157,29 @@ export function migrateConnectRefs(
     return { outcome: 'skipped', project, ...empty, reason: 'the manifest carries no document rows yet' };
   }
 
-  const byKey = new Map<string, RvDocumentEntry>();
-  for (const doc of documents) {
-    const path = typeof doc.path === 'string' ? doc.path : '';
-    if (!path) continue;
-    const key = modelKey(path);
-    // First row wins: two GLBs with the same leaf name in different folders are ambiguous under
-    // the LEGACY comparison, and the legacy comparison is the only thing that could ever have
-    // bound them. Picking the first reproduces what CONNECT did; guessing would not.
-    if (!byKey.has(key)) byKey.set(key, doc);
-  }
+  // `bind`, not `report`: CONNECT's comparison IS case-insensitive, so the
+  // lowercase key is the match and there is no near-miss to report. The
+  // opposite choice from the scriptRef migration, and deliberately so — each
+  // reproduces the runtime whose bindings it is adopting.
+  const plan = planRefMigration(
+    documents,
+    bindings.map(b => ({ key: b.model, ref: b.connectRef, binding: b })),
+    {
+      field: 'connectRef',
+      documentKey: modelKey,
+      bindingKey: modelKey,
+      caseMismatch: 'bind',
+      // A reference that points outside the project cannot be adopted, and
+      // saying so is news: this one DOES record its unmatched bindings.
+      isBindable: entry => isContainedRef(entry.binding.connectRef),
+    });
 
-  const refByDocument = new Map<RvDocumentEntry, string>();
-  const assigned: ConnectRefMigrationResult['assigned'] = [];
-  const unmatched: string[] = [];
-
-  for (const binding of bindings) {
-    if (!isContainedRef(binding.connectRef)) {
-      unmatched.push(binding.model);
-      continue;
-    }
-    const doc = byKey.get(modelKey(binding.model));
-    if (!doc) {
-      unmatched.push(binding.model);
-      continue;
-    }
-    // An authored connectRef is never overwritten — a human already answered this question.
-    const current = doc.connectRef;
-    if (typeof current === 'string' && normalizeRefPath(current) !== '') continue;
-    if (refByDocument.has(doc)) continue;
-    refByDocument.set(doc, binding.connectRef);
-    assigned.push({ model: binding.model, connectRef: binding.connectRef, documentId: String(doc.id ?? '') });
-  }
+  const assigned: ConnectRefMigrationResult['assigned'] = plan.assigned.map(a => ({
+    model: a.binding.binding.model,
+    connectRef: a.binding.binding.connectRef,
+    documentId: a.documentId,
+  }));
+  const unmatched = plan.unmatched.map(b => b.binding.model);
 
   if (assigned.length === 0 && unmatched.length === 0) {
     return { outcome: 'skipped', project, ...empty, reason: 'every binding was already authored' };
@@ -197,14 +191,11 @@ export function migrateConnectRefs(
     assignedIds: assigned.map(a => a.documentId),
     unmatched,
   };
-  const migrated: RvProject = {
-    ...project,
-    documents: documents.map(doc => {
-      const ref = refByDocument.get(doc);
-      return ref ? { ...doc, connectRef: ref } : doc;
-    }),
-    [CONNECT_REF_MIGRATION_MARKER]: marker,
-  };
+  const migrated = applyRefMigration(project, plan, {
+    field: 'connectRef',
+    markerKey: CONNECT_REF_MIGRATION_MARKER,
+    marker: marker as unknown as Record<string, unknown>,
+  });
   return { outcome: 'migrated', project: migrated, assigned, unmatched };
 }
 
@@ -215,13 +206,9 @@ export function migrateConnectRefs(
 export function rollbackConnectRefMigration(project: RvProject): RvProject {
   const marker = readConnectRefMigrationMarker(project);
   if (!marker) return project;
-  const assignedIds = new Set(marker.assignedIds);
-  const out: Record<string, unknown> = { ...(project as Record<string, unknown>) };
-  delete out[CONNECT_REF_MIGRATION_MARKER];
-  out.documents = (project.documents ?? []).map(doc => {
-    if (!assignedIds.has(String(doc.id ?? ''))) return doc;
-    const { connectRef: _dropped, ...rest } = doc;
-    return rest as RvDocumentEntry;
+  return rollbackRefMigration(project, {
+    field: 'connectRef',
+    markerKey: CONNECT_REF_MIGRATION_MARKER,
+    assignedIds: marker.assignedIds,
   });
-  return out as RvProject;
 }

@@ -349,8 +349,13 @@ function rowsToTable(rows: Cell[][], columns: TagColumnMap = CSV_COLUMNS): Parse
 
 // ── CSV parsing ─────────────────────────────────────────────────────────────
 
-/** Autodetect the CSV delimiter by counting `,`, `;` and Tab on the first line. */
-function detectDelimiter(text: string): string {
+/**
+ * Autodetect the CSV delimiter by counting `,`, `;` and Tab on the first line.
+ *
+ * Exported (plan-457) so the SEW symbol-table parser shares exactly this
+ * detection instead of growing a second, subtly different copy.
+ */
+export function detectDelimiter(text: string): string {
   const firstLine = text.split(/\r?\n/, 1)[0] ?? '';
   const counts: Record<string, number> = {
     ';': (firstLine.match(/;/g) ?? []).length,
@@ -368,8 +373,13 @@ function detectDelimiter(text: string): string {
   return best;
 }
 
-/** Split a single CSV line on a delimiter, honoring double-quoted fields. */
-function splitCsvLine(line: string, delimiter: string): string[] {
+/**
+ * Split a single CSV line on a delimiter, honoring double-quoted fields.
+ *
+ * Exported (plan-457) for reuse by the SEW symbol-table parser — same quoting
+ * rules, one implementation.
+ */
+export function splitCsvLine(line: string, delimiter: string): string[] {
   const out: string[] = [];
   let cur = '';
   let inQuotes = false;

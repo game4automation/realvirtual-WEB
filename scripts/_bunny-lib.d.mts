@@ -216,6 +216,12 @@ export function readDeployManifest(rootDir: string): Record<string, unknown> | n
 
 export const PUBLIC_TEST_SCENE_PREFIX: string;
 
+/** Folder name of the demo project inside a deploy root (plan-737). */
+export const PUBLIC_DEMO_FOLDER: string;
+
+/** `<distDir>/demo-realvirtual` — the base every public-demo guard works from. */
+export function publicDemoDir(distDir: string): string;
+
 export interface PublicScenePruningResult {
   kept: string[];
   dropped: string[];

@@ -58,8 +58,14 @@ const backend = {
   id: 'fake',
   writable: true,
   isActive: true,
-  async writeBlob(relPath: string) { writes.push(relPath); },
+  // plan-736 moved the writer to the document API; `writes` still records the
+  // path, which is what every assertion below is about.
+  async writeDocument(ref: string | { path: string }) {
+    writes.push(typeof ref === 'string' ? ref : ref.path);
+    return { revision: 'rev' };
+  },
   // Nothing is stored, so every save is a first save of its path.
+  async readDocument() { return null; },
   async readDocumentUrl() { return null; },
   async listDocuments() { return []; },
 };
@@ -111,6 +117,13 @@ function context(name: string, base: AssetBase, opts?: { bound?: boolean }) {
     dirty: true,
     renameDocument(n: string) { this.name = n; },
     whenIdle: async () => {},
+    // plan-462 B3 — `saveDocument` takes a short-lived `save` lock on the
+    // document before its first side effect. The stub answers the three
+    // members that path uses; nothing here is testing the lock itself (see
+    // `rv-asset-document-lock.test.ts`), it just has to be a document.
+    lockOwner: null,
+    tryLock: () => ({ kind: 'save', token: Symbol('stub'), generation: 1 }),
+    unlock: () => {},
     markSaved: async (b: AssetBase, n?: string) => { saved.push({ base: b, name: n }); },
     get isBound() { return opts?.bound === true; },
     document: {
