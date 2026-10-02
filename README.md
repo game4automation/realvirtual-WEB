@@ -19,12 +19,12 @@ This repository is the **Community edition** under AGPL. It includes the viewer,
 
 ## What It Does
 
-realvirtual replaces traditional desktop HMI and SCADA visualization with a modern, browser-based 3D experience. Connect to real PLCs via WebSocket or MQTT, and operators see live machine states — drive positions, sensor readings, alarms, KPIs — all in the context of the machine's 3D layout. Unlike flat panel HMIs, operators see *what* is happening, *where* it is happening, and *why*.
+realvirtual replaces traditional desktop HMI and SCADA visualization with a modern, browser-based 3D experience. Connect real PLCs and robot controllers through [realvirtual CONNECT](#industrial-connectivity), and operators see live machine states — drive positions, sensor readings, alarms, KPIs — all in the context of the machine's 3D layout. Unlike flat panel HMIs, operators see *what* is happening, *where* it is happening, and *why*.
 
 ### Key Capabilities
 
 - **Workspace Modes** — Viewer for presentation, HMI for operation, Planner for layouts, and Commissioning for commissioning workflows. DES and Editor require the corresponding commercial modules. Select a workspace from the toolbar or use `?mode=viewer`, `hmi`, `planner`, `commissioning`, `des` or `editor`; selecting a mode does not install its required features.
-- **Live 3D HMI** — Real-time PLC signal visualization via WebSocket or MQTT. Drive monitoring, sensor states, KPI overlays, alarm dashboards, and production charts powered by [Apache ECharts](https://echarts.apache.org/).
+- **Live 3D HMI** — Real-time PLC signal visualization. Machines connect through realvirtual CONNECT — Siemens S7, TwinCAT ADS, OPC UA, EtherNet/IP, Modbus, MQTT, ctrlX, robot controllers and more. Drive monitoring, sensor states, KPI overlays, alarm dashboards, and production charts powered by [Apache ECharts](https://echarts.apache.org/).
 - **Signal Linking by Drag & Drop** — Drag a live interface signal straight onto a component slot (Forward, TargetSpeed, SensorOccupied, …). Direction and value type are checked, connections are saved with the layout, and signals can be monitored and forced.
 - **Collision Detection** — Give a node one of six collision roles (Tool, Workpiece, Machine, Robot, Environment, None); while the simulation runs, every pair of bodies with *different* roles is checked against each other.
 - **Machine Information System** — Attach documents, maintenance guides, technical drawings, and manuals directly to 3D components. Technicians click a part and see its documentation in context — accessible from any device on the shop floor.
@@ -61,14 +61,14 @@ This repository is the **community edition** of realvirtual. It contains the com
 Two related commercial products complete the platform and are separate from this repository:
 
 - **[realvirtual for Unity — Professional](https://realvirtual.io)** — the Unity runtime for Unity developers and native builds (.exe, Linux, XR); it exports `rv_extras`-enriched GLBs and bridges 15+ native industrial protocols (Siemens S7, Beckhoff ADS, OPC UA, and more).
-- **[realvirtual CONNECT](https://realvirtual.io/doc/web/connect/)** — the gateway that makes Live mode work (industrial protocols → WebSocket) and hosts the built-in MCP server.
+- **[realvirtual CONNECT](https://realvirtual.io/doc/web/connect/overview/)** — the gateway that makes Live mode work (industrial protocols → WebSocket) and hosts the built-in MCP server.
 
 A commercial license additionally allows proprietary/closed-source use, keeping your models and configuration private, and removal or replacement of the realvirtual branding — see [License](#license).
 
 ## Use Cases
 
 ### 3D HMI / Operator Dashboards
-Web-based HMI connected to real PLCs via WebSocket or MQTT. Live signal visualization, KPI overlays, drive monitoring — replacing desktop HMI applications with a browser link.
+Web-based HMI connected to real PLCs through realvirtual CONNECT. Live signal visualization, KPI overlays, drive monitoring — replacing desktop HMI applications with a browser link.
 
 ![HMI Overview — KPI cards, message panel, button panel, search bar, camera presets](docs/images/screenshot-hmi-overview.png)
 
@@ -148,7 +148,7 @@ yourself, serve the `dist/` folder produced by `npm run build` from any static w
 **realvirtual CONNECT** is the gateway that makes Live mode work: it speaks the industrial
 protocols a browser cannot, and hands the signals to the browser over one WebSocket. It is a
 separate product and is documented at
-[realvirtual.io/doc/web/connect](https://realvirtual.io/doc/web/connect/) — this repository holds
+[realvirtual.io/doc/web/connect](https://realvirtual.io/doc/web/connect/overview/) — this repository holds
 only the browser side of the contract (see [doc-webviewer-interface.md](doc-webviewer-interface.md)).
 
 ## Deployment Options
@@ -173,16 +173,27 @@ Publishing to realvirtual's hosted demo uses maintainer credentials and infrastr
 
 ## Industrial Connectivity
 
-Connect to real automation systems via:
+**Machines connect through [realvirtual CONNECT](https://realvirtual.io/en/products/connect).** CONNECT is a native gateway that runs next to the machine (IPC or edge PC). It speaks the controllers' own protocols and streams every signal into the browser over one WebSocket (the openly documented WebSocket Realtime v2 protocol). Interfaces are configured and monitored in the browser, signal by signal. The free CONNECT tier covers all interfaces with up to 20 signals.
 
-| Protocol | Description |
-|----------|-------------|
-| **WebSocket Realtime** | Bidirectional PLC signal streaming (primary live mode) |
-| **MQTT** | IoT and cloud connectivity |
-| **Bosch Rexroth ctrlX** | Direct ctrlX CORE integration |
+| Category | Interfaces in realvirtual CONNECT |
+|----------|-----------------------------------|
+| **PLCs** | Siemens S7 (S7-300/400/1200/1500) · Siemens PLCSIM Advanced (native API) · Beckhoff TwinCAT ADS · OPC UA · EtherNet/IP (Allen-Bradley, Omron) · Modbus TCP client and server · Bosch Rexroth ctrlX (native Data Layer or bridge) · Keba Kemro X · Festo AX / Phoenix Contact PLCnext |
+| **IoT** | MQTT — topics, Siemens process image, flat JSON (SEW MOVI-C) |
+| **Robots** | FANUC (RoboGuide / Robot-IF) · Denso (b-CAP / WinCaps VRC) · ABB RobotStudio |
+| **Simulation** | Siemens SIMIT (shared memory) |
+
+Full list with addressing and settings: [CONNECT interfaces](https://realvirtual.io/doc/web/connect/interfaces/protocols/).
+
+**Without a gateway**, the browser can also connect directly to equipment that speaks a browser-capable protocol:
+
+| Interface | Description |
+|-----------|-------------|
+| **WebSocket Realtime v2** | Your own bridge or server speaking the open realvirtual protocol |
+| **MQTT over WebSocket** | Brokers that offer a WebSocket listener |
+| **Bosch Rexroth ctrlX** | ctrlX CORE through the realvirtual bridge snap |
 | **REST API** | Polling-based signal access |
 
-[realvirtual for Unity](https://realvirtual.io) Professional supports 15+ industrial protocols including Siemens S7, Beckhoff ADS, OPC UA, Fanuc, KUKA, ABB, EtherNet/IP, Modbus, and more — all bridged to the browser via WebSocket.
+[realvirtual for Unity](https://realvirtual.io) Professional has its own 25+ interfaces that run inside Unity — no separate gateway is needed there.
 
 ## Architecture
 
@@ -292,7 +303,7 @@ Developers start with **[Architecture](doc-webviewer.md)**. The full in-repo doc
 
 realvirtual and realvirtual for Unity are fully AI-enabled through the **Model Context Protocol (MCP)**. AI coding assistants like [Claude Code](https://claude.ai/code) can drive the running scene directly.
 
-**[realvirtual CONNECT](https://realvirtual.io/doc/web/connect/) is a separate installation** and the default MCP host. Once installed and configured, it exposes `http://localhost:5100/mcp`; the browser bridge connects to CONNECT to make the `web_*` tools available. A local Node bridge is also supported for development. Follow [AI Integration](doc-ai-integration.md) for setup, registration requirements and troubleshooting.
+**[realvirtual CONNECT](https://realvirtual.io/doc/web/connect/overview/) is a separate installation** and the default MCP host. Once installed and configured, it exposes `http://localhost:5100/mcp`; the browser bridge connects to CONNECT to make the `web_*` tools available. A local Node bridge is also supported for development. Follow [AI Integration](doc-ai-integration.md) for setup, registration requirements and troubleshooting.
 
 - **realvirtual (browser)** — list drives and positions, read/write PLC signals, query the scene
   hierarchy, inspect sensor states, debug transport simulation, take screenshots of the running
