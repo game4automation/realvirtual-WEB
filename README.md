@@ -1,44 +1,44 @@
-# realvirtual WEB
+# realvirtual
 
-**Browser-Based 3D HMI, Machine Information System, and Digital Twin Viewer for Industrial Automation**
+**The browser platform for industrial digital twins — 3D HMI, Machine Information System, simulation and layout planning**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-blue.svg)](https://www.typescriptlang.org/)
 [![Three.js](https://img.shields.io/badge/Three.js-WebGL%20%7C%20WebGPU-green.svg)](https://threejs.org/)
-[![AI-Driven Development](https://img.shields.io/badge/AI--Driven_Development-MCP_Enabled-blueviolet.svg)](https://github.com/game4automation/realvirtual-MCP)
+[![AI-Driven Development](https://img.shields.io/badge/AI--Driven_Development-MCP_Enabled-blueviolet.svg)](doc-ai-integration.md)
 
-![realvirtual WEB — Browser-based 3D HMI and Digital Twin Viewer](docs/images/realvirtual-web-demo.jpg)
+![realvirtual — browser-based 3D HMI and digital twin platform](docs/images/realvirtual-web-demo.jpg)
 
-realvirtual WEB is an open-source, browser-based 3D HMI and digital twin viewer for manufacturing. Load any standard GLB/glTF file and view it as an interactive 3D model in the browser. For full digital twin functionality — drives, sensors, transport simulation, signal wiring, and KPI dashboards — use GLB files enriched with `rv_extras` metadata, either exported from [realvirtual.io](https://realvirtual.io) Professional or authored manually. No installation required.
+realvirtual (formerly *realvirtual WEB*) is an open-source, browser-based 3D HMI and digital twin platform for manufacturing. Open GLB/glTF models in the browser, simulate drives and material flow, connect machine signals, and build operator dashboards. Simulation components use `rv_extras` metadata, which you can export from [realvirtual for Unity](https://realvirtual.io) Professional or author with your own tools. Viewers need no desktop installation; developers can build the Community application with Node.js.
 
 **One link. Any device. Live Digital Twin.** Try it: [web.realvirtual.io/demo](https://web.realvirtual.io/demo)
 
-This repository is the **community edition** — the full viewer and HMI runtime under AGPL. Authoring features such as the browser-based Asset & Kinematics Editor and CAD import (STEP, JT, …) are commercial extensions — but you can try all of them in the [public demo](https://web.realvirtual.io/demo): see [Community Edition vs. Commercial](#community-edition-vs-commercial).
+This repository is the **Community edition** under AGPL. It includes the viewer, HMI, transport simulation and layout planner. Browser asset authoring, CAD import and additional simulation modules are commercial extensions. See [Community Edition vs. Commercial](#community-edition-vs-commercial).
 
-> Part of the [realvirtual.io](https://realvirtual.io) industrial digital twin platform — a [Unity Verified Solution](https://unity.com/partners/realvirtual) for virtual commissioning, 3D HMI, and simulation.
+> Made by [realvirtual GmbH](https://realvirtual.io). realvirtual runs in the browser; [realvirtual for Unity](https://realvirtual.io) — a [Unity Verified Solution](https://unity.com/partners/realvirtual) — is the option for Unity developers and native builds.
 
 ## What It Does
 
-realvirtual WEB replaces traditional desktop HMI and SCADA visualization with a modern, browser-based 3D experience. Connect to real PLCs via WebSocket or MQTT, and operators see live machine states — drive positions, sensor readings, alarms, KPIs — all in the context of the machine's 3D layout. Unlike flat panel HMIs, operators see *what* is happening, *where* it is happening, and *why*.
+realvirtual replaces traditional desktop HMI and SCADA visualization with a modern, browser-based 3D experience. Connect to real PLCs via WebSocket or MQTT, and operators see live machine states — drive positions, sensor readings, alarms, KPIs — all in the context of the machine's 3D layout. Unlike flat panel HMIs, operators see *what* is happening, *where* it is happening, and *why*.
 
 ### Key Capabilities
 
-- **Workspace Modes** — One application, four workspaces, switchable from the toolbar or via `?mode=viewer|hmi|planner|des`: **Viewer** (just show the machine — model and running kinematics, no panels and no authoring), **HMI** (operate and monitor), **Planner** (assemble layouts), **DES** (event-driven material-flow analysis).
+- **Workspace Modes** — Viewer for presentation, HMI for operation, Planner for layouts, and Commissioning for commissioning workflows. DES and Editor require the corresponding commercial modules. Select a workspace from the toolbar or use `?mode=viewer`, `hmi`, `planner`, `commissioning`, `des` or `editor`; selecting a mode does not install its required features.
 - **Live 3D HMI** — Real-time PLC signal visualization via WebSocket or MQTT. Drive monitoring, sensor states, KPI overlays, alarm dashboards, and production charts powered by [Apache ECharts](https://echarts.apache.org/).
 - **Signal Linking by Drag & Drop** — Drag a live interface signal straight onto a component slot (Forward, TargetSpeed, SensorOccupied, …). Direction and value type are checked, connections are saved with the layout, and signals can be monitored and forced.
 - **Collision Detection** — Give a node one of six collision roles (Tool, Workpiece, Machine, Robot, Environment, None); while the simulation runs, every pair of bodies with *different* roles is checked against each other.
 - **Machine Information System** — Attach documents, maintenance guides, technical drawings, and manuals directly to 3D components. Technicians click a part and see its documentation in context — accessible from any device on the shop floor.
 - **Transport Simulation** — Full in-browser simulation engine at 60 Hz fixed timestep: conveyor surfaces, sources, sinks, sensors with AABB collision, grippers, and material flow.
-- **LogicStep Sequencing** — Serial/parallel containers, signal conditions, delays, drive commands — ported from realvirtual.io Professional based on Unity.
-- **WebXR (VR/AR)** — Immersive visualization on Meta Quest, Apple Vision Pro, and AR on Android/iOS with surface detection.
+- **LogicStep Sequencing** — Serial/parallel containers, signal conditions, delays, drive commands — ported from realvirtual for Unity Professional.
+- **WebXR (VR/AR)** — Immersive visualization in compatible WebXR browsers and devices. VR, AR and surface detection depend on browser and device capabilities.
 - **Layout Planning** *(Beta)* — Assemble factory layouts directly in the browser: drag reusable parts from a library onto a grid, connect them with typed snap points, and position them with transform gizmos. Ships with a standard parts library and can load any GLB catalog straight from a GitHub repository.
 - **Multiuser Sessions** *(Beta)* — Real-time collaboration with avatars, shared camera views, role management, and late-join state sync.
 - **Plugin Architecture** — Extend with custom plugins for project-specific HMI, KPI dashboards, maintenance workflows, and industrial interfaces.
-- **AI-Ready (MCP)** — Built-in [Model Context Protocol](https://modelcontextprotocol.io) bridge lets AI assistants like Claude inspect, control, and debug a running realvirtual WEB instance — read drive states, set signals, query scene hierarchy, and automate testing through natural language. Uses the [realvirtual MCP Server](https://github.com/game4automation/realvirtual-MCP).
+- **AI-Ready (MCP)** — Let an AI assistant inspect drives, read and write signals, query the scene and debug simulation through the browser MCP bridge. Connect through the separately installed realvirtual CONNECT gateway or the Node development fallback; see [AI setup](doc-ai-integration.md).
 
 ## Community Edition vs. Commercial
 
-This repository is the **community edition** of realvirtual WEB. It contains the complete viewer and HMI runtime under AGPL-3.0 and builds and runs entirely on its own — the commercial extension modules resolve to no-op stubs (`src/private-stubs/`), so the corresponding features are simply absent from a public build.
+This repository is the **community edition** of realvirtual. It contains the complete viewer and HMI runtime under AGPL-3.0 and builds and runs entirely on its own — the commercial extension modules resolve to no-op stubs (`src/private-stubs/`), so the corresponding features are simply absent from a public build.
 
 **Included in this repository (AGPL):** the full 3D viewer and HMI runtime — GLB loading with `rv_extras` parsing, the transport simulation engine (drives, sensors, sources/sinks, grippers, LogicSteps), signal store with WebSocket / MQTT / ctrlX / REST interfaces, drag & drop signal linking, collision detection, machine information system, layout planner *(Beta)*, multiuser sessions *(Beta)*, WebXR, the plugin system, and the MCP bridge.
 
@@ -46,22 +46,24 @@ This repository is the **community edition** of realvirtual WEB. It contains the
 
 | Feature | Description |
 |---|---|
-| **Asset & Kinematics Editor** | Browser-based authoring workspace: rename and group parts, assign materials, create kinematic axes and drives, author mechanisms, and save the result back into the GLB. The community edition can *load and run* such models, but not author them. |
-| **CAD Import** | STEP, JT, USD, FBX, and Onshape import with local in-browser conversion (WASM) — CAD geometry never leaves your machine. |
-| **Robot IK Solver** | Interactive inverse kinematics for robot models. |
-| **Kinematic Mechanisms** | Closed-loop mechanism solver (cranks, couplers, parallel kinematics). |
-| **Machining Simulation** | CSG-based material removal. |
-| **DES Simulation Kernel** | The discrete-event simulation engine behind the DES workspace mode. |
-| **Physics & Smooth Motion** | Physics-based behavior and motion smoothing/interpolation. |
+| **Asset & Kinematics Editor** | Browser authoring: group parts, assign materials, create drives and save GLBs. Community loads geometry and supported components from these models; components requiring commercial solvers still need those modules. |
+| **CAD Import** | STEP, JT, USD, FBX and Onshape import providers. Setup and conversion requirements depend on the provider; these providers are absent from Community. |
+| **Robot IK Solver** *(Beta)* | Inverse kinematics for robot models. |
+| **Kinematic Mechanisms** *(Beta)* | Closed-loop mechanism solver (cranks, couplers, parallel kinematics). |
+| **Machining Simulation** *(Beta)* | CSG-based material removal. |
+| **DES Simulation Kernel** *(Beta)* | Discrete-event simulation for the DES workspace. |
+| **Virtual PLC** *(Beta)* | Browser PLC programming and execution; see [Virtual PLC](doc-plc-programming.md). Live signal connectivity in Community is a separate capability. |
+| **Physics** *(Beta)* | Physics-based simulation behavior. |
+| **Smooth Motion** | Motion smoothing and interpolation. |
 
-**Try the commercial features live — no license, no installation:** the public demo at [web.realvirtual.io/demo](https://web.realvirtual.io/demo) runs the **full commercial feature set**. Open the Asset & Kinematics Editor, import your own STEP or JT files (conversion runs locally in your browser — geometry is never uploaded), run DES material-flow analyses, and try the IK solver, machining, and physics directly in the browser. The free-tier evaluation limits apply: CAD import up to **25 MB per STEP file** and **12 MB per JT file**, and live PLC connectivity through the free realvirtual CONNECT tier serves up to **20 signals** — a commercial license lifts these limits.
+**Explore the hosted demo:** [web.realvirtual.io/demo](https://web.realvirtual.io/demo) can include commercial extensions that are absent from this repository. Available modules and evaluation limits depend on the deployed build and license. A local Community build does not gain those modules by opening the same model.
 
 Two related commercial products complete the platform and are separate from this repository:
 
-- **[realvirtual.io Professional (Unity)](https://realvirtual.io)** — the engineering platform that authors and exports `rv_extras`-enriched GLBs and bridges 15+ native industrial protocols (Siemens S7, Beckhoff ADS, OPC UA, and more).
+- **[realvirtual for Unity — Professional](https://realvirtual.io)** — the Unity runtime for Unity developers and native builds (.exe, Linux, XR); it exports `rv_extras`-enriched GLBs and bridges 15+ native industrial protocols (Siemens S7, Beckhoff ADS, OPC UA, and more).
 - **[realvirtual CONNECT](https://realvirtual.io/doc/web/connect/)** — the gateway that makes Live mode work (industrial protocols → WebSocket) and hosts the built-in MCP server.
 
-A commercial license additionally allows proprietary/closed-source use, keeping your models and configuration private, and removal of the watermark — see [License](#license).
+A commercial license additionally allows proprietary/closed-source use, keeping your models and configuration private, and removal or replacement of the realvirtual branding — see [License](#license).
 
 ## Use Cases
 
@@ -84,7 +86,7 @@ Assemble factory layouts directly in the browser — drag conveyors, robots, fix
 
 ![Layout Planner — the library panel with conveyors and pallets, placing a snap-connected chain conveyor on the grid](docs/images/screenshot-layout-planner.jpg)
 
-**Try it live:** [Layout Planner demo](https://web.realvirtual.io/demo/?scene=published%3ADemoPlanner&mode=planner)
+**Try it live:** Open the [public demo](https://web.realvirtual.io/demo) and choose **Layout planning** on the welcome screen.
 
 ### Training & Onboarding
 Operators learn machine behavior interactively before touching the real system. No software installation, no VPN, no IT department required.
@@ -95,13 +97,12 @@ Share virtual commissioning models with customers for review and sign-off — wo
 ## Quick Start
 
 ```bash
-# Requirements: Node.js >= 18
-# Clone the repository (increase buffer for large GLB model files)
-git config --global http.postBuffer 524288000
+# Use Node.js 22 or 24 LTS
+# Clone the standalone Community repository
 git clone https://github.com/game4automation/realvirtual-WEB.git
 cd realvirtual-WEB
 
-npm install
+npm ci
 npm run dev          # Vite dev server with HMR
 ```
 
@@ -115,9 +116,11 @@ Load your own model in one of three ways — there is no folder that gets scanne
 npm run build        # Production build -> dist/ (local only, nothing published)
 npm run preview      # Preview production build
 npx tsc --noEmit     # Type check (community view)
+npx playwright install chromium  # Install the browser before browser tests
 npm test             # Run browser tests (headless Chromium via Playwright)
 npm run test:node    # Run Node.js tests (fs, glob, ESLint instance)
 npm run test:all     # Run both Node + browser tests
+npm run build:embed  # Build the embed app required by the E2E preview server
 npm run e2e          # Run Playwright end-to-end tests (e2e/)
 npm run lint         # ESLint (flat-config, boundaries rule)
 ```
@@ -143,17 +146,19 @@ yourself, serve the `dist/` folder produced by `npm run build` from any static w
 | **Direct** | The browser connects straight to the equipment over a browser-capable protocol (MQTT over WebSocket, REST) — no gateway in the loop. |
 
 **realvirtual CONNECT** is the gateway that makes Live mode work: it speaks the industrial
-protocols a browser cannot, and hands the signals to realvirtual WEB over one WebSocket. It is a
+protocols a browser cannot, and hands the signals to the browser over one WebSocket. It is a
 separate product and is documented at
 [realvirtual.io/doc/web/connect](https://realvirtual.io/doc/web/connect/) — this repository holds
 only the browser side of the contract (see [doc-webviewer-interface.md](doc-webviewer-interface.md)).
 
 ## Deployment Options
 
-- **Public Demo** — Publish to `web.realvirtual.io` for sales demos and marketing
-- **Private Projects** — Unguessable URLs with 128-bit entropy for secure customer access
-- **Self-Hosted** — Deploy on your own infrastructure with `settings.json` configuration
-- **Kiosk Mode** — Lock all configuration UI for shopfloor panels and public displays
+- **Self-hosted application** — Build with `npm run build` and serve `dist/` from your own static host. See [hosting and deployment](doc-deploy.md).
+- **Embedded viewer** — Build with `npm run build:embed` and integrate the custom element or lightweight viewer API into your site.
+- **Project delivery** — Keep `project.json`, models, attachments and compiled plugins together. See [persistence](doc-persistence.md).
+- **Kiosk display** — Hide configuration controls for shop-floor panels. Configure access restrictions on your hosting infrastructure; a hidden control or an unguessable link is not authentication.
+
+Publishing to realvirtual's hosted demo uses maintainer credentials and infrastructure.
 
 ## Tech Stack
 
@@ -177,13 +182,13 @@ Connect to real automation systems via:
 | **Bosch Rexroth ctrlX** | Direct ctrlX CORE integration |
 | **REST API** | Polling-based signal access |
 
-The Unity-side [realvirtual.io Professional](https://realvirtual.io) supports 15+ industrial protocols including Siemens S7, Beckhoff ADS, OPC UA, Fanuc, KUKA, ABB, EtherNet/IP, Modbus, and more — all bridged to the browser via WebSocket.
+[realvirtual for Unity](https://realvirtual.io) Professional supports 15+ industrial protocols including Siemens S7, Beckhoff ADS, OPC UA, Fanuc, KUKA, ABB, EtherNet/IP, Modbus, and more — all bridged to the browser via WebSocket.
 
 ## Architecture
 
-realvirtual WEB works with **any standard GLB/glTF file** — load a CAD export from Blender, SolidWorks, Fusion 360, or any other 3D tool and view it as an interactive 3D model in the browser.
+realvirtual loads GLB/glTF geometry from compatible exporters. See [Quick Start](#quick-start) for the loading options.
 
-For full digital twin functionality, the GLB file becomes the single source of truth: signal bindings, kinematic definitions, drive parameters, sensor thresholds, and component metadata are embedded via the `rv_extras` schema. [realvirtual.io Professional](https://realvirtual.io) provides the authoring tools to add this metadata during Unity export, but the `rv_extras` format is open and documented — you can author it with any toolchain.
+The GLB stores model geometry and `rv_extras` metadata such as signal bindings, drives and sensors. The project manifest (`project.json`) identifies documents and their plugin bindings; attachments and compiled project plugins can be separate files. Keep these together when delivering a project. [realvirtual for Unity](https://realvirtual.io) Professional can export enriched GLBs, and the metadata format is also documented for other toolchains.
 
 ```
 src/
@@ -194,15 +199,16 @@ src/
   interfaces/        # Industrial protocol adapters (WebSocket, MQTT, ctrlX)
   plugins/           # Built-in plugins (multiuser, annotations, FPV, XR)
     demo/            # Demo charts and HMI (OEE, cycle time, energy, drive/sensor overlays)
-    models/          # Per-model plugins (auto-loaded when a model is selected)
+    models/          # Built-in model plugin packs compiled into the application
   private-stubs/     # No-op stubs for commercial modules — what makes this community
                      #   edition build and run without the private sibling repository
-tests/               # Vitest browser-mode tests
+  embed/             # Lightweight embedding entry points
+tests/               # Vitest browser and Node tests
 e2e/                 # Playwright E2E tests
 public/demo-realvirtual/  # Bundled demo project: its GLBs and its project.json manifest
 ```
 
-## Extending realvirtual WEB
+## Extending realvirtual
 
 Plugins can contribute UI components to predefined **slots** in the HMI layout — KPI bar, button panel, message panel, settings tabs, and more. The built-in demo plugin uses all of these:
 
@@ -212,59 +218,41 @@ Plugins can contribute UI components to predefined **slots** in the HMI layout �
 
 ![Settings Panel — tabbed configuration for model, visual, interfaces, and AI](docs/images/screenshot-settings.png)
 
-The plugin system makes it easy to add custom functionality. Create a plugin class and register it with `viewer.use()`:
+For a project-specific extension, bind a TypeScript module to a document through `documents[].scriptRef` in the project manifest:
 
-```typescript
-import type { RVViewerPlugin } from './core/rv-plugin';
-import type { RVViewer } from './core/rv-viewer';
-
-class MyPlugin implements RVViewerPlugin {
-  id = 'my-plugin';
-
-  init(viewer: RVViewer) {
-    // Access drives, signals, scene — all from the RVViewer API
-    viewer.on('model-loaded', () => {
-      const drives = viewer.drives;          // all drives in the scene
-      const signals = viewer.signalStore;    // PLC signal store
-      console.log(`Model loaded with ${drives.length} drives`);
-    });
-  }
-}
-
-// Register in main.ts or a model-specific plugin module
-viewer.use(new MyPlugin());
-```
-
-**Per-model plugins** load automatically when a specific GLB is selected. Place them in `src/plugins/models/<ModelName>/index.ts`:
-
-```typescript
-export const models = ['MyMachine'];  // matches MyMachine.glb
-
-export function registerModelPlugins(viewer) {
-  viewer.use(new MyCustomDashboard());
-}
-
-export function unregisterModelPlugins(viewer) {
-  viewer.removePlugin('my-dashboard');
+```json
+{
+  "id": "doc_triangle_dkqhmg",
+  "name": "Community triangle",
+  "path": "triangle.glb",
+  "scriptRef": "plugins/counter.ts"
 }
 ```
+
+The module exports paired `registerModelPlugins` and `unregisterModelPlugins` functions that register its plugins with `viewer.use()` and clean them up again. Compile the project's scripts with `npm run build:project-scripts -- <project-folder>`, open the project folder in the application and allow its native project code after reviewing it. Distribute the compiled `.js` alongside the `.ts` source and manifest.
+
+Built-in model plugin packs under `src/plugins/models/` are compiled into the application. Use project `scriptRef` bindings for extensions that should travel with a project. For JavaScript behaviors stored inside a GLB, see [Component Scripting](doc-scripting.md).
 
 For the full plugin API — UI slots, event bus, hooks, context menus, and tooltip extensions — see [doc-extending-webviewer.md](doc-extending-webviewer.md).
 
 ## Documentation
 
-End users start at the **[realvirtual WEB documentation site](https://realvirtual.io/doc/web/)**.
+End users start at the **[realvirtual documentation site](https://realvirtual.io/doc/web/)**.
 Developers start with **[Architecture](doc-webviewer.md)**. The full in-repo documentation set:
 
 **Getting started & architecture**
+
 | Document | Contents |
 |----------|----------|
 | [Architecture](doc-webviewer.md) | Full architecture, component reference, configuration, workspace modes |
+| [AGV and fleet control](doc-path-fleet-control.md) | Paths, tasks, docking and project control |
+| [Virtual PLC (commercial beta)](doc-plc-programming.md) | Requires an enabled commercial build; not in Community |
 | [From Unity to the Web](doc-unity-to-web.md) | Porting patterns and the AI coding-agent workflow |
 | [Lifecycle](doc-lifecycle.md) | Runtime lifecycle: model load, fixed-step loop, pause, reset, dispose, events |
 | [Node Paths](doc-node-paths.md) | How component, signal and kinematic references are written and resolved |
 
 **Building & extending**
+
 | Document | Contents |
 |----------|----------|
 | [Plugin Development](doc-extending-webviewer.md) | Plugin system, custom components, UI slots, hooks |
@@ -277,13 +265,15 @@ Developers start with **[Architecture](doc-webviewer.md)**. The full in-repo doc
 | [UI Visibility](doc-ui-visibility.md) | Which axis decides what is shown: plugin modes vs. UI visibility rules |
 
 **Authoring & operations**
+
 | Document | Contents |
 |----------|----------|
 | [Layout Planner](doc-layout-planner.md) | Library objects, catalogs, snap points, pivots, deep-links |
-| [Persistence](doc-persistence.md) | Document model, edit ops log, drafts, storage layout |
+| [Persistence](doc-persistence.md) | Document model, GLB drafts, autosave, recovery and storage backends |
 | [Document Linking](doc-document-linking.md) | PDF/AASX datasheet linking and metadata |
 
 **Connectivity & collaboration**
+
 | Document | Contents |
 |----------|----------|
 | [Industrial Interfaces](doc-webviewer-interface.md) | WebSocket Realtime, ctrlX, MQTT, signal flow, new-interface guide |
@@ -292,23 +282,22 @@ Developers start with **[Architecture](doc-webviewer.md)**. The full in-repo doc
 | [MCP Tools](webviewer.mcp.md) | MCP tools reference (read state, set signals, build layouts) |
 
 **Deploy & debug**
+
 | Document | Contents |
 |----------|----------|
-| [Building & Deploying](doc-deploy.md) | Local test build vs. publishing, private projects, credentials, CI |
+| [Building & Deploying](doc-deploy.md) | Community self-hosting and separate maintainer publishing workflows |
 | [Debugging Guide](doc-web-debugging.md) | Debugging tools, debug API, E2E tests, workflow |
 
 ## AI-Enabled Development (MCP)
 
-realvirtual WEB and [realvirtual.io](https://realvirtual.io) are fully AI-enabled through the **Model Context Protocol (MCP)**. AI coding assistants like [Claude Code](https://claude.ai/code) can drive the running scene directly.
+realvirtual and realvirtual for Unity are fully AI-enabled through the **Model Context Protocol (MCP)**. AI coding assistants like [Claude Code](https://claude.ai/code) can drive the running scene directly.
 
-**The MCP server ships inside [realvirtual CONNECT](https://realvirtual.io/doc/web/connect/)** — there is
-nothing extra to install. CONNECT hosts the endpoint at `http://localhost:5100/mcp`; point your
-assistant at it and the `web_*` tools reach the browser scene over the same origin that serves it:
+**[realvirtual CONNECT](https://realvirtual.io/doc/web/connect/) is a separate installation** and the default MCP host. Once installed and configured, it exposes `http://localhost:5100/mcp`; the browser bridge connects to CONNECT to make the `web_*` tools available. A local Node bridge is also supported for development. Follow [AI Integration](doc-ai-integration.md) for setup, registration requirements and troubleshooting.
 
-- **realvirtual WEB** — list drives and positions, read/write PLC signals, query the scene
+- **realvirtual (browser)** — list drives and positions, read/write PLC signals, query the scene
   hierarchy, inspect sensor states, debug transport simulation, take screenshots of the running
   scene.
-- **Unity Editor** *(optional)* — with [realvirtual.io](https://realvirtual.io) Professional, the
+- **Unity Editor** *(optional)* — with [realvirtual for Unity](https://realvirtual.io) Professional, the
   separate realvirtual MCP package adds 80+ editor tools: create GameObjects, set component
   properties, run simulations, manage scenes, run tests.
 
@@ -316,29 +305,28 @@ This means AI assistants can design, build, test, and debug industrial digital t
 
 ### Getting Started with AI Development
 
-This repo includes a full [Claude Code](https://claude.ai/code) setup:
+This repo includes guidance for AI coding assistants such as [Claude Code](https://claude.ai/code):
 
 - **[CLAUDE.md](CLAUDE.md)** — Project conventions, architecture overview, and coding guidelines for AI assistants
-- **[.claude/commands/](.claude/commands/)** — Slash commands for common workflows: `/dev`, `/debug`, `/test`, `/build`, `/inspect`, `/license-check`
 - **[webviewer.mcp.md](webviewer.mcp.md)** — MCP tools reference for browser-side scene inspection
 
-Open this project in Claude Code and use `/dev` to start the dev server, `/debug drives` to inspect drive states, or `/test` to run the full test suite — all through natural language.
+Open this project in Claude Code, start the dev server and connect the MCP bridge as described in [AI Integration](doc-ai-integration.md) — then inspect drives, signals and the scene through natural language.
 
-## The Two-Platform Strategy
+## One Platform, Two Runtimes
 
-realvirtual.io follows a deliberate two-platform architecture:
+realvirtual is the browser platform and the default way to work. Both runtimes share the same data — GLB files with `rv_extras` — and connect to machines through realvirtual CONNECT.
 
-| | Unity (Engineering Platform) | realvirtual WEB (Delivery Platform) |
+| | realvirtual (browser) | realvirtual for Unity |
 |---|---|---|
-| **Purpose** | CAD import, behavior modeling, virtual commissioning | Browser-based 3D HMI, monitoring, collaboration |
-| **Technology** | Unity Engine, C#, Unity Industry | Three.js, TypeScript, React |
-| **Deployment** | Desktop application, XR headsets, mobile devices | Any modern browser |
-| **PLC connection** | Native protocol drivers | WebSocket / MQTT gateway |
-| **Target user** | Automation engineer, simulation expert | Operator, service tech, sales, customer |
+| **For** | Drag & drop users and everyone building 3D HMIs, Machine Information Systems or their own web apps | Unity developers and teams that need native builds |
+| **Scope** | 3D HMI, Machine Information System, simulation, layout planning, collaboration; commercial asset authoring, CAD import and DES | Engineering in the Unity Editor, virtual commissioning, native protocol drivers |
+| **Technology** | Three.js, TypeScript, React | Unity Engine, C# |
+| **Deployment** | Any modern browser | Desktop (.exe, Linux), XR headsets, mobile |
+| **PLC connection** | realvirtual CONNECT gateway, or direct WebSocket, MQTT over WebSocket and REST | Native protocol drivers |
 
 ## Contributing
 
-Contributions are welcome. Please note that realvirtual WEB is **dual-licensed**
+Contributions are welcome. Please note that realvirtual is **dual-licensed**
 (AGPL-3.0-only + commercial): by submitting a pull request or any other
 contribution, you agree to the grant of rights described in
 [CONTRIBUTING.md](CONTRIBUTING.md), which allows realvirtual GmbH to also
@@ -350,9 +338,9 @@ Copyright (C) 2025–2026 [realvirtual GmbH](https://realvirtual.io)
 
 This program is licensed under the **GNU Affero General Public License v3 (AGPL-3.0)**.
 
-**What this means:** If you use, modify, or build upon realvirtual WEB in your own project — including deploying it as a web service — you must publish your **complete project** under the same AGPL-3.0 license and make it freely available. This includes all source code, configuration, and **all content delivered through the application** (such as GLB model files, settings, and plugins). This applies whether served over a network or distributed directly.
+**What this means:** If you use, modify, or build upon realvirtual in your own project — including deploying it as a web service — the AGPL-3.0 requires you to make the corresponding source of your work available to its users under the same license. realvirtual GmbH considers everything delivered through the application part of that work: source code, plugins, configuration and content such as GLB model files and settings. If you want to keep any of this private, use a commercial license.
 
-The "Powered by realvirtual WEB" watermark and the realvirtual logo must remain visible and unmodified in all AGPL deployments. Removal or modification of any branding requires a commercial license.
+The realvirtual branding — the realvirtual logo and the "powered by realvirtual" badge — stays visible and unmodified in AGPL deployments. Removing or replacing the branding requires a commercial license.
 
 See [LICENSE](LICENSE) for the full license text.
 
@@ -360,10 +348,10 @@ See [LICENSE](LICENSE) for the full license text.
 
 ### Commercial License
 
-If you want to use realvirtual WEB in proprietary or closed-source products — or keep your 3D models, project configuration, and plugins private — a commercial license is available.
+If you want to use realvirtual in proprietary or closed-source products — or keep your 3D models, project configuration, and plugins private — a commercial license is available.
 
 Contact: [realvirtual.io/en/company/license](https://realvirtual.io/en/company/license)
 
 ---
 
-**[realvirtual.io](https://realvirtual.io)** | [Live Demo](https://web.realvirtual.io/demo) | [realvirtual WEB Documentation](https://realvirtual.io/doc/web/) | [realvirtual.io Documentation](https://doc.realvirtual.io) | [YouTube](https://youtube.com/@realvirtualio) | [Forum](https://forum.realvirtual.io)
+**[realvirtual.io](https://realvirtual.io)** | [Live Demo](https://web.realvirtual.io/demo) | [realvirtual Documentation](https://realvirtual.io/doc/web/) | [realvirtual for Unity Documentation](https://doc.realvirtual.io) | [YouTube](https://youtube.com/@realvirtualio) | [Forum](https://forum.realvirtual.io)
