@@ -190,7 +190,6 @@ Full list with addressing and settings: [CONNECT interfaces](https://realvirtual
 |-----------|-------------|
 | **WebSocket Realtime v2** | Your own bridge or server speaking the open realvirtual protocol |
 | **MQTT over WebSocket** | Brokers that offer a WebSocket listener |
-| **Bosch Rexroth ctrlX** | ctrlX CORE through the realvirtual bridge snap |
 | **REST API** | Polling-based signal access |
 
 [realvirtual for Unity](https://realvirtual.io) Professional has its own 25+ interfaces that run inside Unity — no separate gateway is needed there.
