@@ -356,6 +356,20 @@ See [LICENSE](LICENSE) for the full license text.
 
 **SPDX-License-Identifier:** `AGPL-3.0-only`
 
+### Third-party components
+
+realvirtual WEB includes third-party software and content that is **not** covered by the
+AGPL-3.0 and remains under its own licence or terms:
+
+- **npm dependencies and bundled assets** — every build writes `THIRD-PARTY-NOTICES.txt`
+  (and `third-party-notices.json`) next to `index.html`, listing each shipped component with
+  its licence, copyright and source. The inventory and licence policy live in `third-party/`.
+- **Demo content provided by third parties** — for example
+  `public/pdf/fanuc-crx-educational-cell-manual.pdf` (FANUC). It is included for demonstration
+  purposes only, remains the property of its owner and may not be reused outside this demo.
+- `public/pdf.worker.min.js` — pdf.js, Mozilla, Apache-2.0.
+- `public/envmaps/empty_warehouse_01_1k.hdr` — Poly Haven, CC0-1.0.
+
 ### Commercial License
 
 If you want to use realvirtual in proprietary or closed-source products — or keep your 3D models, project configuration, and plugins private — a commercial license is available.

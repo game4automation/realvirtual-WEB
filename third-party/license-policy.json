@@ -1,0 +1,46 @@
+{
+  "$comment": "realvirtual WEB licence policy (plan-544). Mirrored to the public repository: never name a private package or vendor here — those belong in realvirtual-WebViewer-Private~/third-party/license-policy.json. Exceptions need a reason; decidedBy \"proposed\" marks a proposal that does NOT silence a violation until a human decides. The number of exceptions has a shrink-only ceiling (tests/third-party-notices.node.test.ts).",
+  "allowed": [
+    "MIT",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Apache-2.0",
+    "0BSD",
+    "Zlib",
+    "CC0-1.0",
+    "Unlicense",
+    "BlueOak-1.0.0",
+    "MPL-2.0",
+    "OFL-1.1",
+    "CC-BY-4.0",
+    "OCCT-exception-1.0"
+  ],
+  "dynamicOnly": [
+    "LGPL-2.1-only",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later"
+  ],
+  "exceptions": [],
+  "vendorTerms": [
+    {
+      "name": "Supplier Asset Administration Shell demo packages",
+      "version": "demo",
+      "vendor": "Festo SE & Co. KG; Bosch Rexroth AG",
+      "licenseRef": "LicenseRef-vendor-aasx",
+      "reason": "Supplier-published AASX demo packages on the public demo site only. Shipped as is under the vendor terms.",
+      "decidedBy": "realvirtual GmbH",
+      "date": "2026-10-03"
+    },
+    {
+      "name": "FANUC CRX educational cell manual (PDF)",
+      "version": "demo",
+      "vendor": "FANUC",
+      "licenseRef": "LicenseRef-vendor-document",
+      "reason": "Manual linked from the robot-alarm demo. Shipped as is under the vendor terms.",
+      "decidedBy": "realvirtual GmbH",
+      "date": "2026-10-03"
+    }
+  ]
+}

@@ -1,0 +1,105 @@
+{
+  "$comment": "Non-npm components shipped by realvirtual WEB (plan-544 F5, Phase 0 inventory 2026-10-03). An entry is listed in the notices when one of its `match` POSIX globs matches a bundle module id, an emitted asset name or a file of the public dir (prefixed public/). `licenseFile` is relative to this folder. Mirrored to the public repository: no private package names here.",
+  "components": [
+    {
+      "name": "Draco 3D Data Compression decoder",
+      "version": "three-0.185.1",
+      "license": "Apache-2.0",
+      "copyright": ["Copyright The Draco Authors"],
+      "source": "https://github.com/google/draco",
+      "notes": ["Decoder builds as distributed with three.js (examples/jsm/libs/draco), used unmodified."],
+      "match": ["draco/draco_*", "**/three/examples/jsm/libs/draco/**"]
+    },
+    {
+      "name": "fflate (three.js copy)",
+      "version": "0.8.2",
+      "license": "MIT",
+      "copyright": ["Copyright (c) Arjun Barrett"],
+      "source": "https://github.com/101arrowz/fflate",
+      "notes": ["Copy distributed with three.js (examples/jsm/libs/fflate.module.js)."],
+      "match": ["**/three/examples/jsm/libs/fflate.module.js"]
+    },
+    {
+      "name": "@webxr-input-profiles/motion-controllers (three.js copy)",
+      "version": "1.0.0",
+      "license": "MIT",
+            "source": "https://github.com/immersive-web/webxr-input-profiles",
+      "notes": ["Copy distributed with three.js (examples/jsm/libs/motion-controllers.module.js)."],
+      "match": ["**/three/examples/jsm/libs/motion-controllers.module.js"]
+    },
+    {
+      "name": "pdfjs-dist",
+      "version": "5.4.296",
+      "license": "Apache-2.0",
+      "copyright": ["Copyright 2024 Mozilla Foundation"],
+      "source": "https://www.npmjs.com/package/pdfjs-dist/v/5.4.296",
+      "notes": ["Shipped as public/pdf.worker.min.js (PDF.js worker), used unmodified."],
+      "match": ["public/pdf.worker.min.js"]
+    },
+    {
+      "name": "Codicons (Monaco editor icon font)",
+      "version": "monaco-editor-0.55.1",
+      "license": "CC-BY-4.0",
+      "copyright": ["Copyright (c) Microsoft Corporation"],
+      "source": "https://github.com/microsoft/vscode-codicons",
+      "notes": ["codicon.ttf as shipped inside monaco-editor; the code of monaco-editor itself is MIT."],
+      "match": ["**/monaco-editor/esm/vs/base/browser/ui/codicons/codicon/codicon.ttf"]
+    },
+    {
+      "name": "occt-import-js",
+      "version": "0.0.23",
+      "license": "LGPL-2.1-only",
+      "linking": "dynamic",
+      "modified": "memory limit patch",
+      "copyright": ["Copyright (c) the occt-import-js authors (https://github.com/kovacsv/occt-import-js)"],
+      "source": "https://www.npmjs.com/package/occt-import-js/v/0.0.23",
+      "notes": [
+        "Repository: https://github.com/kovacsv/occt-import-js (release 0.0.23). The WebAssembly module contains Open CASCADE Technology (https://dev.opencascade.org), LGPL-2.1-only WITH OCCT-exception-1.0.",
+        "Shipped as two separate, loose files in the build output: occt/occt-import-js.js (JavaScript glue) and occt/occt-import-js.wasm (OpenCascade compiled to WebAssembly). They are not bundled into any realvirtual chunk; the STEP-import worker loads them at runtime from <deploy base>/occt/.",
+        "To replace the library, put an interface-compatible occt-import-js.js and occt-import-js.wasm (for example a self-built or newer occt-import-js release) at the same names in the occt/ folder of the deployment.",
+        "MODIFIED by realvirtual GmbH (memory limit patch, scripts/patch-occt-memory.mjs): the WebAssembly memory section's maximum is raised from 32768 to 65536 pages and the glue's getHeapMax() from 2147483648 to 4294967296 bytes (2 GB -> 4 GB heap ceiling). No other byte is changed; the unmodified files are those of the npm release named above."
+      ],
+      "files": ["occt/occt-import-js.js", "occt/occt-import-js.wasm"],
+      "match": ["occt/occt-import-js.js", "occt/occt-import-js.wasm"]
+    },
+    {
+      "name": "Empty Warehouse 01 HDRI (Poly Haven)",
+      "version": "1k",
+      "license": "CC0-1.0",
+      "copyright": ["Sergej Majboroda / Poly Haven"],
+      "source": "https://polyhaven.com/a/empty_warehouse_01",
+      "notes": ["Environment map public/envmaps/empty_warehouse_01_1k.hdr."],
+      "match": ["public/envmaps/empty_warehouse_01_1k.hdr"]
+    },
+    {
+      "name": "Modelica Reference FMUs (BouncingBall)",
+      "version": "0.0.40",
+      "license": "BSD-2-Clause",
+      "copyright": ["Copyright (c) 2026, Modelica Association Project \"FMI\"."],
+      "source": "https://github.com/modelica/Reference-FMUs",
+      "licenseFile": "../public/demo-realvirtual/fmu-demo.LICENSE.txt",
+      "notes": ["Embedded unmodified in the demo model public/demo-realvirtual/fmu-demo.glb."],
+      "match": ["public/demo-realvirtual/fmu-demo.glb"]
+    },
+    {
+      "name": "Supplier Asset Administration Shell demo packages",
+      "version": "demo",
+      "license": "LicenseRef-vendor-aasx",
+      "vendorTerms": true,
+      "vendor": "Festo SE & Co. KG; Bosch Rexroth AG",
+      "source": "https://demo.realvirtual.io",
+      "notes": ["Public demo content only (public/aasx/*.aasx); never part of a customer delivery."],
+      "match": ["public/aasx/*.aasx"]
+    },
+    {
+      "name": "FANUC CRX educational cell manual (PDF)",
+      "version": "demo",
+      "license": "LicenseRef-vendor-document",
+      "vendorTerms": true,
+      "vendor": "FANUC",
+      "source": "https://www.fanuc.eu",
+      "notes": ["Document public/pdf/fanuc-crx-educational-cell-manual.pdf used by the robot-alarm demo. Included for demonstration purposes under the owner's terms."],
+      "match": ["public/pdf/fanuc-crx-educational-cell-manual.pdf"]
+    }
+  ]
+}
